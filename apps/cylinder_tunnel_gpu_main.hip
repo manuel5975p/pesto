@@ -25,6 +25,7 @@
 #include "dns/gpu/ghostfill.hpp"
 #include "dns/gpu/kernels.hpp"
 #include "dns/gpu/reductions.hpp"
+#include "dns/gpu/tunnel.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -46,127 +47,12 @@ namespace {
 using namespace dns;
 using gpu::Real;
 
-// Interior k range: [1, nz-2] with a z ghost ring, the single plane k = 0 in
-// native 2D (nz == 1).
-__host__ __device__ inline int kInLo(int nz) { return nz == 1 ? 0 : 1; }
-__host__ __device__ inline int kInHi(int nz) { return nz == 1 ? 0 : nz - 2; }
-
 double parseOr(const char* s, double fallback)
 {
     double v{};
     const std::string_view sv(s);
     auto [q, ec] = std::from_chars(sv.begin(), sv.end(), v);
     return ec == std::errc{} && q == sv.end() ? v : fallback;
-}
-
-// Ghost-ring boundary conditions, applied after maskSolidFaces zeroed every
-// closed face. cdt = Uc*dt/hx drives the convective outlet from the stage
-// input state (pass cdt = 0 with in == out aliased for a pure refresh).
-//   inlet   (i<=1):      u = uInf; v,w antimirrored so they vanish on x=hx
-//   outlet  (i==nx-1):   convective advection out of the domain
-//   y-walls (j rings):   FREE-SLIP -- u,w mirrored (Neumann, zero tangential
-//                        gradient: the wall generates NO vorticity), v = 0 on
-//                        the wall faces, v ghost antimirrored. Pressure is
-//                        already Neumann there (closed apertures + DCT).
-//                        (A Dirichlet u = uInf far field clamps the velocity
-//                        next to the sheared interior flow and paints a bright
-//                        vortex sheet along the wall.)
-//   z-walls (k rings):   FREE-SLIP -- u,v mirrored, w = 0 on the wall faces
-__global__ void kBcTunnel(gpu::GpuGrid g, Real uInf, Real cdt, const Real* inu,
-                          const Real* inv, const Real* inw, Real* u, Real* v, Real* w)
-{
-    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (c >= g.size()) return;
-    int i, j, k;
-    gpu::decompose(g, c, i, j, k);
-    const int nx = g.nx, ny = g.ny, nz = g.nz;
-    // Free-slip mirror row; none in native 2D (nz == 1, no z ghosts).
-    const int km = nz == 1 ? k : (k == 0 ? 1 : k == nz - 1 ? nz - 2 : k);
-
-    const int jm = j == 0 ? 1 : j == ny - 1 ? ny - 2 : j; // y free-slip mirror
-
-    if (i <= 1) u[c] = uInf;
-    else if (i == nx - 1)
-        u[c] = inu[c] - cdt * (inu[c] - inu[gidx(g, nx - 2, j, k)]);
-    else if (jm != j) u[c] = u[gidx(g, i, jm, k)];
-    else if (km != k) u[c] = u[gidx(g, i, j, km)];
-
-    if (i == 0) v[c] = -v[gidx(g, 1, j, k)];
-    else if (i == nx - 1)
-        v[c] = inv[c] - cdt * (inv[c] - inv[gidx(g, nx - 2, j, k)]);
-    else if (j == 1 || j == ny - 1) v[c] = 0; // impermeable wall faces
-    else if (j == 0) v[c] = -v[gidx(g, i, 2, k)]; // antimirror across y = hy
-    else if (km != k) v[c] = v[gidx(g, i, j, km)];
-
-    if (i == 0) w[c] = -w[gidx(g, 1, j, k)];
-    else if (i == nx - 1)
-        w[c] = inw[c] - cdt * (inw[c] - inw[gidx(g, nx - 2, j, k)]);
-    else if (jm != j) w[c] = w[gidx(g, i, jm, k)];
-    else if (nz == 1 || k <= 1 || k == nz - 1) w[c] = 0;
-}
-
-// Open far-field fringe sponge (--open): relax the stage velocity toward the
-// free stream over cosine-ramped bands along the x/y domain boundaries.
-// r = max over axes of normalized band depth (0 at the interior band edge,
-// 1 on the boundary); sig = sigMax*(1-cos(pi r))/2. z is left plain periodic:
-// the flow is z-invariant (quasi-2D), a z band would sponge the whole wake.
-// The body never reaches the bands, so no solid face is touched.
-__global__ void kFringe(gpu::GpuGrid g, int ns, Real sigMax, Real uInf, Real* u,
-                        Real* v, Real* w)
-{
-    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (c >= g.size()) return;
-    int i, j, k;
-    gpu::decompose(g, c, i, j, k);
-    auto depth = [ns](int q, int nq) {
-        if (q < ns) return Real(ns - q) / Real(ns);
-        if (q >= nq - ns) return Real(q - (nq - ns) + 1) / Real(ns);
-        return Real(0);
-    };
-    const Real r = std::max(depth(i, g.nx), depth(j, g.ny));
-    if (r <= 0) return;
-    const Real sig = sigMax * Real(0.5) * (Real(1) - cosf(Real(M_PI) * r));
-    u[c] += sig * (uInf - u[c]);
-    v[c] -= sig * v[c];
-    w[c] -= sig * w[c];
-}
-
-// Per-cell tally of the outlet-plane u so one sumScalar yields the volume flux.
-__global__ void kOutletTally(gpu::GpuGrid g, const Real* u, Real* out)
-{
-    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (c >= g.size()) return;
-    int i, j, k;
-    gpu::decompose(g, c, i, j, k);
-    const bool plane = i == g.nx - 1 && j >= 1 && j <= g.ny - 2 && k >= kInLo(g.nz)
-                    && k <= kInHi(g.nz);
-    out[c] = plane ? u[c] : Real(0);
-}
-
-// u_outlet += corr on the open outlet plane (exact global mass balance).
-__global__ void kOutletCorrect(gpu::GpuGrid g, Real corr, Real* u)
-{
-    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (c >= g.size()) return;
-    int i, j, k;
-    gpu::decompose(g, c, i, j, k);
-    if (i == g.nx - 1 && j >= 1 && j <= g.ny - 2 && k >= kInLo(g.nz)
-        && k <= kInHi(g.nz))
-        u[c] += corr;
-}
-
-// The inlet/outlet faces carry prescribed fluxes but zero apertures, so
-// divergenceCut misses them; add the missing terms to the projection RHS.
-__global__ void kInOutFluxRhs(gpu::GpuGrid g, Real scale, Real uInf, const Real* u,
-                              Real* rhs)
-{
-    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (c >= g.size()) return;
-    int i, j, k;
-    gpu::decompose(g, c, i, j, k);
-    if (j < 1 || j > g.ny - 2 || k < kInLo(g.nz) || k > kInHi(g.nz)) return;
-    if (i == 1) rhs[c] -= scale * uInf / g.hx;
-    else if (i == g.nx - 2) rhs[c] += scale * u[gidx(g, g.nx - 1, j, k)] / g.hx;
 }
 
 // Pressure force the projection exerts on the body inside a bounding box:
@@ -569,31 +455,23 @@ int main(int argc, char** argv)
     gpu::maskSolidFaces(gg, *dCut, *dU);
     (void)hipMemset(scr->phi.data(), 0, g.size() * sizeof(Real)); // warm-start seed
 
-    const double planeArea = double(n) * nzCells * h * h;
+    auto tunnel = gpu::DeviceTunnelBc::make(gg, {uInf});
+    // Fringe band: ~10% of the domain per side, cosine-ramped, sigMax 0.5.
+    // x,y only: the flow is z-invariant, a z band would sponge the whole wake.
+    const int nsFringe = std::clamp(int(0.1 * nx), 8, nx / 2 - 1);
+    auto fringe = gpu::DeviceFringe::make(gg, {uInf, 0.5, nsFringe, 2});
+    if (!tunnel || !fringe)
+    {
+        std::fprintf(stderr, "far-field init failed\n");
+        return 2;
+    }
     auto bcApply = [&](const gpu::DeviceField& in, gpu::DeviceField& out, double cdt) {
-        kBcTunnel<<<gpu::launchBlocks(g.size()), gpu::blockSize>>>(
-            gg, Real(uInf), Real(cdt), in.u.data(), in.v.data(), in.w.data(),
-            out.u.data(), out.v.data(), out.w.data());
-        gpu::checkLastKernel("bcTunnel");
+        tunnel->apply(in, out, cdt);
     };
     auto fluxCorrect = [&](gpu::DeviceField& out) {
-        kOutletTally<<<gpu::launchBlocks(g.size()), gpu::blockSize>>>(
-            gg, out.u.data(), dFx->data());
-        gpu::checkLastKernel("outletTally");
-        const double qOut = gpu::sumScalar(*dFx, *red) * h * h;
-        const double corr = (uInf * planeArea - qOut) / planeArea;
-        kOutletCorrect<<<gpu::launchBlocks(g.size()), gpu::blockSize>>>(
-            gg, Real(corr), out.u.data());
-        gpu::checkLastKernel("outletCorrect");
+        tunnel->correctOutletFlux(out, *red, *dFx);
     };
-    // Fringe band: ~10% of the domain per side, cosine-ramped, sigMax 0.5.
-    const int nsFringe = std::clamp(int(0.1 * nx), 8, nx / 2 - 1);
-    auto fringeApply = [&](gpu::DeviceField& out) {
-        kFringe<<<gpu::launchBlocks(g.size()), gpu::blockSize>>>(
-            gg, nsFringe, Real(0.5), Real(uInf), out.u.data(), out.v.data(),
-            out.w.data());
-        gpu::checkLastKernel("fringe");
-    };
+    auto fringeApply = [&](gpu::DeviceField& out) { fringe->apply(out); };
     if (!open) bcApply(*dU, *dU, 0.0); // seed ghosts/prescribed faces
 
     // One SSP-RK3 stage with channel BCs and the ghost-flux projection.
@@ -626,9 +504,7 @@ int main(int argc, char** argv)
         gpu::divergenceCut(gg, *dCut, out, scr->div, Real(1.0 / dt));
         if (!open)
         {
-            kInOutFluxRhs<<<gpu::launchBlocks(g.size()), gpu::blockSize>>>(
-                gg, Real(1.0 / dt), Real(uInf), out.u.data(), scr->div.data());
-            gpu::checkLastKernel("inOutFluxRhs");
+            tunnel->addFluxRhs(out, 1.0 / dt, scr->div);
         }
         pcgIters += poisson->solve(scr->div, scr->phi, true);
         gpu::subtractGradientCut(gg, *dCut, scr->phi, Real(dt), out);
@@ -642,7 +518,7 @@ int main(int argc, char** argv)
     const int bi1 = std::min(nx - 3, int((cyl.cx + cyl.r) / h) + 3);
     const int bj0 = std::max(2, int((cyl.cy - cyl.r) / h) - 2);
     const int bj1 = std::min(nx - 3, int((cyl.cy + cyl.r) / h) + 3);
-    const int bk0 = kInLo(nz), bk1 = kInHi(nz);
+    const int bk0 = gg.kInLo(), bk1 = gg.kInHi();
 
     const double tEnd = flowThroughs * L / uInf;
     const double qRef = 0.5 * uInf * uInf * D * (nzCells * h); // frontal rectangle
@@ -821,9 +697,7 @@ int main(int argc, char** argv)
             gpu::divergenceCut(gg, *dCut, *dU, scr->div, Real(1));
             if (!open)
             {
-                kInOutFluxRhs<<<gpu::launchBlocks(g.size()), gpu::blockSize>>>(
-                    gg, Real(1), Real(uInf), dU->u.data(), scr->div.data());
-                gpu::checkLastKernel("inOutFluxRhs");
+                tunnel->addFluxRhs(*dU, 1.0, scr->div);
             }
             const double maxDiv = gpu::maxAbsScalar(scr->div, *red);
 

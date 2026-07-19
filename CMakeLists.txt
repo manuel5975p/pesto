@@ -79,6 +79,7 @@ if(DNS_WITH_HIP)
         src/dns/gpu/projection.hip
         src/dns/gpu/reductions.hip
         src/dns/gpu/timestepper.hip
+        src/dns/gpu/tunnel.hip
     )
     target_link_libraries(dns_gpu
         PUBLIC dns_core hip::host
@@ -149,6 +150,14 @@ if(BUILD_TESTING)
             add_test(NAME ${t} COMMAND test_${t})
             set_tests_properties(${t} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
         endforeach()
+
+        # Needs its own kernels (the pre-recomposition BC variant, as an
+        # identity oracle), so it is a HIP TU rather than a plain .cpp.
+        add_executable(test_gpu_tunnel_bc tests/test_gpu_tunnel_bc.hip)
+        target_link_libraries(test_gpu_tunnel_bc PRIVATE dns_gpu)
+        add_test(NAME gpu_tunnel_bc COMMAND test_gpu_tunnel_bc)
+        set_tests_properties(gpu_tunnel_bc PROPERTIES TIMEOUT 300
+            SKIP_RETURN_CODE 77)
 
         # Open far-field path is app-local; drive the built binary.
         add_executable(test_gpu_open_incomp tests/test_gpu_open_incomp.cpp)

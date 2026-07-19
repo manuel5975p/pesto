@@ -27,6 +27,16 @@ struct GpuGrid
     {
         return std::size_t(nx) * ny * nz;
     }
+
+    // Interior k range on a grid carrying a one-cell ghost ring: [1, nz-2],
+    // or the single plane k = 0 in native 2D (nz == 1, no z ghosts). A form
+    // that hardcodes [1, nz-2] is an EMPTY range at nz == 1 and silently
+    // disables whatever it guards.
+    __host__ __device__ int kInLo() const { return nz == 1 ? 0 : 1; }
+    __host__ __device__ int kInHi() const { return nz == 1 ? 0 : nz - 2; }
+
+    // Interior cell count along z (1 in native 2D).
+    __host__ __device__ int kInCount() const { return kInHi() - kInLo() + 1; }
 };
 
 // Periodic wrap for stencil offsets; |i - [0,n)| <= 1.
