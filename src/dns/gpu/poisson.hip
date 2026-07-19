@@ -5,6 +5,7 @@
 #include <hipfft/hipfft.h>
 
 #include <cassert>
+#include <cstdio>
 #include <cmath>
 #include <numbers>
 #include <vector>
@@ -14,6 +15,17 @@ namespace dns::gpu {
 static_assert(std::is_same_v<Real, float>, "hipFFT plans below are float");
 
 namespace {
+
+// hipfftExec* statuses used to be [[maybe_unused]] + assert, i.e. DISCARDED in
+// the Release build this project ships. solve() is void-returning (it sits
+// under the PoissonSolver interface), so the status cannot be propagated
+// without changing that interface; report it loudly instead of dropping it.
+void checkFft(hipfftResult r, const char* what)
+{
+    if (r != HIPFFT_SUCCESS)
+        std::fprintf(stderr, "dns: hipfft %s failed (status %d)\n", what, int(r));
+}
+
 
 // ------------------------------- periodic ---------------------------------
 
@@ -340,8 +352,8 @@ void DevicePoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p)
         // R2C may clobber its input: stage rhs into the work buffer.
         (void)hipMemcpy(s.work.data(), rhs.data(), s.g.size() * sizeof(Real),
                         hipMemcpyDeviceToDevice);
-        [[maybe_unused]] auto rf = hipfftExecR2C(s.fwd, s.work.data(), s.spec.data());
-        assert(rf == HIPFFT_SUCCESS);
+        auto rf = hipfftExecR2C(s.fwd, s.work.data(), s.spec.data());
+        checkFft(rf, "ExecR2C");
 
         const std::size_t nc = std::size_t(s.nxh) * s.g.ny * s.g.nz;
         const Real norm = Real(1.0 / double(s.g.size()));
@@ -351,8 +363,8 @@ void DevicePoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p)
                                                        s.spec.data());
         checkLastKernel("poissonScale");
 
-        [[maybe_unused]] auto rb = hipfftExecC2R(s.bwd, s.spec.data(), p.data());
-        assert(rb == HIPFFT_SUCCESS);
+        auto rb = hipfftExecC2R(s.bwd, s.spec.data(), p.data());
+        checkFft(rb, "ExecC2R");
         return;
     }
 
@@ -374,9 +386,9 @@ void DevicePoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p)
         if (n0 == 1) continue;
         kDctPermute<<<launchBlocks(total), blockSize>>>(total, n0, cur, s.cbuf.data());
         checkLastKernel("dctPermute");
-        [[maybe_unused]] auto r =
+        auto r =
             hipfftExecC2C(s.plan[a], s.cbuf.data(), s.cbuf.data(), HIPFFT_FORWARD);
-        assert(r == HIPFFT_SUCCESS);
+        checkFft(r, "ExecC2C forward");
         kDctTwiddleRot<<<rotGrid(n0, n1, n2), rotBlock>>>(n0, n1, n2,
                                                           s.cbuf.data(), nxt);
         checkLastKernel("dctTwiddleRot");
@@ -397,9 +409,9 @@ void DevicePoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p)
         kDctInvTwiddle<<<launchBlocks(total), blockSize>>>(total, n0, cur,
                                                            s.cbuf.data());
         checkLastKernel("dctInvTwiddle");
-        [[maybe_unused]] auto r =
+        auto r =
             hipfftExecC2C(s.plan[a], s.cbuf.data(), s.cbuf.data(), HIPFFT_BACKWARD);
-        assert(r == HIPFFT_SUCCESS);
+        checkFft(r, "ExecC2C backward");
         kDctInvPermuteRot<<<rotGrid(n0, n1, n2), rotBlock>>>(n0, n1, n2,
                                                              s.cbuf.data(), nxt);
         checkLastKernel("dctInvPermuteRot");

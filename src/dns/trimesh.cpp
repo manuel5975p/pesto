@@ -188,12 +188,38 @@ std::expected<TriMesh, std::string> loadGltf(const std::string& path)
     return std::move(b.m);
 }
 
+namespace {
+
+// A NaN or inf coordinate survives every parser and only surfaces much later as
+// a degenerate BVH and an sdf that is NaN everywhere.
+bool allFinite(const TriMesh& m)
+{
+    for (const auto& v : m.verts)
+        for (double x : v)
+            if (!std::isfinite(x)) return false;
+    // Indices must address the vertex table: a stale index is a silent OOB read
+    // inside the BVH build.
+    const int nv = int(m.verts.size());
+    for (const auto& t : m.tris)
+        for (int i : t)
+            if (i < 0 || i >= nv) return false;
+    return true;
+}
+
+} // namespace
+
 std::expected<TriMesh, std::string> loadMesh(const std::string& path)
 {
     const std::string e = lowerExt(path);
-    if (e == ".stl") return loadStl(path);
-    if (e == ".gltf" || e == ".glb") return loadGltf(path);
-    return std::unexpected("unsupported mesh extension: " + path);
+    auto m = e == ".stl"                        ? loadStl(path)
+           : (e == ".gltf" || e == ".glb")      ? loadGltf(path)
+           : std::expected<TriMesh, std::string>(
+                 std::unexpected("unsupported mesh extension: " + path));
+    if (!m) return m;
+    if (!allFinite(*m))
+        return std::unexpected("mesh has non-finite vertex coordinates or "
+                               "out-of-range triangle indices: " + path);
+    return m;
 }
 
 void transform(TriMesh& m, double scale, double pitchRad, double yawRad,

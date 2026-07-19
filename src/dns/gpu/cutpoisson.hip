@@ -118,7 +118,9 @@ double reduce(ReduceScratch& s, std::size_t n, F f, Op op, double init)
     if (s.tmp.size() < bytes)
     {
         auto grown = DeviceBuffer<unsigned char>::make(bytes);
-        assert(grown && "reduction temp allocation failed");
+        // assert() is a comment in Release: the old form dereferenced a
+        // valueless expected on an allocation failure.
+        if (!grown) return init;
         s.tmp = std::move(*grown);
     }
     bytes = s.tmp.size();
@@ -143,7 +145,9 @@ void reduceInto(DeviceBuffer<unsigned char>& tmp, std::size_t n, F f, Op op,
     if (tmp.size() < bytes)
     {
         auto grown = DeviceBuffer<unsigned char>::make(bytes);
-        assert(grown && "reduction temp allocation failed");
+        // assert() is a comment in Release: the old form dereferenced a
+        // valueless expected on an allocation failure.
+        if (!grown) return;
         tmp = std::move(*grown);
     }
     bytes = tmp.size();
@@ -306,8 +310,13 @@ int DeviceCutPoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p,
     (void)hipMemcpy(&rr, RR, sizeof(double), hipMemcpyDeviceToHost); // initial guard
     double chk[2]{}; // [rr, dq] pulled together each iteration (one sync)
 
+    // NaN compares false against everything, so `rr > target` alone would exit
+    // the loop at iteration 0 and report a perfect solve on a field that has
+    // already diverged. Require rr to be a finite number to CONTINUE, and
+    // report non-convergence when it is not.
     int it = 0;
-    for (; it < maxIters_ && rr > target; ++it)
+    if (!std::isfinite(rr)) return maxIters_;
+    for (; it < maxIters_ && std::isfinite(rr) && rr > target; ++it)
     {
         // projectMean(q_) is load-bearing in FP32: M(d) telescopes to a zero
         // fluid sum only in exact arithmetic, and the roundoff mean leaks into
@@ -325,6 +334,7 @@ int DeviceCutPoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p,
         // Single host round-trip: RR and DQ are the contiguous slots [0],[1].
         (void)hipMemcpy(chk, RR, 2 * sizeof(double), hipMemcpyDeviceToHost);
         rr = chk[0];
+        if (!std::isfinite(rr)) return maxIters_;              // diverged
         if (rr <= target || chk[1] <= 0.0) { ++it; break; } // converged / breakdown
         precondition(r_, z_);
         fluidDotInto(r_, z_, RZN);

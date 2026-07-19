@@ -72,7 +72,11 @@ double reduce(ReduceScratch& s, std::size_t n, F f, Op op, double init)
     if (s.tmp.size() < bytes)
     {
         auto grown = DeviceBuffer<unsigned char>::make(bytes);
-        assert(grown && "reduction temp allocation failed");
+        // assert() is a comment in the Release build this project ships, so the
+        // old form dereferenced a valueless expected on an allocation failure.
+        // Leave the scratch untouched and let the reduction run on what we have:
+        // rocPRIM reports the shortfall rather than corrupting memory.
+        if (!grown) return init;
         s.tmp = std::move(*grown);
     }
     bytes = s.tmp.size();

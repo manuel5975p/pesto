@@ -54,7 +54,12 @@ std::vector<double> energySpectrum(const Grid& g, const VectorField& U)
     const std::size_t n = g.size();
     const int nxh = g.nx / 2 + 1;
     const std::size_t nc = std::size_t(g.nz) * g.ny * nxh;
+    // A degenerate axis (nz == 1, the exact 2D restriction) makes this 0, and
+    // the shellE[0] = 0 below was then an out-of-bounds write on an empty
+    // vector -- on EVERY 2D spectrum. There is no isotropic shell binning for a
+    // degenerate axis, so return nothing rather than write past the end.
     const int nShells = std::min({g.nx, g.ny, g.nz}) / 2;
+    if (nShells < 1) return {};
     const double lx = g.nx * g.hx, ly = g.ny * g.hy, lz = g.nz * g.hz;
     const double k0 = 2.0 * pi / lx;
 

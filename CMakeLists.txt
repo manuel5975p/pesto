@@ -109,6 +109,15 @@ if(BUILD_TESTING)
         set_tests_properties(${t} PROPERTIES TIMEOUT 120)
     endforeach()
     target_link_libraries(test_fieldpng PRIVATE ZLIB::ZLIB) # decodes IDAT
+
+    # The exit-code contract, driven through the real binary. GPU-free: every
+    # case is reachable in phases 1-3a.
+    add_executable(test_errors tests/test_errors.cpp)
+    target_link_libraries(test_errors PRIVATE dns_core)
+    target_compile_definitions(test_errors PRIVATE DNS_BIN="$<TARGET_FILE:dns>")
+    add_dependencies(test_errors dns)
+    add_test(NAME errors COMMAND test_errors)
+    set_tests_properties(errors PROPERTIES TIMEOUT 120)
     if(DNS_WITH_FFTW)
         set_tests_properties(hit_mini PROPERTIES TIMEOUT 900
             LABELS "slow;validation;literature")

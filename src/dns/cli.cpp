@@ -95,7 +95,12 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
 {
     RawConfig c;
 
-    if (argc < 2) return std::unexpected(CliError{helpTop(), true});
+    // No subcommand at all is a USAGE ERROR, not a help request: `dns` alone
+    // used to print the help and exit 0, so a script that lost its arguments
+    // reported success without running anything.
+    if (argc < 2)
+        return std::unexpected(CliError{
+            helpTop() + "\ndns: a subcommand is required\n", false});
     const string_view sub(argv[1]);
     if (sub == "--help" || sub == "-h" || sub == "help")
         return std::unexpected(CliError{helpTop(), true});
