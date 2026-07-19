@@ -47,14 +47,10 @@ if(DNS_WITH_FFTW)
     target_compile_definitions(dns_core PUBLIC DNS_WITH_FFTW=1)
 endif()
 
-add_executable(tgv apps/tgv_main.cpp)
-target_link_libraries(tgv PRIVATE dns_core)
-
-add_executable(tgv3d apps/tgv3d_main.cpp)
-target_link_libraries(tgv3d PRIVATE dns_core)
-
-add_executable(cube_cut apps/cube_cut_main.cpp)
-target_link_libraries(cube_cut PRIVATE dns_core)
+# The one executable. Everything else in apps/ was deleted by the
+# recomposition; `dns <subcommand>` covers the whole former 15-binary surface.
+add_executable(dns apps/dns_main.cpp)
+target_link_libraries(dns PRIVATE dns_core)
 
 if(DNS_WITH_HIP)
     if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
@@ -93,36 +89,10 @@ if(DNS_WITH_HIP)
     target_compile_options(dns_gpu PRIVATE
         $<$<COMPILE_LANGUAGE:HIP>:-Wall$<SEMICOLON>-Wextra>)
 
-    add_executable(bench apps/bench_main.cpp)
-    target_link_libraries(bench PRIVATE dns_gpu)
-
-    add_executable(hit apps/hit_main.cpp)
-    target_link_libraries(hit PRIVATE dns_gpu)
-
-    add_executable(movie apps/movie_main.cpp)
-    target_link_libraries(movie PRIVATE dns_gpu)
-
-    add_executable(sphere_tunnel_gpu apps/sphere_tunnel_gpu_main.hip)
-    target_link_libraries(sphere_tunnel_gpu PRIVATE dns_gpu)
-
-    add_executable(cube_tunnel_gpu apps/cube_tunnel_gpu_main.hip)
-    target_link_libraries(cube_tunnel_gpu PRIVATE dns_gpu)
-
-    add_executable(cylinder_tunnel_gpu apps/cylinder_tunnel_gpu_main.hip)
-    target_link_libraries(cylinder_tunnel_gpu PRIVATE dns_gpu)
-    add_executable(comp_cylinder_tunnel_gpu apps/comp_cylinder_tunnel_gpu_main.hip)
-    target_link_libraries(comp_cylinder_tunnel_gpu PRIVATE dns_gpu)
-    add_executable(eye_tunnel_gpu apps/eye_tunnel_gpu_main.hip)
-    target_link_libraries(eye_tunnel_gpu PRIVATE dns_gpu)
-    add_executable(mesh_tunnel_gpu apps/mesh_tunnel_gpu_main.hip)
-    target_link_libraries(mesh_tunnel_gpu PRIVATE dns_gpu)
-    add_executable(comp_mesh_tunnel_gpu apps/comp_mesh_tunnel_gpu_main.hip)
-    target_link_libraries(comp_mesh_tunnel_gpu PRIVATE dns_gpu)
-
-    # tgv3d picks up the GPU integrator when available. (Target predates
-    # enable_language(HIP), so set its HIP arch explicitly.)
-    target_link_libraries(tgv3d PRIVATE dns_gpu)
-    set_property(TARGET tgv3d PROPERTY HIP_ARCHITECTURES ${CMAKE_HIP_ARCHITECTURES})
+    # dns picks up the GPU backend and the runners when HIP is available.
+    # (Target predates enable_language(HIP), so set its HIP arch explicitly.)
+    target_link_libraries(dns PRIVATE dns_gpu)
+    set_property(TARGET dns PROPERTY HIP_ARCHITECTURES ${CMAKE_HIP_ARCHITECTURES})
 endif()
 
 include(CTest)
@@ -169,8 +139,8 @@ if(BUILD_TESTING)
         add_executable(test_gpu_open_incomp tests/test_gpu_open_incomp.cpp)
         target_link_libraries(test_gpu_open_incomp PRIVATE dns_gpu)
         target_compile_definitions(test_gpu_open_incomp PRIVATE
-            CYLINDER_BIN="$<TARGET_FILE:cylinder_tunnel_gpu>")
-        add_dependencies(test_gpu_open_incomp cylinder_tunnel_gpu)
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_open_incomp dns)
         add_test(NAME gpu_open_incomp COMMAND test_gpu_open_incomp)
         set_tests_properties(gpu_open_incomp PROPERTIES TIMEOUT 600
             SKIP_RETURN_CODE 77)
@@ -198,8 +168,8 @@ if(BUILD_TESTING)
             add_executable(test_${t} tests/test_${t}.cpp)
             target_link_libraries(test_${t} PRIVATE dns_gpu)
             target_compile_definitions(test_${t} PRIVATE ${DNS_VAL_DEFS}
-                CYLINDER_BIN="$<TARGET_FILE:cylinder_tunnel_gpu>")
-            add_dependencies(test_${t} cylinder_tunnel_gpu)
+                DNS_BIN="$<TARGET_FILE:dns>")
+            add_dependencies(test_${t} dns)
         endforeach()
         if(DNS_VALIDATION_BASELINE)
         # QUARANTINED 2026-07-19 (masterplan_recompose §7): bands measured before the
@@ -216,10 +186,10 @@ if(BUILD_TESTING)
         add_executable(test_val_tgv3d tests/test_val_tgv3d.cpp)
         target_link_libraries(test_val_tgv3d PRIVATE dns_gpu)
         target_compile_definitions(test_val_tgv3d PRIVATE ${DNS_VAL_DEFS}
-            TGV3D_BIN="$<TARGET_FILE:tgv3d>"
+            DNS_BIN="$<TARGET_FILE:dns>"
             DNS_VALIDATION_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data/validation"
             DNS_SPECTRAL_REF="${CMAKE_CURRENT_SOURCE_DIR}/data/spectral_Re1600_512.gdiag")
-        add_dependencies(test_val_tgv3d tgv3d)
+        add_dependencies(test_val_tgv3d dns)
         if(DNS_VALIDATION_BASELINE)
         # QUARANTINED 2026-07-19 (masterplan_recompose §7): bands measured before the
         # kBcTunnel corner unification, the 3-direction friction tally, and the FP64
@@ -232,8 +202,8 @@ if(BUILD_TESTING)
         add_executable(test_val_comp_cyl tests/test_val_comp_cyl.cpp)
         target_link_libraries(test_val_comp_cyl PRIVATE dns_gpu)
         target_compile_definitions(test_val_comp_cyl PRIVATE ${DNS_VAL_DEFS}
-            COMP_CYLINDER_BIN="$<TARGET_FILE:comp_cylinder_tunnel_gpu>")
-        add_dependencies(test_val_comp_cyl comp_cylinder_tunnel_gpu)
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_val_comp_cyl dns)
         add_test(NAME val_comp_cyl_re60 COMMAND test_val_comp_cyl re60)
         set_tests_properties(val_comp_cyl_re60 PROPERTIES TIMEOUT 300
             SKIP_RETURN_CODE 77 LABELS "validation;anchor")
@@ -241,22 +211,21 @@ if(BUILD_TESTING)
         add_executable(test_val_sphere_re300 tests/test_val_sphere_re300.cpp)
         target_link_libraries(test_val_sphere_re300 PRIVATE dns_gpu)
         target_compile_definitions(test_val_sphere_re300 PRIVATE ${DNS_VAL_DEFS}
-            SPHERE_BIN="$<TARGET_FILE:sphere_tunnel_gpu>")
-        add_dependencies(test_val_sphere_re300 sphere_tunnel_gpu)
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_val_sphere_re300 dns)
 
         add_executable(test_val_mesh_sphere tests/test_val_mesh_sphere.cpp)
         target_link_libraries(test_val_mesh_sphere PRIVATE dns_gpu)
         target_compile_definitions(test_val_mesh_sphere PRIVATE ${DNS_VAL_DEFS}
-            MESH_BIN="$<TARGET_FILE:mesh_tunnel_gpu>"
-            SPHERE_BIN="$<TARGET_FILE:sphere_tunnel_gpu>")
-        add_dependencies(test_val_mesh_sphere mesh_tunnel_gpu sphere_tunnel_gpu)
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_val_mesh_sphere dns)
 
         # Tier A: mesh insertion into the 3D compressible solver (short 64^3).
         add_executable(test_val_comp_mesh_sphere tests/test_val_comp_mesh_sphere.cpp)
         target_link_libraries(test_val_comp_mesh_sphere PRIVATE dns_gpu)
         target_compile_definitions(test_val_comp_mesh_sphere PRIVATE ${DNS_VAL_DEFS}
-            COMP_MESH_BIN="$<TARGET_FILE:comp_mesh_tunnel_gpu>")
-        add_dependencies(test_val_comp_mesh_sphere comp_mesh_tunnel_gpu)
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_val_comp_mesh_sphere dns)
         if(DNS_VALIDATION_BASELINE)
         # QUARANTINED 2026-07-19 (masterplan_recompose §7): bands measured before the
         # kBcTunnel corner unification, the 3-direction friction tally, and the FP64

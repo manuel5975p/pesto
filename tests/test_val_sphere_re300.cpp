@@ -28,9 +28,10 @@ int main()
     const std::string prefix = std::string(DNS_VAL_SCRATCH) + "/sphere_re300";
     const double tEnd = 12.0 * 2 * pi; // ~75.4
     const int rc = valtest::runBinary(
-        std::string(SPHERE_BIN)
-        + " 160 --re 300 --dr 8 --ft 12 --fdt 1e9 --out " + prefix);
-    valtest::check(rc == 0, "sphere_tunnel_gpu Re300 exits 0");
+        std::string(DNS_BIN)
+        + " flow --body sphere --far tunnel --n 160 --re 300 --dr 8"
+          " --ft 12 --fdt 1e9 --out " + prefix);
+    valtest::check(rc == 0, "dns flow sphere Re300 exits 0");
 
     auto tab = valtest::loadCsv(prefix + "_stats.csv");
     if (!tab) { std::printf("FAIL: no stats csv\n"); return 1; }

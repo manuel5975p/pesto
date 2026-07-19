@@ -29,8 +29,8 @@
 
 #include <sys/wait.h>
 
-#ifndef CYLINDER_BIN
-#error "CYLINDER_BIN must be defined (path to cylinder_tunnel_gpu binary)"
+#ifndef DNS_BIN
+#error "DNS_BIN must be defined (path to the dns binary)"
 #endif
 
 namespace {
@@ -40,7 +40,8 @@ constexpr int skipExitCode = 77;
 // Run the app; return its exit status (WEXITSTATUS), -1 on abnormal exit.
 int runApp(const std::string& args)
 {
-    const std::string cmd = "\"" CYLINDER_BIN "\" " + args + " > /dev/null 2>&1";
+    const std::string cmd = "\"" DNS_BIN "\" flow --body cylinder " + args
+                          + " > /dev/null 2>&1";
     const int rc = std::system(cmd.c_str());
     if (rc == -1 || !WIFEXITED(rc)) return -1;
     return WEXITSTATUS(rc);
@@ -103,7 +104,7 @@ int main()
     // ~55 D-times the confined anchor needed to settle. --fdt huge = no
     // frames past t=0.
     const std::string prefix = "open_incomp_test";
-    const int rc = runApp("512 --nz 1 --re 60 --dr 16 --open --ft 6 --fdt 1e9 "
+    const int rc = runApp("--far fringe --n 512 --nz 1 --re 60 --dr 16 --ft 6 --fdt 1e9 "
                           "--out " + prefix);
     check(rc == 0, "--open run exits 0");
 

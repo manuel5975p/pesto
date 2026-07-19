@@ -27,8 +27,8 @@ int main(int argc, char** argv)
     const std::string out =
         std::string(DNS_VAL_SCRATCH) + "/tgv3d_" + std::to_string(n) + ".csv";
     const int rc = valtest::runBinaryTo(
-        std::string(TGV3D_BIN) + " " + std::to_string(n) + " 1600 20", out);
-    valtest::check(rc == 0, "tgv3d exits 0");
+        std::string(DNS_BIN) + " tgv --n " + std::to_string(n) + " --re 1600 --ft 20", out);
+    valtest::check(rc == 0, "dns tgv exits 0");
 
     auto sim = valtest::loadCsv(out);
     if (!sim) { std::printf("FAIL: no output csv\n"); return 1; }

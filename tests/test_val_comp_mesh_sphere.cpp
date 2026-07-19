@@ -23,11 +23,11 @@ int main()
     meshtest::writeBinaryStl(stl, meshtest::icosphere(1.0, {0.0, 0.0, 0.0}, 3));
 
     const std::string prefix = scratch + "/comp_sph";
-    const std::string cmd = std::string(COMP_MESH_BIN) + " " + stl +
-                            " 64 --nz 64 --re 100 --mach 0.2 --dr 6 --ft 2 "
-                            "--fdt 1e9 --out " + prefix;
+    const std::string cmd = std::string(DNS_BIN) + " flow --physics compressible --body " + stl +
+                            " --far nscbc --open --n 64 --nz 64 --re 100 --mach 0.2"
+                            " --dr 6 --ft 2 --fdt 1e9 --out " + prefix;
     const int rc = valtest::runBinary(cmd);
-    valtest::check(rc == 0, "comp_mesh_tunnel_gpu exits 0");
+    valtest::check(rc == 0, "dns flow compressible mesh exits 0");
 
     auto tab = valtest::loadCsv(prefix + "_stats.csv");
     if (!tab) { std::printf("FAIL: no stats csv\n"); return 1; }

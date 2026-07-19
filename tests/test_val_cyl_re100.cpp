@@ -24,9 +24,9 @@ int main()
     const std::string prefix = std::string(DNS_VAL_SCRATCH) + "/cyl_re100";
     const double tEnd = 16.0 * 2 * pi; // ~100.5; window [40,100] ~ 12 periods
     const int rc = valtest::runBinary(
-        std::string(CYLINDER_BIN)
-        + " 256 --nz 1 --re 100 --dr 8 --ft 16 --fdt 1e9 --out " + prefix);
-    valtest::check(rc == 0, "cylinder_tunnel_gpu Re100 exits 0");
+        std::string(DNS_BIN)
+        + " flow --body cylinder --far tunnel --n 256 --nz 1 --re 100 --dr 8 --ft 16 --fdt 1e9 --out " + prefix);
+    valtest::check(rc == 0, "dns flow cylinder Re100 exits 0");
 
     auto tab = valtest::loadCsv(prefix + "_stats.csv");
     if (!tab) { std::printf("FAIL: no stats csv\n"); return 1; }

@@ -42,14 +42,16 @@ int main()
 
     const double tEnd = 6.0 * 2 * pi; // ~37.7
     const double t0 = tEnd - 3.0 * 2 * pi;
-    const std::string args = " 96 --re 300 --dr 8 --ft 6 --fdt 1e9 --out ";
+    const std::string args =
+        " --far tunnel --n 96 --re 300 --dr 8 --ft 6 --fdt 1e9 --out ";
 
-    const int rcMesh = valtest::runBinary(std::string(MESH_BIN) + " " + stl + args
-                                          + scratch + "/mesh_sph");
-    valtest::check(rcMesh == 0, "mesh_tunnel_gpu exits 0");
-    const int rcSph = valtest::runBinary(std::string(SPHERE_BIN) + args
+    const int rcMesh = valtest::runBinary(std::string(DNS_BIN) + " flow --body "
+                                          + stl + args + scratch + "/mesh_sph");
+    valtest::check(rcMesh == 0, "dns flow mesh sphere exits 0");
+    const int rcSph = valtest::runBinary(std::string(DNS_BIN)
+                                         + " flow --body sphere" + args
                                          + scratch + "/ana_sph");
-    valtest::check(rcSph == 0, "sphere_tunnel_gpu exits 0");
+    valtest::check(rcSph == 0, "dns flow analytic sphere exits 0");
 
     const double cdMesh = windowedCd(scratch + "/mesh_sph", t0, tEnd);
     const double cdSph = windowedCd(scratch + "/ana_sph", t0, tEnd);

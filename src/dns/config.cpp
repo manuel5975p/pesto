@@ -188,12 +188,20 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     // Grid: two separately validated conventions, dispatched on --physics.
     const int ny = r.given.contains("--ny") ? r.ny : r.n;
     if (ny < 1) return bad(2, "--ny", "must be >= 1");
-    if (r.nz < 1) return bad(2, "--nz", "must be >= 1 (interior cells; 1 = native 2D)");
-    if (r.nz != 1 && r.nz < 4)
+    // --nz defaults to 1 (native 2D) for the z-invariant bodies and to --n for
+    // the genuinely 3D ones: a sphere or a mesh in a one-cell-thick box has no
+    // solid cells at all, which used to surface as a silent no-body run.
+    const bool body3d = c.bodyKind == BodyKind::Sphere || c.bodyKind == BodyKind::Mesh;
+    const int nzI = r.given.contains("--nz") ? r.nz : (body3d ? r.n : 1);
+    if (nzI < 1) return bad(2, "--nz", "must be >= 1 (interior cells; 1 = native 2D)");
+    if (nzI != 1 && nzI < 4)
         return bad(2, "--nz", "must be 1 (native 2D) or >= 4");
+    if (body3d && nzI == 1)
+        return bad(2, "--nz", std::string("--body ") + name(c.bodyKind)
+                   + " is a 3D body; --nz 1 leaves it with no solid cells");
     if (!finitePos(r.dr)) return bad(2, "--dr", "must be finite and > 0");
     c.dr = r.dr;
-    c.nzInterior = r.nz;
+    c.nzInterior = nzI;
 
     c.uInf = 1.0;
     if (comp)
@@ -203,11 +211,11 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         const double D = pi / 4.0;
         c.h = D / 64.0 * (512.0 / double(ny));
         const double lx = r.n * c.h, ly = ny * c.h;
-        const double lz = r.nz > 1 ? r.nz * c.h : 1.0;
-        c.grid = Grid::make(r.n, ny, r.nz, lx, ly, lz);
+        const double lz = nzI > 1 ? nzI * c.h : 1.0;
+        c.grid = Grid::make(r.n, ny, nzI, lx, ly, lz);
         c.L = lx;
         c.placement = {2.1107, ly / 2.0 + 0.0146,
-                       r.nz > 1 ? lz / 2.0 : 0.5, D};
+                       nzI > 1 ? lz / 2.0 : 0.5, D};
     }
     else
     {
@@ -215,7 +223,7 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         c.L = 2 * pi;
         c.h = c.L / double(r.n);
         const int nxT = r.n + 2, nyT = ny + 2;
-        const int nzT = r.nz <= 1 ? 1 : r.nz + 2;
+        const int nzT = nzI <= 1 ? 1 : nzI + 2;
         const double lz = nzT == 1 ? 1.0 : nzT * c.h;
         c.grid = Grid::make(nxT, nyT, nzT, nxT * c.h, nyT * c.h, lz);
         const double D = c.L / c.dr;
@@ -225,7 +233,7 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         const double cy = c.h + c.L / 2.0 + 0.17 * c.h;
         const double cz = c.bodyKind == BodyKind::Sphere
                               ? c.h + c.L / 2.0 + 0.23 * c.h
-                              : (nzT == 1 ? 0.5 * c.h : c.h + r.nz * c.h / 2.0);
+                              : (nzT == 1 ? 0.5 * c.h : c.h + nzI * c.h / 2.0);
         c.placement = {cx, cy, cz, D};
     }
     c.body = c.placement;
@@ -266,7 +274,7 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         return bad(2, "--les", "must be finite and >= 0");
     // Checked BEFORE geometry construction (the old apps checked after the
     // sanitizeCut print).
-    if (c.cs > 0 && !comp && r.nz != 1)
+    if (c.cs > 0 && !comp && nzI != 1)
         return bad(2, "--les", "--les requires --nz 1 (the incompressible "
                                "Smagorinsky path is 2D-only)");
     // Honest labelling: the boundary layer scales as D/sqrt(Re).

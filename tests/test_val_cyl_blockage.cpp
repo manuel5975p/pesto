@@ -26,7 +26,8 @@ struct RunStats {
 RunStats runCase(int dr, const std::string& prefix, double tEnd)
 {
     const int rc = valtest::runBinary(
-        std::string(CYLINDER_BIN) + " 512 --nz 1 --re 100 --dr "
+        std::string(DNS_BIN)
+        + " flow --body cylinder --far tunnel --n 512 --nz 1 --re 100 --dr "
         + std::to_string(dr) + " --ft 16 --fdt 1e9 --out " + prefix);
     valtest::check(rc == 0, "dr" + std::to_string(dr) + " run exits 0");
     auto tab = valtest::loadCsv(prefix + "_stats.csv");

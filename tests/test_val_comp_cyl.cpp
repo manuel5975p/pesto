@@ -36,9 +36,10 @@ int main(int argc, char** argv)
         const std::string prefix = std::string(DNS_VAL_SCRATCH) + "/comp_re60";
         const double tEnd = 20.0 * pi; // n=256 -> L=pi, --ft 20 -> t ~ 62.8
         const int rc = valtest::runBinary(
-            std::string(COMP_CYLINDER_BIN)
-            + " 256 --re 60 --mach 0.2 --ft 20 --fdt 1e9 --out " + prefix);
-        valtest::check(rc == 0, "comp_cylinder_tunnel_gpu Re60 exits 0");
+            std::string(DNS_BIN)
+            + " flow --physics compressible --body cylinder --far sponge"
+              " --n 256 --re 60 --mach 0.2 --ft 20 --fdt 1e9 --out " + prefix);
+        valtest::check(rc == 0, "dns flow compressible cylinder Re60 exits 0");
 
         auto tab = valtest::loadCsv(prefix + "_stats.csv");
         if (!tab) { std::printf("FAIL: no stats csv\n"); return 1; }
@@ -71,9 +72,10 @@ int main(int argc, char** argv)
     const std::string prefix = std::string(DNS_VAL_SCRATCH) + "/comp_re800";
     const double tEnd = 15.0 * 2 * pi; // n=512 -> L=2pi
     const int rc = valtest::runBinary(
-        std::string(COMP_CYLINDER_BIN)
-        + " 512 --re 800 --mach 0.2 --ft 15 --fdt 1e9 --out " + prefix);
-    valtest::check(rc == 0, "comp_cylinder_tunnel_gpu Re800 exits 0");
+        std::string(DNS_BIN)
+        + " flow --physics compressible --body cylinder --far sponge"
+          " --n 512 --re 800 --mach 0.2 --ft 15 --fdt 1e9 --out " + prefix);
+    valtest::check(rc == 0, "dns flow compressible cylinder Re800 exits 0");
 
     auto tab = valtest::loadCsv(prefix + "_stats.csv");
     if (!tab) { std::printf("FAIL: no stats csv\n"); return 1; }
