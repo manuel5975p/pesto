@@ -77,6 +77,7 @@ if(DNS_WITH_HIP)
         src/dns/gpu/device_util.hip
         src/dns/gpu/ghostfill.hip
         src/dns/gpu/kernels.hip
+        src/dns/gpu/les.hip
         src/dns/gpu/poisson.hip
         src/dns/gpu/projection.hip
         src/dns/gpu/reductions.hip
@@ -146,7 +147,7 @@ if(BUILD_TESTING)
                   gpu_cutcell gpu_cutcell2d gpu_cutcell_sphere gpu_conservation
                   gpu_energy_stability gpu_ghostfill gpu_comp gpu_comp_ghost
                   gpu_comp_les gpu_comp_ghost3d gpu_comp_mesh gpu_comp_far
-                  gpu_comp_nscbc)
+                  gpu_comp_nscbc gpu_les_smag)
             add_executable(test_${t} tests/test_${t}.cpp)
             target_link_libraries(test_${t} PRIVATE dns_gpu)
             add_test(NAME ${t} COMMAND test_${t})
@@ -172,15 +173,6 @@ if(BUILD_TESTING)
         set_tests_properties(gpu_open_incomp PROPERTIES TIMEOUT 600
             SKIP_RETURN_CODE 77)
 
-        # LES Smagorinsky path is app-local (anonymous namespace in
-        # cylinder_tunnel_gpu); drive the built binary instead of the library.
-        add_executable(test_gpu_les_smag tests/test_gpu_les_smag.cpp)
-        target_link_libraries(test_gpu_les_smag PRIVATE dns_gpu)
-        target_compile_definitions(test_gpu_les_smag PRIVATE
-            CYLINDER_BIN="$<TARGET_FILE:cylinder_tunnel_gpu>")
-        add_dependencies(test_gpu_les_smag cylinder_tunnel_gpu)
-        add_test(NAME gpu_les_smag COMMAND test_gpu_les_smag)
-        set_tests_properties(gpu_les_smag PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 
         # --- Physical validation suite (docs/validation.md) -----------------
         # Tier A registers always; Tier B (heavy) behind DNS_HEAVY_VALIDATION.

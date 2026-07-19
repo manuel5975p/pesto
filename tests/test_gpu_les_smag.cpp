@@ -1,89 +1,36 @@
-// Coverage for the app-local Smagorinsky LES path in cylinder_tunnel_gpu
-// (--les Cs, 2D only). The kernels (kSmagNut/kEddyDiffuse) live in the app's
-// anonymous namespace, so we exercise them by driving the built binary and
-// reading its stats CSV (columns: t,dt,K,cd,cl,cdf,cfl,maxDiv,pcgIters).
+// DeviceSmagorinsky (gpu/les.hpp), the incompressible 2D LES model, tested
+// against the library directly. This test used to shell out to a built
+// cylinder_tunnel_gpu because the kernels lived in that app's anonymous
+// namespace; linking dns_gpu instead is the proof the lift was faithful.
 //
 // Checks:
-//   1. --les 0 stats == no --les stats (default-off is a no-op).
-//   2. --les 0.2 completes (exit 0), final K finite and STRICTLY LOWER than
-//      the --les 0 final K at identical settings (dissipation has the right
-//      sign).
-//   3. --les with --nz > 1 exits nonzero (2D-only guard).
+//   1. make() rejects cs <= 0 and rejects nz > 1 (the model is 2D-only).
+//   2. nut >= 0 everywhere, is exactly 0 on the domain-boundary ring, and is
+//      exactly 0 in solid cells (lambda == 0 scales it away).
+//   3. nut scales as cs^2 for a fixed field.
+//   4. A uniform field produces nut == 0 (|S| == 0) and no eddy flux.
+//   5. The eddy-diffusion substep DISSIPATES: sum u . div(nut grad u) < 0 for a
+//      sheared field, i.e. the sign of the model term is right.
 //
-// No HIP device -> skip (exit 77). The app itself needs a device, so device
-// presence is probed here up front via the same predicate the app uses.
+// No HIP device -> skip (exit 77).
 
+#include "dns/cutcell.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/les.hpp"
 
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
-#include <fstream>
-#include <sstream>
-#include <string>
+#include <numbers>
 #include <vector>
-
-#include <sys/wait.h>
-
-#ifndef CYLINDER_BIN
-#error "CYLINDER_BIN must be defined (path to cylinder_tunnel_gpu binary)"
-#endif
 
 namespace {
 
 constexpr int skipExitCode = 77;
-
-// Run the app with the given extra args and output prefix; return its exit
-// status (WEXITSTATUS), or -1 if it did not exit normally. Output silenced.
-int runApp(const std::string& extraArgs, const std::string& prefix)
-{
-    // Re 5000 on a D=8-cell body: an under-resolved wake with real small-scale
-    // energy, so eddy viscosity produces an unambiguous drop in total K (at the
-    // laminar default Re=60 the domain K is dominated by the fixed freestream
-    // and the LES effect is FP-noise). Still only a few-second run at n=64.
-    std::string cmd = "\"" CYLINDER_BIN "\" 64 --nz 1 --re 5000 --ft 1.0 --fdt 100 ";
-    cmd += extraArgs;
-    cmd += " --out \"" + prefix + "\" > /dev/null 2>&1";
-    const int rc = std::system(cmd.c_str());
-    if (rc == -1 || !WIFEXITED(rc)) return -1;
-    return WEXITSTATUS(rc);
-}
-
-std::string slurp(const std::string& path)
-{
-    std::ifstream f(path, std::ios::binary);
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
-
-// Final K value (3rd CSV column) from the last data row; NaN if unreadable.
-double finalK(const std::string& prefix)
-{
-    std::ifstream f(prefix + "_stats.csv");
-    std::string line, last;
-    std::getline(f, line); // header
-    while (std::getline(f, line))
-        if (!line.empty()) last = line;
-    if (last.empty()) return std::nan("");
-    std::stringstream ls(last);
-    std::string cell;
-    for (int col = 0; col < 3; ++col)
-        if (!std::getline(ls, cell, ',')) return std::nan("");
-    return std::strtod(cell.c_str(), nullptr);
-}
-
-void cleanup(const std::string& prefix)
-{
-    for (const char* suf : {"_stats.csv", ".json", "_vort.bin", "_speed.bin",
-                            "_mask.bin"})
-        std::remove((prefix + suf).c_str());
-}
-
 bool pass = true;
+
 void check(bool ok, const char* what)
 {
-    std::printf("%-40s %s\n", what, ok ? "ok" : "FAIL");
+    std::printf("%-52s %s\n", what, ok ? "ok" : "FAIL");
     if (!ok) pass = false;
 }
 
@@ -91,41 +38,144 @@ void check(bool ok, const char* what)
 
 int main()
 {
-    if (!dns::gpu::deviceAvailable())
+    using namespace dns;
+    using gpu::Real;
+
+    if (!gpu::deviceAvailable())
     {
         std::printf("no HIP device, skipping\n");
         return skipExitCode;
     }
 
-    const std::string pOff = "les_test_off", pNoflag = "les_test_noflag",
-                      pOn = "les_test_on", p3d = "les_test_3d";
+    const int n = 32;
+    const auto g = Grid::make(n, n, 1, 1.0, 1.0, 1.0);
+    const auto gg = gpu::GpuGrid::from(g);
 
-    const int rcNoflag = runApp("", pNoflag);
-    const int rcOff = runApp("--les 0", pOff);
-    const int rcOn = runApp("--les 0.2", pOn);
-    const int rc3d = runApp("--les 0.2 --nz 4", p3d);
+    // --- (1) rejections ----------------------------------------------------
+    check(!gpu::DeviceSmagorinsky::make(gg, 0.0).has_value(),
+          "make() rejects cs == 0");
+    check(!gpu::DeviceSmagorinsky::make(gg, -1.0).has_value(),
+          "make() rejects cs < 0");
+    {
+        const auto g3 = Grid::make(8, 8, 8, 1.0, 1.0, 1.0);
+        check(!gpu::DeviceSmagorinsky::make(gpu::GpuGrid::from(g3), 0.2).has_value(),
+              "make() rejects nz > 1 (the model is 2D-only)");
+    }
 
-    check(rcNoflag == 0, "no-flag run exits 0");
-    check(rcOff == 0, "--les 0 run exits 0");
-    check(rcOn == 0, "--les 0.2 run exits 0");
+    // Geometry: all fluid except a solid block, so lambda damping is exercised.
+    CutGeometry cut{zeros(g), zeros(g), zeros(g), zeros(g)};
+    for (std::size_t c = 0; c < g.size(); ++c)
+    {
+        cut.lambda[c] = 1.0;
+        cut.ax[c] = cut.ay[c] = cut.az[c] = 1.0;
+    }
+    for (int j = 12; j < 20; ++j)
+        for (int i = 12; i < 20; ++i) cut.lambda[g.idx(i, j, 0)] = 0.0;
+    auto dCut = gpu::DeviceCutGeometry::make(cut);
+    if (!dCut) { std::printf("geometry upload failed\n"); return 1; }
 
-    // (1) default-off is a bit-for-bit no-op.
-    const std::string sOff = slurp(pOff + "_stats.csv");
-    const std::string sNoflag = slurp(pNoflag + "_stats.csv");
-    check(!sOff.empty() && sOff == sNoflag,
-          "--les 0 stats == no-flag stats");
+    auto dU = gpu::DeviceField::make(g.size());
+    auto dOut = gpu::DeviceField::make(g.size());
+    if (!dU || !dOut) { std::printf("alloc failed\n"); return 1; }
 
-    // (2) LES dissipates: finite, lower final K.
-    const double kOff = finalK(pOff), kOn = finalK(pOn);
-    std::printf("final K: off=%.6g on=%.6g\n", kOff, kOn);
-    check(std::isfinite(kOn), "--les 0.2 final K finite");
-    check(std::isfinite(kOff) && std::isfinite(kOn) && kOn < kOff,
-          "--les 0.2 final K < --les 0 final K");
+    auto upload = [&](const VectorField& U) { (void)gpu::uploadField(U, *dU); };
+    auto nutHost = [&](gpu::DeviceSmagorinsky& les) {
+        std::vector<Real> h(g.size());
+        (void)les.nut().download(h.data());
+        return h;
+    };
 
-    // (3) 2D-only guard.
-    check(rc3d != 0, "--les with --nz 4 exits nonzero");
+    // --- (4) uniform field: |S| == 0 ---------------------------------------
+    {
+        auto U = VectorField::zeros(g);
+        for (auto& x : U.u) x = 1.0;
+        upload(U);
+        auto les = gpu::DeviceSmagorinsky::make(gg, 0.2);
+        if (!les) { std::printf("les make failed\n"); return 1; }
+        les->computeNut(*dU, *dCut);
+        const auto h = nutHost(*les);
+        double m = 0;
+        for (auto v : h) m = std::max(m, double(std::abs(v)));
+        check(m < 1e-12, "uniform field gives nut == 0");
+    }
 
-    for (const auto& p : {pOff, pNoflag, pOn, p3d}) cleanup(p);
+    // Sheared + vortical field with real strain.
+    auto U = VectorField::zeros(g);
+    for (int j = 0; j < n; ++j)
+        for (int i = 0; i < n; ++i)
+        {
+            const double x = double(i) / n, y = double(j) / n;
+            using std::numbers::pi;
+            U.u[g.idx(i, j, 0)] = std::sin(2 * pi * y) + 0.3 * std::cos(4 * pi * x);
+            U.v[g.idx(i, j, 0)] = 0.5 * std::sin(2 * pi * x);
+        }
+    upload(U);
+
+    std::vector<Real> nutA, nutB;
+    {
+        auto les = gpu::DeviceSmagorinsky::make(gg, 0.1);
+        if (!les) return 1;
+        les->computeNut(*dU, *dCut);
+        nutA = nutHost(*les);
+    }
+    {
+        auto les = gpu::DeviceSmagorinsky::make(gg, 0.2);
+        if (!les) return 1;
+        les->computeNut(*dU, *dCut);
+        nutB = nutHost(*les);
+    }
+
+    // --- (2) positivity, ring, solid ---------------------------------------
+    bool nonneg = true, ringZero = true, solidZero = true, anyPositive = false;
+    for (int j = 0; j < n; ++j)
+        for (int i = 0; i < n; ++i)
+        {
+            const double v = nutB[g.idx(i, j, 0)];
+            if (v < 0) nonneg = false;
+            if (v > 0) anyPositive = true;
+            if (i == 0 || i == n - 1 || j == 0 || j == n - 1)
+                if (v != 0) ringZero = false;
+            if (cut.lambda[g.idx(i, j, 0)] == 0.0 && v != 0) solidZero = false;
+        }
+    check(nonneg, "nut >= 0 everywhere");
+    check(anyPositive, "nut > 0 somewhere (the field has strain)");
+    check(ringZero, "nut == 0 on the domain-boundary ring");
+    check(solidZero, "nut == 0 in solid cells (lambda damping)");
+
+    // --- (3) cs^2 scaling ---------------------------------------------------
+    {
+        double worst = 0;
+        for (std::size_t c = 0; c < g.size(); ++c)
+            if (nutA[c] > 1e-6)
+                worst = std::max(worst,
+                                 std::abs(double(nutB[c]) / double(nutA[c]) - 4.0));
+        check(worst < 1e-4, "nut scales as cs^2");
+    }
+
+    // --- (5) the eddy-diffusion substep dissipates -------------------------
+    {
+        auto les = gpu::DeviceSmagorinsky::make(gg, 0.2);
+        if (!les) return 1;
+        les->computeNut(*dU, *dCut);
+        (void)hipMemset(dOut->u.data(), 0, g.size() * sizeof(Real));
+        (void)hipMemset(dOut->v.data(), 0, g.size() * sizeof(Real));
+        (void)hipMemset(dOut->w.data(), 0, g.size() * sizeof(Real));
+        les->addEddyDiffusion(*dU, Real(1), *dOut);
+
+        auto R = VectorField::zeros(g);
+        (void)gpu::downloadField(*dOut, R);
+        // sum u . div(nut grad u) over the interior: the model's power input.
+        double power = 0;
+        for (int j = 1; j < n - 1; ++j)
+            for (int i = 1; i < n - 1; ++i)
+            {
+                const auto c = g.idx(i, j, 0);
+                power += U.u[c] * R.u[c] + U.v[c] * R.v[c];
+            }
+        std::printf("eddy power = %.6g\n", power);
+        check(std::isfinite(power) && power < 0,
+              "eddy diffusion removes energy (power < 0)");
+    }
 
     std::printf("%s\n", pass ? "ALL OK" : "FAILURES");
     return pass ? 0 : 1;

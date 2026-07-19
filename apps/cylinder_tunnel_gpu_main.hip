@@ -24,6 +24,7 @@
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/ghostfill.hpp"
 #include "dns/gpu/kernels.hpp"
+#include "dns/gpu/les.hpp"
 #include "dns/gpu/reductions.hpp"
 #include "dns/gpu/bodyforce.hpp"
 #include "dns/gpu/tunnel.hpp"
@@ -40,6 +41,7 @@
 #include <cstdio>
 #include <fstream>
 #include <numbers>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -54,81 +56,6 @@ double parseOr(const char* s, double fallback)
     const std::string_view sv(s);
     auto [q, ec] = std::from_chars(sv.begin(), sv.end(), v);
     return ec == std::errc{} && q == sv.end() ? v : fallback;
-}
-
-// --- Optional Smagorinsky LES (2D, --les Cs, off by default) ----------------
-// nut = (Cs^2 hx hy) |S| lambda at cell centres from the MAC field; the eddy-
-// diffusion substep adds b*dt * div(nut grad u) per RK stage in conservative
-// flux form (face/corner-averaged nut). Explicitly stable: dt*nut/h^2 ~ Cs^2 *
-// CFL << 1. Purely app-local so the shared inviscid-exact kernels stay untouched.
-// NOTE: gradient form div(nut grad u), NOT symmetric stress div(2 nut S). Diff
-// is dj(nut di uj): =0 for const nut + div u=0, nonzero for varying nut. Still
-// flux-conservative and dissipative (nut|grad u|^2 >= 0); Cs is nominal, output
-// qualitative per project LES stance (grid+Cs dependent, not converged).
-// Cut-cell caveat: |S| uses central differences that reach into the solid where
-// u is masked to 0, so raw nut PEAKS at the wall (no van Driest) and the flux
-// form ignores apertures ax/ay (staircase body). Mitigation: scale nut by the
-// fluid fraction lambda -- zero in solid, damped in cut cells; the eddy-flux
-// coefficient is the cell/corner nut (fluid-fraction plane, not the ax/ay MAC
-// plane), so lambda is the consistent open-area weight. Coarse, not exact.
-// Ghost ring gets nut = 0: the wrap stencil would read across the box, and
-// zero is the correct no-eddy-flux condition at the domain boundary.
-__global__ void kSmagNut(gpu::GpuGrid g, Real cs2hh, const Real* u, const Real* v,
-                         const Real* lam, Real* nut)
-{
-    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (c >= g.size()) return;
-    int i, j, k;
-    gpu::decompose(g, c, i, j, k);
-    if (i == 0 || i == g.nx - 1 || j == 0 || j == g.ny - 1)
-    {
-        nut[c] = 0; // ghost ring: no eddy flux through the domain boundary
-        return;
-    }
-    const Real dudx = (u[gidx(g, i + 1, j, k)] - u[c]) / g.hx;
-    const Real dvdy = (v[gidx(g, i, j + 1, k)] - v[c]) / g.hy;
-    auto uc = [&](int a, int b) {
-        return Real(0.5) * (u[gidx(g, a, b, k)] + u[gidx(g, a + 1, b, k)]);
-    };
-    auto vc = [&](int a, int b) {
-        return Real(0.5) * (v[gidx(g, a, b, k)] + v[gidx(g, a, b + 1, k)]);
-    };
-    const Real dudy = (uc(i, j + 1) - uc(i, j - 1)) / (2 * g.hy);
-    const Real dvdx = (vc(i + 1, j) - vc(i - 1, j)) / (2 * g.hx);
-    const Real sxy = Real(0.5) * (dudy + dvdx);
-    const Real smag =
-        std::sqrt(2 * dudx * dudx + 2 * dvdy * dvdy + 4 * sxy * sxy);
-    nut[c] = cs2hh * smag * lam[c];
-}
-
-__global__ void kEddyDiffuse(gpu::GpuGrid g, Real s, const Real* nut,
-                             const Real* u, const Real* v, Real* ou, Real* ov)
-{
-    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (c >= g.size()) return;
-    int i, j, k;
-    gpu::decompose(g, c, i, j, k);
-    const Real ix = Real(1) / (g.hx * g.hx), iy = Real(1) / (g.hy * g.hy);
-    auto n4 = [&](int a, int b) { // nut at the (a,b) cell corner
-        return Real(0.25) * (nut[gidx(g, a, b, k)] + nut[gidx(g, a - 1, b, k)]
-                             + nut[gidx(g, a, b - 1, k)] + nut[gidx(g, a - 1, b - 1, k)]);
-    };
-    { // u-face at (i,j): cells i and i-1 in x, corners (i,j) and (i,j+1) in y
-        const std::size_t xp = gidx(g, i + 1, j, k), xm = gidx(g, i - 1, j, k);
-        const std::size_t yp = gidx(g, i, j + 1, k), ym = gidx(g, i, j - 1, k);
-        const Real lap =
-            ix * (nut[c] * (u[xp] - u[c]) - nut[xm] * (u[c] - u[xm]))
-          + iy * (n4(i, j + 1) * (u[yp] - u[c]) - n4(i, j) * (u[c] - u[ym]));
-        ou[c] += s * lap;
-    }
-    { // v-face at (i,j): cells j and j-1 in y, corners (i,j) and (i+1,j) in x
-        const std::size_t xp = gidx(g, i + 1, j, k), xm = gidx(g, i - 1, j, k);
-        const std::size_t yp = gidx(g, i, j + 1, k), ym = gidx(g, i, j - 1, k);
-        const Real lap =
-            iy * (nut[c] * (v[yp] - v[c]) - nut[ym] * (v[c] - v[ym]))
-          + ix * (n4(i + 1, j) * (v[xp] - v[c]) - n4(i, j) * (v[c] - v[xm]));
-        ov[c] += s * lap;
-    }
 }
 
 hipError_t downloadSlab(const gpu::DeviceScalar& q, const gpu::GpuGrid& g, int k,
@@ -330,12 +257,22 @@ int main(int argc, char** argv)
     auto dFy = gpu::DeviceScalar::make(g.size());
     auto red = gpu::ReduceScratch::make();
     auto scr = gpu::DeviceCutProjectionScratch::make(g.size());
-    auto dNut = gpu::DeviceScalar::make(csLes > 0 ? g.size() : 1);
     if (!dCut || !dGhost || !dU || !dU0 || !dS || !dG || !dFx || !dFy || !red
-        || !scr || !dNut)
+        || !scr)
     {
         std::fprintf(stderr, "GPU alloc failed\n");
         return 1;
+    }
+    std::optional<gpu::DeviceSmagorinsky> les;
+    if (csLes > 0)
+    {
+        auto m = gpu::DeviceSmagorinsky::make(gg, csLes);
+        if (!m)
+        {
+            std::fprintf(stderr, "LES init failed\n");
+            return 2;
+        }
+        les = std::move(*m);
     }
     auto poisson = gpu::DeviceCutPoissonSolver::make(
         gg, *dCut, 500, tol,
@@ -377,16 +314,10 @@ int main(int argc, char** argv)
         (void)dGhost->fillFrom(in, *dG); // sub-cell wall for the viscous terms
         gpu::fusedRhsStage(gg, Real(nu), Real(0), 0, 0, 0, Real(a), *dU0,
                            Real(1.0 - a), in, *dG, Real(dt), out);
-        if (csLes > 0)
+        if (les)
         {
-            kSmagNut<<<gpu::launchBlocks(g.size()), gpu::blockSize>>>(
-                gg, Real(csLes * csLes * h * h), dG->u.data(), dG->v.data(),
-                dCut->lambda.data(), dNut->data());
-            gpu::checkLastKernel("smagNut");
-            kEddyDiffuse<<<gpu::launchBlocks(g.size()), gpu::blockSize>>>(
-                gg, Real((1.0 - a) * dt), dNut->data(), dG->u.data(), dG->v.data(),
-                out.u.data(), out.v.data());
-            gpu::checkLastKernel("eddyDiffuse");
+            les->computeNut(*dG, *dCut);
+            les->addEddyDiffusion(*dG, Real((1.0 - a) * dt), out);
         }
         gpu::maskSolidFaces(gg, *dCut, out);
         if (open) fringeApply(out);
@@ -518,7 +449,7 @@ int main(int argc, char** argv)
             // the wall links the viscous term actually applied this step.
             (void)dGhost->fillFrom(*dU0, *dG);
             const auto co = bodyForce->measure(*dCut, scr->phi, *dG, nu, qRef,
-                                               csLes > 0 ? &*dNut : nullptr, *red);
+                                               les ? &les->nut() : nullptr, *red);
             cd = co.cd;
             cl = co.cl;
             cdf = co.cdf;
