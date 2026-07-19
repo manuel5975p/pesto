@@ -17,6 +17,8 @@ option(DNS_WITH_HIP "Build the HIP GPU backend" OFF)
 find_package(ZLIB REQUIRED) # fieldpng.cpp (PNG frame export)
 
 add_library(dns_core
+    src/dns/cli.cpp
+    src/dns/config.cpp
     src/dns/cutcell.cpp
     src/dns/diagnostics.cpp
     src/dns/fieldpng.cpp
@@ -117,7 +119,7 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
-    set(DNS_TESTS poisson projection tgv tgv3d cutcell cutcell_sphere comp meshsdf
+    set(DNS_TESTS cli poisson projection tgv tgv3d cutcell cutcell_sphere comp meshsdf
         fieldpng webframes)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)
