@@ -1,0 +1,11 @@
+# Scalar regression anchors for the validation suite (label 'anchor').
+# Filled by the Tier C regeneration procedure in docs/validation.md — run the
+# exact 'config' command, compute the windowed statistic the owning test uses,
+# and record value + date. Tests SKIP (rc 77) on anchors still commented out.
+# Regenerate only with an intended physics change; record the change in CLAUDE.md.
+name,value,tol_rel,config,date,note
+# cyl_re60_n256_cd,TODO,0.01,cylinder_tunnel_gpu 256 --nz 1 --re 60 --dr 8 --ft 12 --fdt 1e9 | cd trapezoid mean t in [30;75.4],TODO,expect ~1.818 (256^2 sharp wall; measured 2026-07-17)
+# comp_re60_n256_cd,TODO,0.01,comp_cylinder_tunnel_gpu 256 --re 60 --mach 0.2 --ft 20 --fdt 1e9 | cd trapezoid mean t in [30;62.8],TODO,expect ~1.82 (M^2 above incompressible)
+# comp_re800_n512_cd,TODO,0.03,comp_cylinder_tunnel_gpu 512 --re 800 --mach 0.2 --ft 15 --fdt 1e9 | cd trapezoid mean over last 5 ft t in [62.8;94.2],TODO,grid-converged 1.71 (2026-07-17)
+# comp_re800_n512_st,TODO,0.03,comp_cylinder_tunnel_gpu 512 --re 800 --mach 0.2 --ft 15 --fdt 1e9 | St from cl zero crossings same window,TODO,grid-converged 0.2445 (2026-07-17)
+# sphere_re300_n160_cd,TODO,0.03,sphere_tunnel_gpu 160 --re 300 --dr 8 --ft 12 --fdt 1e9 | cd trapezoid mean over last 5 ft t in [44;75.4],TODO,J&P 0.656; expect ~0.7 (8D blockage)

@@ -1,0 +1,20 @@
+# Build tree (CMake + ninja, Release)
+build/
+Testing/
+
+# Large field dumps: regenerable solver output, GB-scale.
+# Stats CSVs, .json run metadata and data/validation/ stay tracked.
+*.bin
+*.gdiag
+
+# Live-viewer frame output written next to the run
+web_*/
+png_*/
+
+# Frames / renders
+*.png
+!cube512_frame.png
+
+# Large mesh assets
+*.glb
+*.stl
