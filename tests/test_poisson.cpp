@@ -1,6 +1,6 @@
 // Poisson solvers vs manufactured solution p = cos(x)cos(2y)[cos(z)], run on
 // a 3D grid and on the degenerate nz == 1 grid (the exact 2D restriction).
-#include "dns/poisson.hpp"
+#include "dns/poisson_internal.hpp"
 
 #include <cmath>
 #include <cstdio>

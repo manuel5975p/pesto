@@ -28,8 +28,7 @@ add_library(dns_core
     src/dns/output.cpp
     src/dns/comp.cpp
     src/dns/meshsdf.cpp
-    src/dns/poisson_jacobi.cpp
-    src/dns/projection.cpp
+    src/dns/poisson.cpp
     src/dns/timestepper.cpp
     src/dns/trimesh.cpp
     src/dns/vtk_writer.cpp
@@ -42,7 +41,7 @@ target_link_libraries(dns_core PRIVATE ZLIB::ZLIB)
 if(DNS_WITH_FFTW)
     find_path(FFTW3_INCLUDE_DIR fftw3.h REQUIRED)
     find_library(FFTW3_LIBRARY fftw3 REQUIRED)
-    target_sources(dns_core PRIVATE src/dns/hit_ic.cpp src/dns/poisson_fft.cpp)
+    target_sources(dns_core PRIVATE src/dns/hit_ic.cpp)
     target_include_directories(dns_core PRIVATE ${FFTW3_INCLUDE_DIR})
     target_link_libraries(dns_core PRIVATE ${FFTW3_LIBRARY})
     target_compile_definitions(dns_core PUBLIC DNS_WITH_FFTW=1)
@@ -74,12 +73,13 @@ if(DNS_WITH_HIP)
         src/dns/gpu/comp_ghost.hip
         src/dns/gpu/comp_nscbc.hip
         src/dns/gpu/cutcell.hip
+        src/dns/gpu/cutpoisson.hip
+        src/dns/gpu/derived.hip
         src/dns/gpu/device_util.hip
         src/dns/gpu/ghostfill.hip
         src/dns/gpu/kernels.hip
         src/dns/gpu/les.hip
         src/dns/gpu/poisson.hip
-        src/dns/gpu/projection.hip
         src/dns/gpu/reductions.hip
         src/dns/gpu/timestepper.hip
         src/dns/gpu/tunnel.hip
@@ -147,7 +147,7 @@ if(BUILD_TESTING)
                   gpu_cutcell gpu_cutcell2d gpu_cutcell_sphere gpu_conservation
                   gpu_energy_stability gpu_ghostfill gpu_comp gpu_comp_ghost
                   gpu_comp_les gpu_comp_ghost3d gpu_comp_mesh gpu_comp_far
-                  gpu_comp_nscbc gpu_les_smag)
+                  gpu_comp_nscbc gpu_les_smag gpu_derived)
             add_executable(test_${t} tests/test_${t}.cpp)
             target_link_libraries(test_${t} PRIVATE dns_gpu)
             add_test(NAME ${t} COMMAND test_${t})

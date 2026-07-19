@@ -10,7 +10,7 @@
 // Usage: sphere_tunnel_gpu [n] [--re ReD] [--dr DRatio] [--ft flowThroughs]
 //                          [--golf nDimples (0 = smooth sphere)]
 //                          [--fdt frameDt] [--tol rms] [--out prefix]
-#include "dns/gpu/cutcell.hpp"
+#include "dns/gpu/cutpoisson.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/ghostfill.hpp"
 #include "dns/gpu/kernels.hpp"

@@ -8,6 +8,7 @@
 #include "dns/comp.hpp"
 #include "dns/output.hpp"
 #include "dns/gpu/comp.hpp"
+#include "dns/gpu/derived.hpp"
 #include "dns/gpu/comp_far.hpp"
 #include "dns/gpu/comp_ghost.hpp"
 #include "dns/gpu/comp_nscbc.hpp"
@@ -206,6 +207,7 @@ int main(int argc, char** argv)
     rm.physics = "compressible";
     rm.kick = kick;
 
+    const auto gg = gpu::GpuGrid::from(g);
     const int kc = nz / 2;
     FrameGeometry fg;
     fg.mask.assign(g.size(), 1.0f);
@@ -234,28 +236,29 @@ int main(int argc, char** argv)
     out->declareSeries("stats", cols);
 
     const float vortScale = float(8.0 * uInf / D), speedMax = float(1.6 * uInf);
-    std::vector<Real> hr(g.size()), hmx(g.size()), hmy(g.size());
-    std::vector<double> uu(g.size()), vv(g.size());
+    auto du = gpu::DeviceScalar::make(g.size());
+    auto dv = gpu::DeviceScalar::make(g.size());
+    auto dw = gpu::DeviceScalar::make(g.size());
+    auto dVort = gpu::DeviceScalar::make(g.size());
+    auto dSpeed = gpu::DeviceScalar::make(g.size());
+    if (!du || !dv || !dw || !dVort || !dSpeed) {
+        std::fprintf(stderr, "GPU alloc failed\n");
+        return 6;
+    }
+    std::vector<Real> hVort(g.size()), hSpeed(g.size());
     std::vector<float> vortF(g.size()), speedF(g.size());
     auto writeFrame = [&](double tNow) {
-        (void)ds->rho.download(hr.data());
-        (void)ds->mx.download(hmx.data());
-        (void)ds->my.download(hmy.data());
+        // Primitives and both derived fields are formed on device: no per-frame
+        // rho/mx/my pull, no host differencing.
+        gpu::primitiveVelocity(gg, ds->rho, ds->mx, ds->my, ds->mz, *du, *dv, *dw);
+        gpu::vorticityZCentred(gg, *du, *dv, *dVort);
+        gpu::speedCentred(gg, *du, *dv, *dw, *dSpeed);
+        (void)dVort->download(hVort.data());
+        (void)dSpeed->download(hSpeed.data());
         for (std::size_t c = 0; c < g.size(); ++c) {
-            uu[c] = double(hmx[c]) / hr[c];
-            vv[c] = double(hmy[c]) / hr[c];
+            vortF[c] = float(hVort[c]);
+            speedF[c] = float(hSpeed[c]);
         }
-        auto at = [&](const std::vector<double>& q, int i, int j) {
-            return q[g.idx(i, j, kc)];
-        };
-        for (int j = 0; j < ny; ++j)
-            for (int i = 0; i < n; ++i) {
-                const std::size_t c = g.idx(i, j, kc);
-                const double wz = (at(vv, i + 1, j) - at(vv, i - 1, j)) / (2 * h) -
-                                  (at(uu, i, j + 1) - at(uu, i, j - 1)) / (2 * h);
-                vortF[c] = float(wz);
-                speedF[c] = float(std::sqrt(uu[c] * uu[c] + vv[c] * vv[c]));
-            }
         const FrameField ff[2]{{"vort", vortF.data(), 0, vortScale, true},
                                {"speed", speedF.data(), 0, speedMax, false}};
         if (auto r = out->frame(tNow, FrameViews{ff}); !r)

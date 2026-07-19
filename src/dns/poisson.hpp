@@ -19,12 +19,13 @@ public:
     virtual void solve(const Scalar& rhs, Scalar& p) = 0;
 };
 
-// Damped-Jacobi reference solver. iters/tol: stop on either.
-std::unique_ptr<PoissonSolver> makeJacobiSolver(const Grid& g, int maxIters, double tol);
-
 #if DNS_WITH_FFTW
 // Exact (to roundoff) spectral solve of the 2nd-order FD Laplacian, O(N log N).
 std::unique_ptr<PoissonSolver> makeFftSolver(const Grid& g);
+#else
+// The damped-Jacobi reference at the settings makeDefaultSolver needs. The
+// solver itself is implementation-only (poisson_internal.hpp).
+std::unique_ptr<PoissonSolver> makeJacobiFallback(const Grid& g);
 #endif
 
 // Best available solver for this build.
@@ -33,7 +34,7 @@ inline std::unique_ptr<PoissonSolver> makeDefaultSolver(const Grid& g)
 #if DNS_WITH_FFTW
     return makeFftSolver(g);
 #else
-    return makeJacobiSolver(g, 20000, 1e-10);
+    return makeJacobiFallback(g);
 #endif
 }
 

@@ -15,7 +15,7 @@
 //                       [--les Cs (Smagorinsky, 2D only, 0 = off)]
 //                       [--out prefix]
 #include "dns/fieldpng.hpp"
-#include "dns/gpu/cutcell.hpp"
+#include "dns/gpu/cutpoisson.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/ghostfill.hpp"
 #include "dns/gpu/les.hpp"

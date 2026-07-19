@@ -1,5 +1,7 @@
 #include "dns/timestepper.hpp"
 
+#include "dns/projection.hpp"
+
 #include "dns/operators.hpp"
 
 #include <algorithm>
@@ -102,6 +104,25 @@ void TimeStepper::step(VectorField& U, double dt)
         U.w[c] = (1.0 / 3.0) * U.w[c] + (2.0 / 3.0) * (s1_.w[c] + dt * s2_.w[c]);
     }
     project(g_, *poisson_, dt, U, scratch_);
+}
+
+
+// --- Chorin projection (was projection.cpp; one TU with the stepper that is
+// its only caller) --------------------------------------------------------
+#include "dns/operators.hpp"
+
+#include <cassert>
+
+
+
+void project(const Grid& g, PoissonSolver& poisson, double dt, VectorField& U,
+             ProjectionScratch& s)
+{
+    assert(dt > 0);
+    divergence(g, U, s.div);
+    for (auto& x : s.div) x /= dt;
+    poisson.solve(s.div, s.phi);
+    subtractGradient(g, s.phi, dt, U);
 }
 
 } // namespace dns

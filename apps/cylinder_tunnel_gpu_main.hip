@@ -20,7 +20,8 @@
 //                            [--les Cs (Smagorinsky, 2D only, 0 = off)]
 //                            [--out prefix]
 #include "dns/output.hpp"
-#include "dns/gpu/cutcell.hpp"
+#include "dns/gpu/cutpoisson.hpp"
+#include "dns/gpu/derived.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/ghostfill.hpp"
 #include "dns/gpu/kernels.hpp"
@@ -56,15 +57,6 @@ double parseOr(const char* s, double fallback)
     const std::string_view sv(s);
     auto [q, ec] = std::from_chars(sv.begin(), sv.end(), v);
     return ec == std::errc{} && q == sv.end() ? v : fallback;
-}
-
-hipError_t downloadSlab(const gpu::DeviceScalar& q, const gpu::GpuGrid& g, int k,
-                        std::vector<Real>& out)
-{
-    const std::size_t slab = std::size_t(g.nx) * g.ny;
-    out.resize(slab);
-    return hipMemcpy(out.data(), q.data() + slab * std::size_t(k),
-                     slab * sizeof(Real), hipMemcpyDeviceToHost);
 }
 
 } // namespace
@@ -385,30 +377,25 @@ int main(int argc, char** argv)
     out->declareSeries("stats", cols);
 
     const float vortScale = float(8.0 * uInf / D), speedMax = float(1.6 * uInf);
-    std::vector<Real> u0, v0, w0, w1;
+    auto dVort = gpu::DeviceScalar::make(g.size());
+    auto dSpeed = gpu::DeviceScalar::make(g.size());
+    if (!dVort || !dSpeed) {
+        std::fprintf(stderr, "GPU alloc failed\n");
+        return 6;
+    }
+    std::vector<Real> hVort(g.size()), hSpeed(g.size());
     std::vector<float> vortF(g.size()), speedF(g.size());
     auto writeFrame = [&](double tNow) {
-        (void)downloadSlab(dU->u, gg, kc, u0);
-        (void)downloadSlab(dU->v, gg, kc, v0);
-        (void)downloadSlab(dU->w, gg, kc, w0);
-        // 2D: w is identically zero and there is no k+1 slab; reuse slab kc.
-        (void)downloadSlab(dU->w, gg, nz == 1 ? kc : kc + 1, w1);
-        auto at = [&](const std::vector<Real>& q, int i, int j) {
-            return double(q[std::size_t(Grid::wrap(j, nx)) * nx
-                            + std::size_t(Grid::wrap(i, nx))]);
-        };
-        for (int j = 0; j < nx; ++j)
-            for (int i = 0; i < nx; ++i)
-            {
-                const std::size_t c = g.idx(i, j, kc);
-                const double wz = (at(v0, i, j) - at(v0, i - 1, j)) / h
-                                - (at(u0, i, j) - at(u0, i, j - 1)) / h;
-                vortF[c] = float(wz);
-                const double uc = 0.5 * (at(u0, i, j) + at(u0, i + 1, j));
-                const double vc = 0.5 * (at(v0, i, j) + at(v0, i, j + 1));
-                const double wc = 0.5 * (at(w0, i, j) + at(w1, i, j));
-                speedF[c] = float(std::sqrt(uc * uc + vc * vc + wc * wc));
-            }
+        // Derived fields are built on device: one pass per field instead of the
+        // per-frame slab pulls plus host differencing this app used to run.
+        gpu::vorticityZ(gg, *dU, *dVort);
+        gpu::speedMac(gg, *dU, *dSpeed);
+        (void)dVort->download(hVort.data());
+        (void)dSpeed->download(hSpeed.data());
+        for (std::size_t c = 0; c < g.size(); ++c) {
+            vortF[c] = float(hVort[c]);
+            speedF[c] = float(hSpeed[c]);
+        }
         const FrameField ff[2]{{"vort", vortF.data(), 0, vortScale, true},
                                {"speed", speedF.data(), 0, speedMax, false}};
         if (auto r = out->frame(tNow, FrameViews{ff}); !r)

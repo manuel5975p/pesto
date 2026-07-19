@@ -17,7 +17,7 @@
 #include "dns/meshsdf.hpp"
 #include "dns/trimesh.hpp"
 
-#include "dns/gpu/cutcell.hpp"
+#include "dns/gpu/cutpoisson.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/ghostfill.hpp"
 #include "dns/gpu/kernels.hpp"

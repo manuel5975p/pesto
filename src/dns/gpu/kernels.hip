@@ -1,5 +1,9 @@
 #include "dns/gpu/kernels.hpp"
 
+#include "dns/gpu/projection.hpp"
+
+#include <cassert>
+
 #include "dns/gpu/device_util.hpp"
 
 namespace dns::gpu {
@@ -289,6 +293,17 @@ void subtractMean(const GpuGrid& g, Real mx, Real my, Real mz, DeviceField& U)
                                                          U.u.data(), U.v.data(),
                                                          U.w.data());
     checkLastKernel("subtractMean");
+}
+
+
+// --- Chorin projection (was projection.hip) -------------------------------
+void project(const GpuGrid& g, DevicePoissonSolver& poisson, Real dt, DeviceField& U,
+             DeviceProjectionScratch& s)
+{
+    assert(dt > 0);
+    divergence(g, U, s.div, Real(1) / dt);
+    poisson.solve(s.div, s.phi);
+    subtractGradient(g, s.phi, dt, U);
 }
 
 } // namespace dns::gpu

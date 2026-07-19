@@ -7,7 +7,7 @@
 // The grid carries a one-cell ghost ring: interior is n x n x nz cells.
 // Usage: cube_tunnel_gpu [n] [--re ReD] [--dr DRatio] [--ft flowThroughs]
 //                        [--flat nz] [--fdt frameDt] [--tol rms] [--out prefix]
-#include "dns/gpu/cutcell.hpp"
+#include "dns/gpu/cutpoisson.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/ghostfill.hpp"
 #include "dns/gpu/kernels.hpp"

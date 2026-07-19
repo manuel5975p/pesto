@@ -5,7 +5,7 @@
 #include "gpu_test_util.hpp"
 
 #include "dns/cutcell.hpp"
-#include "dns/gpu/cutcell.hpp"
+#include "dns/gpu/cutpoisson.hpp"
 #include "dns/gpu/poisson.hpp"
 #include "dns/operators.hpp"
 

@@ -34,4 +34,12 @@ double maxCourantPerDt(const GpuGrid& g, const DeviceField& U, ReduceScratch& s)
 double maxAbsDivergence(const GpuGrid& g, const DeviceField& U, ReduceScratch& s);
 double velocityGradientSq(const GpuGrid& g, const DeviceField& U, ReduceScratch& s);
 
+// Plain sum of a device scalar field in double (e.g. the fringe momentum
+// tally). Moved here from gpu/cutcell.hpp: it is a reduction, not cut-cell
+// geometry, and both the tunnel and the diagnostics paths need it.
+double sumScalar(const DeviceScalar& q, ReduceScratch& s);
+
+// max |q| in double (e.g. the continuity-residual diagnostic).
+double maxAbsScalar(const DeviceScalar& q, ReduceScratch& s);
+
 } // namespace dns::gpu

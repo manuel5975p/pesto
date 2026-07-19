@@ -20,6 +20,22 @@ std::expected<ReduceScratch, hipError_t> ReduceScratch::make()
 
 namespace {
 
+struct PlainSum
+{
+    const Real* x;
+    __host__ __device__ double operator()(int c) const { return double(x[c]); }
+};
+
+struct PlainAbs
+{
+    const Real* x;
+    __host__ __device__ double operator()(int c) const
+    {
+        return std::abs(double(x[c]));
+    }
+};
+
+
 // One reduction over n items through a transform functor, double accumulator.
 template <class F, class Op>
 double reduce(ReduceScratch& s, std::size_t n, F f, Op op, double init)
@@ -174,6 +190,16 @@ double velocityGradientSq(const GpuGrid& g, const DeviceField& U, ReduceScratch&
     const double sum = reduce(s, g.size(), GradSq{g, U.u.data(), U.v.data(), U.w.data()},
                               rocprim::plus<double>(), 0.0);
     return sum / double(g.size());
+}
+
+double sumScalar(const DeviceScalar& q, ReduceScratch& s)
+{
+    return reduce(s, q.size(), PlainSum{q.data()}, rocprim::plus<double>(), 0.0);
+}
+
+double maxAbsScalar(const DeviceScalar& q, ReduceScratch& s)
+{
+    return reduce(s, q.size(), PlainAbs{q.data()}, rocprim::maximum<double>(), 0.0);
 }
 
 } // namespace dns::gpu
