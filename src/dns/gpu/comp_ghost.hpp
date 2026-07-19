@@ -6,6 +6,7 @@
 #pragma once
 
 #include "dns/gpu/comp.hpp"
+#include "dns/gpu/reductions.hpp"
 
 #include <expected>
 #include <functional>
@@ -56,7 +57,12 @@ private:
     DeviceBuffer<int> deep_;     // deep-solid cell index
     DeviceBuffer<int> fcell_;    // fluid cell of an interface face
     DeviceBuffer<int> fdir_;     // 0:+x 1:-x 2:+y 3:-y 4:+z 5:-z (ghost side)
-    DeviceBuffer<float> acc_;    // fx, fy, fz accumulator
+    // Per-face FP64 staging for the force tally, laid out [fx | fy | fz], each
+    // nFace_ long. The tally used to atomicAdd in FP32: cancelling +-
+    // contributions lost precision and atomic ordering made the reported cd
+    // irreproducible run to run. A deterministic FP64 reduction replaces it.
+    DeviceBuffer<double> facc_;
+    ReduceScratch red_;
     std::vector<int> solid_;
 };
 

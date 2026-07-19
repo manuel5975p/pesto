@@ -25,6 +25,7 @@
 #include "dns/gpu/ghostfill.hpp"
 #include "dns/gpu/kernels.hpp"
 #include "dns/gpu/reductions.hpp"
+#include "dns/gpu/bodyforce.hpp"
 #include "dns/gpu/tunnel.hpp"
 
 #include <hip/hip_runtime.h>
@@ -53,62 +54,6 @@ double parseOr(const char* s, double fallback)
     const std::string_view sv(s);
     auto [q, ec] = std::from_chars(sv.begin(), sv.end(), v);
     return ec == std::errc{} && q == sv.end() ? v : fallback;
-}
-
-// Pressure force the projection exerts on the body inside a bounding box:
-// F = -sum phi_c * (a_xp - a_c) * A_face (discrete aperture identity, the
-// exact surface integral of phi over the embedded boundary).
-__global__ void kBodyPressure(gpu::GpuGrid g, const Real* lam, const Real* ax,
-                              const Real* ay, const Real* phi, int i0, int i1,
-                              int j0, int j1, int k0, int k1, Real* fx, Real* fy)
-{
-    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (c >= g.size()) return;
-    int i, j, k;
-    gpu::decompose(g, c, i, j, k);
-    fx[c] = 0;
-    fy[c] = 0;
-    if (lam[c] <= 0 || i < i0 || i > i1 || j < j0 || j > j1 || k < k0 || k > k1)
-        return;
-    fx[c] = -phi[c] * (ax[gidx(g, i + 1, j, k)] - ax[c]) * g.hy * g.hz;
-    fy[c] = -phi[c] * (ay[gidx(g, i, j + 1, k)] - ay[c]) * g.hx * g.hz;
-}
-
-// Friction force the masked Laplacian exerts on the body: momentum leaves the
-// fluid only through Laplacian links from open faces to closed (masked-zero)
-// faces, each draining nu*u*(A_link/d_link). x/y links only -- the cylinder is
-// z-invariant and the free-slip z ghosts mirror the field, so z links carry no
-// viscous flux (and the closed ghost-ring z faces must not be counted).
-__global__ void kBodyFriction(gpu::GpuGrid g, Real nu, const Real* ax,
-                              const Real* ay, const Real* u, const Real* v,
-                              int i0, int i1, int j0, int j1, int k0, int k1,
-                              Real* fx, Real* fy)
-{
-    constexpr Real openTol = Real(CutGeometry::openTol);
-    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (c >= g.size()) return;
-    int i, j, k;
-    gpu::decompose(g, c, i, j, k);
-    fx[c] = 0;
-    fy[c] = 0;
-    if (i < i0 || i > i1 || j < j0 || j > j1 || k < k0 || k > k1) return;
-    const Real lx = g.hy * g.hz / g.hx; // link conductance A/d per direction
-    const Real ly = g.hx * g.hz / g.hy;
-    // Closed neighbors hold ghost-fill mirror values, so each wall link drains
-    // nu*(q - q_ghost)*A/d -- the Laplacian flux the momentum update applies.
-    auto closedLinks = [&](const Real* a, const Real* q) {
-        Real s = 0;
-        auto link = [&](std::size_t nb, Real l) {
-            if (a[nb] <= openTol) s += l * (q[c] - q[nb]);
-        };
-        link(gidx(g, i - 1, j, k), lx);
-        link(gidx(g, i + 1, j, k), lx);
-        link(gidx(g, i, j - 1, k), ly);
-        link(gidx(g, i, j + 1, k), ly);
-        return s;
-    };
-    if (ax[c] > openTol) fx[c] = nu * closedLinks(ax, u);
-    if (ay[c] > openTol) fy[c] = nu * closedLinks(ay, v);
 }
 
 // --- Optional Smagorinsky LES (2D, --les Cs, off by default) ----------------
@@ -183,57 +128,6 @@ __global__ void kEddyDiffuse(gpu::GpuGrid g, Real s, const Real* nut,
             iy * (nut[c] * (v[yp] - v[c]) - nut[ym] * (v[c] - v[ym]))
           + ix * (n4(i + 1, j) * (v[xp] - v[c]) - n4(i, j) * (v[c] - v[xm]));
         ov[c] += s * lap;
-    }
-}
-
-// SGS counterpart of kBodyFriction: kEddyDiffuse drains momentum through the
-// same closed links, but with the local nut and its exact per-link weights
-// (x: cell-centre nut[c]/nut[xm]; y: corner-averaged n4). Same A/d normalisation
-// as kBodyFriction (nu -> nut), so this folds straight into cd.
-__global__ void kBodySgsFriction(gpu::GpuGrid g, const Real* nut, const Real* ax,
-                                 const Real* ay, const Real* u, const Real* v,
-                                 int i0, int i1, int j0, int j1, int k0, int k1,
-                                 Real* fx, Real* fy)
-{
-    constexpr Real openTol = Real(CutGeometry::openTol);
-    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (c >= g.size()) return;
-    int i, j, k;
-    gpu::decompose(g, c, i, j, k);
-    fx[c] = 0;
-    fy[c] = 0;
-    if (i < i0 || i > i1 || j < j0 || j > j1 || k < k0 || k > k1) return;
-    const Real lx = g.hy * g.hz / g.hx; // link conductance A/d per direction
-    const Real ly = g.hx * g.hz / g.hy;
-    auto n4 = [&](int a, int b) { // nut at the (a,b) cell corner (as kEddyDiffuse)
-        return Real(0.25) * (nut[gidx(g, a, b, k)] + nut[gidx(g, a - 1, b, k)]
-                             + nut[gidx(g, a, b - 1, k)] + nut[gidx(g, a - 1, b - 1, k)]);
-    };
-    // As in kBodyFriction: closed neighbors hold ghost values, drain is per-link
-    // nut*(q - q_ghost)*A/d.
-    if (ax[c] > openTol)
-    {
-        Real s = 0;
-        auto link = [&](std::size_t nb, Real nl) {
-            if (ax[nb] <= openTol) s += nl * (u[c] - u[nb]);
-        };
-        link(gidx(g, i - 1, j, k), nut[gidx(g, i - 1, j, k)] * lx);
-        link(gidx(g, i + 1, j, k), nut[c] * lx);
-        link(gidx(g, i, j - 1, k), n4(i, j) * ly);
-        link(gidx(g, i, j + 1, k), n4(i, j + 1) * ly);
-        fx[c] = s;
-    }
-    if (ay[c] > openTol)
-    {
-        Real s = 0;
-        auto link = [&](std::size_t nb, Real nl) {
-            if (ay[nb] <= openTol) s += nl * (v[c] - v[nb]);
-        };
-        link(gidx(g, i, j - 1, k), nut[gidx(g, i, j - 1, k)] * ly);
-        link(gidx(g, i, j + 1, k), nut[c] * ly);
-        link(gidx(g, i - 1, j, k), n4(i, j) * lx);
-        link(gidx(g, i + 1, j, k), n4(i + 1, j) * lx);
-        fy[c] = s;
     }
 }
 
@@ -511,14 +405,17 @@ int main(int argc, char** argv)
         if (!open) bcApply(out, out, 0.0); // refresh mirrors after the correction
     };
 
-    // Bounding box (grid indices) for the body-force reduction: the body plus
-    // margin in x/y, strictly inside the interior so lateral boundary faces
-    // never count; the full interior span in z (only x/y links are tallied).
-    const int bi0 = std::max(2, int((cyl.cx - cyl.r) / h) - 2);
-    const int bi1 = std::min(nx - 3, int((cyl.cx + cyl.r) / h) + 3);
-    const int bj0 = std::max(2, int((cyl.cy - cyl.r) / h) - 2);
-    const int bj1 = std::min(nx - 3, int((cyl.cy + cyl.r) / h) + 3);
-    const int bk0 = gg.kInLo(), bk1 = gg.kInHi();
+    // Body-force tally box: the body plus margin, strictly inside the interior
+    // so lateral boundary faces never count; the full interior span in z.
+    auto box = gpu::bodyBox(gg, cyl.cx, cyl.cy, 0.0, cyl.r);
+    box.k0 = gg.kInLo();
+    box.k1 = gg.kInHi();
+    auto bodyForce = gpu::DeviceBodyForce::make(gg, box);
+    if (!bodyForce)
+    {
+        std::fprintf(stderr, "body-force init failed\n");
+        return 2;
+    }
 
     const double tEnd = flowThroughs * L / uInf;
     const double qRef = 0.5 * uInf * uInf * D * (nzCells * h); // frontal rectangle
@@ -645,42 +542,15 @@ int main(int argc, char** argv)
             // Surface pressure integral from the FIRST stage's phi: that stage
             // advances a full dt, so phi is the static pressure. The later
             // stages' effective substeps are shorter (phi ~ (2/3)p on stage 3)
-            // and would bias the force low.
-            kBodyPressure<<<gpu::launchBlocks(g.size()), gpu::blockSize>>>(
-                gg, dCut->lambda.data(), dCut->ax.data(), dCut->ay.data(),
-                scr->phi.data(), bi0, bi1, bj0, bj1, bk0, bk1, dFx->data(),
-                dFy->data());
-            gpu::checkLastKernel("bodyPressure");
-            cd = gpu::sumScalar(*dFx, *red) / qRef;
-            cl = gpu::sumScalar(*dFy, *red) / qRef;
-
-            // Skin friction from the time-t field (matches phi's time level),
-            // through the ghost-filled view: the wall links the viscous term
-            // actually applied this step.
+            // and would bias the force low. Friction is read from the time-t
+            // field (matching phi's time level) through the ghost-filled view:
+            // the wall links the viscous term actually applied this step.
             (void)dGhost->fillFrom(*dU0, *dG);
-            kBodyFriction<<<gpu::launchBlocks(g.size()), gpu::blockSize>>>(
-                gg, Real(nu), dCut->ax.data(), dCut->ay.data(), dG->u.data(),
-                dG->v.data(), bi0, bi1, bj0, bj1, bk0, bk1, dFx->data(),
-                dFy->data());
-            gpu::checkLastKernel("bodyFriction");
-            cdf = gpu::sumScalar(*dFx, *red) / qRef;
-            cd += cdf;
-            cl += gpu::sumScalar(*dFy, *red) / qRef;
-
-            // SGS wall stress: the eddy term drains momentum through the same
-            // closed links. dNut already holds nut of the time-t field dU0 (set
-            // by this step's first stage), so mirror kEddyDiffuse's weights and
-            // fold into cd. cdf column stays nu-only (documented).
-            if (csLes > 0)
-            {
-                kBodySgsFriction<<<gpu::launchBlocks(g.size()), gpu::blockSize>>>(
-                    gg, dNut->data(), dCut->ax.data(), dCut->ay.data(),
-                    dG->u.data(), dG->v.data(), bi0, bi1, bj0, bj1, bk0, bk1,
-                    dFx->data(), dFy->data());
-                gpu::checkLastKernel("bodySgsFriction");
-                cd += gpu::sumScalar(*dFx, *red) / qRef;
-                cl += gpu::sumScalar(*dFy, *red) / qRef;
-            }
+            const auto co = bodyForce->measure(*dCut, scr->phi, *dG, nu, qRef,
+                                               csLes > 0 ? &*dNut : nullptr, *red);
+            cd = co.cd;
+            cl = co.cl;
+            cdf = co.cdf;
         }
         stage(*dU, *dS, 0.75, dt);
         stage(*dS, *dU, 1.0 / 3.0, dt);

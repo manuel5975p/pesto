@@ -60,7 +60,7 @@ __global__ void kQuiescent(const int* cells, int m, Real rhoInf, Real EInf,
 // Exact discrete momentum flux fluid -> body: the same faceFlux the rhs uses,
 // summed over fluid/ghost interface faces, oriented into the body.
 __global__ void kBodyFlux(GpuGrid g, Real mu, Real kappa, PrimView q,
-                          const int* fcell, const int* fdir, int m, float* acc)
+                          const int* fcell, const int* fdir, int m, double* acc)
 {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= m) return;
@@ -77,9 +77,11 @@ __global__ void kBodyFlux(GpuGrid g, Real mu, Real kappa, PrimView q,
                     : axis == 1 ? g.hx * g.hz
                                 : g.hx * g.hy;
     const Real sgn = minus ? Real(-1) : Real(1);
-    atomicAdd(&acc[0], float(sgn * f.mx * area));
-    atomicAdd(&acc[1], float(sgn * f.my * area));
-    atomicAdd(&acc[2], float(sgn * f.mz * area));
+    // Staged per face, not atomically accumulated: the reduction below is
+    // deterministic and FP64 (see DeviceCompGhost::facc_).
+    acc[t] = double(sgn * f.mx * area);
+    acc[m + t] = double(sgn * f.my * area);
+    acc[2 * m + t] = double(sgn * f.mz * area);
 }
 
 } // namespace
@@ -233,9 +235,12 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
     if (auto e = up(out.deep_, deep); e != hipSuccess) return std::unexpected(e);
     if (auto e = up(out.fcell_, fcell); e != hipSuccess) return std::unexpected(e);
     if (auto e = up(out.fdir_, fdir); e != hipSuccess) return std::unexpected(e);
-    auto acc = DeviceBuffer<float>::make(3);
+    auto acc = DeviceBuffer<double>::make(std::size_t(std::max(out.nFace_, 1)) * 3);
     if (!acc) return std::unexpected(acc.error());
-    out.acc_ = std::move(*acc);
+    out.facc_ = std::move(*acc);
+    auto red = ReduceScratch::make();
+    if (!red) return std::unexpected(red.error());
+    out.red_ = std::move(*red);
     return out;
 }
 
@@ -262,18 +267,19 @@ DeviceCompGhost::Force DeviceCompGhost::force(DeviceComp& solver,
 {
     if (nFace_ == 0) return {0.0, 0.0, 0.0};
     solver.primitives(s);
-    const float zero[3] = {0.f, 0.f, 0.f};
-    (void)acc_.upload(zero);
     const PrimView q{s.rho.data(),      solver.u().data(), solver.v().data(),
                      solver.w().data(), solver.e().data(), solver.p().data(),
                      solver.T().data()};
     kBodyFlux<<<launchBlocks(nFace_), blockSize>>>(
         g_, solver.mu(), solver.kappaCond(), q, fcell_.data(), fdir_.data(),
-        nFace_, acc_.data());
+        nFace_, facc_.data());
     checkLastKernel("kBodyFlux");
-    float acc[3];
-    (void)acc_.download(acc);
-    return {double(acc[0]), double(acc[1]), double(acc[2])};
+    // Three deterministic FP64 reductions over disjoint spans of facc_.
+    const std::size_t m = std::size_t(nFace_);
+    double f[3];
+    for (int c = 0; c < 3; ++c)
+        f[c] = sumDouble(facc_.data() + c * m, m, red_);
+    return {f[0], f[1], f[2]};
 }
 
 } // namespace dns::gpu

@@ -162,6 +162,13 @@ double maxAbsDivergence(const GpuGrid& g, const DeviceField& U, ReduceScratch& s
                   rocprim::maximum<double>(), 0.0);
 }
 
+double sumDouble(const double* q, std::size_t n, ReduceScratch& s)
+{
+    if (n == 0) return 0.0;
+    return reduce(s, n, [q] __device__(int i) { return q[i]; },
+                  rocprim::plus<double>(), 0.0);
+}
+
 double velocityGradientSq(const GpuGrid& g, const DeviceField& U, ReduceScratch& s)
 {
     const double sum = reduce(s, g.size(), GradSq{g, U.u.data(), U.v.data(), U.w.data()},

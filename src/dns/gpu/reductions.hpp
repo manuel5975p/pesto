@@ -20,6 +20,12 @@ struct ReduceScratch
 
 struct Mean3 { double x, y, z; };
 
+// Deterministic FP64 sum of a device double array. Force/flux tallies stage
+// their per-item contributions here instead of atomicAdd-ing in FP32: with
+// cancelling +- contributions the FP32 atomic both loses precision and makes
+// the reported coefficient irreproducible run to run (atomic ordering).
+double sumDouble(const double* q, std::size_t n, ReduceScratch& s);
+
 // Same semantics as the CPU oracle (dns/operators.hpp), accumulated in double.
 double kineticEnergy(const GpuGrid& g, const DeviceField& U, ReduceScratch& s);
 Mean3 meanVelocity(const GpuGrid& g, const DeviceField& U, ReduceScratch& s);

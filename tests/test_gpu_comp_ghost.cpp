@@ -99,5 +99,19 @@ int main()
     check(cd > 0.5 && cd < 30.0, "drag positive and sane (early transient)");
     check(smax < 3.0, "speed bounded");
 
+    // The tally used to atomicAdd in FP32: cancelling +- contributions made the
+    // reported cd irreproducible run to run, non-determinism in the primary
+    // validated quantity. It now stages per face in FP64 and reduces
+    // deterministically, so repeats must agree to the last bit.
+    {
+        bool same = true;
+        for (int r = 0; r < 4; ++r) {
+            const auto Fr = ghost->force(*dev, *ds);
+            if (Fr.fx != F.fx || Fr.fy != F.fy || Fr.fz != F.fz) same = false;
+        }
+        check(same, "force tally is bit-reproducible across repeats");
+        std::printf("cd (FP64 tally) = %.17g\n", cd);
+    }
+
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

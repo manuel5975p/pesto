@@ -67,6 +67,7 @@ if(DNS_WITH_HIP)
     find_package(rocprim REQUIRED)
 
     add_library(dns_gpu
+        src/dns/gpu/bodyforce.hip
         src/dns/gpu/comp.hip
         src/dns/gpu/comp_far.hip
         src/dns/gpu/comp_ghost.hip
@@ -151,13 +152,14 @@ if(BUILD_TESTING)
             set_tests_properties(${t} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
         endforeach()
 
-        # Needs its own kernels (the pre-recomposition BC variant, as an
-        # identity oracle), so it is a HIP TU rather than a plain .cpp.
-        add_executable(test_gpu_tunnel_bc tests/test_gpu_tunnel_bc.hip)
-        target_link_libraries(test_gpu_tunnel_bc PRIVATE dns_gpu)
-        add_test(NAME gpu_tunnel_bc COMMAND test_gpu_tunnel_bc)
-        set_tests_properties(gpu_tunnel_bc PROPERTIES TIMEOUT 300
-            SKIP_RETURN_CODE 77)
+        # These define their own kernels (the pre-recomposition kernel variants,
+        # as identity oracles), so they are HIP TUs rather than plain .cpp.
+        foreach(t gpu_tunnel_bc gpu_bodyforce)
+            add_executable(test_${t} tests/test_${t}.hip)
+            target_link_libraries(test_${t} PRIVATE dns_gpu)
+            add_test(NAME ${t} COMMAND test_${t})
+            set_tests_properties(${t} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        endforeach()
 
         # Open far-field path is app-local; drive the built binary.
         add_executable(test_gpu_open_incomp tests/test_gpu_open_incomp.cpp)
