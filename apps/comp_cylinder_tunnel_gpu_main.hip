@@ -7,11 +7,7 @@
 // Kennedy-Gruber central fluxes: smooth (shock-free) Mach only.
 #include "dns/comp.hpp"
 #include "dns/output.hpp"
-#include "dns/gpu/comp.hpp"
-#include "dns/gpu/derived.hpp"
-#include "dns/gpu/comp_far.hpp"
-#include "dns/gpu/comp_ghost.hpp"
-#include "dns/gpu/comp_nscbc.hpp"
+#include "dns/gpu/runner_comp.hpp"
 #include "dns/gpu/device_util.hpp"
 
 #include <hip/hip_runtime.h>
@@ -82,6 +78,7 @@ int main(int argc, char** argv)
     const int nsStrip = int(arg(argc, argv, "--nsstrip", 0.0));
     const double tRamp = arg(argc, argv, "--ramp", 2.0);
     const double kick = arg(argc, argv, "--kick", 0.05);
+    const double nsBeta = arg(argc, argv, "--nsbeta", -1.0); // -1 = auto (Mach)
     const std::string prefix = argS(argc, argv, "--out", "comp_cyl");
 
     // Resolution scales with ny (domain height fixed at 8 D): D = 64 cells
@@ -96,58 +93,12 @@ int main(int argc, char** argv)
     const double mu = rhoInf * uInf * D / reD;
 
     const auto g = Grid::make(n, ny, nz, L, Ly, nz > 1 ? nz * h : 1.0);
-    auto dev = gpu::DeviceComp::make(g, gamma, mu);
-    auto ds = gpu::DeviceCompState::make(g.size());
-    auto red = gpu::ReduceScratch::make();
-    gpu::DeviceCompFar::Config fc;
-    fc.rhoInf = rhoInf;
-    fc.uInf = uInf;
-    fc.pInf = pInf;
-    fc.gamma = gamma;
-    fc.ns = std::clamp(int(0.1 * n), 8, n / 2 - 1);
-    fc.openY = open;
-    fc.openZ = open;
-    if (nscbc) { // x handled by NSCBC; optional thin strip absorbs residuals
-        fc.sigMax = nsStrip > 0 ? 0.5 : 0.0;
-        if (nsStrip > 0) fc.ns = nsStrip;
-    }
-    auto far = gpu::DeviceCompFar::make(g, fc);
-    gpu::DeviceCompNscbc::Config nc;
-    nc.rhoInf = rhoInf;
-    nc.uInf = uInf;
-    nc.pInf = pInf;
-    nc.gamma = gamma;
-    nc.betaTrans = arg(argc, argv, "--nsbeta", -1.0); // -1 = auto (Mach)
-    // --nscbc --open: lateral extremes become characteristic far-field faces
-    // (DeviceCompFar then applies no walls; sponge only if --nsstrip).
-    nc.openY = open;
-    nc.openZ = open && nz > 1;
-    auto nsc = nscbc ? gpu::DeviceCompNscbc::make(g, nc)
-                     : std::expected<gpu::DeviceCompNscbc, hipError_t>(
-                           std::unexpected(hipErrorInvalidValue));
-    if (!dev || !ds || !red || !far || (nscbc && !nsc)) {
-        std::fprintf(stderr, "GPU alloc failed\n");
-        return 1;
-    }
 
     // Sharp ghost-fill wall on the exact circle (z-invariant when nz > 1).
     auto sdf = [&](double x, double y, double) {
         const double dx = x - cxx, dy = y - cyy;
         return std::sqrt(dx * dx + dy * dy) - R;
     };
-    auto ghost = gpu::DeviceCompGhost::make(g, sdf, gamma, rhoInf, pInf);
-    if (!ghost) {
-        std::fprintf(stderr, "ghost wall init failed\n");
-        return 1;
-    }
-    auto applyBc = [&](gpu::DeviceCompState& st) {
-        far->apply(st);
-        ghost->apply(st);
-    };
-    dev->setStageHook(applyBc);
-    if (nscbc)
-        dev->setRhsHook([&](const gpu::DeviceCompState& st,
-                            gpu::DeviceCompState& k) { nsc->apply(*dev, st, k); });
 
     // IC. Quiet start (tRamp > 0): rest, exactly consistent with the no-slip
     // body -- the freestream is then raised by silent Galilean boosts.
@@ -182,18 +133,6 @@ int main(int argc, char** argv)
                 host.E[c] = pInf / (gamma - 1.0) + 0.5 * rhoInf * (u * u + v * v);
                 if (k == 0 && d < 0.0) mask[std::size_t(j) * n + i] = 0.0f;
             }
-    (void)ds->upload(host);
-    far->setFreestream(u0);
-    if (nscbc) nsc->setFreestream(u0);
-    applyBc(*ds);
-
-    // Quiet-start freestream schedule: smoothstep 0 -> 1 over [0, tRamp].
-    auto rampFrac = [&](double tt) {
-        if (tRamp <= 0 || tt >= tRamp) return 1.0;
-        const double s = tt / tRamp;
-        return s * s * (3 - 2 * s);
-    };
-
     const double tEnd = tRamp + flowThroughs * L / uInf;
     const double qRef = 0.5 * rhoInf * uInf * uInf * D;
 
@@ -232,90 +171,31 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "output init failed: %s\n", out.error().c_str());
         return 4;
     }
-    const std::string cols[] = {"t", "dt", "cd", "cl", "wmax"};
-    out->declareSeries("stats", cols);
+    // The runner declares the stats series.
 
-    const float vortScale = float(8.0 * uInf / D), speedMax = float(1.6 * uInf);
-    auto du = gpu::DeviceScalar::make(g.size());
-    auto dv = gpu::DeviceScalar::make(g.size());
-    auto dw = gpu::DeviceScalar::make(g.size());
-    auto dVort = gpu::DeviceScalar::make(g.size());
-    auto dSpeed = gpu::DeviceScalar::make(g.size());
-    if (!du || !dv || !dw || !dVort || !dSpeed) {
-        std::fprintf(stderr, "GPU alloc failed\n");
-        return 6;
+    gpu::CompRun rr;
+    rr.gamma = gamma;
+    rr.mu = mu;
+    rr.uInf = uInf;
+    rr.rhoInf = rhoInf;
+    rr.pInf = pInf;
+    rr.mach = mach;
+    rr.D = D;
+    rr.qRef = qRef;
+    rr.cfl = cfl;
+    rr.tEnd = tEnd;
+    rr.far = nscbc ? FarField::Nscbc : FarField::Sponge;
+    rr.open = open;
+    rr.nscbcBeta = nsBeta;
+    rr.nscbcStrip = nsStrip;
+    rr.ramp = tRamp;
+
+    auto res = gpu::runCompressible(g, host, sdf, nullptr, rr, *out);
+    if (!res) {
+        std::fprintf(stderr, "%s\n", res.error().message.c_str());
+        return res.error().code;
     }
-    std::vector<Real> hVort(g.size()), hSpeed(g.size());
-    std::vector<float> vortF(g.size()), speedF(g.size());
-    auto writeFrame = [&](double tNow) {
-        // Primitives and both derived fields are formed on device: no per-frame
-        // rho/mx/my pull, no host differencing.
-        gpu::primitiveVelocity(gg, ds->rho, ds->mx, ds->my, ds->mz, *du, *dv, *dw);
-        gpu::vorticityZCentred(gg, *du, *dv, *dVort);
-        gpu::speedCentred(gg, *du, *dv, *dw, *dSpeed);
-        (void)dVort->download(hVort.data());
-        (void)dSpeed->download(hSpeed.data());
-        for (std::size_t c = 0; c < g.size(); ++c) {
-            vortF[c] = float(hVort[c]);
-            speedF[c] = float(hSpeed[c]);
-        }
-        const FrameField ff[2]{{"vort", vortF.data(), 0, vortScale, true},
-                               {"speed", speedF.data(), 0, speedMax, false}};
-        if (auto r = out->frame(tNow, FrameViews{ff}); !r)
-            std::fprintf(stderr, "frame write failed: %s\n", r.error().c_str());
-    };
-
-    double t = 0.0;
-    long steps = 0, lastLog = 0;
-    const auto wall0 = std::chrono::steady_clock::now();
-
-    // stableDt costs two full-grid reductions + host syncs; the acoustic CFL
-    // moves slowly, so recompute every 16 steps and take a 5% margin.
-    double dtStab = 0.0;
-    int sinceDt = 1 << 30;
-    while (t < tEnd) {
-        if (++sinceDt >= 16) {
-            dtStab = 0.95 * dev->stableDt(*ds, *red, cfl);
-            sinceDt = 0;
-        }
-        const double dt = std::min(tEnd - t, dtStab);
-        if (dtStab < 1e-6) {
-            std::fprintf(stderr, "dt collapsed at t=%.3f -- blowup\n", t);
-            return 7;
-        }
-        dev->step(*ds, Real(dt));
-        if (t < tRamp) { // quiet start: boost the frame, retarget the sponge
-            const double uNew = uInf * rampFrac(t + dt);
-            far->boost(*ds, uNew - far->freestream());
-            far->setFreestream(uNew);
-            if (nscbc) nsc->setFreestream(uNew);
-        }
-        applyBc(*ds); // leave the state BC/ghost-consistent between steps
-        t += dt;
-        ++steps;
-
-        if (steps - lastLog >= 200 || t >= tEnd) {
-            const auto F = ghost->force(*dev, *ds);
-            const double span = nz > 1 ? nz * g.hz : 1.0;
-            const double cd = F.fx / (qRef * span);
-            const double cl = F.fy / (qRef * span);
-            const double wmax = cfl / dtStab * std::min(g.hx, g.hy);
-            const double rowv[] = {t, dt, cd, cl, wmax};
-            (void)out->row("stats", rowv);
-            if (steps - lastLog >= 4000 || t >= tEnd)
-                std::printf("t=%.2f/%.2f cd=%.3f cl=%+.3f wmax=%.2f dt=%.2e\n", t,
-                            tEnd, cd, cl, wmax, dt);
-            lastLog = steps;
-        }
-        if (out->wantsFrame(t) || out->wantsPng(t) || out->wantsWeb(t))
-            writeFrame(t);
-    }
-    const double ms = std::chrono::duration<double, std::milli>(
-                          std::chrono::steady_clock::now() - wall0)
-                          .count() /
-                      double(steps);
-    out->setMsPerStep(ms);
-    std::printf("done: %ld steps, %d frames, %.2f ms/step\n", steps,
-                out->frames(), ms);
+    std::printf("done: %ld steps, %d frames, %.2f ms/step\n", res->steps,
+                out->frames(), res->msPerStep);
     return 0;
 }

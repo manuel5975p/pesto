@@ -185,6 +185,10 @@ void RunOutput::declareSeries(std::string_view name,
     if (!has(p_->cfg.kinds, Emit::Stats)) return;
     const std::string key(name);
     auto& f = p_->series[key];
+    // Re-declaring a series reopens it: opening an already-open stream would
+    // set failbit and silently swallow every subsequent row.
+    if (f.is_open()) f.close();
+    f.clear();
     f.open(p_->cfg.prefix + "_" + key + ".csv");
     for (std::size_t i = 0; i < cols.size(); ++i)
         f << (i ? "," : "") << cols[i];

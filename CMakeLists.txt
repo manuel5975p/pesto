@@ -81,6 +81,8 @@ if(DNS_WITH_HIP)
         src/dns/gpu/les.hip
         src/dns/gpu/poisson.hip
         src/dns/gpu/reductions.hip
+        src/dns/gpu/runner_comp.hip
+        src/dns/gpu/runner_incomp.hip
         src/dns/gpu/timestepper.hip
         src/dns/gpu/tunnel.hip
     )
