@@ -64,6 +64,9 @@ bool writePngRgb(const std::string& path, int w, int h,
     chunk(f, "IHDR", ihdr, 13);
     chunk(f, "IDAT", z.data(), std::uint32_t(zlen));
     chunk(f, "IEND", nullptr, 0);
+    // Close first: a buffered ENOSPC only surfaces at close, so testing the
+    // stream while it is still open reports success on a truncated file.
+    f.close();
     return bool(f);
 }
 

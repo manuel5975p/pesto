@@ -30,6 +30,9 @@ writeVtk(const Grid& g, const VectorField& U, const std::string& path)
                 f << std::format("{} {} {}\n", uc, vc, wc);
             }
 
+    // Close first: a buffered ENOSPC only surfaces at close, so testing the
+    // stream while it is still open reports success on a truncated file.
+    f.close();
     if (!f)
         return std::unexpected(std::format("write failed on '{}'", path));
     return {};

@@ -25,6 +25,7 @@ add_library(dns_core
     src/dns/fieldpng.cpp
     src/dns/geometry.cpp
     src/dns/operators.cpp
+    src/dns/output.cpp
     src/dns/comp.cpp
     src/dns/meshsdf.cpp
     src/dns/poisson_jacobi.cpp
@@ -123,7 +124,7 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
-    set(DNS_TESTS cli geometry poisson projection tgv tgv3d cutcell cutcell_sphere comp meshsdf
+    set(DNS_TESTS cli geometry output poisson projection tgv tgv3d cutcell cutcell_sphere comp meshsdf
         fieldpng webframes)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)

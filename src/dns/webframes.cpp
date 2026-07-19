@@ -53,6 +53,9 @@ bool WebFrames::writeQuantized(const std::string& path, const float* data,
     if (!f) return false;
     f.write(reinterpret_cast<const char*>(q.data()),
             std::streamsize(n * sizeof(std::uint16_t)));
+    // Close first: a buffered ENOSPC only surfaces at close, so testing the
+    // stream while it is still open reports success on a truncated file.
+    f.close();
     return bool(f);
 }
 

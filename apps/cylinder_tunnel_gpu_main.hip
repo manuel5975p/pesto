@@ -19,7 +19,7 @@
 //                            [--ft flowThroughs] [--fdt frameDt] [--tol rms] [--cfl c]
 //                            [--les Cs (Smagorinsky, 2D only, 0 = off)]
 //                            [--out prefix]
-#include "dns/fieldpng.hpp"
+#include "dns/output.hpp"
 #include "dns/gpu/cutcell.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/ghostfill.hpp"
@@ -419,84 +419,69 @@ int main(int argc, char** argv)
 
     const double tEnd = flowThroughs * L / uInf;
     const double qRef = 0.5 * uInf * uInf * D * (nzCells * h); // frontal rectangle
-    std::ofstream stats(prefix + "_stats.csv");
-    stats << "t,dt,K,cd,cl,cdf,cfl,maxDiv,pcgIters\n";
 
-    std::ofstream(prefix + ".json")
-        << "{\"nx\":" << n << ",\"ny\":" << n << ",\"frameDt\":" << frameDt
-        << ",\"D\":" << D << ",\"reD\":" << reD << ",\"cx\":" << cyl.cx / h - 1
-        << ",\"cy\":" << cyl.cy / h - 1 << ",\"R\":" << cyl.r / h
-        << ",\"golf\":" << golf << ",\"open\":" << int(open) << "}\n";
-
-    // Interior mid-z slices: signed z-vorticity at cell corners and velocity
-    // magnitude at cell centres (top view).
+    // Every run artefact goes through the one sink; the ghost ring is cropped
+    // out by the (i0, j0) = (1, 1) window so frames stay n x n interior cells.
     const int kc = nz == 1 ? 0 : nz / 2;
-    std::ofstream vortFile(prefix + "_vort.bin", std::ios::binary);
-    std::ofstream speedFile(prefix + "_speed.bin", std::ios::binary);
-    std::vector<float> maskImg(std::size_t(n) * n);
-    for (int j = 0; j < n; ++j)
-        for (int i = 0; i < n; ++i)
-            maskImg[std::size_t(j) * n + i] =
-                float(cut.lambda[g.idx(i + 1, j + 1, kc)]);
-    {
-        std::ofstream mf(prefix + "_mask.bin", std::ios::binary);
-        mf.write(reinterpret_cast<const char*>(maskImg.data()),
-                 std::streamsize(maskImg.size() * sizeof(float)));
+    RunMeta rm;
+    rm.nx = n; rm.ny = n; rm.nz = nzCells;
+    rm.hx = h; rm.hy = h; rm.hz = h;
+    rm.D = D; rm.re = reD; rm.frameDt = frameDt; rm.cs = csLes;
+    rm.les = csLes > 0;
+    rm.body = golf > 0 ? "cylinder-golf" : "cylinder";
+    rm.farField = open ? "fringe" : "tunnel";
+    rm.physics = "incompressible";
+
+    FrameGeometry fg;
+    fg.mask.assign(g.size(), 1.0f);
+    for (std::size_t c = 0; c < g.size(); ++c) fg.mask[c] = float(cut.lambda[c]);
+    fg.ic = nx / 2; fg.jc = nx / 2; fg.kc = kc; fg.D = D;
+    fg.i0 = 1; fg.j0 = 1; fg.k0 = nz == 1 ? 0 : 1;
+    fg.w = n; fg.h = n; fg.d = nzCells;
+
+    RunOutput::Config oc;
+    oc.prefix = prefix;
+    oc.kinds = {Emit::Stats, Emit::Bin};
+    if (nz == 1) oc.kinds.insert(Emit::Png);
+    oc.fdt = frameDt;
+    auto out = RunOutput::make(oc, rm, g, fg);
+    if (!out) {
+        std::fprintf(stderr, "output init failed: %s\n", out.error().c_str());
+        return 4;
     }
-    // Live PNGs of the 2D fields (vorticity diverging, |u| viridis).
-    const std::string pngDir = "png_" + prefix;
-    const bool pngs = nz == 1;
-    if (pngs) std::filesystem::create_directories(pngDir);
+    const std::string cols[] = {"t", "dt", "K", "cd", "cl",
+                                "cdf", "cfl", "maxDiv", "pcgIters"};
+    out->declareSeries("stats", cols);
+
     const float vortScale = float(8.0 * uInf / D), speedMax = float(1.6 * uInf);
-    int frames = 0;
-    double nextFrame = 0.0;
     std::vector<Real> u0, v0, w0, w1;
-    std::vector<float> frame(std::size_t(n) * n);
-    auto writeFrame = [&]() {
+    std::vector<float> vortF(g.size()), speedF(g.size());
+    auto writeFrame = [&](double tNow) {
         (void)downloadSlab(dU->u, gg, kc, u0);
         (void)downloadSlab(dU->v, gg, kc, v0);
         (void)downloadSlab(dU->w, gg, kc, w0);
         // 2D: w is identically zero and there is no k+1 slab; reuse slab kc.
         (void)downloadSlab(dU->w, gg, nz == 1 ? kc : kc + 1, w1);
         auto at = [&](const std::vector<Real>& q, int i, int j) {
-            return double(q[std::size_t(j) * nx + std::size_t(i)]);
+            return double(q[std::size_t(Grid::wrap(j, nx)) * nx
+                            + std::size_t(Grid::wrap(i, nx))]);
         };
-        for (int j = 0; j < n; ++j)
-            for (int i = 0; i < n; ++i)
+        for (int j = 0; j < nx; ++j)
+            for (int i = 0; i < nx; ++i)
             {
-                const int ii = i + 1, jj = j + 1;
-                const double wz = (at(v0, ii, jj) - at(v0, ii - 1, jj)) / h
-                                - (at(u0, ii, jj) - at(u0, ii, jj - 1)) / h;
-                frame[std::size_t(j) * n + i] = float(wz);
+                const std::size_t c = g.idx(i, j, kc);
+                const double wz = (at(v0, i, j) - at(v0, i - 1, j)) / h
+                                - (at(u0, i, j) - at(u0, i, j - 1)) / h;
+                vortF[c] = float(wz);
+                const double uc = 0.5 * (at(u0, i, j) + at(u0, i + 1, j));
+                const double vc = 0.5 * (at(v0, i, j) + at(v0, i, j + 1));
+                const double wc = 0.5 * (at(w0, i, j) + at(w1, i, j));
+                speedF[c] = float(std::sqrt(uc * uc + vc * vc + wc * wc));
             }
-        vortFile.write(reinterpret_cast<const char*>(frame.data()),
-                       std::streamsize(frame.size() * sizeof(float)));
-        char png[4096];
-        if (pngs) {
-            std::snprintf(png, sizeof png, "%s/vort_%05d.png", pngDir.c_str(),
-                          frames);
-            dns::writeDivergingPng(png, n, n, frame.data(), vortScale,
-                                   maskImg.data());
-        }
-        for (int j = 0; j < n; ++j)
-            for (int i = 0; i < n; ++i)
-            {
-                const int ii = i + 1, jj = j + 1;
-                const double uc = 0.5 * (at(u0, ii, jj) + at(u0, ii + 1, jj));
-                const double vc = 0.5 * (at(v0, ii, jj) + at(v0, ii, jj + 1));
-                const double wc = 0.5 * (at(w0, ii, jj) + at(w1, ii, jj));
-                frame[std::size_t(j) * n + i] =
-                    float(std::sqrt(uc * uc + vc * vc + wc * wc));
-            }
-        speedFile.write(reinterpret_cast<const char*>(frame.data()),
-                        std::streamsize(frame.size() * sizeof(float)));
-        if (pngs) {
-            std::snprintf(png, sizeof png, "%s/speed_%05d.png", pngDir.c_str(),
-                          frames);
-            dns::writeSequentialPng(png, n, n, frame.data(), 0.0f, speedMax,
-                                    maskImg.data());
-        }
-        ++frames;
+        const FrameField ff[2]{{"vort", vortF.data(), 0, vortScale, true},
+                               {"speed", speedF.data(), 0, speedMax, false}};
+        if (auto r = out->frame(tNow, FrameViews{ff}); !r)
+            std::fprintf(stderr, "frame write failed: %s\n", r.error().c_str());
     };
 
     double t = 0.0, dt = 1e-3;
@@ -515,22 +500,8 @@ int main(int argc, char** argv)
         {
             auto host = VectorField::zeros(g);
             (void)gpu::downloadField(*dU, host);
-            const Scalar* comp[3]{&host.u, &host.v, &host.w};
-            const char* name[3]{"u", "v", "w"};
-            for (int q = 0; q < 3; ++q)
-            {
-                std::size_t am = 0;
-                double m = 0.0;
-                for (std::size_t c = 0; c < g.size(); ++c)
-                    if (std::abs((*comp[q])[c]) > m) { m = std::abs((*comp[q])[c]); am = c; }
-                const int i = int(am % nx), j = int((am / nx) % nx),
-                          k = int(am / (std::size_t(nx) * nx));
-                std::printf("BLOWUP t=%.4f max|%s|=%.3e at i=%d j=%d k=%d "
-                            "(lam=%.3f)\n", t, name[q], m, i, j, k,
-                            cut.lambda[am]);
-            }
-            std::fflush(stdout);
-            return 2;
+            reportBlowup(g, host, cut.lambda, t);
+            return 7;
         }
 
         std::swap(*dU0, *dU);
@@ -555,7 +526,7 @@ int main(int argc, char** argv)
         stage(*dU, *dS, 0.75, dt);
         stage(*dS, *dU, 1.0 / 3.0, dt);
 
-        if (t >= nextFrame) { writeFrame(); nextFrame += frameDt; }
+        if (out->wantsFrame(t) || out->wantsPng(t)) writeFrame(t);
 
         if (steps % 20 == 0)
         {
@@ -571,9 +542,10 @@ int main(int argc, char** argv)
             }
             const double maxDiv = gpu::maxAbsScalar(scr->div, *red);
 
-            stats << t << ',' << dt << ',' << K << ',' << cd << ',' << cl << ','
-                  << cdf << ',' << cfl << ',' << maxDiv << ',' << pcgIters << '\n';
-            stats.flush();
+            const double rowv[] = {t,   dt,  K,      cd,
+                                   cl,  cdf, cfl,    maxDiv,
+                                   double(pcgIters)};
+            (void)out->row("stats", rowv);
             if (steps % 200 == 0)
             {
                 std::printf("t=%.2f/%.2f cd=%.3f (cdf=%.3f) cl=%+.3f "
@@ -589,13 +561,8 @@ int main(int argc, char** argv)
     const double wallMs = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - wall0).count();
 
-    std::ofstream(prefix + ".json")
-        << "{\"nx\":" << n << ",\"ny\":" << n << ",\"frames\":" << frames
-        << ",\"frameDt\":" << frameDt << ",\"D\":" << D << ",\"reD\":" << reD
-        << ",\"cx\":" << cyl.cx / h - 1 << ",\"cy\":" << cyl.cy / h - 1
-        << ",\"R\":" << cyl.r / h << ",\"open\":" << int(open)
-        << ",\"msPerStep\":" << wallMs / double(steps) << "}\n";
+    out->setMsPerStep(wallMs / double(steps));
     std::printf("done: %ld steps, %d frames, %.2f ms/step\n",
-                steps, frames, wallMs / double(steps));
+                steps, out->frames(), wallMs / double(steps));
     return 0;
 }

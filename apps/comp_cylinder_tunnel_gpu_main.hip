@@ -6,8 +6,7 @@
 // Galilean boosts -- no start-up acoustic pulse.
 // Kennedy-Gruber central fluxes: smooth (shock-free) Mach only.
 #include "dns/comp.hpp"
-#include "dns/fieldpng.hpp"
-#include "dns/webframes.hpp"
+#include "dns/output.hpp"
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_far.hpp"
 #include "dns/gpu/comp_ghost.hpp"
@@ -197,48 +196,48 @@ int main(int argc, char** argv)
     const double tEnd = tRamp + flowThroughs * L / uInf;
     const double qRef = 0.5 * rhoInf * uInf * uInf * D;
 
-    std::ofstream stats(prefix + "_stats.csv");
-    stats << "t,dt,cd,cl,wmax\n";
-    std::ofstream(prefix + ".json")
-        << "{\"nx\":" << n << ",\"ny\":" << ny << ",\"frameDt\":" << frameDt
-        << ",\"D\":" << D << ",\"reD\":" << reD << ",\"mach\":" << mach
-        << ",\"nz\":" << nz << ",\"open\":" << (open ? 1 : 0)
-        << ",\"nscbc\":" << (nscbc ? 1 : 0) << ",\"ramp\":" << tRamp
-        << ",\"cx\":" << cxx / h << ",\"cy\":" << cyy / h << ",\"R\":" << R / h
-        << "}\n";
-    {
-        std::ofstream mf(prefix + "_mask.bin", std::ios::binary);
-        mf.write(reinterpret_cast<const char*>(mask.data()),
-                 std::streamsize(mask.size() * sizeof(float)));
-    }
-    std::ofstream vortFile(prefix + "_vort.bin", std::ios::binary);
-    std::ofstream speedFile(prefix + "_speed.bin", std::ios::binary);
-
-    // Live PNGs of the 2D fields (vorticity diverging, |u| viridis).
-    const std::string pngDir = "png_" + prefix;
-    const bool pngs = nz == 1;
-    if (pngs) std::filesystem::create_directories(pngDir);
-    const float vortScale = float(8.0 * uInf / D), speedMax = float(1.6 * uInf);
-    // Live browser frames (docs/viewer-format.md), same cadence as the PNGs.
-    std::unique_ptr<dns::WebFrames> web;
-    if (pngs) {
-        std::string sim = "{\"app\":\"comp_cylinder\",\"re\":" +
-                          std::to_string(reD) + ",\"mach\":" +
-                          std::to_string(mach) + ",\"nscbc\":" +
-                          std::to_string(nscbc ? 1 : 0) + "}";
-        web = std::make_unique<dns::WebFrames>("web_" + prefix, n, ny, sim);
-        web->addField("vort", "diverging", -vortScale, vortScale);
-        web->addField("speed", "sequential", 0.0, speedMax);
-        web->writeStatic("mask", mask.data(), 0.0, 1.0);
-    }
+    // Every run artefact goes through the one sink.
+    RunMeta rm;
+    rm.nx = n; rm.ny = ny; rm.nz = nz;
+    rm.hx = h; rm.hy = h; rm.hz = g.hz;
+    rm.D = D; rm.re = reD; rm.mach = mach; rm.frameDt = frameDt;
+    rm.body = "cylinder";
+    rm.farField = nscbc ? (open ? "nscbc-open" : "nscbc") : (open ? "sponge-open" : "sponge");
+    rm.physics = "compressible";
+    rm.kick = kick;
 
     const int kc = nz / 2;
+    FrameGeometry fg;
+    fg.mask.assign(g.size(), 1.0f);
+    for (int k = 0; k < nz; ++k)
+        for (int j = 0; j < ny; ++j)
+            for (int i = 0; i < n; ++i)
+                fg.mask[g.idx(i, j, k)] = mask[std::size_t(j) * n + i];
+    fg.ic = n / 2; fg.jc = ny / 2; fg.kc = kc; fg.D = D;
+
+    RunOutput::Config oc;
+    oc.prefix = prefix;
+    oc.kinds = {Emit::Stats, Emit::Bin};
+    if (nz == 1) { oc.kinds.insert(Emit::Png); oc.kinds.insert(Emit::Web); }
+    oc.fdt = frameDt;
+    oc.pdt = pngDt;
+    oc.wdt = pngDt;
+    oc.simJson = "{\"app\":\"comp_cylinder\",\"re\":" + std::to_string(reD)
+               + ",\"mach\":" + std::to_string(mach)
+               + ",\"nscbc\":" + std::to_string(nscbc ? 1 : 0);
+    auto out = RunOutput::make(oc, rm, g, fg);
+    if (!out) {
+        std::fprintf(stderr, "output init failed: %s\n", out.error().c_str());
+        return 4;
+    }
+    const std::string cols[] = {"t", "dt", "cd", "cl", "wmax"};
+    out->declareSeries("stats", cols);
+
+    const float vortScale = float(8.0 * uInf / D), speedMax = float(1.6 * uInf);
     std::vector<Real> hr(g.size()), hmx(g.size()), hmy(g.size());
-    std::vector<float> frame(std::size_t(n) * ny);
     std::vector<double> uu(g.size()), vv(g.size());
-    int frames = 0, pngIdx = 0;
-    std::vector<float> vortKeep(web ? std::size_t(n) * ny : 0);
-    auto writeFrame = [&](bool bins, bool png, double tNow) {
+    std::vector<float> vortF(g.size()), speedF(g.size());
+    auto writeFrame = [&](double tNow) {
         (void)ds->rho.download(hr.data());
         (void)ds->mx.download(hmx.data());
         (void)ds->my.download(hmy.data());
@@ -251,44 +250,20 @@ int main(int argc, char** argv)
         };
         for (int j = 0; j < ny; ++j)
             for (int i = 0; i < n; ++i) {
+                const std::size_t c = g.idx(i, j, kc);
                 const double wz = (at(vv, i + 1, j) - at(vv, i - 1, j)) / (2 * h) -
                                   (at(uu, i, j + 1) - at(uu, i, j - 1)) / (2 * h);
-                frame[std::size_t(j) * n + i] = float(wz);
+                vortF[c] = float(wz);
+                speedF[c] = float(std::sqrt(uu[c] * uu[c] + vv[c] * vv[c]));
             }
-        if (bins)
-            vortFile.write(reinterpret_cast<const char*>(frame.data()),
-                           std::streamsize(frame.size() * sizeof(float)));
-        char pth[4096];
-        if (png && pngs) {
-            std::snprintf(pth, sizeof pth, "%s/vort_%05d.png", pngDir.c_str(),
-                          pngIdx);
-            dns::writeDivergingPng(pth, n, ny, frame.data(), vortScale,
-                                   mask.data());
-            if (web) vortKeep = frame; // held until speed is computed
-        }
-        for (int j = 0; j < ny; ++j)
-            for (int i = 0; i < n; ++i) {
-                const std::size_t c = g.idx(i, j, kc);
-                frame[std::size_t(j) * n + i] =
-                    float(std::sqrt(uu[c] * uu[c] + vv[c] * vv[c]));
-            }
-        if (bins)
-            speedFile.write(reinterpret_cast<const char*>(frame.data()),
-                            std::streamsize(frame.size() * sizeof(float)));
-        if (png && pngs) {
-            std::snprintf(pth, sizeof pth, "%s/speed_%05d.png", pngDir.c_str(),
-                          pngIdx);
-            dns::writeSequentialPng(pth, n, ny, frame.data(), 0.0f, speedMax,
-                                    mask.data());
-            if (web) web->writeFrame(tNow, {vortKeep.data(), frame.data()});
-        }
-        if (bins) ++frames;
-        if (png) ++pngIdx;
+        const FrameField ff[2]{{"vort", vortF.data(), 0, vortScale, true},
+                               {"speed", speedF.data(), 0, speedMax, false}};
+        if (auto r = out->frame(tNow, FrameViews{ff}); !r)
+            std::fprintf(stderr, "frame write failed: %s\n", r.error().c_str());
     };
 
     double t = 0.0;
     long steps = 0, lastLog = 0;
-    double nextFrame = 0.0, nextPng = 0.0;
     const auto wall0 = std::chrono::steady_clock::now();
 
     // stableDt costs two full-grid reductions + host syncs; the acoustic CFL
@@ -303,7 +278,7 @@ int main(int argc, char** argv)
         const double dt = std::min(tEnd - t, dtStab);
         if (dtStab < 1e-6) {
             std::fprintf(stderr, "dt collapsed at t=%.3f -- blowup\n", t);
-            return 1;
+            return 7;
         }
         dev->step(*ds, Real(dt));
         if (t < tRamp) { // quiet start: boost the frame, retarget the sponge
@@ -322,28 +297,22 @@ int main(int argc, char** argv)
             const double cd = F.fx / (qRef * span);
             const double cl = F.fy / (qRef * span);
             const double wmax = cfl / dtStab * std::min(g.hx, g.hy);
-            stats << t << ',' << dt << ',' << cd << ',' << cl << ',' << wmax << '\n';
+            const double rowv[] = {t, dt, cd, cl, wmax};
+            (void)out->row("stats", rowv);
             if (steps - lastLog >= 4000 || t >= tEnd)
                 std::printf("t=%.2f/%.2f cd=%.3f cl=%+.3f wmax=%.2f dt=%.2e\n", t,
                             tEnd, cd, cl, wmax, dt);
             lastLog = steps;
         }
-        if (t >= nextFrame || t >= nextPng) {
-            const bool bins = t >= nextFrame, png = t >= nextPng;
-            writeFrame(bins, png, t);
-            if (bins) nextFrame += frameDt;
-            if (png) nextPng += pngDt;
-        }
+        if (out->wantsFrame(t) || out->wantsPng(t) || out->wantsWeb(t))
+            writeFrame(t);
     }
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - wall0)
                           .count() /
                       double(steps);
-    std::printf("done: %ld steps, %d frames, %.2f ms/step\n", steps, frames, ms);
-    std::ofstream(prefix + ".json")
-        << "{\"nx\":" << n << ",\"ny\":" << ny << ",\"frames\":" << frames
-        << ",\"frameDt\":" << frameDt << ",\"D\":" << D << ",\"reD\":" << reD
-        << ",\"mach\":" << mach << ",\"cx\":" << cxx / h << ",\"cy\":" << cyy / h
-        << ",\"R\":" << R / h << ",\"msPerStep\":" << ms << "}\n";
+    out->setMsPerStep(ms);
+    std::printf("done: %ld steps, %d frames, %.2f ms/step\n", steps,
+                out->frames(), ms);
     return 0;
 }
