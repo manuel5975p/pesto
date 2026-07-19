@@ -17,6 +17,7 @@
 //          [--cfl C] [--out prefix]
 #include "dns/comp.hpp"
 #include "dns/cutcell.hpp"
+#include "dns/geometry.hpp"
 #include "dns/meshsdf.hpp"
 #include "dns/trimesh.hpp"
 #include "dns/webframes.hpp"
@@ -178,8 +179,13 @@ int main(int argc, char** argv)
 
     // Exact frontal area from supersampled cut apertures (drag reference only;
     // the solver itself never uses the cut geometry, only the ghost wall).
-    const double halfDiag = 0.5 * std::sqrt(3.0) * h;
-    auto cut = makeMeshCut(g, sdf, -halfDiag, halfDiag);
+    auto cutR = sampleCut(g, [&](double x, double y, double z) { return sdf(x, y, z); });
+    if (!cutR)
+    {
+        std::fprintf(stderr, "cut geometry: %s\n", cutR.error().c_str());
+        return 3;
+    }
+    auto cut = std::move(*cutR);
     const auto sst = sanitizeCut(g, cut);
     double aFront = 0.0;
     for (int k = 0; k < nz; ++k)

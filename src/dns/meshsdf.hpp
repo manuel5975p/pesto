@@ -57,12 +57,4 @@ private:
     bool watertight_ = false;
 };
 
-// Cut geometry by supersampling the sdf: lambda from 4^3 cell samples,
-// apertures from 4^2 face samples, only inside the band
-// bandLo < sdf(center) < bandHi (outside: trivially solid/fluid).
-// Pre: bandLo <= -halfCellDiag < halfCellDiag <= bandHi; sdf ~ true distance
-// near the surface. Post: run sanitizeCut before solving.
-CutGeometry makeMeshCut(const Grid& g, const MeshSdf& sdf, double bandLo,
-                        double bandHi);
-
 } // namespace dns

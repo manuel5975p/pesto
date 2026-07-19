@@ -13,6 +13,7 @@
 //          [--scale s (0 = fit max extent to L/DRatio)] [--pitch deg]
 //          [--yaw deg] [--robust] [--open] [--ft flowThroughs] [--fdt frameDt]
 //          [--tol rms] [--out prefix]
+#include "dns/geometry.hpp"
 #include "dns/meshsdf.hpp"
 #include "dns/trimesh.hpp"
 
@@ -308,8 +309,13 @@ int main(int argc, char** argv)
         std::printf("# WARNING: mesh not watertight%s\n",
                     robust ? "" : "; consider --robust");
 
-    const double halfDiag = 0.5 * std::sqrt(3.0) * h;
-    auto cut = makeMeshCut(g, sdf, -halfDiag, halfDiag);
+    auto cutR = sampleCut(g, [&](double x, double y, double z) { return sdf(x, y, z); });
+    if (!cutR)
+    {
+        std::fprintf(stderr, "cut geometry: %s\n", cutR.error().c_str());
+        return 3;
+    }
+    auto cut = std::move(*cutR);
     const auto st = sanitizeCut(g, cut); // before the ring: body cells only
 
     // Projected frontal area from the apertures: a (j,k) stream column is

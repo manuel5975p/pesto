@@ -1,11 +1,12 @@
-// MeshSdf + mesh loaders + makeMeshCut against analytic oracles (CPU only).
+// MeshSdf + mesh loaders + sampleCut against analytic oracles (CPU only).
 //  1) cube mesh: MeshSdf == exact box sdf (vertex/edge/face pseudonormals).
 //  2) icosphere: |MeshSdf - sphere sdf| < faceting sag; sign exact off-surface.
 //  3) pseudonormal vs winding-number sign agreement at every cell center
 //     (default and robust classification of solid cells must match).
-//  4) makeMeshCut: solid-volume vs exact mesh volume, x-plane aperture deficit
+//  4) sampleCut: solid-volume vs exact mesh volume, x-plane aperture deficit
 //     vs cross-circle area (coarse: supersampling), sanitizeCut invariants.
 //  5) STL round-trip: binary and ASCII through temp files.
+#include "dns/geometry.hpp"
 #include "dns/meshsdf.hpp"
 
 #include "mesh_test_util.hpp"
@@ -213,8 +214,9 @@ int main()
     }
 
     // --- 4) makeMeshCut geometry + sanitize invariants ---
-    const double halfDiag = 0.5 * std::sqrt(3.0) * h;
-    auto cut = makeMeshCut(g, sdf, -halfDiag, halfDiag);
+    auto cutR = sampleCut(g, [&](double x, double y, double z) { return sdf(x, y, z); });
+    if (!cutR) { std::printf("FAIL: sampleCut: %s\n", cutR.error().c_str()); return 1; }
+    auto cut = std::move(*cutR);
     {
         double solid = 0.0;
         for (double l : cut.lambda) solid += 1.0 - l;
