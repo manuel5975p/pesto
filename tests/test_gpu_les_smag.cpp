@@ -1,16 +1,20 @@
-// DeviceSmagorinsky (gpu/les.hpp), the incompressible 2D LES model, tested
+// DeviceSmagorinsky (gpu/les.hpp), the incompressible LES model, tested
 // against the library directly. This test used to shell out to a built
 // cylinder_tunnel_gpu because the kernels lived in that app's anonymous
 // namespace; linking dns_gpu instead is the proof the lift was faithful.
 //
 // Checks:
-//   1. make() rejects cs <= 0 and rejects nz > 1 (the model is 2D-only).
+//   1. make() rejects cs <= 0 and accepts nz > 1 (full 3D since 2026-07-20).
 //   2. nut >= 0 everywhere, is exactly 0 on the domain-boundary ring, and is
 //      exactly 0 in solid cells (lambda == 0 scales it away).
 //   3. nut scales as cs^2 for a fixed field.
 //   4. A uniform field produces nut == 0 (|S| == 0) and no eddy flux.
 //   5. The eddy-diffusion substep DISSIPATES: sum u . div(nut grad u) < 0 for a
 //      sheared field, i.e. the sign of the model term is right.
+//   6. 3D: a z-extruded field on cubic cells reproduces the 2D nut plane by
+//      plane (the z terms vanish, Delta^2 matches), the 3D substep dissipates
+//      a genuinely 3D field, and the conservative flux form conserves each
+//      momentum component over the periodic box.
 //
 // No HIP device -> skip (exit 77).
 
@@ -58,8 +62,8 @@ int main()
           "make() rejects cs < 0");
     {
         const auto g3 = Grid::make(8, 8, 8, 1.0, 1.0, 1.0);
-        check(!gpu::DeviceSmagorinsky::make(gpu::GpuGrid::from(g3), 0.2).has_value(),
-              "make() rejects nz > 1 (the model is 2D-only)");
+        check(gpu::DeviceSmagorinsky::make(gpu::GpuGrid::from(g3), 0.2).has_value(),
+              "make() accepts nz > 1 (the model is 3D)");
     }
 
     // Geometry: all fluid except a solid block, so lambda damping is exercised.
@@ -175,6 +179,97 @@ int main()
         std::printf("eddy power = %.6g\n", power);
         check(std::isfinite(power) && power < 0,
               "eddy diffusion removes energy (power < 0)");
+    }
+
+    // --- (6) 3D --------------------------------------------------------------
+    {
+        const int nz = 8;
+        // Cubic cells, h = 1/n: Delta^2 = (h^3)^(2/3) = h^2 = the 2D hx*hy.
+        const auto g3 = Grid::make(n, n, nz, 1.0, 1.0, double(nz) / n);
+        const auto gg3 = gpu::GpuGrid::from(g3);
+
+        CutGeometry cut3{zeros(g3), zeros(g3), zeros(g3), zeros(g3)};
+        for (std::size_t c = 0; c < g3.size(); ++c)
+        {
+            cut3.lambda[c] = 1.0;
+            cut3.ax[c] = cut3.ay[c] = cut3.az[c] = 1.0;
+        }
+        for (int k = 0; k < nz; ++k)
+            for (int j = 12; j < 20; ++j)
+                for (int i = 12; i < 20; ++i) cut3.lambda[g3.idx(i, j, k)] = 0.0;
+        auto dCut3 = gpu::DeviceCutGeometry::make(cut3);
+        auto dU3 = gpu::DeviceField::make(g3.size());
+        auto dOut3 = gpu::DeviceField::make(g3.size());
+        if (!(dCut3 && dU3 && dOut3)) { std::printf("3d alloc failed\n"); return 1; }
+
+        // z-extrusion of the 2D sheared field: every z term is zero, so nut
+        // must reproduce the 2D plane wherever both grids are interior.
+        auto U3 = VectorField::zeros(g3);
+        for (int k = 0; k < nz; ++k)
+            for (int j = 0; j < n; ++j)
+                for (int i = 0; i < n; ++i)
+                {
+                    U3.u[g3.idx(i, j, k)] = U.u[g.idx(i, j, 0)];
+                    U3.v[g3.idx(i, j, k)] = U.v[g.idx(i, j, 0)];
+                }
+        (void)gpu::uploadField(U3, *dU3);
+        auto les3 = gpu::DeviceSmagorinsky::make(gg3, 0.2);
+        if (!les3) return 1;
+        les3->computeNut(*dU3, *dCut3);
+        std::vector<Real> nut3(g3.size());
+        (void)les3->nut().download(nut3.data());
+        double worst = 0;
+        for (int j = 1; j < n - 1; ++j)
+            for (int i = 1; i < n - 1; ++i)
+            {
+                const double a = nutB[g.idx(i, j, 0)];
+                const double b = nut3[g3.idx(i, j, nz / 2)];
+                worst = std::max(worst, std::abs(a - b));
+            }
+        check(worst < 1e-6, "extruded field reproduces the 2D nut plane");
+        bool ringZ = true;
+        for (int j = 0; j < n; ++j)
+            for (int i = 0; i < n; ++i)
+                if (nut3[g3.idx(i, j, 0)] != 0 || nut3[g3.idx(i, j, nz - 1)] != 0)
+                    ringZ = false;
+        check(ringZ, "3d nut == 0 on the z boundary ring");
+
+        // Genuinely 3D field: dissipation and per-component conservation.
+        for (int k = 0; k < nz; ++k)
+            for (int j = 0; j < n; ++j)
+                for (int i = 0; i < n; ++i)
+                {
+                    using std::numbers::pi;
+                    const double x = double(i) / n, y = double(j) / n,
+                                 z = double(k) / nz;
+                    const auto c = g3.idx(i, j, k);
+                    U3.u[c] += 0.2 * std::sin(2 * pi * z);
+                    U3.w[c] = 0.4 * std::sin(2 * pi * x) * std::cos(2 * pi * y)
+                            + 0.1 * std::cos(2 * pi * z);
+                }
+        (void)gpu::uploadField(U3, *dU3);
+        les3->computeNut(*dU3, *dCut3);
+        (void)hipMemset(dOut3->u.data(), 0, g3.size() * sizeof(Real));
+        (void)hipMemset(dOut3->v.data(), 0, g3.size() * sizeof(Real));
+        (void)hipMemset(dOut3->w.data(), 0, g3.size() * sizeof(Real));
+        les3->addEddyDiffusion(*dU3, Real(1), *dOut3);
+        auto R3 = VectorField::zeros(g3);
+        (void)gpu::downloadField(*dOut3, R3);
+        double power = 0, su = 0, sv = 0, sw = 0, mag = 0;
+        for (std::size_t c = 0; c < g3.size(); ++c)
+        {
+            power += U3.u[c] * R3.u[c] + U3.v[c] * R3.v[c] + U3.w[c] * R3.w[c];
+            su += R3.u[c];
+            sv += R3.v[c];
+            sw += R3.w[c];
+            mag += std::abs(R3.u[c]) + std::abs(R3.v[c]) + std::abs(R3.w[c]);
+        }
+        std::printf("3d eddy power = %.6g\n", power);
+        check(std::isfinite(power) && power < 0, "3d eddy diffusion dissipates");
+        check(mag > 0
+                  && std::abs(su) < 1e-3 * mag && std::abs(sv) < 1e-3 * mag
+                  && std::abs(sw) < 1e-3 * mag,
+              "3d flux form conserves momentum over the periodic box");
     }
 
     std::printf("%s\n", pass ? "ALL OK" : "FAILURES");

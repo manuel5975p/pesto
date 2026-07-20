@@ -396,6 +396,78 @@ double lateralVortexAlongFace()
     return resid / v0;
 }
 
+// Potential correction, neutral parameters (Q = 0, aBody = 0): the targets
+// reduce to uniform freestream and the state after N steps must be BITWISE
+// identical to the uncorrected boundary — no 2D run moves unless the flag is
+// armed with a real source.
+bool potNeutralBitIdentical()
+{
+    auto init = [](Rig& r) {
+        const double Lx = r.g.nx * r.g.hx, Ly = r.g.ny * r.g.hy;
+        setState(r, [&](double x, double y) {
+            const double dx = x - 0.5 * Lx, dy = y - 0.5 * Ly, kw = 6 * r.g.hx;
+            const double e = 0.05 * uInf * std::exp(-(dx * dx + dy * dy) / (kw * kw));
+            return std::array{rhoInf, uInf + 2 * dy / kw * e, -2 * dx / kw * e,
+                              pInf};
+        });
+    };
+    Rig a(96, 48, 1e-3), b(96, 48, 1e-3);
+    gpu::DeviceCompNscbc::Config c{rhoInf, uInf, pInf, gam};
+    c.potCorrect = true; // Q defaults to 0, aBody = 0
+    c.xc = 0.3 * a.g.nx * a.g.hx;
+    c.yc = 0.5 * a.g.ny * a.g.hy;
+    b.nsc = gpu::DeviceCompNscbc::make(b.g, c);
+    if (!b.nsc) return false;
+    init(a);
+    init(b);
+    for (int it = 0; it < 50; ++it) {
+        const double dt = a.dev->stableDt(*a.ds, *a.red);
+        a.dev->step(*a.ds, gpu::Real(dt));
+        b.dev->step(*b.ds, gpu::Real(dt));
+    }
+    auto ha = CompState::zeros(a.g), hb = CompState::zeros(b.g);
+    (void)a.ds->download(ha);
+    (void)b.ds->download(hb);
+    for (std::size_t q = 0; q < a.g.size(); ++q)
+        if (ha.rho[q] != hb.rho[q] || ha.mx[q] != hb.mx[q] ||
+            ha.my[q] != hb.my[q] || ha.E[q] != hb.E[q])
+            return false;
+    return true;
+}
+
+// Armed correction (Q > 0, aBody > 0) about a centre mid-domain: the stiff
+// inflow now relaxes toward the source/doublet DEFICIT, so from uniform
+// freestream the inflow-row u must settle below uInf, onto the potential
+// target, and the state must stay finite.
+double potInflowDeficit()
+{
+    Rig r(96, 48, 1e-3);
+    const double Lx = r.g.nx * r.g.hx, Ly = r.g.ny * r.g.hy;
+    gpu::DeviceCompNscbc::Config c{rhoInf, uInf, pInf, gam};
+    c.potCorrect = true;
+    c.xc = 0.5 * Lx;
+    c.yc = 0.5 * Ly;
+    c.aBody = 0.06 * Lx;
+    r.nsc = gpu::DeviceCompNscbc::make(r.g, c);
+    if (!r.nsc) return 1e9;
+    r.nsc->setWakeSource(0.1 * uInf * Lx); // strong, well-defined source
+    setState(r, [](double, double) {
+        return std::array{rhoInf, uInf, 0.0, pInf};
+    });
+    r.run(2.0 * Lx / uInf);
+    auto h = CompState::zeros(r.g);
+    (void)r.ds->download(h);
+    // Expected target on the inflow centreline.
+    const double dx = 0.5 * r.g.hx - c.xc;
+    const double uPot = uInf + 0.1 * uInf * Lx / (2 * M_PI) * dx / (dx * dx) -
+                        uInf * c.aBody * c.aBody / (dx * dx);
+    const std::size_t cIn = r.g.idx(0, r.g.ny / 2, 0);
+    if (!std::isfinite(h.mx[cIn]) || !std::isfinite(h.rho[cIn])) return 1e9;
+    const double uIn = h.mx[cIn] / h.rho[cIn];
+    std::printf("pot inflow u: %.4f (target %.4f)\n", uIn, uPot);
+    return std::abs(uIn - uPot) / (uInf - uPot); // relative to the deficit
+}
+
 } // namespace
 
 int main()
@@ -445,6 +517,13 @@ int main()
     const double fres = lateralVortexAlongFace();
     std::printf("lateral vortex-on-face residual |v|/v0: %.3f\n", fres);
     check(fres < 0.2, "vortex on open lateral face, residual < 20%");
+
+    check(potNeutralBitIdentical(),
+          "potCorrect with Q = 0, aBody = 0 is bit-identical");
+
+    const double pres = potInflowDeficit();
+    check(pres < 0.5, "armed potential targets pull the inflow row onto the "
+                      "source/doublet deficit");
 
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

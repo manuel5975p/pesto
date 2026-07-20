@@ -79,6 +79,11 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         nc.betaTrans = r.nscbcBeta;
         nc.openY = r.open;
         nc.openZ = r.open && g.nz > 1;
+        nc.potCorrect = r.nscbcPot;
+        nc.xc = r.cx;
+        nc.yc = r.cy;
+        nc.zc = r.cz;
+        nc.aBody = 0.5 * r.D;
         auto m = DeviceCompNscbc::make(g, nc);
         if (!m) return fail(6, "NSCBC init failed");
         nsc = std::move(*m);
@@ -146,6 +151,11 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     long lastLog = 0;
     double dtStab = 0.0;
     int sinceDt = 1 << 30;
+    // Potential-correction wake source: EMA of F_drag/(rhoInf uInf) over
+    // ~2 D/uInf so the shedding oscillation does not feed back into the
+    // far-field target. Fed only past the quiet-start ramp (the ramp's
+    // inertial force is not drag).
+    double qEma = 0.0, tQ = r.ramp;
     const auto wall0 = std::chrono::steady_clock::now();
 
     while (t < r.tEnd)
@@ -190,6 +200,16 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
             st.cd = F.fx / (r.qRef * span);
             st.cl = F.fy / (r.qRef * span);
             st.cs = F.fz / (r.qRef * span);
+            if (nsc && r.nscbcPot && t > r.ramp)
+            {
+                const double Qinst = std::clamp(F.fx / (r.rhoInf * r.uInf),
+                                                0.0, 2.0 * r.D * r.uInf * span);
+                const double alpha =
+                    std::min(1.0, (t - tQ) / (2.0 * r.D / r.uInf));
+                qEma += alpha * (Qinst - qEma);
+                tQ = t;
+                nsc->setWakeSource(qEma);
+            }
             const double wmax =
                 r.cfl / dtStab * std::min({g.hx, g.hy, g.hz});
             const double row[] = {t, dt, st.cd, st.cl, st.cs, wmax};

@@ -21,6 +21,15 @@ namespace dns::gpu {
 // A Dirichlet u = uInf far field clamps the velocity against the sheared
 // interior flow and paints a vortex sheet along the wall. Never reintroduce it.
 //
+// openLat: OPEN lateral faces instead of walls (sponge-free free stream).
+// Tangential ghosts keep the zero-gradient mirror; the NORMAL velocity on the
+// lateral boundary faces is zero-gradient from the nearest interior face (the
+// displacement/dipole field vents; relaxing it is a wall in disguise). Those
+// faces carry prescribed flux at zero aperture exactly like the inlet/outlet:
+// addFluxRhs adds them to the projection RHS, correctOutletFlux closes the
+// global balance uInf*Ain = Qout + Qlat at the outlet plane, and the pressure
+// stays Neumann/DCT. openLat == false is bit-identical to the wall tunnel.
+//
 // Ghost corners are mirrored DIAGONALLY: an edge cell takes the single
 // (jm,km) value, and the k == 0 w row is explicitly antimirrored. At nz == 1
 // km == k identically, so this reduces exactly to the y-only treatment -- one
@@ -33,14 +42,28 @@ public:
     struct Config
     {
         double uInf = 1.0;
+        bool openLat = false; // open lateral faces (y, and z when nz > 1)
+        // Potential-corrected INLET (requires openLat): the Dirichlet inlet
+        // becomes u = uInf + wake source + displacement doublet (v likewise),
+        // removing the finite-domain bias of pinning u = uInf a few D
+        // upstream of the body. The wake-source strength Q = F_drag / uInf is
+        // fed via setWakeSource (EMA-smoothed by the caller). The lateral
+        // faces stay free (zero-gradient) -- they already vent adaptively.
+        // pot with Q == 0 and aBody == 0 reproduces the uniform inlet.
+        bool pot = false;
+        double xc = 0, yc = 0, zc = 0; // body centre (world coords)
+        double aBody = 0;              // displacement radius (D/2)
     };
 
     static std::expected<DeviceTunnelBc, hipError_t> make(const GpuGrid&, Config);
 
     // cdt = uInf*dt/hx drives the outlet from `in`. cdt == 0 with `in` aliased
-    // to `out` is a pure ghost refresh.
+    // to `out` is a pure ghost refresh. refreshOnly (open laterals, after the
+    // projection): keep the prescribed lateral boundary fluxes the projection
+    // balanced, update only the ghost rows.
     // Pre: same grid, same size.
-    void apply(const DeviceField& in, DeviceField& out, double cdt) const;
+    void apply(const DeviceField& in, DeviceField& out, double cdt,
+               bool refreshOnly = false) const;
 
     // Restore exact global mass balance on the open outlet plane.
     void correctOutletFlux(DeviceField&, ReduceScratch&, DeviceScalar& tmp) const;
@@ -50,10 +73,15 @@ public:
     // the one passed to divergenceCut.
     void addFluxRhs(const DeviceField&, double scale, DeviceScalar& rhs) const;
 
+    // Wake-source strength Q = F_drag / uInf for the potential-corrected
+    // inlet. Pre: Q >= 0, finite. Ignored unless Config::pot.
+    void setWakeSource(double Q) { Q_ = Q; }
+
 private:
     DeviceTunnelBc(const GpuGrid& g, Config c) : g_(g), cfg_(c) {}
     GpuGrid g_;
     Config cfg_;
+    double Q_ = 0;
 };
 
 // Cosine-ramped fringe relaxing u -> (uInf,0,0) on the domain boundaries of a

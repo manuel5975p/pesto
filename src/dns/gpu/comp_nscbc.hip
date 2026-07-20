@@ -2,6 +2,7 @@
 
 #include "dns/gpu/comp_flux.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/farpot.hpp"
 #include "dns/gpu/index.hpp"
 
 #include <cmath>
@@ -34,7 +35,8 @@ __global__ void kNscbcCells(GpuGrid g, Real mu, Real kappa, Real gam, PrimView q
                             int openY, int openZ, Real invLx, Real invLy,
                             Real invLz, Real sigma, Real etaIn, Real omM2,
                             Real betaT, Real sigLat, Real etaLat, Real uT,
-                            Real rhoI, Real pI, Real* krho, Real* kmx,
+                            Real rhoI, Real pI, int pot, Real Q, Real dbl,
+                            Real xc, Real yc, Real zc, Real* krho, Real* kmx,
                             Real* kmy, Real* kmz, Real* kE)
 {
     // Disjoint boundary enumeration: x faces own their full slabs, y faces
@@ -95,6 +97,25 @@ __global__ void kNscbcCells(GpuGrid g, Real mu, Real kappa, Real gam, PrimView q
         return (fp - fm) * (Real(0.5) / hh[d]);
     };
 
+    // Far-field target: uniform freestream, or (pot) freestream + wake source
+    // + displacement doublet with the Bernoulli pressure. tgt == {uT,0,0} and
+    // pPt == pI when pot is off, keeping every form below bit-identical.
+    Real tgt[3] = {uT, 0, 0};
+    Real pPt = pI;
+    if (pot) {
+        Real du, dv, dw;
+        farPotential(g.nz == 1, (Real(i) + Real(0.5)) * g.hx - xc,
+                     (Real(j) + Real(0.5)) * g.hy - yc,
+                     (Real(k) + Real(0.5)) * g.hz - zc, Q, dbl,
+                     Real(4) * g.hx * g.hx, du, dv, dw);
+        tgt[0] += du;
+        tgt[1] = dv;
+        tgt[2] = dw;
+        pPt = pI + Real(0.5) * rhoI *
+                       (uT * uT - (tgt[0] * tgt[0] + tgt[1] * tgt[1] +
+                                   tgt[2] * tgt[2]));
+    }
+
     Real drdt = 0, dvdt[3] = {0, 0, 0}, dpdt = 0;
     Real trho = 0, tm[3] = {0, 0, 0}, tE = 0;
 
@@ -125,9 +146,9 @@ __global__ void kNscbcCells(GpuGrid g, Real mu, Real kappa, Real gam, PrimView q
         if (a == 0 && !hi) { // stiff subsonic inflow: only L1 leaves
             L1 = (un - cs) * (dp_ - r * cs * dun);
             L2 = etaIn * cs * c2 * invL[0] * (r - rhoI);
-            L3 = etaIn * cs * invL[0] * vc[t1];
-            L4 = etaIn * cs * invL[0] * vc[t2];
-            L5 = etaIn * omM2 * r * c2 * invL[0] * (un - uT);
+            L3 = etaIn * cs * invL[0] * (vc[t1] - tgt[t1]);
+            L4 = etaIn * cs * invL[0] * (vc[t2] - tgt[t2]);
+            L5 = etaIn * omM2 * r * c2 * invL[0] * (un - tgt[0]);
         } else { // outflow / lateral far field
             // Yoo-Im transverse correction on the incoming acoustic wave:
             // without partial cancellation of the transverse forcing, wake
@@ -144,7 +165,7 @@ __global__ void kNscbcCells(GpuGrid g, Real mu, Real kappa, Real gam, PrimView q
             const Real s = hi ? Real(1) : Real(-1);
             const Real sig = a == 0 ? sigma : sigLat;
             const Real om = a == 0 ? omM2 : Real(1); // lateral normal M ~ 0
-            const Real Lin = sig * om * cs * invL[a] * (p - pI) -
+            const Real Lin = sig * om * cs * invL[a] * (p - pPt) -
                              betaT * (Tp - s * r * cs * Tun);
             if (a == 0) { // x-outflow entropy/shear leave: one-sided compute
                 L2 = un * (c2 * dr_ - dp_);
@@ -157,10 +178,8 @@ __global__ void kNscbcCells(GpuGrid g, Real mu, Real kappa, Real gam, PrimView q
                 const Real Lout3 = un * dn(vf[t1]);
                 const Real Lout4 = un * dn(vf[t2]);
                 const Real Lin2 = etaLat * cs * c2 * invL[a] * (r - rhoI);
-                const Real Lin3 =
-                    etaLat * cs * invL[a] * (vc[t1] - (t1 == 0 ? uT : Real(0)));
-                const Real Lin4 =
-                    etaLat * cs * invL[a] * (vc[t2] - (t2 == 0 ? uT : Real(0)));
+                const Real Lin3 = etaLat * cs * invL[a] * (vc[t1] - tgt[t1]);
+                const Real Lin4 = etaLat * cs * invL[a] * (vc[t2] - tgt[t2]);
                 const Real w =
                     Real(0.5) * (Real(1) + tanh(s * un / (kLatBand * cs)));
                 L2 = w * Lout2 + (Real(1) - w) * Lin2;
@@ -203,7 +222,11 @@ std::expected<DeviceCompNscbc, hipError_t> DeviceCompNscbc::make(const Grid& g,
     const bool ok = g.nx >= 4 && c.rhoInf > 0 && c.pInf > 0 && c.gamma > 1 &&
                     c.sigma > 0 && c.etaIn > 0 && c.uInf >= 0 && c.uInf < cInf &&
                     (!c.openY || (g.ny >= 4 && c.sigLat > 0 && c.etaLat > 0)) &&
-                    (!c.openZ || (g.nz >= 4 && c.sigLat > 0 && c.etaLat > 0));
+                    (!c.openZ || (g.nz >= 4 && c.sigLat > 0 && c.etaLat > 0)) &&
+                    (!c.potCorrect ||
+                     (c.aBody >= 0 && std::isfinite(c.aBody) &&
+                      std::isfinite(c.xc) && std::isfinite(c.yc) &&
+                      std::isfinite(c.zc)));
     if (!ok) return std::unexpected(hipErrorInvalidValue);
     return DeviceCompNscbc(g, c);
 }
@@ -226,13 +249,17 @@ void DeviceCompNscbc::apply(const DeviceComp& d, const DeviceCompState& s,
              (c_.openZ ? std::size_t(g_.nx - 2) * (c_.openY ? g_.ny - 2 : g_.ny)
                        : 0));
     const double betaT = c_.betaTrans < 0 ? M : c_.betaTrans;
+    // Doublet strength tracks the ramped freestream: 2D u a^2, 3D u a^3 / 2.
+    const double a2 = c_.aBody * c_.aBody;
+    const double dbl = g_.nz == 1 ? u_ * a2 : 0.5 * u_ * a2 * c_.aBody;
     kNscbcCells<<<launchBlocks(nb), blockSize>>>(
         g_, d.mu(), d.kappaCond(), Real(c_.gamma), q, int(c_.openY),
         int(c_.openZ), Real(1.0 / (g_.nx * g_.hx)), Real(1.0 / (g_.ny * g_.hy)),
         Real(1.0 / (g_.nz * g_.hz)), Real(c_.sigma), Real(c_.etaIn),
         Real(1.0 - M * M), Real(betaT), Real(c_.sigLat), Real(c_.etaLat),
-        Real(u_), Real(c_.rhoInf), Real(c_.pInf), k.rho.data(), k.mx.data(),
-        k.my.data(), k.mz.data(), k.E.data());
+        Real(u_), Real(c_.rhoInf), Real(c_.pInf), int(c_.potCorrect), Real(Q_),
+        Real(dbl), Real(c_.xc), Real(c_.yc), Real(c_.zc), k.rho.data(),
+        k.mx.data(), k.my.data(), k.mz.data(), k.E.data());
     checkLastKernel("kNscbcCells");
 }
 

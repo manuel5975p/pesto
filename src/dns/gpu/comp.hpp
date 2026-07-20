@@ -10,6 +10,11 @@
 
 #include <expected>
 #include <functional>
+#include <optional>
+
+namespace dns {
+struct CurvMetrics;
+}
 
 namespace dns::gpu {
 
@@ -29,6 +34,17 @@ struct DeviceCompState
 // quiet starts = repeated small boosts tracking the freestream ramp.
 void boostX(const GpuGrid& g, DeviceCompState& s, double du);
 
+// Device tables of CurvMetrics (FP32, like the fields); hmin stays host-side
+// for the viscous dt limit.
+struct DeviceCurv
+{
+    DeviceScalar S[3][3], Ji[3][9], invVol, aov[3];
+    double hmin = 0.0;
+
+    // m must come from CurvMetrics::build (already validated).
+    static std::expected<DeviceCurv, hipError_t> make(const CurvMetrics& m);
+};
+
 // Owns RK3 / primitive scratch; periodic domain (BCs via the stage hook).
 class DeviceComp
 {
@@ -41,6 +57,14 @@ public:
     // nz == 1 (the |S| z-shear terms cancel by periodic wrap).
     static std::expected<DeviceComp, hipError_t> make(const Grid& g, double gamma,
                                                       double mu, double csLes = 0.0);
+
+    // Curvilinear variant on a distorted regular mesh (dns/curvmesh.hpp):
+    // rhs/stableDt switch to the finite-volume metric form, everything else
+    // (RK3, primitives, hooks) is shared. No LES on curvilinear meshes.
+    static std::expected<DeviceComp, hipError_t> make(const CurvMetrics& m,
+                                                      double gamma, double mu);
+
+    bool curvilinear() const { return curv_.has_value(); }
 
     // One SSP-RK3 step in place; dt within stableDt.
     void step(DeviceCompState& s, Real dt);
@@ -89,6 +113,7 @@ private:
     Real smagCd_ = Real(0); // Cs^2 * Delta^2 (filter width folded in)
     Real prt_ = Real(0.9);  // turbulent Prandtl number
     DeviceCompState k_, q1_, q2_;
+    std::optional<DeviceCurv> curv_; // engaged = curvilinear rhs/stableDt
     DeviceScalar u_, v_, w_, e_, p_, T_;
     DeviceScalar nut_;      // per-cell dynamic eddy viscosity (LES only)
     DeviceBuffer<const Real*> ptrs_; // axpy pointer table

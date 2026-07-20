@@ -70,20 +70,31 @@ int main()
     expect("flow --body cylinder --nz 2 --dry-run", 2, "--nz must be 1 or >= 4");
     expect("flow --body sphere --nz 1 --dry-run", 2,
            "a 3D body with --nz 1 is rejected");
-    expect("flow --body cylinder --les 0.1 --nz 8 --dry-run", 2,
-           "incompressible --les requires --nz 1");
+    expect("flow --body cylinder --les 0.1 --nz 8 --dry-run", 0,
+           "incompressible --les is 3D-capable");
     expect("flow --body cylinder --mach 0.2 --dry-run", 2,
            "--mach is compressible-only");
     expect("flow --physics compressible --body cylinder --far tunnel --dry-run", 2,
            "--far tunnel is incompressible-only");
-    expect("flow --body cylinder --far tunnel --open --dry-run", 2,
-           "--open is rejected, not ignored, with tunnel");
+    expect("flow --body cylinder --far tunnel --open --dry-run", 0,
+           "--open turns the tunnel laterals into open faces");
+    expect("flow --body cylinder --far fringe --open --dry-run", 2,
+           "--open is rejected, not ignored, with fringe");
     expect("flow --physics compressible --body cylinder --far nscbc "
            "--nscbc-beta 1.0 --dry-run", 2,
            "--nscbc-beta 1.0 is rejected (measured blow-up)");
     expect("flow --physics compressible --body cylinder --far nscbc "
            "--re 2000 --dry-run", 2,
            "pure NSCBC above Re 800 is rejected");
+    expect("flow --physics compressible --body cylinder --pot --dry-run", 2,
+           "--pot requires an open far field (sponge rejected)");
+    expect("flow --body cylinder --far tunnel --open --pot --dry-run", 0,
+           "--pot works with the incompressible open tunnel");
+    expect("flow --physics compressible --body cylinder --dr 4 --dry-run", 2,
+           "compressible --dr below 6 is rejected");
+    expect("flow --physics compressible --body cylinder --far nscbc --dr 16 "
+           "--dry-run", 0,
+           "compressible --dr widens the box");
     expect("flow --body cylinder --out '' --dry-run", 2, "an empty --out");
     expect("flow --body cylinder --dr 1e9 --dry-run", 2,
            "a body under 4 cells across");

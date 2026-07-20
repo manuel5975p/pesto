@@ -1,6 +1,9 @@
-// Optional incompressible Smagorinsky LES (2D only). nut = (Cs*Delta)^2 |S|
-// scaled by the fluid fraction lambda; the eddy-diffusion substep adds
-// b*dt*div(nut grad u) per RK stage in conservative flux form.
+// Optional incompressible Smagorinsky LES. nut = (Cs*Delta)^2 |S| scaled by
+// the fluid fraction lambda; the eddy-diffusion substep adds
+// b*dt*div(nut grad u) per RK stage in conservative flux form. Full 3D strain
+// and fluxes; at nz == 1 every z term is exactly zero and the model is
+// bit-identical to the historical 2D kernel (Delta^2 = hx*hy there,
+// (hx hy hz)^(2/3) in 3D).
 //
 // NOTE gradient form div(nut grad u), NOT the symmetric stress div(2 nut S).
 // The difference is dj(nut di uj): zero for constant nut with div u = 0,
@@ -32,8 +35,7 @@ namespace dns::gpu {
 class DeviceSmagorinsky
 {
 public:
-    // Pre: cs > 0, g.nz == 1 (the incompressible model is 2D-only; the shared
-    // compressible core carries its own 3D-valid LES).
+    // Pre: cs > 0.
     static std::expected<DeviceSmagorinsky, hipError_t> make(const GpuGrid&,
                                                              double cs);
 
@@ -44,7 +46,7 @@ public:
     void computeNut(const DeviceField& U, const DeviceCutGeometry&);
 
     // out += scale * div(nut grad U), conservative flux form with face- and
-    // corner-averaged nut. Explicitly stable: dt*nut/h^2 ~ Cs^2 * CFL << 1.
+    // edge-averaged nut. Explicitly stable: dt*nut/h^2 ~ Cs^2 * CFL << 1.
     void addEddyDiffusion(const DeviceField& U, Real scale, DeviceField& out) const;
 
     // The SGS viscosity field, for the body SGS-friction tally. Never enters
@@ -52,12 +54,12 @@ public:
     const DeviceScalar& nut() const { return nut_; }
 
 private:
-    DeviceSmagorinsky(const GpuGrid& g, Real cs2hh, DeviceScalar nut)
-        : g_(g), cs2hh_(cs2hh), nut_(std::move(nut))
+    DeviceSmagorinsky(const GpuGrid& g, Real cs2d2, DeviceScalar nut)
+        : g_(g), cs2d2_(cs2d2), nut_(std::move(nut))
     {}
 
     GpuGrid g_;
-    Real cs2hh_;
+    Real cs2d2_;
     DeviceScalar nut_;
 };
 

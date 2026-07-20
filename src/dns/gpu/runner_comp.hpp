@@ -33,6 +33,10 @@ struct CompRun
     int spongeCells = 0;         // 0 = clamp(0.1 nx, 8, nx/2 - 1)
     double nscbcBeta = 0.5;      // Yoo-Im transverse correction, in [0,1)
     int nscbcStrip = 0;          // absorbing strip inside the NSCBC rows
+    // Potential-corrected NSCBC targets: wake source from the EMA-smoothed
+    // measured drag + displacement doublet about the body centre.
+    bool nscbcPot = false;
+    double cx = 0, cy = 0, cz = 0; // body centre (world coords)
 
     // Quiet start. ramp > 0: the IC is at REST (exactly consistent with the
     // no-slip body) and the freestream is raised by uniform Galilean boosts

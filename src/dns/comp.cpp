@@ -1,5 +1,7 @@
 #include "dns/comp.hpp"
 
+#include "dns/curvmesh.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -17,6 +19,118 @@ struct Flux
     double rho, m[3], E;
 };
 
+Prim primitives(const Comp& c, const CompState& s)
+{
+    const std::size_t n = c.g.size();
+    Prim q;
+    for (int d = 0; d < 3; ++d) q.u[d].resize(n);
+    q.e.resize(n);
+    q.p.resize(n);
+    q.T.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        assert(s.rho[i] > 0.0);
+        q.u[0][i] = s.mx[i] / s.rho[i];
+        q.u[1][i] = s.my[i] / s.rho[i];
+        q.u[2][i] = s.mz[i] / s.rho[i];
+        q.e[i] = s.E[i] / s.rho[i];
+        q.p[i] = c.pressure(s.rho[i], s.mx[i], s.my[i], s.mz[i], s.E[i]);
+        q.T[i] = q.p[i] / (s.rho[i] * c.Rgas);
+    }
+    return q;
+}
+
+// Finite-volume curvilinear rhs: Kennedy-Gruber fluxes with the face area
+// vector S in place of the axis normal (Un = u_avg . S), viscous gradients
+// via the face inverse Jacobian, divergence scaled by the cell volume.
+void rhsCurv(const Comp& c, const CurvMetrics& m, const CompState& s,
+             CompState& out)
+{
+    const Grid& g = c.g;
+    const double cp = c.gamma * c.Rgas / (c.gamma - 1.0);
+    const double kappa = c.mu * cp / c.Pr;
+    const Prim q = primitives(c, s);
+
+    // Central index-space derivative (dxi = 1) of f along axis d.
+    auto ider = [&](const std::vector<double>& f, int i, int j, int k, int d) {
+        const int o[3] = {d == 0, d == 1, d == 2};
+        return 0.5 * (f[g.idx(i + o[0], j + o[1], k + o[2])] -
+                      f[g.idx(i - o[0], j - o[1], k - o[2])]);
+    };
+
+    // Total flux (convective minus viscous) through the +a face of cell.
+    auto faceFlux = [&](int i, int j, int k, int a) -> Flux {
+        const std::size_t ca = g.idx(i, j, k);
+        const int o[3] = {a == 0, a == 1, a == 2};
+        const int i2 = i + o[0], j2 = j + o[1], k2 = k + o[2];
+        const std::size_t cb = g.idx(i2, j2, k2);
+        const double Sv[3] = {m.S[a][0][ca], m.S[a][1][ca], m.S[a][2][ca]};
+
+        const double rm = 0.5 * (s.rho[ca] + s.rho[cb]);
+        double um[3];
+        for (int d = 0; d < 3; ++d) um[d] = 0.5 * (q.u[d][ca] + q.u[d][cb]);
+        const double em = 0.5 * (q.e[ca] + q.e[cb]);
+        const double pm = 0.5 * (q.p[ca] + q.p[cb]);
+        const double Un = um[0] * Sv[0] + um[1] * Sv[1] + um[2] * Sv[2];
+        Flux f{rm * Un,
+               {rm * Un * um[0] + pm * Sv[0], rm * Un * um[1] + pm * Sv[1],
+                rm * Un * um[2] + pm * Sv[2]},
+               rm * Un * em + pm * Un};
+        if (c.mu == 0.0) return f;
+
+        // d{u,v,w,T}/dxi at the face: normal compact, tangential averaged.
+        double dxi[4][3];
+        for (int f4 = 0; f4 < 4; ++f4) {
+            const std::vector<double>& fld = f4 < 3 ? q.u[f4] : q.T;
+            for (int d = 0; d < 3; ++d)
+                dxi[f4][d] = d == a
+                    ? fld[cb] - fld[ca]
+                    : 0.5 * (ider(fld, i, j, k, d) + ider(fld, i2, j2, k2, d));
+        }
+        double gr[4][3]; // d{u,v,w,T}/dx_c
+        for (int f4 = 0; f4 < 4; ++f4)
+            for (int cx = 0; cx < 3; ++cx) {
+                double sum = 0.0;
+                for (int d = 0; d < 3; ++d)
+                    sum += dxi[f4][d] * m.Ji[a][d * 3 + cx][ca];
+                gr[f4][cx] = sum;
+            }
+        const double divu = gr[0][0] + gr[1][1] + gr[2][2];
+        double eflux =
+            kappa * (gr[3][0] * Sv[0] + gr[3][1] * Sv[1] + gr[3][2] * Sv[2]);
+        for (int cx = 0; cx < 3; ++cx) {
+            double ts = 0.0; // (tau . S)_cx
+            for (int d = 0; d < 3; ++d)
+                ts += (c.mu * (gr[cx][d] + gr[d][cx]) -
+                       (cx == d ? 2.0 / 3.0 * c.mu * divu : 0.0)) * Sv[d];
+            f.m[cx] -= ts;
+            eflux += um[cx] * ts;
+        }
+        f.E -= eflux;
+        return f;
+    };
+
+    for (int k = 0; k < g.nz; ++k)
+        for (int j = 0; j < g.ny; ++j)
+            for (int i = 0; i < g.nx; ++i) {
+                const std::size_t cc = g.idx(i, j, k);
+                double drho = 0.0, dm[3] = {0, 0, 0}, dE = 0.0;
+                for (int a = 0; a < 3; ++a) {
+                    const int o[3] = {a == 0, a == 1, a == 2};
+                    const Flux hi = faceFlux(i, j, k, a);
+                    const Flux lo = faceFlux(i - o[0], j - o[1], k - o[2], a);
+                    drho -= hi.rho - lo.rho;
+                    for (int d = 0; d < 3; ++d) dm[d] -= hi.m[d] - lo.m[d];
+                    dE -= hi.E - lo.E;
+                }
+                const double iv = 1.0 / m.vol[cc];
+                out.rho[cc] = drho * iv;
+                out.mx[cc] = dm[0] * iv;
+                out.my[cc] = dm[1] * iv;
+                out.mz[cc] = dm[2] * iv;
+                out.E[cc] = dE * iv;
+            }
+}
+
 } // namespace
 
 CompState CompState::zeros(const Grid& g)
@@ -30,7 +144,18 @@ CompState CompState::zeros(const Grid& g)
 Comp Comp::make(const Grid& g, double gamma, double mu)
 {
     assert(gamma > 1.0 && mu >= 0.0);
-    return {g, gamma, mu, 0.72, 1.0};
+    return {g, gamma, mu, 0.72, 1.0, nullptr};
+}
+
+std::expected<Comp, std::string> Comp::make(const CurvMesh& mesh, double gamma,
+                                            double mu)
+{
+    assert(gamma > 1.0 && mu >= 0.0);
+    auto m = CurvMetrics::build(mesh);
+    if (!m) return std::unexpected(std::move(m.error()));
+    Comp c = make(mesh.g, gamma, mu);
+    c.curv = std::make_shared<const CurvMetrics>(std::move(*m));
+    return c;
 }
 
 double Comp::pressure(double rho, double mx, double my, double mz, double E) const
@@ -41,25 +166,12 @@ double Comp::pressure(double rho, double mx, double my, double mz, double E) con
 
 void Comp::rhs(const CompState& s, CompState& out) const
 {
-    const std::size_t n = g.size();
+    if (curv) return rhsCurv(*this, *curv, s, out);
+
     const double h[3] = {g.hx, g.hy, g.hz};
     const double cp = gamma * Rgas / (gamma - 1.0);
     const double kappa = mu * cp / Pr;
-
-    Prim q;
-    for (int c = 0; c < 3; ++c) q.u[c].resize(n);
-    q.e.resize(n);
-    q.p.resize(n);
-    q.T.resize(n);
-    for (std::size_t c = 0; c < n; ++c) {
-        assert(s.rho[c] > 0.0);
-        q.u[0][c] = s.mx[c] / s.rho[c];
-        q.u[1][c] = s.my[c] / s.rho[c];
-        q.u[2][c] = s.mz[c] / s.rho[c];
-        q.e[c] = s.E[c] / s.rho[c];
-        q.p[c] = pressure(s.rho[c], s.mx[c], s.my[c], s.mz[c], s.E[c]);
-        q.T[c] = q.p[c] / (s.rho[c] * Rgas);
-    }
+    const Prim q = primitives(*this, s);
 
     auto at = [&](const std::vector<double>& f, int i, int j, int k) {
         return f[g.idx(i, j, k)];
@@ -158,7 +270,9 @@ void Comp::step(CompState& s, double dt) const
 
 double Comp::stableDt(const CompState& s, double cfl) const
 {
-    // Per-axis (|u| + c)/h; degenerate axes impose no constraint.
+    // Per-axis (|u| + c)/h; degenerate axes impose no constraint. On a
+    // curvilinear mesh the width is 1/aov and |u| bounds the face-normal
+    // speed, so the curvilinear dt is conservative by construction.
     double wmax = 0.0, rhomin = s.rho[0];
     for (std::size_t i = 0; i < g.size(); ++i) {
         assert(s.rho[i] > 0.0);
@@ -166,16 +280,29 @@ double Comp::stableDt(const CompState& s, double cfl) const
         assert(p > 0.0);
         const double r = s.rho[i];
         const double c = std::sqrt(gamma * p / r);
-        double w = (std::abs(s.mx[i] / r) + c) / g.hx;
-        w = std::max(w, (std::abs(s.my[i] / r) + c) / g.hy);
-        if (g.nz > 1) w = std::max(w, (std::abs(s.mz[i] / r) + c) / g.hz);
+        double w = 0.0;
+        if (curv) {
+            const double sp = std::sqrt(s.mx[i] * s.mx[i] + s.my[i] * s.my[i] +
+                                        s.mz[i] * s.mz[i]) / r + c;
+            w = sp * std::max(curv->aov[0][i], curv->aov[1][i]);
+            if (g.nz > 1) w = std::max(w, sp * curv->aov[2][i]);
+        } else {
+            w = (std::abs(s.mx[i] / r) + c) / g.hx;
+            w = std::max(w, (std::abs(s.my[i] / r) + c) / g.hy);
+            if (g.nz > 1) w = std::max(w, (std::abs(s.mz[i] / r) + c) / g.hz);
+        }
         wmax = std::max(wmax, w);
         rhomin = std::min(rhomin, s.rho[i]);
     }
     double dt = cfl / wmax;
     if (mu > 0.0) {
-        double h = std::min(g.hx, g.hy);
-        if (g.nz > 1) h = std::min(h, g.hz);
+        double h;
+        if (curv) {
+            h = curv->hmin;
+        } else {
+            h = std::min(g.hx, g.hy);
+            if (g.nz > 1) h = std::min(h, g.hz);
+        }
         dt = std::min(dt, 0.25 * h * h * rhomin / mu);
     }
     return dt;

@@ -46,6 +46,18 @@ public:
         bool openY = false;
         bool openZ = false;
         double sigLat = 0.25; // lateral pressure-anchor strength
+        // Potential-corrected far-field targets: relax/anchor toward
+        // freestream + wake source (strength Q set via setWakeSource, from the
+        // measured drag) + displacement doublet (radius aBody about
+        // xc,yc,zc), with the Bernoulli pressure. Removes the finite-domain
+        // bias of uniform-freestream targets (pinning u = uInf ~2.7D upstream
+        // ignores the body's ~7% upstream influence at an 8D box). 2D
+        // (nz == 1) source+doublet or 3D forms. With potCorrect == false, or
+        // Q == 0 and aBody == 0, behaviour is bit-identical to the uniform
+        // targets; uniform freestream then stays an exact fixed point.
+        bool potCorrect = false;
+        double xc = 0, yc = 0, zc = 0; // body centre (world coords)
+        double aBody = 0;              // displacement radius (D/2)
         // Lateral entropy/shear relax rate where flow enters the domain. Keep
         // it gentle: a stiff lateral velocity clamp is a wall in disguise
         // (measured with the sponge far field: lateral u-relax cd 1.98 ~=
@@ -66,12 +78,18 @@ public:
     void setFreestream(double u) { u_ = u; }
     double freestream() const { return u_; }
 
+    // Wake-source strength Q = F_drag / (rhoInf uInf) for the potential
+    // correction; caller smooths (EMA) so the shedding oscillation does not
+    // feed back. Ignored unless potCorrect. Pre: Q >= 0, finite.
+    void setWakeSource(double Q) { Q_ = Q; }
+
 private:
     DeviceCompNscbc(const Grid& g, const Config& c);
 
     GpuGrid g_;
     Config c_;
     double u_, cInf_;
+    double Q_ = 0;
 };
 
 } // namespace dns::gpu

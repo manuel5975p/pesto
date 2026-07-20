@@ -84,6 +84,14 @@ int main()
     accepts("flow --physics compressible --body cylinder --far nscbc "
             "--nscbc-beta 0.5 --n 512");
     accepts("flow --physics compressible --body cylinder --far nscbc --open --n 512");
+    accepts("flow --physics compressible --body cylinder --far nscbc --open "
+            "--pot --n 512");
+    accepts("flow --physics compressible --body cylinder --far nscbc --dr 16 "
+            "--n 1024 --ny 1024");
+    accepts("flow --body cylinder --far tunnel --open --pot --n 512 --nz 1");
+    rejects("flow --physics compressible --body cylinder --far sponge --pot");
+    rejects("flow --body cylinder --far tunnel --pot"); // pot needs --open
+    rejects("flow --physics compressible --body cylinder --dr 4");
     accepts("flow --physics compressible --body cylinder --far nscbc "
             "--nscbc-strip 12 --n 1024 --re 2000");
     accepts("flow --physics compressible --body m.stl --far nscbc --open --n 96 "
@@ -100,8 +108,11 @@ int main()
     rejects("flow --body cylinder 512");               // bare positional
     rejects("flow --body cylinder --far sponge");      // compressible far field
     rejects("flow --physics compressible --body cylinder --far tunnel");
-    rejects("flow --body cylinder --far tunnel --open");
-    rejects("flow --body cylinder --les 0.17 --nz 8"); // 2D-only LES path
+    accepts("flow --body cylinder --far tunnel --open --n 512 --nz 1");
+    accepts("flow --body sphere --far tunnel --open --n 96");
+    accepts("flow --body cylinder --les 0.17 --nz 8 --n 512"); // 3D LES
+    rejects("flow --body cylinder --far fringe --open");
+    rejects("flow --body cylinder --far periodic --open");
     rejects("flow --body cylinder --mach 0.2");        // incompressible + --mach
     rejects("flow --physics compressible --body cylinder --far nscbc "
             "--nscbc-beta 1.0");                       // measured to blow up

@@ -1,5 +1,6 @@
 #include "dns/gpu/comp.hpp"
 
+#include "dns/curvmesh.hpp"
 #include "dns/gpu/comp_flux.hpp"
 #include "dns/gpu/device_util.hpp"
 
@@ -90,6 +91,53 @@ __global__ void kCompRhs(GpuGrid g, Real mu, Real kappa, PrimView q, Real* orho,
     omz[c] = dmz;
     oE[c] = dE;
 }
+
+__global__ void kCompRhsCurv(GpuGrid g, Real mu, Real kappa, PrimView q,
+                             CurvView m, Real* orho, Real* omx, Real* omy,
+                             Real* omz, Real* oE)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= g.size()) return;
+    int i, j, k;
+    decompose(g, c, i, j, k);
+    Real drho = 0, dmx = 0, dmy = 0, dmz = 0, dE = 0;
+    for (int a = 0; a < 3; ++a) {
+        const int ox = a == 0, oy = a == 1, oz = a == 2;
+        const Flux hi = faceFluxCurv(g, mu, kappa, q, m, i, j, k, a);
+        const Flux lo = faceFluxCurv(g, mu, kappa, q, m, i - ox, j - oy, k - oz, a);
+        drho -= hi.rho - lo.rho;
+        dmx -= hi.mx - lo.mx;
+        dmy -= hi.my - lo.my;
+        dmz -= hi.mz - lo.mz;
+        dE -= hi.E - lo.E;
+    }
+    const Real iv = m.invVol[c];
+    orho[c] = drho * iv;
+    omx[c] = dmx * iv;
+    omy[c] = dmy * iv;
+    omz[c] = dmz * iv;
+    oE[c] = dE * iv;
+}
+
+// Curvilinear acoustic bound: (|u| + c) / width, width = 1/aov per axis;
+// |u| >= |u . n| makes the bound conservative on skewed cells.
+struct WavePerDtCurv
+{
+    const Real *rho, *mx, *my, *mz, *E;
+    const Real *ax, *ay, *az; // az == nullptr when nz == 1
+    double gamma;
+    __host__ __device__ double operator()(int c) const
+    {
+        const double r = rho[c];
+        const double u = mx[c] / r, v = my[c] / r, w = mz[c] / r;
+        const double p = (gamma - 1.0) *
+            (double(E[c]) - 0.5 * (u * u + v * v + w * w) * r);
+        const double sp = sqrt(u * u + v * v + w * w) + sqrt(gamma * p / r);
+        double m = sp * double(ax[c] > ay[c] ? ax[c] : ay[c]);
+        if (az && sp * az[c] > m) m = sp * az[c];
+        return m;
+    }
+};
 
 // out = ca a + cb b + cr k, all five components.
 __global__ void kAxpy5(std::size_t n, Real ca, const Real* const* av, Real cb,
@@ -222,6 +270,37 @@ void boostX(const GpuGrid& g, DeviceCompState& s, double du)
     checkLastKernel("kBoostX");
 }
 
+std::expected<DeviceCurv, hipError_t> DeviceCurv::make(const CurvMetrics& m)
+{
+    const std::size_t n = m.vol.size();
+    std::vector<Real> tmp(n);
+    auto up = [&](DeviceScalar& dst,
+                  const std::vector<double>& src) -> hipError_t {
+        auto b = DeviceScalar::make(n);
+        if (!b) return b.error();
+        for (std::size_t i = 0; i < n; ++i) tmp[i] = Real(src[i]);
+        if (auto e = b->upload(tmp.data()); e != hipSuccess) return e;
+        dst = std::move(*b);
+        return hipSuccess;
+    };
+    DeviceCurv d;
+    d.hmin = m.hmin;
+    for (int a = 0; a < 3; ++a) {
+        for (int c = 0; c < 3; ++c)
+            if (auto e = up(d.S[a][c], m.S[a][c]); e != hipSuccess)
+                return std::unexpected(e);
+        for (int q = 0; q < 9; ++q)
+            if (auto e = up(d.Ji[a][q], m.Ji[a][q]); e != hipSuccess)
+                return std::unexpected(e);
+        if (auto e = up(d.aov[a], m.aov[a]); e != hipSuccess)
+            return std::unexpected(e);
+    }
+    std::vector<double> iv(n);
+    for (std::size_t i = 0; i < n; ++i) iv[i] = 1.0 / m.vol[i];
+    if (auto e = up(d.invVol, iv); e != hipSuccess) return std::unexpected(e);
+    return d;
+}
+
 std::expected<DeviceCompState, hipError_t> DeviceCompState::make(std::size_t n)
 {
     DeviceCompState s;
@@ -280,6 +359,17 @@ std::expected<DeviceComp, hipError_t> DeviceComp::make(const Grid& g,
     return d;
 }
 
+std::expected<DeviceComp, hipError_t> DeviceComp::make(const CurvMetrics& m,
+                                                       double gamma, double mu)
+{
+    auto d = make(m.g, gamma, mu, 0.0);
+    if (!d) return d;
+    auto cv = DeviceCurv::make(m);
+    if (!cv) return std::unexpected(cv.error());
+    d->curv_ = std::move(*cv);
+    return d;
+}
+
 DeviceComp::DeviceComp(const GpuGrid& g, Real gamma, Real mu, Real csLes)
     : g_(g), gamma_(gamma), mu_(mu), csLes_(csLes)
 {
@@ -307,6 +397,20 @@ void DeviceComp::rhs(const DeviceCompState& s, DeviceCompState& out)
     const PrimView q{s.rho.data(), u_.data(), v_.data(), w_.data(), e_.data(),
                      p_.data(), T_.data()};
     const std::size_t n = g_.size();
+    if (curv_) {
+        CurvView cv;
+        for (int a = 0; a < 3; ++a) {
+            for (int c = 0; c < 3; ++c) cv.S[a][c] = curv_->S[a][c].data();
+            for (int e = 0; e < 9; ++e) cv.Ji[a][e] = curv_->Ji[a][e].data();
+        }
+        cv.invVol = curv_->invVol.data();
+        kCompRhsCurv<<<launchBlocks(n), blockSize>>>(
+            g_, mu_, kappa, q, cv, out.rho.data(), out.mx.data(),
+            out.my.data(), out.mz.data(), out.E.data());
+        checkLastKernel("kCompRhsCurv");
+        if (rhsHook_) rhsHook_(s, out);
+        return;
+    }
     const Real* nutp = nullptr;
     Real kapScale = Real(0);
     if (csLes_ > Real(0)) {
@@ -358,12 +462,19 @@ void DeviceComp::step(DeviceCompState& s, Real dt)
 double DeviceComp::stableDt(const DeviceCompState& s, ReduceScratch& r,
                             double cfl) const
 {
-    const double wmax = reduce(
-        r, g_.size(),
-        WavePerDt{s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(), s.E.data(),
-                  double(gamma_), 1.0 / g_.hx, 1.0 / g_.hy,
-                  g_.nz > 1 ? 1.0 / g_.hz : 0.0},
-        rocprim::maximum<double>(), 0.0);
+    const double wmax = curv_
+        ? reduce(r, g_.size(),
+                 WavePerDtCurv{s.rho.data(), s.mx.data(), s.my.data(),
+                               s.mz.data(), s.E.data(), curv_->aov[0].data(),
+                               curv_->aov[1].data(),
+                               g_.nz > 1 ? curv_->aov[2].data() : nullptr,
+                               double(gamma_)},
+                 rocprim::maximum<double>(), 0.0)
+        : reduce(r, g_.size(),
+                 WavePerDt{s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
+                           s.E.data(), double(gamma_), 1.0 / g_.hx, 1.0 / g_.hy,
+                           g_.nz > 1 ? 1.0 / g_.hz : 0.0},
+                 rocprim::maximum<double>(), 0.0);
     double dt = cfl / wmax;
     double muEff = double(mu_);
     if (csLes_ > Real(0)) {
@@ -377,8 +488,13 @@ double DeviceComp::stableDt(const DeviceCompState& s, ReduceScratch& r,
     if (muEff > 0.0) {
         const double rhomin = reduce(r, g_.size(), MinRho{s.rho.data()},
                                      rocprim::minimum<double>(), 1e300);
-        double h = std::min<double>(g_.hx, g_.hy);
-        if (g_.nz > 1) h = std::min<double>(h, g_.hz);
+        double h;
+        if (curv_) {
+            h = curv_->hmin;
+        } else {
+            h = std::min<double>(g_.hx, g_.hy);
+            if (g_.nz > 1) h = std::min<double>(h, g_.hz);
+        }
         const double dtv = 0.25 * h * h * rhomin / muEff;
         if (dtv < dt) dt = dtv;
     }

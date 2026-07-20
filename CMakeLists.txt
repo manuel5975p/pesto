@@ -27,6 +27,7 @@ add_library(dns_core
     src/dns/operators.cpp
     src/dns/output.cpp
     src/dns/comp.cpp
+    src/dns/curvmesh.cpp
     src/dns/meshsdf.cpp
     src/dns/poisson.cpp
     src/dns/timestepper.cpp
@@ -97,7 +98,7 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
-    set(DNS_TESTS cli geometry output poisson projection tgv tgv3d cutcell cutcell_sphere comp meshsdf
+    set(DNS_TESTS cli geometry output poisson projection tgv tgv3d cutcell cutcell_sphere comp comp_curv meshsdf
         fieldpng webframes)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)
@@ -126,9 +127,9 @@ if(BUILD_TESTING)
         foreach(t gpu_buffer gpu_operators gpu_reductions gpu_poisson
                   gpu_poisson_neumann gpu_poisson2d gpu_projection gpu_tgv
                   gpu_cutcell gpu_cutcell2d gpu_cutcell_sphere gpu_conservation
-                  gpu_energy_stability gpu_ghostfill gpu_comp gpu_comp_ghost
-                  gpu_comp_les gpu_comp_ghost3d gpu_comp_mesh gpu_comp_far
-                  gpu_comp_nscbc gpu_les_smag gpu_derived)
+                  gpu_energy_stability gpu_ghostfill gpu_comp gpu_comp_curv
+                  gpu_comp_ghost gpu_comp_les gpu_comp_ghost3d gpu_comp_mesh
+                  gpu_comp_far gpu_comp_nscbc gpu_les_smag gpu_derived)
             add_executable(test_${t} tests/test_${t}.cpp)
             target_link_libraries(test_${t} PRIVATE dns_gpu)
             add_test(NAME ${t} COMMAND test_${t})
@@ -152,6 +153,17 @@ if(BUILD_TESTING)
         add_dependencies(test_gpu_open_incomp dns)
         add_test(NAME gpu_open_incomp COMMAND test_gpu_open_incomp)
         set_tests_properties(gpu_open_incomp PROPERTIES TIMEOUT 600
+            SKIP_RETURN_CODE 77)
+
+        # Sponge-free open tunnel: library-level freestream cycles + a short
+        # end-to-end run of the built binary.
+        add_executable(test_gpu_tunnel_open tests/test_gpu_tunnel_open.cpp)
+        target_link_libraries(test_gpu_tunnel_open PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_tunnel_open PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_tunnel_open dns)
+        add_test(NAME gpu_tunnel_open COMMAND test_gpu_tunnel_open)
+        set_tests_properties(gpu_tunnel_open PROPERTIES TIMEOUT 600
             SKIP_RETURN_CODE 77)
 
 
