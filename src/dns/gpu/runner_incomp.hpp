@@ -29,17 +29,32 @@ struct IncompRun
     double tEnd = 0;
     double tol = 1e-4;        // CG per-cell RMS residual target
     int maxIters = 500;
-    double les = 0;           // Smagorinsky Cs; 0 = DNS. Requires nz == 1.
+    double les = 0;           // Smagorinsky Cs; 0 = DNS
 
     // Far field. Fringe = fully periodic box + cosine sponge (FFT pressure);
     // otherwise the confined tunnel (Dirichlet inlet, convective outlet,
     // free-slip lateral walls, DCT-preconditioned CG on the confined box).
+    // open turns the tunnel's lateral walls into sponge-free zero-gradient
+    // open faces whose flux enters the projection (see DeviceTunnelBc).
     bool fringe = false;
+    bool open = false;
+    // Potential-corrected inlet (requires open): Dirichlet inlet = freestream
+    // + wake source (EMA of measured drag) + displacement doublet about the
+    // body centre.
+    bool pot = false;
+    double cx = 0, cy = 0, cz = 0; // body centre (world coords)
     int fringeCells = 0;      // 0 = clamp(0.1 nx, 8, nx/2 - 1)
     int fringeAxes = 0;       // 0 = nz == 1 ? 2 : 3
 
     BodyBox box{};            // force-tally index box
     int statsEvery = 20;      // steps between force/diagnostic rows
+
+    // Stationary mode: stop early once the field stops changing. The residual
+    // is R = max|u(t+dt) - u(t)| / dt, non-dimensionalized by uInf^2/D, so the
+    // threshold is dt- and grid-independent. 0 = disabled (march to tEnd).
+    // tEnd then acts as the give-up cap: reaching it is a non-convergence
+    // error (exit 8), never a silent "converged".
+    double steadyTol = 0;
 };
 
 struct RunStats
@@ -47,6 +62,9 @@ struct RunStats
     long steps = 0;
     double msPerStep = 0;
     double cd = 0, cl = 0, cs = 0, cdf = 0;   // last measured
+    double resid = 0;         // last steady residual, uInf^2/D units
+    double tStop = 0;         // time actually reached
+    bool converged = false;   // steady mode only: resid fell below steadyTol
 };
 
 // Runs to completion, writing through `out`. `cut` must already be sanitized

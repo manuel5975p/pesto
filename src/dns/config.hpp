@@ -55,6 +55,7 @@ struct RawConfig
     int spongeCells = 0, fringeAxes = 0;
     double nscbcBeta = 0.5;
     int nscbcStrip = 0;
+    bool farPot = false;
 
     // start-up (compressible)
     double ramp = 2.0, kick = 0.05;
@@ -66,6 +67,7 @@ struct RawConfig
 
     // run length
     double ft = 0.0;
+    double steady = 0.0;   // >0: stop at this steady residual instead of tEnd
 
     // output
     std::set<Emit> emit;
@@ -125,6 +127,7 @@ public:
     int n = 0, nzInterior = 1;
     double h = 0, L = 0, uInf = 1.0;
     double re = 0, mach = 0, nu = 0, cfl = 0, tol = 0, ft = 0, tEnd = 0;
+    double steadyTol = 0;   // 0 = time-march to tEnd; >0 = stationary solve
     double cs = 0, qRef = 0, dr = 0, aspect = 0;
     double ramp = 0, kick = 0, nscbcBeta = 0;
     double scale = 0, pitch = 0, yaw = 0;
@@ -133,6 +136,7 @@ public:
     int steps = 0;
     unsigned seed = 1;
     bool open = false, robust = false, lesLabel = false, quiet = false, dryRun = false;
+    bool farPot = false;
 
     // hit (SI inputs)
     double urms = 0, spin = 0, stats = 0;

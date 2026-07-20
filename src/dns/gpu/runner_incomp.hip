@@ -44,6 +44,9 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     auto dGhost = DeviceGhostFill::make(g, cut, sdf);
     auto dU = DeviceField::make(g.size());
     auto dU0 = DeviceField::make(g.size());
+    // Steady mode only: the field as of the previous stats row. Differencing
+    // adjacent steps loses the signal to FP32 cancellation.
+    auto dSnap = DeviceField::make(g.size());
     auto dS = DeviceField::make(g.size());
     auto dG = DeviceField::make(g.size());
     auto dTmp = DeviceScalar::make(g.size());
@@ -51,7 +54,7 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     auto dSpeed = DeviceScalar::make(g.size());
     auto red = ReduceScratch::make();
     auto scr = DeviceCutProjectionScratch::make(g.size());
-    if (!dCut || !dGhost || !dU || !dU0 || !dS || !dG || !dTmp || !dVort
+    if (!dCut || !dGhost || !dU || !dU0 || !dSnap || !dS || !dG || !dTmp || !dVort
         || !dSpeed || !red || !scr)
         return fail(6, "GPU allocation failed");
 
@@ -59,7 +62,7 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     if (r.les > 0)
     {
         auto m = DeviceSmagorinsky::make(gg, r.les);
-        if (!m) return fail(6, "LES model init failed (--les requires --nz 1)");
+        if (!m) return fail(6, "LES model init failed");
         les = std::move(*m);
     }
 
@@ -71,7 +74,8 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     auto bodyForce = DeviceBodyForce::make(gg, r.box);
     if (!bodyForce) return fail(6, "body-force tally init failed");
 
-    auto tunnel = DeviceTunnelBc::make(gg, {r.uInf});
+    auto tunnel = DeviceTunnelBc::make(
+        gg, {r.uInf, r.open, r.pot, r.cx, r.cy, r.cz, 0.5 * r.D});
     const int nsF = r.fringeCells > 0
                         ? r.fringeCells
                         : std::clamp(int(0.1 * g.nx), 8, g.nx / 2 - 1);
@@ -109,11 +113,12 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
         if (!r.fringe) tunnel->addFluxRhs(outF, 1.0 / dt, scr->div);
         pcgIters += poisson->solve(scr->div, scr->phi, true);
         subtractGradientCut(gg, *dCut, scr->phi, Real(dt), outF);
-        if (!r.fringe) tunnel->apply(outF, outF, 0.0); // refresh the mirrors
+        if (!r.fringe) // refresh the mirrors; keep the projected lateral fluxes
+            tunnel->apply(outF, outF, 0.0, /*refreshOnly=*/true);
     };
 
     const std::string cols[] = {"t",   "dt",  "K",   "cd",      "cl",
-                                "cdf", "cfl", "maxDiv", "pcgIters"};
+                                "cdf", "cfl", "maxDiv", "pcgIters", "resid"};
     out.declareSeries("stats", cols);
 
     const float vortScale = float(8.0 * r.uInf / r.D), speedMax = float(1.6 * r.uInf);
@@ -137,6 +142,20 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
 
     RunStats st;
     double t = 0.0, dt = 1e-3;
+    // Potential-corrected inlet wake source: EMA of F_drag / uInf over
+    // ~2 D/uInf (the shedding oscillation must not feed the far-field
+    // target), fed only after the impulsive-start transient.
+    double qEma = 0.0, tQ = 2.0 * r.D / r.uInf;
+    // Steady-residual snapshot interval, in PHYSICAL time -- not in steps. The
+    // metric differences two FP32 fields, so its noise floor is ~eps*u/interval;
+    // a fixed step count shrinks the interval with dt and pushes the floor UP on
+    // finer grids (measured: 1.2e-6 at 256^2 would become ~1.8e-5 at 2048^2,
+    // above any useful tolerance). A fixed time span keeps the floor grid-free.
+    const double residDt = 0.5 * r.D / r.uInf;
+    double tSnap = 0.0;   // time of the steady-residual snapshot; 0 = none yet
+    bool residValid = false;  // a residual needs TWO snapshots; the first tally
+                              // only takes one, and 0.0 must never read as
+                              // "converged" (it did: stopped at step 1)
     const auto wall0 = std::chrono::steady_clock::now();
     while (t < r.tEnd)
     {
@@ -159,7 +178,11 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
         pcgIters = 0;
         stage(*dU0, *dU, 0.0, dt);
 
-        const bool tally = st.steps % r.statsEvery == 0;
+        // The end-of-run clamp can leave a sliver of a step. The surface
+        // pressure is phi/dt, so a sliver dt turns the force tally into
+        // garbage (measured: cd ~1e6 in the last row). Never tally on it.
+        const bool clamped = dt < 0.5 * dtStab;
+        const bool tally = st.steps % r.statsEvery == 0 && !clamped;
         if (tally)
         {
             // Surface pressure from the FIRST stage's phi: that stage advances a
@@ -173,6 +196,16 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
             st.cl = co.cl;
             st.cs = co.cs;
             st.cdf = co.cdf;
+            if (r.pot && t > tQ)
+            {
+                const double Qinst = std::clamp(st.cd * r.qRef / r.uInf, 0.0,
+                                                2.0 * r.D * r.uInf);
+                const double alpha =
+                    std::min(1.0, (t - tQ) / (2.0 * r.D / r.uInf));
+                qEma += alpha * (Qinst - qEma);
+                tQ = t;
+                tunnel->setWakeSource(qEma);
+            }
         }
         stage(*dU, *dS, 0.75, dt);
         stage(*dS, *dU, 1.0 / 3.0, dt);
@@ -182,6 +215,29 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
 
         if (tally)
         {
+            // Steady residual: RMS change since the previous stats row, over
+            // that row's elapsed time, scaled to uInf^2/D so the threshold is
+            // dt- and grid-free. The interval (not one step) is what makes it
+            // measurable: the per-step change reaches the FP32 rounding level
+            // (~eps*u/dt) long before the flow is stationary, which floors a
+            // step-to-step residual at ~1e-4 on fine grids -- measured.
+            if (r.steadyTol > 0 && t + dt >= tSnap + residDt)
+            {
+                if (tSnap > 0)
+                {
+                    st.resid = rmsDiffField(*dU, *dSnap, *red) / (t + dt - tSnap)
+                               * r.D / (r.uInf * r.uInf);
+                    residValid = true;
+                }
+                const std::size_t nb = g.size() * sizeof(Real);
+                (void)hipMemcpy(dSnap->u.data(), dU->u.data(), nb,
+                                hipMemcpyDeviceToDevice);
+                (void)hipMemcpy(dSnap->v.data(), dU->v.data(), nb,
+                                hipMemcpyDeviceToDevice);
+                (void)hipMemcpy(dSnap->w.data(), dU->w.data(), nb,
+                                hipMemcpyDeviceToDevice);
+                tSnap = t + dt;
+            }
             const double K = kineticEnergy(gg, *dU, *red);
             // Continuity residual; the tunnel adds the prescribed in/out fluxes,
             // the fringe box is plain periodic divergence.
@@ -190,19 +246,34 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
             const double maxDiv = maxAbsScalar(scr->div, *red);
             const double row[] = {t,       dt,     K,      st.cd,
                                   st.cl,   st.cdf, dt * conv, maxDiv,
-                                  double(pcgIters)};
+                                  double(pcgIters), st.resid};
             (void)out.row("stats", row);
             if (st.steps % (10 * r.statsEvery) == 0)
             {
                 std::printf("t=%.2f/%.2f cd=%.3f (cdf=%.3f) cl=%+.3f K=%.1f "
-                            "maxDiv=%.2e pcg=%d\n",
-                            t, r.tEnd, st.cd, st.cdf, st.cl, K, maxDiv, pcgIters);
+                            "maxDiv=%.2e pcg=%d resid=%.2e\n",
+                            t, r.tEnd, st.cd, st.cdf, st.cl, K, maxDiv, pcgIters,
+                            st.resid);
                 std::fflush(stdout);
             }
         }
         t += dt;
         ++st.steps;
+
+        if (r.steadyTol > 0 && tally && residValid && st.resid < r.steadyTol)
+        {
+            st.converged = true;
+            std::printf("steady: resid=%.3e < %.3e at t=%.2f (%ld steps)\n",
+                        st.resid, r.steadyTol, t, st.steps);
+            break;
+        }
     }
+    st.tStop = t;
+    if (r.steadyTol > 0 && !st.converged)
+        return fail(8, "steady state not reached by tEnd (residual "
+                       + std::to_string(st.resid) + " > "
+                       + std::to_string(r.steadyTol)
+                       + "); raise --ft or relax --steady");
     (void)hipDeviceSynchronize();
     st.msPerStep = std::chrono::duration<double, std::milli>(
                        std::chrono::steady_clock::now() - wall0)

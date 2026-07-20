@@ -269,6 +269,12 @@ int runFlowIncompressible(const Case& c, Geometry& geo)
     rr.maxIters = c.maxIters;
     rr.les = c.cs;
     rr.fringe = fringe;
+    rr.open = c.open;
+    rr.pot = c.farPot;
+    rr.steadyTol = c.steadyTol;
+    rr.cx = c.placement.cx;
+    rr.cy = c.placement.cy;
+    rr.cz = c.placement.cz;
     rr.fringeCells = c.spongeCells;
     rr.fringeAxes = c.fringeAxes;
 
@@ -391,6 +397,10 @@ int runFlowCompressible(const Case& c, Geometry& geo)
     rr.spongeCells = c.spongeCells;
     rr.nscbcBeta = c.nscbcBeta;
     rr.nscbcStrip = c.nscbcStrip;
+    rr.nscbcPot = c.farPot;
+    rr.cx = c.placement.cx;
+    rr.cy = c.placement.cy;
+    rr.cz = c.placement.cz;
     rr.ramp = c.ramp;
     rr.dtRecompute = c.dtRecompute;
     // 3D runs report |curl| (sequential map); native 2D reports signed wz so

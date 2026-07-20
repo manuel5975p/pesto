@@ -42,4 +42,10 @@ double sumScalar(const DeviceScalar& q, ReduceScratch& s);
 // max |q| in double (e.g. the continuity-residual diagnostic).
 double maxAbsScalar(const DeviceScalar& q, ReduceScratch& s);
 
+// RMS of (A - B) over all three face components. Used for the steady-state
+// residual, where A and B are the field a stats interval apart: differencing
+// adjacent steps instead loses the answer to FP32 cancellation (the change per
+// step is at the rounding level long before the flow is actually stationary).
+double rmsDiffField(const DeviceField& A, const DeviceField& B, ReduceScratch& s);
+
 } // namespace dns::gpu

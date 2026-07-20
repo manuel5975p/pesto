@@ -181,9 +181,11 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
                      "tunnel, fringe or periodic");
 
     c.open = r.open;
-    if (c.open && c.far != FarField::Sponge && c.far != FarField::Nscbc)
+    if (c.open && c.far != FarField::Sponge && c.far != FarField::Nscbc
+        && c.far != FarField::Tunnel)
         return bad(2, "--open", std::string("--open has no meaning with --far ")
-                   + name(c.far) + " (only sponge and nscbc have lateral bands)");
+                   + name(c.far)
+                   + " (tunnel, sponge and nscbc have lateral faces)");
 
     // Grid: two separately validated conventions, dispatched on --physics.
     const int ny = r.given.contains("--ny") ? r.ny : r.n;
@@ -206,16 +208,22 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     c.uInf = 1.0;
     if (comp)
     {
-        // D = pi/4 fixed, h scales with ny, box 8D x 8D. No ghost ring: the
-        // compressible far fields act on interior rows.
+        // D = pi/4 fixed, h scales with ny AND --dr: box = dr*D in y
+        // (dr*(n/ny)*D in x), D spans ny/dr cells. The dr = 8 default keeps
+        // the historical 8D x 8D box BIT-IDENTICAL (the *(dr/8) factor is an
+        // exact *1.0 and the 2.1107 placement literal is preserved). No ghost
+        // ring: the compressible far fields act on interior rows.
+        if (c.dr < 6)
+            return bad(2, "--dr", "compressible box is dr*D wide; below 6 the "
+                                  "body sits under 1.5D from the inflow row");
         const double D = pi / 4.0;
-        c.h = D / 64.0 * (512.0 / double(ny));
+        c.h = D / 64.0 * (512.0 / double(ny)) * (c.dr / 8.0);
         const double lx = r.n * c.h, ly = ny * c.h;
         const double lz = nzI > 1 ? nzI * c.h : 1.0;
         c.grid = Grid::make(r.n, ny, nzI, lx, ly, lz);
         c.L = lx;
-        c.placement = {2.1107, ly / 2.0 + 0.0146,
-                       nzI > 1 ? lz / 2.0 : 0.5, D};
+        c.placement = {c.dr == 8.0 ? 2.1107 : lx / 3.0 + 0.0163,
+                       ly / 2.0 + 0.0146, nzI > 1 ? lz / 2.0 : 0.5, D};
     }
     else
     {
@@ -272,11 +280,6 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     c.cs = r.les;
     if (!(std::isfinite(c.cs) && c.cs >= 0))
         return bad(2, "--les", "must be finite and >= 0");
-    // Checked BEFORE geometry construction (the old apps checked after the
-    // sanitizeCut print).
-    if (c.cs > 0 && !comp && nzI != 1)
-        return bad(2, "--les", "--les requires --nz 1 (the incompressible "
-                               "Smagorinsky path is 2D-only)");
     // Honest labelling: the boundary layer scales as D/sqrt(Re).
     const double blCells = c.placement.D / std::sqrt(c.re) / c.h;
     c.lesLabel = c.cs > 0;
@@ -305,6 +308,12 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     }
     else if (r.given.contains("--nscbc-strip") && c.nscbcStrip > 0)
         return bad(2, "--nscbc-strip", "requires --far nscbc");
+    c.farPot = r.farPot;
+    if (c.farPot && c.far != FarField::Nscbc
+        && !(c.far == FarField::Tunnel && c.open))
+        return bad(2, "--pot", "requires --far nscbc (compressible) or "
+                               "--far tunnel --open (incompressible) -- the "
+                               "correction retargets an open far field");
 
     // Sponge / fringe band width. clamp(0.1n, 8, n/2-1) is UB when n < 18.
     const int bandBase = comp ? c.grid.nx : c.grid.nx;
@@ -378,6 +387,20 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     c.ft = r.ft;
     if (!finitePos(c.ft)) return bad(2, "--ft", "must be finite and > 0");
     c.tEnd = comp ? c.ft * c.L / c.uInf : c.ft * c.L / c.uInf;
+
+    // Stationary mode. tEnd stops being the run length and becomes the
+    // give-up cap: not converging by then is exit 8, never a silent answer.
+    c.steadyTol = r.steady;
+    if (c.steadyTol < 0 || !std::isfinite(c.steadyTol))
+        return bad(2, "--steady", "must be finite and >= 0 (0 = time-march)");
+    if (c.steadyTol > 0 && comp)
+        return bad(2, "--steady",
+                   "is incompressible-only; the compressible loop has acoustic "
+                   "transients that a velocity residual cannot certify");
+    if (c.steadyTol > 0 && c.cs > 0)
+        return bad(2, "--steady",
+                   "with --les is meaningless: a filtered field has no "
+                   "stationary state to converge to");
     c.fdt = r.fdt;
     c.pdt = r.pdt > 0 ? r.pdt : c.fdt;
     c.wdt = r.wdt > 0 ? r.wdt : c.fdt;
@@ -419,14 +442,21 @@ std::string Case::describe() const
         "  placement  cx=%.6g cy=%.6g cz=%.6g D=%.6g (%.1f cells)\n"
         "  Re=%.6g  nu=%.6g  Mach=%.6g  cfl=%.6g  Cs=%.6g (%s)\n"
         "  ft=%.6g  tEnd=%.6g  fdt=%.6g  qRef=%.6g\n"
+        "  mode       %s\n"
         "  out        %s\n",
         name(physics), name(bodyKind), meshPath.empty() ? "" : (" " + meshPath).c_str(),
-        name(far), open ? " (lateral open)" : "",
+        name(far),
+        open ? (farPot ? " (lateral open, potential-corrected)"
+                       : " (lateral open)")
+             : (farPot ? " (potential-corrected)" : ""),
         grid.nx, grid.ny, grid.nz, h, L, grid.nz == 1 ? "  [native 2D]" : "",
         placement.cx, placement.cy, placement.cz, placement.D,
         h > 0 ? placement.D / h : 0.0,
         re, nu, mach, cfl, cs, lesLabel ? "LES" : "DNS",
-        ft, tEnd, fdt, qRef, outPrefix.c_str());
+        ft, tEnd, fdt, qRef,
+        steadyTol > 0 ? "stationary (stop at steady residual, tEnd = give-up cap)"
+                      : "time-march to tEnd",
+        outPrefix.c_str());
     return buf;
 }
 

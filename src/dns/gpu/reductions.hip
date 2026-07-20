@@ -26,6 +26,18 @@ struct PlainSum
     __host__ __device__ double operator()(int c) const { return double(x[c]); }
 };
 
+struct SqDiff3
+{
+    const Real *au, *av, *aw, *bu, *bv, *bw;
+    __host__ __device__ double operator()(int c) const
+    {
+        const double du = double(au[c]) - double(bu[c]);
+        const double dv = double(av[c]) - double(bv[c]);
+        const double dw = double(aw[c]) - double(bw[c]);
+        return du * du + dv * dv + dw * dw;
+    }
+};
+
 struct PlainAbs
 {
     const Real* x;
@@ -204,6 +216,17 @@ double sumScalar(const DeviceScalar& q, ReduceScratch& s)
 double maxAbsScalar(const DeviceScalar& q, ReduceScratch& s)
 {
     return reduce(s, q.size(), PlainAbs{q.data()}, rocprim::maximum<double>(), 0.0);
+}
+
+double rmsDiffField(const DeviceField& A, const DeviceField& B, ReduceScratch& s)
+{
+    const std::size_t n = A.u.size();
+    if (n == 0) return 0.0;
+    const double sum = reduce(s, n,
+                              SqDiff3{A.u.data(), A.v.data(), A.w.data(),
+                                      B.u.data(), B.v.data(), B.w.data()},
+                              rocprim::plus<double>(), 0.0);
+    return std::sqrt(sum / (3.0 * double(n)));
 }
 
 } // namespace dns::gpu

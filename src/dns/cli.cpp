@@ -144,6 +144,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--nscbc-beta", &c.nscbcBeta}, {"--nscbc-strip", &c.nscbcStrip},
              {"--ramp", &c.ramp}, {"--kick", &c.kick}, {"--tol", &c.tol},
              {"--max-iters", &c.maxIters}, {"--dt-recompute", &c.dtRecompute},
+             {"--steady", &c.steady},
              {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
              {"--planes", &c.planes}});
     if (c.sub == Subcommand::Tgv)
@@ -187,6 +188,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     {
         flags.push_back({"--robust", &c.robust});
         flags.push_back({"--open", &c.open});
+        flags.push_back({"--pot", &c.farPot});
     }
 
     std::vector<string> known;
@@ -336,8 +338,9 @@ GRID
 
   Grid convention differs by --physics and is stated here once:
     incompressible: L = 2*pi, h = L/n, D = L/--dr  (box scales with n)
-    compressible:   D = pi/4, h = D/64 * (512/--ny), box 8D x 8D fixed
-                    (resolution scales with --ny; the box does not)
+    compressible:   D = pi/4, box = --dr * D in y ((n/ny)*dr*D in x),
+                    D spans ny/dr cells (dr 8, n 512 = the historical
+                    8D x 8D box, bit-identical); --dr >= 6
   These are two genuinely different, separately validated conventions.
   Merging them relocates the body and rescales Re — a real past bug
   (measured cd 3.19). They are NOT unified by this recomposition.
@@ -363,8 +366,8 @@ PHYSICS
   --re RE            Reynolds number on D                           [60]
   --mach M           Mach number (compressible only)               [0.2]
   --les CS           Smagorinsky constant; 0 = DNS                   [0]
-                     incompressible: requires --nz 1 (2D-only path)
-                     compressible:   shared 3D core, no restriction
+                     full 3D strain in both physics; nz==1 reduces
+                     exactly to the 2D model (see CLAUDE.md caveats)
   --cfl C            Courant target             [0.8 incomp / 0.4 comp]
 
 FAR FIELD (--far, exactly one)
@@ -379,9 +382,12 @@ FAR FIELD (--far, exactly one)
   --far periodic     no far field (plain periodic box).
 
   --open             make the LATERAL faces open too.
+                       --far tunnel  -> zero-gradient open faces; the
+                                        lateral flux is free and enters
+                                        the projection (sponge-free)
                        --far sponge  -> lateral rho/p-relax bands
                        --far nscbc   -> six-face characteristic
-                     Rejected (not ignored) with tunnel/fringe/periodic.
+                     Rejected (not ignored) with fringe/periodic.
   --sponge-cells N   sponge / fringe band width; 0 = 10% of n         [0]
   --fringe-axes 2|3  fringe on x,y only, or x,y,z; 0 = auto
                      (2 when --nz 1, else 3)                          [0]
@@ -391,6 +397,15 @@ FAR FIELD (--far, exactly one)
   --nscbc-strip N    absorbing strip inside the NSCBC rows; 0 = pure
                      characteristic. Required above Re 800; use ~ny/64
                      (pure NSCBC blows up at Re 2000, 2048^2).         [0]
+  --pot              potential-corrected far field: targets/inlet are
+                     freestream + wake source (strength from the
+                     measured drag, EMA) + displacement doublet instead
+                     of uniform uInf. Removes the finite-domain bias of
+                     pinning u = uInf a few D from the body (measured:
+                     8D corrected == 32D plain, comp cyl Re100).
+                       compressible   --far nscbc: all targets
+                       incompressible --far tunnel --open: the inlet
+                     Rejected with any other far field.
 
 START-UP (compressible)
   --ramp T           quiet start: IC at rest, freestream raised by
@@ -409,9 +424,18 @@ SOLVER
 
 RUN LENGTH
   --ft N             flow-throughs to integrate                      [20]
+  --steady TOL       stationary solve: march until the field stops
+                     changing, then stop. TOL is on the residual
+                     R = max|du/dt| * D / uInf^2 (dt- and grid-free);
+                     1e-6 is tight, 1e-4 loose. --ft becomes the
+                     give-up cap -- reaching it is exit 8, not a
+                     silent answer. Incompressible, --les 0. Only
+                     converges below the shedding onset (cyl Re<47).
+                     0 = plain time-march.                            [0]
 
 OUTPUT (--emit is repeatable; default = stats,bin)
-  --emit stats       <out>_stats.csv (t,dt,K,cd,cl,cdf,cfl,maxDiv,iters)
+  --emit stats       <out>_stats.csv (t,dt,K,cd,cl,cdf,cfl,maxDiv,
+                     pcgIters,resid)
   --emit bin         <out>_{vort,speed,mask}.bin float32 mid-plane
   --emit png         png_<out>/{vort,speed}_%05d.png  (requires --nz 1)
   --emit web         web_<out>/ live browser frames + planes.json
