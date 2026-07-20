@@ -68,6 +68,7 @@ struct RawConfig
     // run length
     double ft = 0.0;
     double steady = 0.0;   // >0: stop at this steady residual instead of tEnd
+    int seq = 1;           // grid-sequencing levels; 1 = solve on --n directly
 
     // output
     std::set<Emit> emit;
@@ -128,6 +129,7 @@ public:
     double h = 0, L = 0, uInf = 1.0;
     double re = 0, mach = 0, nu = 0, cfl = 0, tol = 0, ft = 0, tEnd = 0;
     double steadyTol = 0;   // 0 = time-march to tEnd; >0 = stationary solve
+    int seqLevels = 1;      // grid-sequencing levels (1 = off)
     double cs = 0, qRef = 0, dr = 0, aspect = 0;
     double ramp = 0, kick = 0, nscbcBeta = 0;
     double scale = 0, pitch = 0, yaw = 0;

@@ -31,7 +31,8 @@ std::unexpected<RunError> fail(int code, std::string m)
 
 std::expected<RunStats, RunError>
 runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
-                  const VectorField& ic, const IncompRun& r, RunOutput& out)
+                  const VectorField& ic, const IncompRun& r, RunOutput& out,
+                  VectorField* finalField)
 {
     const auto gg = GpuGrid::from(g);
     const double h = g.hx;
@@ -269,6 +270,7 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
         }
     }
     st.tStop = t;
+    if (finalField) (void)downloadField(*dU, *finalField);
     if (r.steadyTol > 0 && !st.converged)
         return fail(8, "steady state not reached by tEnd (residual "
                        + std::to_string(st.resid) + " > "

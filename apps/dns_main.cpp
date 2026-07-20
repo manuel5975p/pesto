@@ -192,7 +192,64 @@ std::expected<Geometry, std::string> buildGeometry(const Case& c)
 
 // --- flow: incompressible --------------------------------------------------
 
-int runFlowIncompressible(const Case& c, Geometry& geo)
+
+// Trilinear prolongation of a MAC velocity field onto a finer grid, by world
+// position. Both grids carry one ghost cell, so the interior origin is at
+// x = h and coordinates are measured from there: a u-face at index i sits at
+// X = (i-1)*h, a cell centre at X = (j-0.5)*h.
+//
+// Deliberately NOT conservative and NOT divergence-free: this only has to be
+// close. The level that receives it masks, projects and re-converges, so the
+// fixed point it reaches is that level's own -- prolongation accuracy buys
+// transient length, never correctness.
+VectorField prolongMac(const Grid& gc, double hc, const VectorField& C,
+                       const Grid& gf, double hf)
+{
+    auto F = VectorField::zeros(gf);
+    const bool flat = gc.nz == 1 || gf.nz == 1;
+
+    // Sample the coarse array at continuous coarse indices, clamped to range.
+    auto sample = [&](const std::vector<double>& q, double ci, double cj, double ck) {
+        const auto lerp1 = [](double a, double b, double t) { return a + (b - a) * t; };
+        ci = std::clamp(ci, 0.0, double(gc.nx - 1));
+        cj = std::clamp(cj, 0.0, double(gc.ny - 1));
+        ck = flat ? 0.0 : std::clamp(ck, 0.0, double(gc.nz - 1));
+        const int i0 = std::min(int(ci), gc.nx - 1), i1 = std::min(i0 + 1, gc.nx - 1);
+        const int j0 = std::min(int(cj), gc.ny - 1), j1 = std::min(j0 + 1, gc.ny - 1);
+        const int k0 = flat ? 0 : std::min(int(ck), gc.nz - 1);
+        const int k1 = flat ? 0 : std::min(k0 + 1, gc.nz - 1);
+        const double tx = ci - i0, ty = cj - j0, tz = flat ? 0.0 : ck - k0;
+        const double c00 = lerp1(q[gc.idx(i0, j0, k0)], q[gc.idx(i1, j0, k0)], tx);
+        const double c10 = lerp1(q[gc.idx(i0, j1, k0)], q[gc.idx(i1, j1, k0)], tx);
+        const double c01 = lerp1(q[gc.idx(i0, j0, k1)], q[gc.idx(i1, j0, k1)], tx);
+        const double c11 = lerp1(q[gc.idx(i0, j1, k1)], q[gc.idx(i1, j1, k1)], tx);
+        return lerp1(lerp1(c00, c10, ty), lerp1(c01, c11, ty), tz);
+    };
+
+    for (int k = 0; k < gf.nz; ++k)
+        for (int j = 0; j < gf.ny; ++j)
+            for (int i = 0; i < gf.nx; ++i)
+            {
+                // Face-normal axis uses the face map, the other two the centre
+                // map; that is what makes this a MAC interpolation and not a
+                // collocated one.
+                const double Xf = (i - 1) * hf, Yf = (j - 1) * hf, Zf = (k - 1) * hf;
+                const double Xc = (i - 0.5) * hf, Yc = (j - 0.5) * hf,
+                             Zc = (k - 0.5) * hf;
+                const std::size_t q = gf.idx(i, j, k);
+                F.u[q] = sample(C.u, Xf / hc + 1.0, Yc / hc + 0.5, Zc / hc + 0.5);
+                F.v[q] = sample(C.v, Xc / hc + 0.5, Yf / hc + 1.0, Zc / hc + 0.5);
+                F.w[q] = flat ? 0.0
+                              : sample(C.w, Xc / hc + 0.5, Yc / hc + 0.5,
+                                       Zf / hc + 1.0);
+            }
+    return F;
+}
+
+int runFlowIncompressible(const Case& c, Geometry& geo,
+                          const VectorField* ic0 = nullptr,
+                          VectorField* finalOut = nullptr,
+                          bool suppressOutput = false)
 {
     const auto& g = c.grid;
     const double h = c.h;
@@ -219,8 +276,11 @@ int runFlowIncompressible(const Case& c, Geometry& geo)
     const double qRef = 0.5 * c.uInf * c.uInf * aFront;
 
     // Clean laminar free stream plus a deterministic z-uniform trip one D
-    // behind the body, to break the symmetric-wake transient early.
+    // behind the body, to break the symmetric-wake transient early. With grid
+    // sequencing the coarse level's converged field replaces both.
     auto U = VectorField::zeros(g);
+    if (ic0) U = *ic0;
+    else {
     for (auto& x : U.u) x = c.uInf;
     for (int k = 0; k < g.nz; ++k)
         for (int j = 0; j < g.ny; ++j)
@@ -231,6 +291,7 @@ int runFlowIncompressible(const Case& c, Geometry& geo)
                     && std::abs(y - c.placement.cy) < 0.5 * geo.D)
                     U.v[g.idx(i, j, k)] = 0.05 * c.uInf;
             }
+    }
 
     // Phase 3c: everything the run will write is created and checked now.
     FrameGeometry fg;
@@ -249,7 +310,7 @@ int runFlowIncompressible(const Case& c, Geometry& geo)
 
     RunOutput::Config oc;
     oc.prefix = c.outPrefix;
-    oc.kinds = c.emit;
+    oc.kinds = suppressOutput ? std::set<Emit>{Emit::None} : c.emit;
     oc.fdt = c.fdt;
     oc.pdt = c.pdt;
     oc.wdt = c.wdt;
@@ -287,7 +348,7 @@ int runFlowIncompressible(const Case& c, Geometry& geo)
         rr.box.k1 = gg.kInHi();
     }
 
-    auto res = gpu::runIncompressible(g, geo.cut, geo.sdf, U, rr, *out);
+    auto res = gpu::runIncompressible(g, geo.cut, geo.sdf, U, rr, *out, finalOut);
     if (!res) return die(res.error().code, res.error().message);
     std::printf("done: %ld steps, %d frames, %.2f ms/step\n", res->steps,
                 out->frames(), res->msPerStep);
@@ -417,11 +478,68 @@ int runFlowCompressible(const Case& c, Geometry& geo)
 
 #endif // DNS_WITH_HIP
 
-int runFlow(const Case& c)
+
+// Grid sequencing: converge on n/2^(L-1), prolong, repeat, finish on n. Each
+// level is a normally validated Case -- the ladder reuses validate() rather
+// than hand-editing a Case, so no level can skip a check. Only the finest
+// level writes output and only its result is reported.
+int runFlowSequenced(const Case& c, const RawConfig& raw)
+{
+    const int L = c.seqLevels;
+    VectorField carry = VectorField::zeros(c.grid);   // replaced at level 0
+    const VectorField* ic = nullptr;
+    Grid gPrev = c.grid;
+    double hPrev = c.h;
+
+    for (int l = 0; l < L; ++l)
+    {
+        const int shift = L - 1 - l;
+        RawConfig lr = raw;
+        lr.n = raw.n >> shift;
+        if (raw.given.contains("--ny")) lr.ny = std::max(1, raw.ny >> shift);
+        if (raw.given.contains("--nz") && raw.nz > 1)
+            lr.nz = std::max(4, raw.nz >> shift);
+        lr.seq = 1;   // the level itself is a plain steady solve
+
+        auto lc = validate(lr);
+        if (!lc) { std::fputs(format(lc.error()).c_str(), stderr); return lc.error().code; }
+
+        auto geo = buildGeometry(*lc);
+        if (!geo) return die(exitInput, geo.error());
+
+        VectorField prolonged = VectorField::zeros(lc->grid);
+        if (l > 0)
+        {
+            prolonged = prolongMac(gPrev, hPrev, carry, lc->grid, lc->h);
+            ic = &prolonged;
+        }
+
+        const bool last = l == L - 1;
+        std::printf("# seq level %d/%d: n=%d h=%.6g (%.1f cells/D)%s\n", l + 1, L,
+                    lc->n, lc->h, lc->placement.D / lc->h,
+                    last ? "  [final]" : "");
+        std::fflush(stdout);
+
+        VectorField fin = VectorField::zeros(lc->grid);
+        const int rc = runFlowIncompressible(*lc, *geo, ic, last ? nullptr : &fin,
+                                             !last);
+        if (rc != 0) return rc;
+        if (!last)
+        {
+            carry = std::move(fin);
+            gPrev = lc->grid;
+            hPrev = lc->h;
+        }
+    }
+    return 0;
+}
+
+int runFlow(const Case& c, const RawConfig& raw)
 {
     if (!haveGpu(c))
         return die(exitNoGpu, "no HIP device (dns flow is GPU-only)");
 #if DNS_WITH_HIP
+    if (c.seqLevels > 1) return runFlowSequenced(c, raw);
     const auto t0 = std::chrono::steady_clock::now();
     auto geo = buildGeometry(c);
     if (!geo) return die(exitInput, geo.error());
@@ -822,7 +940,7 @@ int main(int argc, char** argv)
     // Phases 3 and 4.
     switch (c->sub)
     {
-    case Subcommand::Flow: return runFlow(*c);
+    case Subcommand::Flow: return runFlow(*c, *raw);
     case Subcommand::Tgv: return runTgv(*c);
     case Subcommand::Hit: return runHit(*c);
     case Subcommand::Bench: return runBench(*c);

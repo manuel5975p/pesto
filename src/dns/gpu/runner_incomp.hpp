@@ -78,8 +78,12 @@ struct RunError
     std::string message;
 };
 
+// `finalField`, when non-null, receives the converged/final velocity field --
+// grid sequencing prolongs it onto the next level as that level's initial
+// guess. Must be sized for this grid.
 std::expected<RunStats, RunError>
 runIncompressible(const Grid&, const CutGeometry& cut, const Sdf& sdf,
-                  const VectorField& ic, const IncompRun&, RunOutput&);
+                  const VectorField& ic, const IncompRun&, RunOutput&,
+                  VectorField* finalField = nullptr);
 
 } // namespace dns::gpu

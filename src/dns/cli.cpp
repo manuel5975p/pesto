@@ -144,7 +144,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--nscbc-beta", &c.nscbcBeta}, {"--nscbc-strip", &c.nscbcStrip},
              {"--ramp", &c.ramp}, {"--kick", &c.kick}, {"--tol", &c.tol},
              {"--max-iters", &c.maxIters}, {"--dt-recompute", &c.dtRecompute},
-             {"--steady", &c.steady},
+             {"--steady", &c.steady}, {"--seq", &c.seq},
              {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
              {"--planes", &c.planes}});
     if (c.sub == Subcommand::Tgv)
@@ -432,6 +432,13 @@ RUN LENGTH
                      silent answer. Incompressible, --les 0. Only
                      converges below the shedding onset (cyl Re<47).
                      0 = plain time-march.                            [0]
+  --seq LEVELS       grid sequencing (requires --steady): converge on a
+                     ladder of grids n/2^(LEVELS-1) .. n, prolonging each
+                     solution as the next level's initial guess. Only the
+                     initial condition changes, never the scheme, so the
+                     converged fine-grid answer is the same one --seq 1
+                     reaches -- just without paying the full transient at
+                     the finest resolution. 1 = off.                  [1]
 
 OUTPUT (--emit is repeatable; default = stats,bin)
   --emit stats       <out>_stats.csv (t,dt,K,cd,cl,cdf,cfl,maxDiv,

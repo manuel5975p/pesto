@@ -401,6 +401,25 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         return bad(2, "--steady",
                    "with --les is meaningless: a filtered field has no "
                    "stationary state to converge to");
+
+    // Grid sequencing. Only the initial guess comes from the coarse level, so
+    // the fine-grid fixed point is unchanged; the ladder just skips paying the
+    // startup transient at full resolution.
+    c.seqLevels = r.seq;
+    if (c.seqLevels < 1 || c.seqLevels > 6)
+        return bad(2, "--seq", "must be in [1,6] (1 = off)");
+    if (c.seqLevels > 1)
+    {
+        if (c.steadyTol <= 0)
+            return bad(2, "--seq", "requires --steady: without a convergence "
+                                   "test there is nothing to advance a level on");
+        // The coarsest level still has to resolve the body: same D >= 4h rule.
+        const int nCoarse = r.n >> (c.seqLevels - 1);
+        if (nCoarse < 16 || double(nCoarse) < 4.0 * c.dr)
+            return bad(2, "--seq", "coarsest level would not resolve the body "
+                                   "(needs n/2^(levels-1) >= max(16, 4*dr)); "
+                                   "use fewer levels or a larger --n");
+    }
     c.fdt = r.fdt;
     c.pdt = r.pdt > 0 ? r.pdt : c.fdt;
     c.wdt = r.wdt > 0 ? r.wdt : c.fdt;
