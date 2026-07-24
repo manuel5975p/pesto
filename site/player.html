@@ -1,0 +1,104 @@
+<!-- PNG-sequence player for --emit png runs (png_<out>/<field>_%05d.png).
+     Serve the repo root with: python3 -m http.server <port>
+     then open: site/player.html?run=../png_cyl_re200&field=vort&fps=25
+     Autoplays, follows the live tail (probes for new frames), scrubbable. -->
+<meta charset="utf-8">
+<title>png preview</title>
+<style>
+  :root{--bg:#0b0d11;--panel:#141821;--edge:#252b36;--ink:#e8ecf2;--mut:#8b94a5;--acc:#37d6c6}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
+    font:500 13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
+  #wrap{display:flex;flex-direction:column;height:100vh}
+  #view{flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:14px}
+  #frame{max-width:100%;max-height:100%;image-rendering:auto;
+    border-radius:8px;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+  #bar{display:flex;align-items:center;gap:14px;padding:12px 18px;
+    background:var(--panel);border-top:1px solid var(--edge)}
+  button{background:transparent;border:1px solid var(--edge);color:var(--ink);
+    border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit}
+  button:hover{border-color:var(--acc)}
+  #scrub{flex:1;accent-color:var(--acc)}
+  #cap{color:var(--mut);white-space:nowrap;min-width:150px}
+  #cap b{color:var(--ink)}
+  #live{color:#8b94a5}
+  #live.on{color:var(--acc)}
+</style>
+<div id="wrap">
+  <div id="view"><img id="frame" alt="frame"></div>
+  <div id="bar">
+    <button id="play">⏸ pause</button>
+    <input id="scrub" type="range" min="0" max="0" value="0">
+    <span id="cap"></span>
+    <span id="live">● live</span>
+  </div>
+</div>
+<script>
+const q = new URLSearchParams(location.search);
+const run = q.get("run") || "../png_cyl_re200";
+const field = q.get("field") || "vort";
+const fps = Math.max(1, +(q.get("fps") || 25));
+const pad = n => String(n).padStart(5, "0");
+const url = n => `${run}/${field}_${pad(n)}.png`;
+
+let count = 0;       // known frames [0, count)
+let cur = 0;
+let playing = true;
+let following = true; // stick to the newest frame
+const cache = new Map();
+
+const $ = id => document.getElementById(id);
+const img = $("frame"), scrub = $("scrub"), cap = $("cap"), live = $("live");
+
+function preload(n){
+  if (n < 0 || cache.has(n)) return;
+  const im = new Image(); im.src = url(n); cache.set(n, im);
+}
+function show(n){
+  if (n < 0 || n >= count) return;
+  cur = n;
+  img.src = url(n);
+  scrub.value = n;
+  cap.innerHTML = `<b>${field}</b> · frame <b>${n}</b> / ${count-1}`;
+  for (let k=1;k<=6;k++) preload(n+k);
+}
+
+// Probe for new frames past `count`; extend as they appear (live tail).
+async function probe(){
+  let added = false;
+  // try up to 8 ahead each tick so we catch up if we fell behind
+  for (let tries=0; tries<8; tries++){
+    const ok = await new Promise(res=>{
+      const t = new Image();
+      t.onload = ()=>res(true); t.onerror = ()=>res(false);
+      t.src = url(count) + "?probe=" + count;
+    });
+    if (!ok) break;
+    count++; added = true;
+  }
+  if (count > 0) scrub.max = count - 1;
+  live.classList.toggle("on", added);
+  if (added && following) show(count - 1);
+  else if (count > 0 && !img.src) show(0);
+}
+
+setInterval(()=>{
+  if (!playing || count === 0) return;
+  let n = cur + 1;
+  if (n >= count){ n = following ? count-1 : 0; }   // hold newest when live
+  if (!following || n !== cur) show(n);
+}, 1000/fps);
+
+setInterval(probe, 700);
+
+$("play").onclick = ()=>{
+  playing = !playing;
+  $("play").textContent = playing ? "⏸ pause" : "▶ play";
+};
+scrub.oninput = ()=>{
+  following = (+scrub.value >= count-1);
+  playing = false; $("play").textContent = "▶ play";
+  show(+scrub.value);
+};
+img.onerror = ()=>{ /* frame not ready yet; probe will retry */ };
+probe();
+</script>

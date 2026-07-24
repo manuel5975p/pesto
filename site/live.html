@@ -130,8 +130,8 @@ let mode = "live";              // live | play | pause
 let lastGrowth = Date.now();
 const cache = new Map();
 
-// Colormaps match src/dns/fieldpng.cpp.
-const MID=[221,221,221], CLO=[59,76,192], CHI=[180,4,38];
+// Vorticity diverging map: dark gray center -> bright blue (-) / bright red (+).
+const MID=[34,34,38], CLO=[40,95,255], CHI=[255,45,35];
 const VIR=[[68,1,84],[72,40,120],[62,74,137],[49,104,142],[38,130,142],
            [31,158,137],[53,183,121],[109,205,89],[180,222,44],[253,231,37]];
 function diva(t){ const s=t*2-1, b=s<0?CLO:CHI, f=Math.abs(s);
