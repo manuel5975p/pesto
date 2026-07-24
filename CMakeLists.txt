@@ -54,8 +54,34 @@ add_executable(dns apps/dns_main.cpp)
 target_link_libraries(dns PRIVATE dns_core)
 
 if(DNS_WITH_HIP)
+    # GPU arch is flexible: an explicit -DCMAKE_HIP_ARCHITECTURES wins;
+    # otherwise auto-detect the installed GPU(s) at configure time and fall
+    # back to a fat multi-arch list if no device is visible (e.g. CI, headless
+    # build hosts). gfx1100 = RX 7900 (RDNA3), gfx1201 = RX 9070 (RDNA4).
     if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
-        set(CMAKE_HIP_ARCHITECTURES gfx1100)
+        set(_dns_detected_arch "")
+        find_program(DNS_AMDGPU_ARCH NAMES amdgpu-arch
+                     HINTS /opt/rocm/bin /opt/rocm/llvm/bin)
+        if(DNS_AMDGPU_ARCH)
+            execute_process(COMMAND ${DNS_AMDGPU_ARCH}
+                            OUTPUT_VARIABLE _dns_arch_out
+                            ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+            string(REPLACE "\n" ";" _dns_arch_list "${_dns_arch_out}")
+            list(REMOVE_DUPLICATES _dns_arch_list)
+            list(FILTER _dns_arch_list INCLUDE REGEX "^gfx")
+            set(_dns_detected_arch "${_dns_arch_list}")
+        endif()
+        if(_dns_detected_arch)
+            set(CMAKE_HIP_ARCHITECTURES "${_dns_detected_arch}")
+            message(STATUS "DNS: auto-detected GPU arch: ${CMAKE_HIP_ARCHITECTURES}")
+        else()
+            set(CMAKE_HIP_ARCHITECTURES "gfx1100;gfx1201")
+            message(STATUS "DNS: no GPU detected, building fat binary for "
+                           "${CMAKE_HIP_ARCHITECTURES} "
+                           "(override with -DCMAKE_HIP_ARCHITECTURES)")
+        endif()
+    else()
+        message(STATUS "DNS: using requested GPU arch: ${CMAKE_HIP_ARCHITECTURES}")
     endif()
     enable_language(HIP)
     list(APPEND CMAKE_PREFIX_PATH /opt/rocm)

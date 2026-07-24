@@ -1,5 +1,6 @@
 # Build tree (CMake + ninja, Release)
 build/
+build-*/
 Testing/
 
 # Large field dumps: regenerable solver output, GB-scale.
