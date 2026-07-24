@@ -1,0 +1,28 @@
+# Three-cylinder side-by-side array with an explicit LES model selection.
+# Cs comes from the scene, merges into the config before validation, and the
+# run is labelled LES everywhere (a conflicting --les on the CLI is an error).
+# 2D + LES is a regularized 2D Euler: qualitative only -- give it --nz for
+# statistics.
+#
+#   build/dns flow --scene examples/cylinder_array_les.toml --re 3000 \
+#       --n 1024 --emit stats --emit web
+
+[model]
+type = "les"
+cs = 0.16
+
+[[objects]]
+kind = "cylinder"
+name = "top"
+y = 1.5
+
+[[objects]]
+kind = "cylinder"
+name = "mid"
+
+[[objects]]
+kind = "cylinder"
+name = "bot"
+y = -1.5
+
+# d defaults to 1.0 D on every object.

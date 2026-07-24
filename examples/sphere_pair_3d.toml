@@ -1,0 +1,18 @@
+# Two spheres in echelon -- genuinely 3D, so the grid needs --nz (a sphere at
+# nz = 1 has no solid cells and is rejected at geometry build).
+#
+#   build/dns flow --scene examples/sphere_pair_3d.toml --re 300 \
+#       --n 384 --nz 192 --emit stats
+
+[[objects]]
+kind = "sphere"
+name = "lead"
+d = 1.0
+
+[[objects]]
+kind = "sphere"
+name = "chase"
+x = 2.0
+y = 0.4
+z = 0.4
+d = 0.75

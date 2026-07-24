@@ -1,0 +1,28 @@
+# A triangle mesh plus an analytic object in one scene. Mesh objects take a
+# path (.stl/.gltf/.glb, loaded in phase 3 like --body FILE.stl), an optional
+# world-unit scale (0 = fit the largest extent to d*D), and robust = true for
+# leaky meshes (winding-number sign). --pitch/--yaw remain deprecated raw
+# model axes: bake attitude with build/orient.py and leave them at 0.
+#
+#   build/dns flow --scene examples/mesh_and_cylinder.toml --re 1000 \
+#       --n 512 --nz 256 --physics compressible --emit stats
+#
+# (Compressible scenes report total forces only for now; per-object columns
+# are incompressible.)
+
+[model]
+type = "dns"
+
+[[objects]]
+kind = "mesh"
+name = "wing"
+path = "assets/wing.glb"
+d = 1.2         # largest extent = 1.2 D
+robust = false
+
+[[objects]]
+kind = "cylinder"
+name = "pylon"
+x = 1.8
+y = -0.6
+d = 0.25

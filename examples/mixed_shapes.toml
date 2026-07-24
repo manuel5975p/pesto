@@ -1,0 +1,25 @@
+# A mixed 2D scene: a lens (sharp-tipped strut) ahead of a cylinder, with a
+# small cube prism in the gap. All three are z-invariant, so the cut is
+# sampled on one x-y layer and the scene runs native 2D.
+#
+#   build/dns flow --scene examples/mixed_shapes.toml --re 500 --n 1024 \
+#       --dr 10 --emit stats --emit png
+
+[[objects]]
+kind = "lens"
+name = "strut"
+x = -2.0
+d = 0.6
+aspect = 4.0    # width / height, > 1
+
+[[objects]]
+kind = "cube"
+name = "prism"
+x = -0.9
+y = -0.4
+d = 0.3
+
+[[objects]]
+kind = "cylinder"
+name = "main"
+d = 1.0

@@ -1,0 +1,23 @@
+# Tandem cylinder pair: a classic wake-interference case. The rear cylinder
+# sits 3 D downstream, slightly offset so it rides the edge of the front
+# wake. DNS -- no [model] block needed (dns is the default).
+#
+#   build/dns flow --scene examples/tandem_cylinders.toml --re 200 --n 1024 \
+#       --emit stats --emit png
+#
+# Per-object drag/lift/friction land in <out>_forces.csv as
+# cd_front/cl_front/cdf_front and cd_rear/... (they sum to the stats totals).
+
+[[objects]]
+kind = "cylinder"
+name = "front"
+x = 0.0      # offsets in units of D from the standard placement
+y = 0.0
+d = 1.0      # diameter in units of D
+
+[[objects]]
+kind = "cylinder"
+name = "rear"
+x = 3.0
+y = 0.25
+d = 1.0

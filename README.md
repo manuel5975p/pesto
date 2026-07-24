@@ -1,6 +1,6 @@
 # dns — incompressible & compressible DNS/LES on a MAC grid (CPU + HIP)
 
-One binary: `build/dns <flow|tgv|hit|bench> [flags]`. The 15 old apps are gone
+One binary: `build/dns <flow|tgv|hit|channel|bench> [flags]`. The 15 old apps are gone
 (recomposed 2026-07-20); every capability is reachable from `dns`. `dns --help`
 and `dns <sub> --help` are authoritative and kept in sync with behaviour — read
 them rather than guessing flags. Historical plan/analysis documents live in
@@ -55,6 +55,7 @@ Build type: Release.
 | `flow` | a body in a uniform free stream: drag/lift, wake, slices |
 | `tgv` | Taylor-Green vortex — 2D analytic check or 3D Re1600 benchmark |
 | `hit` | forced homogeneous isotropic turbulence (SI-configured) |
+| `channel` | wall-resolved turbulent channel flow (compressible, forced; spec: `docs/channel.md`) |
 | `bench` | step-time and throughput benchmark |
 
 Common to every subcommand: `--backend cpu|gpu|auto` (auto), `--out PREFIX`
@@ -69,9 +70,18 @@ Common to every subcommand: `--backend cpu|gpu|auto` (auto), `--out PREFIX`
   cylinder → 2D disks, sphere → 3D caps), `--scale S` (mesh, 0 = fit max extent
   to D), `--robust` (winding-number sign for leaky meshes),
   `--pitch/--yaw` DEPRECATED (§10).
+* **Scene** `--scene FILE.toml` instead of `--body`: the generalized
+  environment — several `[[objects]]` (cylinder/sphere/cube/lens/mesh) placed
+  in units of D about the standard placement, an explicit `[model]` block
+  (`dns` | `les` + Cs) merged before validation, one union-SDF sampled cut,
+  and per-object `cd_/cl_/cdf_` columns in `<out>_forces.csv` (incompressible,
+  ≥ 2 objects; the columns sum exactly to the stats totals). Parsed with the
+  vendored toml++ (`third_party/tomlplusplus`). Spec: `docs/scene.md`;
+  examples: `examples/*.toml`.
 * **Physics** `--physics incompressible|compressible` (incompressible), `--re`
-  (60), `--mach` (0.2, compressible only), `--les CS` (0 = DNS), `--cfl`
-  (0.8 incomp / 0.4 comp).
+  (60), `--mach` (0.2, compressible only), `--les CS` (0 = DNS),
+  `--sgs smag|sigma` (smag; sigma = transition-capable σ-model, Cσ ≈ 1.35,
+  nz > 1 only), `--cfl` (0.8 incomp / 0.4 comp).
 * **Far field** `--far tunnel|fringe|sponge|nscbc|periodic` + `--open` for the
   lateral faces (§7). Tuning: `--sponge-cells N` (0 = 10% of n),
   `--fringe-axes 2|3` (0 = auto: 2 when `--nz 1`), `--nscbc-beta` (0.5),
@@ -258,7 +268,7 @@ Poinsot-Lele characteristic boundaries as a RHS OVERWRITE, not a state overwrite
 `DeviceComp::setRhsHook` (called after `kCompRhs`, stage primitives live) lets the
 module rewrite rows i = 0 / nx−1 of k with the LODI d/dt plus the exact transverse
 y/z `faceFlux` divergence; the rows then ride through SSP-RK3 via the normal axpy
-(no dt plumbing needed — this is why it avoids `comp_bc`'s acoustic churn).
+(no dt plumbing needed — this is why it avoids `comp_bc`'s acoustic transients).
 `kCompRhs` stays pure-periodic: the wrap-contaminated x-fluxes at those rows are
 overwritten and no interior cell reads the wrap face. x-viscous terms on boundary
 rows are dropped.
@@ -271,7 +281,7 @@ rows are dropped.
   `L1 −= betaTrans (Tp − ρc·Tu)`, `--nscbc-beta` default 0.5, ≥ 1 rejected:
   measured Re800 scan — β 0 pumps a growing global mode (wake cores crossing the
   outflow radiate uncanceled incoming waves, cl 2→13), β = M = 0.2 still drifts,
-  0.5 clean, 1.0 BLOWS UP at t = 35 (full cancellation is ill-posed at low M).
+  0.5 clean, 1.0 diverges at t = 35 (full cancellation is ill-posed at low M).
   Unit vortex-exit residual: 13% (β 0) → 2.5% (0.5).
 
 **Six-face** (2026-07-18): generalized from x-rows to all open faces — Config
@@ -305,7 +315,7 @@ Deferred: FP64 gauge-p differencing, wall-aware transverse stencil, LES nut at
 boundary rows, betaLat split, long-window open validation campaign.
 
 ### `--nscbc-strip N` — the Re2000 limit and the production hybrid
-Pure NSCBC BLOWS UP at Re2000 2048² (t = 63.6) — residual outflow reflection pumps
+Pure NSCBC diverges at Re2000 2048² (t = 63.6) — residual outflow reflection pumps
 box modes between the stiff inflow and the walls; final frames show vorticity
 sheets ON the free-slip walls and shed FROM the inflow row (a stiff inflow is a
 wall for transverse sloshing). At 1024² it survives but is contaminated
@@ -383,6 +393,50 @@ FFT/DCT-preconditioned CG on the fluid subspace. `makeMeshCut` / `makeGolfCut` /
 `makeLensCut` are now the single `sampleCut()` in `geometry.*` (bit-identical,
 verified against all three).
 
+### `--cut-flux` — sharp apertured momentum (incompressible, off by default)
+
+Momentum advection/diffusion classically see the body as a binary staircase
+(`maskSolidFaces` zeros); `--cut-flux` instead weights the convective and
+viscous fluxes by the exact face apertures the projection already uses, over
+λ-floored control volumes (`gpu/cutflux.*`, λ_floor = 0.5 on the time term
+only). Advecting fluxes are averages of the stored face mass fluxes and the
+skew correction uses the APERTURED divergence, so the operator stays exactly
+skew-symmetric in the λ̃-weighted inner product — no hidden dissipation
+(pinned by `test_gpu_cutflux`: inviscid KE bounded, exact 2D degeneracy).
+Fluid↔ghost links keep full conductance (the mirror owns the sub-cell wall;
+`kBodyFriction` unchanged); the flag band is cleared near the domain boundary
+(the far-field rows own it). Interior cells are bit-identical BY CONSTRUCTION:
+the plain kernel runs first, a band-only kernel overwrites flagged cells (two
+TUs do NOT contract identical expressions identically — measured).
+Compressible `--cut-flux` is validator-blocked: the KG split flux loses its
+KE-consistency under per-face area weighting and the run diverges near the
+body (measured 2026-07-23, twice).
+
+### `--penalize ETA` — λ-smooth Brinkman band decay (experimental)
+
+Near-wall velocity decays by `exp(-dt·(1-λ_face)/ETA)` per stage, smooth along
+the surface, unconditionally stable, both physics (compressible: momentum
+only, drained KE becomes internal energy). CAVEAT measured: it HALVES cdf
+(the ghost mirror reads a pre-damped profile) — never use it when friction
+physics matters. No cd-budget tally yet.
+
+### Upstream "ripples" — what they are and what actually helps
+
+The stationary vorticity filaments upstream of bodies (visible under asinh
+maps at 256³+, ABSENT at 128³) are broadband 6–12h dispersive standing waves
+of the central scheme: continuously seeded at the shoulder by the SUB-CELL
+boundary layer (D/√Re < 1 cell at these Re), trapped in the low-speed
+stagnation region where their upstream group velocity holds. Every clean
+lever was measured (2026-07-23/24, 256³ σ-sphere probes): `--cut-flux` ~20%,
+`--penalize` ~15%, quiet start (`--ramp`, now incompressible too, opt-in)
+~0% — the saturated level is forced, not a start transient. They are the
+honest footprint of an unresolved BL under a zero-dissipation scheme:
+schemes that suppress them (Smagorinsky |S| in the laminar BL, filters,
+penalization) do it by injecting unphysical dissipation. The only true cure
+is resolving the BL (D/√Re ≥ 3 cells). Amplitude is ~20% of local wmax at
+0.25D, decaying upstream; bounded, stationary, does not destabilize.
+No filter/limiter is applied anywhere: dissipation stays ν + explicit SGS.
+
 ## 10. Mesh bodies + orientation convention
 
 `src/dns/trimesh.*` (STL hand parser + glTF/GLB via vendored
@@ -433,7 +487,7 @@ The core scheme is DNS: KE-conserving skew-symmetric advection, the ONLY
 dissipation is the physical ν. Valid iff the grid resolves the smallest active
 scale (body BL ~ D/√Re). Cylinder 512², D = 64 cells: honest up to Re ≈ 500
 (BL ≈ 3 cells). Beyond that the separated shear layer piles enstrophy at the grid
-scale and the run blows up (~t = 3 at Re 3e5) — no CFL/tol setting fixes zero
+scale and the run diverges (~t = 3 at Re 3e5) — no CFL/tol setting fixes zero
 dissipation.
 
 `--les Cs` (default 0 = off) switches to LES: adds per-stage `div(νt grad u)`,
@@ -448,6 +502,19 @@ optional per-cell eddy viscosity `μ_t = ρ(CsΔ)²|S|` face-averaged into
 (hxhy at nz == 1); `stableDt` folds max μ_t into the viscous limit (SmagMax
 reduction). `csLes == 0` is bit-for-bit molecular DNS; the ghost force tally calls
 `faceFlux` with `nut = nullptr` so `cdf` stays ν-only.
+
+`--sgs smag|sigma` (default smag) selects the νt operator, same plumbing in both
+physics. `sigma` is the σ-model (Nicoud et al., Phys. Fluids 23, 085106, 2011):
+`νt = (Cσ·Δ)²·Dσ`, `Dσ = σ3(σ1−σ2)(σ2−σ3)/σ1²` from the singular values of
+∇u (`dns/sgs.hpp`, shared by all three νt sites; CPU-pinned in `test_sgs_op`).
+Use `Cσ ≈ 1.35` — the constant slot is `--les`, it is NOT a Smagorinsky Cs. Dσ
+vanishes identically in pure shear, solid rotation, axisymmetric strain and any
+2D flow, and decays as y³ at walls — so laminar/transitional boundary layers see
+zero eddy viscosity and transition/separation stay physical (the drag-crisis /
+tripped-BL use case, where Smagorinsky's |S| relaminarizes the very BL under
+study). Consequences: `--sgs sigma` requires nz > 1 (validator: Dσ ≡ 0 in 2D
+would be a silent no-op), and a σ-run's nut says nothing until the field is
+genuinely 3D. Smagorinsky stays the default; all pinned trajectories are on it.
 
 Consequences — never blur these:
 * LES output is a FILTERED field; statistics depend on grid AND Cs by
@@ -488,10 +555,91 @@ ratio 4.01 (2nd order), nz == 1 keeps mz EXACTLY 0 on distorted meshes
 `CurvMesh::sinusoidal(g, amp)` = a fixed smooth mapping (skewness survives
 refinement), |amp| ≤ 0.06 valid.
 
-NOT wired: the CLI (no compressible periodic subcommand), and LES / ghost / NSCBC
-/ sponge on curvilinear (all assume Cartesian; `make(metrics, ...)` forces
+NOT wired: LES / sponge on curvilinear (`make(metrics, ...)` forces
 csLes = 0). The Cartesian path is untouched — dispatch is one branch on the
-optional metrics.
+optional metrics. The compressible periodic curvilinear path IS driven by
+`dns channel` (`docs/channel.md`): `CurvMesh::channelY` + `DeviceChannelWall`
++ body-force RHS hook.
+
+### 12.1 Focal clustering — `--focal` (bodies on a curvilinear mesh)
+
+`--focal x0,x1,y0,y1,z0,z1` (or `auto`) puts a FINE plateau box where the
+physics is — a body plus its wake — and coarsens the far field, via one
+independent per-axis `Focal1D` map composed into `AxisRemap3` (`dns/remap.hpp`).
+`Focal1D` is an integrated quintic smoothstep: shape `s(u)=u³(10−15u+6u²)`,
+weight `phi` = 1 on `[a,b]`, blended to 0 over `w` each side, and
+`x(X) = c(X − (1−r)∫phi)`, `dx/dX = c(1 − (1−r)phi) ∈ [c·r, c]`, `r = 1/R`,
+`c = L/(L − (1−r)((b−a)+w))`. The COMPACT support is why polynomial beats
+tanh here: outside the blend the slope is exactly `c`, so the far grid is
+exactly uniform, the periodic wrap is exactly C², the plateau spacing is
+exactly `c·r·h` and the cell-size ratio is exactly `R` (all test-pinned).
+Inactive is the exact identity by branch, so an all-off `AxisRemap3` gives
+`CurvMesh::fromRemap` nodes bit-identical to `uniform` and the device path
+reproduces the Cartesian one.
+
+ONE concrete type, not a template product: NSCBC and the vorticity frame each
+get exactly one extra instantiation and the coefficients travel as data, so
+any combination of clustered axes costs no further kernels.
+
+Validator (compressible, no LES, `--far nscbc` or explicit sponge, mutually
+exclusive with `--stretch`): the blend must clear each domain face by ≥ 4
+cells (x also `nscbc-strip + 2`) so the boundary treatment always reads an
+exactly uniform grid; the plateau must span ≥ 4 fine cells; `nz == 1` forbids
+a z plateau; and the max ADJACENT cell growth is capped at 1.25 — the KG
+central flux has no dissipation, so a sharp coarse/fine step is a dispersive
+reflector. `--dry-run` prints per-axis fine/coarse spacings, the exact ratio,
+the growth and the dt penalty factor. With a body the plateau must contain it
+plus a 3-fine-cell guard, so the ghost wall's mirror stencil never straddles
+the blend; `auto` derives the box from the body AABB (`--focal-pad`,
+`--focal-wake`), shrinking it to fit and reporting what it resolved.
+Analytic bodies only — a mesh/scene AABB is not known until the file loads and
+validation touches no filesystem.
+
+Ghost wall on curvilinear (`comp_ghost`): classification is entirely host-side,
+so the map's inverse never reaches a kernel. Cell centres, normals, wall
+distances and band tests are PHYSICAL (`R.map` of the reference centres); the
+sample point is taken back through the per-axis inverse so the trilinear
+weights stay the Cartesian index-space ones (a separable monotone map keeps
+the centre lattice a valid interpolation lattice). The force tally switches to
+`faceFluxCurv`, which carries the exact face area vector, so the `hy·hz`
+multiply is dropped.
+
+Measured (Re100 cylinder, M0.2, NSCBC, 2D, mean over t > 60):
+
+| mesh | cells | mean cd | St |
+|---|---|---|---|
+| uniform 512 (reference) | 262k | 1.7983 | 0.2532 |
+| uniform 256 | 65k | 1.7876 | 0.2544 |
+| focal 256 `auto`, R = 2 | 65k | 1.8029 | 0.2546 |
+
+Read this as "focal costs nothing", NOT as "focal wins": Re100 at 256² is
+already grid-converged (uniform 256 is within 0.6% of uniform 512), so the
+case cannot discriminate. It does pin that clustering, its blend and the
+ported ghost wall leave cd and St intact at 1/4 the reference's cells.
+
+To measure a BENEFIT the coarse uniform mesh has to be genuinely
+under-resolved while the reference is not — the body BL spans D/√Re, so on
+the default 8D box that window is Re ~ 200-400. At Re300 the BL is 3.7 cells
+on uniform 512, 1.9 on uniform 256 and 3.2 on the focal mesh:
+
+| mesh (Re300) | cells | mean cd | err | St | err |
+|---|---|---|---|---|---|
+| uniform 512 (reference) | 262k | 1.7366 | — | 0.3012 | — |
+| uniform 256 | 65k | 1.7060 | −1.76% | 0.3053 | +1.36% |
+| focal 256 `auto`, R = 2 | 65k | 1.7240 | −0.73% | 0.3026 | +0.46% |
+
+At the SAME cell count focal more than halves the drag error and cuts the
+Strouhal error ~3×, recovering most of the gap to a 4× finer uniform mesh.
+The margin is modest because 2D Re300 is itself near convergence; the gap
+this closes grows with Re, which is the regime the feature is for.
+
+One trap worth stating, because it cost a sign-flipped drag: the deep-solid
+threshold that decides "quiescent" vs "mirrored" is a physical depth, and on
+ANISOTROPIC cells it must follow the WIDEST local spacing. Set from the
+smallest, the mirror band is under two cells thick along the wide axis, the
+interior stencil reaches quiescent deep cells, and cd went 1.49 → −7.6 (a
+thrust). Isotropic cells make the two identical, which is why the Cartesian
+path never saw it. Pinned structurally in `test_gpu_comp_ghost_focal`.
 
 ## 13. 2D == `nz == 1`, no separate code
 
@@ -522,8 +670,13 @@ green.
 * `stats` — `<out>_stats.csv`: `t, dt, K, cd, cl, cdf, cfl, maxDiv, pcgIters,
   resid`.
 * `bin` — `<out>_{vort,speed,mask}.bin`, float32 mid-plane, one frame per `--fdt`.
-* `png` — live PNG frames (`src/dns/fieldpng.*`, test `fieldpng`), requires
-  `--nz 1`: `png_<out>/vort_%05d.png` (diverging cool-warm, clip ±8 uInf/D, body
+* `png` — live PNG frames (`src/dns/fieldpng.*`, test `fieldpng`); at `--nz`
+  > 1 the centre z-plane is rendered (channel precedent). High-Re framing:
+  `--vort-max V` (clip in uInf/D; auto 8/15 saturates ~15× at Re 1e5),
+  `--vort-map asinh` (display-only compression, bin/web stay raw),
+  `--speed-map delta` (|u|−uInf diverging, freestream = background),
+  `--vort-signed` (3D compressible: signed wz instead of |curl|):
+  `png_<out>/vort_%05d.png` (diverging cool-warm, clip ±8 uInf/D, body
   dark) and `speed_%05d.png` (viridis, 0..1.6 uInf), one pair per `--pdt` frame
   (0 = follow `--fdt`), alongside the `.bin` frames. Writer = hand-rolled zlib PNG
   (`dns_core` links ZLIB), row 0 = image bottom.
