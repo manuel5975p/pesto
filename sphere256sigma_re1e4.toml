@@ -1,0 +1,29 @@
+# PILOT for the sigma-LES sphere: Re 1e4, 256^3, dr 4 (D = 64 cells), Mach 0.2,
+# 3 flow-throughs. Cheap shakedown of the sigma model (Csigma = 1.35 --
+# FILTERED field) before the 448^3 Re 4e4 production run
+# (sphere448sigma_re4e4.toml).
+# --far nscbc + validator strip ny/64 = 4.
+# vort_max scaled from the 448 recipe by sqrt(Re) (BL vorticity ~ sqrt(Re)):
+# 120 * sqrt(1e4/4e4) = 60.
+#
+#   build/dns --config sphere256sigma_re1e4.toml
+
+subcommand = "flow"
+physics = "compressible"
+body = "sphere"
+n = 256
+dr = 4
+re = 1e4
+mach = 0.2
+les = 1.35
+sgs = "sigma"
+nscbc_strip = 4
+ft = 3
+# ~15 s of wall time between pngs at 256^3 (~0.1 s/step, dt ~ 1e-3).
+pdt = 0.15
+vort_signed = true
+vort_map = "asinh"
+vort_max = 60
+speed_map = "delta"
+emit = ["stats", "png"]
+out = "/tmp/dns/sphere256sigma_re1e4"

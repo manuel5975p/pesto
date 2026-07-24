@@ -1,0 +1,19 @@
+# KMM Re_tau 180 channel, 512 x 128 x 128, Mach_bulk 0.3, softened trip
+# (kick 0.15 vs the 0.2 default), pure DNS (no LES). Shortened to tt 3
+# turnovers (~3 h wall) with a 10x PNG rate (pdt 0.015 -> a frame pair every
+# ~50 s wall); the full-statistics run is tt 30 at the default pdt.
+# Other settings at the channel defaults: re-tau 180, stretch 2.0, cfl 0.4,
+# isothermal walls, profile-dt 1.
+#
+#   build/dns --config chan512.toml
+
+subcommand = "channel"
+n = 512
+ny = 128
+nz = 128
+mach = 0.3
+kick = 0.15
+tt = 3
+pdt = 0.015
+emit = ["stats", "png"]
+out = "/tmp/dns/chan512"

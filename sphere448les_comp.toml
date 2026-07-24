@@ -1,0 +1,30 @@
+# Compressible twin of sphere448les.toml, for benchmarking against the
+# incompressible tunnel run: same 4D cube (D = pi/4, 112 cells/D at dr 4),
+# same Re 1e5, same LES (Cs = 0.17, field is FILTERED), same 2 flow-throughs
+# and png cadence. Compressible specifics: Mach 0.2, --far nscbc (default)
+# with the validator-required strip ny/64 = 7 above Re 800, quiet-start
+# ramp 2 (tEnd = ramp + 2 L/uInf). Acoustic CFL makes steps ~16x smaller
+# than the incompressible twin -- that cost IS the benchmark.
+#
+#   build/dns --config sphere448les_comp.toml
+
+subcommand = "flow"
+physics = "compressible"
+body = "sphere"
+n = 448
+dr = 4
+re = 1e5
+mach = 0.2
+les = 0.17
+nscbc_strip = 7
+ft = 2
+pdt = 0.015
+# Rendering (chosen via the 384^3 colormap probes, 2026-07-23): signed wz on
+# the diverging map, asinh-compressed with full scale ~ the measured peak
+# (~120 uInf/D at Re 3e4-1e5), and speed as |u| - uInf about the freestream.
+vort_signed = true
+vort_map = "asinh"
+vort_max = 120
+speed_map = "delta"
+emit = ["stats", "png"]
+out = "/tmp/dns/sphere448lesC"

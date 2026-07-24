@@ -1,0 +1,21 @@
+# Sphere in the incompressible tunnel, LES (Smagorinsky Cs = 0.17 -- the
+# field is FILTERED; statistics depend on grid AND Cs). Re 1e5 on D, D = a
+# quarter of the domain height (dr 4, D = 112 cells), 2 flow-throughs,
+# high-rate centre-plane PNGs (pdt 0.015, ~840 frame pairs).
+#
+# 448^3, not 512^3: at 514^3 the DCT-preconditioned CG pressure solver's
+# buffers + FFT workspace exceed the 16 GiB card on top of ~11 GB of
+# state/cut (measured exit 6 at init, 2026-07-23); 448^3 fits.
+#
+#   build/dns --config sphere448les.toml
+
+subcommand = "flow"
+body = "sphere"
+n = 448
+dr = 4
+re = 1e5
+les = 0.17
+ft = 2
+pdt = 0.015
+emit = ["stats", "png"]
+out = "/tmp/dns/sphere448les"

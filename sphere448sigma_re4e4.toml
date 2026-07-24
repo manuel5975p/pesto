@@ -1,0 +1,32 @@
+# Compressible sphere in the tunnel, LES with the SIGMA model (Csigma = 1.35
+# -- FILTERED field; nut vanishes in the laminar attached BL, so transition/
+# separation stay physical, unlike the Smagorinsky run this redoes).
+# Re 4e4 on D, Mach 0.2 (Mach 2 was requested but the Kennedy-Gruber
+# central flux has no shock capturing; validator rejects mach >= 1),
+# 448^3, dr 4 (D = 112 cells), 3 flow-throughs.
+# --far nscbc (compressible default) + validator-required strip ny/64 = 7.
+# Rendering follows the calibrated high-Re recipe: signed wz asinh with
+# vort-max ~ measured peak, speed as |u| - uInf delta.
+#
+#   build/dns --config sphere448sigma_re4e4.toml
+
+subcommand = "flow"
+physics = "compressible"
+body = "sphere"
+n = 448
+dr = 4
+re = 4e4
+mach = 0.2
+les = 1.35
+sgs = "sigma"
+nscbc_strip = 7
+ft = 3
+# ~15 s of wall time between pngs: measured 0.0286 t/min at 448^3 on this GPU
+# -> 0.25 min * 0.0286 = 0.007. Frames start at t = 0 (ramp gate removed).
+pdt = 0.007
+vort_signed = true
+vort_map = "asinh"
+vort_max = 120
+speed_map = "delta"
+emit = ["stats", "png"]
+out = "/tmp/dns/sphere448sigma_re4e4"
