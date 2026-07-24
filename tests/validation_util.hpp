@@ -182,7 +182,7 @@ inline StrouhalResult strouhal(const std::vector<double>& t, const std::vector<d
 }
 
 // Max |y - yRef| over refT in [t0,t1], scaled by max|yRef| in the window
-// (scale-relative: pointwise-relative blows up at zero crossings).
+// (scale-relative: pointwise-relative diverges at zero crossings).
 inline double curveMaxRelDiff(const std::vector<double>& refT, const std::vector<double>& refY,
                               const std::vector<double>& t, const std::vector<double>& y,
                               double t0, double t1)

@@ -15,6 +15,7 @@
 
 #include <expected>
 #include <string>
+#include <vector>
 
 namespace dns::gpu {
 
@@ -29,7 +30,15 @@ struct IncompRun
     double tEnd = 0;
     double tol = 1e-4;        // CG per-cell RMS residual target
     int maxIters = 500;
-    double les = 0;           // Smagorinsky Cs; 0 = DNS
+    double les = 0;           // SGS constant; 0 = DNS
+    SgsModel sgs = SgsModel::Smagorinsky;   // nut operator, used iff les > 0
+    bool cutFlux = false;     // --cut-flux: apertured momentum RHS (gpu/cutflux.hpp)
+    double penalize = 0;      // --penalize: Brinkman band decay time eta; 0 = off
+    double ramp = 0;          // --ramp: quiet start, freestream smoothstepped
+                              // over [0, ramp]; 0 = impulsive (historical)
+    double vortMax = 0;       // vorticity frame clip (absolute); 0 = 8 uInf/D
+    bool vortAsinh = false;   // png: asinh(v/toe), toe = vortMax/32
+    bool speedDelta = false;  // frames carry |u| - uInf (diverging)
 
     // Far field. Fringe = fully periodic box + cosine sponge (FFT pressure);
     // otherwise the confined tunnel (Dirichlet inlet, convective outlet,
@@ -43,10 +52,29 @@ struct IncompRun
     // body centre.
     bool pot = false;
     double cx = 0, cy = 0, cz = 0; // body centre (world coords)
+    // Full-width solid floor crossing the inlet/outlet planes (--body floor):
+    // fully-solid interior row count and the cut row's open face fraction,
+    // measured from the body cut BEFORE the boundary ring is closed.
+    // -1 = no floor (bit-identical historical tunnel).
+    int floorRows = -1;
+    double floorFrac = 1.0;
     int fringeCells = 0;      // 0 = clamp(0.1 nx, 8, nx/2 - 1)
     int fringeAxes = 0;       // 0 = nz == 1 ? 2 : 3
 
-    BodyBox box{};            // force-tally index box
+    BodyBox box{};            // force-tally index box (the whole scene/body)
+
+    // Per-object force integration (scenes): one extra tally per object,
+    // written as the "forces" CSV series (t, then cd_/cl_/cdf_ per label) at
+    // the same cadence as "stats". Boxes must be pairwise disjoint -- an
+    // overlapping pair would each count the shared surface -- and the caller
+    // (dns_main) enforces that, downgrading to the total-only tally instead.
+    struct Tally
+    {
+        std::string name;
+        BodyBox box;
+    };
+    std::vector<Tally> tallies;
+
     int statsEvery = 20;      // steps between force/diagnostic rows
 
     // Stationary mode: stop early once the field stops changing. The residual

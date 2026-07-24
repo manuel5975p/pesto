@@ -1,8 +1,12 @@
 #include "dns/cli.hpp"
 
+#define TOML_EXCEPTIONS 0
+#include <tomlplusplus/toml.hpp>
+
 #include <algorithm>
 #include <charconv>
 #include <cstring>
+#include <format>
 #include <initializer_list>
 #include <string_view>
 #include <variant>
@@ -109,6 +113,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     else if (sub == "tgv") c.sub = Subcommand::Tgv;
     else if (sub == "hit") c.sub = Subcommand::Hit;
     else if (sub == "bench") c.sub = Subcommand::Bench;
+    else if (sub == "channel") c.sub = Subcommand::Channel;
     else
         return std::unexpected(CliError{
             "dns: unknown subcommand '" + string(sub) + "'\n"
@@ -122,6 +127,11 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                            c.re = 1600.0; c.cfl = 0.9; break;
     case Subcommand::Hit:  c.out = "hit";  c.n = 256; c.nz = 0; break;
     case Subcommand::Bench: c.out = "bench"; c.n = 256; c.nz = 0; break;
+    // KMM Re_tau 180 grid; interior wall-normal cells, spanwise 160.
+    case Subcommand::Channel: c.out = "channel"; c.n = 192; c.ny = 128;
+                              c.nz = 160; c.physics = Physics::Compressible;
+                              c.stretch = 2.0; c.kick = 0.2; c.cfl = 0.4;
+                              break;
     }
 
     // Numeric / string options valid in this subcommand.
@@ -137,16 +147,24 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
 
     if (c.sub == Subcommand::Flow)
         add({{"--ny", &c.ny}, {"--dr", &c.dr}, {"--body", &c.body},
+             {"--scene", &c.scene},
              {"--aspect", &c.aspect}, {"--dimples", &c.dimples},
+             {"--bumps", &c.bumps}, {"--bump-h", &c.bumpH},
              {"--scale", &c.scale}, {"--pitch", &c.pitch}, {"--yaw", &c.yaw},
              {"--mach", &c.mach}, {"--les", &c.les}, {"--cfl", &c.cfl},
+             {"--penalize", &c.penalize},
              {"--sponge-cells", &c.spongeCells}, {"--fringe-axes", &c.fringeAxes},
              {"--nscbc-beta", &c.nscbcBeta}, {"--nscbc-strip", &c.nscbcStrip},
+             {"--stretch", &c.stretch}, {"--focal", &c.focal},
+             {"--focal-ratio", &c.focalRatio},
+             {"--focal-blend", &c.focalBlend},
+             {"--focal-wake", &c.focalWake}, {"--focal-pad", &c.focalPad},
              {"--ramp", &c.ramp}, {"--kick", &c.kick}, {"--tol", &c.tol},
              {"--max-iters", &c.maxIters}, {"--dt-recompute", &c.dtRecompute},
              {"--steady", &c.steady}, {"--seq", &c.seq},
              {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
-             {"--planes", &c.planes}});
+             {"--planes", &c.planes}, {"--png-down", &c.pngDown},
+             {"--vort-max", &c.vortMax}});
     if (c.sub == Subcommand::Tgv)
         add({{"--nu", &c.nu}, {"--cfl", &c.cfl}, {"--fdt", &c.fdt}});
     if (c.sub == Subcommand::Hit)
@@ -154,9 +172,17 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--stats", &c.stats}, {"--fdt", &c.fdt}});
     if (c.sub == Subcommand::Bench)
         add({{"--steps", &c.steps}});
+    if (c.sub == Subcommand::Channel)
+        add({{"--ny", &c.ny}, {"--re-tau", &c.reTau}, {"--mach", &c.mach},
+             {"--stretch", &c.stretch}, {"--kick", &c.kick},
+             {"--tt", &c.tt}, {"--lx", &c.lx}, {"--lz", &c.lzBox},
+             {"--cfl", &c.cfl}, {"--dt-recompute", &c.dtRecompute},
+             {"--profile-dt", &c.profileDt},
+             {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
+             {"--planes", &c.planes}, {"--png-down", &c.pngDown}});
 
     int physicsSel = int(c.physics), farSel = int(c.far), backendSel = int(c.backend),
-        poissonSel = int(c.poisson);
+        poissonSel = int(c.poisson), sgsSel = int(c.sgs);
     std::vector<EnumOpt> enums{
         {"--backend", {{"cpu", int(Backend::Cpu)}, {"gpu", int(Backend::Gpu)},
                        {"auto", int(Backend::Auto)}}, &backendSel},
@@ -175,11 +201,22 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                           {"nscbc", int(FarField::Nscbc)},
                           {"periodic", int(FarField::Periodic)}},
                          &farSel});
+        enums.push_back({"--sgs",
+                         {{"smag", int(SgsModel::Smagorinsky)},
+                          {"sigma", int(SgsModel::Sigma)}},
+                         &sgsSel});
+        enums.push_back({"--vort-map",
+                         {{"linear", 0}, {"asinh", 1}}, &c.vortMap});
+        enums.push_back({"--speed-map",
+                         {{"abs", 0}, {"delta", 1}}, &c.speedMap});
         enums.push_back({"--poisson",
                          {{"auto", int(PoissonKind::Auto)}, {"fft", int(PoissonKind::Fft)},
                           {"dct", int(PoissonKind::Dct)}, {"cg", int(PoissonKind::Cg)}},
                          &poissonSel});
     }
+    if (c.sub == Subcommand::Channel)
+        enums.push_back({"--wall", {{"isothermal", 1}, {"adiabatic", 0}},
+                         &c.wallIso});
 
     // Boolean flags (no value).
     std::vector<std::pair<const char*, bool*>> flags{
@@ -187,8 +224,11 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     if (c.sub == Subcommand::Flow)
     {
         flags.push_back({"--robust", &c.robust});
+        flags.push_back({"--vort-signed", &c.vortSigned});
         flags.push_back({"--open", &c.open});
         flags.push_back({"--pot", &c.farPot});
+        flags.push_back({"--cut-flux", &c.cutFlux});
+        flags.push_back({"--noslip", &c.noslip});
     }
 
     std::vector<string> known;
@@ -281,8 +321,78 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     c.physics = Physics(physicsSel);
     c.far = FarField(farSel);
     c.poisson = PoissonKind(poissonSel);
+    c.sgs = SgsModel(sgsSel);
     if (!c.given.contains("--out")) c.out = string(sub);
     return c;
+}
+
+// ---------------------------------------------------------------------------
+
+std::expected<ConfigTokens, std::string> configTokens(std::string_view toml)
+{
+    const auto res = toml::parse(toml);
+    if (!res)
+    {
+        const auto& e = res.error();
+        return std::unexpected("config: TOML parse error: "
+                               + std::string(e.description()) + " (line "
+                               + std::to_string(e.source().begin.line) + ")");
+    }
+
+    ConfigTokens out;
+    // One scalar to one CLI token; the strict full-consumption parse() then
+    // re-reads it, so the formatting only has to round-trip.
+    auto scalar = [](const toml::node& n) -> std::expected<string, string> {
+        if (const auto s = n.value<string>()) return *s;
+        if (n.is_integer()) return std::format("{}", *n.value<int64_t>());
+        if (n.is_floating_point()) return std::format("{}", *n.value<double>());
+        return std::unexpected("must be a string, number, or bool");
+    };
+
+    for (const auto& [key, v] : res.table())
+    {
+        string k(key.str());
+        std::ranges::replace(k, '_', '-');
+        if (k == "subcommand")
+        {
+            const auto s = v.value<string>();
+            if (!s || s->empty())
+                return std::unexpected("config: `subcommand` must be a "
+                                       "non-empty string");
+            out.subcommand = *s;
+            continue;
+        }
+        const string flag = "--" + k;
+        if (v.is_boolean())
+        {
+            // Flags can only be asserted; `x = false` looks like it disables
+            // something and silently would not -- reject it instead.
+            if (!v.value_or(false))
+                return std::unexpected("config: `" + k + " = false` has no CLI "
+                                       "form (flags cannot be negated); drop "
+                                       "the key");
+            out.args.push_back(flag);
+            continue;
+        }
+        if (const toml::array* a = v.as_array())
+        {
+            for (const auto& item : *a)
+            {
+                auto s = scalar(item);
+                if (!s)
+                    return std::unexpected("config: `" + k + "` entries "
+                                           + s.error());
+                out.args.push_back(flag);
+                out.args.push_back(std::move(*s));
+            }
+            continue;
+        }
+        auto s = scalar(v);
+        if (!s) return std::unexpected("config: `" + k + "` " + s.error());
+        out.args.push_back(flag);
+        out.args.push_back(std::move(*s));
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -294,11 +404,17 @@ R"(dns — incompressible & compressible DNS/LES on a MAC grid (CPU + HIP)
 
 usage: dns <subcommand> [options]
        dns <subcommand> --help
+       dns [<subcommand>] --config FILE.toml [options]
+           (TOML run config: `n = 512` = `--n 512`, `re_tau` = `--re-tau`,
+            `emit = ["stats","png"]` repeats the flag, `noslip = true` asserts
+            it, `subcommand = "channel"` may replace the positional; explicit
+            CLI flags override the file)
 
 subcommands:
   flow    a body in a uniform free stream: drag/lift, wake, slices
   tgv     Taylor-Green vortex — 2D analytic check or 3D Re1600 benchmark
   hit     forced homogeneous isotropic turbulence (SI-configured)
+  channel wall-resolved turbulent channel flow (compressible, forced)
   bench   step-time and throughput benchmark
 
 common options (every subcommand):
@@ -328,7 +444,8 @@ std::string help(Subcommand s)
         return
 R"(dns flow — a body in a uniform free stream
 
-usage: dns flow --body BODY [grid] [physics] [far field] [output]
+usage: dns flow (--body BODY | --scene FILE.toml) [grid] [physics] [far field]
+                [output]
 
 GRID
   --n N              cells along x (streamwise)                    [512]
@@ -340,7 +457,7 @@ GRID
     incompressible: L = 2*pi, h = L/n, D = L/--dr  (box scales with n)
     compressible:   D = pi/4, box = --dr * D in y ((n/ny)*dr*D in x),
                     D spans ny/dr cells (dr 8, n 512 = the historical
-                    8D x 8D box, bit-identical); --dr >= 6
+                    8D x 8D box, bit-identical); --dr >= 4
   These are two genuinely different, separately validated conventions.
   Merging them relocates the body and rescales Re — a real past bug
   (measured cd 3.19). They are NOT unified by this recomposition.
@@ -350,13 +467,55 @@ BODY (exactly one; required)
   --body sphere          ball                                          (3D)
   --body cube            45-deg rotated square prism              (2D or 3D)
   --body lens            two-disk intersection, sharp tips              (2D)
+  --body fence           wall-mounted blocker: rectangle sealed to the
+                         tunnel floor, top edge at D above it (thickness
+                         D/8) -- --dr 10 blocks the bottom 10%. The 2D
+                         shear-layer rig (incompressible --far tunnel)  (2D)
+  --body floor           raised solid floor: slab over the FULL streamwise
+                         extent, surface at D above the wall -- --dr 10
+                         solidifies the bottom 10%; a no-slip flat plate
+                         with its leading edge in the inflow plane. The
+                         wall-layer rig (incompressible --far tunnel)   (2D)
   --body FILE.stl|.gltf|.glb    triangle mesh, sdf via BVH       (2D or 3D)
+  --body none            body-free box (wall boundary layers; compressible
+                         only -- pair with --noslip and/or --stretch)
+  --scene FILE.toml      generalized scene instead of --body: several
+                         objects ([[objects]] tables: cylinder/sphere/cube/
+                         lens/mesh) placed in units of D about the standard
+                         placement, plus an explicit [model] block
+                         (dns | les + cs). Uses the generic sampled cut;
+                         per-object cd/cl/cdf land in <out>_forces.csv
+                         (incompressible). Spec + examples: docs/scene.md,
+                         examples/*.toml
 
   --aspect A         lens width / height, A > 1                    [3.5]
   --dimples N        golf dimples, 0 = smooth                        [0]
+  --bumps N          floor trip spikes: N triangular teeth (height
+                     --bump-h, base = height), evenly pitched over
+                     10%..75% of the plate (smooth development length
+                     ahead, smooth recovery length before the
+                     outlet); 0 = smooth. --body floor only.          [0]
+  --bump-h H         spike height in cells, [4,48]. The layer trips
+                     when the teeth poke through the local boundary
+                     layer (k/delta ~ 1); 8h buried under a
+                     quiet-start BL stays laminar (measured).         [8]
                      (cylinder -> 2D disks, sphere -> 3D caps)
   --scale S          mesh scale; 0 = fit max extent to D             [0]
   --robust           mesh sign by winding number (leaky meshes)
+  --cut-flux         apertured momentum fluxes: the wall enters
+                     advection/diffusion at its sub-cell position
+                     instead of the binary staircase mask, removing
+                     the stationary 2-grid vorticity the staircase
+                     sheds upstream. Both physics, needs a body.
+                     Intended default after validation.
+  --penalize ETA     Brinkman solid-band decay: near-wall velocity
+                     relaxes to rest on time scale ETA/(1-lambda),
+                     SMOOTH along the surface (lambda = exact fluid
+                     fraction) -- damps the jagged staircase slip
+                     that --cut-flux's flux weighting cannot reach.
+                     Dissipative and local; drained momentum is not
+                     yet in the cd budget (cd reads slightly low).
+                     Composable with --cut-flux. Try ETA ~ h/uInf. [0]
   --pitch DEG        DEPRECATED: rotates RAW MODEL AXES, not aircraft
   --yaw DEG          angles. Bake attitude with build/orient.py and
                      leave these at 0.
@@ -365,9 +524,15 @@ PHYSICS
   --physics incompressible|compressible          [incompressible]
   --re RE            Reynolds number on D                           [60]
   --mach M           Mach number (compressible only)               [0.2]
-  --les CS           Smagorinsky constant; 0 = DNS                   [0]
-                     full 3D strain in both physics; nz==1 reduces
+  --les CS           SGS model constant; 0 = DNS                     [0]
+                     full 3D gradients in both physics; nz==1 reduces
                      exactly to the 2D model (see CLAUDE.md caveats)
+  --sgs smag|sigma   SGS model, used with --les                   [smag]
+                     smag:  nut = (Cs D)^2 |S|, Cs ~ 0.17. Nonzero in
+                            laminar shear -- eats boundary layers.
+                     sigma: Nicoud 2011, Csigma ~ 1.35. Vanishes in
+                            2D/pure-shear/rotation states, y^3 wall
+                            decay: the transition-capable choice.
   --cfl C            Courant target             [0.8 incomp / 0.4 comp]
 
 FAR FIELD (--far, exactly one)
@@ -377,8 +542,11 @@ FAR FIELD (--far, exactly one)
   --far fringe       fully periodic + cosine sponge on the boundaries
                      relaxing u -> uInf. FFT pressure. (was: --open)
   --far sponge       compressible streamwise freestream sponge +
-                     free-slip lateral walls. Compressible default.
+                     free-slip lateral walls. Escape hatch / explicit fallback
+                     ONLY -- never a default; it eats the near field in
+                     a relaxation band. Ask for it by name.
   --far nscbc        Poinsot-Lele characteristic boundaries.
+                     Compressible default.
   --far periodic     no far field (plain periodic box).
 
   --open             make the LATERAL faces open too.
@@ -393,10 +561,10 @@ FAR FIELD (--far, exactly one)
                      (2 when --nz 1, else 3)                          [0]
   --nscbc-beta B     Yoo-Im transverse correction, in [0,1)         [0.5]
                      Measured: 0 pumps a growing global mode;
-                     1.0 blows up at t=35. Values >= 1 are rejected.
+                     1.0 diverges at t=35. Values >= 1 are rejected.
   --nscbc-strip N    absorbing strip inside the NSCBC rows; 0 = pure
                      characteristic. Required above Re 800; use ~ny/64
-                     (pure NSCBC blows up at Re 2000, 2048^2).         [0]
+                     (pure NSCBC diverges at Re 2000, 2048^2).         [0]
   --pot              potential-corrected far field: targets/inlet are
                      freestream + wake source (strength from the
                      measured drag, EMA) + displacement doublet instead
@@ -407,10 +575,61 @@ FAR FIELD (--far, exactly one)
                        incompressible --far tunnel --open: the inlet
                      Rejected with any other far field.
 
-START-UP (compressible)
-  --ramp T           quiet start: IC at rest, freestream raised by
-                     uniform Galilean boosts over [0,T]. 0 = impulsive
-                     (legacy taper IC).                             [2.0]
+MESH & WALLS (compressible)
+  --stretch B        tanh wall-normal clustering along y (curvilinear
+                     finite-volume path; dns/remap.hpp TanhStretchY).
+                     B in (0,4]: cells shrink toward both y walls with
+                     bounded growth; 0 = uniform. Requires --body none
+                     and --far nscbc (default; the characteristic terms
+                     evaluate the remap) or an explicit --far sponge;
+                     no --les. --dry-run
+                     prints the resolved first-cell height + growth
+                     ratio (the acoustic dt shrinks with the wall
+                     cell).                                            [0]
+  --focal BOX        focal clustering: a FINE plateau box, coarse far
+                     field, one independent per-axis map (dns/remap.hpp
+                     Focal1D / AxisRemap3). BOX = x0,x1,y0,y1,z0,z1 in
+                     world units; a degenerate pair (x0 == x1) leaves
+                     that axis uniform, so a tube around a body and its
+                     wake is x = body..wake, y/z = body diameter. The
+                     map is the EXACT identity within 4 cells of every
+                     domain face (x also clears the NSCBC strip), so the
+                     boundary treatment always sees a uniform grid.
+                     BOX = auto derives the plateau from the body: its
+                     AABB inflated by --focal-pad, extended downstream
+                     by --focal-wake, shrunk if the box cannot hold it
+                     (--dry-run prints what was resolved). Analytic
+                     bodies only -- a mesh/scene AABB is not known
+                     until the file is loaded, and validation touches no
+                     filesystem. With a body the plateau must contain it
+                     plus a 3-fine-cell guard, so the ghost wall's
+                     mirror stencil never straddles the blend.
+                     Compressible, no --les, --far nscbc or explicit
+                     sponge; mutually exclusive with --stretch.
+                     --dry-run prints the per-axis fine/coarse spacings,
+                     the max adjacent growth ratio and the dt penalty.
+  --focal-ratio R    coarse/fine cell-size ratio, (1,16].            [4]
+  --focal-blend F    blend width per side as a fraction of the plateau
+                     extent, (0,2]. Wider = gentler transition; the
+                     validator rejects a max adjacent growth over 1.25
+                     (the central flux has no dissipation and reflects
+                     off a sharp coarse/fine step).                 [0.5]
+  --focal-wake W     --focal auto: plateau extension downstream of the
+                     body, in diameters.                             [5]
+  --focal-pad P      --focal auto: AABB inflation, in diameters.   [0.25]
+  --noslip           closed y walls become adiabatic NO-SLIP mirrors
+                     (boundary layers grow on them) instead of
+                     free-slip. Rejected with --open.
+
+START-UP
+  --ramp T           quiet start: IC at rest, freestream raised
+                     smoothly over [0,T] (compressible: uniform
+                     Galilean boosts; incompressible: ramped inlet /
+                     fringe target). 0 = impulsive start. An impulsive
+                     start rings up trapped dispersive standing waves
+                     in the stagnation region that decay only on the
+                     viscous time scale -- the quiet start never
+                     creates them.               [2.0 comp / 0 incomp]
   --kick A           deterministic solenoidal Gaussian trip 1 D behind
                      the body. Divergence-free, hence acoustically
                      silent; the quiet start is too symmetric to shed
@@ -444,7 +663,8 @@ OUTPUT (--emit is repeatable; default = stats,bin)
   --emit stats       <out>_stats.csv (t,dt,K,cd,cl,cdf,cfl,maxDiv,
                      pcgIters,resid)
   --emit bin         <out>_{vort,speed,mask}.bin float32 mid-plane
-  --emit png         png_<out>/{vort,speed}_%05d.png  (requires --nz 1)
+  --emit png         png_<out>/{vort,speed}_%05d.png  (nz > 1: the centre
+                     z-plane)
   --emit web         web_<out>/ live browser frames + planes.json
   --emit volume      <out>_{vol,lam}.bin full 3D field per frame
   --emit slices      three centre planes instead of the volume
@@ -455,6 +675,23 @@ OUTPUT (--emit is repeatable; default = stats,bin)
   --pdt DT           png interval;  0 = follow --fdt                  [0]
   --wdt DT           web interval;  0 = follow --fdt                  [0]
   --planes N         web planes per axis: 1 = centre, 3 = +/- n/16    [3]
+  --png-down S       box-average PNG frames by S (must divide nx, ny);
+                     1 = full res. e.g. 2048x1024 --png-down 2 -> 1024x512 [1]
+  --vort-max V       vorticity/|curl| colour clip in uInf/D units; 0 = auto
+                     (8 signed / 15 magnitude, calibrated at Re 60-200 --
+                     high-Re runs saturate them; BL vorticity scales as
+                     sqrt(Re) uInf/D)                                  [0]
+  --vort-signed      3D compressible frames: signed z-vorticity on the
+                     diverging map (neutral background, matches the
+                     incompressible look) instead of |curl| sequential
+  --vort-map M       png vorticity mapping: linear (clip at --vort-max) or
+                     asinh (linear toe = vort-max/32, log above: BL and
+                     weak wake filaments both read at high Re). Display
+                     only -- bin/web data stay raw.             [linear]
+  --speed-map M      abs: |u| on viridis, 0..1.6 uInf. delta: frames carry
+                     dspeed = |u| - uInf on the diverging map (freestream
+                     = background, overspeed red, deficit blue); bin
+                     series becomes <out>_dspeed.bin.              [abs]
 )";
     case Subcommand::Tgv:
         return
@@ -482,6 +719,59 @@ R"(dns hit — forced homogeneous isotropic turbulence
   --spin TE        eddy turnovers of spin-up before statistics      [10]
   --stats TE       eddy turnovers of statistics                     [10]
   --emit stats | spectrum | snapshot | slices
+)";
+    case Subcommand::Channel:
+        return
+R"(dns channel — wall-resolved turbulent channel flow
+
+Compressible DNS of a periodic plane channel driven by a constant streamwise
+body force, on the curvilinear wall-clustered mesh. Wall units throughout:
+half-height delta = 1, u_tau = 1, force density f = 1, nu = 1/Re_tau -- the
+box momentum balance pins tau_wall = 1, so --re-tau IS the run's friction
+Reynolds number (in the mean). Validation anchor: Kim-Moin-Moser Re_tau 180.
+
+GRID (defaults = the KMM 192 x 128 x 160 box)
+  --n N              streamwise cells (x, periodic)                 [192]
+  --ny N             wall-normal FLUID cells (two mirror ghost rows
+                     are added internally)                          [128]
+  --nz N             spanwise cells (z, periodic); 1 = native 2D
+                     (qualitative only -- no vortex stretching)     [160]
+  --lx L             box length; 0 = 4 pi delta (KMM)                 [0]
+  --lz L             box span;   0 = 4 pi/3 delta (KMM)               [0]
+  --stretch B        tanh wall-normal clustering, [0,4]. --dry-run
+                     prints the resolved first-cell y+ and growth
+                     ratio (they set the acoustic dt).              [2.0]
+
+PHYSICS
+  --re-tau RE        friction Reynolds number (nu = 1/RE)           [180]
+  --mach M           BULK Mach number: sets the background pressure
+                     from the log-law bulk-velocity estimate. Above
+                     ~0.3 compressibility contaminates comparison
+                     with incompressible references.                [0.2]
+  --wall isothermal|adiabatic                              [isothermal]
+                     isothermal walls conduct the body-force power
+                     out; adiabatic has NO heat sink (T climbs until
+                     dt collapses) -- short transients only.
+  --cfl C            Courant target                                 [0.4]
+
+START-UP
+  --kick A           deterministic solenoidal trip amplitude (times
+                     the bulk-velocity estimate) on the laminar
+                     Poiseuille IC; 0 = untripped (stays laminar)   [0.2]
+
+RUN LENGTH
+  --tt N             eddy turnovers (delta/u_tau = 1) to integrate   [30]
+  --dt-recompute N   steps between stableDt recomputes               [16]
+
+OUTPUT
+  --emit stats       <out>_stats.csv (t,dt,ubulk,utauBot,utauTop,
+                     retau,KE)                                       [on]
+  --profile-dt DT    <out>_profiles.csv y-profile dump interval
+                     (t,y,yplus,uplus,urms,vrms,wrms,uv,rho,T),
+                     Favre-averaged over x,z; 0 = off               [1.0]
+  --emit png|web|bin mid-plane frames (png renders the centre z-plane,
+                     2D or 3D)
+  --fdt/--pdt/--wdt  frame cadences as in dns flow
 )";
     case Subcommand::Bench:
         return

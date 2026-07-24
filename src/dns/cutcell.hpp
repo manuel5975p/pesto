@@ -7,7 +7,7 @@
 // Small cells: the scheme never divides by the fluid fraction (momentum is
 // staircase-masked -- though the GPU apps sharpen the viscous wall with mirror
 // ghost values, see gpu/ghostfill.hpp -- the projection is aperture-weighted
-// only), so tiny cells cannot blow up the update. What they can do is degrade the pressure solve:
+// only), so tiny cells cannot destabilize the update. What they can do is degrade the pressure solve:
 // a nearly closed cell couples to the fluid through vanishing apertures and
 // contributes near-zero eigenvalues (a fully isolated one contributes an exact
 // extra null mode) that stall the FP32 PCG. sanitizeCut() removes both by
@@ -17,6 +17,8 @@
 
 #include "dns/field.hpp"
 #include "dns/grid.hpp"
+
+#include <vector>
 
 namespace dns {
 
@@ -64,6 +66,25 @@ struct CutGeometry
     // A face carrying fluid; below this it is treated as a solid wall.
     static constexpr double openTol = 1e-9;
 };
+
+// Cut-region dispatch mask for the apertured momentum kernel (--cut-flux):
+// 1 on every cell within DISPATCH RADIUS 2 (the widest read footprint of the
+// apertured stencils: the skew correction at face i reaches cellDiv(i-1),
+// whose apertures sit one more cell out) of any cell with lambda < 1 or any
+// non-unity incident face aperture; 0 elsewhere. Cells at 0 take the plain
+// interior stencil VERBATIM, which is what makes the interior bit-identical
+// to the uniform kernel. Deterministic fixed-order dilation; periodic wrap.
+std::vector<unsigned char> buildCutFlag(const Grid& g, const CutGeometry& cut);
+
+// Clear the cut flag within `width` cells of every domain boundary. The ring
+// closure (closeBoxBoundary) makes the whole boundary ring non-unity, but the
+// far-field machinery (tunnel rows, NSCBC/sponge strips) OWNS those cells --
+// aperture-weighting their fluxes fights the boundary scheme (measured: the
+// compressible probe diverged through the NSCBC rows). The cut treatment is
+// for the body, which the validator keeps away from the boundary. NB floor/
+// fence bodies touch the boundary and lose the cut treatment there.
+void clearBoundaryFlag(const Grid& g, std::vector<unsigned char>& flag,
+                       int width);
 
 // What sanitizeCut changed; min* are the post-sanitize conditioning bounds.
 struct CutSanitizeStats

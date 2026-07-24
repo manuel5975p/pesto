@@ -219,6 +219,161 @@ void vortexConvergence()
     check(ratio > 2.7, "second-order convergence on the distorted mesh");
 }
 
+// The TanhStretchY PointRemap and the mesh derived from it: exact identity at
+// beta == 0, endpoint/symmetry/monotonicity of the mapping, analytic Jacobian
+// vs finite differences, inverse-Jacobian and metric-tensor consistency, and
+// valid finite-volume metrics that still tile the box.
+void stretchedRemap()
+{
+    const auto g = Grid::make(8, 16, 1, 2.0, 1.0, 1.0);
+    const auto u = CurvMesh::uniform(g);
+    const auto s0 = CurvMesh::stretchedY(g, 0.0);
+    check(s0.x == u.x && s0.y == u.y && s0.z == u.z,
+          "stretchedY(beta = 0) is uniform bit-for-bit");
+
+    const double beta = 2.0, ly = g.ny * g.hy;
+    const TanhStretchY R{ly, beta};
+    check(R.mapY(0.0) == 0.0 && std::abs(R.mapY(ly) - ly) < 1e-15,
+          "tanh stretch preserves the y endpoints");
+    bool mono = true, sym = true;
+    double prev = R.mapY(0.0);
+    for (int j = 1; j <= g.ny; ++j) {
+        const double y = R.mapY(j * g.hy);
+        if (!(y > prev)) mono = false;
+        prev = y;
+        const double yr = R.mapY(ly - j * g.hy);
+        if (std::abs(y + yr - ly) > 1e-13) sym = false;
+    }
+    check(mono, "tanh stretch is monotone");
+    check(sym, "tanh stretch is symmetric about mid-box");
+    check(R.mapY(0.5 * g.hy) < 0.5 * g.hy,
+          "cells compress toward the wall");
+
+    // Analytic Jacobian against central differences, and the derived
+    // inverse-Jacobian / metric-tensor helpers.
+    const double X[3] = {0.3, 0.11, 0.0};
+    double J[3][3], Ji[3][3], G[3][3];
+    R.jacobian(X, J);
+    const double d = 1e-6;
+    const double fd = (R.mapY(X[1] + d) - R.mapY(X[1] - d)) / (2 * d);
+    check(std::abs(J[1][1] - fd) < 1e-8 && J[0][0] == 1.0 && J[2][2] == 1.0 &&
+              J[0][1] == 0.0 && J[1][0] == 0.0,
+          "remap Jacobian matches finite differences");
+    check(remapInverseJacobian(R, X, Ji) &&
+              std::abs(Ji[1][1] * J[1][1] - 1.0) < 1e-13,
+          "inverse Jacobian inverts the Jacobian");
+    remapMetric(R, X, G);
+    check(std::abs(G[1][1] - J[1][1] * J[1][1]) < 1e-13 &&
+              std::abs(G[0][0] - 1.0) < 1e-15 && std::abs(G[0][1]) < 1e-15,
+          "metric tensor is J^T J");
+    check(std::abs(remapDet(R, X) - J[1][1]) < 1e-15,
+          "det J is the 1D compression factor");
+
+    // Finite-volume tables from the stretched nodes stay valid and tile the
+    // box; the smallest width is the wall cell.
+    const auto m = CurvMetrics::build(CurvMesh::stretchedY(g, beta));
+    if (!m) { check(false, "stretched metrics build"); return; }
+    double tot = 0.0;
+    for (const double v : m->vol) tot += v;
+    const double box = g.nx * g.hx * ly * g.nz * g.hz;
+    check(std::abs(tot - box) < 1e-12 * box, "stretched cells tile the box");
+    const double hWall = R.mapY(g.hy) - R.mapY(0.0);
+    check(std::abs(m->hmin - hWall) < 1e-10, "hmin is the wall-cell height");
+}
+
+// Focal1D / AxisRemap3: bit-exact inactive identity, exact plateau and far
+// spacings, Jacobian vs finite differences, exact C^2 periodic extension,
+// inverse round-trip, and valid finite-volume metrics on a 3-axis focal mesh.
+void focalRemap()
+{
+    const auto g = Grid::make(16, 16, 8, 4.0, 4.0, 2.0);
+    const auto u = CurvMesh::uniform(g);
+
+    const AxisRemap3 id{Focal1D::identity(4.0), Focal1D::identity(4.0),
+                        Focal1D::identity(2.0)};
+    const auto m0 = CurvMesh::fromRemap(g, id);
+    check(m0.x == u.x && m0.y == u.y && m0.z == u.z,
+          "inactive AxisRemap3 is uniform bit-for-bit");
+    check(!Focal1D::make(4.0, 1.0, 2.0, 0.5, 1.0).active &&
+              !Focal1D::make(4.0, 2.0, 1.0, 0.5, 4.0).active &&
+              !Focal1D::make(4.0, 1.0, 2.0, 0.0, 4.0).active,
+          "invalid Focal1D parameters degrade to the identity");
+
+    const double L = 4.0, a = 1.5, b = 2.5, w = 0.5, R = 4.0;
+    const Focal1D f = Focal1D::make(L, a, b, w, R);
+    check(f.map(0.0) == 0.0 && std::abs(f.map(L) - L) < 1e-14,
+          "focal map preserves the endpoints");
+
+    bool mono = true;
+    double prev = f.map(0.0);
+    const double h = L / 64;
+    for (int j = 1; j <= 64; ++j) {
+        const double x = f.map(j * h);
+        if (!(x > prev)) mono = false;
+        prev = x;
+    }
+    check(mono, "focal map is monotone");
+    const double fine = f.map(2.0 + h) - f.map(2.0);
+    const double coarse = f.map(0.25 + h) - f.map(0.25);
+    check(std::abs(fine - f.c * f.r * h) < 5e-15 &&
+              std::abs(coarse - f.c * h) < 5e-15,
+          "plateau spacing c r h, far spacing c h exactly");
+    check(std::abs(coarse / fine - R) < 1e-12,
+          "cell-size ratio is exactly R");
+
+    bool periodic = true;
+    for (const double X : {-0.7, 0.3, 1.8, 2.6, 3.9, 4.4, 9.1}) {
+        if (std::abs(f.map(X + L) - (f.map(X) + L)) > 1e-13) periodic = false;
+        const double fd =
+            (f.map(X + 1e-6) - f.map(X - 1e-6)) / 2e-6;
+        if (std::abs(fd - f.deriv(X)) > 1e-7) periodic = false;
+    }
+    check(periodic, "periodic extension and deriv match everywhere");
+    check(f.deriv(1e-9) == f.c && f.deriv(L - 1e-9) == f.c,
+          "slope is exactly c at both faces (C2 across the wrap)");
+
+    bool inv = true;
+    for (int j = 0; j <= 200; ++j) {
+        const double X = -L + 3.0 * L * j / 200.0;
+        if (std::abs(f.inverse(f.map(X)) - X) > 1e-12) inv = false;
+    }
+    check(inv, "inverse(map(X)) round-trips through both blends");
+
+    const AxisRemap3 A{Focal1D::make(4.0, 1.0, 3.0, 0.5, 4.0),
+                       Focal1D::make(4.0, 1.5, 2.5, 0.5, 4.0),
+                       Focal1D::make(2.0, 0.7, 1.3, 0.3, 2.0)};
+    const double X[3] = {0.8, 1.7, 1.2};
+    double J[3][3];
+    A.jacobian(X, J);
+    bool diag = true;
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            if (i != j && J[i][j] != 0.0) diag = false;
+    check(diag && remapDet(A, X) > 0.0,
+          "AxisRemap3 Jacobian is diagonal with positive det");
+    double Ji[3][3];
+    check(remapInverseJacobian(A, X, Ji) &&
+              std::abs(Ji[0][0] * J[0][0] - 1.0) < 1e-13,
+          "inverse Jacobian inverts the diagonal");
+
+    const auto m = CurvMetrics::build(CurvMesh::fromRemap(g, A));
+    if (!m) { check(false, "focal metrics build"); return; }
+    double tot = 0.0;
+    for (const double v : m->vol) tot += v;
+    const double box = 4.0 * 4.0 * 2.0;
+    check(std::abs(tot - box) < 1e-12 * box, "focal cells tile the box");
+    const double hfine = std::min({A.fx.c * A.fx.r * g.hx,
+                                   A.fy.c * A.fy.r * g.hy,
+                                   A.fz.c * A.fz.r * g.hz});
+    check(std::abs(m->hmin - hfine) < 1e-10 * hfine,
+          "hmin is the fine plateau spacing");
+
+    const auto g2 = Grid::make(32, 32, 1, 4.0, 4.0, 1.0);
+    const AxisRemap3 A2{A.fx, A.fy, Focal1D::identity(1.0)};
+    check(bool(CurvMetrics::build(CurvMesh::fromRemap(g2, A2))),
+          "nz == 1 stays planar with x/y focal");
+}
+
 void rejection()
 {
     const auto g = Grid::make(12, 12, 1, 2.0, 2.0, 1.0);
@@ -247,6 +402,8 @@ int main()
     conservation();
     twoDExact();
     vortexConvergence();
+    stretchedRemap();
+    focalRemap();
     rejection();
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -21,6 +21,16 @@ namespace {
 
 bool has(const std::set<Emit>& s, Emit e) { return s.contains(e); }
 
+// "png_"/"web_" tag onto the LAST path component of the prefix: an --out with
+// directories ("/tmp/dns/chan512") must keep its outputs together
+// ("/tmp/dns/png_chan512"), not grow a literal "png_/tmp/..." tree under the
+// CWD (measured: a channel run quietly filed its frames inside build/).
+std::string tagPrefix(const std::string& tag, const std::string& prefix)
+{
+    const std::filesystem::path p(prefix);
+    return (p.parent_path() / (tag + p.filename().string())).string();
+}
+
 // Closes explicitly and only then reports success: a buffered ENOSPC surfaces
 // at close, so testing the stream while it is still open reports success on a
 // truncated file.
@@ -66,12 +76,12 @@ struct RunOutput::Impl
     {
         return std::format(
             "{{\"nx\":{},\"ny\":{},\"nz\":{},\"frames\":{},\"frameDt\":{},"
-            "\"D\":{},\"re\":{},\"mach\":{},\"cs\":{},\"les\":{},"
+            "\"D\":{},\"re\":{},\"mach\":{},\"cs\":{},\"les\":{},\"sgs\":\"{}\","
             "\"body\":\"{}\",\"far\":\"{}\",\"physics\":\"{}\",\"kick\":{},"
             "\"msPerStep\":{}}}\n",
             meta.nx, meta.ny, meta.nz, frames, meta.frameDt, meta.D, meta.re,
-            meta.mach, meta.cs, meta.les ? 1 : 0, meta.body, meta.farField,
-            meta.physics, meta.kick, msPerStep);
+            meta.mach, meta.cs, meta.les ? 1 : 0, meta.sgs, meta.body,
+            meta.farField, meta.physics, meta.kick, msPerStep);
     }
 
     void writeJson() const
@@ -125,8 +135,10 @@ RunOutput::make(Config cfg, RunMeta meta, const Grid& g, FrameGeometry geo)
 {
     if (cfg.prefix.empty())
         return std::unexpected("output prefix is empty");
-    if (has(cfg.kinds, Emit::Png) && g.nz != 1)
-        return std::unexpected("PNG output requires nz == 1");
+    // PNG at nz > 1 renders the centre z-plane (the gather below slices kc,
+    // same as the bin path). Whether that plane is the meaningful one is the
+    // subcommand's call: flow still rejects it in validate(); channel allows
+    // it (the x-y mid-plane IS the picture of a channel).
     if (cfg.pdt <= 0) cfg.pdt = cfg.fdt;
     if (cfg.wdt <= 0) cfg.wdt = cfg.fdt;
 
@@ -170,7 +182,7 @@ RunOutput::make(Config cfg, RunMeta meta, const Grid& g, FrameGeometry geo)
 
     if (has(p.cfg.kinds, Emit::Png))
     {
-        p.pngDir = "png_" + p.cfg.prefix;
+        p.pngDir = tagPrefix("png_", p.cfg.prefix);
         std::error_code ec;
         std::filesystem::create_directories(p.pngDir, ec);
         if (ec) return std::unexpected(
@@ -247,7 +259,7 @@ std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv
                     char offs[40];
                     std::snprintf(offs, sizeof offs, "%+.3gD", offD);
                     wp.wf = std::make_unique<WebFrames>(
-                        "web_" + p.cfg.prefix + suf, a, b,
+                        tagPrefix("web_", p.cfg.prefix) + suf, a, b,
                         p.cfg.simJson + ",\"plane\":\"" + axis + "\",\"off\":\"" +
                             (offD == 0.0 ? "mid" : offs) + "\"}");
                     for (const auto& f : fv.fields)
@@ -308,7 +320,8 @@ std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv
                     add("_yz_m", "yz", -cellsD(dI), ny, nz, yz(ic - dI));
                     add("_yz_p", "yz", +cellsD(dI), ny, nz, yz(ic + dI));
                 }
-                const std::string path = "web_" + p.cfg.prefix + "/planes.json";
+                const std::string path =
+                    tagPrefix("web_", p.cfg.prefix) + "/planes.json";
                 std::ofstream pf(path);
                 pf << "{\"planes\":[" << idx << "]}\n";
                 return closeChecked(pf, path);
@@ -385,12 +398,54 @@ std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv
                              return std::array{i0 + i, j0 + j, kc};
                          },
                          m);
+            // Optional box-average coarsening of the PNG frame (--png-down).
+            // The field averages over each s*s block; a block is rendered solid
+            // only if ALL its cells are solid, so the body outline never bleeds.
+            int pw = nx, ph = ny;
+            const float* pf = p.buf.data();
+            const float* pm = m.empty() ? nullptr : m.data();
+            std::vector<float> dbuf, dmask;
+            const int s = p.cfg.pngDown;
+            if (s > 1 && nx % s == 0 && ny % s == 0)
+            {
+                pw = nx / s; ph = ny / s;
+                dbuf.assign(std::size_t(pw) * ph, 0.0f);
+                if (pm) dmask.assign(std::size_t(pw) * ph, 1.0f);
+                const float inv = 1.0f / float(s * s);
+                for (int J = 0; J < ph; ++J)
+                    for (int I = 0; I < pw; ++I)
+                    {
+                        float acc = 0.0f, msolid = 0.0f;
+                        for (int dj = 0; dj < s; ++dj)
+                            for (int di = 0; di < s; ++di)
+                            {
+                                const std::size_t c = std::size_t(J * s + dj) * nx
+                                                    + (I * s + di);
+                                acc += p.buf[c];
+                                if (pm && pm[c] < 0.5f) msolid += 1.0f;
+                            }
+                        dbuf[std::size_t(J) * pw + I] = acc * inv;
+                        if (pm)
+                            dmask[std::size_t(J) * pw + I] =
+                                msolid >= float(s * s) ? 0.0f : 1.0f;
+                    }
+                pf = dbuf.data();
+                pm = dmask.empty() ? nullptr : dmask.data();
+            }
+            std::vector<float> abuf;
+            if (f.diverging && f.asinhToe > 0)
+            {   // display-only asinh compression; bin/web carry the raw field
+                abuf.resize(std::size_t(pw) * ph);
+                const float den = std::asinh(f.hi / f.asinhToe);
+                for (std::size_t c = 0; c < abuf.size(); ++c)
+                    abuf[c] = std::asinh(pf[c] / f.asinhToe) / den;
+                pf = abuf.data();
+            }
             const bool ok =
                 f.diverging
-                    ? writeDivergingPng(path, nx, ny, p.buf.data(), f.hi,
-                                        m.empty() ? nullptr : m.data())
-                    : writeSequentialPng(path, nx, ny, p.buf.data(), f.lo, f.hi,
-                                         m.empty() ? nullptr : m.data());
+                    ? writeDivergingPng(path, pw, ph, pf,
+                                        f.asinhToe > 0 ? 1.0f : f.hi, pm)
+                    : writeSequentialPng(path, pw, ph, pf, f.lo, f.hi, pm);
             if (!ok) return std::unexpected(std::format("PNG write failed: {}", path));
         }
         ++p.pngIdx;

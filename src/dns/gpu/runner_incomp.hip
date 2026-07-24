@@ -1,5 +1,6 @@
 #include "dns/gpu/runner_incomp.hpp"
 
+#include "dns/gpu/cutflux.hpp"
 #include "dns/gpu/cutpoisson.hpp"
 #include "dns/gpu/derived.hpp"
 #include "dns/gpu/device_util.hpp"
@@ -27,6 +28,15 @@ std::unexpected<RunError> fail(int code, std::string m)
     return std::unexpected(RunError{code, std::move(m)});
 }
 
+// Quiet-start freestream schedule: smoothstep 0 -> 1 over [0, ramp]
+// (the runner_comp schedule, verbatim).
+double rampFrac(double t, double ramp)
+{
+    if (ramp <= 0 || t >= ramp) return 1.0;
+    const double s = t / ramp;
+    return s * s * (3.0 - 2.0 * s);
+}
+
 } // namespace
 
 std::expected<RunStats, RunError>
@@ -38,6 +48,17 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     const double h = g.hx;
 
     auto dCut = DeviceCutGeometry::make(cut);
+    // --cut-flux: the dispatch mask for the apertured momentum kernel. Built
+    // only when requested; flag-off runs never touch the cutflux TU.
+    std::optional<DeviceCutFlag> dFlag;
+    if (r.cutFlux)
+    {
+        auto hostFlag = buildCutFlag(g, cut);
+        clearBoundaryFlag(g, hostFlag, 4); // tunnel/fringe rows own the ring
+        auto f = DeviceCutFlag::make(hostFlag);
+        if (!f) return fail(6, "GPU allocation failed");
+        dFlag = std::move(*f);
+    }
     // Sharp viscous wall: the diffusion term reads a ghost-filled copy of the
     // stage field (mirror values, no-slip at the true sub-cell surface) while
     // convection keeps the masked zeros. Mirror values in the skew-symmetric
@@ -62,7 +83,7 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     std::optional<DeviceSmagorinsky> les;
     if (r.les > 0)
     {
-        auto m = DeviceSmagorinsky::make(gg, r.les);
+        auto m = DeviceSmagorinsky::make(gg, r.les, r.sgs);
         if (!m) return fail(6, "LES model init failed");
         les = std::move(*m);
     }
@@ -75,14 +96,36 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     auto bodyForce = DeviceBodyForce::make(gg, r.box);
     if (!bodyForce) return fail(6, "body-force tally init failed");
 
-    auto tunnel = DeviceTunnelBc::make(
-        gg, {r.uInf, r.open, r.pot, r.cx, r.cy, r.cz, 0.5 * r.D});
+    // Per-object tallies (scenes): the same surface integral, restricted to
+    // each object's own index box.
+    std::vector<DeviceBodyForce> objForce;
+    objForce.reserve(r.tallies.size());
+    for (const auto& tb : r.tallies)
+    {
+        auto f = DeviceBodyForce::make(gg, tb.box);
+        if (!f) return fail(6, "per-object force tally init failed");
+        objForce.push_back(std::move(*f));
+    }
+
+    auto tunnel = DeviceTunnelBc::make(gg, {r.uInf, r.open, r.pot, r.cx, r.cy,
+                                            r.cz, 0.5 * r.D, r.floorRows,
+                                            r.floorFrac});
     const int nsF = r.fringeCells > 0
                         ? r.fringeCells
                         : std::clamp(int(0.1 * g.nx), 8, g.nx / 2 - 1);
     const int axes = r.fringeAxes > 0 ? r.fringeAxes : (g.nz == 1 ? 2 : 3);
     auto fringe = DeviceFringe::make(gg, {r.uInf, 0.5, nsF, axes});
     if (!tunnel || !fringe) return fail(6, "far-field init failed");
+
+    // Quiet start: the inlet/fringe target starts at rest and is
+    // smoothstepped up to uInf over [0, ramp] each step below. uF is the
+    // CURRENT freestream; the outlet convection speed follows it.
+    double uF = r.ramp > 0 ? 0.0 : r.uInf;
+    if (r.ramp > 0)
+    {
+        tunnel->setFreestream(0.0);
+        fringe->setFreestream(0.0);
+    }
 
     (void)uploadField(ic, *dU);
     maskSolidFaces(gg, *dCut, *dU);
@@ -96,18 +139,26 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     int pcgIters = 0;
     auto stage = [&](const DeviceField& in, DeviceField& outF, double a, double dt) {
         (void)dGhost->fillFrom(in, *dG);
-        fusedRhsStage(gg, Real(r.nu), Real(0), 0, 0, 0, Real(a), *dU0,
-                      Real(1.0 - a), in, *dG, Real(dt), outF);
+        if (dFlag)
+            fusedRhsStageCut(gg, Real(r.nu), Real(0), 0, 0, 0, Real(a), *dU0,
+                             Real(1.0 - a), in, *dG, *dCut, *dFlag, Real(dt),
+                             outF);
+        else
+            fusedRhsStage(gg, Real(r.nu), Real(0), 0, 0, 0, Real(a), *dU0,
+                          Real(1.0 - a), in, *dG, Real(dt), outF);
         if (les)
         {
             les->computeNut(*dG, *dCut);
             les->addEddyDiffusion(*dG, Real((1.0 - a) * dt), outF);
         }
+        if (r.penalize > 0)
+            penalizeSolidBand(gg, *dCut, Real(r.penalize),
+                              Real((1.0 - a) * dt), outF);
         maskSolidFaces(gg, *dCut, outF);
         if (r.fringe) fringe->apply(outF);
         else
         {
-            tunnel->apply(in, outF, r.uInf * dt / h);
+            tunnel->apply(in, outF, uF * dt / h);
             tunnel->correctOutletFlux(outF, *red, *dTmp);
         }
         divergenceCut(gg, *dCut, outF, scr->div, Real(1.0 / dt));
@@ -121,22 +172,38 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     const std::string cols[] = {"t",   "dt",  "K",   "cd",      "cl",
                                 "cdf", "cfl", "maxDiv", "pcgIters", "resid"};
     out.declareSeries("stats", cols);
+    if (!objForce.empty())
+    {
+        std::vector<std::string> fcols{"t"};
+        for (const auto& tb : r.tallies)
+            for (const char* q : {"cd_", "cl_", "cdf_"})
+                fcols.push_back(q + tb.name);
+        out.declareSeries("forces", fcols);
+    }
 
-    const float vortScale = float(8.0 * r.uInf / r.D), speedMax = float(1.6 * r.uInf);
+    const float vortScale =
+        float(r.vortMax > 0 ? r.vortMax : 8.0 * r.uInf / r.D);
+    const float speedMax = float(1.6 * r.uInf);
     std::vector<Real> hVort(g.size()), hSpeed(g.size());
     std::vector<float> vortF(g.size()), speedF(g.size());
+    const float vortToe = r.vortAsinh ? vortScale / 32.0f : 0.0f;
     auto writeFrame = [&](double t) {
         vorticityZ(gg, *dU, *dVort);
         speedMac(gg, *dU, *dSpeed);
         (void)dVort->download(hVort.data());
         (void)dSpeed->download(hSpeed.data());
+        const float uOff = r.speedDelta ? float(r.uInf) : 0.0f;
         for (std::size_t c = 0; c < g.size(); ++c)
         {
             vortF[c] = float(hVort[c]);
-            speedF[c] = float(hSpeed[c]);
+            speedF[c] = float(hSpeed[c]) - uOff;
         }
-        const FrameField ff[2]{{"vort", vortF.data(), 0, vortScale, true},
-                               {"speed", speedF.data(), 0, speedMax, false}};
+        const FrameField ff[2]{
+            {"vort", vortF.data(), 0, vortScale, true, vortToe},
+            r.speedDelta
+                ? FrameField{"dspeed", speedF.data(), 0, float(0.6 * r.uInf),
+                             true}
+                : FrameField{"speed", speedF.data(), 0, speedMax, false}};
         if (auto e = out.frame(t, FrameViews{ff}); !e)
             std::fprintf(stderr, "frame write failed: %s\n", e.error().c_str());
     };
@@ -146,7 +213,7 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     // Potential-corrected inlet wake source: EMA of F_drag / uInf over
     // ~2 D/uInf (the shedding oscillation must not feed the far-field
     // target), fed only after the impulsive-start transient.
-    double qEma = 0.0, tQ = 2.0 * r.D / r.uInf;
+    double qEma = 0.0, tQ = r.ramp + 2.0 * r.D / r.uInf;
     // Steady-residual snapshot interval, in PHYSICAL time -- not in steps. The
     // metric differences two FP32 fields, so its noise floor is ~eps*u/interval;
     // a fixed step count shrinks the interval with dt and pushes the floor UP on
@@ -160,7 +227,10 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     const auto wall0 = std::chrono::steady_clock::now();
     while (t < r.tEnd)
     {
-        const double conv = maxCourantPerDt(gg, *dU, *red);
+        const double conv =
+            dFlag ? maxCourantPerDtCut(gg, *dU, dCut->ax, dCut->ay, dCut->az,
+                                       dCut->lambda, *red)
+                  : maxCourantPerDt(gg, *dU, *red);
         const double diff = r.nu > 0 ? 6.0 * r.nu / (h * h) : 0.0;
         const double dtStab = r.cfl / std::max(conv, diff);
         dt = std::min(r.tEnd - t, dtStab);
@@ -175,6 +245,12 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
             return fail(7, "the velocity field diverged (dt collapsed)");
         }
 
+        if (r.ramp > 0 && t < r.ramp)
+        {
+            uF = r.uInf * rampFrac(t + dt, r.ramp);
+            tunnel->setFreestream(uF);
+            fringe->setFreestream(uF);
+        }
         std::swap(*dU0, *dU);
         pcgIters = 0;
         stage(*dU0, *dU, 0.0, dt);
@@ -197,6 +273,19 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
             st.cl = co.cl;
             st.cs = co.cs;
             st.cdf = co.cdf;
+            if (!objForce.empty())
+            {
+                // Same phi / ghost view as the total: the per-object rows are
+                // a decomposition of it, not a second measurement scheme.
+                std::vector<double> frow{t};
+                for (auto& f : objForce)
+                {
+                    const auto oc = f.measure(*dCut, scr->phi, *dG, r.nu, r.qRef,
+                                              les ? &les->nut() : nullptr, *red);
+                    frow.insert(frow.end(), {oc.cd, oc.cl, oc.cdf});
+                }
+                (void)out.row("forces", frow);
+            }
             if (r.pot && t > tQ)
             {
                 const double Qinst = std::clamp(st.cd * r.qRef / r.uInf, 0.0,

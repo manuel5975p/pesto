@@ -113,6 +113,29 @@ struct CourantSum
     }
 };
 
+// Cut-flux variant: the through-flow rate of a cut u-CV scales like
+// ax*|u|/lambda~ (fluxes apertured, volume floored at 1/2), so each face term
+// carries max(1, a/lambda~). Interior cells (a == 1, lambda == 1) reduce to
+// CourantSum exactly; the amplification is bounded by 2 and in practice ~1
+// because near-wall face velocities are small.
+struct CourantSumCut
+{
+    GpuGrid g;
+    const Real *u, *v, *w, *ax, *ay, *az, *lam;
+    double ihx, ihy, ihz;
+    __host__ __device__ double operator()(int c) const
+    {
+        int i, j, k;
+        decompose(g, std::size_t(c), i, j, k);
+        const double lu = fmax(0.5 * (double(lam[gidx(g, i - 1, j, k)]) + lam[c]), 0.5);
+        const double lv = fmax(0.5 * (double(lam[gidx(g, i, j - 1, k)]) + lam[c]), 0.5);
+        const double lw = fmax(0.5 * (double(lam[gidx(g, i, j, k - 1)]) + lam[c]), 0.5);
+        return fabs(double(u[c])) * ihx * fmax(1.0, double(ax[c]) / lu)
+             + fabs(double(v[c])) * ihy * fmax(1.0, double(ay[c]) / lv)
+             + fabs(double(w[c])) * ihz * fmax(1.0, double(az[c]) / lw);
+    }
+};
+
 struct AbsDiv
 {
     GpuGrid g;
@@ -185,6 +208,18 @@ double maxCourantPerDt(const GpuGrid& g, const DeviceField& U, ReduceScratch& s)
     return reduce(s, g.size(),
                   CourantSum{U.u.data(), U.v.data(), U.w.data(), 1.0 / g.hx,
                              1.0 / g.hy, 1.0 / g.hz},
+                  rocprim::maximum<double>(), 0.0);
+}
+
+double maxCourantPerDtCut(const GpuGrid& g, const DeviceField& U,
+                          const DeviceScalar& ax, const DeviceScalar& ay,
+                          const DeviceScalar& az, const DeviceScalar& lam,
+                          ReduceScratch& s)
+{
+    return reduce(s, g.size(),
+                  CourantSumCut{g, U.u.data(), U.v.data(), U.w.data(),
+                                ax.data(), ay.data(), az.data(), lam.data(),
+                                1.0 / g.hx, 1.0 / g.hy, 1.0 / g.hz},
                   rocprim::maximum<double>(), 0.0);
 }
 

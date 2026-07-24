@@ -51,7 +51,7 @@ __device__ Real cellDiv(const GpuGrid& g, const Real* u, const Real* v,
 // correction vanishes on a discretely solenoidal field; with cut cells (only
 // the apertured divergence is projected to zero) and the FP32 projection
 // residual it is what keeps the operator energy-conserving -- the plain
-// divergence form injects energy ~ u^2*div(u) at cut faces and blows up
+// divergence form injects energy ~ u^2*div(u) at cut faces and diverges
 // under-resolved shear layers. Mirrors dns/operators.cpp exactly.
 __device__ Real convX(const GpuGrid& g, const Real* u, const Real* v, const Real* w,
                       std::size_t c, int i, int j, int k)

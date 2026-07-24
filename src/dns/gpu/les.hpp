@@ -27,6 +27,7 @@
 
 #include "dns/gpu/cutcell.hpp"
 #include "dns/gpu/index.hpp"
+#include "dns/sgs.hpp"
 
 #include <expected>
 
@@ -35,9 +36,12 @@ namespace dns::gpu {
 class DeviceSmagorinsky
 {
 public:
-    // Pre: cs > 0.
-    static std::expected<DeviceSmagorinsky, hipError_t> make(const GpuGrid&,
-                                                             double cs);
+    // Pre: cs > 0. model selects nut(grad u): Smagorinsky (Cs Delta)^2 |S| or
+    // the sigma model (Csigma Delta)^2 D_sigma (dns/sgs.hpp) -- same constant
+    // slot, same Delta^2, same eddy-diffusion substep; only the local operator
+    // on the (already assembled) velocity-gradient tensor differs.
+    static std::expected<DeviceSmagorinsky, hipError_t>
+    make(const GpuGrid&, double cs, SgsModel model = SgsModel::Smagorinsky);
 
     // nut at cell centres from the MAC field. U must be the GHOST-FILLED view
     // the viscous term reads, matching the field addEddyDiffusion is given.
@@ -54,12 +58,14 @@ public:
     const DeviceScalar& nut() const { return nut_; }
 
 private:
-    DeviceSmagorinsky(const GpuGrid& g, Real cs2d2, DeviceScalar nut)
-        : g_(g), cs2d2_(cs2d2), nut_(std::move(nut))
+    DeviceSmagorinsky(const GpuGrid& g, Real cs2d2, SgsModel model,
+                      DeviceScalar nut)
+        : g_(g), cs2d2_(cs2d2), model_(model), nut_(std::move(nut))
     {}
 
     GpuGrid g_;
     Real cs2d2_;
+    SgsModel model_ = SgsModel::Smagorinsky;
     DeviceScalar nut_;
 };
 

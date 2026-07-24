@@ -21,6 +21,9 @@ public:
         // vents instead of reflecting). Default = free-slip mirror wall.
         bool openY = false;
         bool openZ = false;      // ignored when nz == 1
+        // Closed-y walls become adiabatic NO-SLIP mirrors (all momentum
+        // antimirrored) instead of free-slip; ignored when openY.
+        bool noslipY = false;
     };
 
     // Periodic grid; 1 <= ns < nx/2, ny/nz >= 3 on walled axes.

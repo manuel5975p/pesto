@@ -1,5 +1,7 @@
 #include "dns/config.hpp"
 
+#include "dns/remap.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -21,6 +23,11 @@ bool hasSuffix(std::string_view s, std::string_view suf)
 const char* name(Physics p)
 {
     return p == Physics::Compressible ? "compressible" : "incompressible";
+}
+
+const char* name(SgsModel m)
+{
+    return m == SgsModel::Sigma ? "sigma" : "smag";
 }
 
 const char* name(FarField f)
@@ -45,7 +52,10 @@ const char* name(BodyKind b)
     case BodyKind::Sphere: return "sphere";
     case BodyKind::Cube: return "cube";
     case BodyKind::Lens: return "lens";
+    case BodyKind::Fence: return "fence";
+    case BodyKind::Floor: return "floor";
     case BodyKind::Mesh: return "mesh";
+    case BodyKind::Scene: return "scene";
     }
     return "?";
 }
@@ -98,7 +108,8 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         c.steps = r.steps;
         c.grid = Grid::make(r.n, r.n, r.n, 2 * pi, 2 * pi, 2 * pi);
         c.meta = {r.n, r.n, r.n, c.grid.hx, c.grid.hy, c.grid.hz,
-                  0, 0, 0, 0, 0, false, "none", "periodic", name(c.physics), 0};
+                  0, 0, 0, 0, 0, false, "none", "periodic", name(c.physics), 0,
+                  ""};
         return c;
     }
 
@@ -141,19 +152,150 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         c.fdt = r.fdt;
         c.meta = {r.n, r.n, nz, c.grid.hx, c.grid.hy, c.grid.hz,
                   0, r.re, 0, c.fdt, 0, false, "none", "periodic",
-                  name(c.physics), 0};
+                  name(c.physics), 0, ""};
+        return c;
+    }
+
+    // --- channel ------------------------------------------------------------
+    // Wall units: delta = 1, u_tau = 1, f = 1, nu = 1/reTau. The box momentum
+    // balance (f * V = 2 tau_w * A_wall with Ly = 2 delta) pins tau_w = 1, so
+    // reTau is the run's friction Reynolds number by construction.
+    if (r.sub == Subcommand::Channel)
+    {
+        if (r.given.contains("--re"))
+            return bad(2, "--re", "channel is configured in wall units by "
+                                  "--re-tau, not a body Reynolds number");
+        if (r.given.contains("--ft"))
+            return bad(2, "--ft", "channel run length is --tt (eddy turnovers "
+                                  "of delta/u_tau = 1)");
+        if (r.n < 4) return bad(2, "--n", "must be >= 4");
+        const int nyI = r.ny;
+        if (nyI < 8)
+            return bad(2, "--ny", "must be >= 8 fluid cells (wall-normal "
+                                  "resolution; two ghost rows are added)");
+        const int nz = r.nz;
+        if (nz < 1) return bad(2, "--nz", "must be >= 1 (interior cells; 1 = "
+                                          "native 2D)");
+        if (nz != 1 && nz < 4)
+            return bad(2, "--nz", "must be 1 (native 2D) or >= 4");
+        if (!finitePos(r.reTau))
+            return bad(2, "--re-tau", "must be finite and > 0");
+        c.reTau = r.reTau;
+        c.re = r.reTau;
+        c.nu = 1.0 / r.reTau;
+        c.mach = r.mach;
+        if (!(std::isfinite(c.mach) && c.mach > 0 && c.mach < 1))
+            return bad(2, "--mach", "must be in (0,1) -- the flux is "
+                                    "Kennedy-Gruber central with no shock "
+                                    "capturing");
+        c.stretchBeta = r.stretch;
+        if (!(std::isfinite(c.stretchBeta) && c.stretchBeta >= 0
+              && c.stretchBeta <= 4))
+            return bad(2, "--stretch", "must be in [0,4] (tanh clustering "
+                                       "strength)");
+        c.wallIso = r.wallIso == 1;
+
+        const double delta = 1.0;
+        const int nyT = nyI + 2; // + the two wall-mirror ghost rows
+        const double h1 = ChannelStretchY::firstCell(nyT, c.stretchBeta, delta);
+        const double ly = 2 * delta + 2 * h1; // period fixed by the ghost rows
+        if (r.given.contains("--lx") && !finitePos(r.lx))
+            return bad(2, "--lx", "must be finite and > 0 (0/omitted = 4 pi)");
+        if (r.given.contains("--lz") && !finitePos(r.lzBox))
+            return bad(2, "--lz", "must be finite and > 0 (0/omitted = 4 pi/3)");
+        c.lxBox = r.lx > 0 ? r.lx : 4 * pi;
+        c.lzBox = nz == 1 ? 1.0 : (r.lzBox > 0 ? r.lzBox : 4 * pi / 3);
+        const std::size_t cells = std::size_t(r.n) * nyT * nz;
+        if (cells > std::size_t(2147483647))
+            return bad(2, "--n", "grid exceeds INT_MAX cells");
+        c.grid = Grid::make(r.n, nyT, nz, c.lxBox, ly, c.lzBox);
+        c.nzInterior = nz;
+        c.h = c.grid.hy;
+        c.L = c.lxBox;
+        c.chanH1 = h1;
+        c.stretchH1 = h1;
+        const ChannelStretchY R{ly, nyT, c.stretchBeta, delta};
+        double prev = h1;
+        for (int j = 2; j < nyT - 1; ++j)
+        {
+            const double dy = R.mapY((j + 1) * c.grid.hy) - R.mapY(j * c.grid.hy);
+            c.stretchGrowth = std::max(c.stretchGrowth,
+                                       std::max(dy / prev, prev / dy));
+            prev = dy;
+        }
+
+        // Bulk-velocity estimate (log law) fixes the sound speed for the
+        // requested BULK Mach: c_s = ubEst/Mach, p = rho c_s^2/gamma,
+        // Twall = p (rho = R = 1). The IC and the isothermal wall share it.
+        c.ubEst = 2.5 * std::log(std::max(c.reTau, 3.0)) + 2.6;
+        c.pRef = (c.ubEst / c.mach) * (c.ubEst / c.mach) / 1.4;
+
+        c.cfl = r.cfl;
+        if (!(c.cfl > 0 && c.cfl <= 1)) return bad(2, "--cfl", "must be in (0,1]");
+        c.kick = r.kick;
+        if (!(std::isfinite(c.kick) && c.kick >= 0))
+            return bad(2, "--kick", "must be finite and >= 0");
+        if (!finitePos(r.tt)) return bad(2, "--tt", "must be finite and > 0");
+        c.ft = r.tt;
+        c.tEnd = r.tt;
+        c.profileDt = r.profileDt;
+        if (!(std::isfinite(c.profileDt) && c.profileDt >= 0))
+            return bad(2, "--profile-dt", "must be finite and >= 0 (0 = off)");
+        c.dtRecompute = r.given.contains("--dt-recompute") ? r.dtRecompute : 16;
+        if (c.dtRecompute < 1) return bad(2, "--dt-recompute", "must be >= 1");
+        c.fdt = r.fdt;
+        c.pdt = r.pdt > 0 ? r.pdt : c.fdt;
+        c.wdt = r.wdt > 0 ? r.wdt : c.fdt;
+        for (auto [v, f] : {std::pair{c.fdt, "--fdt"}, {c.pdt, "--pdt"},
+                            {c.wdt, "--wdt"}})
+            if (!finitePos(v)) return bad(2, f, "must be finite and > 0");
+        c.planes = r.planes;
+        if (c.planes != 1 && c.planes != 3)
+            return bad(2, "--planes", "must be 1 (centre only) or 3");
+        c.pngDown = r.pngDown;
+        if (c.pngDown < 1)
+            return bad(2, "--png-down", "must be >= 1 (1 = full resolution)");
+        if (c.pngDown > 1 && (c.grid.nx % c.pngDown || c.grid.ny % c.pngDown))
+            return bad(2, "--png-down", "must divide both nx and ny evenly");
+        if (c.emit.empty()) c.emit.insert(Emit::Stats);
+        if (c.emit.contains(Emit::None) && c.emit.size() > 1)
+            return bad(2, "--emit", "--emit none cannot be combined with "
+                                    "other kinds");
+        // PNG is allowed at nz > 1 here: it renders the centre z-plane,
+        // which for a channel is exactly the picture you want.
+        c.physics = Physics::Compressible;
+        c.far = FarField::Periodic;
+        c.bodyKind = BodyKind::None;
+        c.meta = {c.grid.nx, c.grid.ny, c.grid.nz, c.grid.hx, c.grid.hy,
+                  c.grid.hz, 2 * delta, c.reTau, c.mach, c.fdt, 0, false,
+                  "channel", "periodic", "compressible", c.kick, ""};
         return c;
     }
 
     // --- flow ---------------------------------------------------------------
-    if (r.body.empty())
+    // A scene file replaces --body: main loads it (phase 1.5) and hands the
+    // parsed Scene to the geometry build; the validator only records the path
+    // and applies the body-independent checks.
+    if (!r.scene.empty())
+    {
+        if (!r.body.empty())
+            return bad(2, "--scene", "--scene and --body are mutually exclusive "
+                                     "(the scene lists its own objects)");
+        c.bodyKind = BodyKind::Scene;
+        c.scenePath = r.scene;
+    }
+    else if (r.body.empty())
         return bad(2, "--body", "required: one of cylinder, sphere, cube, lens, "
-                                "or a .stl/.gltf/.glb file");
+                                "fence, floor, none, a .stl/.gltf/.glb file, or "
+                                "--scene FILE.toml");
 
-    if (r.body == "cylinder") c.bodyKind = BodyKind::Cylinder;
+    else if (r.body == "none") c.bodyKind = BodyKind::None;
+    else if (r.body == "cylinder") c.bodyKind = BodyKind::Cylinder;
     else if (r.body == "sphere") c.bodyKind = BodyKind::Sphere;
     else if (r.body == "cube") c.bodyKind = BodyKind::Cube;
     else if (r.body == "lens") c.bodyKind = BodyKind::Lens;
+    else if (r.body == "fence") c.bodyKind = BodyKind::Fence;
+    else if (r.body == "floor") c.bodyKind = BodyKind::Floor;
     else if (hasSuffix(r.body, ".stl") || hasSuffix(r.body, ".gltf")
              || hasSuffix(r.body, ".glb"))
     {
@@ -162,12 +304,21 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     }
     else
         return bad(2, "--body", "unrecognised body '" + r.body
-                                + "'; expected cylinder, sphere, cube, lens, or a "
-                                  "path ending in .stl/.gltf/.glb");
+                                + "'; expected cylinder, sphere, cube, lens, fence, "
+                                  "floor, none, or a path ending in .stl/.gltf/.glb");
+
+    // Body-free box (wall boundary layers, channel-like cases): the
+    // incompressible runner requires solid cells, so this is compressible-only.
+    if (c.bodyKind == BodyKind::None && c.physics != Physics::Compressible)
+        return bad(2, "--body", "--body none is compressible-only (the "
+                                "incompressible tunnel needs a body)");
 
     // Far field defaults follow the physics when the user did not choose one.
+    // Sponge is NEVER a default (any physics, any mode): it is an escape hatch that
+    // eats the near field in a relaxation band. The compressible default is
+    // the physical characteristic boundary; --far sponge must be asked for.
     if (!r.given.contains("--far"))
-        c.far = c.physics == Physics::Compressible ? FarField::Sponge
+        c.far = c.physics == Physics::Compressible ? FarField::Nscbc
                                                    : FarField::Tunnel;
 
     const bool comp = c.physics == Physics::Compressible;
@@ -186,6 +337,33 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         return bad(2, "--open", std::string("--open has no meaning with --far ")
                    + name(c.far)
                    + " (tunnel, sponge and nscbc have lateral faces)");
+
+    // Floor-mounted bodies (fence blocker, raised floor): they sit ON the
+    // tunnel floor (sealed through the ghost row), so they need the
+    // incompressible tunnel's solid lateral wall. Compressible wall rows are
+    // far-field mirror rows; a ghost body intersecting them is unvalidated --
+    // rejected, not silently degraded.
+    if (c.bodyKind == BodyKind::Fence || c.bodyKind == BodyKind::Floor)
+    {
+        const char* b = c.bodyKind == BodyKind::Fence ? "fence" : "floor";
+        if (comp && c.bodyKind == BodyKind::Fence)
+            return bad(2, "--body", "fence is incompressible-only for now (a "
+                                    "mid-plate blocker on the compressible "
+                                    "mirror wall rows is unvalidated)");
+        // Compressible floor: NSCBC/sponge x planes skip the fully-solid
+        // rows (the ghost wall owns them); periodic has no walls at all.
+        if (comp && c.far == FarField::Periodic)
+            return bad(2, "--far", "floor needs closed y walls; use --far "
+                                   "nscbc (default) or an explicit sponge");
+        if (!comp && c.far != FarField::Tunnel)
+            return bad(2, "--far", std::string(b) +
+                                   " sits on the tunnel floor; incompressible "
+                                   "runs need --far tunnel (periodic/fringe "
+                                   "have no wall for it to stand on)");
+        if (c.open)
+            return bad(2, "--open", std::string("--open removes the lateral "
+                                    "walls; the ") + b + " needs the floor wall");
+    }
 
     // Grid: two separately validated conventions, dispatched on --physics.
     const int ny = r.given.contains("--ny") ? r.ny : r.n;
@@ -213,17 +391,21 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         // the historical 8D x 8D box BIT-IDENTICAL (the *(dr/8) factor is an
         // exact *1.0 and the 2.1107 placement literal is preserved). No ghost
         // ring: the compressible far fields act on interior rows.
-        if (c.dr < 6)
-            return bad(2, "--dr", "compressible box is dr*D wide; below 6 the "
-                                  "body sits under 1.5D from the inflow row");
+        if (c.dr < 4)
+            return bad(2, "--dr", "compressible box is dr*D wide; below 4 the "
+                                  "body sits under 1D from the inflow row");
         const double D = pi / 4.0;
         c.h = D / 64.0 * (512.0 / double(ny)) * (c.dr / 8.0);
         const double lx = r.n * c.h, ly = ny * c.h;
         const double lz = nzI > 1 ? nzI * c.h : 1.0;
         c.grid = Grid::make(r.n, ny, nzI, lx, ly, lz);
         c.L = lx;
+        // The floor is pinned to the box bottom (no ghost ring here): the
+        // slab spans [0, D], cy = centre of the blocked strip.
         c.placement = {c.dr == 8.0 ? 2.1107 : lx / 3.0 + 0.0163,
-                       ly / 2.0 + 0.0146, nzI > 1 ? lz / 2.0 : 0.5, D};
+                       c.bodyKind == BodyKind::Floor ? D / 2.0
+                                                     : ly / 2.0 + 0.0146,
+                       nzI > 1 ? lz / 2.0 : 0.5, D};
     }
     else
     {
@@ -237,8 +419,15 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         const double D = c.L / c.dr;
         // Per-body placement offsets: each deliberately puts the body off-node
         // so the shedding instability trips. Carried verbatim (masterplan §6).
+        // The fence is pinned to the floor instead: the wall face is at y = h
+        // (top of the ghost row) and the blocker spans [wall, wall + D], so
+        // cy = centre of the blocked strip. Its top edge is off-node through
+        // the 0.31h x-offset alone.
         const double cx = c.h + c.L / 3.0 + 0.31 * c.h;
-        const double cy = c.h + c.L / 2.0 + 0.17 * c.h;
+        const double cy = c.bodyKind == BodyKind::Fence
+                                  || c.bodyKind == BodyKind::Floor
+                              ? c.h + D / 2.0
+                              : c.h + c.L / 2.0 + 0.17 * c.h;
         const double cz = c.bodyKind == BodyKind::Sphere
                               ? c.h + c.L / 2.0 + 0.23 * c.h
                               : (nzT == 1 ? 0.5 * c.h : c.h + nzI * c.h / 2.0);
@@ -252,6 +441,14 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     if (c.placement.D < 4 * c.h)
         return bad(2, "--dr", "body diameter is under 4 cells; refine --n or lower "
                               "--dr");
+    // The fence is D/8 thick; below 32 cells of D the blocker itself is under
+    // 4 cells and the sampled cut degenerates.
+    if (c.bodyKind == BodyKind::Fence && c.placement.D < 32 * c.h)
+        return bad(2, "--dr", "fence thickness is D/8; D under 32 cells makes it "
+                              "thinner than 4 cells -- refine --n or lower --dr");
+    if (c.bodyKind == BodyKind::Floor && c.dr < 2)
+        return bad(2, "--dr", "floor solidifies the bottom 1/dr of the channel; "
+                              "--dr under 2 blocks more than half of it");
 
     // Physics.
     c.mach = r.mach;
@@ -268,7 +465,7 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     }
     else
     {
-        for (const char* f : {"--mach", "--ramp", "--kick"})
+        for (const char* f : {"--mach", "--kick"})
             if (r.given.contains(f))
                 return bad(2, f, std::string(f) + " is compressible-only");
     }
@@ -280,10 +477,39 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     c.cs = r.les;
     if (!(std::isfinite(c.cs) && c.cs >= 0))
         return bad(2, "--les", "must be finite and >= 0");
+    c.sgsModel = r.sgs;
+    if (r.given.contains("--sgs") && c.cs == 0)
+        return bad(2, "--sgs", "selects the SGS model for --les; give --les CS "
+                               "(> 0) or drop --sgs");
+    c.cutFlux = r.cutFlux;
+    if (c.cutFlux && c.bodyKind == BodyKind::None)
+        return bad(2, "--cut-flux", "apertures the body's momentum fluxes; "
+                                    "there is no body");
+    if (c.cutFlux && r.given.contains("--stretch"))
+        return bad(2, "--cut-flux", "apertures are uniform-mesh geometry; the "
+                                    "curvilinear path has none. Drop --stretch");
+    if (c.cutFlux && comp)
+        return bad(2, "--cut-flux", "compressible cut-flux DIVERGES near the "
+                                    "body (measured twice, 2026-07-23: the KG "
+                                    "split flux loses its KE property under "
+                                    "per-face area weighting). Incompressible "
+                                    "only until redesigned");
+    c.penalize = r.penalize;
+    if (!(std::isfinite(c.penalize) && c.penalize >= 0))
+        return bad(2, "--penalize", "must be finite and >= 0");
+    if (c.penalize > 0 && c.bodyKind == BodyKind::None)
+        return bad(2, "--penalize", "decays the near-body band; there is no body");
+    if (c.penalize > 0 && r.given.contains("--stretch"))
+        return bad(2, "--penalize", "needs the uniform-mesh fluid fractions; "
+                                    "drop --stretch");
+    if (c.sgsModel == SgsModel::Sigma && c.cs > 0 && c.grid.nz == 1)
+        return bad(2, "--sgs", "sigma: D_sigma is identically ZERO for any 2D "
+                               "flow (that is the model's design); at nz == 1 "
+                               "it is a silent no-op. Use nz > 1 or smag");
     // Honest labelling: the boundary layer scales as D/sqrt(Re).
     const double blCells = c.placement.D / std::sqrt(c.re) / c.h;
     c.lesLabel = c.cs > 0;
-    if (blCells < 3.0 && !c.lesLabel)
+    if (blCells < 3.0 && !c.lesLabel && c.bodyKind != BodyKind::None)
         std::fprintf(stderr, "dns: warning: boundary layer is %.1f cells "
                              "(D/sqrt(Re)/h); this is under-resolved for DNS\n",
                      blCells);
@@ -294,21 +520,24 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     if (c.far == FarField::Nscbc)
     {
         // Empirically bracketed stability window (masterplan §6.3): 0 pumps a
-        // growing global mode, 1.0 blows up at t = 35.
+        // growing global mode, 1.0 diverges at t = 35.
         if (!(std::isfinite(c.nscbcBeta) && c.nscbcBeta >= 0 && c.nscbcBeta < 1))
-            return bad(2, "--nscbc-beta", "must be in [0,1); 1.0 is measured to blow "
-                                          "up at t = 35 (full transverse cancellation "
+            return bad(2, "--nscbc-beta", "must be in [0,1); 1.0 is measured to diverge "
+                                          "at t = 35 (full transverse cancellation "
                                           "is ill-posed at low Mach)");
         if (c.nscbcStrip < 0 || c.nscbcStrip >= c.grid.nx / 4)
             return bad(2, "--nscbc-strip", "must be >= 0 and < nx/4");
         if (c.re > 800 && c.nscbcStrip == 0)
             return bad(2, "--nscbc-strip", "pure NSCBC is validated only up to "
-                                           "Re 800 (it blows up at Re 2000, 2048^2); "
+                                           "Re 800 (it diverges at Re 2000, 2048^2); "
                                            "pass --nscbc-strip ~ny/64");
     }
     else if (r.given.contains("--nscbc-strip") && c.nscbcStrip > 0)
         return bad(2, "--nscbc-strip", "requires --far nscbc");
     c.farPot = r.farPot;
+    if (c.farPot && c.bodyKind == BodyKind::None)
+        return bad(2, "--pot", "models the body's wake source and displacement "
+                               "doublet; meaningless with --body none");
     if (c.farPot && c.far != FarField::Nscbc
         && !(c.far == FarField::Tunnel && c.open))
         return bad(2, "--pot", "requires --far nscbc (compressible) or "
@@ -337,8 +566,333 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         return bad(2, "--fringe-axes", "a z fringe band needs nz >= 2*cells + 2; "
                                        "pass --fringe-axes 2 for a z-invariant run");
 
-    // Start-up.
-    c.ramp = r.ramp;
+    // Curvilinear y-stretch + wall type. Scope is deliberate: the interior
+    // scheme (curv finite-volume path) is general and NSCBC evaluates the
+    // PointRemap on device (physical distances in its one-sided and
+    // transverse terms), but the immersed ghost wall still assumes uniform
+    // spacing and the curvilinear solver has no LES -- each combination is
+    // rejected, not silently degraded. Sponge stays explicit per the ground
+    // rule: the validator never swaps --far for the user.
+    c.stretchBeta = r.stretch;
+    c.noslipY = r.noslip;
+    if (!(std::isfinite(c.stretchBeta) && c.stretchBeta >= 0 && c.stretchBeta <= 4))
+        return bad(2, "--stretch", "must be in [0,4] (tanh clustering strength; "
+                                   "4 already compresses the wall cell ~190x)");
+    if (c.stretchBeta > 0)
+    {
+        if (!comp)
+            return bad(2, "--stretch", "the curvilinear solver is compressible-"
+                                       "only; --stretch needs --physics "
+                                       "compressible");
+        if (c.cs > 0)
+            return bad(2, "--stretch", "the curvilinear path has no LES; drop "
+                                       "--les or --stretch");
+        if (c.bodyKind != BodyKind::None)
+            return bad(2, "--stretch", "the ghost wall samples the body SDF at "
+                                       "uniform cell positions; stretched runs "
+                                       "need --body none for now");
+        if (c.open)
+            return bad(2, "--open", "--stretch clusters cells toward the closed "
+                                    "y walls; open lateral faces defeat it");
+        if (c.far != FarField::Nscbc && c.far != FarField::Sponge)
+            return bad(2, "--far", "stretched-y runs need --far nscbc (the "
+                                   "characteristic terms evaluate the PointRemap) "
+                                   "or an explicit --far sponge");
+        // Resolved wall resolution: first INTERIOR cell (row 1; rows 0 and
+        // ny-1 are the wall-mirror ghost rows) and max growth ratio. These
+        // set the acoustic dt, so --dry-run must surface them.
+        const TanhStretchY R{double(c.grid.ny) * c.grid.hy, c.stretchBeta};
+        const double hy = c.grid.hy;
+        c.stretchH1 = R.mapY(2 * hy) - R.mapY(hy);
+        double prev = R.mapY(hy) - R.mapY(0.0);
+        for (int j = 1; j < c.grid.ny; ++j)
+        {
+            const double dy = R.mapY((j + 1) * hy) - R.mapY(j * hy);
+            c.stretchGrowth = std::max(c.stretchGrowth,
+                                       std::max(dy / prev, prev / dy));
+            prev = dy;
+        }
+    }
+    // Focal clustering: a fine plateau box (typically the body plus its wake)
+    // with a coarse far field, one independent Focal1D per axis. Same scope
+    // as --stretch (compressible curvilinear, no LES, NSCBC or explicit
+    // sponge), but bodies ARE supported here: the ghost wall classifies
+    // against the mapped cell centres. The blend support must stay clear of
+    // the domain faces, so the map is the exact identity there and the
+    // periodic wrap stays C^2.
+    if (r.given.contains("--focal"))
+    {
+        if (!comp)
+            return bad(2, "--focal", "the curvilinear solver is compressible-"
+                                     "only; --focal needs --physics "
+                                     "compressible");
+        if (c.stretchBeta > 0)
+            return bad(2, "--focal", "--stretch and --focal are different "
+                                     "curvilinear meshes; pick one");
+        if (c.cs > 0)
+            return bad(2, "--focal", "the curvilinear path has no LES; drop "
+                                     "--les or --focal");
+        // Bodies ARE supported (the ghost wall classifies against the mapped
+        // cell centres), but only the analytic ones: their AABB follows from
+        // the placement alone, and validate() may not touch the filesystem to
+        // read a mesh.
+        if (c.bodyKind == BodyKind::Mesh || c.bodyKind == BodyKind::Scene)
+            return bad(2, "--focal", "a mesh/scene body's bounding box is only "
+                                     "known after the file is loaded, and "
+                                     "validation touches no filesystem; give "
+                                     "the plateau explicitly for now");
+        if (c.bodyKind == BodyKind::Fence || c.bodyKind == BodyKind::Floor)
+            return bad(2, "--focal", "the wall-mounted bodies span the full "
+                                     "domain width; there is no compact "
+                                     "plateau to cluster on");
+        if (c.cutFlux || c.penalize > 0)
+            return bad(2, "--focal", "apertures and the Brinkman band are "
+                                     "uniform-mesh geometry; the curvilinear "
+                                     "path has none");
+        if (c.open)
+            return bad(2, "--open", "--focal needs the closed lateral faces "
+                                    "its blend margin is measured against");
+        if (c.far != FarField::Nscbc && c.far != FarField::Sponge)
+            return bad(2, "--far", "focal runs need --far nscbc (the "
+                                   "characteristic terms evaluate the "
+                                   "PointRemap) or an explicit --far sponge");
+
+        c.focalRatio = r.focalRatio;
+        if (!(std::isfinite(c.focalRatio) && c.focalRatio > 1
+              && c.focalRatio <= 16))
+            return bad(2, "--focal-ratio", "must be in (1,16] (coarse/fine "
+                                           "cell-size ratio; the fine spacing "
+                                           "sets the acoustic dt)");
+        const double blendFrac = r.focalBlend;
+        if (!(std::isfinite(blendFrac) && blendFrac > 0 && blendFrac <= 2))
+            return bad(2, "--focal-blend", "must be in (0,2] (blend width per "
+                                           "side as a fraction of the plateau)");
+
+        // The body's axis-aligned bounds, when there is a body: the
+        // containment rule below keeps the ghost wall's neighbourhood inside
+        // the plateau, so it always sees a locally UNIFORM (anisotropic) grid
+        // -- the geometry the Cartesian construction was validated on. The
+        // cylinder is z-invariant, so its z extent is the whole box.
+        const char* axName[3] = {"x", "y", "z"};
+        const bool hasBody = c.bodyKind != BodyKind::None;
+        const bool zSpanning = c.bodyKind == BodyKind::Cylinder;
+        const double bLo[3] = {c.placement.cx - 0.5 * c.placement.D,
+                               c.placement.cy - 0.5 * c.placement.D,
+                               c.placement.cz - 0.5 * c.placement.D};
+        const double bHi[3] = {c.placement.cx + 0.5 * c.placement.D,
+                               c.placement.cy + 0.5 * c.placement.D,
+                               c.placement.cz + 0.5 * c.placement.D};
+
+        double box[6];
+        if (r.focal == "auto")
+        {
+            if (!hasBody)
+                return bad(2, "--focal", "auto needs a body; --body none has "
+                                         "no AABB to focus on");
+            if (!(std::isfinite(r.focalWake) && r.focalWake >= 0))
+                return bad(2, "--focal-wake", "must be finite and >= 0");
+            if (!(std::isfinite(r.focalPad) && r.focalPad >= 0))
+                return bad(2, "--focal-pad", "must be finite and >= 0");
+            const double D = c.placement.D, pad = r.focalPad * D;
+            const int nA[3] = {c.grid.nx, c.grid.ny, c.grid.nz};
+            const double hA[3] = {c.grid.hx, c.grid.hy, c.grid.hz};
+            for (int a = 0; a < 3; ++a)
+            {
+                // Axes the body does not localize stay uniform.
+                if (a == 2 && (zSpanning || c.grid.nz == 1))
+                {
+                    box[4] = box[5] = 0.0;
+                    continue;
+                }
+                const double want[2] = {
+                    bLo[a] - pad,
+                    bHi[a] + pad + (a == 0 ? r.focalWake * D : 0.0)};
+                // Smallest plateau that still satisfies the containment rule
+                // below; the desired box shrinks toward it until its blend
+                // clears the domain faces. The resolved box is what
+                // --dry-run prints, so the shrink is never silent.
+                const double guard = 3.0 * hA[a] / c.focalRatio;
+                const double need[2] = {bLo[a] - guard, bHi[a] + guard};
+                const double Lax = nA[a] * hA[a];
+                const double m =
+                    (a == 0 ? std::max(4, c.nscbcStrip + 2) : 4) * hA[a];
+                auto fits = [&](double lo, double hi) {
+                    const double w = blendFrac * (hi - lo);
+                    return hi > lo && lo - w >= m && hi + w <= Lax - m;
+                };
+                if (!fits(std::min(need[0], want[0]),
+                          std::max(need[1], want[1])) &&
+                    !fits(need[0], need[1]))
+                    return bad(2, "--focal", std::string(axName[a])
+                                   + " has no plateau that both contains the "
+                                     "body and clears the domain faces; the "
+                                     "box is too small for --focal-blend");
+                double t = 1.0;
+                if (!fits(want[0], want[1]))
+                {
+                    double lo = 0.0, hi = 1.0; // largest fitting t
+                    for (int it = 0; it < 60; ++it)
+                    {
+                        const double mid = 0.5 * (lo + hi);
+                        const double a0 = need[0] + mid * (want[0] - need[0]);
+                        const double a1 = need[1] + mid * (want[1] - need[1]);
+                        (fits(a0, a1) ? lo : hi) = mid;
+                    }
+                    t = lo;
+                }
+                box[2 * a] = need[0] + t * (want[0] - need[0]);
+                box[2 * a + 1] = need[1] + t * (want[1] - need[1]);
+            }
+        }
+        // "x0,x1,y0,y1,z0,z1"; a degenerate pair leaves that axis uniform.
+        else {
+            std::string_view s(r.focal);
+            for (int q = 0; q < 6; ++q)
+            {
+                const std::size_t comma = s.find(',');
+                const std::string tok(s.substr(0, comma));
+                char* end = nullptr;
+                box[q] = std::strtod(tok.c_str(), &end);
+                if (tok.empty() || end != tok.c_str() + tok.size()
+                    || !std::isfinite(box[q]))
+                    return bad(2, "--focal", "expects six numbers "
+                                             "x0,x1,y0,y1,z0,z1 (world units) "
+                                             "or 'auto'");
+                if (comma == std::string_view::npos)
+                {
+                    if (q != 5)
+                        return bad(2, "--focal", "expects six comma-separated "
+                                                 "numbers x0,x1,y0,y1,z0,z1");
+                    s = {};
+                }
+                else
+                    s = s.substr(comma + 1);
+            }
+            if (!s.empty())
+                return bad(2, "--focal", "expects exactly six numbers "
+                                         "x0,x1,y0,y1,z0,z1");
+        }
+
+        const int nAx[3] = {c.grid.nx, c.grid.ny, c.grid.nz};
+        const double hAx[3] = {c.grid.hx, c.grid.hy, c.grid.hz};
+        for (int a = 0; a < 3; ++a)
+        {
+            const double lo = box[2 * a], hi = box[2 * a + 1];
+            const double L = nAx[a] * hAx[a];
+            if (hi <= lo)
+            {
+                // Degenerate pair = leave this axis uniform.
+                if (hi < lo)
+                    return bad(2, "--focal", std::string(axName[a])
+                                                 + " plateau has hi < lo");
+                c.focalHFine[a] = c.focalHCoarse[a] = hAx[a];
+                continue;
+            }
+            if (a == 2 && c.grid.nz == 1)
+                return bad(2, "--focal", "nz == 1 IS the exact 2D restriction; "
+                                         "a z plateau there is meaningless -- "
+                                         "pass z0,z1 equal");
+            const double w = blendFrac * (hi - lo);
+            // Identity margin at both faces: the blend support must end at
+            // least 4 cells short of each domain face (x also clears the
+            // NSCBC rows and any absorbing strip), so the far grid is
+            // exactly uniform where the boundary treatment reads it.
+            const int mCells = a == 0 ? std::max(4, c.nscbcStrip + 2) : 4;
+            const double margin = mCells * hAx[a];
+            if (!(lo - w >= margin && hi + w <= L - margin))
+                return bad(2, "--focal",
+                           std::string(axName[a]) + " plateau plus its blend "
+                           "must clear both domain faces by " +
+                           std::to_string(mCells) + " cells (the map must be "
+                           "the exact identity there); shrink the box or "
+                           "--focal-blend");
+            const double fine = hAx[a] / c.focalRatio;
+            if (hi - lo < 4 * fine)
+                return bad(2, "--focal", std::string(axName[a])
+                                             + " plateau spans under 4 fine "
+                                               "cells; widen it");
+            // Containment: the body plus the ghost wall's 3-cell mirror
+            // neighbourhood must sit inside the PLATEAU, never in the blend.
+            // The wall stencil is then built on locally uniform cells, which
+            // is the geometry it was validated on.
+            if (hasBody && !(a == 2 && zSpanning))
+            {
+                const double guard = 3.0 * fine;
+                if (!(lo <= bLo[a] - guard && hi >= bHi[a] + guard))
+                    return bad(2, "--focal",
+                               std::string(axName[a]) + " plateau must contain "
+                               "the body plus a 3-fine-cell guard band "
+                               "([" + std::to_string(bLo[a] - guard) + "," +
+                               std::to_string(bHi[a] + guard) + "]); the ghost "
+                               "wall's mirror stencil must not straddle the "
+                               "coarse/fine blend");
+            }
+            c.focalActive = true;
+            c.focalLo[a] = lo;
+            c.focalHi[a] = hi;
+            c.focalW[a] = w;
+            const Focal1D f = Focal1D::make(L, lo, hi, w, c.focalRatio);
+            c.focalHFine[a] = f.c * f.r * hAx[a];
+            c.focalHCoarse[a] = f.c * hAx[a];
+            // Discrete adjacent growth: the KG flux carries no dissipation,
+            // so a fast coarse->fine transition is a dispersive reflector.
+            double prev = f.map(hAx[a]) - f.map(0.0);
+            for (int i = 1; i < nAx[a]; ++i)
+            {
+                const double d = f.map((i + 1) * hAx[a]) - f.map(i * hAx[a]);
+                c.focalGrowth =
+                    std::max(c.focalGrowth, std::max(d / prev, prev / d));
+                prev = d;
+            }
+        }
+        if (!c.focalActive)
+            return bad(2, "--focal", "every axis pair is degenerate; the mesh "
+                                     "would be uniform -- drop --focal");
+        if (c.focalGrowth > 1.25)
+            return bad(2, "--focal-blend", "max adjacent cell growth " +
+                       std::to_string(c.focalGrowth) + " exceeds 1.25; the "
+                       "central flux has no dissipation and reflects off a "
+                       "sharp transition. Widen --focal-blend or lower "
+                       "--focal-ratio");
+        const double hUni = c.grid.nz == 1
+                                ? std::min(c.grid.hx, c.grid.hy)
+                                : std::min({c.grid.hx, c.grid.hy, c.grid.hz});
+        const double hFoc = c.grid.nz == 1
+                                ? std::min(c.focalHFine[0], c.focalHFine[1])
+                                : std::min({c.focalHFine[0], c.focalHFine[1],
+                                            c.focalHFine[2]});
+        c.focalDtFactor = hFoc / hUni;
+    }
+    else
+    {
+        for (const char* f : {"--focal-ratio", "--focal-blend", "--focal-wake",
+                              "--focal-pad"})
+            if (r.given.contains(f))
+                return bad(2, f, std::string(f) + " requires --focal");
+    }
+
+    if (c.noslipY)
+    {
+        if (!comp)
+            return bad(2, "--noslip", "the y mirror walls belong to the "
+                                      "compressible far field; --noslip needs "
+                                      "--physics compressible");
+        if (c.open)
+            return bad(2, "--noslip", "--open removes the y walls; there is "
+                                      "nothing to make no-slip");
+        if (c.far != FarField::Sponge && c.far != FarField::Nscbc)
+            return bad(2, "--noslip", "requires a far field with closed y walls "
+                                      "(--far sponge or --far nscbc)");
+    }
+
+    // Start-up. The raw default (2.0) is the COMPRESSIBLE default; the
+    // incompressible ramp is opt-in so existing impulsive-start trajectories
+    // and anchors do not silently move.
+    c.ramp = comp ? r.ramp : (r.given.contains("--ramp") ? r.ramp : 0.0);
+    if (!comp && c.ramp > 0 && (r.seq > 1 || r.steady > 0))
+        return bad(2, "--ramp", "the quiet start would re-ramp the developed "
+                                "field each --seq level / fight --steady; "
+                                "use an impulsive start there");
     c.kick = r.kick;
     if (!(std::isfinite(c.ramp) && c.ramp >= 0)) return bad(2, "--ramp", "must be >= 0");
     if (!std::isfinite(c.kick)) return bad(2, "--kick", "must be finite");
@@ -372,6 +926,27 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     if (c.dimples > 0 && c.placement.D < 16 * c.h)
         return bad(2, "--dimples", "dimple pits are 5h wide; D must span at least 16 "
                                    "cells or they consume the body");
+    c.bumps = r.bumps;
+    if (c.bumps < 0) return bad(2, "--bumps", "must be >= 0");
+    if (c.bumps > 0 && c.bodyKind != BodyKind::Floor)
+        return bad(2, "--bumps", "the surface ripple belongs to --body floor");
+    c.bumpH = r.bumpH;
+    if (c.bumps > 0)
+    {
+        if (!(std::isfinite(c.bumpH) && c.bumpH >= 4 && c.bumpH <= 48))
+            return bad(2, "--bump-h", "must be in [4,48] cells (base = height, "
+                                      "63-degree flanks; under 4 the tip is "
+                                      "sub-cell, over 48 it is a fence, not "
+                                      "roughness)");
+        if (c.bumps > int(0.65 * c.n / (2.0 * c.bumpH)))
+            return bad(2, "--bumps", "spike pitch is under twice the tooth "
+                                     "base; the teeth merge -- fewer bumps, "
+                                     "shorter --bump-h, or more cells");
+        if (c.placement.D < 4 * c.bumpH * c.h)
+            return bad(2, "--bump-h", "spikes taller than D/4 are a fence "
+                                      "field, not surface roughness -- lower "
+                                      "--bump-h or --dr");
+    }
     c.scale = r.scale;
     if (!(std::isfinite(c.scale) && c.scale >= 0))
         return bad(2, "--scale", "must be finite and >= 0 (0 = fit D)");
@@ -428,12 +1003,33 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     c.planes = r.planes;
     if (c.planes != 1 && c.planes != 3)
         return bad(2, "--planes", "must be 1 (centre only) or 3 (centre +/- n/16)");
+    c.pngDown = r.pngDown;
+    if (c.pngDown < 1)
+        return bad(2, "--png-down", "must be >= 1 (1 = full-resolution PNGs)");
+    if (c.pngDown > 1 && (c.grid.nx % c.pngDown || c.grid.ny % c.pngDown))
+        return bad(2, "--png-down",
+                   "must divide both nx and ny evenly for box-averaging");
+    c.vortMax = r.vortMax;
+    if (!(std::isfinite(c.vortMax) && c.vortMax >= 0))
+        return bad(2, "--vort-max", "must be finite and >= 0 (0 = auto scale)");
+    c.vortAsinh = r.vortMap == 1;
+    if (c.vortAsinh && !(c.vortMax > 0))
+        return bad(2, "--vort-map", "asinh needs an explicit full-scale clip; "
+                                    "set --vort-max (~ the peak |vorticity| in "
+                                    "uInf/D, e.g. sqrt(Re))");
+    c.speedDelta = r.speedMap == 1;
+    c.vortSigned = r.vortSigned;
+    if (c.vortSigned && !comp)
+        return bad(2, "--vort-signed", "incompressible frames are already "
+                                       "signed z-vorticity; the flag selects "
+                                       "it for 3D compressible runs");
 
     if (c.emit.empty()) { c.emit.insert(Emit::Stats); c.emit.insert(Emit::Bin); }
     if (c.emit.contains(Emit::None) && c.emit.size() > 1)
         return bad(2, "--emit", "--emit none cannot be combined with other kinds");
-    if (c.emit.contains(Emit::Png) && c.grid.nz != 1)
-        return bad(2, "--emit", "--emit png requires --nz 1");
+    // PNG at nz > 1 renders the centre z-plane (same machinery the channel
+    // already uses); the old flow-only nz == 1 restriction was conservative,
+    // not load-bearing.
 
     // Reference dynamic pressure x frontal area.
     const double span = comp ? (c.grid.nz > 1 ? c.grid.nz * c.h : c.grid.hz)
@@ -442,8 +1038,11 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
 
     c.meta = {c.grid.nx, c.grid.ny, c.grid.nz, c.grid.hx, c.grid.hy, c.grid.hz,
               c.placement.D, c.re, comp ? c.mach : 0.0, c.fdt, c.cs, c.lesLabel,
-              c.bodyKind == BodyKind::Mesh ? c.meshPath : name(c.bodyKind),
-              name(c.far), name(c.physics), comp ? c.kick : 0.0};
+              c.bodyKind == BodyKind::Mesh    ? c.meshPath
+              : c.bodyKind == BodyKind::Scene ? "scene:" + c.scenePath
+                                              : name(c.bodyKind),
+              name(c.far), name(c.physics), comp ? c.kick : 0.0,
+              c.lesLabel ? name(c.sgsModel) : ""};
     return c;
 }
 
@@ -451,11 +1050,42 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
 
 std::string Case::describe() const
 {
+    if (sub == Subcommand::Channel)
+    {
+        char buf[2048];
+        std::snprintf(buf, sizeof buf,
+            "case:\n"
+            "  mode       compressible turbulent channel (periodic x/z, "
+            "no-slip y walls)\n"
+            "  grid       %d x %d x %d (%d fluid rows + 2 ghost)  "
+            "box %.6g x %.6g x %.6g%s\n"
+            "  mesh       y tanh-stretch beta=%.4g: first cell %.3e "
+            "(y+ = %.3g), growth <= %.4f\n"
+            "  physics    Re_tau=%.6g  nu=%.6g  Mach_bulk=%.3g  "
+            "(u_bulk est %.3g, p=%.6g)  cfl=%.3g\n"
+            "  walls      %s no-slip mirrors; force f=1 (constant), "
+            "u_tau target 1\n"
+            "  run        tt=%.6g eddy turnovers (tEnd=%.6g)  kick=%.3g  "
+            "profile-dt=%.3g\n"
+            "  label      DNS%s\n"
+            "  out        %s\n",
+            grid.nx, grid.ny, grid.nz, grid.ny - 2,
+            lxBox, 2.0, lzBox, grid.nz == 1 ? "  [native 2D]" : "",
+            stretchBeta, chanH1, chanH1 * reTau, stretchGrowth,
+            reTau, nu, mach, ubEst, pRef, cfl,
+            wallIso ? "isothermal" : "ADIABATIC (no heat sink -- short "
+                                     "transients only)",
+            ft, tEnd, kick, profileDt,
+            grid.nz == 1 ? " (2D: qualitative only, no vortex stretching)"
+                         : "",
+            outPrefix.c_str());
+        return buf;
+    }
     char buf[2048];
     std::snprintf(buf, sizeof buf,
         "case:\n"
         "  physics    %s\n"
-        "  body       %s%s\n"
+        "  body       %s%s%s\n"
         "  far field  %s%s\n"
         "  grid       %d x %d x %d  h=%.6g  L=%.6g%s\n"
         "  placement  cx=%.6g cy=%.6g cz=%.6g D=%.6g (%.1f cells)\n"
@@ -463,7 +1093,11 @@ std::string Case::describe() const
         "  ft=%.6g  tEnd=%.6g  fdt=%.6g  qRef=%.6g\n"
         "  mode       %s\n"
         "  out        %s\n",
-        name(physics), name(bodyKind), meshPath.empty() ? "" : (" " + meshPath).c_str(),
+        name(physics), name(bodyKind),
+        bodyKind == BodyKind::Scene
+            ? (" " + scenePath).c_str()
+            : meshPath.empty() ? "" : (" " + meshPath).c_str(),
+        cutFlux ? " [cut-flux]" : "",
         name(far),
         open ? (farPot ? " (lateral open, potential-corrected)"
                        : " (lateral open)")
@@ -471,12 +1105,50 @@ std::string Case::describe() const
         grid.nx, grid.ny, grid.nz, h, L, grid.nz == 1 ? "  [native 2D]" : "",
         placement.cx, placement.cy, placement.cz, placement.D,
         h > 0 ? placement.D / h : 0.0,
-        re, nu, mach, cfl, cs, lesLabel ? "LES" : "DNS",
+        re, nu, mach, cfl, cs,
+        lesLabel ? (sgsModel == SgsModel::Sigma ? "LES sigma" : "LES smag")
+                 : "DNS",
         ft, tEnd, fdt, qRef,
         steadyTol > 0 ? "stationary (stop at steady residual, tEnd = give-up cap)"
                       : "time-march to tEnd",
         outPrefix.c_str());
-    return buf;
+    std::string s = buf;
+    if (stretchBeta > 0)
+    {
+        char m[256];
+        std::snprintf(m, sizeof m,
+                      "  mesh       y tanh-stretch beta=%.4g: first interior cell "
+                      "%.3e (hy/%.1f), growth <= %.4f\n"
+                      "             (acoustic dt shrinks with the wall cell)\n",
+                      stretchBeta, stretchH1,
+                      stretchH1 > 0 ? grid.hy / stretchH1 : 0.0, stretchGrowth);
+        s += m;
+    }
+    if (focalActive)
+    {
+        char m[512];
+        const char* ax[3] = {"x", "y", "z"};
+        std::string per;
+        for (int a = 0; a < 3; ++a)
+        {
+            if (focalHi[a] <= focalLo[a]) continue;
+            char l[192];
+            std::snprintf(l, sizeof l,
+                          "             %s [%.4g,%.4g] blend %.4g: fine %.3e "
+                          "coarse %.3e\n",
+                          ax[a], focalLo[a], focalHi[a], focalW[a],
+                          focalHFine[a], focalHCoarse[a]);
+            per += l;
+        }
+        std::snprintf(m, sizeof m,
+                      "  mesh       focal clustering ratio %.4g, growth <= "
+                      "%.4f, dt factor %.3f\n",
+                      focalRatio, focalGrowth, focalDtFactor);
+        s += m;
+        s += per;
+    }
+    if (noslipY) s += "  walls      y walls no-slip (adiabatic mirror)\n";
+    return s;
 }
 
 } // namespace dns

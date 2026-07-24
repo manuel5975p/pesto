@@ -78,10 +78,14 @@ bool px(const std::vector<unsigned char>& rgb, int w, int h, int i, int jBottom,
 int main()
 {
     const int w = 8, h = 4;
+    // Probe cells sit in the INTERIOR (i in [1,6], j in [1,2]): writeMapped
+    // replicates the inner neighbour into the outermost 1px ring (cosmetic
+    // trim of the periodic-stencil rim), so edge cells no longer show their
+    // own value.
     std::vector<float> field(w * h, 0.0f), mask(w * h, 1.0f);
-    field[0 * w + 1] = -2.0f;      // (1, 0) = -scale, clipped
+    field[1 * w + 2] = -2.0f;      // (2, 1) = -scale, clipped
     field[2 * w + 3] = 1.0f;       // (3, 2) = +scale
-    field[3 * w + 6] = 0.25f;      // (6, 3) = mid-blend
+    field[2 * w + 6] = 0.25f;      // (6, 2) = mid-blend
     mask[1 * w + 5] = 0.0f;        // (5, 1) solid
 
     const char* dPath = "fieldpng_div.png";
@@ -90,11 +94,15 @@ int main()
     auto d = decode(dPath, w, h);
     check(!d.empty(), "diverging PNG structurally valid");
     if (!d.empty()) {
-        check(px(d, w, h, 0, 0, 221, 221, 221), "zero maps to light midpoint");
-        check(px(d, w, h, 1, 0, 59, 76, 192), "-scale clips to cool endpoint");
-        check(px(d, w, h, 3, 2, 180, 4, 38), "+scale maps to warm endpoint");
+        // Glow diverging map: dark-grey core, blue/red saturation knot at
+        // 0.62, white-hot extremes (matches site/live.html).
+        check(px(d, w, h, 1, 1, 20, 20, 24), "zero maps to dark core");
+        check(px(d, w, h, 2, 1, 225, 240, 255), "-scale clips to white-hot blue");
+        check(px(d, w, h, 3, 2, 255, 240, 225), "+scale maps to white-hot red");
         check(px(d, w, h, 5, 1, 32, 32, 32), "masked cell renders dark");
-        check(px(d, w, h, 6, 3, 211, 167, 175, 2), "quarter-scale blends");
+        check(px(d, w, h, 6, 2, 115, 30, 26, 2), "quarter-scale blends");
+        check(px(d, w, h, 0, 0, 20, 20, 24),
+              "edge ring replicates the inner neighbour");
     }
 
     const char* sPath = "fieldpng_seq.png";

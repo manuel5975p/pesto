@@ -53,6 +53,17 @@ public:
         bool pot = false;
         double xc = 0, yc = 0, zc = 0; // body centre (world coords)
         double aBody = 0;              // displacement radius (D/2)
+        // Full-width solid floor crossing the inlet/outlet planes (--body
+        // floor): interior rows j <= floorRows are fully solid there -- the
+        // Dirichlet inlet and convective outlet become 0 -- and row
+        // floorRows+1 is the cut row, open over fraction floorFrac of its
+        // face. Prescribed fluxes, the outlet tally and the global mass
+        // balance are weighted accordingly (the slab is x/z-invariant, so a
+        // row count + one fraction describe both planes exactly).
+        // floorRows == -1 (no floor) is BIT-IDENTICAL to the historical
+        // tunnel.
+        int floorRows = -1;
+        double floorFrac = 1.0;
     };
 
     static std::expected<DeviceTunnelBc, hipError_t> make(const GpuGrid&, Config);
@@ -62,6 +73,10 @@ public:
     // projection): keep the prescribed lateral boundary fluxes the projection
     // balanced, update only the ghost rows.
     // Pre: same grid, same size.
+    // Quiet start (--ramp): retarget the freestream the inlet/outlet/mirrors
+    // impose. Host-side; takes effect on the next apply.
+    void setFreestream(double u) { cfg_.uInf = u; }
+
     void apply(const DeviceField& in, DeviceField& out, double cdt,
                bool refreshOnly = false) const;
 
@@ -102,6 +117,9 @@ public:
     };
 
     static std::expected<DeviceFringe, hipError_t> make(const GpuGrid&, Config);
+
+    // Quiet start (--ramp): retarget the freestream the fringe relaxes to.
+    void setFreestream(double u) { cfg_.uInf = u; }
 
     void apply(DeviceField&) const;
 

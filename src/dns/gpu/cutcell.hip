@@ -46,6 +46,25 @@ __global__ void kSubtractGradientCut(GpuGrid g, const Real* ax, const Real* ay,
     if (az[c] > openTol) w[c] -= scale * (p[c] - p[gidx(g, i, j, k - 1)]) / g.hz;
 }
 
+// exp(-dt*(1-lambda_face)/eta) split decay per face component; lambda_face is
+// the average of the two adjacent cell fractions (the same staggering the
+// cut-flux volume uses). Interior faces (lambda_face == 1) are untouched
+// EXACTLY (factor branch, not exp(0) roundoff).
+__global__ void kPenalize(GpuGrid g, const Real* lam, Real idte, Real* u,
+                          Real* v, Real* w)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= g.size()) return;
+    int i, j, k;
+    decompose(g, c, i, j, k);
+    const Real lu = Real(0.5) * (lam[gidx(g, i - 1, j, k)] + lam[c]);
+    const Real lv = Real(0.5) * (lam[gidx(g, i, j - 1, k)] + lam[c]);
+    const Real lw = Real(0.5) * (lam[gidx(g, i, j, k - 1)] + lam[c]);
+    if (lu < Real(1)) u[c] *= exp(-idte * (Real(1) - lu));
+    if (lv < Real(1)) v[c] *= exp(-idte * (Real(1) - lv));
+    if (lw < Real(1)) w[c] *= exp(-idte * (Real(1) - lw));
+}
+
 __global__ void kMaskSolidFaces(std::size_t n, const Real* ax, const Real* ay,
                                 const Real* az, Real* u, Real* v, Real* w)
 {
@@ -158,6 +177,14 @@ void maskSolidFaces(const GpuGrid& g, const DeviceCutGeometry& cut, DeviceField&
         g.size(), cut.ax.data(), cut.ay.data(), cut.az.data(), U.u.data(),
         U.v.data(), U.w.data());
     checkLastKernel("maskSolidFaces");
+}
+
+void penalizeSolidBand(const GpuGrid& g, const DeviceCutGeometry& cut, Real eta,
+                       Real dt, DeviceField& U)
+{
+    kPenalize<<<launchBlocks(g.size()), blockSize>>>(
+        g, cut.lambda.data(), dt / eta, U.u.data(), U.v.data(), U.w.data());
+    checkLastKernel("penalize");
 }
 
 double maxAbsDivergenceCut(const GpuGrid& g, const DeviceCutGeometry& cut,

@@ -2,7 +2,6 @@
 
 #include <cmath>
 #include <format>
-#include <numbers>
 
 namespace dns {
 namespace {
@@ -72,21 +71,18 @@ CurvMesh CurvMesh::uniform(const Grid& g)
 
 CurvMesh CurvMesh::sinusoidal(const Grid& g, double amp)
 {
-    using std::numbers::pi;
-    CurvMesh m = uniform(g);
-    const double lx = g.nx * g.hx, ly = g.ny * g.hy, lz = g.nz * g.hz;
-    for (int k = 0; k < g.nz; ++k)
-        for (int j = 0; j < g.ny; ++j)
-            for (int i = 0; i < g.nx; ++i) {
-                const std::size_t c = g.idx(i, j, k);
-                const double sx = std::sin(2 * pi * m.x[c] / lx);
-                const double sy = std::sin(2 * pi * m.y[c] / ly);
-                const double sz = g.nz > 1 ? std::sin(2 * pi * m.z[c] / lz) : 0.0;
-                m.x[c] += amp * lx * (sy + sz);
-                m.y[c] += amp * ly * (sz + sx);
-                if (g.nz > 1) m.z[c] += amp * lz * (sx + sy);
-            }
-    return m;
+    return fromRemap(g, SinusoidalRemap{g.nx * g.hx, g.ny * g.hy, g.nz * g.hz,
+                                        amp, g.nz == 1});
+}
+
+CurvMesh CurvMesh::stretchedY(const Grid& g, double beta)
+{
+    return fromRemap(g, TanhStretchY{g.ny * g.hy, beta});
+}
+
+CurvMesh CurvMesh::channelY(const Grid& g, double beta, double delta)
+{
+    return fromRemap(g, ChannelStretchY{g.ny * g.hy, g.ny, beta, delta});
 }
 
 std::array<double, 3> CurvMesh::node(int i, int j, int k) const

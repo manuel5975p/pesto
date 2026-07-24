@@ -329,6 +329,68 @@ int main()
             for (auto v : ok->ax) check(v >= 0 && v <= 1, "ax in [0,1]");
     }
 
+    // --- 6) fence: exact slab sdf + sampled cut sits sealed on the floor ----
+    {
+        const Fence f{2.0, 0.25, 1.0}; // x in [1.75, 2.25], y <= 1
+        const Sdf sdf = sdfOf(f);
+        check(sdf(2.0, 0.5, 0.3) == -0.25, "fence sdf: inside, x-face nearest");
+        check(std::abs(sdf(2.0, 0.9, 0.0) - (-0.1)) < 1e-12,
+              "fence sdf: inside near top, top face nearest");
+        check(sdf(2.5, 0.5, 0.0) == 0.25, "fence sdf: beside");
+        check(sdf(2.0, 1.5, 0.0) == 0.5, "fence sdf: above");
+        check(std::abs(sdf(2.25 + 0.3, 1.0 + 0.4, 0.0) - 0.5) < 1e-12,
+              "fence sdf: Euclidean corner distance");
+        check(sdf(2.0, -5.0, 0.0) == -0.25, "fence sdf: solid far below the floor");
+
+        const auto g = Grid::make(64, 64, 1, 4.0, 4.0, 1.0);
+        const auto cut = sampleCut(g, sdf, {8, 8, true});
+        check(cut.has_value(), "sampleCut(fence) succeeds");
+        if (cut)
+        {
+            bool sealed = true; // wall-adjacent y-faces under the fence closed
+            for (int i = 0; i < g.nx; ++i)
+            {
+                const double x = (i + 0.5) * g.hx;
+                if (x > f.cx - f.w + g.hx && x < f.cx + f.w - g.hx)
+                    for (int j = 0; j <= 8; ++j) // rows below yTop - h
+                        if (cut->ay[g.idx(i, j, 0)] > 0.0) sealed = false;
+            }
+            check(sealed, "fence cut: sealed to the floor (no under-gap)");
+            check(cut->lambda[g.idx(32, 8, 0)] == 0.0, "fence cut: core is solid");
+            check(cut->lambda[g.idx(32, 40, 0)] == 1.0, "fence cut: above is fluid");
+            check(cut->lambda[g.idx(4, 4, 0)] == 1.0, "fence cut: upstream is fluid");
+            check(same(cut->az, cut->lambda), "fence cut: az == lambda (z-invariant)");
+        }
+    }
+
+    // --- 7) floor: half-space sdf, cut is full solid rows below the plane ---
+    {
+        const Floor f{1.0};
+        const Sdf sdf = sdfOf(f);
+        check(sdf(0.0, 0.25, 0.0) == -0.75, "floor sdf: inside");
+        check(sdf(9.0, 1.5, 0.0) == 0.5, "floor sdf: above, x-invariant");
+
+        const auto g = Grid::make(32, 64, 1, 4.0, 4.0, 1.0);
+        const auto cut = sampleCut(g, sdf, {8, 8, true});
+        check(cut.has_value(), "sampleCut(floor) succeeds");
+        if (cut)
+        {
+            bool rows = true; // yTop = 1.0 = face y at j = 16: rows j < 16
+            for (int j = 0; j < g.ny && rows; ++j)   // solid, j >= 16 fluid
+                for (int i = 0; i < g.nx; ++i)
+                {
+                    const double want = j < 16 ? 0.0 : 1.0;
+                    if (cut->lambda[g.idx(i, j, 0)] != want) rows = false;
+                }
+            check(rows, "floor cut: whole rows solid below the plane");
+            bool sealed = true;
+            for (int i = 0; i < g.nx; ++i)
+                for (int j = 0; j <= 15; ++j)
+                    if (cut->ay[g.idx(i, j, 0)] > 0.0) sealed = false;
+            check(sealed, "floor cut: y-faces closed below the surface");
+        }
+    }
+
     if (failures == 0) std::printf("geometry: ok\n");
     return failures == 0 ? 0 : 1;
 }

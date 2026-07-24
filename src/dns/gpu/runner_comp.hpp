@@ -26,10 +26,39 @@ struct CompRun
     double cfl = 0.4;
     double tEnd = 0;
     double les = 0;              // shared 3D-valid core LES; 0 = molecular DNS
+    SgsModel sgs = SgsModel::Smagorinsky;   // nut operator, used iff les > 0
+    // Aperture geometry for --cut-flux / --penalize; nullptr when both are
+    // off. Uniform mesh + body only (validator-enforced); must outlive the run.
+    const CutGeometry* cutGeom = nullptr;
+    bool cutFlux = false;        // sharp apertured fluxes (attachCutFlux)
+    double penalize = 0;         // Brinkman band decay time eta; 0 = off
 
-    // Far field.
-    FarField far = FarField::Sponge;
+    // Wall-normal tanh clustering along y (dns/remap.hpp TanhStretchY):
+    // 0 = uniform mesh; > 0 switches the solver to the curvilinear
+    // finite-volume path on CurvMesh::stretchedY. The validator guarantees
+    // les == 0, no immersed body and far == Sponge with this (NSCBC's
+    // transverse terms and the ghost wall still assume uniform spacing).
+    double stretchBeta = 0;
+    // Focal clustering (dns/remap.hpp AxisRemap3): a fine plateau box with a
+    // coarse far field, one independent map per axis. Mutually exclusive with
+    // stretchBeta; same guarantees from the validator (les == 0, no immersed
+    // body, and the map is the exact identity within the boundary margin).
+    // focalActive == false leaves the mesh uniform bit-for-bit.
+    bool focalActive = false;
+    double focalLo[3] = {0, 0, 0}, focalHi[3] = {0, 0, 0}, focalW[3] = {0, 0, 0};
+    double focalRatio = 1;
+    // Closed lateral y walls become adiabatic no-slip mirrors (boundary
+    // layers grow on them) instead of the default free-slip.
+    bool noslipY = false;
+
+    // Far field. Sponge is never a default (it is an explicit escape hatch fallback);
+    // the physical characteristic boundary is the default here too.
+    FarField far = FarField::Nscbc;
     bool open = false;           // lateral faces open too
+    // Full-width solid floor (--body floor) crossing the NSCBC x planes:
+    // interior rows j <= floorRows are fully solid there (the ghost wall
+    // owns them; NSCBC must not overwrite their rhs). -1 = no floor.
+    int floorRows = -1;
     int spongeCells = 0;         // 0 = clamp(0.1 nx, 8, nx/2 - 1)
     double nscbcBeta = 0.5;      // Yoo-Im transverse correction, in [0,1)
     int nscbcStrip = 0;          // absorbing strip inside the NSCBC rows
@@ -52,6 +81,8 @@ struct CompRun
 
     bool signedVorticity = true; // 2D frames use signed wz + a diverging map
     double curlMax = 0;          // 0 = 8/D signed, 15/D magnitude
+    bool vortAsinh = false;      // png: asinh(v/toe), toe = curlMax/32
+    bool speedDelta = false;     // frames carry |u| - uInf (diverging)
     int statsEvery = 200;        // steps between force rows
 };
 

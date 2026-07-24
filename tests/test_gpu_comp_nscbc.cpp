@@ -4,11 +4,15 @@
 // uniform velocity offset is pulled back toward the inflow target. Open
 // lateral faces (openY/openZ): freestream fixed point in 2D and true 3D, a
 // radial acoustic pulse exits through all faces, and a vortex skimming the
-// lateral boundary leaves without exciting the edge cells.
+// lateral boundary leaves without exciting the edge cells. Stretched-y
+// (TanhStretchY PointRemap + curvilinear tables): freestream fixed point,
+// beta = 0 consistency with the uniform path, pulse and vortex exit.
 #include "dns/comp.hpp"
+#include "dns/curvmesh.hpp"
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_far.hpp"
 #include "dns/gpu/comp_nscbc.hpp"
+#include "dns/remap.hpp"
 #include "gpu_test_util.hpp"
 
 #include <algorithm>
@@ -396,6 +400,186 @@ double lateralVortexAlongFace()
     return resid / v0;
 }
 
+// Stretched-y rig: curvilinear DeviceComp on the TanhStretchY mesh, NSCBC x
+// boundaries evaluating the SAME PointRemap (physical distances in the
+// one-sided and transverse terms, transverse flux divergence from the metric
+// tables), free-slip y mirror walls. 2D and small by design.
+std::expected<gpu::DeviceComp, hipError_t> makeStretchedDev(const Grid& g,
+                                                            double beta,
+                                                            double mu)
+{
+    auto m = CurvMetrics::build(CurvMesh::stretchedY(g, beta));
+    if (!m) return std::unexpected(hipErrorInvalidValue);
+    return gpu::DeviceComp::make(*m, gam, mu);
+}
+
+struct StretchRig
+{
+    Grid g;
+    TanhStretchY remap;
+    std::expected<gpu::DeviceComp, hipError_t> dev;
+    std::expected<gpu::DeviceCompFar, hipError_t> far;
+    std::expected<gpu::DeviceCompNscbc, hipError_t> nsc;
+    std::expected<gpu::DeviceCompState, hipError_t> ds;
+    std::expected<gpu::ReduceScratch, hipError_t> red;
+
+    StretchRig(int nx, int ny, double beta, double mu)
+        : g(Grid::make(nx, ny, 1, nx * 0.01, ny * 0.01, 1.0)),
+          remap{ny * 0.01, beta},
+          dev(makeStretchedDev(g, beta, mu)),
+          far(gpu::DeviceCompFar::make(
+              g, {rhoInf, uInf, pInf, gam, 8, 0.0, false, false})),
+          nsc(gpu::DeviceCompNscbc::make(g, {rhoInf, uInf, pInf, gam})),
+          ds(gpu::DeviceCompState::make(g.size())),
+          red(gpu::ReduceScratch::make())
+    {
+        if (!dev || !far || !nsc || !ds || !red) std::exit(EXIT_FAILURE);
+        dev->setStageHook([this](gpu::DeviceCompState& st) { far->apply(st); });
+        dev->setRhsHook([this](const gpu::DeviceCompState& st,
+                               gpu::DeviceCompState& k) {
+            nsc->apply(*dev, st, k, remap);
+        });
+    }
+
+    void run(double tEnd)
+    {
+        double t = 0.0;
+        while (t < tEnd) {
+            const double dt = std::min(tEnd - t, dev->stableDt(*ds, *red));
+            dev->step(*ds, gpu::Real(dt));
+            t += dt;
+        }
+    }
+
+    void set(auto prim) // prim(xPhys, yPhys) -> {rho, u, v, p}
+    {
+        auto h = CompState::zeros(g);
+        for (int j = 0; j < g.ny; ++j)
+            for (int i = 0; i < g.nx; ++i) {
+                const std::size_t c = g.idx(i, j, 0);
+                const auto [rho, u, v, p] =
+                    prim((i + 0.5) * g.hx, remap.mapY((j + 0.5) * g.hy));
+                h.rho[c] = rho;
+                h.mx[c] = rho * u;
+                h.my[c] = rho * v;
+                h.E[c] = p / (gam - 1.0) + 0.5 * rho * (u * u + v * v);
+            }
+        (void)ds->upload(h);
+    }
+};
+
+// Uniform freestream on the stretched mesh: the per-axis face closure of the
+// metric tables and the remapped characteristic terms both vanish, so the
+// state must stay at freestream to FP32 metric rounding.
+double stretchedFreestreamDrift()
+{
+    StretchRig r(96, 48, 2.0, 1e-3);
+    r.set([](double, double) {
+        return std::array{rhoInf, uInf, 0.0, pInf};
+    });
+    for (int it = 0; it < 100; ++it)
+        r.dev->step(*r.ds, gpu::Real(r.dev->stableDt(*r.ds, *r.red)));
+    auto h = CompState::zeros(r.g);
+    (void)r.ds->download(h);
+    double d = 0.0;
+    for (std::size_t c = 0; c < r.g.size(); ++c) {
+        d = std::max(d, std::abs(h.rho[c] - rhoInf));
+        d = std::max(d, std::abs(h.mx[c] - rhoInf * uInf));
+        d = std::max(d, std::abs(h.my[c]));
+        d = std::max(d, std::abs(h.E[c] - EInf) / EInf);
+    }
+    return d;
+}
+
+// beta = 0 is the exact identity remap on exactly-uniform metric tables: the
+// stretched NSCBC path must reproduce the uniform path to FP32 arithmetic
+// reordering (curv flux + remap divisors round differently, so not bitwise).
+double stretchedBeta0VsUniform()
+{
+    Rig a(96, 48, 1e-3);
+    StretchRig b(96, 48, 0.0, 1e-3);
+    auto init = [](auto& r, auto set) {
+        const double Lx = r.g.nx * r.g.hx, Ly = r.g.ny * r.g.hy;
+        set([&](double x, double y) {
+            const double dx = x - 0.6 * Lx, dy = y - 0.5 * Ly, kw = 6 * r.g.hx;
+            const double e =
+                0.05 * uInf * std::exp(-(dx * dx + dy * dy) / (kw * kw));
+            return std::array{rhoInf, uInf + 2 * dy / kw * e, -2 * dx / kw * e,
+                              pInf};
+        });
+    };
+    init(a, [&](auto f) { setState(a, f); });
+    init(b, [&](auto f) { b.set(f); });
+    for (int it = 0; it < 50; ++it) {
+        const double dt = a.dev->stableDt(*a.ds, *a.red);
+        a.dev->step(*a.ds, gpu::Real(dt));
+        b.dev->step(*b.ds, gpu::Real(dt));
+    }
+    auto ha = CompState::zeros(a.g), hb = CompState::zeros(b.g);
+    (void)a.ds->download(ha);
+    (void)b.ds->download(hb);
+    double d = 0.0;
+    for (std::size_t c = 0; c < a.g.size(); ++c)
+        d = std::max({d, std::abs(ha.rho[c] - hb.rho[c]),
+                      std::abs(ha.mx[c] - hb.mx[c]),
+                      std::abs(ha.my[c] - hb.my[c]),
+                      std::abs(ha.E[c] - hb.E[c]) / EInf});
+    return d;
+}
+
+// Right-going acoustic pulse on the stretched mesh (y-uniform pulse, so the
+// clustering is exercised only through the remapped boundary terms): it must
+// leave through the outflow with the same small reflection as uniform.
+double stretchedPulseReflection(double amp)
+{
+    StretchRig r(256, 48, 2.0, 0.0);
+    const double Lx = r.g.nx * r.g.hx, x0 = 0.5 * Lx, sig = 8 * r.g.hx;
+    r.set([&](double x, double) {
+        const double pp =
+            amp * pInf * std::exp(-(x - x0) * (x - x0) / (sig * sig));
+        return std::array{rhoInf + pp / (cInf * cInf),
+                          uInf + pp / (rhoInf * cInf), 0.0, pInf + pp};
+    });
+    r.run(2.5 * 0.5 * Lx / (uInf + cInf));
+    r.dev->primitives(*r.ds);
+    std::vector<gpu::Real> hp(r.g.size());
+    (void)r.dev->p().download(hp.data());
+    double resid = 0.0;
+    for (std::size_t c = 0; c < r.g.size(); ++c) {
+        if (!std::isfinite(double(hp[c]))) return 1e9;
+        resid = std::max(resid, std::abs(double(hp[c]) - pInf));
+    }
+    return resid / (amp * pInf);
+}
+
+// Gaussian vortex advecting through the outflow of the stretched mesh -- the
+// end-to-end case --stretch + --far nscbc exists for. Placed mid-box where
+// the clustering is mildest, but its induced field reaches the outflow rows
+// at every y, so the remapped transverse terms are fully exercised.
+double stretchedVortexResidual()
+{
+    StretchRig r(192, 64, 1.5, 1e-4);
+    const double Lx = r.g.nx * r.g.hx, Ly = r.g.ny * r.g.hy;
+    const double x0 = 0.75 * Lx, y0 = 0.5 * Ly, kw = 8 * r.g.hx, A = 0.1 * uInf;
+    double v0 = 0.0;
+    r.set([&](double x, double y) {
+        const double dx = x - x0, dy = y - y0;
+        const double e = A * std::exp(-(dx * dx + dy * dy) / (kw * kw));
+        const double u = uInf + 2 * dy / kw * e, v = -2 * dx / kw * e;
+        v0 = std::max(v0, std::abs(v));
+        return std::array{rhoInf, u, v, pInf};
+    });
+    r.run((Lx - x0 + 6 * kw) / uInf + 4 * kw / cInf);
+    auto h = CompState::zeros(r.g);
+    (void)r.ds->download(h);
+    double resid = 0.0;
+    for (std::size_t c = 0; c < r.g.size(); ++c) {
+        if (!std::isfinite(h.my[c])) return 1e9;
+        resid = std::max(resid, std::abs(h.my[c] / h.rho[c]));
+    }
+    return resid / v0;
+}
+
 // Potential correction, neutral parameters (Q = 0, aBody = 0): the targets
 // reduce to uniform freestream and the state after N steps must be BITWISE
 // identical to the uncorrected boundary — no 2D run moves unless the flag is
@@ -517,6 +701,22 @@ int main()
     const double fres = lateralVortexAlongFace();
     std::printf("lateral vortex-on-face residual |v|/v0: %.3f\n", fres);
     check(fres < 0.2, "vortex on open lateral face, residual < 20%");
+
+    const double sdrift = stretchedFreestreamDrift();
+    std::printf("stretched freestream drift: %.2e\n", sdrift);
+    check(sdrift < 1e-4, "stretched freestream fixed to FP32 metric rounding");
+
+    const double b0 = stretchedBeta0VsUniform();
+    std::printf("stretched beta=0 vs uniform max diff: %.2e\n", b0);
+    check(b0 < 1e-3, "beta = 0 stretched path matches the uniform path");
+
+    const double srefl = stretchedPulseReflection(0.01);
+    std::printf("stretched pulse reflection: %.3f\n", srefl);
+    check(srefl < 0.15, "stretched acoustic pulse exits, reflection < 15%");
+
+    const double svres = stretchedVortexResidual();
+    std::printf("stretched vortex residual |v|/v0: %.3f\n", svres);
+    check(svres < 0.15, "stretched vortex exits, residual < 15% of peak");
 
     check(potNeutralBitIdentical(),
           "potCorrect with Q = 0, aBody = 0 is bit-identical");

@@ -11,9 +11,9 @@ namespace {
 // Ghost-ring boundary conditions, applied after maskSolidFaces zeroed every
 // closed face. See DeviceTunnelBc's header comment for the physics; the corner
 // treatment is diagonal and collapses exactly to the y-only form at nz == 1.
-__global__ void kBcTunnel(GpuGrid g, int open, int slave, Real uInf, Real cdt,
-                          const Real* inu, const Real* inv, const Real* inw,
-                          Real* u, Real* v, Real* w)
+__global__ void kBcTunnel(GpuGrid g, int open, int slave, int fr, Real uInf,
+                          Real cdt, const Real* inu, const Real* inv,
+                          const Real* inw, Real* u, Real* v, Real* w)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
@@ -27,15 +27,22 @@ __global__ void kBcTunnel(GpuGrid g, int open, int slave, Real uInf, Real cdt,
     // so `open` only rewrites the NORMAL-component clauses.
     const int jm = j == 0 ? 1 : j == ny - 1 ? ny - 2 : j;
     const int km = nz == 1 ? k : (k == 0 ? 1 : k == nz - 1 ? nz - 2 : k);
+    // Rows fully inside the solid floor at the x extremes: the boundary value
+    // is the wall value, not the freestream/convected one. fr == -1 = no floor.
+    const bool solidRow = j <= fr;
 
-    if (i <= 1) u[c] = uInf;
+    if (i <= 1) u[c] = solidRow ? Real(0) : uInf;
     else if (i == nx - 1)
-        u[c] = inu[c] - cdt * (inu[c] - inu[gidx(g, nx - 2, j, k)]);
+        u[c] = solidRow
+                   ? Real(0)
+                   : inu[c] - cdt * (inu[c] - inu[gidx(g, nx - 2, j, k)]);
     else if (jm != j || km != k) u[c] = u[gidx(g, i, jm, km)];
 
     if (i == 0) v[c] = -v[gidx(g, 1, j, k)];
     else if (i == nx - 1)
-        v[c] = inv[c] - cdt * (inv[c] - inv[gidx(g, nx - 2, j, k)]);
+        v[c] = solidRow
+                   ? Real(0)
+                   : inv[c] - cdt * (inv[c] - inv[gidx(g, nx - 2, j, k)]);
     else if (open)
     {   // boundary faces and ghosts take the nearest interior face value:
         // dv/dy = 0, the lateral flux is free (vents the displacement field).
@@ -54,7 +61,9 @@ __global__ void kBcTunnel(GpuGrid g, int open, int slave, Real uInf, Real cdt,
 
     if (i == 0) w[c] = -w[gidx(g, 1, j, k)];
     else if (i == nx - 1)
-        w[c] = inw[c] - cdt * (inw[c] - inw[gidx(g, nx - 2, j, k)]);
+        w[c] = solidRow
+                   ? Real(0)
+                   : inw[c] - cdt * (inw[c] - inw[gidx(g, nx - 2, j, k)]);
     // nz == 1: w is identically zero and k == 0 == nz - 1, so this clause
     // fires first and sets w = 0, exactly as the native-2D form did.
     else if (nz == 1) w[c] = 0;
@@ -110,9 +119,9 @@ __global__ void kPotInlet(GpuGrid g, Real Q, Real dbl, Real xc, Real yc,
 // outlet-plane u, plus (open laterals) the signed lateral face fluxes scaled
 // to u-equivalent units by wy = hx/hy, wz = hx/hz (the caller multiplies the
 // sum by hy*hz). open == 0 writes exactly the old outlet-plane tally.
-__global__ void kOutletTally(GpuGrid g, int open, int pot, Real wy, Real wz,
-                             const Real* u, const Real* v, const Real* w,
-                             Real* out)
+__global__ void kOutletTally(GpuGrid g, int open, int pot, int fr, Real af,
+                             Real wy, Real wz, const Real* u, const Real* v,
+                             const Real* w, Real* out)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
@@ -120,11 +129,14 @@ __global__ void kOutletTally(GpuGrid g, int open, int pot, Real wy, Real wz,
     decompose(g, c, i, j, k);
     const bool inJ = j >= 1 && j <= g.ny - 2;
     const bool inK = k >= g.kInLo() && k <= g.kInHi();
-    Real q = i == g.nx - 1 && inJ && inK ? u[c] : Real(0);
+    // Floor weight: solid rows carry no flux, the cut row carries af of its
+    // face. fr == -1, af == 1 is the historical full-face tally bit-for-bit.
+    const Real fw = j <= fr ? Real(0) : (j == fr + 1 ? af : Real(1));
+    Real q = i == g.nx - 1 && inJ && inK ? u[c] * fw : Real(0);
     // pot: the inlet flux varies per face; tally the NET outflux and let the
     // host close corr = -net / A (the uInf * A shortcut assumed a uniform
     // inlet).
-    if (pot && i == 1 && inJ && inK) q -= u[c];
+    if (pot && i == 1 && inJ && inK) q -= u[c] * fw;
     if (open && i >= 1 && i <= g.nx - 2)
     {
         if (inK && j == 1) q -= wy * v[c];
@@ -136,13 +148,13 @@ __global__ void kOutletTally(GpuGrid g, int open, int pot, Real wy, Real wz,
 }
 
 // u_outlet += corr on the open outlet plane (exact global mass balance).
-__global__ void kOutletCorrect(GpuGrid g, Real corr, Real* u)
+__global__ void kOutletCorrect(GpuGrid g, int fr, Real corr, Real* u)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
-    if (i == g.nx - 1 && j >= 1 && j <= g.ny - 2 && k >= g.kInLo()
+    if (i == g.nx - 1 && j > fr && j >= 1 && j <= g.ny - 2 && k >= g.kInLo()
         && k <= g.kInHi())
         u[c] += corr;
 }
@@ -151,17 +163,22 @@ __global__ void kOutletCorrect(GpuGrid g, Real corr, Real* u)
 // but zero apertures, so divergenceCut misses them; add the missing terms to
 // the projection RHS. A corner cell owns several boundary faces and gets one
 // term per face.
-__global__ void kInOutFluxRhs(GpuGrid g, int open, int pot, Real scale,
-                              Real uInf, const Real* u, const Real* v,
-                              const Real* w, Real* rhs)
+__global__ void kInOutFluxRhs(GpuGrid g, int open, int pot, int fr, Real af,
+                              Real scale, Real uInf, const Real* u,
+                              const Real* v, const Real* w, Real* rhs)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
     if (j < 1 || j > g.ny - 2 || k < g.kInLo() || k > g.kInHi()) return;
-    if (i == 1) rhs[c] -= scale * (pot ? u[c] : uInf) / g.hx;
-    else if (i == g.nx - 2) rhs[c] += scale * u[gidx(g, g.nx - 1, j, k)] / g.hx;
+    // Floor rows carry no prescribed flux (solid), the cut row carries af of
+    // its face. fr == -1, af == 1 is the historical form bit-for-bit.
+    if (j <= fr) return;
+    const Real fw = j == fr + 1 ? af : Real(1);
+    if (i == 1) rhs[c] -= scale * (pot ? u[c] : uInf) * fw / g.hx;
+    else if (i == g.nx - 2)
+        rhs[c] += scale * u[gidx(g, g.nx - 1, j, k)] * fw / g.hx;
     if (!open || i < 1 || i > g.nx - 2) return;
     if (j == 1) rhs[c] -= scale * v[c] / g.hy;
     if (j == g.ny - 2) rhs[c] += scale * v[gidx(g, i, g.ny - 1, k)] / g.hy;
@@ -209,6 +226,12 @@ DeviceTunnelBc::make(const GpuGrid& g, Config c)
                   || !std::isfinite(c.xc) || !std::isfinite(c.yc)
                   || !std::isfinite(c.zc)))
         return std::unexpected(hipErrorInvalidValue);
+    // Floor: must leave open rows above the cut row, and it is incompatible
+    // with open laterals / the potential inlet (validator-enforced upstream).
+    if (c.floorRows < -1 || c.floorRows > g.ny - 5
+        || !(c.floorFrac > 0 && c.floorFrac <= 1)
+        || (c.floorRows >= 0 && (c.openLat || c.pot)))
+        return std::unexpected(hipErrorInvalidValue);
     return DeviceTunnelBc(g, c);
 }
 
@@ -216,9 +239,9 @@ void DeviceTunnelBc::apply(const DeviceField& in, DeviceField& out, double cdt,
                            bool refreshOnly) const
 {
     kBcTunnel<<<launchBlocks(g_.size()), blockSize>>>(
-        g_, int(cfg_.openLat), int(!refreshOnly), Real(cfg_.uInf), Real(cdt),
-        in.u.data(), in.v.data(), in.w.data(), out.u.data(), out.v.data(),
-        out.w.data());
+        g_, int(cfg_.openLat), int(!refreshOnly), cfg_.floorRows,
+        Real(cfg_.uInf), Real(cdt), in.u.data(), in.v.data(), in.w.data(),
+        out.u.data(), out.v.data(), out.w.data());
     checkLastKernel("bcTunnel");
     if (cfg_.pot)
     {   // Doublet strength: 2D uInf a^2, 3D uInf a^3 / 2.
@@ -238,17 +261,25 @@ void DeviceTunnelBc::correctOutletFlux(DeviceField& out, ReduceScratch& red,
                                        DeviceScalar& tmp) const
 {
     kOutletTally<<<launchBlocks(g_.size()), blockSize>>>(
-        g_, int(cfg_.openLat), int(cfg_.pot), Real(g_.hx / g_.hy),
-        Real(g_.hx / g_.hz), out.u.data(), out.v.data(), out.w.data(),
-        tmp.data());
+        g_, int(cfg_.openLat), int(cfg_.pot), cfg_.floorRows,
+        Real(cfg_.floorFrac), Real(g_.hx / g_.hy), Real(g_.hx / g_.hz),
+        out.u.data(), out.v.data(), out.w.data(), tmp.data());
     checkLastKernel("outletTally");
+    // Open plane area: with a floor, only the rows above it (plus floorFrac
+    // of the cut row) carry flux -- on both planes, so it is also the target
+    // inlet area. floorRows == -1 reproduces the historical full plane.
     const double planeArea =
-        double(g_.ny - 2) * g_.kInCount() * double(g_.hy) * double(g_.hz);
+        cfg_.floorRows < 0
+            ? double(g_.ny - 2) * g_.kInCount() * double(g_.hy) * double(g_.hz)
+            : (double(g_.ny - 2 - (cfg_.floorRows + 1)) + cfg_.floorFrac)
+                  * g_.kInCount() * double(g_.hy) * double(g_.hz);
     const double qOut = sumScalar(tmp, red) * double(g_.hy) * double(g_.hz);
     // pot: qOut is already the NET outflux (inlet tallied negative).
     const double corr = cfg_.pot ? -qOut / planeArea
                                  : (cfg_.uInf * planeArea - qOut) / planeArea;
-    kOutletCorrect<<<launchBlocks(g_.size()), blockSize>>>(g_, Real(corr), out.u.data());
+    kOutletCorrect<<<launchBlocks(g_.size()), blockSize>>>(g_, cfg_.floorRows,
+                                                           Real(corr),
+                                                           out.u.data());
     checkLastKernel("outletCorrect");
 }
 
@@ -256,8 +287,9 @@ void DeviceTunnelBc::addFluxRhs(const DeviceField& U, double scale,
                                 DeviceScalar& rhs) const
 {
     kInOutFluxRhs<<<launchBlocks(g_.size()), blockSize>>>(
-        g_, int(cfg_.openLat), int(cfg_.pot), Real(scale), Real(cfg_.uInf),
-        U.u.data(), U.v.data(), U.w.data(), rhs.data());
+        g_, int(cfg_.openLat), int(cfg_.pot), cfg_.floorRows,
+        Real(cfg_.floorFrac), Real(scale), Real(cfg_.uInf), U.u.data(),
+        U.v.data(), U.w.data(), rhs.data());
     checkLastKernel("inOutFluxRhs");
 }
 

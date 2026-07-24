@@ -72,6 +72,14 @@ int main()
            "a 3D body with --nz 1 is rejected");
     expect("flow --body cylinder --les 0.1 --nz 8 --dry-run", 0,
            "incompressible --les is 3D-capable");
+    expect("flow --body cylinder --les 1.35 --sgs sigma --nz 8 --dry-run", 0,
+           "--sgs sigma with --les and nz > 1 is accepted");
+    expect("flow --body cylinder --sgs sigma --nz 8 --dry-run", 2,
+           "--sgs without --les is rejected");
+    expect("flow --body cylinder --les 1.35 --sgs sigma --nz 1 --dry-run", 2,
+           "--sgs sigma at nz == 1 is rejected (D_sigma == 0 in 2D)");
+    expect("flow --body cylinder --les 0.17 --sgs wale --nz 8 --dry-run", 1,
+           "unknown --sgs value is a CLI error");
     expect("flow --body cylinder --mach 0.2 --dry-run", 2,
            "--mach is compressible-only");
     expect("flow --physics compressible --body cylinder --far tunnel --dry-run", 2,
@@ -82,22 +90,44 @@ int main()
            "--open is rejected, not ignored, with fringe");
     expect("flow --physics compressible --body cylinder --far nscbc "
            "--nscbc-beta 1.0 --dry-run", 2,
-           "--nscbc-beta 1.0 is rejected (measured blow-up)");
+           "--nscbc-beta 1.0 is rejected (measured divergence)");
     expect("flow --physics compressible --body cylinder --far nscbc "
            "--re 2000 --dry-run", 2,
            "pure NSCBC above Re 800 is rejected");
-    expect("flow --physics compressible --body cylinder --pot --dry-run", 2,
+    expect("flow --physics compressible --body cylinder --far sponge --pot "
+           "--dry-run", 2,
            "--pot requires an open far field (sponge rejected)");
     expect("flow --body cylinder --far tunnel --open --pot --dry-run", 0,
            "--pot works with the incompressible open tunnel");
-    expect("flow --physics compressible --body cylinder --dr 4 --dry-run", 2,
-           "compressible --dr below 6 is rejected");
+    expect("flow --physics compressible --body cylinder --dr 3 --dry-run", 2,
+           "compressible --dr below 4 is rejected");
     expect("flow --physics compressible --body cylinder --far nscbc --dr 16 "
            "--dry-run", 0,
            "compressible --dr widens the box");
     expect("flow --body cylinder --out '' --dry-run", 2, "an empty --out");
     expect("flow --body cylinder --dr 1e9 --dry-run", 2,
            "a body under 4 cells across");
+    expect("flow --physics compressible --body none --far sponge --stretch 2 "
+           "--noslip --n 128 --ny 128 --dry-run", 0,
+           "body-free stretched no-slip wall case validates");
+    expect("flow --physics compressible --body none --stretch 2 --n 128 "
+           "--dry-run", 0,
+           "--stretch with the default nscbc far field validates");
+    expect("flow --physics compressible --body none --far periodic --stretch 2 "
+           "--n 128 --dry-run", 2,
+           "--stretch with a wall-less far field is rejected");
+    expect("flow --body none --n 128 --dry-run", 2,
+           "--body none is compressible-only");
+    expect("flow --body cylinder --noslip --dry-run", 2,
+           "--noslip is compressible-only");
+    expect("flow --body fence --dr 10 --re 2000 --n 1024 --dry-run", 0,
+           "the fence shear-layer rig validates in native 2D");
+    expect("flow --body fence --physics compressible --n 512 --dry-run", 2,
+           "fence is incompressible-only");
+    expect("flow --body floor --dr 10 --re 2000 --n 1024 --dry-run", 0,
+           "the raised-floor wall-layer rig validates in native 2D");
+    expect("flow --body floor --far fringe --n 512 --dry-run", 2,
+           "floor needs the tunnel wall to stand on");
     expect("tgv --nz 2 --dry-run", 2, "tgv --nz must be 1 or >= 4");
     expect("hit --nz 1 --dry-run", 2, "hit needs nz >= 4");
     expect("bench --steps 0 --dry-run", 2, "--steps must be >= 1");

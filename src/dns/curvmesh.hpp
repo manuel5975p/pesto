@@ -5,6 +5,7 @@
 #pragma once
 
 #include "dns/grid.hpp"
+#include "dns/remap.hpp"
 
 #include <array>
 #include <expected>
@@ -21,10 +22,41 @@ struct CurvMesh
     // Undistorted mesh: node (i,j,k) = (i hx, j hy, k hz).
     static CurvMesh uniform(const Grid& g);
 
+    // Nodes from any PointRemap (dns/remap.hpp): node (i,j,k) =
+    // remap(i hx, j hy, k hz). The remap is the mathematical source of truth;
+    // CurvMetrics::build still derives the finite-volume tables from the
+    // nodes so the discrete face closure survives.
+    template <class Remap>
+    static CurvMesh fromRemap(const Grid& g, const Remap& r)
+    {
+        CurvMesh m = uniform(g);
+        for (std::size_t c = 0; c < m.x.size(); ++c) {
+            const double X[3] = {m.x[c], m.y[c], m.z[c]};
+            double x[3];
+            r.map(X, x);
+            m.x[c] = x[0];
+            m.y[c] = x[1];
+            m.z[c] = x[2];
+        }
+        return m;
+    }
+
     // Smooth fixed mapping x = X + amp*L*sin(2 pi X_other/L): skewness stays
     // finite under refinement. |amp| <= 0.06 keeps cells valid; nz == 1
     // stays planar (z = 0) so the exact 2D restriction survives.
+    // Equivalent to fromRemap(g, SinusoidalRemap{...}).
     static CurvMesh sinusoidal(const Grid& g, double amp);
+
+    // Two-sided tanh wall-normal clustering along y (TanhStretchY): cells
+    // shrink toward both y extremes, x and z stay uniform, nz == 1 stays
+    // planar. beta == 0 reproduces uniform() bit-for-bit.
+    static CurvMesh stretchedY(const Grid& g, double beta);
+
+    // Channel mesh (ChannelStretchY): rows 0 and ny-1 are wall-mirror ghost
+    // rows, exact geometric reflections of the first fluid rows; the wall
+    // faces sit ON nodes 1 and ny-1 at y = 0 and 2*delta. The caller must
+    // have sized the grid with ly = 2*delta + 2*ChannelStretchY::firstCell.
+    static CurvMesh channelY(const Grid& g, double beta, double delta);
 
     // Node position for any logical index; periodic images add the box.
     std::array<double, 3> node(int i, int j, int k) const;

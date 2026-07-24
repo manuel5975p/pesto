@@ -23,10 +23,41 @@ struct Lens
     double ra() const { return e() + hh; }                    // disk radius
 };
 
+// Wall-mounted blocker: axis-aligned rectangle of half-thickness w about
+// x = cx, solid from below the domain floor (semi-infinite downward, so it is
+// sealed through the wall/ghost rows -- no under-gap jet) up to y = yTop.
+// z-invariant. The 2D shear-layer rig: a laminar tunnel inflow separates at
+// the sharp top edge.
+struct Fence
+{
+    double cx, w, yTop;
+};
+
+// Raised solid floor: a slab spanning the ENTIRE streamwise (and spanwise)
+// extent, solid for y <= y_s(x), sealed semi-infinitely downward. The cut
+// surface is a no-slip plate whose leading edge sits in the inflow plane --
+// the wall-boundary-layer rig. Optional roughness: n triangular SPIKES of
+// height amp and half-base halfw, one per pitch, centred at
+// x0 + (m + 1/2) pitch (m = 0..n-1):
+//   y_s(x) = yTop + max(0, amp (1 - |x - centre| / halfw)).
+// Sharp tips are fine for the sampled cut (lens-tip precedent); the plate is
+// exactly FLAT for at least pitch/2 - halfw next to the inlet/outlet planes,
+// so the boundary cut rows never seal into a pocket (a ripple reaching a
+// plane ratcheted the prescribed inflow into a sliver pocket -- measured
+// dt collapse). amp = 0 is the exact flat plate. z-invariant.
+struct Floor
+{
+    double yTop;
+    double amp = 0, halfw = 1, pitch = 1, x0 = 0;
+    int n = 0;
+};
+
 Sdf sdfOf(const Sphere&);
 Sdf sdfOf(const CylinderZ&);
 Sdf sdfOf(const RotatedCube&);
 Sdf sdfOf(const Lens&);
+Sdf sdfOf(const Fence&);
+Sdf sdfOf(const Floor&);
 
 // base minus spherical-cap pits: sdf = max(base, -pits). Pit footprint radius
 // rd and depth are in WORLD units; the caller sizes them in grid units so they

@@ -84,16 +84,91 @@ __global__ void kBodyFlux(GpuGrid g, Real mu, Real kappa, PrimView q,
     acc[2 * m + t] = double(sgn * f.mz * area);
 }
 
+// Curvilinear counterpart: faceFluxCurv already integrates over the exact
+// face area vector S, so there is no separate area multiply here.
+__global__ void kBodyFluxCurv(GpuGrid g, Real mu, Real kappa, PrimView q,
+                              CurvView m, const int* fcell, const int* fdir,
+                              int n, double* acc)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n) return;
+    int i, j, k;
+    decompose(g, std::size_t(fcell[t]), i, j, k);
+    const int d = fdir[t];
+    const int axis = d / 2;
+    const bool minus = d & 1;
+    const int ox = axis == 0, oy = axis == 1, oz = axis == 2;
+    const Flux f = minus
+        ? faceFluxCurv(g, mu, kappa, q, m, i - ox, j - oy, k - oz, axis)
+        : faceFluxCurv(g, mu, kappa, q, m, i, j, k, axis);
+    const Real sgn = minus ? Real(-1) : Real(1);
+    acc[t] = double(sgn * f.mx);
+    acc[n + t] = double(sgn * f.my);
+    acc[2 * n + t] = double(sgn * f.mz);
+}
+
 } // namespace
 
 std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
     const Grid& g, const Sdf& sdf, double gamma, double rhoInf, double pInf,
     const double* bbox)
 {
+    const double L[3] = {g.nx * g.hx, g.ny * g.hy, g.nz * g.hz};
+    return make(g, sdf, gamma, rhoInf, pInf, bbox,
+                AxisRemap3{Focal1D::identity(L[0]), Focal1D::identity(L[1]),
+                           Focal1D::identity(L[2])});
+}
+
+std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
+    const Grid& g, const Sdf& sdf, double gamma, double rhoInf, double pInf,
+    const double* bbox, const AxisRemap3& R)
+{
     const int nx = g.nx, ny = g.ny, nz = g.nz;
     const double hx = g.hx, hy = g.hy, hz = g.hz;
-    double h = std::min(hx, hy);
-    if (nz > 1) h = std::min(h, hz);
+    const bool curv = R.fx.active || R.fy.active || R.fz.active;
+    const Focal1D* ax[3] = {&R.fx, &R.fy, &R.fz};
+    const double href[3] = {hx, hy, hz};
+
+    // Physical cell centre of the reference centre (i+0.5) h; the identity
+    // remap returns the reference position unchanged, so the Cartesian path
+    // below is arithmetically untouched.
+    auto cx = [&](int i) { return R.fx.map((i + 0.5) * hx); };
+    auto cy = [&](int j) { return R.fy.map((j + 0.5) * hy); };
+    auto cz = [&](int k) { return R.fz.map((k + 0.5) * hz); };
+
+    // Local physical spacing per axis at a cell: the map's slope times the
+    // reference spacing. Degenerate axes report 0 and are skipped by every
+    // consumer. These are physical lengths -- the near-wall band, the
+    // deep-solid threshold and the sample distance are all physical.
+    auto localSpacing = [&](int i, int j, int k, double d[3]) {
+        const int idx[3] = {i, j, k};
+        const int n[3] = {nx, ny, nz};
+        for (int a = 0; a < 3; ++a)
+            d[a] = n[a] == 1
+                       ? 0.0
+                       : ax[a]->deriv((idx[a] + 0.5) * href[a]) * href[a];
+    };
+    auto minSpacing = [](const double d[3]) {
+        double m = 1e300;
+        for (int a = 0; a < 3; ++a)
+            if (d[a] > 0.0) m = std::min(m, d[a]);
+        return m;
+    };
+    auto maxSpacing = [](const double d[3]) {
+        double m = 0.0;
+        for (int a = 0; a < 3; ++a) m = std::max(m, d[a]);
+        return m;
+    };
+    // Coarsest spacing anywhere on the mesh. The bbox short-circuit below
+    // needs an UPPER bound on any cell's near-wall reach, so it is the
+    // coarse spacing -- not the fine one -- that sets the band.
+    double hCoarse = 0.0;
+    for (int a = 0; a < 3; ++a) {
+        const int n[3] = {nx, ny, nz};
+        if (n[a] == 1) continue;
+        hCoarse = std::max(hCoarse, ax[a]->active ? ax[a]->c * href[a]
+                                                  : href[a]);
+    }
     const double Lx = nx * hx, Ly = ny * hy, Lz = nz * hz;
     auto pmod = [](double x, double L) { return x - L * std::floor(x / L); };
 
@@ -101,7 +176,9 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
     // than that from the surface (the box contains the surface), hence phi > 2h:
     // plain fluid, never a ghost / near-wall cell / interface neighbour, so its
     // exact sdf value is irrelevant. Margin covers the -2h deep band + a cell.
-    const double band = 2.0 * h + std::max({hx, hy, hz});
+    // On a focal mesh the coarse spacing bounds every cell's near-wall reach,
+    // so it -- not the fine one -- keeps this an upper bound.
+    const double band = 2.0 * hCoarse + std::max({hx, hy, hz, hCoarse});
     const double outer = band + 1.0; // any value > band marks a skipped fluid cell
     auto farFromBox = [&](double x, double y, double z) {
         double d2 = 0.0;
@@ -118,8 +195,7 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
     for (int k = 0; k < nz; ++k)
         for (int j = 0; j < ny; ++j)
             for (int i = 0; i < nx; ++i) {
-                const double x = (i + 0.5) * hx, y = (j + 0.5) * hy,
-                             z = (k + 0.5) * hz;
+                const double x = cx(i), y = cy(j), z = cz(k);
                 phi[g.idx(i, j, k)] =
                     (bbox && farFromBox(x, y, z)) ? outer : sdf(x, y, z);
             }
@@ -134,13 +210,27 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
                 const std::size_t c = g.idx(i, j, k);
                 if (phi[c] >= 0.0) continue;
                 solid.push_back(int(c));
-                if (phi[c] < -2.0 * h) {
+                // Local physical spacing: on a focal mesh the near-wall
+                // thresholds must follow the cells that are actually there.
+                double dloc[3];
+                localSpacing(i, j, k, dloc);
+                const double hl = minSpacing(dloc);
+                // The mirror band must be at least two cells deep along
+                // EVERY axis: the interior stencil reaches two cells, and a
+                // quiescent deep-solid cell inside its reach is a hard
+                // discontinuity against the fluid. The threshold therefore
+                // follows the WIDEST local spacing -- with the smallest, an
+                // anisotropic fine region leaves the band under two cells
+                // thick along the wide axis (measured on the Re100 cylinder
+                // at aspect 1.7: cd 1.49 -> -7.6, a spurious thrust).
+                // Isotropic cells make the two identical, so the Cartesian
+                // construction is untouched.
+                if (phi[c] < -2.0 * maxSpacing(dloc)) {
                     deep.push_back(int(c));
                     continue;
                 }
-                const double x = (i + 0.5) * hx, y = (j + 0.5) * hy,
-                             z = (k + 0.5) * hz;
-                const double d = 1e-3 * h;
+                const double x = cx(i), y = cy(j), z = cz(k);
+                const double d = 1e-3 * hl;
                 double nv[3] = {(sdf(x + d, y, z) - sdf(x - d, y, z)) / (2 * d),
                                 (sdf(x, y + d, z) - sdf(x, y - d, z)) / (2 * d),
                                 (sdf(x, y, z + d) - sdf(x, y, z - d)) / (2 * d)};
@@ -152,13 +242,19 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
                     continue;
                 }
                 for (double& v : nv) v /= nn;
-                // Sample at ds beyond the wall (>= 0.75 h so the stencil
-                // always reaches fluid, even for cells barely inside).
+                // Sample at ds beyond the wall (>= 0.75 of the finest local
+                // spacing so the stencil always reaches fluid, even for cells
+                // barely inside).
                 const double dw = -phi[c];
-                const double dsmp = std::max(dw, 0.75 * h);
-                const double xi = pmod(x + (dw + dsmp) * nv[0], Lx);
-                const double yi = pmod(y + (dw + dsmp) * nv[1], Ly);
-                const double zi = pmod(z + (dw + dsmp) * nv[2], Lz);
+                const double dsmp = std::max(dw, 0.75 * hl);
+                // The sample point is a PHYSICAL offset along the physical
+                // normal; the per-axis inverse takes it back to reference
+                // space, where the cell-centre lattice is uniform and the
+                // trilinear weights are the Cartesian ones. The map is
+                // box-preserving, so the physical wrap is the reference wrap.
+                const double xi = R.fx.inverse(pmod(x + (dw + dsmp) * nv[0], Lx));
+                const double yi = R.fy.inverse(pmod(y + (dw + dsmp) * nv[1], Ly));
+                const double zi = R.fz.inverse(pmod(z + (dw + dsmp) * nv[2], Lz));
                 // Trilinear over cell centres, fluid cells only, renormalized.
                 const double fx = xi / hx - 0.5, fy = yi / hy - 0.5,
                              fz = zi / hz - 0.5;
@@ -219,7 +315,9 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
     out.nGhost_ = int(gcell.size());
     out.nDeep_ = int(deep.size());
     out.nFace_ = int(fcell.size());
+    out.curv_ = curv;
     out.solid_ = std::move(solid);
+    out.deepHost_ = deep;
     auto up = [](auto& dst, const auto& src) -> hipError_t {
         if (src.empty()) return hipSuccess;
         auto b = DeviceBuffer<std::decay_t<decltype(src[0])>>::make(src.size());
@@ -270,10 +368,26 @@ DeviceCompGhost::Force DeviceCompGhost::force(DeviceComp& solver,
     const PrimView q{s.rho.data(),      solver.u().data(), solver.v().data(),
                      solver.w().data(), solver.e().data(), solver.p().data(),
                      solver.T().data()};
-    kBodyFlux<<<launchBlocks(nFace_), blockSize>>>(
-        g_, solver.mu(), solver.kappaCond(), q, fcell_.data(), fdir_.data(),
-        nFace_, facc_.data());
-    checkLastKernel("kBodyFlux");
+    if (curv_) {
+        const DeviceCurv* t = solver.curvTables();
+        assert(t && "focal ghost force needs the curvilinear DeviceComp");
+        if (!t) return {0.0, 0.0, 0.0};
+        CurvView cv;
+        for (int a = 0; a < 3; ++a) {
+            for (int c = 0; c < 3; ++c) cv.S[a][c] = t->S[a][c].data();
+            for (int e = 0; e < 9; ++e) cv.Ji[a][e] = t->Ji[a][e].data();
+        }
+        cv.invVol = t->invVol.data();
+        kBodyFluxCurv<<<launchBlocks(nFace_), blockSize>>>(
+            g_, solver.mu(), solver.kappaCond(), q, cv, fcell_.data(),
+            fdir_.data(), nFace_, facc_.data());
+        checkLastKernel("kBodyFluxCurv");
+    } else {
+        kBodyFlux<<<launchBlocks(nFace_), blockSize>>>(
+            g_, solver.mu(), solver.kappaCond(), q, fcell_.data(), fdir_.data(),
+            nFace_, facc_.data());
+        checkLastKernel("kBodyFlux");
+    }
     // Three deterministic FP64 reductions over disjoint spans of facc_.
     const std::size_t m = std::size_t(nFace_);
     double f[3];

@@ -5,6 +5,7 @@
 #include "dns/gpu/cutcell.hpp"
 #include "dns/gpu/reductions.hpp"
 
+#include <array>
 #include <expected>
 
 namespace dns::gpu {
@@ -21,6 +22,15 @@ struct BodyBox
 // Pre: h > 0 on every axis.
 BodyBox bodyBox(const GpuGrid&, double cx, double cy, double cz, double r,
                 int margin = 2);
+
+// Same clamping from an explicit world box {xlo,ylo,zlo,xhi,yhi,zhi} -- the
+// per-object scene tallies, whose extents are not cubes.
+BodyBox bodyBox(const GpuGrid&, const std::array<double, 6>& worldBox,
+                int margin = 2);
+
+// Index-box overlap test: two overlapping tally boxes would each count the
+// shared surface, so the caller must not emit per-object series for them.
+bool overlaps(const BodyBox&, const BodyBox&);
 
 class DeviceBodyForce
 {

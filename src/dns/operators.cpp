@@ -64,7 +64,7 @@ void convection(const Grid& g, const VectorField& U, VectorField& out)
     // plain-divergence errors -- which it always does at cut cells (only the
     // APERTURED divergence is projected to zero there) and, on the GPU, at the
     // FP32 projection residual. Without it the divergence form injects energy
-    // ~ u^2*div(u) into under-resolved cut-cell shear layers and blows up.
+    // ~ u^2*div(u) into under-resolved cut-cell shear layers and diverges.
     const auto& u = U.u; const auto& v = U.v; const auto& w = U.w;
     auto cellDiv = [&](int i, int j, int k) {
         return (u[g.idx(i + 1, j, k)] - u[g.idx(i, j, k)]) / g.hx

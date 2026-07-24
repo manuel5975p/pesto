@@ -31,6 +31,14 @@ double kineticEnergy(const GpuGrid& g, const DeviceField& U, ReduceScratch& s);
 Mean3 meanVelocity(const GpuGrid& g, const DeviceField& U, ReduceScratch& s);
 double fluctuationEnergy(const GpuGrid& g, const DeviceField& U, ReduceScratch& s);
 double maxCourantPerDt(const GpuGrid& g, const DeviceField& U, ReduceScratch& s);
+
+// --cut-flux variant: per-face amplification max(1, aperture/lambda~) with
+// lambda~ = max(face lambda, 1/2); equals maxCourantPerDt on interior cells,
+// bounded by 2x overall.
+double maxCourantPerDtCut(const GpuGrid& g, const DeviceField& U,
+                          const DeviceScalar& ax, const DeviceScalar& ay,
+                          const DeviceScalar& az, const DeviceScalar& lam,
+                          ReduceScratch& s);
 double maxAbsDivergence(const GpuGrid& g, const DeviceField& U, ReduceScratch& s);
 double velocityGradientSq(const GpuGrid& g, const DeviceField& U, ReduceScratch& s);
 

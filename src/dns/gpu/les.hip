@@ -10,11 +10,14 @@ namespace dns::gpu {
 
 namespace {
 
-// nut = (Cs Delta)^2 |S| lambda at cell centres from the MAC field, full 3D
-// strain. At nz == 1 every z term is EXACTLY zero (w == 0, k+-1 wraps to k),
-// so the value is bit-identical to the old 2D kernel.
-__global__ void kSmagNut(GpuGrid g, Real cs2d2, const Real* u, const Real* v,
-                         const Real* w, const Real* lam, Real* nut)
+// nut = cs2d2 * op(grad u) * lambda at cell centres from the MAC field, full
+// 3D gradients; op is |S| (sigma == 0, Smagorinsky) or D_sigma (sigma != 0).
+// At nz == 1 every z term is EXACTLY zero (w == 0, k+-1 wraps to k), so the
+// Smagorinsky value is bit-identical to the old 2D kernel -- and D_sigma is
+// identically zero there (two-component flow), by design.
+__global__ void kSmagNut(GpuGrid g, Real cs2d2, int sigma, const Real* u,
+                         const Real* v, const Real* w, const Real* lam,
+                         Real* nut)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
@@ -44,6 +47,14 @@ __global__ void kSmagNut(GpuGrid g, Real cs2d2, const Real* u, const Real* v,
     const Real dwdx = (wc(i + 1, j, k) - wc(i - 1, j, k)) / (2 * g.hx);
     const Real dvdz = (vc(i, j, k + 1) - vc(i, j, k - 1)) / (2 * g.hz);
     const Real dwdy = (wc(i, j + 1, k) - wc(i, j - 1, k)) / (2 * g.hy);
+    if (sigma)
+    {
+        const Real gd[3][3] = {{dudx, dudy, dudz},
+                               {dvdx, dvdy, dvdz},
+                               {dwdx, dwdy, dwdz}};
+        nut[c] = cs2d2 * Real(sigmaDsigma(gd)) * lam[c];
+        return;
+    }
     const Real sxy = Real(0.5) * (dudy + dvdx);
     const Real sxz = Real(0.5) * (dudz + dwdx);
     const Real syz = Real(0.5) * (dvdz + dwdy);
@@ -108,7 +119,7 @@ __global__ void kEddyDiffuse(GpuGrid g, Real s, const Real* nut, const Real* u,
 } // namespace
 
 std::expected<DeviceSmagorinsky, hipError_t>
-DeviceSmagorinsky::make(const GpuGrid& g, double cs)
+DeviceSmagorinsky::make(const GpuGrid& g, double cs, SgsModel model)
 {
     if (!(cs > 0)) return std::unexpected(hipErrorInvalidValue);
     auto nut = DeviceScalar::make(g.size());
@@ -121,15 +132,15 @@ DeviceSmagorinsky::make(const GpuGrid& g, double cs)
                   : Real(cs * cs
                          * std::pow(double(g.hx) * double(g.hy) * double(g.hz),
                                     2.0 / 3.0));
-    return DeviceSmagorinsky(g, cs2d2, std::move(*nut));
+    return DeviceSmagorinsky(g, cs2d2, model, std::move(*nut));
 }
 
 void DeviceSmagorinsky::computeNut(const DeviceField& U,
                                    const DeviceCutGeometry& cut)
 {
     kSmagNut<<<launchBlocks(g_.size()), blockSize>>>(
-        g_, cs2d2_, U.u.data(), U.v.data(), U.w.data(), cut.lambda.data(),
-        nut_.data());
+        g_, cs2d2_, model_ == SgsModel::Sigma ? 1 : 0, U.u.data(), U.v.data(),
+        U.w.data(), cut.lambda.data(), nut_.data());
     checkLastKernel("smagNut");
 }
 

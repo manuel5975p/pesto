@@ -56,11 +56,14 @@ __global__ void kFarSponge(GpuGrid g, int ns, Real sigMax, Real gam, int openY,
     E[c] = p / (gam - Real(1)) + Real(0.5) * r * (u * u + v * v + w * w);
 }
 
-// Free-slip mirror on the y extremes: tangential momentum and thermodynamics
-// mirrored, normal momentum antimirrored. Writes j in {0, ny-1}, reads
-// {1, ny-2}: disjoint.
-__global__ void kFarWallY(GpuGrid g, Real* rho, Real* mx, Real* my, Real* mz,
-                          Real* E)
+// Mirror walls on the y extremes; the wall planes are the faces between rows
+// {0,1} and {ny-2,ny-1} (rows 0 and ny-1 are ghost rows). Free-slip: only the
+// normal momentum antimirrored. No-slip: ALL momentum antimirrored, so every
+// velocity component vanishes at the wall face by symmetry; |m| is unchanged,
+// so the copied E keeps p mirrored -- an adiabatic no-slip wall. Writes j in
+// {0, ny-1}, reads {1, ny-2}: disjoint.
+__global__ void kFarWallY(GpuGrid g, int noslip, Real* rho, Real* mx, Real* my,
+                          Real* mz, Real* E)
 {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t nxz = std::size_t(g.nx) * g.nz;
@@ -70,9 +73,9 @@ __global__ void kFarWallY(GpuGrid g, Real* rho, Real* mx, Real* my, Real* mz,
     const std::size_t c = gidx(g, i, hi ? g.ny - 1 : 0, k);
     const std::size_t s = gidx(g, i, hi ? g.ny - 2 : 1, k);
     rho[c] = rho[s];
-    mx[c] = mx[s];
+    mx[c] = noslip ? -mx[s] : mx[s];
     my[c] = -my[s];
-    mz[c] = mz[s];
+    mz[c] = noslip ? -mz[s] : mz[s];
     E[c] = E[s];
 }
 
@@ -121,7 +124,8 @@ void DeviceCompFar::apply(DeviceCompState& s) const
     checkLastKernel("kFarSponge");
     if (!c_.openY) {
         kFarWallY<<<launchBlocks(2 * std::size_t(g_.nx) * g_.nz), blockSize>>>(
-            g_, s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(), s.E.data());
+            g_, int(c_.noslipY), s.rho.data(), s.mx.data(), s.my.data(),
+            s.mz.data(), s.E.data());
         checkLastKernel("kFarWallY");
     }
     if (!c_.openZ && g_.nz > 1) {

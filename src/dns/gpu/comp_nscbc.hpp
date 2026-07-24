@@ -18,6 +18,7 @@
 #pragma once
 
 #include "dns/gpu/comp.hpp"
+#include "dns/remap.hpp"
 
 namespace dns::gpu {
 
@@ -38,7 +39,7 @@ public:
         // Outflow transverse compensation L1 -= betaTrans (Tp - rho c Tu)
         // (Yoo-Im). Measured at cyl Re800 M0.2 512: 0 pumps a growing global
         // mode (cl 2 -> 13), beta = M = 0.2 still drifts, 0.5 = clean limit
-        // cycle matching the sponge's cd sigma and St, 1.0 blows up (full
+        // cycle matching the sponge's cd sigma and St, 1.0 diverges (full
         // cancellation is ill-posed at low M). < 0 = freestream Mach.
         double betaTrans = 0.5;
         // Characteristic far-field lateral faces (default = leave the lateral
@@ -63,6 +64,12 @@ public:
         // (measured with the sponge far field: lateral u-relax cd 1.98 ~=
         // walls 1.96, rho/p-only 1.91).
         double etaLat = 0.25;
+        // Full-width solid floor crossing the x planes (--body floor): rows
+        // j <= floorRows are fully solid there -- the ghost wall owns their
+        // state, so the characteristic overwrite is skipped and they keep
+        // the interior rhs. -1 = no floor (bit-identical). Incompatible with
+        // openY/openZ (validator-enforced upstream).
+        int floorRows = -1;
     };
 
     // Periodic grid, nx >= 4 (ny/nz >= 4 on open axes); subsonic freestream.
@@ -73,6 +80,22 @@ public:
     // primitives are live).
     void apply(const DeviceComp& d, const DeviceCompState& s,
                DeviceCompState& k) const;
+
+    // Stretched-y (curvilinear) variant: the PointRemap travels as a template
+    // argument of the kernel, so every one-sided normal derivative, Yoo-Im
+    // transverse derivative and potential-target position uses PHYSICAL
+    // distances, and the retained transverse flux divergence comes from
+    // faceFluxCurv on d's metric tables -- the interior scheme, exactly.
+    // Pre: d is the curvilinear DeviceComp built from the same remap's nodes.
+    void apply(const DeviceComp& d, const DeviceCompState& s,
+               DeviceCompState& k, const TanhStretchY& remap) const;
+
+    // Focal (per-axis interior clustering) variant: same contract, one more
+    // kernel instantiation. AxisRemap3 is ONE concrete type whatever the
+    // focal box is -- the coefficients travel as data, so x/y/z clustering
+    // in any combination costs no extra instantiations.
+    void apply(const DeviceComp& d, const DeviceCompState& s,
+               DeviceCompState& k, const AxisRemap3& remap) const;
 
     // Inflow target u (quiet-start ramp tracking); must stay subsonic.
     void setFreestream(double u) { u_ = u; }

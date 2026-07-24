@@ -141,6 +141,25 @@ BodyBox bodyBox(const GpuGrid& g, double cx, double cy, double cz, double r,
     return {i0, i1, j0, j1, k0, k1};
 }
 
+BodyBox bodyBox(const GpuGrid& g, const std::array<double, 6>& w, int margin)
+{
+    auto span = [margin](double lo, double hi, double h, int n) {
+        return std::pair{std::max(2, int(lo / h) - margin),
+                         std::min(n - 3, int(hi / h) + margin + 1)};
+    };
+    const auto [i0, i1] = span(w[0], w[3], g.hx, g.nx);
+    const auto [j0, j1] = span(w[1], w[4], g.hy, g.ny);
+    if (g.nz == 1) return {i0, i1, j0, j1, 0, 0};
+    const auto [k0, k1] = span(w[2], w[5], g.hz, g.nz);
+    return {i0, i1, j0, j1, k0, k1};
+}
+
+bool overlaps(const BodyBox& a, const BodyBox& b)
+{
+    return a.i0 <= b.i1 && b.i0 <= a.i1 && a.j0 <= b.j1 && b.j0 <= a.j1
+           && a.k0 <= b.k1 && b.k0 <= a.k1;
+}
+
 std::expected<DeviceBodyForce, hipError_t>
 DeviceBodyForce::make(const GpuGrid& g, BodyBox b)
 {

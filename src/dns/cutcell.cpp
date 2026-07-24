@@ -144,7 +144,7 @@ double integrate(const G& fn, double a, double b, double tol)
 // integrand kinks where the slice circle passes an edge or corner of the
 // rectangle; splitting there first keeps every adaptive piece smooth (without
 // the split, kink cells drive the recursion to its depth cap and the geometry
-// build blows up at high resolution).
+// build diverges at high resolution).
 double sphereBoxSolidVolume(double x0, double y0, double z0, double hx,
                             double hy, double hz, const Sphere& s)
 {
@@ -285,6 +285,57 @@ CutGeometry CutGeometry::make(const Grid& g, const Sphere& s)
                 cut.az[id] = faceOpen(z0 - s.cz, x0 - s.cx, y0 - s.cy, g.hx, g.hy);
             }
     return cut;
+}
+
+std::vector<unsigned char> buildCutFlag(const Grid& g, const CutGeometry& cut)
+{
+    // Seed: any cell whose volume or any INCIDENT face aperture is not exactly
+    // 1. A cell's high faces are its +1 neighbours' low faces; checking both
+    // sides keeps the seed symmetric so the dilation below is what sets the
+    // reach, not the storage convention.
+    const std::size_t n = g.size();
+    std::vector<unsigned char> seed(n, 0), flag(n, 0);
+    for (int k = 0; k < g.nz; ++k)
+        for (int j = 0; j < g.ny; ++j)
+            for (int i = 0; i < g.nx; ++i)
+            {
+                const std::size_t c = g.idx(i, j, k);
+                if (cut.lambda[c] < 1.0 || cut.ax[c] < 1.0 || cut.ay[c] < 1.0
+                    || cut.az[c] < 1.0 || cut.ax[g.idx(i + 1, j, k)] < 1.0
+                    || cut.ay[g.idx(i, j + 1, k)] < 1.0
+                    || cut.az[g.idx(i, j, k + 1)] < 1.0)
+                    seed[c] = 1;
+            }
+    // Dispatch radius 2 (see header): fixed-order box dilation, periodic wrap.
+    constexpr int r = 2;
+    for (int k = 0; k < g.nz; ++k)
+        for (int j = 0; j < g.ny; ++j)
+            for (int i = 0; i < g.nx; ++i)
+            {
+                if (!seed[g.idx(i, j, k)]) continue;
+                const int dzr = g.nz == 1 ? 0 : r; // nz==1: z wraps to itself
+                for (int dk = -dzr; dk <= dzr; ++dk)
+                    for (int dj = -r; dj <= r; ++dj)
+                        for (int di = -r; di <= r; ++di)
+                            flag[g.idx(i + di, j + dj, k + dk)] = 1;
+            }
+    return flag;
+}
+
+void clearBoundaryFlag(const Grid& g, std::vector<unsigned char>& flag,
+                       int width)
+{
+    assert(flag.size() == g.size());
+    for (int k = 0; k < g.nz; ++k)
+        for (int j = 0; j < g.ny; ++j)
+            for (int i = 0; i < g.nx; ++i)
+            {
+                const bool nearZ =
+                    g.nz > 1 && (k < width || k >= g.nz - width);
+                if (i < width || i >= g.nx - width || j < width
+                    || j >= g.ny - width || nearZ)
+                    flag[g.idx(i, j, k)] = 0;
+            }
 }
 
 CutSanitizeStats sanitizeCut(const Grid& g, CutGeometry& cut, double lambdaMin,

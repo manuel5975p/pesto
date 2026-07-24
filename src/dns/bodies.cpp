@@ -45,6 +45,59 @@ Sdf sdfOf(const Lens& b)
     };
 }
 
+Sdf sdfOf(const Fence& f)
+{
+    // Semi-infinite slab: exact distance everywhere (the only rounding is at
+    // the two top corners, where the Euclidean corner distance applies).
+    return [f](double x, double y, double) {
+        const double dx = std::abs(x - f.cx) - f.w;
+        const double dy = y - f.yTop;
+        if (dx > 0.0 && dy > 0.0) return std::hypot(dx, dy);
+        return std::max(dx, dy);
+    };
+}
+
+Sdf sdfOf(const Floor& f)
+{
+    // amp == 0: half-space, the plane distance is exact. Rippled: the
+    // vertical gap divided by the max surface-slope factor is a conservative
+    // near-distance (exact for a plane of that slope), which is all the cut
+    // sampler's Lipschitz early-out needs.
+    if (f.amp == 0.0 || f.n <= 0)
+        return [f](double, double y, double) { return y - f.yTop; };
+    // EXACT distance to the piecewise-linear surface (flats + the flank
+    // segments of the up-to-three nearest teeth): the compressible ghost
+    // wall mirrors across the surface and needs |grad sdf| ~ 1 -- a
+    // slope-normalized vertical gap (conservative underestimate) made the
+    // mirror points land wrong and NaN'd the fill at the first step.
+    return [f](double x, double y, double) {
+        auto seg = [&](double ax, double ay, double bx, double by) {
+            const double vx = bx - ax, vy = by - ay;
+            double t = ((x - ax) * vx + (y - ay) * vy) / (vx * vx + vy * vy);
+            t = std::min(std::max(t, 0.0), 1.0);
+            const double dx = x - (ax + t * vx), dy = y - (ay + t * vy);
+            return std::sqrt(dx * dx + dy * dy);
+        };
+        const double m0 = std::floor((x - f.x0) / f.pitch);
+        double d = 1e300, ys = f.yTop;
+        bool overTooth = false;
+        for (double m = m0 - 1; m <= m0 + 1; m += 1.0)
+        {
+            if (m < 0 || m > double(f.n - 1)) continue;
+            const double cm = f.x0 + (m + 0.5) * f.pitch;
+            d = std::min(d, seg(cm - f.halfw, f.yTop, cm, f.yTop + f.amp));
+            d = std::min(d, seg(cm, f.yTop + f.amp, cm + f.halfw, f.yTop));
+            if (std::abs(x - cm) <= f.halfw)
+            {
+                overTooth = true;
+                ys = f.yTop + f.amp * (1.0 - std::abs(x - cm) / f.halfw);
+            }
+        }
+        if (!overTooth) d = std::min(d, std::abs(y - f.yTop));
+        return y < ys ? -d : d;
+    };
+}
+
 double pitRadius(double a, double depth)
 {
     assert(depth > 0);

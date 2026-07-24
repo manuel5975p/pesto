@@ -181,6 +181,61 @@ double startupNoise(bool quiet)
     return noise / pInf;
 }
 
+// No-slip mirror walls: after one apply, the ghost rows carry the FULL
+// antimirror (every momentum component negated, rho/E copied), so all
+// velocity components vanish at the wall faces by symmetry; and a short
+// stepped run decelerates the near-wall flow (a boundary layer starts).
+void noslipWall()
+{
+    const int nx = 64, ny = 32;
+    const auto g = Grid::make(nx, ny, 1, 2 * pi, pi, 1.0);
+    auto cfg = config(nx, false);
+    cfg.noslipY = true;
+    auto far = gpu::DeviceCompFar::make(g, cfg);
+    auto ds = gpu::DeviceCompState::make(g.size());
+    if (!far || !ds) std::exit(EXIT_FAILURE);
+    auto host = CompState::zeros(g);
+    for (std::size_t c = 0; c < g.size(); ++c) {
+        host.rho[c] = rhoInf;
+        host.mx[c] = rhoInf * uInf;
+        host.my[c] = 0.1;
+        host.E[c] = EInf;
+    }
+    (void)ds->upload(host);
+    far->apply(*ds);
+    auto h1 = CompState::zeros(g);
+    (void)ds->download(h1);
+    double err = 0.0;
+    for (int i = 0; i < nx; ++i)
+        for (const auto [jg, js] : {std::pair{0, 1}, {ny - 1, ny - 2}}) {
+            const std::size_t cg = g.idx(i, jg, 0), cs = g.idx(i, js, 0);
+            err = std::max({err, std::abs(h1.mx[cg] + h1.mx[cs]),
+                            std::abs(h1.my[cg] + h1.my[cs]),
+                            std::abs(h1.rho[cg] - h1.rho[cs]),
+                            std::abs(h1.E[cg] - h1.E[cs]) / EInf});
+        }
+    std::printf("no-slip mirror max defect: %.2e\n", err);
+    check(err < 1e-12, "no-slip walls antimirror all momentum");
+
+    auto dev = gpu::DeviceComp::make(g, gam, 5e-3);
+    auto red = gpu::ReduceScratch::make();
+    if (!dev || !red) std::exit(EXIT_FAILURE);
+    dev->setStageHook([&](gpu::DeviceCompState& st) { far->apply(st); });
+    for (int it = 0; it < 200; ++it)
+        dev->step(*ds, gpu::Real(dev->stableDt(*ds, *red)));
+    (void)ds->download(h1);
+    double uWall = 0.0, uMid = 0.0;
+    for (int i = 0; i < nx; ++i) {
+        uWall += h1.mx[g.idx(i, 1, 0)] / h1.rho[g.idx(i, 1, 0)];
+        uMid += h1.mx[g.idx(i, ny / 2, 0)] / h1.rho[g.idx(i, ny / 2, 0)];
+    }
+    uWall /= nx;
+    uMid /= nx;
+    std::printf("after 200 steps: <u> wall row %.4f, mid %.4f\n", uWall, uMid);
+    check(std::isfinite(uWall) && uWall < 0.9 * uMid,
+          "boundary layer decelerates the wall row");
+}
+
 } // namespace
 
 int main()

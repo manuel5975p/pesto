@@ -30,6 +30,10 @@ struct FrameField
     const float* data = nullptr;
     float lo = 0, hi = 1;
     bool diverging = false;
+    // > 0 (diverging only): the PNG renders asinh(v/toe)/asinh(hi/toe) --
+    // linear below the toe, logarithmic above, so a high-Re field's decades
+    // of vorticity all read. bin/web stay RAW; this is a display transform.
+    float asinhToe = 0;
 };
 
 // What the caller hands to RunOutput::frame(): the fields of one time level.
@@ -64,6 +68,7 @@ public:
         std::set<Emit> kinds;
         double fdt = 0.15, pdt = 0, wdt = 0;
         int planesPerAxis = 3;
+        int pngDown = 1;       // box-average coarsening for PNG frames; 1 = full res
         std::string simJson;   // extra "sim" metadata for the web manifest
     };
 

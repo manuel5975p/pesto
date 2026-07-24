@@ -33,10 +33,11 @@ __global__ void kPrim(GpuGrid g, Real gamma, Real Rgas, const Real* rho,
     T[c] = pr / (r * Rgas);
 }
 
-// Smagorinsky dynamic eddy viscosity mu_t = rho (Cs Delta)^2 |S| at cell
-// centres; |S| = sqrt(2 S_ij S_ij) from central-difference velocity gradients.
-// smagCd = Cs^2 Delta^2. z-shear terms cancel by periodic wrap when nz == 1.
-__global__ void kCompSmagNut(GpuGrid g, Real smagCd, const Real* rho,
+// Dynamic eddy viscosity mu_t = rho (C Delta)^2 op(grad u) at cell centres
+// from central-difference velocity gradients; op is |S| = sqrt(2 S_ij S_ij)
+// (sigma == 0, Smagorinsky) or D_sigma (sigma != 0, dns/sgs.hpp).
+// smagCd = C^2 Delta^2. z-shear terms cancel by periodic wrap when nz == 1.
+__global__ void kCompSmagNut(GpuGrid g, Real smagCd, int sigma, const Real* rho,
                              const Real* u, const Real* v, const Real* w,
                              Real* nut)
 {
@@ -54,6 +55,10 @@ __global__ void kCompSmagNut(GpuGrid g, Real smagCd, const Real* rho,
                      vc[cc][gidx(g, i, j - 1, k)]) * inv[1];
         gd[cc][2] = (vc[cc][gidx(g, i, j, k + 1)] -
                      vc[cc][gidx(g, i, j, k - 1)]) * inv[2];
+    }
+    if (sigma) {
+        nut[c] = rho[c] * smagCd * Real(sigmaDsigma(gd));
+        return;
     }
     Real s2 = 0;
     for (int cc = 0; cc < 3; ++cc)
@@ -90,6 +95,69 @@ __global__ void kCompRhs(GpuGrid g, Real mu, Real kappa, PrimView q, Real* orho,
     omy[c] = dmy;
     omz[c] = dmz;
     oE[c] = dE;
+}
+
+// Local copy of cutcell.hip's uploader (kept TU-private there, same pattern
+// as the reduce driver).
+std::expected<DeviceScalar, hipError_t> uploadNarrow(const Scalar& src)
+{
+    auto buf = DeviceScalar::make(src.size());
+    if (!buf) return buf;
+    std::vector<Real> tmp(src.begin(), src.end());
+    if (auto e = buf->upload(tmp.data()); e != hipSuccess)
+        return std::unexpected(e);
+    return buf;
+}
+
+struct CompCutView
+{
+    const Real *ax, *ay, *az, *lam;
+    const unsigned char *flag, *solid;
+};
+
+// --cut-flux band overwrite for the uniform comp RHS: kCompRhs runs first over
+// the whole grid (interior cells keep its exact bits); this kernel then
+// recomputes the flagged FLUID cells with aperture-weighted face fluxes over
+// the lambda-floored volume. Faces to a solid-centre neighbour keep the FULL
+// flux -- the ghost-mirror wall closure, unchanged, so kBodyFlux's
+// fluid<->ghost tally remains the exact budget of the applied update. The KG
+// split face flux stays single-valued per face, so aperture weighting is
+// plain finite volume with varying face areas: conservative up to the
+// lambda~ divisor (small-cell floor, transient-only error).
+__global__ void kCompRhsCutOverwrite(GpuGrid g, Real mu, Real kappa, PrimView q,
+                                     CompCutView cv, Real* orho, Real* omx,
+                                     Real* omy, Real* omz, Real* oE,
+                                     const Real* nut, Real kapScale)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= g.size()) return;
+    if (!cv.flag[c] || cv.solid[c]) return;
+    int i, j, k;
+    decompose(g, c, i, j, k);
+    Real drho = 0, dmx = 0, dmy = 0, dmz = 0, dE = 0;
+    for (int a = 0; a < 3; ++a) {
+        const int ox = a == 0, oy = a == 1, oz = a == 2;
+        const Real h = a == 0 ? g.hx : a == 1 ? g.hy : g.hz;
+        const std::size_t hiN = gidx(g, i + ox, j + oy, k + oz);
+        const std::size_t loN = gidx(g, i - ox, j - oy, k - oz);
+        const Real* A = a == 0 ? cv.ax : a == 1 ? cv.ay : cv.az;
+        const Real wHi = cv.solid[hiN] ? Real(1) : A[hiN];
+        const Real wLo = cv.solid[loN] ? Real(1) : A[c];
+        const Flux hi = faceFlux(g, mu, kappa, q, i, j, k, a, nut, kapScale);
+        const Flux lo =
+            faceFlux(g, mu, kappa, q, i - ox, j - oy, k - oz, a, nut, kapScale);
+        drho -= (wHi * hi.rho - wLo * lo.rho) / h;
+        dmx -= (wHi * hi.mx - wLo * lo.mx) / h;
+        dmy -= (wHi * hi.my - wLo * lo.my) / h;
+        dmz -= (wHi * hi.mz - wLo * lo.mz) / h;
+        dE -= (wHi * hi.E - wLo * lo.E) / h;
+    }
+    const Real lt = fmax(cv.lam[c], Real(0.5));
+    orho[c] = drho / lt;
+    omx[c] = dmx / lt;
+    omy[c] = dmy / lt;
+    omz[c] = dmz / lt;
+    oE[c] = dE / lt;
 }
 
 __global__ void kCompRhsCurv(GpuGrid g, Real mu, Real kappa, PrimView q,
@@ -154,6 +222,7 @@ struct WavePerDt
 {
     const Real *rho, *mx, *my, *mz, *E;
     double gamma, ihx, ihy, ihz; // degenerate axes pass 0
+    const Real* lam = nullptr;   // --cut-flux: 1/lambda~ volume amplification
     __host__ __device__ double operator()(int c) const
     {
         const double r = rho[c];
@@ -166,6 +235,7 @@ struct WavePerDt
         const double wz = (fabs(w) + cs) * ihz;
         if (wy > m) m = wy;
         if (wz > m) m = wz;
+        if (lam) m /= fmax(double(lam[c]), 0.5);
         return m;
     }
 };
@@ -176,13 +246,14 @@ struct MinRho
     __host__ __device__ double operator()(int c) const { return double(rho[c]); }
 };
 
-// Dynamic Smagorinsky eddy viscosity mu_t = rho (Cs Delta)^2 |S| at cell c,
-// computed straight from the conserved state (no primitive scratch) so it can
-// feed the const stableDt viscous limit. smagCd = Cs^2 Delta^2.
+// Dynamic eddy viscosity mu_t = rho (C Delta)^2 op(grad u) at cell c (op as in
+// kCompSmagNut), computed straight from the conserved state (no primitive
+// scratch) so it can feed the const stableDt viscous limit. smagCd = C^2 Delta^2.
 struct SmagMax
 {
     GpuGrid g;
     double smagCd;
+    int sigma;
     const Real *rho, *mx, *my, *mz;
     __host__ __device__ double vel(int c, int comp) const
     {
@@ -201,6 +272,7 @@ struct SmagMax
         for (int cc = 0; cc < 3; ++cc)
             for (int d = 0; d < 3; ++d)
                 gd[cc][d] = (vel(nb[d][0], cc) - vel(nb[d][1], cc)) * inv[d];
+        if (sigma) return double(rho[c]) * smagCd * sigmaDsigma(gd);
         double s2 = 0;
         for (int cc = 0; cc < 3; ++cc)
             for (int d = 0; d < 3; ++d) {
@@ -333,10 +405,10 @@ hipError_t DeviceCompState::download(CompState& h) const
 
 std::expected<DeviceComp, hipError_t> DeviceComp::make(const Grid& g,
                                                        double gamma, double mu,
-                                                       double csLes)
+                                                       double csLes, SgsModel sgs)
 {
     assert(gamma > 1.0 && mu >= 0.0 && csLes >= 0.0);
-    DeviceComp d(GpuGrid::from(g), Real(gamma), Real(mu), Real(csLes));
+    DeviceComp d(GpuGrid::from(g), Real(gamma), Real(mu), Real(csLes), sgs);
     const std::size_t n = g.size();
     for (auto* s : {&d.k_, &d.q1_, &d.q2_}) {
         auto e = DeviceCompState::make(n);
@@ -370,8 +442,9 @@ std::expected<DeviceComp, hipError_t> DeviceComp::make(const CurvMetrics& m,
     return d;
 }
 
-DeviceComp::DeviceComp(const GpuGrid& g, Real gamma, Real mu, Real csLes)
-    : g_(g), gamma_(gamma), mu_(mu), csLes_(csLes)
+DeviceComp::DeviceComp(const GpuGrid& g, Real gamma, Real mu, Real csLes,
+                       SgsModel sgs)
+    : g_(g), gamma_(gamma), mu_(mu), csLes_(csLes), sgs_(sgs)
 {
     // Delta^2 = (hx hy hz)^(2/3) in 3D; hx hy when nz == 1 (unit z-depth).
     const double d2 = g.nz > 1
@@ -415,8 +488,8 @@ void DeviceComp::rhs(const DeviceCompState& s, DeviceCompState& out)
     Real kapScale = Real(0);
     if (csLes_ > Real(0)) {
         kCompSmagNut<<<launchBlocks(n), blockSize>>>(
-            g_, smagCd_, s.rho.data(), u_.data(), v_.data(), w_.data(),
-            nut_.data());
+            g_, smagCd_, sgs_ == SgsModel::Sigma ? 1 : 0, s.rho.data(),
+            u_.data(), v_.data(), w_.data(), nut_.data());
         checkLastKernel("kCompSmagNut");
         nutp = nut_.data();
         kapScale = gamma_ * Rgas_ / ((gamma_ - Real(1)) * prt_); // cp / Pr_t
@@ -426,7 +499,72 @@ void DeviceComp::rhs(const DeviceCompState& s, DeviceCompState& out)
                                              out.mz.data(), out.E.data(), nutp,
                                              kapScale);
     checkLastKernel("kCompRhs");
+    if (cutFlux_) {
+        const CompCutView cv{cutAx_.data(), cutAy_.data(), cutAz_.data(),
+                             cutLam_.data(), cutFlag_.data(), cutSolid_.data()};
+        kCompRhsCutOverwrite<<<launchBlocks(n), blockSize>>>(
+            g_, mu_, kappa, q, cv, out.rho.data(), out.mx.data(),
+            out.my.data(), out.mz.data(), out.E.data(), nutp, kapScale);
+        checkLastKernel("kCompRhsCutOverwrite");
+    }
     if (rhsHook_) rhsHook_(s, out);
+}
+
+namespace {
+
+__global__ void kPenalizeMomentum(std::size_t n, const Real* lam, Real idte,
+                                  Real* mx, Real* my, Real* mz)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    const Real l = lam[c];
+    if (l >= Real(1)) return; // interior untouched exactly
+    const Real f = exp(-idte * (Real(1) - l));
+    mx[c] *= f;
+    my[c] *= f;
+    mz[c] *= f;
+}
+
+} // namespace
+
+void penalizeMomentum(const GpuGrid& g, const DeviceScalar& lam, Real eta,
+                      Real dt, DeviceCompState& s)
+{
+    kPenalizeMomentum<<<launchBlocks(g.size()), blockSize>>>(
+        g.size(), lam.data(), dt / eta, s.mx.data(), s.my.data(), s.mz.data());
+    checkLastKernel("penalizeMomentum");
+}
+
+std::expected<void, hipError_t>
+DeviceComp::attachCutFlux(const CutGeometry& cut,
+                          const std::vector<unsigned char>& flag,
+                          const std::vector<unsigned char>& solid)
+{
+    assert(!curv_ && flag.size() == g_.size() && solid.size() == g_.size());
+    auto ax = uploadNarrow(cut.ax);
+    if (!ax) return std::unexpected(ax.error());
+    auto ay = uploadNarrow(cut.ay);
+    if (!ay) return std::unexpected(ay.error());
+    auto az = uploadNarrow(cut.az);
+    if (!az) return std::unexpected(az.error());
+    auto lam = uploadNarrow(cut.lambda);
+    if (!lam) return std::unexpected(lam.error());
+    auto fb = DeviceBuffer<unsigned char>::make(flag.size());
+    auto sb = DeviceBuffer<unsigned char>::make(solid.size());
+    if (!fb) return std::unexpected(fb.error());
+    if (!sb) return std::unexpected(sb.error());
+    if (auto e = fb->upload(flag.data()); e != hipSuccess)
+        return std::unexpected(e);
+    if (auto e = sb->upload(solid.data()); e != hipSuccess)
+        return std::unexpected(e);
+    cutAx_ = std::move(*ax);
+    cutAy_ = std::move(*ay);
+    cutAz_ = std::move(*az);
+    cutLam_ = std::move(*lam);
+    cutFlag_ = std::move(*fb);
+    cutSolid_ = std::move(*sb);
+    cutFlux_ = true;
+    return {};
 }
 
 void DeviceComp::step(DeviceCompState& s, Real dt)
@@ -473,15 +611,16 @@ double DeviceComp::stableDt(const DeviceCompState& s, ReduceScratch& r,
         : reduce(r, g_.size(),
                  WavePerDt{s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
                            s.E.data(), double(gamma_), 1.0 / g_.hx, 1.0 / g_.hy,
-                           g_.nz > 1 ? 1.0 / g_.hz : 0.0},
+                           g_.nz > 1 ? 1.0 / g_.hz : 0.0,
+                           cutFlux_ ? cutLam_.data() : nullptr},
                  rocprim::maximum<double>(), 0.0);
     double dt = cfl / wmax;
     double muEff = double(mu_);
     if (csLes_ > Real(0)) {
         const double nutMax = reduce(
             r, g_.size(),
-            SmagMax{g_, double(smagCd_), s.rho.data(), s.mx.data(), s.my.data(),
-                    s.mz.data()},
+            SmagMax{g_, double(smagCd_), sgs_ == SgsModel::Sigma ? 1 : 0,
+                    s.rho.data(), s.mx.data(), s.my.data(), s.mz.data()},
             rocprim::maximum<double>(), 0.0);
         muEff += nutMax;
     }

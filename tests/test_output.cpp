@@ -85,6 +85,21 @@ int main()
         check(fileSize("a_mask.bin") == std::size_t(n) * n * 4, "mask.bin size");
         check(std::filesystem::is_directory("png_a"), "png dir created");
 
+        // A prefix with directories keeps the png dir NEXT TO the other
+        // outputs -- "outdir/png_b", never a literal "png_outdir/b" under the
+        // CWD (measured: a channel run filed its frames inside build/).
+        {
+            std::filesystem::create_directories("outdir");
+            RunOutput::Config c2 = cfg;
+            c2.prefix = "outdir/b";
+            auto o2 = RunOutput::make(c2, meta(g), g, geo);
+            check(o2.has_value(), "RunOutput::make with dir prefix");
+            check(std::filesystem::is_directory("outdir/png_b"),
+                  "png dir lands beside the prefix");
+            check(!std::filesystem::exists("png_outdir"),
+                  "no mangled png_<dir> tree");
+        }
+
         const std::string cols[] = {"t", "dt", "K", "cd", "cl",
                                     "cdf", "cfl", "maxDiv", "pcgIters"};
         o->declareSeries("stats", cols);
@@ -158,8 +173,10 @@ int main()
         RunOutput::Config cfg;
         cfg.prefix = "p";
         cfg.kinds = {Emit::Png};
-        check(!RunOutput::make(cfg, meta(g3), g3, {}).has_value(),
-              "PNG output is rejected at nz > 1");
+        // nz > 1 PNG renders the centre z-plane (subcommands gate whether
+        // that plane is meaningful); the sink itself accepts it.
+        check(RunOutput::make(cfg, meta(g3), g3, {}).has_value(),
+              "PNG output at nz > 1 slices the centre plane");
         cfg.prefix.clear();
         check(!RunOutput::make(cfg, meta(g3), g3, {}).has_value(),
               "an empty prefix is rejected");

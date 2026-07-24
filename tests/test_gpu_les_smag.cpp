@@ -15,6 +15,10 @@
 //      plane (the z terms vanish, Delta^2 matches), the 3D substep dissipates
 //      a genuinely 3D field, and the conservative flux form conserves each
 //      momentum component over the periodic box.
+//   7. SgsModel::Sigma: nut == 0 identically for a two-component (z-extruded
+//      2D) field where Smagorinsky is strongly nonzero -- the model's defining
+//      property -- while a genuinely 3D field gives nut >= 0, > 0 somewhere,
+//      zero ring/solid, and a dissipative substep.
 //
 // No HIP device -> skip (exit 77).
 
@@ -270,6 +274,101 @@ int main()
                   && std::abs(su) < 1e-3 * mag && std::abs(sv) < 1e-3 * mag
                   && std::abs(sw) < 1e-3 * mag,
               "3d flux form conserves momentum over the periodic box");
+    }
+
+    // --- (7) sigma model ----------------------------------------------------
+    {
+        const int nz = 8;
+        const auto g3 = Grid::make(n, n, nz, 1.0, 1.0, double(nz) / n);
+        const auto gg3 = gpu::GpuGrid::from(g3);
+        CutGeometry cut3{zeros(g3), zeros(g3), zeros(g3), zeros(g3)};
+        for (std::size_t c = 0; c < g3.size(); ++c)
+        {
+            cut3.lambda[c] = 1.0;
+            cut3.ax[c] = cut3.ay[c] = cut3.az[c] = 1.0;
+        }
+        for (int k = 0; k < nz; ++k)
+            for (int j = 12; j < 20; ++j)
+                for (int i = 12; i < 20; ++i) cut3.lambda[g3.idx(i, j, k)] = 0.0;
+        auto dCut3 = gpu::DeviceCutGeometry::make(cut3);
+        auto dU3 = gpu::DeviceField::make(g3.size());
+        auto dOut3 = gpu::DeviceField::make(g3.size());
+        if (!(dCut3 && dU3 && dOut3)) { std::printf("3d alloc failed\n"); return 1; }
+        auto sig = gpu::DeviceSmagorinsky::make(gg3, 1.35, SgsModel::Sigma);
+        auto smag = gpu::DeviceSmagorinsky::make(gg3, 0.2);
+        if (!(sig && smag)) return 1;
+        std::vector<Real> h(g3.size());
+
+        // Two-component field (the 2D shear extruded in z): Smagorinsky sees
+        // strain everywhere, sigma must return EXACTLY zero.
+        auto U3 = VectorField::zeros(g3);
+        for (int k = 0; k < nz; ++k)
+            for (int j = 0; j < n; ++j)
+                for (int i = 0; i < n; ++i)
+                {
+                    U3.u[g3.idx(i, j, k)] = U.u[g.idx(i, j, 0)];
+                    U3.v[g3.idx(i, j, k)] = U.v[g.idx(i, j, 0)];
+                }
+        (void)gpu::uploadField(U3, *dU3);
+        smag->computeNut(*dU3, *dCut3);
+        (void)smag->nut().download(h.data());
+        double smagMax = 0;
+        for (auto v : h) smagMax = std::max(smagMax, double(v));
+        sig->computeNut(*dU3, *dCut3);
+        (void)sig->nut().download(h.data());
+        double sigMax = 0;
+        for (auto v : h) sigMax = std::max(sigMax, double(std::abs(v)));
+        check(smagMax > 0 && sigMax == 0,
+              "sigma nut == 0 on a two-component field (smag > 0)");
+
+        // Genuinely 3D field: sigma switches on, stays a viscosity, and the
+        // substep dissipates.
+        for (int k = 0; k < nz; ++k)
+            for (int j = 0; j < n; ++j)
+                for (int i = 0; i < n; ++i)
+                {
+                    using std::numbers::pi;
+                    const double x = double(i) / n, y = double(j) / n,
+                                 z = double(k) / nz;
+                    const auto c = g3.idx(i, j, k);
+                    U3.u[c] += 0.2 * std::sin(2 * pi * z);
+                    U3.v[c] += 0.15 * std::cos(2 * pi * z) * std::sin(2 * pi * x);
+                    U3.w[c] = 0.4 * std::sin(2 * pi * x) * std::cos(2 * pi * y)
+                            + 0.1 * std::cos(2 * pi * z);
+                }
+        (void)gpu::uploadField(U3, *dU3);
+        sig->computeNut(*dU3, *dCut3);
+        (void)sig->nut().download(h.data());
+        bool nonneg3 = true, ring3 = true, solid3 = true, any3 = false;
+        for (int k = 0; k < nz; ++k)
+            for (int j = 0; j < n; ++j)
+                for (int i = 0; i < n; ++i)
+                {
+                    const auto c = g3.idx(i, j, k);
+                    const double v = h[c];
+                    if (v < 0) nonneg3 = false;
+                    if (v > 0) any3 = true;
+                    if (i == 0 || i == n - 1 || j == 0 || j == n - 1
+                        || k == 0 || k == nz - 1)
+                        if (v != 0) ring3 = false;
+                    if (cut3.lambda[c] == 0.0 && v != 0) solid3 = false;
+                }
+        check(nonneg3, "sigma nut >= 0 everywhere (3D field)");
+        check(any3, "sigma nut > 0 somewhere (3D field)");
+        check(ring3, "sigma nut == 0 on the boundary ring");
+        check(solid3, "sigma nut == 0 in solid cells");
+
+        (void)hipMemset(dOut3->u.data(), 0, g3.size() * sizeof(Real));
+        (void)hipMemset(dOut3->v.data(), 0, g3.size() * sizeof(Real));
+        (void)hipMemset(dOut3->w.data(), 0, g3.size() * sizeof(Real));
+        sig->addEddyDiffusion(*dU3, Real(1), *dOut3);
+        auto R3 = VectorField::zeros(g3);
+        (void)gpu::downloadField(*dOut3, R3);
+        double power = 0;
+        for (std::size_t c = 0; c < g3.size(); ++c)
+            power += U3.u[c] * R3.u[c] + U3.v[c] * R3.v[c] + U3.w[c] * R3.w[c];
+        std::printf("sigma eddy power = %.6g\n", power);
+        check(std::isfinite(power) && power < 0, "sigma eddy diffusion dissipates");
     }
 
     std::printf("%s\n", pass ? "ALL OK" : "FAILURES");

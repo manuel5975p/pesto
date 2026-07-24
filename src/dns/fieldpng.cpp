@@ -77,10 +77,18 @@ bool writeMapped(const std::string& path, int w, int h, const float* field,
 {
     assert(w > 0 && h > 0 && field);
     std::vector<unsigned char> rgb(std::size_t(w) * h * 3);
+    // The derived vorticity stencil wraps periodically (gidx), so on a
+    // non-periodic box the outermost ring differences across to the opposite
+    // wall -- a spurious bright "mirror" rim. Replicate the inner neighbour
+    // into that 1px ring for display; purely cosmetic, physics untouched.
+    const bool trim = w >= 3 && h >= 3;
+    auto clampi = [](int x, int lo, int hi) { return x < lo ? lo : (x > hi ? hi : x); };
     for (int r = 0; r < h; ++r) {
         const int j = h - 1 - r;
+        const int sj = trim ? clampi(j, 1, h - 2) : j;
         for (int i = 0; i < w; ++i) {
-            const std::size_t c = std::size_t(j) * w + i;
+            const int si = trim ? clampi(i, 1, w - 2) : i;
+            const std::size_t c = std::size_t(sj) * w + si;
             unsigned char* px = rgb.data() + (std::size_t(r) * w + i) * 3;
             if (mask && mask[c] < 0.5f) {
                 px[0] = px[1] = px[2] = 32;
@@ -106,14 +114,23 @@ bool writeDivergingPng(const std::string& path, int w, int h,
                        const float* field, float scale, const float* mask)
 {
     assert(scale > 0.0f);
-    // Moreland cool-warm endpoints, light midpoint.
-    static const float lo[3] = {59 / 255.0f, 76 / 255.0f, 192 / 255.0f};
-    static const float mid[3] = {221 / 255.0f, 221 / 255.0f, 221 / 255.0f};
-    static const float hi[3] = {180 / 255.0f, 4 / 255.0f, 38 / 255.0f};
+    // "Glow" diverging map: dark-grey core -> saturated blue/red -> white-hot
+    // at the extremes, so strong vorticity reads as luminous. Each half is a
+    // two-segment ramp mid -> sat (knot) -> white.
+    static const float mid[3] = {20 / 255.0f, 20 / 255.0f, 24 / 255.0f};
+    static const float bSat[3] = {40 / 255.0f, 110 / 255.0f, 255 / 255.0f};
+    static const float rSat[3] = {255 / 255.0f, 45 / 255.0f, 30 / 255.0f};
+    static const float bTop[3] = {225 / 255.0f, 240 / 255.0f, 255 / 255.0f};
+    static const float rTop[3] = {255 / 255.0f, 240 / 255.0f, 225 / 255.0f};
+    static const float knot = 0.62f; // mid->sat below, sat->white above
+    auto glow = [&](const float sat[3], const float top[3], float f) {
+        return f < knot ? lerp3(mid, sat, f / knot)
+                        : lerp3(sat, top, (f - knot) / (1.0f - knot));
+    };
     return writeMapped(path, w, h, field, mask, [&](float v) {
         float t = v / scale;
         t = t < -1.0f ? -1.0f : (t > 1.0f ? 1.0f : t);
-        return t < 0.0f ? lerp3(mid, lo, -t) : lerp3(mid, hi, t);
+        return t < 0.0f ? glow(bSat, bTop, -t) : glow(rSat, rTop, t);
     });
 }
 
