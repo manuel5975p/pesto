@@ -46,8 +46,29 @@ is AUTO-DETECTED from the installed device — set it explicitly only to
 cross-compile; a wrong arch shows up as a HIP `getStatFunc` assertion),
 `BUILD_TESTING` (master test switch),
 `DNS_HEAVY_VALIDATION` (heavy tier, ~25 min, RUN_SERIAL),
-`DNS_VALIDATION_BASELINE` (quarantined literature-band `val_*`, OFF — see §15).
+`DNS_VALIDATION_BASELINE` (quarantined literature-band `val_*`, OFF — see §15),
+`DNS_WITH_UI` (OFF; builds `dns-ui`, below).
 Build type: Release.
+
+### `dns-ui` — obstacle editor and grid viewer
+
+```sh
+cmake -B build -G Ninja -DDNS_WITH_UI=ON    # fetches SDL3 3.4.0 + HarfBuzz 14.2.1
+ninja -C build dns-ui
+build/dns-ui                                # interactive
+build/dns-ui --check                        # headless self-check (ctest: ui_check)
+```
+
+A second binary, and the only exception to the one-binary rule: it solves
+nothing. It is a pre-run inspector — place bodies, choose a resolution, and see
+the grid and the **cut cells** (fluid fraction λ, face apertures, post-
+`sanitizeCut`) the solver would actually receive, plus the resolution verdict
+`(D/h)/√Re` that decides DNS from under-resolved. It links `dns_core` only and
+drives the same `validate()` / `buildCaseGeometry()` / `sanitizeCut()` the
+runners do, so it cannot disagree with them; a rejected edit shows the
+validator's own message and exit code. Dependencies are SDL3, Vulkan and
+HarfBuzz and nothing else — no FreeType (glyph outlines come from `hb-draw`),
+no widget toolkit. Full description: `docs/ui.md`.
 
 ## 3. CLI
 

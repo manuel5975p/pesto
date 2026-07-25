@@ -131,6 +131,97 @@ if(DNS_WITH_HIP)
     set_property(TARGET dns PROPERTY HIP_ARCHITECTURES ${CMAKE_HIP_ARCHITECTURES})
 endif()
 
+# --- dns-ui: the interactive obstacle editor / grid viewer -------------------
+#
+# A SECOND binary, and the only exception to the one-binary rule: it solves
+# nothing. It is a pre-run inspector -- place bodies, choose a grid, and see
+# the cut cells the solver would actually get -- so it links dns_core only
+# (cli/config + geometry) and never dns_gpu. Everything it shows comes from the
+# same sampleCut()/sanitizeCut() the runners consume; it does not reimplement
+# geometry.
+#
+# Deps are SDL3 (window + input), Vulkan (system loader) and HarfBuzz (text
+# shaping AND glyph outlines -- there is no FreeType here). SDL3 and HarfBuzz
+# are fetched and built in-tree so the UI cannot drift against whatever the
+# distro ships; Vulkan comes from the system, since the ICD does anyway.
+option(DNS_WITH_UI "Build dns-ui (SDL3 + Vulkan + HarfBuzz)" OFF)
+if(DNS_WITH_UI)
+    include(FetchContent)
+    find_package(Vulkan REQUIRED)
+
+    # Shared SDL3 (its best-tested configuration; it dlopens X11/Wayland
+    # itself), static HarfBuzz. BUILD_SHARED_LIBS is saved and restored so the
+    # setting cannot leak into dns_core.
+    set(_dns_saved_shared ${BUILD_SHARED_LIBS})
+    set(SDL_SHARED ON CACHE BOOL "" FORCE)
+    set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(SDL3
+        URL https://github.com/libsdl-org/SDL/releases/download/release-3.4.0/SDL3-3.4.0.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+
+    # HarfBuzz with every optional integration off: we want the shaper and
+    # hb_font_draw_glyph(), nothing that drags in glib/icu/cairo/freetype.
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(HB_BUILD_SUBSET OFF CACHE BOOL "" FORCE)
+    set(HB_BUILD_UTILS OFF CACHE BOOL "" FORCE)
+    set(HB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(HB_HAVE_FREETYPE OFF CACHE BOOL "" FORCE)
+    set(HB_HAVE_GLIB OFF CACHE BOOL "" FORCE)
+    set(HB_HAVE_ICU OFF CACHE BOOL "" FORCE)
+    set(HB_HAVE_CORETEXT OFF CACHE BOOL "" FORCE)
+    set(HB_HAVE_GDI OFF CACHE BOOL "" FORCE)
+    set(HB_HAVE_DIRECTWRITE OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(harfbuzz
+        URL https://github.com/harfbuzz/harfbuzz/archive/refs/tags/14.2.1.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+
+    FetchContent_MakeAvailable(SDL3 harfbuzz)
+    set(BUILD_SHARED_LIBS ${_dns_saved_shared} CACHE BOOL "" FORCE)
+
+    # GLSL -> SPIR-V, embedded as a C array header at build time. No runtime
+    # shader files to lose, and a shader syntax error is a BUILD error.
+    find_program(DNS_GLSLC NAMES glslc HINTS $ENV{VULKAN_SDK}/bin REQUIRED)
+    set(_dns_spv_dir ${CMAKE_CURRENT_BINARY_DIR}/ui_shaders)
+    file(MAKE_DIRECTORY ${_dns_spv_dir})
+    set(DNS_UI_SPV "")
+    foreach(s scene3d.vert scene3d.frag line3d.vert line3d.frag
+              ui2d.vert ui2d.frag)
+        string(REPLACE "." "_" _sym ${s})
+        set(_out ${_dns_spv_dir}/${_sym}.spv.h)
+        add_custom_command(OUTPUT ${_out}
+            COMMAND ${DNS_GLSLC} -O --target-env=vulkan1.1 -mfmt=c
+                    -o ${_out} ${CMAKE_CURRENT_SOURCE_DIR}/src/ui/shaders/${s}
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/ui/shaders/${s}
+            COMMENT "glslc ${s}"
+            VERBATIM)
+        list(APPEND DNS_UI_SPV ${_out})
+    endforeach()
+    add_custom_target(dns_ui_shaders DEPENDS ${DNS_UI_SPV})
+
+    add_executable(dns-ui
+        apps/dns_ui.cpp
+        src/ui/app.cpp
+        src/ui/doc.cpp
+        src/ui/draw.cpp
+        src/ui/gui.cpp
+        src/ui/text.cpp
+        src/ui/view.cpp
+        src/ui/vk.cpp
+    )
+    add_dependencies(dns-ui dns_ui_shaders)
+    target_include_directories(dns-ui PRIVATE src ${_dns_spv_dir})
+    target_link_libraries(dns-ui PRIVATE dns_core SDL3::SDL3 Vulkan::Vulkan harfbuzz)
+
+    # `dns-ui --check` drives the whole non-graphical half (document build,
+    # validator wiring, cut census, view geometry) over a small case matrix.
+    # No window, no GPU, no font -- so it runs headless like every other test.
+    add_test(NAME ui_check COMMAND dns-ui --check)
+    set_tests_properties(ui_check PROPERTIES TIMEOUT 300)
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
     set(DNS_TESTS cli geometry output poisson projection tgv tgv3d cutcell cutcell_sphere comp comp_curv meshsdf
