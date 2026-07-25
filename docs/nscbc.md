@@ -1,9 +1,13 @@
 # NSCBC/LODI characteristic boundaries (x extremes)
 
-State as of 2026-07-18. Module `src/dns/gpu/comp_nscbc.*`, test
-`tests/test_gpu_comp_nscbc.cpp`, flag `--nscbc` in `comp_cylinder_tunnel_gpu`.
-The streamwise sponge (`DeviceCompFar`) remains the default; NSCBC is opt-in
-until 3D/mesh validation and anchor regeneration.
+State as of 2026-07-18, with the CLI names updated to the single `dns` binary.
+Module `src/dns/gpu/comp_nscbc.*`, test `tests/test_gpu_comp_nscbc.cpp`,
+selected with `--far nscbc` on `dns flow --physics compressible`.
+
+**Since the recomposition, `--far nscbc` is the compressible DEFAULT** and the
+streamwise sponge (`DeviceCompFar`) is an explicit escape hatch only. Where the
+historical notes below call the sponge "the default", read them as a record of
+the state on 2026-07-18, not as current behaviour.
 
 ## Design
 
@@ -40,7 +44,7 @@ L2..L5 leave (one-sided differences); incoming
     L1 = σ(1−M²) c/Lx (p − p∞)  −  β (Tp − ρc Tu)
 
 σ = 0.25 (Rudy–Strikwerda). The second term is the **Yoo–Im transverse
-correction**, β = `betaTrans` = 0.5 (`--nsbeta`), with
+correction**, β = `betaTrans` = 0.5 (`--nscbc-beta`), with
 Tp = v∂p/∂y + γp∂v/∂y (+ z-terms), Tu = v∂u/∂y (+ z). It is NOT optional at
 shedding Re: the incoming invariant obeys dR⁻/dt = −L1 − (Tp − ρc Tu), and
 leaving the transverse forcing uncanceled makes every wake core crossing the
@@ -85,19 +89,19 @@ machine-exact, stiff-inflow pull exact.
 - 2026-07-18: the comp cylinder app's grid convention was fixed to scale
   resolution with ny (domain fixed 8D; bit-identical at ny = 512). Numbers in
   this file measured at 512² hold; pre-fix n = 256 runs were geometry-broken.
-- Not yet validated: 3D, `comp_mesh_tunnel_gpu` wiring, saturated
+- Not yet validated: 3D, the STL-body wiring, saturated
   long-window Re60 shedding.
 - Reflection is small, not zero (plane-wave-normal exact only); a vortex
   crossing still leaves a few-% residual. At Re2000 this residual PUMPS:
   pure NSCBC blew up at 2048² (t = 63.6; final frames show vorticity sheets
   on the free-slip walls and shed from the stiff inflow row — box modes
   between stiff inflow, walls and soft outflow), and at 1024² it survives
-  contaminated (cd σ 0.58, clAmp 4.8). Fix = `--nsstrip N`: a thin sponge
+  contaminated (cd σ 0.58, clAmp 4.8). Fix = `--nscbc-strip N`: a thin sponge
   strip (sigMax 0.5, N ≈ ny/64 ≈ 1–1.5% of nx) inside the NSCBC rows, the
   standard production hybrid. 1024² Re2000 triplet, window [50, 96]:
   pure 1.846 ± 0.582 (clAmp 4.8), strip-12 1.902 ± 0.341 (2.4, calmest of
-  all three), sponge 2.087 ± 0.370 (2.8). Use --nscbc alone up to ~Re800;
-  add --nsstrip beyond.
+  all three), sponge 2.087 ± 0.370 (2.8). Use `--far nscbc` alone up to ~Re800;
+  add `--nscbc-strip` beyond.
 
 ## Six-face NSCBC (2026-07-18, later)
 
@@ -125,16 +129,20 @@ interior-x strips, z faces the interior core), `openY/openZ` in Config
   (`DeviceCompFar::boost` delegates), so sponge-free apps keep the quiet
   start.
 
-Wiring: `comp_mesh_tunnel_gpu` dropped sponge + walls entirely — always
-all-face NSCBC (`--open` removed, `--nsbeta` added). `comp_cylinder_tunnel_gpu
---nscbc --open` = laterally open (walls remain its default; `--nsstrip` still
-adds lateral rho/p strips through the open sponge bands).
+Wiring (historical: the two separate apps this predates are gone). The mesh app
+dropped sponge + walls entirely — always all-face NSCBC, with `--nscbc-beta`
+added. The cylinder app kept free-slip walls as its default and took
+`--nscbc --open` for a laterally open box.
+
+Today both are one path: `--far nscbc` (all-face characteristic boundaries,
+free-slip laterals), `--far nscbc --open` for laterally open, `--nscbc-beta`
+for the Yoo-Im transverse weight, and `--nscbc-strip N` for the hybrid strip.
 
 Measured:
 - Unit (test gpu_comp_nscbc): 2D/3D uniform freestream is a fixed point to
   FP32 rounding; radial acoustic pulse exits ALL faces with 2.4% residual
   (soft-inflow rig); vortex skimming the open y-hi face exits with 2.9%.
-- Sphere Re100 M0.2 dr6 (comp_mesh_tunnel_gpu, quiet start): 64³ cd 1.10,
+- Sphere Re100 M0.2 dr6 (STL body, all-face NSCBC, quiet start): 64³ cd 1.10,
   96³ cd 1.146, cl/cs ~ 1e-3 — vs the walled-sponge-era 96³ anchor 1.226 and
   literature unbounded ~1.09: the free-slip-image blockage excess is gone.
 - Cylinder Re800 512 `--nscbc --open` smoke (short window): cd 1.71 ± 0.17,

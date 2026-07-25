@@ -11,6 +11,8 @@
 // Every case here is reachable without a GPU (phases 1-3a), so this test does
 // not skip on a device-less machine.
 
+#include "check.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -25,7 +27,6 @@
 
 namespace {
 
-bool pass = true;
 
 int run(const std::string& args)
 {
@@ -41,7 +42,7 @@ void expect(const std::string& args, int want, const char* what)
     const int got = run(args);
     const bool ok = got == want;
     std::printf("%-56s want %d got %d  %s\n", what, want, got, ok ? "ok" : "FAIL");
-    if (!ok) pass = false;
+    if (!ok) ++dnstest::gFailures;
 }
 
 } // namespace
@@ -131,6 +132,13 @@ int main()
     expect("tgv --nz 2 --dry-run", 2, "tgv --nz must be 1 or >= 4");
     expect("hit --nz 1 --dry-run", 2, "hit needs nz >= 4");
     expect("bench --steps 0 --dry-run", 2, "--steps must be >= 1");
+    // bench builds an n^3 box and used to skip the grid guards every other
+    // branch applies: `--n 1300` overflowed the int indexing, and `--n 1` made
+    // nz == 1 with hz == 2pi, violating the enforced `nz == 1 => hz == 1`.
+    expect("bench --n 1 --dry-run", 2, "bench --n 1 is rejected (hz == 1 rule)");
+    expect("bench --n 2 --dry-run", 2, "bench --n below 4 is rejected");
+    expect("bench --n 1300 --dry-run", 2, "bench --n 1300 exceeds INT_MAX cells");
+    expect("bench --n 64 --steps 1 --dry-run", 0, "a sane bench still validates");
 
     // --- 3: input -----------------------------------------------------------
     expect("flow --body /nonexistent/model.stl --n 32 --nz 32", 3,
@@ -143,6 +151,27 @@ int main()
         std::filesystem::remove(tmp);
     }
 
-    std::printf("%s\n", pass ? "ALL OK" : "FAILURES");
-    return pass ? 0 : 1;
+    // --- 4: output ----------------------------------------------------------
+    // Phase 3c creates and truncates EVERY output before the first hipMalloc,
+    // so an unwritable destination is exit 4 in the first second rather than a
+    // surprise hours into a run. This is the only case here that needs a
+    // device: `dns flow` probes the GPU (phase 3a) before it opens files, so
+    // without one the run exits 5 first and the check is skipped rather than
+    // failed.
+    {
+        const int rc = run("flow --body cylinder --n 32 --nz 1 --ft 0.01 "
+                           "--out /proc/nonexistent/x");
+        if (rc == 5)
+            std::printf("SKIP  exit 4 (unwritable --out): no GPU, exits 5 first\n");
+        else if (rc != 4)
+        {
+            std::printf("FAIL  exit 4 (unwritable --out): got %d\n", rc);
+            ++dnstest::gFailures;
+        }
+        else
+            std::printf("ok    exit 4 (unwritable --out)\n");
+    }
+
+    std::printf("%s\n", dnstest::gFailures == 0 ? "ALL OK" : "FAILURES");
+    return dnstest::finish();
 }

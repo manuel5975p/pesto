@@ -6,6 +6,7 @@
 #include "dns/gpu/comp_far.hpp"
 #include "dns/gpu/comp_ghost.hpp"
 #include "gpu_test_util.hpp"
+#include "check.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -19,13 +20,9 @@ using std::numbers::pi;
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    std::printf("%-52s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) ++failures;
-}
+
 
 constexpr double gam = 1.4, rhoInf = 1.0, uInf = 1.0;
 constexpr double mach = 0.2;
@@ -265,5 +262,5 @@ int main()
     check(still < 0.5 * loud, "quiet start radiates < half the impulsive pulse");
     check(still < 2e-2, "quiet start far field stays near pInf");
 
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return dnstest::gFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

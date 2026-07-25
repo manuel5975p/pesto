@@ -1,12 +1,15 @@
 // GPU curvilinear compressible solver vs the CPU reference: stableDt and
 // step parity on a distorted mesh, uniform-mesh degeneracy against the
 // Cartesian device path, FP32 freestream preservation and conservation
-// drift, and a short 3D distorted viscous run.
+// drift, a short 3D distorted viscous run, and the curvilinear LES
+// (both SGS operators; the CPU reference has no LES, so the pins are
+// against the Cartesian device path and the model's own invariants).
 #include "dns/comp.hpp"
 #include "dns/curvmesh.hpp"
 #include "dns/gpu/comp.hpp"
 #include "curv_test_util.hpp"
 #include "gpu_test_util.hpp"
+#include "check.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -18,13 +21,9 @@ using namespace curvtest;
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    std::printf("%-58s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) ++failures;
-}
+
 
 bool parityDistorted2d()
 {
@@ -43,7 +42,7 @@ bool parityDistorted2d()
     if (!ds || !scratch) { check(false, "GPU allocation"); return true; }
     (void)ds->upload(sc);
 
-    const double dtc = cpu->stableDt(sc);
+    const double dtc = *cpu->stableDt(sc);
     const double dtg = dev->stableDt(*ds, *scratch);
     std::printf("dt cpu %.6e gpu %.6e\n", dtc, dtg);
     check(std::abs(dtc - dtg) < 1e-4 * dtc, "stableDt parity on distorted mesh");
@@ -92,7 +91,7 @@ void uniformDegeneracy()
     if (!devCart || !devCurv || !da || !db) { check(false, "GPU alloc"); return; }
     (void)da->upload(s0);
     (void)db->upload(s0);
-    const double dt = 0.9 * cpu->stableDt(s0);
+    const double dt = 0.9 * *cpu->stableDt(s0);
     for (int it = 0; it < 5; ++it) {
         devCart->step(*da, gpu::Real(dt));
         devCurv->step(*db, gpu::Real(dt));
@@ -160,7 +159,7 @@ void stretched2d()
     auto scratch = gpu::ReduceScratch::make();
     if (!dev || !ds || !scratch) { check(false, "GPU alloc"); return; }
     (void)ds->upload(s);
-    const double dtc = cpu->stableDt(s);
+    const double dtc = *cpu->stableDt(s);
     const double dtg = dev->stableDt(*ds, *scratch);
     std::printf("stretched dt cpu %.6e gpu %.6e\n", dtc, dtg);
     check(std::abs(dtc - dtg) < 1e-4 * dtc, "stableDt parity on stretched mesh");
@@ -206,7 +205,7 @@ void focal2d()
     auto scratch = gpu::ReduceScratch::make();
     if (!dev || !ds || !scratch) { check(false, "GPU alloc"); return; }
     (void)ds->upload(s);
-    const double dtc = cpu->stableDt(s);
+    const double dtc = *cpu->stableDt(s);
     const double dtg = dev->stableDt(*ds, *scratch);
     std::printf("focal dt cpu %.6e gpu %.6e\n", dtc, dtg);
     check(std::abs(dtc - dtg) < 1e-4 * dtc, "stableDt parity on focal mesh");
@@ -259,6 +258,215 @@ void focal2d()
     check(d < 1e-5, "inactive focal maps reproduce the Cartesian path");
 }
 
+// Kinetic energy of a downloaded state, unweighted (the mesh is the same on
+// both sides of every comparison below).
+double kineticEnergy(const CompState& s)
+{
+    double k = 0.0;
+    for (std::size_t i = 0; i < s.rho.size(); ++i)
+        k += 0.5 * (s.mx[i] * s.mx[i] + s.my[i] * s.my[i] + s.mz[i] * s.mz[i]) /
+             s.rho[i];
+    return k;
+}
+
+// The LES viscous dt limit, 0.25 h^2 rho_min / (mu + nut_max), must be the
+// SAME on the identity-map curvilinear path as on the Cartesian one: same
+// nut_max reduction, one through min(h), the other through the mesh hmin. The
+// acoustic bound is not comparable between the two paths (see lesCurv), so the
+// model constant is exaggerated until the viscous limit provably binds -- the
+// check asserts that precondition rather than assuming it.
+void lesViscousDtDegeneracy()
+{
+    const auto g = Grid::make(24, 24, 24, 2.0, 2.0, 2.0);
+    const auto mesh = CurvMesh::uniform(g);
+    const auto cpu = Comp::make(mesh, 1.4, 2e-3);
+    if (!cpu) { check(false, "uniform curvilinear LES-dt make"); return; }
+    const auto s0 = smoothState(mesh, 1.4);
+    const SgsModel models[2] = {SgsModel::Smagorinsky, SgsModel::Sigma};
+    const double cbig[2] = {20.0, 60.0}; // D_sigma << |S| on a smooth field
+    for (int q = 0; q < 2; ++q) {
+        auto dCart = gpu::DeviceComp::make(g, 1.4, 2e-3, cbig[q], models[q]);
+        auto dCurv =
+            gpu::DeviceComp::make(*cpu->curv, 1.4, 2e-3, cbig[q], models[q]);
+        auto dnsCart = gpu::DeviceComp::make(g, 1.4, 2e-3);
+        auto dnsCurv = gpu::DeviceComp::make(*cpu->curv, 1.4, 2e-3);
+        auto da = gpu::DeviceCompState::make(g.size());
+        auto scratch = gpu::ReduceScratch::make();
+        if (!dCart || !dCurv || !dnsCart || !dnsCurv || !da || !scratch) {
+            check(false, "GPU alloc");
+            return;
+        }
+        (void)da->upload(s0);
+        const double dta = dCart->stableDt(*da, *scratch);
+        const double dtb = dCurv->stableDt(*da, *scratch);
+        const double acoustic =
+            std::min(dnsCart->stableDt(*da, *scratch),
+                     dnsCurv->stableDt(*da, *scratch));
+        std::printf("LES viscous dt: cart %.6e curv %.6e (acoustic %.6e)\n",
+                    dta, dtb, acoustic);
+        check(dta < 0.5 * acoustic && dtb < 0.5 * acoustic,
+              q == 0 ? "smag: the LES viscous limit binds"
+                     : "sigma: the LES viscous limit binds");
+        check(std::abs(dta - dtb) < 1e-4 * dta,
+              q == 0 ? "curv LES smag viscous dt matches Cartesian"
+                     : "curv LES sigma viscous dt matches Cartesian");
+    }
+}
+
+// LES on the curvilinear path. Three pins:
+//   (a) on the IDENTITY map the metric-gradient / per-cell-Delta model must
+//       reproduce the uniform-mesh LES, for BOTH operators -- that is the
+//       whole claim that this is the same model, not a new one;
+//   (b) at nz == 1 the sigma model must stay identically zero on a DISTORTED
+//       mesh (its defining 2D zero survives the metric contraction), which
+//       makes the run bit-identical to molecular DNS;
+//   (c) on a genuinely clustered 3D focal mesh both operators run, stay
+//       physical, and dissipate.
+void lesCurv()
+{
+    const double cs = 0.17, csig = 1.35;
+
+    { // (a) identity degeneracy, 3D, both operators
+        const auto g = Grid::make(24, 24, 24, 2.0, 2.0, 2.0);
+        const auto mesh = CurvMesh::uniform(g);
+        const auto cpu = Comp::make(mesh, 1.4, 2e-3);
+        if (!cpu) { check(false, "uniform curvilinear LES make"); return; }
+        const auto s0 = smoothState(mesh, 1.4);
+        const SgsModel models[2] = {SgsModel::Smagorinsky, SgsModel::Sigma};
+        const double cval[2] = {cs, csig};
+        const char* label[2] = {"uniform-mesh curv LES smag matches Cartesian",
+                                "uniform-mesh curv LES sigma matches Cartesian"};
+        for (int q = 0; q < 2; ++q) {
+            auto dCart = gpu::DeviceComp::make(g, 1.4, 2e-3, cval[q], models[q]);
+            auto dCurv = gpu::DeviceComp::make(*cpu->curv, 1.4, 2e-3, cval[q],
+                                               models[q]);
+            auto da = gpu::DeviceCompState::make(g.size());
+            auto db = gpu::DeviceCompState::make(g.size());
+            auto scratch = gpu::ReduceScratch::make();
+            if (!dCart || !dCurv || !da || !db || !scratch) {
+                check(false, "GPU alloc");
+                return;
+            }
+            (void)da->upload(s0);
+            (void)db->upload(s0);
+            const double dta = dCart->stableDt(*da, *scratch);
+            const double dtb = dCurv->stableDt(*db, *scratch);
+            // NOTE the two stableDt values are NOT comparable in general, LES
+            // or not: the curvilinear acoustic bound uses |u| where the
+            // Cartesian one uses |u . n| (deliberately conservative on skewed
+            // cells), so they differ by a few percent whenever the acoustic
+            // limit binds. lesViscousDtDegeneracy() below pins the LES half of
+            // the bound, where they must agree exactly.
+            const double dt = 0.5 * std::min(dta, dtb);
+            for (int it = 0; it < 10; ++it) {
+                dCart->step(*da, gpu::Real(dt));
+                dCurv->step(*db, gpu::Real(dt));
+            }
+            auto ha = CompState::zeros(g), hb = CompState::zeros(g);
+            (void)da->download(ha);
+            (void)db->download(hb);
+            const double e =
+                std::max({relLinf(hb.rho, ha.rho), relLinf(hb.mx, ha.mx),
+                          relLinf(hb.my, ha.my), relLinf(hb.mz, ha.mz),
+                          relLinf(hb.E, ha.E)});
+            std::printf("curv-vs-Cartesian LES %s rel Linf %.2e\n",
+                        q == 0 ? "smag " : "sigma", e);
+            check(e < 1e-4, label[q]);
+        }
+    }
+
+    { // (b) sigma is exactly zero at nz == 1, on a DISTORTED mesh
+        const auto g = Grid::make(48, 48, 1, 4.0, 4.0, 4.0 / 48);
+        const auto mesh = CurvMesh::sinusoidal(g, 0.04);
+        const auto cpu = Comp::make(mesh, 1.4, 2e-3);
+        if (!cpu) { check(false, "2D distorted LES make"); return; }
+        const auto s0 = smoothState(mesh, 1.4);
+        auto dns = gpu::DeviceComp::make(*cpu->curv, 1.4, 2e-3);
+        auto les = gpu::DeviceComp::make(*cpu->curv, 1.4, 2e-3, csig,
+                                         SgsModel::Sigma);
+        auto da = gpu::DeviceCompState::make(g.size());
+        auto db = gpu::DeviceCompState::make(g.size());
+        auto scratch = gpu::ReduceScratch::make();
+        if (!dns || !les || !da || !db || !scratch) {
+            check(false, "GPU alloc");
+            return;
+        }
+        (void)da->upload(s0);
+        (void)db->upload(s0);
+        const double dt = 0.5 * dns->stableDt(*da, *scratch);
+        for (int it = 0; it < 20; ++it) {
+            dns->step(*da, gpu::Real(dt));
+            les->step(*db, gpu::Real(dt));
+        }
+        auto ha = CompState::zeros(g), hb = CompState::zeros(g);
+        (void)da->download(ha);
+        (void)db->download(hb);
+        bool same = true;
+        for (std::size_t i = 0; i < g.size(); ++i)
+            if (ha.rho[i] != hb.rho[i] || ha.mx[i] != hb.mx[i] ||
+                ha.my[i] != hb.my[i] || ha.E[i] != hb.E[i])
+                same = false;
+        check(same, "nz == 1 distorted mesh: sigma LES is bit-identical to DNS");
+    }
+
+    { // (c) clustered 3D focal mesh: both operators run and dissipate
+        const double lx = 4.0, ly = 4.0, lz = 4.0;
+        const auto g = Grid::make(32, 32, 32, lx, ly, lz);
+        const AxisRemap3 R{Focal1D::make(lx, 1.2, 2.8, 0.8, 3.0),
+                           Focal1D::make(ly, 1.4, 2.6, 0.6, 3.0),
+                           Focal1D::make(lz, 1.4, 2.6, 0.6, 3.0)};
+        const auto mesh = CurvMesh::fromRemap(g, R);
+        const auto cpu = Comp::make(mesh, 1.4, 2e-3);
+        if (!cpu) { check(false, "3D focal LES make"); return; }
+        const auto s0 = smoothState(mesh, 1.4);
+        const double k0 = kineticEnergy(s0);
+        const SgsModel models[2] = {SgsModel::Smagorinsky, SgsModel::Sigma};
+        const double cval[2] = {cs, csig};
+        for (int q = 0; q < 2; ++q) {
+            auto dns = gpu::DeviceComp::make(*cpu->curv, 1.4, 2e-3);
+            auto les = gpu::DeviceComp::make(*cpu->curv, 1.4, 2e-3, cval[q],
+                                             models[q]);
+            auto da = gpu::DeviceCompState::make(g.size());
+            auto db = gpu::DeviceCompState::make(g.size());
+            auto scratch = gpu::ReduceScratch::make();
+            if (!dns || !les || !da || !db || !scratch) {
+                check(false, "GPU alloc");
+                return;
+            }
+            (void)da->upload(s0);
+            (void)db->upload(s0);
+            const double dtDns = dns->stableDt(*da, *scratch);
+            const double dtLes = les->stableDt(*db, *scratch);
+            check(dtLes > 0.0 && dtLes <= dtDns * (1.0 + 1e-9),
+                  q == 0 ? "focal LES smag tightens the dt limit"
+                         : "focal LES sigma tightens the dt limit");
+            const double dt = 0.5 * dtLes;
+            for (int it = 0; it < 40; ++it) {
+                dns->step(*da, gpu::Real(dt));
+                les->step(*db, gpu::Real(dt));
+            }
+            auto ha = CompState::zeros(g), hb = CompState::zeros(g);
+            (void)da->download(ha);
+            (void)db->download(hb);
+            bool finite = true;
+            double rhomin = 1e300;
+            for (std::size_t i = 0; i < g.size(); ++i) {
+                if (!std::isfinite(hb.rho[i]) || !std::isfinite(hb.E[i]))
+                    finite = false;
+                rhomin = std::min(rhomin, hb.rho[i]);
+            }
+            const double kd = kineticEnergy(ha), kl = kineticEnergy(hb);
+            std::printf("focal 3D %s: K0 %.6f DNS %.6f LES %.6f\n",
+                        q == 0 ? "smag " : "sigma", k0, kd, kl);
+            check(finite && rhomin > 0.0,
+                  q == 0 ? "focal 3D LES smag run stays physical"
+                         : "focal 3D LES sigma run stays physical");
+            check(kl < kd, q == 0 ? "focal 3D LES smag drains kinetic energy"
+                                  : "focal 3D LES sigma drains kinetic energy");
+        }
+    }
+}
+
 void distorted3dRun()
 {
     const auto g = Grid::make(24, 24, 24, 2.0, 2.0, 2.0);
@@ -306,6 +514,8 @@ int main()
     freestream3d();
     stretched2d();
     focal2d();
+    lesCurv();
+    lesViscousDtDegeneracy();
     distorted3dRun();
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return dnstest::gFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

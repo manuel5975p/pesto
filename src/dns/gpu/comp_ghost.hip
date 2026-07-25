@@ -1,6 +1,6 @@
 #include "dns/gpu/comp_ghost.hpp"
 
-#include "dns/gpu/comp_flux.hpp"
+#include "dns/gpu/internal/comp_flux.hpp"
 #include "dns/gpu/device_util.hpp"
 
 #include <cassert>
@@ -372,12 +372,7 @@ DeviceCompGhost::Force DeviceCompGhost::force(DeviceComp& solver,
         const DeviceCurv* t = solver.curvTables();
         assert(t && "focal ghost force needs the curvilinear DeviceComp");
         if (!t) return {0.0, 0.0, 0.0};
-        CurvView cv;
-        for (int a = 0; a < 3; ++a) {
-            for (int c = 0; c < 3; ++c) cv.S[a][c] = t->S[a][c].data();
-            for (int e = 0; e < 9; ++e) cv.Ji[a][e] = t->Ji[a][e].data();
-        }
-        cv.invVol = t->invVol.data();
+        const CurvView cv = t->view();
         kBodyFluxCurv<<<launchBlocks(nFace_), blockSize>>>(
             g_, solver.mu(), solver.kappaCond(), q, cv, fcell_.data(),
             fdir_.data(), nFace_, facc_.data());

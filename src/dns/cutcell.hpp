@@ -15,34 +15,15 @@
 // first-order boundary discretization error.
 #pragma once
 
+#include "dns/bodies.hpp"   // RotatedCube / Sphere / CylinderZ
 #include "dns/field.hpp"
 #include "dns/grid.hpp"
 
+#include <expected>
+#include <string>
 #include <vector>
 
 namespace dns {
-
-// Axis-aligned solid slab in z crossed with an L1 ball (diamond) in x-y, i.e.
-// a square prism rotated 45 deg about z -- a "rotated cube". cx,cy,R,z0,z1 in
-// world units. Interior: |x-cx|+|y-cy| <= R and z0 <= z <= z1.
-struct RotatedCube
-{
-    double cx, cy, r, z0, z1;
-};
-
-// Solid ball of radius r centred at (cx,cy,cz), world units. Must not touch
-// the periodic images (geometry is built unwrapped).
-struct Sphere
-{
-    double cx, cy, cz, r;
-};
-
-// Solid circular cylinder along z (infinite: spans the whole grid), axis at
-// (cx,cy), radius r, world units. Interior: (x-cx)^2 + (y-cy)^2 <= r^2.
-struct CylinderZ
-{
-    double cx, cy, r;
-};
 
 // Per-cell fluid fraction and per-face open apertures, all in [0,1] and indexed
 // by Grid::idx. ax[idx(i,j,k)] is the u-face (left, x=i*hx), ay the v-face
@@ -139,15 +120,27 @@ double maxAbsDivergenceCut(const Grid& g, const CutGeometry& cut,
 class CutPoissonSolver
 {
 public:
-    CutPoissonSolver(const Grid& g, const CutGeometry& cut, int maxIters, double tol);
+    // An all-solid geometry (no fluid cell) is a USER-caused input, not a
+    // programmer error -- a body that swallows the box, or a mesh that failed
+    // to sample. It used to be an assert, so in Release projectMean divided by
+    // zero and poisoned every subsequent solve. Reported instead.
+    static std::expected<CutPoissonSolver, std::string>
+    make(const Grid& g, const CutGeometry& cut, int maxIters, double tol);
+
+    CutPoissonSolver(CutPoissonSolver&&) = default;
 
     // Solve M(p) = rhs; rhs mean over fluid cells is projected out. p has zero
     // mean over fluid cells on return (zero in solid cells). warmStart reuses
     // the incoming p as the initial guess (cheap for slowly varying pressure).
-    // Returns the iterations taken.
+    // Returns the iterations taken, or maxIters (non-convergence) if the
+    // residual is non-finite -- a NaN residual is DIVERGENCE, never a solve
+    // that converged instantly. Same contract as the GPU CG.
     int solve(const Scalar& rhs, Scalar& p, bool warmStart = false);
 
 private:
+    CutPoissonSolver(const Grid& g, const CutGeometry& cut, int maxIters,
+                     double tol, std::size_t nFluid);
+
     void apply(const Scalar& x, Scalar& y) const; // y = -M(x), SPD on fluid
     double fluidDot(const Scalar& a, const Scalar& b) const;
     void projectMean(Scalar& x) const;

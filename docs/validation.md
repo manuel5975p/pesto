@@ -17,15 +17,38 @@ class(es), and `SKIP_RETURN_CODE 77`:
 | `anchor`     | repo's own converged numbers (`data/validation/anchors.csv`)    |
 | `heavy`      | Tier B: registered only with `-DDNS_HEAVY_VALIDATION=ON`        |
 
-- **Tier A** (default `ctest`): ~2.8 min GPU total, runs in every ctest sweep.
+- **Tier A** (default `ctest`): the tier the table below describes. In the
+  default build only **two** of its rows are actually registered —
+  `val_spindown` (the green canary) and `val_comp_cyl_re60` (which itself exits
+  77, every check being anchor-gated). The other Tier-A rows are quarantined;
+  see below.
 - **Tier B** (`cmake -B build -DDNS_HEAVY_VALIDATION=ON`): heavy runs,
-  `RUN_SERIAL`, ~23 min GPU total.
+  `RUN_SERIAL`, ~23 min GPU total. Most Tier-B rows are quarantined too.
 - **Tier C**: manual anchor regeneration + optional studies, documented below;
   never run by ctest.
 
 Anchor-gated checks print `[DEFER] anchor '<key>' missing` while the anchor row
 in `anchors.csv` is commented out; a test whose checks are ALL anchor-gated
 skips (rc 77). Anchors are currently deferred by decision (2026-07-17).
+
+### The `DNS_VALIDATION_BASELINE` quarantine
+
+The nine literature-band tests are **registered only** with
+`cmake -B build -DDNS_VALIDATION_BASELINE=ON`:
+
+`val_cyl_re60`, `val_cyl_re100`, `val_tgv3d_64`, `val_comp_mesh_sphere`
+(Tier A) and `val_cyl_re200`, `val_cyl_blockage`, `val_tgv3d_128`,
+`val_sphere_re300`, `val_mesh_sphere` (Tier B, which also needs
+`DNS_HEAVY_VALIDATION=ON`).
+
+This is a **decision, not a failure** (CLAUDE.md): the bands are repo-calibrated
+against the confinement argument below and must be RE-MEASURED before being
+cited. Do not undo the quarantine, and do not uncomment anchor rows, without
+that measurement.
+
+Their `add_executable` targets are built unconditionally even when zero of the
+tests are registered. That is deliberate — it keeps the quarantined sources
+compiling against the current library instead of rotting.
 
 ## The confinement (blockage) calibration argument
 
@@ -70,7 +93,7 @@ Measured on gfx1100, 2026-07-17. "runtime" = full ctest wall time.
 | `val_sphere_re300` | Johnson & Patel (JFM 1999): cd 0.656, in-plane |cl| 0.069, St 0.137 | cd 0.7427, cl_y -0.0265, cl_rms 0.0064, St gate not met | cd in [0.657, 0.77]; |cl| in [0.01, 0.10]; St in [0.12, 0.15] gated on cl_rms > 0.01 and >= 5 periods | 160^3, D = 20 cells: coarse BL + 8D blockage => cd +13%; only the y-projection of the planar-symmetric lift is tallied and the wake plane drifts, so the |cl| floor asserts non-axisymmetry only; the shedding oscillation is weak near onset (J&P dCl ~ 0.016), so the St band rarely arms | 360 s |
 | `val_tgv3d_128` | as `val_tgv3d_64` | curves K 1.06e-07 / eps 6.28e-07; peak 0.013580 at t = 8.62 (+5.6%) | curves 2e-3/2e-2 vs `ours_tgv128.csv`; peak time 9.0 +- 0.7; value [-10%, +10%] | convergence to the spectral peak is oscillatory (see convergence row above); 512^3 sits at +1.2%, so +-10% brackets the physical claim at 128^3 | 1 s |
 | `val_comp_cyl_re800` | anchor only (2D Re800 = model, not reality) | -- | cd 1.71 +-3%, St 0.2445 +-3% vs anchors | SKIPS rc 77 until anchors regenerated | skip |
-| `val_mesh_sphere` | analytic-sphere pipeline itself (validated by `val_sphere_re300`): generated unit-sphere STL through `mesh_tunnel_gpu` vs `sphere_tunnel_gpu`, matched Re300/n96/dr8 | cd 0.7099 vs 0.6851 (3.6%) | windowed cd (last 3 ft) within 5% | the gap is geometry-pipeline discretization at D = 12 cells (supersampled sdf band vs exact overlap), NOT faceting: subdiv-4 and subdiv-5 STLs give identical cd to 1e-4; aperture qRef differs -0.15% from the exact disk | 73 s |
+| `val_mesh_sphere` | analytic-sphere pipeline itself (validated by `val_sphere_re300`): generated unit-sphere STL via `--body sphere.stl` vs the analytic `--body sphere`, matched Re300/n96/dr8 | cd 0.7099 vs 0.6851 (3.6%) | windowed cd (last 3 ft) within 5% | the gap is geometry-pipeline discretization at D = 12 cells (supersampled sdf band vs exact overlap), NOT faceting: subdiv-4 and subdiv-5 STLs give identical cd to 1e-4; aperture qRef differs -0.15% from the exact disk | 73 s |
 
 TGV dissipation-peak convergence (repo curves vs spectral 0.012858 at t = 8.97):
 64^3 0.011820 (-8.1%), 128^3 0.013580 (+5.6%), 256^3 0.012298 (-4.3%),
@@ -137,26 +160,39 @@ CLAUDE.md. For each key, run the exact `config` command from the CSV row from
 the repo root, e.g.:
 
 ```sh
-build/cylinder_tunnel_gpu 256 --nz 1 --re 60 --dr 8 --ft 12 --fdt 1e9 --out /tmp/a60
-build/comp_cylinder_tunnel_gpu 256 --re 60 --mach 0.2 --ft 20 --fdt 1e9 --out /tmp/c60
-build/comp_cylinder_tunnel_gpu 512 --re 800 --mach 0.2 --ft 15 --fdt 1e9 --out /tmp/c800
-build/sphere_tunnel_gpu 160 --re 300 --dr 8 --ft 12 --fdt 1e9 --out /tmp/s300
+build/dns flow --body cylinder --far tunnel --n 256  --nz 1 --re 60  --dr 8 --ft 12 --fdt 1e9 --out /tmp/a60
+build/dns flow --body cylinder --far tunnel --n 512  --nz 1 --re 60  --dr 8 --ft 12 --fdt 1e9 --out /tmp/a60b
+build/dns flow --body cylinder --far tunnel --n 1024 --nz 1 --re 60  --dr 8 --ft 12 --fdt 1e9 --out /tmp/a60c
+build/dns flow --body cylinder --far tunnel --n 512  --nz 8 --re 60  --dr 8 --ft 12 --fdt 1e9 --out /tmp/a60z
+build/dns flow --body cube     --far tunnel --n 256  --nz 8 --re 300        --ft  6 --fdt 1e9 --out /tmp/cube
+build/dns flow --body sphere   --far tunnel --n 160  --re 300 --dr 8 --ft 12 --fdt 1e9 --out /tmp/s300
+build/dns flow --body sphere.stl --far tunnel --n 96 --re 300 --dr 8 --ft 12 --fdt 1e9 --out /tmp/ms
+build/dns flow --physics compressible --body cylinder --far sponge --n 256 --re 60  --mach 0.2 --ft 20 --fdt 1e9 --out /tmp/c60
+build/dns flow --physics compressible --body cylinder --far sponge --n 512 --re 800 --mach 0.2 --ft 15 --fdt 1e9 --out /tmp/c800
+build/dns flow --physics compressible --body sphere.stl --far nscbc --open --n 96 --nz 96 --re 100 --mach 0.2 --ft 12 --out /tmp/cms
 ```
+
+The two `--far sponge` lines are NOT an endorsement of sponge: they name the
+boundary condition the existing anchor values were measured under, explicitly,
+because an anchor must be reproduced under the conditions that produced it.
+`--far sponge` remains an escape hatch, never a default (CLAUDE.md).
 
 then compute the statistic named in the row from `<prefix>_stats.csv` with the
 same estimators the tests use (`tests/validation_util.hpp`): trapezoidal
 `windowMean` over the row's window for cd, hysteresis zero-crossing `strouhal`
-for St (comp app: St = f * pi/4). Uncomment the row with value + date.
+for St (compressible: St = f * pi/4). Uncomment the row with value + date.
 Run-to-run repeatability measured 2026-07-17 was bit-identical at 256^2, so
 tol_rel 0.01 is safe; widen to 0.015 only if drift is observed and note it here.
 
 ### Convergence / blockage sweeps (optional, not automated)
 
-- Cylinder cd/St grid triple: `cylinder_tunnel_gpu {256,512,1024} --nz 1 --re 60 --dr 8 --ft 12`
+- Cylinder cd/St grid triple:
+  `dns flow --body cylinder --far tunnel --n {256,512,1024} --nz 1 --re 60 --dr 8 --ft 12`
   (anchors 1.803/1.785/1.785 pre-date this suite; see CLAUDE.md).
-- Blockage sweep: `cylinder_tunnel_gpu 512 --nz 1 --re 100 --dr {8,16,24} --ft 16`.
-- TGV: `tgv3d {256,512} 1600 20` vs `data/validation/tgv3d_{256,512}.csv` and
-  the spectral reference.
+- Blockage sweep:
+  `dns flow --body cylinder --far tunnel --n 512 --nz 1 --re 100 --dr {8,16,24} --ft 16`.
+- TGV: `dns tgv --n {256,512} --re 1600 --ft 20` vs
+  `data/validation/tgv3d_{256,512}.csv` and the spectral reference.
 - Kim & Lee Re550 impulsive-start plot: manual, see rejected list (delta ~
   sqrt(nu t) is sub-cell early on; qualitative overlay only).
 

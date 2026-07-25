@@ -9,19 +9,16 @@
 // negative viscosity or NaN.
 
 #include "dns/sgs.hpp"
+#include "check.hpp"
 
 #include <cmath>
 #include <cstdio>
 
 namespace {
 
-bool pass = true;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    std::printf("%-52s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) pass = false;
-}
+
 
 double lcg(unsigned& s) // deterministic uniform in [-1, 1)
 {
@@ -101,5 +98,5 @@ int main()
         check(std::fabs(sigmaDsigma(g)) <= 1e-6, "float pure shear -> 0");
     }
 
-    return pass ? 0 : 1;
+    return dnstest::finish();
 }

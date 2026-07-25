@@ -21,7 +21,12 @@ struct ChannelRun
     double gamma = 1.4, Rgas = 1.0;
     double mu = 0;              // = rho nu = 1/reTau in wall units
     double reTau = 180;
-    double fBody = 1.0;         // constant body-force density along x
+    double ubEst = 0;           // log-law bulk-velocity estimate (validate())
+    // Streamwise body-force density. NOT configurable and deliberately so:
+    // the channel runs in wall units (delta = 1, uTau = 1, nu = 1/reTau), and
+    // the box momentum balance pins tau_wall = f*delta = 1. Changing it would
+    // silently redefine what --re-tau means.
+    static constexpr double fBody = 1.0;
     double delta = 1.0;         // channel half-height
     double pRef = 1.0;          // background pressure (sets the bulk Mach)
     double Twall = 1.0;         // isothermal wall temperature

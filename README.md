@@ -25,7 +25,8 @@ Staggered MAC grid, 2nd-order central differences, skew-symmetric
 
 Backends:
 * **CPU** (`dns_core`): serial, double precision — the correctness oracle.
-* **GPU** (`dns_gpu`): HIP/ROCm (gfx1100), FP32 fields with FP64 reductions,
+* **GPU** (`dns_gpu`): HIP/ROCm (arch auto-detected; gfx1100 and gfx1201 both
+  exercised), FP32 fields with FP64 reductions,
   hipFFT Poisson, fused RHS+RK-stage kernel; mirrors the CPU API 1:1 and is
   tested for parity. ~86 ms/step at 512³ on an RX 7900 XTX (~7 GiB VRAM).
   No HIP header leaks into a public header.
@@ -41,7 +42,9 @@ ctest --test-dir build                      # GPU tests skip (rc 77) without a d
 ```
 
 Options: `DNS_WITH_FFTW` (ON), `DNS_WITH_HIP` (OFF; `CMAKE_HIP_ARCHITECTURES`
-defaults to gfx1100), `BUILD_TESTING` (master test switch),
+is AUTO-DETECTED from the installed device — set it explicitly only to
+cross-compile; a wrong arch shows up as a HIP `getStatFunc` assertion),
+`BUILD_TESTING` (master test switch),
 `DNS_HEAVY_VALIDATION` (heavy tier, ~25 min, RUN_SERIAL),
 `DNS_VALIDATION_BASELINE` (quarantined literature-band `val_*`, OFF — see §15).
 Build type: Release.
@@ -61,13 +64,29 @@ Build type: Release.
 Common to every subcommand: `--backend cpu|gpu|auto` (auto), `--out PREFIX`
 (= subcommand name), `--seed N` (1), `--quiet`, `--dry-run`, `--help`.
 
+`--config FILE.toml` supplies any of the above from a TOML run config —
+`n = 512` is `--n 512`, `re_tau` is `--re-tau`, `emit = ["stats","png"]`
+repeats the flag, `noslip = true` asserts it, and `subcommand = "channel"` may
+replace the positional. Explicit CLI flags override the file.
+
 ### `flow` — orthogonal flag groups
 
-* **Body** `--body cylinder|sphere|cube|lens|FILE.stl|.gltf|.glb` (exactly one,
-  required). `cylinder` = z-aligned circle, `cube` = 45° rotated square prism,
-  `lens` = two-disk intersection with sharp tips (2D). Modifiers:
+* **Body** `--body cylinder|sphere|cube|lens|fence|floor|none|FILE.stl|.gltf|.glb`
+  (exactly one, required). `cylinder` = z-aligned circle, `cube` = 45° rotated
+  square prism, `lens` = two-disk intersection with sharp tips (2D),
+  `fence` = wall-mounted blocker sealed to the tunnel floor, top edge at D
+  above it, thickness D/8 — the 2D shear-layer rig; `floor` = raised solid slab
+  over the full streamwise extent with its surface at D above the wall, i.e. a
+  no-slip flat plate with its leading edge in the inflow plane — the wall-layer
+  rig (both incompressible `--far tunnel`, both 2D; `--dr 10` blocks the bottom
+  10%); `none` = body-free box for wall boundary layers (compressible only,
+  pair with `--noslip` and/or `--stretch`). Modifiers:
   `--aspect A` (lens width/height, 3.5), `--dimples N` (golf dimples, 0 = smooth;
-  cylinder → 2D disks, sphere → 3D caps), `--scale S` (mesh, 0 = fit max extent
+  cylinder → 2D disks, sphere → 3D caps), `--bumps N` + `--bump-h H`
+  (floor trip spikes: N triangular teeth of height H cells, [4,48], default 8,
+  pitched over 10–75% of the plate; the layer trips when the teeth poke through
+  the local BL, k/δ ~ 1 — measured, teeth buried under a quiet-start BL stay
+  laminar; `--body floor` only), `--scale S` (mesh, 0 = fit max extent
   to D), `--robust` (winding-number sign for leaky meshes),
   `--pitch/--yaw` DEPRECATED (§10).
 * **Scene** `--scene FILE.toml` instead of `--body`: the generalized
@@ -86,10 +105,15 @@ Common to every subcommand: `--backend cpu|gpu|auto` (auto), `--out PREFIX`
   lateral faces (§7). Tuning: `--sponge-cells N` (0 = 10% of n),
   `--fringe-axes 2|3` (0 = auto: 2 when `--nz 1`), `--nscbc-beta` (0.5),
   `--nscbc-strip` (0), `--pot`.
-* **Solver** `--poisson auto|fft|dct|cg` (auto follows `--far`), `--tol` (1e-4,
-  CG per-cell RMS residual), `--max-iters` (500), `--dt-recompute` (16, comp).
+* **Solver** `--tol` (1e-4, CG per-cell RMS residual), `--max-iters` (500),
+  `--dt-recompute` (16, comp). The pressure solve is NOT selectable: it follows
+  `--far` (periodic FFT for `fringe`/`periodic`, Neumann-box DCT otherwise).
+* **Walls** `--noslip` — the closed y walls become adiabatic NO-SLIP mirrors
+  (boundary layers grow on them) instead of free-slip. Rejected with `--open`.
 * **Emit** (repeatable) `stats,bin,png,web,volume,slices,vtk,none`
-  (default `stats,bin`), with `--fdt` 0.15, `--pdt` 0, `--wdt` 0, `--planes` 3.
+  (default `stats,bin`), with `--fdt` 0.15, `--pdt` 0, `--wdt` 0, `--planes` 3,
+  `--png-down S` (box-average PNG frames by S, which must divide nx and ny;
+  1 = full res, e.g. 2048×1024 `--png-down 2` → 1024×512).
 * **Grid** `--n` 512, `--ny` (=n), `--nz` 1, `--dr` 8. **Run length** `--ft` 20,
   `--steady TOL` 0, `--seq LEVELS` 1. **Compressible start-up** `--ramp` 2.0,
   `--kick` 0.05.
@@ -103,6 +127,22 @@ Grid conventions differ by physics and are deliberately **not** unified:
 Merging them relocates the body and rescales Re — a real past bug (the old app
 hardcoded `h = D/64` so n grew only the DOMAIN: body 67% downstream, sponge 0.4D
 behind it, measured cd 3.19).
+
+### `channel`
+
+Spec: `docs/channel.md`. Wall units throughout (δ = 1, u_τ = 1, force density
+f = 1, ν = 1/Re_τ), so `--re-tau` IS the run's friction Reynolds number in the
+mean. Grid defaults are the KMM 192×128×160 box: `--n` 192 (streamwise),
+`--ny` 128 (wall-normal FLUID cells; two mirror ghost rows are added
+internally), `--nz` 160, `--lx` 0 (= 4πδ, KMM), `--lz` 0 (= 4πδ/3, KMM),
+`--stretch` 2.0 (tanh wall clustering, [0,4]). Physics: `--re-tau` 180,
+`--mach` 0.2 (BULK Mach, from the log-law bulk-velocity estimate; above ~0.3
+compressibility contaminates comparison with incompressible references),
+`--wall isothermal|adiabatic` (isothermal — adiabatic has no heat sink, so T
+climbs until dt collapses: short transients only), `--cfl` 0.4. Start-up
+`--kick` 0.2 (solenoidal trip on the laminar Poiseuille IC; 0 stays laminar).
+Run length `--tt` 30 eddy turnovers (δ/u_τ = 1), `--dt-recompute` 16. Output
+adds `--profile-dt` 1.0 (`<out>_profiles.csv`, Favre-averaged over x and z).
 
 ### `tgv`, `hit`, `bench`
 
@@ -136,12 +176,18 @@ and exits 0 — use it to check a config without touching the GPU.
 ## 4. Library layering
 
 ```
-cli/config (parse + validate, pure)
-  → bodies/geometry (sdf + cut sampling)
-    → gpu/{tunnel,bodyforce,les,cutpoisson,derived}
-      → gpu/runner_{incomp,comp}   (the two time loops)
+cli/config (parse + validate, pure)  [+ dns/scene, dns/remap, dns/sgs]
+  → bodies/geometry (sdf + cut sampling)  [+ dns/curvmesh, dns/framemap]
+    → gpu/{tunnel,bodyforce,les,cutpoisson,cutflux,derived,comp_channel}
+      → gpu/runner_{incomp,comp,channel}   (the three time loops)
         → output (RunOutput, the one artefact sink)
 ```
+
+Post-recompose additions, placed by layer: `dns/scene` (scene-file model, feeds
+config), `dns/remap` + `dns/sgs` (pure headers: axis remaps and the SGS
+operator), `dns/curvmesh` + `dns/framemap` (mesh mapping and the
+physical↔index frame raster), `gpu/cutflux` (incompressible cut-cell flux),
+`gpu/comp_channel` + `gpu/runner_channel` (the channel path).
 
 `apps/` is `dns_main.cpp` alone. `main` is four phases:
 **Parse → Validate → Acquire → Run**. Phases 1-2 touch NEITHER filesystem NOR
@@ -183,7 +229,8 @@ at the finest resolution.
 
 ## 6. Compressible solver
 
-`dns flow --physics compressible --body cylinder` (default `--far sponge`).
+`dns flow --physics compressible --body cylinder` (default `--far nscbc`;
+`--far sponge` is an explicit escape hatch only — see §7).
 The core was already 3D (`DeviceCompState` carries mz; `comp_flux.hpp::faceFlux`
 loops axes 0/1/2, nz==1 cancels by wrap).
 
@@ -251,7 +298,11 @@ vs confined 1.803 (lit unbounded 1.42) — fringe is a softer image system, roug
 halving the blockage excess; maxDiv 1.5e-4. Tunnel mode bit-identical.
 Test `gpu_open_incomp`.
 
-### `--far sponge` (compressible default) and `--open` lateral bands
+### `--far sponge` (escape hatch; NOT a default) and `--open` lateral bands
+Sponge is never a default anywhere — the compressible default is `--far nscbc`
+(`config.cpp`). It relaxes the freestream in a boundary band that eats the near
+field; ask for it by name or not at all.
+
 `gpu/comp_far.*` (`DeviceCompFar`) = x-band freestream sponge + lateral free-slip
 mirror walls, or `--open` lateral bands that relax rho/p ONLY (velocity free —
 the displacement/dipole field is not clamped; relaxing v→0 or u→uInf laterally is
@@ -555,9 +606,22 @@ ratio 4.01 (2nd order), nz == 1 keeps mz EXACTLY 0 on distorted meshes
 `CurvMesh::sinusoidal(g, amp)` = a fixed smooth mapping (skewness survives
 refinement), |amp| ≤ 0.06 valid.
 
-NOT wired: LES / sponge on curvilinear (`make(metrics, ...)` forces
-csLes = 0). The Cartesian path is untouched — dispatch is one branch on the
-optional metrics. The compressible periodic curvilinear path IS driven by
+LES IS wired on curvilinear (`make(metrics, gamma, mu, csLes, sgs)`): the same
+two operators, the same eddy conductivity `nut·cp/Pr_t`, with the velocity
+gradient assembled from the mesh metrics (`curvVelGradCentre`: index-space
+central differences contracted with the cell-centre inverse Jacobian, averaged
+from the two faces normal to each axis) and the filter width the cell's OWN
+`Delta² = vol^(2/3)` (`vol/hz` at `nz == 1`), so a clustered mesh filters at
+the local spacing instead of a box average. Measured degeneracy: on the
+identity map both operators match the Cartesian LES path to 1e-6 rel Linf over
+10 steps, and the LES viscous dt limit matches to 1e-4 (the ACOUSTIC halves of
+the two `stableDt`s are not comparable by construction — see the `|u|` vs
+`|u·n̂|` note above — so the dt pin exaggerates C until the viscous limit
+binds). At `nz == 1` on a distorted mesh the sigma model is still identically
+zero (the Ji z-column is exactly zero ⇒ the gradient tensor stays 2-block ⇒
+σ3 = 0), so a sigma run there is BIT-identical to molecular DNS — test-pinned.
+NOT wired: sponge on curvilinear. The Cartesian path is untouched — dispatch
+is one branch on the optional metrics. The compressible periodic curvilinear path IS driven by
 `dns channel` (`docs/channel.md`): `CurvMesh::channelY` + `DeviceChannelWall`
 + body-force RHS hook.
 
@@ -581,19 +645,40 @@ ONE concrete type, not a template product: NSCBC and the vorticity frame each
 get exactly one extra instantiation and the coefficients travel as data, so
 any combination of clustered axes costs no further kernels.
 
-Validator (compressible, no LES, `--far nscbc` or explicit sponge, mutually
-exclusive with `--stretch`): the blend must clear each domain face by ≥ 4
+Validator (compressible, `--far nscbc` or explicit sponge, mutually
+exclusive with `--stretch`; `--les` is allowed and filters at the per-cell
+Delta): the blend must clear each domain face by ≥ 4
 cells (x also `nscbc-strip + 2`) so the boundary treatment always reads an
 exactly uniform grid; the plateau must span ≥ 4 fine cells; `nz == 1` forbids
 a z plateau; and the max ADJACENT cell growth is capped at 1.25 — the KG
 central flux has no dissipation, so a sharp coarse/fine step is a dispersive
-reflector. `--dry-run` prints per-axis fine/coarse spacings, the exact ratio,
+reflector; widen `--focal-blend F` (blend width per side as a fraction of the
+plateau extent, (0,2], default 0.5) to get under that cap. `--dry-run` prints
+per-axis fine/coarse spacings, the exact ratio,
 the growth and the dt penalty factor. With a body the plateau must contain it
 plus a 3-fine-cell guard, so the ghost wall's mirror stencil never straddles
 the blend; `auto` derives the box from the body AABB (`--focal-pad`,
 `--focal-wake`), shrinking it to fit and reporting what it resolved.
 Analytic bodies only — a mesh/scene AABB is not known until the file loads and
 validation touches no filesystem.
+
+Display raster (`dns/framemap.hpp`, `PhysicalRaster`): the solver's arrays are
+indexed in REFERENCE space, so a pixel-per-cell frame is a picture of the INDEX
+space — on a clustered mesh the plateau is blown up and the far field squashed,
+and the body comes out the wrong shape. Every frame (and the body mask) is
+resampled onto a uniform PHYSICAL grid before it reaches `RunOutput`, which is
+constructed with that render grid. The raster pitch is the FINEST spacing on
+each axis, so clustering never costs displayed detail: the render grid is
+LARGER than the solver grid by up to `--focal-ratio` per clustered axis
+(measured: 128³ focal auto ratio 4 → 326×382×382, PNGs 326×382). Guards: per-
+axis growth ≤ 8, and a 128M total render-cell cap past which all grown axes
+shrink by one common factor — the geometry stays true, only the detail is
+capped. The identity map is INACTIVE: render grid == solver grid and `apply()`
+is a bit-exact copy, so uniform-mesh runs are unchanged. Test-pinned by round
+trip (a known function of physical position, stored at the reference cells,
+comes back as that function on the raster, to the linear-interpolation floor of
+the coarse cells) and by a step edge landing at its physical position.
+Display only — nothing here touches state, fluxes or statistics.
 
 Ghost wall on curvilinear (`comp_ghost`): classification is entirely host-side,
 so the map's inverse never reaches a kernel. Cell centres, normals, wall
@@ -667,8 +752,11 @@ green.
 
 `--emit` is repeatable; default `stats,bin`.
 
-* `stats` — `<out>_stats.csv`: `t, dt, K, cd, cl, cdf, cfl, maxDiv, pcgIters,
-  resid`.
+* `stats` — `<out>_stats.csv`. **Three schemas, one filename** — parse by
+  COLUMN NAME from the header row, never by index:
+  * incompressible `flow`: `t, dt, K, cd, cl, cdf, cfl, maxDiv, pcgIters, resid`
+  * compressible `flow`: `t, dt, cd, cl, cs, wmax`
+  * `channel`: `t, dt, ubulk, utauBot, utauTop, retau, KE`
 * `bin` — `<out>_{vort,speed,mask}.bin`, float32 mid-plane, one frame per `--fdt`.
 * `png` — live PNG frames (`src/dns/fieldpng.*`, test `fieldpng`); at `--nz`
   > 1 the centre z-plane is rendered (channel precedent). High-Re framing:
@@ -702,6 +790,13 @@ green.
 
 ## 15. Validation suite + quarantine status
 
+Smoke coverage for the three time loops is separate and unquarantined:
+`gpu_runners` (`tests/test_gpu_runners.cpp`) drives `--far tunnel` with walls
+(the incompressible default), `--physics compressible --far nscbc`, and a short
+`dns channel`, asserting only exit 0, finite coefficients, a healthy projection
+and that stats rows were written. No literature band, so nothing there is
+quarantine-shaped.
+
 `test_val_*` + `tests/validation_util.hpp`; labels = truth class
 (`analytic` / `literature` / `anchor`) + `validation`. Heavy tier behind
 `-DDNS_HEAVY_VALIDATION=ON` (~25 min, RUN_SERIAL). Routine: plain `ctest`
@@ -709,7 +804,7 @@ green.
 procedure: `docs/validation.md`; scalar anchors in `data/validation/anchors.csv`
 (deferred anchors ⇒ rc 77 skip).
 
-**QUARANTINE (2026-07-20, recomposition)**: the eight literature-band `val_*`
+**QUARANTINE (2026-07-20, recomposition)**: the nine literature-band `val_*`
 registrations sit behind `-DDNS_VALIDATION_BASELINE=ON` (default OFF) — sources and
 `anchors.csv` are untouched on disk. They were set aside BY DECISION so the
 recomposition was not gated on bit-identity, NOT because they failed.

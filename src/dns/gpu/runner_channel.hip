@@ -4,7 +4,8 @@
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_channel.hpp"
 #include "dns/gpu/derived.hpp"
-#include "dns/gpu/derived_remap.hpp"
+#include "dns/gpu/internal/derived_remap.hpp"
+#include "dns/gpu/internal/run_loop.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/reductions.hpp"
 #include "dns/remap.hpp"
@@ -19,12 +20,11 @@
 
 namespace dns::gpu {
 
+using internal::fail;
+using internal::finishTiming;
+
 namespace {
 
-std::unexpected<RunError> fail(int code, std::string m)
-{
-    return std::unexpected(RunError{code, std::move(m)});
-}
 
 // One-sided 2nd-order wall gradient from the first two off-wall values with
 // u(0) = 0 pinned: du/dy|0 = (u1 d2^2 - u2 d1^2) / (d1 d2 (d2 - d1)).
@@ -89,7 +89,10 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
                                  "vrms", "wrms", "uv",    "rho",   "T"};
     out.declareSeries("profiles", pcols);
 
-    const double ubEst = 2.5 * std::log(std::max(r.reTau, 3.0)) + 2.6;
+    // Log-law bulk-velocity estimate, resolved once in validate() (it also
+    // sets pRef from the bulk Mach there); re-deriving it here would let the
+    // two drift apart.
+    const double ubEst = r.ubEst;
     const float vortScale = float(r.curlMax > 0 ? r.curlMax : r.reTau / 4.0);
     const float speedMax = float(1.6 * ubEst);
     std::vector<Real> hVort(g.size()), hSpeed(g.size());
@@ -186,18 +189,14 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
 
     while (t < r.tEnd)
     {
-        if (++sinceDt >= r.dtRecompute)
-        {
-            const double s = dev->stableDt(*ds, *red, r.cfl);
-            if (!std::isfinite(s) || s <= 0)
-                return fail(7, "stable dt is not finite and positive "
-                               "(the state diverged)");
-            dtStab = r.dtMargin * s;
-            sinceDt = 0;
-        }
+        // 1e-9: the channel's own collapse threshold (wall units put dt on a
+        // different scale than the body runs). NOT shared with comp's 1e-6.
+        if (auto e = internal::recomputeDt(
+                sinceDt, dtStab, r.dtRecompute, r.dtMargin, 1e-9,
+                [&] { return dev->stableDt(*ds, *red, r.cfl); });
+            !e)
+            return fail(7, e.error());
         const double dt = std::min(r.tEnd - t, dtStab);
-        if (dtStab < 1e-9)
-            return fail(7, "dt collapsed -- the state diverged");
 
         dev->step(*ds, Real(dt));
         wall->apply(*ds); // leave the state wall-consistent between steps
@@ -238,11 +237,7 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
             writeFrame(t);
     }
     (void)hipDeviceSynchronize();
-    st.msPerStep = std::chrono::duration<double, std::milli>(
-                       std::chrono::steady_clock::now() - wall0)
-                       .count()
-                   / double(st.steps ? st.steps : 1);
-    out.setMsPerStep(st.msPerStep);
+    finishTiming(st, wall0, out);
     return st;
 }
 

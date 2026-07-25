@@ -126,19 +126,12 @@ __global__ void kBodySgsFriction(GpuGrid g, const Real* nut, const Real* ax,
 
 } // namespace
 
+// The sphere overload IS the AABB overload on the sphere's own AABB --
+// arithmetically identical, so it forwards rather than repeating the spans.
 BodyBox bodyBox(const GpuGrid& g, double cx, double cy, double cz, double r,
                 int margin)
 {
-    auto span = [margin](double lo, double hi, double h, int n) {
-        return std::pair{std::max(2, int(lo / h) - margin),
-                         std::min(n - 3, int(hi / h) + margin + 1)};
-    };
-    const auto [i0, i1] = span(cx - r, cx + r, g.hx, g.nx);
-    const auto [j0, j1] = span(cy - r, cy + r, g.hy, g.ny);
-    // Native 2D has no z ghost ring: the single plane k = 0 is the interior.
-    if (g.nz == 1) return {i0, i1, j0, j1, 0, 0};
-    const auto [k0, k1] = span(cz - r, cz + r, g.hz, g.nz);
-    return {i0, i1, j0, j1, k0, k1};
+    return bodyBox(g, {cx - r, cy - r, cz - r, cx + r, cy + r, cz + r}, margin);
 }
 
 BodyBox bodyBox(const GpuGrid& g, const std::array<double, 6>& w, int margin)
@@ -149,6 +142,7 @@ BodyBox bodyBox(const GpuGrid& g, const std::array<double, 6>& w, int margin)
     };
     const auto [i0, i1] = span(w[0], w[3], g.hx, g.nx);
     const auto [j0, j1] = span(w[1], w[4], g.hy, g.ny);
+    // Native 2D has no z ghost ring: the single plane k = 0 is the interior.
     if (g.nz == 1) return {i0, i1, j0, j1, 0, 0};
     const auto [k0, k1] = span(w[2], w[5], g.hz, g.nz);
     return {i0, i1, j0, j1, k0, k1};

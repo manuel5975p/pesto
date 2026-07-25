@@ -41,4 +41,14 @@ double velocityGradientSq(const Grid& g, const VectorField& U);
 // max |div(U)| over cells (diagnostic; needs no scratch).
 double maxAbsDivergence(const Grid& g, const VectorField& U);
 
+// MAC-aware trilinear prolongation of a staggered field from a coarse grid
+// (gc, spacing hc) onto a fine one (gf, hf) -- the grid-sequencing (--seq)
+// transfer. Each component samples its OWN face map along the face-normal axis
+// and the centre map along the other two; a collocated interpolation here
+// would smear the staggering and seed the fine level with a divergent field.
+// Both grids carry the one-cell ghost ring. nz == 1 on either grid keeps w
+// exactly 0 and the z sampling collapsed.
+VectorField prolongMac(const Grid& gc, double hc, const VectorField& C,
+                       const Grid& gf, double hf);
+
 } // namespace dns

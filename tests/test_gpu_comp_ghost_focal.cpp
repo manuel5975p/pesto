@@ -7,6 +7,7 @@
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_ghost.hpp"
 #include "gpu_test_util.hpp"
+#include "check.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -19,13 +20,9 @@ using std::numbers::pi;
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    std::printf("%-56s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) ++failures;
-}
+
 
 const double Lbox = 2 * pi, Rb = Lbox / 16;
 const double cxB = Lbox / 2, cyB = Lbox / 2 + 0.013;
@@ -312,5 +309,5 @@ int main()
     // quiescent deep cells, and the measured Re100 cylinder drag flipped
     // sign (cd 1.49 -> -7.6). Keep this case green.
     focalWall(g, 5.0, 0.25, "anisotropic fine cells");
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return dnstest::gFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

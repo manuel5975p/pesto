@@ -103,7 +103,8 @@ int main()
     }
     maskSolidFaces(g, cut, U);
 
-    CutPoissonSolver poisson(g, cut, 20000, 1e-12);
+    auto ps = CutPoissonSolver::make(g, cut, 20000, 1e-12);
+    auto& poisson = *ps;
     auto scr = CutProjectionScratch::make(g);
     projectCut(g, cut, poisson, 0.01, U, scr);
 

@@ -50,7 +50,9 @@ struct Comp
     static std::expected<Comp, std::string> make(const CurvMesh& mesh,
                                                  double gamma, double mu);
 
-    // p = (gamma-1)(E - |m|^2 / (2 rho)); rho > 0.
+    // p = (gamma-1)(E - |m|^2 / (2 rho)). PRECONDITION rho > 0, established by
+    // stableDt() -- which reports a diverged field rather than asserting -- so
+    // this stays branch-free in the inner loops.
     double pressure(double rho, double mx, double my, double mz, double E) const;
 
     // Conservative rhs dq/dt = -div(F); out arrays sized like s.
@@ -59,8 +61,11 @@ struct Comp
     // One SSP-RK3 step in place; dt within stableDt.
     void step(CompState& s, double dt) const;
 
-    // Largest stable dt: acoustic CFL and viscous limit combined; rho > 0.
-    double stableDt(const CompState& s, double cfl = 0.4) const;
+    // Largest stable dt: acoustic CFL and viscous limit combined. Returns an
+    // error instead of a NaN when the state has diverged (rho <= 0, p <= 0):
+    // a user can cause that, so it is std::expected, not an assert.
+    std::expected<double, std::string> stableDt(const CompState& s,
+                                                double cfl = 0.4) const;
 };
 
 } // namespace dns

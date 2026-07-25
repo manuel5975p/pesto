@@ -17,6 +17,7 @@
 // No HIP device -> skip (exit 77), probed via the app's own predicate.
 
 #include "dns/gpu/device_util.hpp"
+#include "validation_util.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -35,16 +36,15 @@
 
 namespace {
 
+using dnstest::check;
+
 constexpr int skipExitCode = 77;
 
-// Run the app; return its exit status (WEXITSTATUS), -1 on abnormal exit.
+// Drives the real binary through validation_util::runBinary -- this used to
+// be a private copy of it.
 int runApp(const std::string& args)
 {
-    const std::string cmd = "\"" DNS_BIN "\" flow --body cylinder " + args
-                          + " > /dev/null 2>&1";
-    const int rc = std::system(cmd.c_str());
-    if (rc == -1 || !WIFEXITED(rc)) return -1;
-    return WEXITSTATUS(rc);
+    return valtest::runBinary("\"" DNS_BIN "\" flow --body cylinder " + args);
 }
 
 struct Row
@@ -52,27 +52,20 @@ struct Row
     double t, cd, maxDiv;
 };
 
-// t (col 0), cd (col 3), maxDiv (col 7) from every complete data row.
+// Rows of <prefix>_stats.csv, parsed BY COLUMN NAME. The hardcoded col[0] /
+// col[3] / col[7] indices this replaces were a live hazard: _stats.csv has
+// three different schemas (incompressible flow / compressible flow /
+// channel), so an index that is `cd` in one is something else in another.
 std::vector<Row> readStats(const std::string& prefix)
 {
     std::vector<Row> rows;
-    std::ifstream f(prefix + "_stats.csv");
-    std::string line;
-    std::getline(f, line); // header
-    while (std::getline(f, line))
-    {
-        if (line.empty()) continue;
-        std::stringstream ls(line);
-        std::string cell;
-        double col[8]{};
-        bool ok = true;
-        for (int q = 0; q < 8 && ok; ++q)
-        {
-            ok = bool(std::getline(ls, cell, ','));
-            if (ok) col[q] = std::strtod(cell.c_str(), nullptr);
-        }
-        if (ok) rows.push_back({col[0], col[3], col[7]});
-    }
+    const auto tbl = valtest::loadCsv(prefix + "_stats.csv");
+    if (!tbl) return rows;
+    const auto& t = tbl->col("t");
+    const auto& cd = tbl->col("cd");
+    const auto& mdiv = tbl->col("maxDiv");
+    for (std::size_t i = 0; i < t.size(); ++i)
+        rows.push_back({t[i], cd[i], mdiv[i]});
     return rows;
 }
 
@@ -83,12 +76,6 @@ void cleanup(const std::string& prefix)
         std::remove((prefix + suf).c_str());
 }
 
-bool pass = true;
-void check(bool ok, const char* what)
-{
-    std::printf("%-48s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) pass = false;
-}
 
 } // namespace
 
@@ -132,6 +119,6 @@ int main()
     }
 
     cleanup(prefix);
-    std::printf("%s\n", pass ? "ALL OK" : "FAILURES");
-    return pass ? 0 : 1;
+    std::printf("%s\n", dnstest::gFailures == 0 ? "ALL OK" : "FAILURES");
+    return dnstest::finish();
 }

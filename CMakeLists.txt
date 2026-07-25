@@ -19,10 +19,13 @@ find_package(ZLIB REQUIRED) # fieldpng.cpp (PNG frame export)
 add_library(dns_core
     src/dns/bodies.cpp
     src/dns/cli.cpp
+    src/dns/casegeom.cpp
     src/dns/config.cpp
+    src/dns/framemap.cpp
     src/dns/cutcell.cpp
     src/dns/diagnostics.cpp
     src/dns/fieldpng.cpp
+    src/dns/flow_ic.cpp
     src/dns/geometry.cpp
     src/dns/operators.cpp
     src/dns/output.cpp
@@ -111,6 +114,7 @@ if(DNS_WITH_HIP)
         src/dns/gpu/runner_channel.hip
         src/dns/gpu/runner_comp.hip
         src/dns/gpu/runner_incomp.hip
+        src/dns/gpu/runner_periodic.hip
         src/dns/gpu/timestepper.hip
         src/dns/gpu/tunnel.hip
     )
@@ -130,7 +134,7 @@ endif()
 include(CTest)
 if(BUILD_TESTING)
     set(DNS_TESTS cli geometry output poisson projection tgv tgv3d cutcell cutcell_sphere comp comp_curv meshsdf
-        fieldpng webframes channel_config scene sgs_op)
+        fieldpng webframes channel_config scene sgs_op framemap)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)
     endif()
@@ -188,6 +192,17 @@ if(BUILD_TESTING)
         set_tests_properties(gpu_open_incomp PROPERTIES TIMEOUT 600
             SKIP_RETURN_CODE 77)
 
+        # Smoke coverage for the three runners, incl. --far tunnel WITH walls
+        # (the incompressible default) and runner_comp, which had none.
+        add_executable(test_gpu_runners tests/test_gpu_runners.cpp)
+        target_link_libraries(test_gpu_runners PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_runners PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_runners dns)
+        add_test(NAME gpu_runners COMMAND test_gpu_runners)
+        set_tests_properties(gpu_runners PROPERTIES TIMEOUT 600
+            SKIP_RETURN_CODE 77)
+
         # Sponge-free open tunnel: library-level freestream cycles + a short
         # end-to-end run of the built binary.
         add_executable(test_gpu_tunnel_open tests/test_gpu_tunnel_open.cpp)
@@ -212,133 +227,102 @@ if(BUILD_TESTING)
             DNS_VAL_SCRATCH="${DNS_VAL_SCRATCH}"
             DNS_ANCHORS_CSV="${CMAKE_CURRENT_SOURCE_DIR}/data/validation/anchors.csv")
 
+        # THE QUARANTINE, in one place.
+        #
+        # Nine literature-band tests have bands measured BEFORE the 2026-07-19
+        # recomposition (the kBcTunnel corner unification, the 3-direction
+        # friction tally, the FP64 force tally). They are a DECISION, not a
+        # failure: re-measure per docs/validation.md Tier C before citing one.
+        #
+        # Their executables are built unconditionally even when zero of them are
+        # registered -- that is deliberate, and keeps the quarantined sources
+        # compiling against the current library instead of rotting.
+        #
+        # dns_add_val(<name>
+        #     [TARGET t]        executable, default test_<name>
+        #     [ARG a]           argument appended to the test command
+        #     [TIMEOUT n]       default 300
+        #     [LABELS "a;b"]    ctest labels, "validation;" prefix included
+        #     [QUARANTINE]      register only with DNS_VALIDATION_BASELINE=ON
+        #     [SERIAL])         RUN_SERIAL (the heavy tier)
+        function(dns_add_val name)
+            # LABELS is a MULTI-value keyword, not a one-value one: ${ARGN} expands
+            # unquoted, so a "validation;anchor" string arrives already split
+            # into two arguments and a one-value slot would keep only the first.
+            cmake_parse_arguments(V "QUARANTINE;SERIAL" "TARGET;ARG;TIMEOUT" "LABELS" ${ARGN})
+            if(NOT V_TARGET)
+                set(V_TARGET test_${name})
+            endif()
+            if(NOT V_TIMEOUT)
+                set(V_TIMEOUT 300)
+            endif()
+            if(V_QUARANTINE AND NOT DNS_VALIDATION_BASELINE)
+                return()
+            endif()
+            add_test(NAME ${name} COMMAND ${V_TARGET} ${V_ARG})
+            # NB: set the properties DIRECTLY. Collecting them into a variable
+            # and expanding ${props} flattens the semicolon-separated LABELS
+            # string into separate arguments, so every test silently kept only
+            # its first label ("validation") and lost its truth class.
+            set_tests_properties(${name} PROPERTIES
+                TIMEOUT ${V_TIMEOUT} SKIP_RETURN_CODE 77 LABELS "${V_LABELS}")
+            if(V_SERIAL)
+                set_tests_properties(${name} PROPERTIES RUN_SERIAL TRUE)
+            endif()
+        endfunction()
+
+        # Builds a validation executable (always, see above); registration is
+        # dns_add_val's job.
+        function(dns_val_exe name)
+            cmake_parse_arguments(E "" "SOURCE" "DEFS" ${ARGN})
+            if(NOT E_SOURCE)
+                set(E_SOURCE tests/test_${name}.cpp)
+            endif()
+            add_executable(test_${name} ${E_SOURCE})
+            target_link_libraries(test_${name} PRIVATE dns_gpu)
+            target_compile_definitions(test_${name} PRIVATE ${DNS_VAL_DEFS}
+                DNS_BIN="$<TARGET_FILE:dns>" ${E_DEFS})
+            add_dependencies(test_${name} dns)
+        endfunction()
+
         add_executable(test_val_spindown tests/test_val_spindown.cpp)
         target_link_libraries(test_val_spindown PRIVATE dns_gpu)
-        add_test(NAME val_spindown COMMAND test_val_spindown)
-        set_tests_properties(val_spindown PROPERTIES TIMEOUT 120
-            SKIP_RETURN_CODE 77 LABELS "validation;analytic")
+        dns_add_val(val_spindown TARGET test_val_spindown TIMEOUT 120
+            LABELS "validation;analytic")
 
-        foreach(t val_cyl_re60 val_cyl_re100 val_cyl_re200 val_cyl_blockage)
-            add_executable(test_${t} tests/test_${t}.cpp)
-            target_link_libraries(test_${t} PRIVATE dns_gpu)
-            target_compile_definitions(test_${t} PRIVATE ${DNS_VAL_DEFS}
-                DNS_BIN="$<TARGET_FILE:dns>")
-            add_dependencies(test_${t} dns)
+        foreach(t val_cyl_re60 val_cyl_re100 val_cyl_re200 val_cyl_blockage
+                  val_comp_cyl val_sphere_re300 val_mesh_sphere
+                  val_comp_mesh_sphere)
+            dns_val_exe(${t})
         endforeach()
-        if(DNS_VALIDATION_BASELINE)
-        # QUARANTINED 2026-07-19 (masterplan_recompose §7): bands measured before the
-        # kBcTunnel corner unification, the 3-direction friction tally, and the FP64
-        # force tally. Re-enable after regenerating per docs/validation.md Tier C.
-            add_test(NAME val_cyl_re60 COMMAND test_val_cyl_re60)
-            set_tests_properties(val_cyl_re60 PROPERTIES TIMEOUT 300
-                SKIP_RETURN_CODE 77 LABELS "validation;anchor;literature")
-            add_test(NAME val_cyl_re100 COMMAND test_val_cyl_re100)
-            set_tests_properties(val_cyl_re100 PROPERTIES TIMEOUT 300
-                SKIP_RETURN_CODE 77 LABELS "validation;literature")
-        endif()
-
-        add_executable(test_val_tgv3d tests/test_val_tgv3d.cpp)
-        target_link_libraries(test_val_tgv3d PRIVATE dns_gpu)
-        target_compile_definitions(test_val_tgv3d PRIVATE ${DNS_VAL_DEFS}
-            DNS_BIN="$<TARGET_FILE:dns>"
+        dns_val_exe(val_tgv3d DEFS
             DNS_VALIDATION_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data/validation"
             DNS_SPECTRAL_REF="${CMAKE_CURRENT_SOURCE_DIR}/data/spectral_Re1600_512.gdiag")
-        add_dependencies(test_val_tgv3d dns)
-        if(DNS_VALIDATION_BASELINE)
-        # QUARANTINED 2026-07-19 (masterplan_recompose §7): bands measured before the
-        # kBcTunnel corner unification, the 3-direction friction tally, and the FP64
-        # force tally. Re-enable after regenerating per docs/validation.md Tier C.
-            add_test(NAME val_tgv3d_64 COMMAND test_val_tgv3d 64)
-            set_tests_properties(val_tgv3d_64 PROPERTIES TIMEOUT 300
-                SKIP_RETURN_CODE 77 LABELS "validation;anchor;literature")
-        endif()
 
-        add_executable(test_val_comp_cyl tests/test_val_comp_cyl.cpp)
-        target_link_libraries(test_val_comp_cyl PRIVATE dns_gpu)
-        target_compile_definitions(test_val_comp_cyl PRIVATE ${DNS_VAL_DEFS}
-            DNS_BIN="$<TARGET_FILE:dns>")
-        add_dependencies(test_val_comp_cyl dns)
-        add_test(NAME val_comp_cyl_re60 COMMAND test_val_comp_cyl re60)
-        set_tests_properties(val_comp_cyl_re60 PROPERTIES TIMEOUT 300
-            SKIP_RETURN_CODE 77 LABELS "validation;anchor")
-
-        add_executable(test_val_sphere_re300 tests/test_val_sphere_re300.cpp)
-        target_link_libraries(test_val_sphere_re300 PRIVATE dns_gpu)
-        target_compile_definitions(test_val_sphere_re300 PRIVATE ${DNS_VAL_DEFS}
-            DNS_BIN="$<TARGET_FILE:dns>")
-        add_dependencies(test_val_sphere_re300 dns)
-
-        add_executable(test_val_mesh_sphere tests/test_val_mesh_sphere.cpp)
-        target_link_libraries(test_val_mesh_sphere PRIVATE dns_gpu)
-        target_compile_definitions(test_val_mesh_sphere PRIVATE ${DNS_VAL_DEFS}
-            DNS_BIN="$<TARGET_FILE:dns>")
-        add_dependencies(test_val_mesh_sphere dns)
-
-        # Tier A: mesh insertion into the 3D compressible solver (short 64^3).
-        add_executable(test_val_comp_mesh_sphere tests/test_val_comp_mesh_sphere.cpp)
-        target_link_libraries(test_val_comp_mesh_sphere PRIVATE dns_gpu)
-        target_compile_definitions(test_val_comp_mesh_sphere PRIVATE ${DNS_VAL_DEFS}
-            DNS_BIN="$<TARGET_FILE:dns>")
-        add_dependencies(test_val_comp_mesh_sphere dns)
-        if(DNS_VALIDATION_BASELINE)
-        # QUARANTINED 2026-07-19 (masterplan_recompose §7): bands measured before the
-        # kBcTunnel corner unification, the 3-direction friction tally, and the FP64
-        # force tally. Re-enable after regenerating per docs/validation.md Tier C.
-            add_test(NAME val_comp_mesh_sphere COMMAND test_val_comp_mesh_sphere)
-            set_tests_properties(val_comp_mesh_sphere PROPERTIES TIMEOUT 600
-                SKIP_RETURN_CODE 77 LABELS "validation;analytic")
-        endif()
+        dns_add_val(val_cyl_re60  QUARANTINE LABELS "validation;anchor;literature")
+        dns_add_val(val_cyl_re100 QUARANTINE LABELS "validation;literature")
+        dns_add_val(val_tgv3d_64  QUARANTINE TARGET test_val_tgv3d ARG 64
+            LABELS "validation;anchor;literature")
+        dns_add_val(val_comp_cyl_re60 TARGET test_val_comp_cyl ARG re60
+            LABELS "validation;anchor")
+        dns_add_val(val_comp_mesh_sphere QUARANTINE TIMEOUT 600
+            LABELS "validation;analytic")
 
         if(DNS_HEAVY_VALIDATION)
-            if(DNS_VALIDATION_BASELINE)
-            # QUARANTINED 2026-07-19 (masterplan_recompose §7): bands measured before the
-            # kBcTunnel corner unification, the 3-direction friction tally, and the FP64
-            # force tally. Re-enable after regenerating per docs/validation.md Tier C.
-                add_test(NAME val_cyl_re200 COMMAND test_val_cyl_re200)
-                set_tests_properties(val_cyl_re200 PROPERTIES TIMEOUT 900
-                    SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
-                    LABELS "validation;literature;heavy")
-            endif()
-            if(DNS_VALIDATION_BASELINE)
-            # QUARANTINED 2026-07-19 (masterplan_recompose §7): bands measured before the
-            # kBcTunnel corner unification, the 3-direction friction tally, and the FP64
-            # force tally. Re-enable after regenerating per docs/validation.md Tier C.
-                add_test(NAME val_cyl_blockage COMMAND test_val_cyl_blockage)
-                set_tests_properties(val_cyl_blockage PROPERTIES TIMEOUT 900
-                    SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
-                    LABELS "validation;literature;heavy")
-            endif()
-            if(DNS_VALIDATION_BASELINE)
-            # QUARANTINED 2026-07-19 (masterplan_recompose §7): bands measured before the
-            # kBcTunnel corner unification, the 3-direction friction tally, and the FP64
-            # force tally. Re-enable after regenerating per docs/validation.md Tier C.
-                add_test(NAME val_tgv3d_128 COMMAND test_val_tgv3d 128)
-                set_tests_properties(val_tgv3d_128 PROPERTIES TIMEOUT 900
-                    SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
-                    LABELS "validation;anchor;literature;heavy")
-            endif()
-            add_test(NAME val_comp_cyl_re800 COMMAND test_val_comp_cyl re800)
-            set_tests_properties(val_comp_cyl_re800 PROPERTIES TIMEOUT 900
-                SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+            dns_add_val(val_cyl_re200 QUARANTINE SERIAL TIMEOUT 900
+                LABELS "validation;literature;heavy")
+            dns_add_val(val_cyl_blockage QUARANTINE SERIAL TIMEOUT 900
+                LABELS "validation;literature;heavy")
+            dns_add_val(val_tgv3d_128 QUARANTINE SERIAL TIMEOUT 900
+                TARGET test_val_tgv3d ARG 128
+                LABELS "validation;anchor;literature;heavy")
+            dns_add_val(val_comp_cyl_re800 SERIAL TIMEOUT 900
+                TARGET test_val_comp_cyl ARG re800
                 LABELS "validation;anchor;heavy")
-            if(DNS_VALIDATION_BASELINE)
-            # QUARANTINED 2026-07-19 (masterplan_recompose §7): bands measured before the
-            # kBcTunnel corner unification, the 3-direction friction tally, and the FP64
-            # force tally. Re-enable after regenerating per docs/validation.md Tier C.
-                add_test(NAME val_sphere_re300 COMMAND test_val_sphere_re300)
-                set_tests_properties(val_sphere_re300 PROPERTIES TIMEOUT 1200
-                    SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
-                    LABELS "validation;anchor;literature;heavy")
-            endif()
-            if(DNS_VALIDATION_BASELINE)
-            # QUARANTINED 2026-07-19 (masterplan_recompose §7): bands measured before the
-            # kBcTunnel corner unification, the 3-direction friction tally, and the FP64
-            # force tally. Re-enable after regenerating per docs/validation.md Tier C.
-                add_test(NAME val_mesh_sphere COMMAND test_val_mesh_sphere)
-                set_tests_properties(val_mesh_sphere PROPERTIES TIMEOUT 1200
-                    SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
-                    LABELS "validation;analytic;heavy")
-            endif()
+            dns_add_val(val_sphere_re300 QUARANTINE SERIAL TIMEOUT 1200
+                LABELS "validation;anchor;literature;heavy")
+            dns_add_val(val_mesh_sphere QUARANTINE SERIAL TIMEOUT 1200
+                LABELS "validation;analytic;heavy")
         endif()
     endif()
 endif()

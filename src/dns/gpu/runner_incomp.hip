@@ -9,6 +9,7 @@
 #include "dns/gpu/les.hpp"
 #include "dns/gpu/reductions.hpp"
 #include "dns/gpu/tunnel.hpp"
+#include "dns/gpu/internal/run_loop.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -21,12 +22,11 @@
 
 namespace dns::gpu {
 
+using internal::fail;
+using internal::finishTiming;
+
 namespace {
 
-std::unexpected<RunError> fail(int code, std::string m)
-{
-    return std::unexpected(RunError{code, std::move(m)});
-}
 
 // Quiet-start freestream schedule: smoothstep 0 -> 1 over [0, ramp]
 // (the runner_comp schedule, verbatim).
@@ -110,11 +110,15 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     auto tunnel = DeviceTunnelBc::make(gg, {r.uInf, r.open, r.pot, r.cx, r.cy,
                                             r.cz, 0.5 * r.D, r.floorRows,
                                             r.floorFrac});
-    const int nsF = r.fringeCells > 0
-                        ? r.fringeCells
-                        : std::clamp(int(0.1 * g.nx), 8, g.nx / 2 - 1);
-    const int axes = r.fringeAxes > 0 ? r.fringeAxes : (g.nz == 1 ? 2 : 3);
-    auto fringe = DeviceFringe::make(gg, {r.uInf, 0.5, nsF, axes});
+    // Both come RESOLVED from validate(); the runner does not second-guess
+    // them. (The fallbacks that used to live here disagreed with the
+    // validator's rule for a thin 3D box -- nz > 1 but too thin to hold a z
+    // band -- and were only dead because dns_main always passes the resolved
+    // values through.)
+    if (r.fringeCells <= 0 || (r.fringeAxes != 2 && r.fringeAxes != 3))
+        return fail(6, "far-field band width/axes were not resolved");
+    auto fringe =
+        DeviceFringe::make(gg, {r.uInf, 0.5, r.fringeCells, r.fringeAxes});
     if (!tunnel || !fringe) return fail(6, "far-field init failed");
 
     // Quiet start: the inlet/fringe target starts at rest and is
@@ -366,11 +370,7 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
                        + std::to_string(r.steadyTol)
                        + "); raise --ft or relax --steady");
     (void)hipDeviceSynchronize();
-    st.msPerStep = std::chrono::duration<double, std::milli>(
-                       std::chrono::steady_clock::now() - wall0)
-                       .count()
-                   / double(st.steps ? st.steps : 1);
-    out.setMsPerStep(st.msPerStep);
+    finishTiming(st, wall0, out);
     return st;
 }
 

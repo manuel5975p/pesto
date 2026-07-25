@@ -493,14 +493,23 @@ double maxAbsDivergenceCut(const Grid& g, const CutGeometry& cut,
     return m;
 }
 
-CutPoissonSolver::CutPoissonSolver(const Grid& g, const CutGeometry& cut, int maxIters,
-                                   double tol)
-    : g_(g), cut_(cut), maxIters_(maxIters), tol_(tol),
+CutPoissonSolver::CutPoissonSolver(const Grid& g, const CutGeometry& cut,
+                                   int maxIters, double tol, std::size_t nFluid)
+    : g_(g), cut_(cut), maxIters_(maxIters), tol_(tol), nFluid_(nFluid),
       r_(zeros(g)), d_(zeros(g)), q_(zeros(g))
 {
-    nFluid_ = 0;
-    for (double l : cut_.lambda) if (l > 0.0) ++nFluid_;
-    assert(nFluid_ > 0);
+}
+
+std::expected<CutPoissonSolver, std::string>
+CutPoissonSolver::make(const Grid& g, const CutGeometry& cut, int maxIters,
+                       double tol)
+{
+    std::size_t nFluid = 0;
+    for (double l : cut.lambda) if (l > 0.0) ++nFluid;
+    if (nFluid == 0)
+        return std::unexpected("cut geometry has no fluid cell: the body fills "
+                               "the whole box, or the cut failed to sample");
+    return CutPoissonSolver(g, cut, maxIters, tol, nFluid);
 }
 
 // y = -M(x): SPD on the fluid subspace modulo the constant mode.
@@ -558,8 +567,15 @@ int CutPoissonSolver::solve(const Scalar& rhs, Scalar& p, bool warmStart)
     double rr = fluidDot(r_, r_);
     const double target = tol_ * tol_ * double(nFluid_);
 
+    // A blown-up field makes rr NaN, and `NaN > target` is FALSE -- without
+    // this guard the loop exits at iteration 0 and solve() returns 0, which is
+    // indistinguishable from a perfect warm-started solve. Signal divergence
+    // the same way the GPU CG does (cutpoisson.hip): return maxIters_, which
+    // the callers already read as non-convergence (exit 8).
+    if (!std::isfinite(rr)) return maxIters_;
+
     int it = 0;
-    for (; it < maxIters_ && rr > target; ++it)
+    for (; it < maxIters_ && std::isfinite(rr) && rr > target; ++it)
     {
         apply(d_, q_);
         projectMean(q_);
@@ -574,6 +590,7 @@ int CutPoissonSolver::solve(const Scalar& rhs, Scalar& p, bool warmStart)
         for (std::size_t c = 0; c < g_.size(); ++c)
             d_[c] = r_[c] + beta * d_[c];
         rr = rrNew;
+        if (!std::isfinite(rr)) return maxIters_;   // diverged mid-solve
     }
     projectMean(p);
     return it;

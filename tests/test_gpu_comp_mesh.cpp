@@ -9,6 +9,7 @@
 #include "dns/meshsdf.hpp"
 #include "gpu_test_util.hpp"
 #include "mesh_test_util.hpp"
+#include "check.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -22,13 +23,9 @@ using std::numbers::pi;
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    std::printf("%-52s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) ++failures;
-}
+
 
 // Run a tapered-freestream sphere to time tEnd and return the drag force fx and
 // the transverse magnitude, for a given signed-distance body.
@@ -122,5 +119,5 @@ int main()
     check(rel < 0.15, "mesh cd matches analytic sphere within 15%");
     check(m.ftrans < 0.25 * std::abs(m.fx), "mesh transverse force small");
 
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return dnstest::gFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -12,7 +12,8 @@
 // case (on the generic sampled cut, not the exact closed-form one).
 #pragma once
 
-#include "dns/config.hpp"
+#include "dns/runmeta.hpp"
+#include "dns/sgs.hpp"
 #include "dns/cutcell.hpp"
 #include "dns/grid.hpp"
 #include "dns/sdf.hpp"
@@ -51,8 +52,15 @@ struct Scene
     SgsModel sgs = SgsModel::Smagorinsky;   // `sgs = "smag"|"sigma"`, Les only
     std::vector<SceneObject> objects;
 
-    // True when every object is z-invariant (no sphere, no mesh): the union
-    // sdf can then be sampled on one x-y layer and replicated.
+    // True when the union sdf may be sampled on ONE x-y layer and replicated.
+    // Excludes sphere, mesh AND cube. The cube exclusion is deliberately
+    // conservative, not an oversight: a scene cube does span the full z extent
+    // (scene.cpp builds RotatedCube{.., 0, lzFull}), so its SIGN is
+    // z-invariant -- but its sdf VALUE is not, near the two z faces, and the
+    // z-invariant path also short-circuits az to lambda. Including cubes would
+    // change a sampled cut, and a changed cut moves every measured
+    // coefficient. It costs sampling speed only; do not "fix" it without
+    // re-measuring.
     bool zInvariant() const;
     // Any genuinely 3D object present (sphere or mesh)? Such a scene needs
     // nz > 1 or it has no solid cells.
@@ -71,11 +79,9 @@ std::expected<Scene, std::string> parseScene(std::string_view toml);
 // before validate; a failure is an INPUT error (exit 3).
 std::expected<Scene, std::string> loadScene(const std::string& path);
 
-// Merges the scene's model selection into the RawConfig before validate():
-//   model les + no --les      -> raw.les = cs
-//   model les + agreeing --les-> keep
-//   any conflict              -> config error (strict, never silently resolved)
-std::expected<void, ConfigError> applySceneModel(const Scene&, RawConfig&);
+// (applySceneModel lives in config.cpp: merging a scene's model selection into
+// the RawConfig is a CONFIG-layer act. Having the geometry layer mutate the
+// parse layer inverted the documented order.)
 
 // The compiled scene: what buildSceneGeometry() hands to the runners.
 struct SceneGeometry

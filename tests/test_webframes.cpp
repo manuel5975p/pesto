@@ -2,6 +2,7 @@
 // round-trips within one LSB of the declared range, statics and per-frame
 // minmax are recorded, and the manifest is valid enough JSON to parse keys.
 #include "dns/webframes.hpp"
+#include "check.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -14,13 +15,9 @@
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    std::printf("%-56s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) ++failures;
-}
+
 
 std::string slurp(const std::string& p)
 {
@@ -96,5 +93,5 @@ int main()
     check(!q1.empty(), "second frame second field present");
 
     std::filesystem::remove_all(dir);
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return dnstest::gFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -200,4 +200,69 @@ exactLensCut(const Grid& g, const Lens& b, int ns)
     return cut;
 }
 
+// --- reference dynamic pressure ---------------------------------------------
+
+namespace {
+
+// A (j,k) stream column is blocked by 1 - min_i ax over the given i range,
+// weighted by the REFERENCE cross-section. See geometry.hpp for the measured
+// reason those are the right weights even on a clustered (--focal) mesh.
+double frontalArea(const Grid& g, const CutGeometry& cut, int i0, int i1,
+                   int j0, int j1, int k0, int k1)
+{
+    double a = 0.0;
+    for (int k = k0; k <= k1; ++k)
+        for (int j = j0; j <= j1; ++j)
+        {
+            double amin = 1.0;
+            for (int i = i0; i <= i1; ++i)
+                amin = std::min(amin, cut.ax[g.idx(i, j, k)]);
+            // nz == 1 is a real thickness (hz == 1, validator-enforced), not a
+            // degenerate axis to skip.
+            a += (1.0 - amin) * g.hy * g.hz;
+        }
+    return a;
+}
+
+} // namespace
+
+ReferenceQ referenceQIncomp(const Grid& g, const CutGeometry& cut,
+                            double rhoInf, double uInf)
+{
+    // Interior only: these grids carry a one-cell ghost ring.
+    const double a = frontalArea(g, cut, 2, g.nx - 2, 1, g.ny - 2, 1,
+                                 g.nz == 1 ? 1 : g.nz - 2);
+    ReferenceQ r;
+    r.area = a;
+    r.measured = a > 0.0;
+    r.q = 0.5 * rhoInf * uInf * uInf * a;
+    return r;
+}
+
+ReferenceQ referenceQComp(const Grid& g, const CutGeometry& cut, double rhoInf,
+                          double uInf, double D)
+{
+    // No ghost ring; the full extent is swept.
+    const double a = frontalArea(g, cut, 1, g.nx - 1, 0, g.ny - 1, 0, g.nz - 1);
+    const double span = g.nz > 1 ? double(g.nz) * g.hz : 1.0;  // per unit depth
+    ReferenceQ r;
+    r.area = a;
+    r.measured = a > 0.0;
+    r.q = r.measured ? 0.5 * rhoInf * uInf * uInf * (a / span)
+                     : 0.5 * rhoInf * uInf * uInf * D;
+    return r;
+}
+
+FloorRows measureFloorRows(const Grid& g, const CutGeometry& cut)
+{
+    const int k0 = g.nz == 1 ? 0 : 1;
+    int fr = 0;
+    while (fr + 1 <= g.ny - 2 && cut.ax[g.idx(1, fr + 1, k0)] == 0.0) ++fr;
+    if (fr + 1 <= g.ny - 2 && cut.ax[g.idx(1, fr + 1, k0)] < 0.5) ++fr;
+    FloorRows f;
+    f.rows = fr;
+    if (fr + 1 <= g.ny - 2) f.frac = cut.ax[g.idx(1, fr + 1, k0)];
+    return f;
+}
+
 } // namespace dns

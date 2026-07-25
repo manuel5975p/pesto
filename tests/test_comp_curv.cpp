@@ -4,6 +4,7 @@
 #include "dns/comp.hpp"
 #include "dns/curvmesh.hpp"
 #include "curv_test_util.hpp"
+#include "check.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -15,13 +16,9 @@ using namespace curvtest;
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    std::printf("%-58s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) ++failures;
-}
+
 
 void metricsUniform()
 {
@@ -123,7 +120,7 @@ void freestream()
             e = std::max({e, std::abs(r.rho[i]), std::abs(r.mx[i]),
                           std::abs(r.my[i]), std::abs(r.mz[i]),
                           std::abs(r.E[i])});
-        const double dt = c->stableDt(s);
+        const double dt = *c->stableDt(s);
         auto s2 = s;
         for (int it = 0; it < 5; ++it) c->step(s2, dt);
         double drift = 0.0;
@@ -147,7 +144,7 @@ void conservation()
     if (!c) { check(false, "distorted make"); return; }
     auto s = smoothState(mesh, 1.4);
     const auto t0 = totals(*c->curv, s);
-    const double dt = 0.5 * c->stableDt(s);
+    const double dt = 0.5 * *c->stableDt(s);
     for (int it = 0; it < 10; ++it) c->step(s, dt);
     const auto t1 = totals(*c->curv, s);
     double e = 0.0;
@@ -166,7 +163,7 @@ void twoDExact()
     const auto c = Comp::make(mesh, 1.4, 2e-3);
     if (!c) { check(false, "2D distorted make"); return; }
     auto s = vortexState(mesh, 5.0, 1.4);
-    const double dt = 0.9 * c->stableDt(s);
+    const double dt = 0.9 * *c->stableDt(s);
     for (int it = 0; it < 10; ++it) c->step(s, dt);
     bool mzZero = true, finite = true;
     for (std::size_t i = 0; i < g.size(); ++i) {
@@ -185,7 +182,7 @@ double vortexError(int n, double T)
     const auto c = Comp::make(mesh, 1.4, 0.0); // inviscid: pure advection
     if (!c) return -1.0;
     auto s = vortexState(mesh, 5.0, 1.4);
-    const int steps = int(std::ceil(T / (0.9 * c->stableDt(s))));
+    const int steps = int(std::ceil(T / (0.9 * *c->stableDt(s))));
     const double dt = T / steps;
     for (int it = 0; it < steps; ++it) c->step(s, dt);
     // Exact solution: the IC advected by (T, T), periodically wrapped.
@@ -405,5 +402,5 @@ int main()
     stretchedRemap();
     focalRemap();
     rejection();
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return dnstest::gFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

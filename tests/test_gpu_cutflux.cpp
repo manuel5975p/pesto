@@ -28,6 +28,7 @@
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/kernels.hpp"
 #include "dns/gpu/reductions.hpp"
+#include "check.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -38,13 +39,9 @@ using namespace dns;
 
 namespace {
 
-bool pass = true;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    std::printf("%-58s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) pass = false;
-}
+
 
 VectorField randomField(const Grid& g, unsigned seed, bool with_w)
 {
@@ -273,6 +270,6 @@ int main()
         check(kMax <= K0 * 1.02, "inviscid cut-flux energy never grows");
     }
 
-    std::printf("%s\n", pass ? "ALL OK" : "FAILURES");
-    return pass ? 0 : 1;
+    std::printf("%s\n", dnstest::gFailures == 0 ? "ALL OK" : "FAILURES");
+    return dnstest::finish();
 }

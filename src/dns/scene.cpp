@@ -301,34 +301,6 @@ std::expected<Scene, std::string> loadScene(const std::string& path)
     return sc;
 }
 
-std::expected<void, ConfigError> applySceneModel(const Scene& s, RawConfig& r)
-{
-    const bool userLes = r.given.contains("--les");
-    if (s.model == SceneModel::Les)
-    {
-        if (userLes && r.les != s.cs)
-            return std::unexpected(ConfigError{
-                2, "--les",
-                "the scene selects model les with cs=" + std::to_string(s.cs)
-                    + "; a conflicting --les was given (drop it or change the "
-                      "scene)"});
-        if (r.given.contains("--sgs") && r.sgs != s.sgs)
-            return std::unexpected(ConfigError{
-                2, "--sgs",
-                std::string("the scene selects sgs = ")
-                    + (s.sgs == SgsModel::Sigma ? "sigma" : "smag")
-                    + "; a conflicting --sgs was given (drop it or change the "
-                      "scene)"});
-        r.les = s.cs;
-        r.sgs = s.sgs;
-    }
-    else if (userLes && r.les > 0)
-        return std::unexpected(ConfigError{
-            2, "--les", "the scene selects model dns; drop --les or set the "
-                        "scene model to les"});
-    return {};
-}
-
 std::expected<SceneGeometry, std::string>
 buildSceneGeometry(const Grid& g, const Placement& ref, const Scene& scene)
 {

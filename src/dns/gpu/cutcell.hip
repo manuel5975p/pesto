@@ -4,6 +4,8 @@
 
 #include <rocprim/device/device_reduce.hpp>
 #include <rocprim/iterator/counting_iterator.hpp>
+#include "dns/gpu/internal/reduce.hpp"
+
 #include <rocprim/iterator/transform_iterator.hpp>
 
 #include <cassert>
@@ -13,6 +15,8 @@
 #include <vector>
 
 namespace dns::gpu {
+
+using internal::reduce;
 
 namespace {
 
@@ -79,31 +83,6 @@ __global__ void kMaskSolidFaces(std::size_t n, const Real* ax, const Real* ay,
 // modulo the constant mode; zero on solid cells.
 // One reduction over n items through a transform functor, double accumulator.
 // (Same pattern as reductions.hip; kept local so hipCUB/rocPRIM stays in TUs.)
-template <class F, class Op>
-double reduce(ReduceScratch& s, std::size_t n, F f, Op op, double init)
-{
-    assert(n <= std::size_t(INT_MAX));
-    const auto in =
-        rocprim::make_transform_iterator(rocprim::counting_iterator<int>(0), f);
-
-    std::size_t bytes = 0;
-    (void)rocprim::reduce(nullptr, bytes, in, s.out.data(), init, n, op);
-    if (s.tmp.size() < bytes)
-    {
-        auto grown = DeviceBuffer<unsigned char>::make(bytes);
-        // assert() is a comment in the Release build this project ships, so the
-        // old form dereferenced a valueless expected on an allocation failure.
-        // Leave the scratch untouched and let the reduction run on what we have:
-        // rocPRIM reports the shortfall rather than corrupting memory.
-        if (!grown) return init;
-        s.tmp = std::move(*grown);
-    }
-    bytes = s.tmp.size();
-    (void)rocprim::reduce(s.tmp.data(), bytes, in, s.out.data(), init, n, op);
-    double h = 0.0;
-    (void)hipMemcpy(&h, s.out.data(), sizeof(double), hipMemcpyDeviceToHost);
-    return h;
-}
 
 struct AbsDivCut
 {

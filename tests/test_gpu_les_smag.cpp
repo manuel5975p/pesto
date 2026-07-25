@@ -25,6 +25,7 @@
 #include "dns/cutcell.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/les.hpp"
+#include "check.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -33,14 +34,10 @@
 
 namespace {
 
-constexpr int skipExitCode = 77;
-bool pass = true;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    std::printf("%-52s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) pass = false;
-}
+constexpr int skipExitCode = 77;
+
 
 } // namespace
 
@@ -371,6 +368,6 @@ int main()
         check(std::isfinite(power) && power < 0, "sigma eddy diffusion dissipates");
     }
 
-    std::printf("%s\n", pass ? "ALL OK" : "FAILURES");
-    return pass ? 0 : 1;
+    std::printf("%s\n", dnstest::gFailures == 0 ? "ALL OK" : "FAILURES");
+    return dnstest::finish();
 }

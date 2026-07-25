@@ -5,6 +5,8 @@
 
 #include "dns/gpu/index.hpp"
 
+#include <cmath>
+
 namespace dns::gpu {
 
 struct Flux
@@ -94,12 +96,67 @@ struct CurvView
     const Real* invVol;
 };
 
+// d u_c / d x_e at the CENTRE of cell (i,j,k) on a curvilinear mesh, for the
+// SGS operators. Index-space central differences (dxi = 1) contracted with the
+// cell-centre inverse Jacobian; row d of dXi/dx is the average of the two
+// faces normal to axis d, which is where CurvMetrics stores it. On the
+// identity map this is exactly the uniform (u[+1] - u[-1]) / (2 h), and at
+// nz == 1 the k stencil wraps onto itself so every z column is exactly zero.
+// `vel(cell, comp)` supplies the velocity (primitives or m/rho).
+template <class T, class Vel>
+__host__ __device__ inline void curvVelGradCentre(const GpuGrid& g,
+                                                  const CurvView& m, int i,
+                                                  int j, int k, Vel vel,
+                                                  T gd[3][3])
+{
+    const std::size_t nb[3][2] = {
+        {gidx(g, i + 1, j, k), gidx(g, i - 1, j, k)},
+        {gidx(g, i, j + 1, k), gidx(g, i, j - 1, k)},
+        {gidx(g, i, j, k + 1), gidx(g, i, j, k - 1)}};
+    T dxi[3][3]; // dxi[c][d] = d vel_c / d xi_d
+    for (int c = 0; c < 3; ++c)
+        for (int d = 0; d < 3; ++d)
+            dxi[c][d] = T(0.5) * (T(vel(nb[d][0], c)) - T(vel(nb[d][1], c)));
+    const std::size_t here = gidx(g, i, j, k);
+    T Jc[3][3]; // Jc[d][e] = d xi_d / d x_e at the cell centre
+    for (int d = 0; d < 3; ++d) {
+        const std::size_t back =
+            gidx(g, i - (d == 0), j - (d == 1), k - (d == 2));
+        for (int e = 0; e < 3; ++e)
+            Jc[d][e] = T(0.5) * (T(m.Ji[d][d * 3 + e][here]) +
+                                 T(m.Ji[d][d * 3 + e][back]));
+    }
+    for (int c = 0; c < 3; ++c)
+        for (int e = 0; e < 3; ++e)
+            gd[c][e] = dxi[c][0] * Jc[0][e] + dxi[c][1] * Jc[1][e] +
+                       dxi[c][2] * Jc[2][e];
+}
+
+// SGS filter width squared of a curvilinear cell: the isotropic (dx dy dz)^(2/3)
+// written through the exact cell volume, and vol/hz at nz == 1 (the unit
+// z-depth carries no filter width). Both reduce to the uniform-mesh Delta^2 of
+// DeviceComp's constructor when the map is the identity.
+__host__ __device__ inline Real curvDelta2(const GpuGrid& g, Real invVol)
+{
+    const double vol = 1.0 / double(invVol);
+    if (g.nz > 1) {
+        const double c = cbrt(vol);
+        return Real(c * c);
+    }
+    return Real(vol / double(g.hz));
+}
+
 // Curvilinear counterpart of faceFlux: Un = u_avg . S, viscous gradients in
 // index space mapped through the face inverse Jacobian, flux carries the
 // face area (the rhs divides by the cell volume, not the spacing).
+// nut (optional, per-cell dynamic eddy viscosity for LES) enters exactly as in
+// faceFlux: face-averaged into mu, and scaled by kapScale = cp/Pr_t into
+// kappa. nut == nullptr reproduces the molecular curvilinear flux bit-for-bit.
 __device__ inline Flux faceFluxCurv(const GpuGrid& g, Real mu, Real kappa,
                                     PrimView q, CurvView m, int i, int j,
-                                    int k, int axis)
+                                    int k, int axis,
+                                    const Real* nut = nullptr,
+                                    Real kapScale = Real(0))
 {
     const std::size_t a = gidx(g, i, j, k);
     const int ox = axis == 0, oy = axis == 1, oz = axis == 2;
@@ -116,7 +173,13 @@ __device__ inline Flux faceFluxCurv(const GpuGrid& g, Real mu, Real kappa,
     const Real Un = um[0] * Sv[0] + um[1] * Sv[1] + um[2] * Sv[2];
     Flux f{rm * Un, rm * Un * um[0] + pm * Sv[0], rm * Un * um[1] + pm * Sv[1],
            rm * Un * um[2] + pm * Sv[2], rm * Un * em + pm * Un};
-    if (mu == Real(0)) return f;
+    Real muf = mu, kapf = kappa;
+    if (nut) {
+        const Real nf = Real(0.5) * (nut[a] + nut[b]);
+        muf += nf;
+        kapf += nf * kapScale;
+    }
+    if (muf == Real(0)) return f;
 
     // d{u,v,w,T}/dxi at the face (dxi = 1): normal compact, tangential the
     // same two-cell average of central differences as the Cartesian flux.
@@ -141,13 +204,13 @@ __device__ inline Flux faceFluxCurv(const GpuGrid& g, Real mu, Real kappa,
                         dxi[c][1] * m.Ji[axis][3 + cx][a] +
                         dxi[c][2] * m.Ji[axis][6 + cx][a];
     const Real divu = gr[0][0] + gr[1][1] + gr[2][2];
-    Real eflux = kappa * (gr[3][0] * Sv[0] + gr[3][1] * Sv[1] + gr[3][2] * Sv[2]);
+    Real eflux = kapf * (gr[3][0] * Sv[0] + gr[3][1] * Sv[1] + gr[3][2] * Sv[2]);
     Real* fm[3] = {&f.mx, &f.my, &f.mz};
     for (int c = 0; c < 3; ++c) {
         Real ts = Real(0); // (tau . S)_c
         for (int d = 0; d < 3; ++d)
-            ts += (mu * (gr[c][d] + gr[d][c]) -
-                   (c == d ? Real(2.0 / 3.0) * mu * divu : Real(0))) * Sv[d];
+            ts += (muf * (gr[c][d] + gr[d][c]) -
+                   (c == d ? Real(2.0 / 3.0) * muf * divu : Real(0))) * Sv[d];
         *fm[c] -= ts;
         eflux += um[c] * ts;
     }

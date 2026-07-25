@@ -3,6 +3,7 @@
 // swallowed (unknown flags became the grid size; atof garbage became a default).
 #include "dns/cli.hpp"
 #include "dns/config.hpp"
+#include "check.hpp"
 
 #include <cstdio>
 #include <string>
@@ -10,12 +11,9 @@
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const std::string& what)
-{
-    if (!ok) { std::printf("FAIL: %s\n", what.c_str()); ++failures; }
-}
+
 
 std::expected<dns::Case, dns::ConfigError> run(std::vector<std::string> args)
 {
@@ -136,7 +134,7 @@ int main()
     // Body-free box, y-stretch (curvilinear) and no-slip walls: the scope is
     // validator-enforced -- stretch needs compressible + --body none + --far
     // nscbc (the default; its terms evaluate the PointRemap) or an EXPLICIT
-    // --far sponge (never silently swapped), no LES, no --open.
+    // --far sponge (never silently swapped), no --open. LES is allowed.
     accepts("flow --physics compressible --body none --far sponge --n 128 "
             "--ny 128 --nz 1");
     accepts("flow --physics compressible --body none --far sponge --noslip "
@@ -153,8 +151,8 @@ int main()
             "--stretch 2 --n 128");                    // periodic has no y walls
     rejects("flow --physics compressible --body cylinder --far sponge "
             "--stretch 2 --n 512");                    // immersed body + stretch
-    rejects("flow --physics compressible --body none --far sponge --stretch 2 "
-            "--les 0.17 --n 128");                     // no LES on curv path
+    accepts("flow --physics compressible --body none --far sponge --stretch 2 "
+            "--les 0.17 --n 128 --ny 128 --nz 1");     // LES rides the curv path
     rejects("flow --physics compressible --body none --far sponge --stretch 2 "
             "--open --n 128");                         // open defeats the walls
     rejects("flow --body cylinder --noslip --n 512");  // noslip is compressible-only
@@ -195,8 +193,8 @@ int main()
               "growth ratio is bounded (~5%/cell at beta 2, ny 128)");
     }
 
-    // Focal clustering: same scope as --stretch (compressible, body-free,
-    // no LES, nscbc or explicit sponge), plus its own geometry rules -- the
+    // Focal clustering: same scope as --stretch (compressible, nscbc or
+    // explicit sponge; LES allowed), plus its own geometry rules -- the
     // blend must clear the domain faces so the map is the exact identity
     // there, and the discrete growth ratio is capped (the central flux has
     // no dissipation to absorb a sharp coarse/fine step).
@@ -215,8 +213,11 @@ int main()
             ",0,0 --n 256 --nz 1");   // plateau misses the body + guard band
     rejects("flow --physics compressible --body none --focal 2,4,2,4,0,0 "
             "--stretch 2 --n 128");                     // two curvilinear meshes
-    rejects("flow --physics compressible --body none --focal 2,4,2,4,0,0 "
-            "--les 0.17 --n 128");                      // no LES on curv path
+    accepts("flow --physics compressible --body none --focal 2,4,2,4,0,0 "
+            "--les 0.17 --n 128 --ny 128 --nz 1");      // LES rides the curv path
+    accepts("flow --physics compressible --body cube --focal auto "
+            "--focal-blend 0.8 --re 2000 --les 1.35 --sgs sigma "
+            "--nscbc-strip 4 --n 128 --nz 128");
     rejects("flow --physics compressible --body none --focal 2,4,2,4,0,0 "
             "--open --n 128");
     rejects("flow --physics compressible --body none --far periodic "
@@ -272,6 +273,39 @@ int main()
         check(k && k->grid.nx == 512, "compressible --n is the interior extent");
     }
 
-    if (failures == 0) std::printf("cli: ok\n");
-    return failures == 0 ? 0 : 1;
+    // --cut-flux scope. The compressible rejection is the invariant the
+    // deleted compressible aperture path relies on: it DIVERGES near the body
+    // (KG split flux loses its KE property under per-face area weighting,
+    // measured twice 2026-07-23). If this rejection is ever relaxed, the
+    // implementation has to come back with it.
+    {
+        auto ok = run(split("flow --body cylinder --cut-flux --n 64 --nz 1"));
+        check(ok.has_value(), "--cut-flux is accepted incompressibly");
+        auto comp = run(split("flow --physics compressible --body cylinder "
+                              "--cut-flux --n 64 --nz 1"));
+        check(!comp && comp.error().field == "--cut-flux",
+              "--cut-flux is REJECTED under --physics compressible");
+        // (--body none is compressible-only, so the "no body" branch of the
+        // --cut-flux guard is unreachable from the CLI today; the compressible
+        // rejection above fires first.)
+    }
+
+    // --penalize scope: the three constraints at config.cpp's penalize block.
+    {
+        auto ok = run(split("flow --body cylinder --penalize 0.01 --n 64 --nz 1"));
+        check(ok.has_value(), "--penalize is accepted with a body");
+        auto neg = run(split("flow --body cylinder --penalize -1 --n 64 --nz 1"));
+        check(!neg && neg.error().field == "--penalize",
+              "--penalize must be finite and >= 0");
+        auto nobody = run(split("flow --physics compressible --body none "
+                                "--penalize 0.01 --n 64 --nz 1"));
+        check(!nobody && nobody.error().field == "--penalize",
+              "--penalize without a body is rejected");
+        auto str = run(split("flow --physics compressible --body cylinder "
+                             "--penalize 0.01 --stretch 2 --n 64 --nz 1"));
+        check(!str.has_value(), "--penalize with --stretch is rejected");
+    }
+
+    if (dnstest::gFailures == 0) std::printf("cli: ok\n");
+    return dnstest::finish();
 }

@@ -2,7 +2,8 @@
 
 #include "dns/curvmesh.hpp"
 #include "dns/gpu/comp.hpp"
-#include "dns/gpu/derived_remap.hpp"
+#include "dns/gpu/internal/derived_remap.hpp"
+#include "dns/gpu/internal/run_loop.hpp"
 #include "dns/gpu/comp_far.hpp"
 #include "dns/gpu/comp_ghost.hpp"
 #include "dns/gpu/comp_nscbc.hpp"
@@ -21,12 +22,11 @@
 
 namespace dns::gpu {
 
+using internal::fail;
+using internal::finishTiming;
+
 namespace {
 
-std::unexpected<RunError> fail(int code, std::string m)
-{
-    return std::unexpected(RunError{code, std::move(m)});
-}
 
 // Quiet-start freestream schedule: smoothstep 0 -> 1 over [0, ramp].
 double rampFrac(double t, double ramp)
@@ -68,8 +68,9 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
 
     // Curvilinear mesh: nodes from the PointRemap, finite-volume tables
     // derived from the nodes (discrete face closure), solver on the
-    // curvilinear path. The validator guarantees les == 0 here (the curv
-    // overload has no LES) and that at most one of the two is active.
+    // curvilinear path. LES rides along on both paths (the SGS operators read
+    // the mesh metrics); the validator guarantees at most one of the two
+    // meshes is active.
     std::optional<CurvMetrics> mtr;
     if (stretched)
     {
@@ -83,30 +84,12 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         if (!m) return fail(2, "focal mesh: " + m.error());
         mtr = std::move(*m);
     }
-    auto dev = mtr ? DeviceComp::make(*mtr, r.gamma, r.mu)
+    auto dev = mtr ? DeviceComp::make(*mtr, r.gamma, r.mu, r.les, r.sgs)
                    : DeviceComp::make(g, r.gamma, r.mu, r.les, r.sgs);
     auto ds = DeviceCompState::make(g.size());
     auto red = ReduceScratch::make();
     if (!dev || !ds || !red) return fail(6, "GPU allocation failed");
 
-    if (r.cutFlux)
-    {
-        // Solid classification MUST match the ghost fill's: sdf < 0 at the
-        // cell centre. Fluid<->solid faces then keep the full ghost-closure
-        // flux and only genuinely open partial faces get apertured.
-        std::vector<unsigned char> solidC(g.size());
-        for (int k = 0; k < g.nz; ++k)
-            for (int j = 0; j < g.ny; ++j)
-                for (int i = 0; i < g.nx; ++i)
-                    solidC[g.idx(i, j, k)] =
-                        sdf((i + 0.5) * g.hx, (j + 0.5) * g.hy,
-                            (k + 0.5) * g.hz) < 0.0;
-        auto hostFlag = buildCutFlag(g, *r.cutGeom);
-        // NSCBC/far rows and strips own the boundary; keep well clear of them.
-        clearBoundaryFlag(g, hostFlag, std::max(4, r.nscbcStrip + 2));
-        if (!dev->attachCutFlux(*r.cutGeom, hostFlag, solidC))
-            return fail(6, "GPU allocation failed");
-    }
     // --penalize: device lambda for the band decay (DeviceCutGeometry::make
     // reuses the standard upload; the aperture buffers ride along unused).
     std::optional<DeviceCutGeometry> dPen;
@@ -122,8 +105,10 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     fc.uInf = r.uInf;
     fc.pInf = r.pInf;
     fc.gamma = r.gamma;
-    fc.ns = r.spongeCells > 0 ? r.spongeCells
-                              : std::clamp(int(0.1 * g.nx), 8, g.nx / 2 - 1);
+    // Resolved by validate(); not re-derived here (see runner_incomp).
+    if (r.spongeCells <= 0)
+        return fail(6, "far-field band width was not resolved");
+    fc.ns = r.spongeCells;
     fc.openY = r.open;
     fc.openZ = r.open && g.nz > 1;
     fc.noslipY = r.noslipY;
@@ -209,6 +194,11 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     const char* vortName = r.signedVorticity ? "vort" : "curl";
     std::vector<Real> hVort(g.size()), hSpeed(g.size());
     std::vector<float> vortF(g.size()), speedF(g.size());
+    // Display raster: on a clustered mesh the frame arrays are resampled onto
+    // the uniform physical grid RunOutput was built with (dns/framemap.hpp).
+    const bool resample = r.raster && r.raster->active();
+    const std::size_t rn = resample ? r.raster->renderGrid().size() : 0;
+    std::vector<float> vortR(rn), speedR(rn);
     auto writeFrame = [&](double t) {
         primitiveVelocity(gg, ds->rho, ds->mx, ds->my, ds->mz, *du, *dv, *dw);
         if (r.signedVorticity && stretched)
@@ -226,13 +216,21 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
             vortF[c] = float(hVort[c]);
             speedF[c] = float(hSpeed[c]) - uOff;
         }
+        const float* vortOut = vortF.data();
+        const float* speedOut = speedF.data();
+        if (resample)
+        {
+            r.raster->apply(vortF.data(), vortR.data());
+            r.raster->apply(speedF.data(), speedR.data());
+            vortOut = vortR.data();
+            speedOut = speedR.data();
+        }
         const FrameField ff[2]{
-            {vortName, vortF.data(), 0, vortScale, r.signedVorticity,
+            {vortName, vortOut, 0, vortScale, r.signedVorticity,
              r.vortAsinh && r.signedVorticity ? vortScale / 32.0f : 0.0f},
             r.speedDelta
-                ? FrameField{"dspeed", speedF.data(), 0, float(0.6 * r.uInf),
-                             true}
-                : FrameField{"speed", speedF.data(), 0, speedMax, false}};
+                ? FrameField{"dspeed", speedOut, 0, float(0.6 * r.uInf), true}
+                : FrameField{"speed", speedOut, 0, speedMax, false}};
         if (auto e = out.frame(t, FrameViews{ff}); !e)
             std::fprintf(stderr, "frame write failed: %s\n", e.error().c_str());
     };
@@ -251,18 +249,14 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
 
     while (t < r.tEnd)
     {
-        if (++sinceDt >= r.dtRecompute)
-        {
-            const double s = dev->stableDt(*ds, *red, r.cfl);
-            if (!std::isfinite(s) || s <= 0)
-                return fail(7, "stable dt is not finite and positive "
-                               "(the state diverged)");
-            dtStab = r.dtMargin * s;
-            sinceDt = 0;
-        }
+        // 1e-6: the compressible collapse threshold. NOT shared with the
+        // channel's 1e-9 -- the dt scales differ.
+        if (auto e = internal::recomputeDt(
+                sinceDt, dtStab, r.dtRecompute, r.dtMargin, 1e-6,
+                [&] { return dev->stableDt(*ds, *red, r.cfl); });
+            !e)
+            return fail(7, e.error());
         const double dt = std::min(r.tEnd - t, dtStab);
-        if (dtStab < 1e-6)
-            return fail(7, "dt collapsed -- the state diverged");
 
         penDt = dt / 3.0;
         dev->step(*ds, Real(dt));
@@ -315,9 +309,6 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
             }
             lastLog = st.steps;
         }
-        // No frames during the quiet-start ramp: the field is near-zero by
-        // construction (freestream still accelerating from rest), so every
-        // frame would render as the bottom of both colour maps.
         // The output schedule is independent of the quiet-start ramp: frames
         // during spin-up show the (physical, ramped) transient. The ramp gate
         // that used to suppress them hid the first `ramp` time units of every
@@ -327,11 +318,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
             writeFrame(t);
     }
     (void)hipDeviceSynchronize();
-    st.msPerStep = std::chrono::duration<double, std::milli>(
-                       std::chrono::steady_clock::now() - wall0)
-                       .count()
-                   / double(st.steps ? st.steps : 1);
-    out.setMsPerStep(st.msPerStep);
+    finishTiming(st, wall0, out);
     return st;
 }
 

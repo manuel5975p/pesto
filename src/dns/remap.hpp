@@ -97,6 +97,17 @@ struct TanhStretchY
         return beta * (1.0 - t * t) / tanh(beta);
     }
 
+    // Exact inverse of mapY (host-side; the display raster of a stretched run
+    // needs it). beta == 0 is the identity, and the atanh argument is clamped
+    // so the y extremes cannot produce an infinity.
+    double invMapY(double y) const
+    {
+        if (beta <= 0.0) return y;
+        const double t = tanh(beta) * (2.0 * y / ly - 1.0);
+        const double tc = fmin(fmax(t, -1.0 + 1e-15), 1.0 - 1e-15);
+        return 0.5 * ly * (atanh(tc) / beta + 1.0);
+    }
+
     DNS_HD void map(const double X[3], double x[3]) const
     {
         x[0] = X[0];

@@ -74,4 +74,25 @@ DNS_HD double sigmaDsigma(const T gd[3][3])
     return s3 * fmax(s1 - s2, 0.0) * fmax(s2 - s3, 0.0) / (s1 * s1);
 }
 
+// The SGS rate that multiplies (C Delta)^2 to give nut / rho, for whichever
+// model `sigma` selects:  sigma ? D_sigma(gd) : |S| = sqrt(2 S:S).
+//
+// Templated on T to stay bit-identical at every call site: the nut kernels
+// accumulate in Real (float) and the dt-limit reducers in double, and
+// T(0.5) / T(2) / sqrt(T) reproduce each verbatim. Do NOT simplify to
+// double-only -- that changes the float sites' rounding, hence nut, hence dt,
+// hence every trajectory.
+template <class T>
+DNS_HD T sgsRate(int sigma, const T gd[3][3])
+{
+    if (sigma) return T(sigmaDsigma(gd));
+    T s2 = T(0);
+    for (int c = 0; c < 3; ++c)
+        for (int d = 0; d < 3; ++d) {
+            const T sij = T(0.5) * (gd[c][d] + gd[d][c]);
+            s2 += T(2) * sij * sij;
+        }
+    return sqrt(s2);
+}
+
 } // namespace dns

@@ -4,6 +4,7 @@
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_ghost.hpp"
 #include "gpu_test_util.hpp"
+#include "check.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -15,13 +16,9 @@ using std::numbers::pi;
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    std::printf("%-52s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) ++failures;
-}
+
 
 } // namespace
 
@@ -113,5 +110,5 @@ int main()
         std::printf("cd (FP64 tally) = %.17g\n", cd);
     }
 
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return dnstest::gFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

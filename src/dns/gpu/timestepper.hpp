@@ -29,9 +29,8 @@ public:
     // Advance U by dt (SSP-RK3, projection after each stage). Pre: dt > 0.
     void step(DeviceField& U, double dt);
 
-    // Shared handles for app-side statistics on the same device state.
+    // Shared handle for app-side statistics on the same device state.
     const GpuGrid& grid() const { return g_; }
-    ReduceScratch& reduceScratch() { return red_; }
 
 private:
     TimeStepper(GpuGrid g, StepParams p, DevicePoissonSolver poisson,

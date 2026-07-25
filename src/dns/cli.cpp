@@ -182,7 +182,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--planes", &c.planes}, {"--png-down", &c.pngDown}});
 
     int physicsSel = int(c.physics), farSel = int(c.far), backendSel = int(c.backend),
-        poissonSel = int(c.poisson), sgsSel = int(c.sgs);
+        sgsSel = int(c.sgs);
     std::vector<EnumOpt> enums{
         {"--backend", {{"cpu", int(Backend::Cpu)}, {"gpu", int(Backend::Gpu)},
                        {"auto", int(Backend::Auto)}}, &backendSel},
@@ -209,10 +209,6 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                          {{"linear", 0}, {"asinh", 1}}, &c.vortMap});
         enums.push_back({"--speed-map",
                          {{"abs", 0}, {"delta", 1}}, &c.speedMap});
-        enums.push_back({"--poisson",
-                         {{"auto", int(PoissonKind::Auto)}, {"fft", int(PoissonKind::Fft)},
-                          {"dct", int(PoissonKind::Dct)}, {"cg", int(PoissonKind::Cg)}},
-                         &poissonSel});
     }
     if (c.sub == Subcommand::Channel)
         enums.push_back({"--wall", {{"isothermal", 1}, {"adiabatic", 0}},
@@ -320,7 +316,6 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     c.backend = Backend(backendSel);
     c.physics = Physics(physicsSel);
     c.far = FarField(farSel);
-    c.poisson = PoissonKind(poissonSel);
     c.sgs = SgsModel(sgsSel);
     if (!c.given.contains("--out")) c.out = string(sub);
     return c;
@@ -490,6 +485,7 @@ BODY (exactly one; required)
 
   --aspect A         lens width / height, A > 1                    [3.5]
   --dimples N        golf dimples, 0 = smooth                        [0]
+                     (cylinder -> 2D disks, sphere -> 3D caps)
   --bumps N          floor trip spikes: N triangular teeth (height
                      --bump-h, base = height), evenly pitched over
                      10%..75% of the plate (smooth development length
@@ -499,7 +495,6 @@ BODY (exactly one; required)
                      when the teeth poke through the local boundary
                      layer (k/delta ~ 1); 8h buried under a
                      quiet-start BL stays laminar (measured).         [8]
-                     (cylinder -> 2D disks, sphere -> 3D caps)
   --scale S          mesh scale; 0 = fit max extent to D             [0]
   --robust           mesh sign by winding number (leaky meshes)
   --cut-flux         apertured momentum fluxes: the wall enters
@@ -513,8 +508,10 @@ BODY (exactly one; required)
                      SMOOTH along the surface (lambda = exact fluid
                      fraction) -- damps the jagged staircase slip
                      that --cut-flux's flux weighting cannot reach.
-                     Dissipative and local; drained momentum is not
-                     yet in the cd budget (cd reads slightly low).
+                     Dissipative and local; the drained momentum is
+                     NOT in the cd budget -- measured, it HALVES cdf.
+                     Never use it when friction drag is the physics
+                     you are after.
                      Composable with --cut-flux. Try ETA ~ h/uInf. [0]
   --pitch DEG        DEPRECATED: rotates RAW MODEL AXES, not aircraft
   --yaw DEG          angles. Bake attitude with build/orient.py and
@@ -581,8 +578,8 @@ MESH & WALLS (compressible)
                      B in (0,4]: cells shrink toward both y walls with
                      bounded growth; 0 = uniform. Requires --body none
                      and --far nscbc (default; the characteristic terms
-                     evaluate the remap) or an explicit --far sponge;
-                     no --les. --dry-run
+                     evaluate the remap) or an explicit --far sponge.
+                     --les works here (per-cell Delta). --dry-run
                      prints the resolved first-cell height + growth
                      ratio (the acoustic dt shrinks with the wall
                      cell).                                            [0]
@@ -604,8 +601,12 @@ MESH & WALLS (compressible)
                      filesystem. With a body the plateau must contain it
                      plus a 3-fine-cell guard, so the ghost wall's
                      mirror stencil never straddles the blend.
-                     Compressible, no --les, --far nscbc or explicit
-                     sponge; mutually exclusive with --stretch.
+                     Compressible, --far nscbc or explicit sponge;
+                     mutually exclusive with --stretch. --les is
+                     allowed: the SGS filter width is the cell's OWN
+                     Delta = vol^(1/3), so the fine plateau filters at
+                     the fine spacing and the coarse far field at the
+                     coarse one.
                      --dry-run prints the per-axis fine/coarse spacings,
                      the max adjacent growth ratio and the dt penalty.
   --focal-ratio R    coarse/fine cell-size ratio, (1,16].            [4]
@@ -636,7 +637,6 @@ START-UP
                      without it.                                   [0.05]
 
 SOLVER
-  --poisson auto|fft|dct|cg    pressure solve; auto follows --far  [auto]
   --tol RMS          CG per-cell RMS residual target (incomp)      [1e-4]
   --max-iters N      CG iteration cap                               [500]
   --dt-recompute N   steps between stableDt recomputes (comp)        [16]
@@ -660,8 +660,13 @@ RUN LENGTH
                      the finest resolution. 1 = off.                  [1]
 
 OUTPUT (--emit is repeatable; default = stats,bin)
-  --emit stats       <out>_stats.csv (t,dt,K,cd,cl,cdf,cfl,maxDiv,
-                     pcgIters,resid)
+  --emit stats       <out>_stats.csv -- the schema depends on --physics:
+                       incompressible: t,dt,K,cd,cl,cdf,cfl,maxDiv,
+                                       pcgIters,resid
+                       compressible:   t,dt,cd,cl,cs,wmax
+                     (dns channel writes a third schema; see its help.)
+                     Parse by COLUMN NAME from the header row, never
+                     by index.
   --emit bin         <out>_{vort,speed,mask}.bin float32 mid-plane
   --emit png         png_<out>/{vort,speed}_%05d.png  (nz > 1: the centre
                      z-plane)

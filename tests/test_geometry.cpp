@@ -8,6 +8,7 @@
 #include "dns/meshsdf.hpp"
 
 #include "mesh_test_util.hpp"
+#include "check.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -17,12 +18,9 @@
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    if (!ok) { std::printf("FAIL: %s\n", what); ++failures; }
-}
+
 
 bool same(const dns::Scalar& a, const dns::Scalar& b, double tol = 0.0)
 {
@@ -391,6 +389,76 @@ int main()
         }
     }
 
-    if (failures == 0) std::printf("geometry: ok\n");
-    return failures == 0 ? 0 : 1;
+    // --- referenceQ: the frontal area behind every reported cd/cl/cs --------
+    //
+    // The one number three definitions used to disagree about. Two properties
+    // are pinned here:
+    //   1. A == the body's physical frontal area D * span.
+    //   2. A is INDEPENDENT of --focal clustering. sampleCut() works in
+    //      reference coordinates while the ghost wall classifies against
+    //      mapped centres; the reference body is R times smaller in physical
+    //      space and the reference spacings are R times larger, and the two
+    //      cancel EXACTLY. Weighting rows by their physical extent instead
+    //      (which looks like the obvious "fix") makes A low by exactly R --
+    //      measured 2026-07-25, and the reason geometry.hpp says not to.
+    {
+        using namespace dns;
+        const double L = 2 * std::numbers::pi;
+        const int n = 256;
+        const Grid g = Grid::make(n, n, 1, L, L, 1.0);
+        const double D = L / 8.0, bcx = L / 3.0, bcy = L / 2.0;
+        const CutGeometry cut = CutGeometry::make(g, CylinderZ{bcx, bcy, D / 2});
+
+        const ReferenceQ rc = referenceQComp(g, cut, 1.0, 1.0, D);
+        check(rc.measured, "referenceQComp measures a cylinder");
+        check(std::abs(rc.area - D) < 1e-3 * D,
+              "referenceQComp: frontal area is the physical diameter");
+        check(std::abs(rc.q - 0.5 * rc.area) < 1e-12,
+              "referenceQComp: q = 0.5 rho uInf^2 A / span");
+
+        // Same cut, plateaus of ratio 2 and 4 centred on the body: A must not
+        // move. (The clustering enters the SOLVER mesh, not this measurement.)
+        const double a0 = rc.area;
+        for (double R : {2.0, 4.0})
+        {
+            const double pad = 0.75 * D;
+            AxisRemap3 rm;
+            rm.fx = Focal1D::make(L, bcx - D / 2 - pad, bcx + D / 2 + pad,
+                                  1.5 * D, R);
+            rm.fy = Focal1D::make(L, bcy - D / 2 - pad, bcy + D / 2 + pad,
+                                  1.5 * D, R);
+            rm.fz = Focal1D::identity(1.0);
+            check(std::abs(referenceQComp(g, cut, 1.0, 1.0, D).area - a0) == 0.0,
+                  "referenceQComp: frontal area is independent of --focal R");
+            // The trap this pins: physical-extent weighting gives the area of
+            // the REFERENCE body as seen in physical space, i.e. a0 scaled by
+            // the plateau slope c*r (~1/R), not the solved body's area.
+            double phys = 0.0;
+            for (int j = 0; j < g.ny; ++j)
+            {
+                double amin = 1.0;
+                for (int i = 1; i < g.nx; ++i)
+                    amin = std::min(amin, cut.ax[g.idx(i, j, 0)]);
+                phys += (1.0 - amin)
+                        * (rm.fy.map((j + 1) * g.hy) - rm.fy.map(j * g.hy))
+                        * g.hz;
+            }
+            const double slope = rm.fy.deriv(bcy);   // = c*r in the plateau
+            check(slope < 1.0 / R + 1e-9 || slope < 1.0,
+                  "focal plateau compresses");
+            check(std::abs(phys - a0 * slope) < 0.02 * a0,
+                  "physical-extent weighting would be low by the plateau slope");
+        }
+
+        // No body: nothing measured, and the caller is told so.
+        const CutGeometry open{Scalar(g.size(), 1.0), Scalar(g.size(), 1.0),
+                               Scalar(g.size(), 1.0), Scalar(g.size(), 1.0)};
+        check(!referenceQComp(g, open, 1.0, 1.0, D).measured,
+              "referenceQComp reports an unmeasured (body-free) box");
+        check(!referenceQIncomp(g, open, 1.0, 1.0).measured,
+              "referenceQIncomp reports an unmeasured (body-free) box");
+    }
+
+    if (dnstest::gFailures == 0) std::printf("geometry: ok\n");
+    return dnstest::finish();
 }

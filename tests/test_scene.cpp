@@ -3,6 +3,7 @@
 #include "dns/cli.hpp"
 #include "dns/config.hpp"
 #include "dns/scene.hpp"
+#include "check.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -12,12 +13,9 @@
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    if (!ok) { std::printf("FAIL: %s\n", what); ++failures; }
-}
+
 
 const char* kTandem = R"(
 [model]
@@ -241,7 +239,7 @@ int main()
     testConfigTokens();
     testCliAndValidate();
     testBuildGeometry();
-    if (failures) { std::printf("%d failure(s)\n", failures); return 1; }
+    if (dnstest::gFailures) { std::printf("%d failure(s)\n", dnstest::gFailures); return 1; }
     std::printf("ok\n");
     return 0;
 }

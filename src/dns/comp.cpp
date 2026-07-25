@@ -28,7 +28,7 @@ Prim primitives(const Comp& c, const CompState& s)
     q.p.resize(n);
     q.T.resize(n);
     for (std::size_t i = 0; i < n; ++i) {
-        assert(s.rho[i] > 0.0);
+        // rho > 0 is stableDt()'s checked precondition (see comp.hpp).
         q.u[0][i] = s.mx[i] / s.rho[i];
         q.u[1][i] = s.my[i] / s.rho[i];
         q.u[2][i] = s.mz[i] / s.rho[i];
@@ -158,9 +158,11 @@ std::expected<Comp, std::string> Comp::make(const CurvMesh& mesh, double gamma,
     return c;
 }
 
+// Precondition rho > 0, CHECKED by stableDt() before every step (an assert
+// here would be an input guard that vanishes in Release, and this is called
+// once per cell in the inner loops).
 double Comp::pressure(double rho, double mx, double my, double mz, double E) const
 {
-    assert(rho > 0.0);
     return (gamma - 1.0) * (E - 0.5 * (mx * mx + my * my + mz * mz) / rho);
 }
 
@@ -268,17 +270,29 @@ void Comp::step(CompState& s, double dt) const
     axpy(s, 1.0 / 3.0, q2, 2.0 / 3.0, k, 2.0 / 3.0 * dt, s);
 }
 
-double Comp::stableDt(const CompState& s, double cfl) const
+std::expected<double, std::string> Comp::stableDt(const CompState& s,
+                                                  double cfl) const
 {
     // Per-axis (|u| + c)/h; degenerate axes impose no constraint. On a
     // curvilinear mesh the width is 1/aov and |u| bounds the face-normal
     // speed, so the curvilinear dt is conservative by construction.
+    // rho <= 0 or p <= 0 means the field has already blown up. A USER can
+    // cause that (any diverging run), so it is reported, not asserted: in
+    // Release the assert vanished and sqrt(gamma*p/r) with p < 0 produced a
+    // NaN dt, which the time loop then never recovered from -- silent
+    // non-termination instead of exit 7.
     double wmax = 0.0, rhomin = s.rho[0];
     for (std::size_t i = 0; i < g.size(); ++i) {
-        assert(s.rho[i] > 0.0);
-        const double p = pressure(s.rho[i], s.mx[i], s.my[i], s.mz[i], s.E[i]);
-        assert(p > 0.0);
         const double r = s.rho[i];
+        if (!(r > 0.0) || !std::isfinite(r))
+            return std::unexpected("compressible state diverged: density is "
+                                   + std::to_string(r) + " at cell "
+                                   + std::to_string(i));
+        const double p = pressure(r, s.mx[i], s.my[i], s.mz[i], s.E[i]);
+        if (!(p > 0.0) || !std::isfinite(p))
+            return std::unexpected("compressible state diverged: pressure is "
+                                   + std::to_string(p) + " at cell "
+                                   + std::to_string(i));
         const double c = std::sqrt(gamma * p / r);
         double w = 0.0;
         if (curv) {
@@ -305,6 +319,8 @@ double Comp::stableDt(const CompState& s, double cfl) const
         }
         dt = std::min(dt, 0.25 * h * h * rhomin / mu);
     }
+    if (!(dt > 0.0) || !std::isfinite(dt))
+        return std::unexpected("compressible stable dt is not positive-finite");
     return dt;
 }
 

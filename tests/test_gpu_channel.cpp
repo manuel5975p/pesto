@@ -10,6 +10,7 @@
 #include "dns/gpu/reductions.hpp"
 #include "dns/remap.hpp"
 #include "gpu_test_util.hpp"
+#include "check.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -20,13 +21,9 @@ using namespace dns;
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    std::printf("%-58s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) ++failures;
-}
+
 
 Grid channelGrid(int nx, int nyFluid, int nz, double beta, double lx, double lz)
 {
@@ -220,7 +217,7 @@ int main()
     meshGeometry();
     wallMirror();
     laminarPoiseuille();
-    if (failures) { std::printf("%d failures\n", failures); return 1; }
+    if (dnstest::gFailures) { std::printf("%d failures\n", dnstest::gFailures); return 1; }
     std::printf("all ok\n");
     return 0;
 }

@@ -20,6 +20,8 @@ struct CurvMetrics;
 
 namespace dns::gpu {
 
+struct CurvView; // dns/gpu/internal/comp_flux.hpp (HIP TUs only)
+
 // Conservative state on device; each buffer has g.size() cells.
 struct DeviceCompState
 {
@@ -45,6 +47,10 @@ struct DeviceCurv
 
     // m must come from CurvMetrics::build (already validated).
     static std::expected<DeviceCurv, hipError_t> make(const CurvMetrics& m);
+
+    // The metric tables as a by-value kernel view.
+    // HIP TUs only (CurvView lives in gpu/internal/comp_flux.hpp).
+    CurvView view() const;
 };
 
 // Owns RK3 / primitive scratch; periodic domain (BCs via the stage hook).
@@ -64,24 +70,24 @@ public:
 
     // Curvilinear variant on a distorted regular mesh (dns/curvmesh.hpp):
     // rhs/stableDt switch to the finite-volume metric form, everything else
-    // (RK3, primitives, hooks) is shared. No LES on curvilinear meshes.
-    static std::expected<DeviceComp, hipError_t> make(const CurvMetrics& m,
-                                                      double gamma, double mu);
+    // (RK3, primitives, hooks) is shared. LES works here exactly as on the
+    // uniform path -- same two operators, same eddy conductivity -- with the
+    // velocity gradient taken through the mesh metrics and Delta^2 the
+    // PER-CELL volume^(2/3), so a clustered mesh filters at the local
+    // spacing. csLes == 0 is molecular DNS, bit-for-bit unchanged.
+    static std::expected<DeviceComp, hipError_t>
+    make(const CurvMetrics& m, double gamma, double mu, double csLes = 0.0,
+         SgsModel sgs = SgsModel::Smagorinsky);
 
     bool curvilinear() const { return curv_.has_value(); }
 
-    // --cut-flux (uniform mesh only): after this, rhs() overwrites the cells
-    // of `flag` (dns::buildCutFlag) with aperture-weighted face fluxes over
-    // lambda-floored volumes. Faces joining a fluid cell to a SOLID-CENTRE
-    // cell keep the FULL flux -- that is the existing ghost-mirror wall
-    // closure, so kBodyFlux's fluid<->ghost tally stays the exact budget of
-    // what the update applied. `solid` must be the same centre classification
-    // the ghost fill uses (sdf < 0). Cells outside the flag keep kCompRhs's
-    // exact bits (they are simply not overwritten). stableDt folds the
-    // 1/lambda~ amplification into the acoustic bound.
-    std::expected<void, hipError_t>
-    attachCutFlux(const CutGeometry& cut, const std::vector<unsigned char>& flag,
-                  const std::vector<unsigned char>& solid);
+    // NOTE: there is deliberately no compressible --cut-flux. Aperture-
+    // weighted face fluxes DIVERGE near the body here: the KG split flux
+    // loses its kinetic-energy property under per-face area weighting
+    // (measured twice, 2026-07-23). config.cpp rejects the combination, and
+    // the implementation was deleted rather than left as a dead branch in the
+    // hot RHS dispatch. `--cut-flux` remains incompressible-only
+    // (gpu/cutflux.*) until the compressible variant is redesigned.
 
     // Device metric tables of the curvilinear path (null on the uniform
     // path); the stretched NSCBC variant reads its retained transverse flux
@@ -128,6 +134,8 @@ private:
     DeviceComp(const GpuGrid& g, Real gamma, Real mu, Real csLes, SgsModel sgs);
 
     void rhs(const DeviceCompState& s, DeviceCompState& out);
+    // Device pointer table of curv_; pre: curvilinear().
+    CurvView curvView() const;
 
     GpuGrid g_;
     Real gamma_, mu_, Pr_ = Real(0.72), Rgas_ = Real(1);
@@ -139,9 +147,6 @@ private:
     std::optional<DeviceCurv> curv_; // engaged = curvilinear rhs/stableDt
     DeviceScalar u_, v_, w_, e_, p_, T_;
     DeviceScalar nut_;      // per-cell dynamic eddy viscosity (LES only)
-    bool cutFlux_ = false;  // attachCutFlux engaged (uniform path only)
-    DeviceScalar cutAx_, cutAy_, cutAz_, cutLam_;
-    DeviceBuffer<unsigned char> cutFlag_, cutSolid_;
     DeviceBuffer<const Real*> ptrs_; // axpy pointer table
     std::function<void(DeviceCompState&)> hook_;
     std::function<void(const DeviceCompState&, DeviceCompState&)> rhsHook_;

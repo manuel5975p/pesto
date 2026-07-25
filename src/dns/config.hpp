@@ -4,11 +4,13 @@
 #pragma once
 
 #include "dns/grid.hpp"
+#include "dns/runmeta.hpp"
 #include "dns/sgs.hpp"
 
 #include <expected>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace dns {
 
@@ -16,9 +18,7 @@ enum class Subcommand { Flow, Tgv, Hit, Bench, Channel };
 enum class Physics { Incompressible, Compressible };
 enum class FarField { Tunnel, Fringe, Sponge, Nscbc, Periodic };
 enum class Backend { Cpu, Gpu, Auto };
-enum class PoissonKind { Auto, Fft, Dct, Cg };
 enum class BodyKind { None, Cylinder, Sphere, Cube, Lens, Fence, Floor, Mesh, Scene };
-enum class Emit { Stats, Bin, Png, Web, Volume, Slices, Vtk, Error, Spectrum, Snapshot, None };
 
 // One field per CLI flag. `given` records which flags the user actually typed,
 // so the validator can distinguish "left at the default" from "set to the
@@ -83,7 +83,6 @@ struct RawConfig
     double ramp = 2.0, kick = 0.05;
 
     // solver
-    PoissonKind poisson = PoissonKind::Auto;
     double tol = 1e-4;
     int maxIters = 500, dtRecompute = 0;
 
@@ -118,33 +117,6 @@ struct RawConfig
     int steps = 20;
 };
 
-// code: the process exit code this error maps to (1 CLI, 2 config, ...).
-struct ConfigError
-{
-    int code = 2;
-    std::string field, message;
-};
-
-std::string format(const ConfigError&);
-
-// Metadata carried into the run's .json / manifest.
-struct RunMeta
-{
-    int nx = 0, ny = 0, nz = 0;
-    double hx = 0, hy = 0, hz = 0;
-    double D = 0, re = 0, mach = 0, frameDt = 0, cs = 0;
-    bool les = false;
-    std::string body, farField, physics;
-    double kick = 0;
-    std::string sgs;   // "smag" | "sigma" when les, "" for DNS
-};
-
-// Body centre and diameter in grid (world) coordinates, ghost offset included.
-struct Placement
-{
-    double cx = 0, cy = 0, cz = 0, D = 0;
-};
-
 // Fully resolved case. Every derived quantity is computed here, so downstream
 // asserts are legitimate BECAUSE validate() ran.
 class Case
@@ -155,11 +127,9 @@ public:
     Physics physics = Physics::Incompressible;
     FarField far = FarField::Tunnel;
     BodyKind bodyKind = BodyKind::None;
-    PoissonKind poisson = PoissonKind::Auto;
 
     Grid grid{1, 1, 1, 1, 1, 1};
-    Placement body;
-    Placement placement;   // alias kept for readability at call sites
+    Placement placement;   // body centre + diameter, ghost offset included
     std::string meshPath;
     std::string scenePath;   // BodyKind::Scene: the scene JSON (loaded by main)
 
@@ -168,7 +138,7 @@ public:
     double re = 0, mach = 0, nu = 0, cfl = 0, tol = 0, ft = 0, tEnd = 0;
     double steadyTol = 0;   // 0 = time-march to tEnd; >0 = stationary solve
     int seqLevels = 1;      // grid-sequencing levels (1 = off)
-    double cs = 0, qRef = 0, dr = 0, aspect = 0;
+    double cs = 0, dr = 0, aspect = 0;
     SgsModel sgsModel = SgsModel::Smagorinsky;
     double penalize = 0;
     double ramp = 0, kick = 0, nscbcBeta = 0;
@@ -227,6 +197,12 @@ public:
 
     RunMeta meta;
 
+    // Non-fatal advisories raised by validate(). CARRIED, not printed:
+    // validate() is specified pure (no filesystem, no GPU), and a library
+    // function writing to stderr is exactly the kind of hidden side effect
+    // that makes it untestable. main() prints these after phase 2.
+    std::vector<std::string> warnings;
+
     // Human-readable dump for --dry-run.
     std::string describe() const;
 
@@ -234,6 +210,17 @@ private:
     Case() = default;
     friend std::expected<Case, ConfigError> validate(const RawConfig&);
 };
+
+struct Scene;   // dns/scene.hpp
+
+// Merges the scene's model selection into the RawConfig before validate():
+//   model les + no --les       -> raw.les = cs
+//   model les + agreeing --les -> keep
+//   any conflict               -> config error (strict, never silently
+//                                 resolved)
+// Config-layer, not scene-layer: this MUTATES the parse layer, so it belongs
+// on the same side of the boundary as RawConfig.
+std::expected<void, ConfigError> applySceneModel(const Scene&, RawConfig&);
 
 // Pure: no filesystem, no HIP, no allocation beyond the Case.
 std::expected<Case, ConfigError> validate(const RawConfig&);

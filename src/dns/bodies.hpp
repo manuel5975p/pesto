@@ -1,10 +1,12 @@
 // Analytic solid shapes in world units and their signed-distance functions.
-// The shapes themselves are declared in cutcell.hpp (which owns the exact
-// closed-form CutGeometry constructors); this header adds their Sdf views, the
-// lens, and the dimple lattices.
+//
+// This header OWNS the shape structs. It used to include cutcell.hpp to get
+// them, which is the wrong direction: every consumer that wanted an Sdf pulled
+// in CutPoissonSolver and its CG workspace with it. cutcell.hpp now includes
+// this one -- it needs the shapes for its exact closed-form CutGeometry
+// constructors, not the other way round.
 #pragma once
 
-#include "dns/cutcell.hpp"
 #include "dns/sdf.hpp"
 
 #include <array>
@@ -12,6 +14,28 @@
 #include <vector>
 
 namespace dns {
+
+// Axis-aligned solid slab in z crossed with an L1 ball (diamond) in x-y, i.e.
+// a square prism rotated 45 deg about z -- a "rotated cube". cx,cy,R,z0,z1 in
+// world units. Interior: |x-cx|+|y-cy| <= R and z0 <= z <= z1.
+struct RotatedCube
+{
+    double cx, cy, r, z0, z1;
+};
+
+// Solid ball of radius r centred at (cx,cy,cz), world units. Must not touch
+// the periodic images (geometry is built unwrapped).
+struct Sphere
+{
+    double cx, cy, cz, r;
+};
+
+// Solid circular cylinder along z (infinite: spans the whole grid), axis at
+// (cx,cy), radius r, world units. Interior: (x-cx)^2 + (y-cy)^2 <= r^2.
+struct CylinderZ
+{
+    double cx, cy, r;
+};
 
 // Two overlapping disks of half-width w and half-height hh (w > hh): a lens
 // with sharp leading/trailing tips at x = cx +- w. Interior: both disks.

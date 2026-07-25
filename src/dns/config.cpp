@@ -1,6 +1,7 @@
 #include "dns/config.hpp"
 
 #include "dns/remap.hpp"
+#include "dns/scene.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -76,6 +77,34 @@ std::string format(const ConfigError& e)
 
 // ---------------------------------------------------------------------------
 
+std::expected<void, ConfigError> applySceneModel(const Scene& s, RawConfig& r)
+{
+    const bool userLes = r.given.contains("--les");
+    if (s.model == SceneModel::Les)
+    {
+        if (userLes && r.les != s.cs)
+            return std::unexpected(ConfigError{
+                2, "--les",
+                "the scene selects model les with cs=" + std::to_string(s.cs)
+                    + "; a conflicting --les was given (drop it or change the "
+                      "scene)"});
+        if (r.given.contains("--sgs") && r.sgs != s.sgs)
+            return std::unexpected(ConfigError{
+                2, "--sgs",
+                std::string("the scene selects sgs = ")
+                    + (s.sgs == SgsModel::Sigma ? "sigma" : "smag")
+                    + "; a conflicting --sgs was given (drop it or change the "
+                      "scene)"});
+        r.les = s.cs;
+        r.sgs = s.sgs;
+    }
+    else if (userLes && r.les > 0)
+        return std::unexpected(ConfigError{
+            2, "--les", "the scene selects model dns; drop --les or set the "
+                        "scene model to les"});
+    return {};
+}
+
 std::expected<Case, ConfigError> validate(const RawConfig& r)
 {
     Case c;
@@ -106,7 +135,18 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     {
         if (r.steps < 1) return bad(2, "--steps", "must be >= 1");
         c.steps = r.steps;
+        // bench builds an n^3 box, so it needs the grid guards every other
+        // branch applies and this one was missing: `--n 1300` overflowed the
+        // int indexing the tree assumes, and `--n 1` produced nz == 1 with
+        // hz == 2pi, violating the validator-enforced `nz == 1 => hz == 1`.
+        // n >= 4 forecloses both the degenerate-z case (bench has no 2D mode:
+        // the box is always n^3) and any n too small to time meaningfully.
+        if (r.n < 4) return bad(2, "--n", "must be >= 4 (bench is an n^3 box)");
+        const std::size_t benchCells = std::size_t(r.n) * r.n * r.n;
+        if (benchCells > std::size_t(2147483647))
+            return bad(2, "--n", "grid exceeds INT_MAX cells");
         c.grid = Grid::make(r.n, r.n, r.n, 2 * pi, 2 * pi, 2 * pi);
+        c.nzInterior = r.n;
         c.meta = {r.n, r.n, r.n, c.grid.hx, c.grid.hy, c.grid.hz,
                   0, 0, 0, 0, 0, false, "none", "periodic", name(c.physics), 0,
                   ""};
@@ -433,7 +473,6 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
                               : (nzT == 1 ? 0.5 * c.h : c.h + nzI * c.h / 2.0);
         c.placement = {cx, cy, cz, D};
     }
-    c.body = c.placement;
 
     const std::size_t cells = std::size_t(c.grid.nx) * c.grid.ny * c.grid.nz;
     if (cells > std::size_t(2147483647))
@@ -460,8 +499,6 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         if (r.given.contains("--tol"))
             return bad(2, "--tol", "compressible runs are fully explicit; there is "
                                    "no pressure solve to converge");
-        if (r.given.contains("--poisson"))
-            return bad(2, "--poisson", "compressible runs have no Poisson solve");
     }
     else
     {
@@ -510,9 +547,13 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     const double blCells = c.placement.D / std::sqrt(c.re) / c.h;
     c.lesLabel = c.cs > 0;
     if (blCells < 3.0 && !c.lesLabel && c.bodyKind != BodyKind::None)
-        std::fprintf(stderr, "dns: warning: boundary layer is %.1f cells "
-                             "(D/sqrt(Re)/h); this is under-resolved for DNS\n",
-                     blCells);
+    {
+        char w[192];
+        std::snprintf(w, sizeof w,
+                      "boundary layer is %.1f cells (D/sqrt(Re)/h); this is "
+                      "under-resolved for DNS", blCells);
+        c.warnings.emplace_back(w);
+    }
 
     // Far-field parameters.
     c.nscbcBeta = r.nscbcBeta;
@@ -545,7 +586,10 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
                                "correction retargets an open far field");
 
     // Sponge / fringe band width. clamp(0.1n, 8, n/2-1) is UB when n < 18.
-    const int bandBase = comp ? c.grid.nx : c.grid.nx;
+    // Band width is measured along x for BOTH physics. (This was once a
+    // `comp ? nx : nx` ternary -- a physics distinction someone intended and
+    // abandoned. Restoring one needs a measurement, not a guess.)
+    const int bandBase = c.grid.nx;
     if ((c.far == FarField::Fringe || c.far == FarField::Sponge
          || c.far == FarField::Nscbc)
         && bandBase < 18)
@@ -584,9 +628,6 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
             return bad(2, "--stretch", "the curvilinear solver is compressible-"
                                        "only; --stretch needs --physics "
                                        "compressible");
-        if (c.cs > 0)
-            return bad(2, "--stretch", "the curvilinear path has no LES; drop "
-                                       "--les or --stretch");
         if (c.bodyKind != BodyKind::None)
             return bad(2, "--stretch", "the ghost wall samples the body SDF at "
                                        "uniform cell positions; stretched runs "
@@ -615,8 +656,9 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     }
     // Focal clustering: a fine plateau box (typically the body plus its wake)
     // with a coarse far field, one independent Focal1D per axis. Same scope
-    // as --stretch (compressible curvilinear, no LES, NSCBC or explicit
-    // sponge), but bodies ARE supported here: the ghost wall classifies
+    // as --stretch (compressible curvilinear, NSCBC or explicit sponge; LES is
+    // allowed, the SGS operators read the mesh metrics and the per-cell
+    // Delta), but bodies ARE supported here: the ghost wall classifies
     // against the mapped cell centres. The blend support must stay clear of
     // the domain faces, so the map is the exact identity there and the
     // periodic wrap stays C^2.
@@ -629,9 +671,6 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         if (c.stretchBeta > 0)
             return bad(2, "--focal", "--stretch and --focal are different "
                                      "curvilinear meshes; pick one");
-        if (c.cs > 0)
-            return bad(2, "--focal", "the curvilinear path has no LES; drop "
-                                     "--les or --focal");
         // Bodies ARE supported (the ghost wall classifies against the mapped
         // cell centres), but only the analytic ones: their AABB follows from
         // the placement alone, and validate() may not touch the filesystem to
@@ -898,11 +937,6 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     if (!std::isfinite(c.kick)) return bad(2, "--kick", "must be finite");
 
     // Solver.
-    c.poisson = r.poisson;
-    if (c.poisson == PoissonKind::Auto)
-        c.poisson = comp ? PoissonKind::Auto
-                         : (c.far == FarField::Tunnel ? PoissonKind::Dct
-                                                      : PoissonKind::Fft);
     c.tol = r.tol;
     if (!(std::isfinite(c.tol) && c.tol > 0)) return bad(2, "--tol", "must be > 0");
     c.maxIters = r.maxIters;
@@ -961,7 +995,9 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     // Run length + output cadences.
     c.ft = r.ft;
     if (!finitePos(c.ft)) return bad(2, "--ft", "must be finite and > 0");
-    c.tEnd = comp ? c.ft * c.L / c.uInf : c.ft * c.L / c.uInf;
+    // One flow-through is L/uInf in both physics (c.L already carries each
+    // physics' own box convention). Formerly a `comp ? X : X` ternary.
+    c.tEnd = c.ft * c.L / c.uInf;
 
     // Stationary mode. tEnd stops being the run length and becomes the
     // give-up cap: not converging by then is exit 8, never a silent answer.
@@ -1031,10 +1067,12 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     // already uses); the old flow-only nz == 1 restriction was conservative,
     // not load-bearing.
 
-    // Reference dynamic pressure x frontal area.
-    const double span = comp ? (c.grid.nz > 1 ? c.grid.nz * c.h : c.grid.hz)
-                             : (c.grid.nz == 1 ? c.h : c.nzInterior * c.h);
-    c.qRef = 0.5 * c.uInf * c.uInf * c.placement.D * span;
+    // NOTE: qRef is deliberately NOT resolved here. It is 0.5 rho uInf^2 A
+    // with A the frontal area MEASURED from the cut apertures, and validate()
+    // touches no filesystem and builds no geometry, so it cannot know A. The
+    // field that used to live here held 0.5 uInf^2 D span -- a placeholder
+    // that --dry-run printed as if it were the number the run would divide by.
+    // The real value comes from dns/geometry.hpp's referenceQ*(), once.
 
     c.meta = {c.grid.nx, c.grid.ny, c.grid.nz, c.grid.hx, c.grid.hy, c.grid.hz,
               c.placement.D, c.re, comp ? c.mach : 0.0, c.fdt, c.cs, c.lesLabel,
@@ -1090,7 +1128,7 @@ std::string Case::describe() const
         "  grid       %d x %d x %d  h=%.6g  L=%.6g%s\n"
         "  placement  cx=%.6g cy=%.6g cz=%.6g D=%.6g (%.1f cells)\n"
         "  Re=%.6g  nu=%.6g  Mach=%.6g  cfl=%.6g  Cs=%.6g (%s)\n"
-        "  ft=%.6g  tEnd=%.6g  fdt=%.6g  qRef=%.6g\n"
+        "  ft=%.6g  tEnd=%.6g  fdt=%.6g\n"
         "  mode       %s\n"
         "  out        %s\n",
         name(physics), name(bodyKind),
@@ -1108,7 +1146,7 @@ std::string Case::describe() const
         re, nu, mach, cfl, cs,
         lesLabel ? (sgsModel == SgsModel::Sigma ? "LES sigma" : "LES smag")
                  : "DNS",
-        ft, tEnd, fdt, qRef,
+        ft, tEnd, fdt,
         steadyTol > 0 ? "stationary (stop at steady residual, tEnd = give-up cap)"
                       : "time-march to tEnd",
         outPrefix.c_str());

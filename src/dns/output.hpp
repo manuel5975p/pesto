@@ -7,7 +7,7 @@
 // run always sees a well-formed manifest.
 #pragma once
 
-#include "dns/config.hpp"
+#include "dns/runmeta.hpp"
 #include "dns/field.hpp"
 #include "dns/grid.hpp"
 
@@ -99,6 +99,23 @@ public:
     // Cell-centred velocity snapshot (Emit::Vtk only).
     [[nodiscard]] std::expected<void, std::string>
     vtkFrame(const Grid&, const VectorField&);
+
+    // Indexed auxiliary artefacts: <prefix>_<kind>_<n><ext>. `hit` writes its
+    // spectra and raw snapshots this way. They go through the sink rather than
+    // straight to std::ofstream so a failed write is REPORTED -- the whole
+    // point of phase 3c is that a full or read-only destination surfaces
+    // immediately, and the old direct writes bypassed that and failed
+    // silently, hours into a run.
+    //
+    // The count is unbounded (one per cadence hit), so these cannot all be
+    // created up front; what phase 3c does establish is that the directory is
+    // writable at all.
+    [[nodiscard]] std::expected<void, std::string>
+    auxText(std::string_view kind, int index, std::string_view ext,
+            std::string_view content);
+    [[nodiscard]] std::expected<void, std::string>
+    auxBinary(std::string_view kind, int index, std::string_view ext,
+              std::span<const float> data);
 
     [[nodiscard]] std::expected<void, std::string> flush();
 

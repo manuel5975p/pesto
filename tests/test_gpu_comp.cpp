@@ -3,6 +3,7 @@
 #include "dns/comp.hpp"
 #include "dns/gpu/comp.hpp"
 #include "gpu_test_util.hpp"
+#include "check.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -14,13 +15,9 @@ using std::numbers::pi;
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    std::printf("%-52s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) ++failures;
-}
+
 
 CompState vortexState(const Comp& c, double beta)
 {
@@ -75,7 +72,7 @@ int main()
     auto scratch = gpu::ReduceScratch::make();
     if (!scratch) return EXIT_FAILURE;
 
-    const double dtc = cpu.stableDt(sc);
+    const double dtc = *cpu.stableDt(sc);
     const double dtg = dev->stableDt(*ds, *scratch);
     std::printf("dt cpu %.6e gpu %.6e\n", dtc, dtg);
     check(std::abs(dtc - dtg) < 1e-5 * dtc, "stableDt parity");
@@ -110,5 +107,5 @@ int main()
                 s1[1] - s0[1], s1[2] - s0[2], s1[3] - s0[3]);
     check(ok, "FP32 conservation drift bounded");
 
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return dnstest::gFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

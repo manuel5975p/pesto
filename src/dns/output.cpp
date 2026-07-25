@@ -90,12 +90,22 @@ struct RunOutput::Impl
         f << json();
     }
 
+    // Frame streams open on first use -- their names come from the runner's
+    // field list, which phase 3c does not have. What phase 3c DOES prove is
+    // that the destination directory is writable (the .json probe), so the
+    // only failure left here is a mid-run one (disk full, quota, unlink). Say
+    // so once per stream instead of silently writing to a dead stream, which
+    // is what this did before.
     std::ofstream& binFor(const std::string& name)
     {
         auto it = bins.find(name);
         if (it != bins.end()) return it->second;
         auto& f = bins[name];
-        f.open(cfg.prefix + "_" + name + ".bin", std::ios::binary);
+        const std::string path = cfg.prefix + "_" + name + ".bin";
+        f.open(path, std::ios::binary);
+        if (!f)
+            std::fprintf(stderr, "dns: warning: cannot open '%s'; those frames "
+                                 "will not be written\n", path.c_str());
         return f;
     }
 
@@ -136,9 +146,9 @@ RunOutput::make(Config cfg, RunMeta meta, const Grid& g, FrameGeometry geo)
     if (cfg.prefix.empty())
         return std::unexpected("output prefix is empty");
     // PNG at nz > 1 renders the centre z-plane (the gather below slices kc,
-    // same as the bin path). Whether that plane is the meaningful one is the
-    // subcommand's call: flow still rejects it in validate(); channel allows
-    // it (the x-y mid-plane IS the picture of a channel).
+    // same as the bin path). Every subcommand allows it now; whether that
+    // plane is the meaningful one is the caller's judgement (for a channel
+    // the x-y mid-plane IS the picture).
     if (cfg.pdt <= 0) cfg.pdt = cfg.fdt;
     if (cfg.wdt <= 0) cfg.wdt = cfg.fdt;
 
@@ -152,8 +162,12 @@ RunOutput::make(Config cfg, RunMeta meta, const Grid& g, FrameGeometry geo)
     if (p.geo.h <= 0) p.geo.h = g.ny - 2 * p.geo.j0;
     if (p.geo.d <= 0) p.geo.d = g.nz - 2 * p.geo.k0;
 
-    // Phase 3c: create and truncate everything now, so a full or read-only
-    // destination is discovered in the first second, not after hours of GPU.
+    // Phase 3c: create and truncate now, so a full or read-only destination is
+    // discovered in the first second rather than after hours of GPU. The .json
+    // probe is what establishes that the directory is writable at all; the
+    // mask, the PNG directory and (via declareSeries) every stats CSV follow
+    // here. Frame .bin streams are named by the runner's field list and open
+    // on first use -- see binFor().
     {
         const auto dir = std::filesystem::path(p.cfg.prefix).parent_path();
         std::error_code ec;
@@ -189,6 +203,38 @@ RunOutput::make(Config cfg, RunMeta meta, const Grid& g, FrameGeometry geo)
             std::format("cannot create '{}': {}", p.pngDir, ec.message()));
     }
     return o;
+}
+
+namespace {
+
+std::string auxPath(const std::string& prefix, std::string_view kind, int index,
+                    std::string_view ext)
+{
+    return prefix + "_" + std::string(kind) + "_" + std::to_string(index)
+         + std::string(ext);
+}
+
+} // namespace
+
+std::expected<void, std::string>
+RunOutput::auxText(std::string_view kind, int index, std::string_view ext,
+                   std::string_view content)
+{
+    const std::string path = auxPath(p_->cfg.prefix, kind, index, ext);
+    std::ofstream f(path);
+    f << content;
+    return closeChecked(f, path);
+}
+
+std::expected<void, std::string>
+RunOutput::auxBinary(std::string_view kind, int index, std::string_view ext,
+                     std::span<const float> data)
+{
+    const std::string path = auxPath(p_->cfg.prefix, kind, index, ext);
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(data.data()),
+            std::streamsize(data.size() * sizeof(float)));
+    return closeChecked(f, path);
 }
 
 void RunOutput::declareSeries(std::string_view name,

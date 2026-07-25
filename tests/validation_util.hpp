@@ -3,6 +3,8 @@
 // driving, and the deferred-anchor registry (data/validation/anchors.csv).
 #pragma once
 
+#include "check.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -18,28 +20,13 @@
 
 namespace valtest {
 
-inline int gFailures = 0;
-
-// Assert a named condition; failures are counted, not fatal.
-inline void check(bool ok, const std::string& what)
-{
-    std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what.c_str());
-    if (!ok) ++gFailures;
-}
-
-// Exit code for the whole test; call last in main.
-inline int finish()
-{
-    if (gFailures) std::printf("%d check(s) FAILED\n", gFailures);
-    return gFailures ? EXIT_FAILURE : EXIT_SUCCESS;
-}
-
-// ctest SKIP_RETURN_CODE convention (no device, missing anchor, ...).
-[[noreturn]] inline void skip(const std::string& why)
-{
-    std::printf("SKIP: %s\n", why.c_str());
-    std::exit(77);
-}
+// check / finish / skip now live in tests/check.hpp so any test can use them
+// without dragging in CSV parsing, the anchor registry and <sys/wait.h>.
+// Re-exported here so every existing valtest:: call site is untouched.
+using dnstest::check;
+using dnstest::finish;
+using dnstest::skip;
+using dnstest::gFailures;
 
 // Columnar numeric table from comma- or whitespace-separated text.
 // '#' lines are ignored; a leading line with alphabetic tokens names columns.

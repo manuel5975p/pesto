@@ -6,6 +6,7 @@
 #include "dns/comp.hpp"
 #include "dns/gpu/comp.hpp"
 #include "gpu_test_util.hpp"
+#include "check.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -17,13 +18,9 @@ using std::numbers::pi;
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    std::printf("%-52s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) ++failures;
-}
+
 
 // Compressible Taylor-Green vortex at Mach M, constant background density.
 CompState tgvState(const Grid& g, double gamma, double M)
@@ -155,5 +152,5 @@ int main()
     check(std::isfinite(sLes.ke) && sLes.ke < sDns.ke,
           "LES dissipates more KE than DNS (3D)");
 
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return dnstest::gFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

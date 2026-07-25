@@ -3,6 +3,7 @@
 #include "dns/cli.hpp"
 #include "dns/config.hpp"
 #include "dns/remap.hpp"
+#include "check.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -11,12 +12,9 @@
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const std::string& what)
-{
-    if (!ok) { std::printf("FAIL: %s\n", what.c_str()); ++failures; }
-}
+
 
 std::expected<dns::Case, dns::ConfigError> run(std::vector<std::string> args)
 {
@@ -116,7 +114,7 @@ int main()
     }
     rejected({"channel", "--wall", "slippery"}, 1, "unknown wall kind");
 
-    if (failures) { std::printf("%d failures\n", failures); return 1; }
+    if (dnstest::gFailures) { std::printf("%d failures\n", dnstest::gFailures); return 1; }
     std::printf("all ok\n");
     return 0;
 }

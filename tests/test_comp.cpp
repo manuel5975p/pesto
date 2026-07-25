@@ -1,6 +1,7 @@
 // Compressible NS: isentropic vortex convergence, acoustic speed, low-Mach
 // Taylor-Green decay, exact conservation, nz=1 vs z-invariant 3D parity.
 #include "dns/comp.hpp"
+#include "check.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -13,13 +14,9 @@ using std::numbers::pi;
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    std::printf("%-52s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) ++failures;
-}
+
 
 // Isentropic vortex (beta strength) centred at (x0,y0), background (uInf,vInf),
 // T0 = 1, rho0 = 1, R = 1: exact solution advects rigidly.
@@ -57,7 +54,7 @@ void advance(const Comp& c, CompState& s, double T)
 {
     double t = 0.0;
     while (t < T) {
-        const double dt = std::min(c.stableDt(s), T - t);
+        const double dt = std::min(*c.stableDt(s), T - t);
         c.step(s, dt);
         t += dt;
     }
@@ -186,7 +183,7 @@ void testConservation()
     };
     double s0[4], s1[4];
     sums(s, s0);
-    for (int it = 0; it < 100; ++it) c.step(s, c.stableDt(s));
+    for (int it = 0; it < 100; ++it) c.step(s, *c.stableDt(s));
     sums(s, s1);
     bool ok = true;
     for (int q = 0; q < 4; ++q) {
@@ -219,7 +216,7 @@ void test2d3dParity()
                 s3.my[b] = s2.my[a];
                 s3.E[b] = s2.E[a];
             }
-    const double dt = 0.9 * c2.stableDt(s2);
+    const double dt = 0.9 * *c2.stableDt(s2);
     for (int it = 0; it < 10; ++it) {
         c2.step(s2, dt);
         c3.step(s3, dt);
@@ -238,6 +235,34 @@ void test2d3dParity()
     check(err < 1e-13 && wmax < 1e-15, "nz=1 == z-invariant 3D, mz stays 0");
 }
 
+// A diverged state must be REPORTED, not asserted away. In Release the old
+// asserts vanished and sqrt(gamma*p/r) with p < 0 returned a NaN dt, which the
+// time loop rode forever -- silent non-termination instead of exit 7.
+void testDivergedStableDt()
+{
+    const int n = 8;
+    const Grid g = Grid::make(n, n, 1, 1.0, 1.0, 1.0);
+    const Comp c = Comp::make(g, 1.4, 0.0);
+
+    CompState s = CompState::zeros(g);
+    for (std::size_t i = 0; i < g.size(); ++i) { s.rho[i] = 1.0; s.E[i] = 2.5; }
+    check(c.stableDt(s).has_value(), "stableDt succeeds on a healthy state");
+
+    CompState neg = s;
+    neg.rho[g.idx(3, 4, 0)] = -1e-3;
+    check(!c.stableDt(neg).has_value(),
+          "stableDt reports a NEGATIVE-density state, not a NaN dt");
+
+    CompState lowp = s;
+    lowp.E[g.idx(2, 2, 0)] = -5.0;   // E < |m|^2/2rho  =>  p < 0
+    check(!c.stableDt(lowp).has_value(),
+          "stableDt reports a NEGATIVE-pressure state, not a NaN dt");
+
+    CompState nan = s;
+    nan.rho[g.idx(1, 1, 0)] = std::nan("");
+    check(!c.stableDt(nan).has_value(), "stableDt reports a NaN density");
+}
+
 int main()
 {
     testVortex();
@@ -245,5 +270,6 @@ int main()
     testTaylorGreen();
     testConservation();
     test2d3dParity();
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    testDivergedStableDt();
+    return dnstest::gFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

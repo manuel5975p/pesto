@@ -72,11 +72,44 @@ int main()
     }
     maskSolidFaces(g, cut, U);
 
-    CutPoissonSolver poisson(g, cut, 5000, 1e-12);
+    auto ps = CutPoissonSolver::make(g, cut, 5000, 1e-12);
+    auto& poisson = *ps;
     auto scr = CutProjectionScratch::make(g);
     projectCut(g, cut, poisson, 0.01, U, scr);
 
     const double e = maxAbsDivergenceCut(g, cut, U);
     std::printf("max |apertured div| after projectCut: %.3e\n", e);
-    return e < 1e-8 ? EXIT_SUCCESS : EXIT_FAILURE;
+    if (e >= 1e-8) return EXIT_FAILURE;
+
+    // --- 4) a NaN residual is DIVERGENCE, not an instant solve ---
+    // `NaN > target` is false, so without the isfinite guard the CG loop exits
+    // at iteration 0 and returns 0 -- indistinguishable from a perfect
+    // warm-started solve. It must report non-convergence (maxIters) instead.
+    {
+        const int maxIters = 50;
+        auto pd = CutPoissonSolver::make(g, cut, maxIters, 1e-12);
+        if (!pd) { std::printf("FAIL: solver make\n"); return EXIT_FAILURE; }
+        Scalar rhs = zeros(g), p = zeros(g);
+        for (std::size_t c = 0; c < g.size(); ++c)
+            if (cut.lambda[c] > 0.0) { rhs[c] = std::nan(""); break; }
+        const int it = pd->solve(rhs, p, /*warmStart=*/false);
+        std::printf("CG on a NaN-seeded rhs returned %d (maxIters %d)\n",
+                    it, maxIters);
+        if (it != maxIters)
+        {
+            std::printf("FAIL: NaN residual reported as a converged solve\n");
+            return EXIT_FAILURE;
+        }
+    }
+
+    // An all-solid geometry is a user input, not a programmer error.
+    {
+        CutGeometry solid{zeros(g), zeros(g), zeros(g), zeros(g)};
+        if (CutPoissonSolver::make(g, solid, 10, 1e-12).has_value())
+        {
+            std::printf("FAIL: all-solid geometry accepted\n");
+            return EXIT_FAILURE;
+        }
+    }
+    return EXIT_SUCCESS;
 }

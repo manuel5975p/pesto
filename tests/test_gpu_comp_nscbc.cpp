@@ -14,6 +14,7 @@
 #include "dns/gpu/comp_nscbc.hpp"
 #include "dns/remap.hpp"
 #include "gpu_test_util.hpp"
+#include "check.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -25,13 +26,9 @@ using namespace dns;
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    std::printf("%-52s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) ++failures;
-}
+
 
 constexpr double gam = 1.4, rhoInf = 1.0, uInf = 1.0, mach = 0.2;
 const double pInf = rhoInf * uInf * uInf / (gam * mach * mach);
@@ -725,5 +722,5 @@ int main()
     check(pres < 0.5, "armed potential targets pull the inflow row onto the "
                       "source/doublet deficit");
 
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return dnstest::gFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -7,6 +7,7 @@
 
 #include "dns/comp.hpp"
 #include "dns/config.hpp"
+#include "dns/framemap.hpp"
 #include "dns/gpu/runner_incomp.hpp"   // RunStats, RunError
 #include "dns/output.hpp"
 #include "dns/sdf.hpp"
@@ -19,18 +20,19 @@ struct CompRun
 {
     double gamma = 1.4;
     double mu = 0;
+    // NOTE: no `mach` here. Mach reaches the solver through pInf (set from it
+    // in dns_main); a second copy was plumbed to the GPU and never read.
     double uInf = 1.0, rhoInf = 1.0, pInf = 1.0;
-    double mach = 0.2;
     double D = 1.0;
     double qRef = 1.0;
     double cfl = 0.4;
     double tEnd = 0;
     double les = 0;              // shared 3D-valid core LES; 0 = molecular DNS
     SgsModel sgs = SgsModel::Smagorinsky;   // nut operator, used iff les > 0
-    // Aperture geometry for --cut-flux / --penalize; nullptr when both are
-    // off. Uniform mesh + body only (validator-enforced); must outlive the run.
+    // Aperture geometry for --penalize; nullptr when it is off. Uniform mesh
+    // + body only (validator-enforced); must outlive the run. There is no
+    // compressible --cut-flux -- see the note in gpu/comp.hpp.
     const CutGeometry* cutGeom = nullptr;
-    bool cutFlux = false;        // sharp apertured fluxes (attachCutFlux)
     double penalize = 0;         // Brinkman band decay time eta; 0 = off
 
     // Wall-normal tanh clustering along y (dns/remap.hpp TanhStretchY):
@@ -78,6 +80,13 @@ struct CompRun
     // statistics, deliberately -- do not "fix" it back to every step.
     int dtRecompute = 16;
     double dtMargin = 0.95;
+
+    // Display raster (dns/framemap.hpp): frames are resampled onto a uniform
+    // PHYSICAL grid before they reach RunOutput, so a clustered mesh is not
+    // rendered as a picture of its index space. Must be the raster RunOutput
+    // was constructed with; nullptr or an inactive raster = one pixel per
+    // cell, unchanged. Must outlive the run.
+    const PhysicalRaster* raster = nullptr;
 
     bool signedVorticity = true; // 2D frames use signed wz + a diverging map
     double curlMax = 0;          // 0 = 8/D signed, 15/D magnitude

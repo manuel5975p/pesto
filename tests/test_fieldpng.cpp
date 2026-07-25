@@ -3,6 +3,7 @@
 // -scale/0/+scale, viridis lo/hi), masked cells render dark, row 0 lands at
 // the image bottom, and bad paths fail cleanly.
 #include "dns/fieldpng.hpp"
+#include "check.hpp"
 
 #include <zlib.h>
 
@@ -15,13 +16,9 @@
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    std::printf("%-56s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) ++failures;
-}
+
 
 std::uint32_t be32(const unsigned char* p)
 {
@@ -130,5 +127,5 @@ int main()
 
     std::remove(dPath);
     std::remove(sPath);
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return dnstest::gFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

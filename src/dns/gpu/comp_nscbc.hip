@@ -1,6 +1,6 @@
 #include "dns/gpu/comp_nscbc.hpp"
 
-#include "dns/gpu/comp_flux.hpp"
+#include "dns/gpu/internal/comp_flux.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/farpot.hpp"
 #include "dns/gpu/index.hpp"
@@ -356,11 +356,7 @@ bool curvViewOf(const DeviceComp& d, CurvView& cv)
     const DeviceCurv* t = d.curvTables();
     assert(t && "curvilinear NSCBC needs the curvilinear DeviceComp");
     if (!t) return false;
-    for (int a = 0; a < 3; ++a) {
-        for (int c = 0; c < 3; ++c) cv.S[a][c] = t->S[a][c].data();
-        for (int e = 0; e < 9; ++e) cv.Ji[a][e] = t->Ji[a][e].data();
-    }
-    cv.invVol = t->invVol.data();
+    cv = t->view();
     return true;
 }
 

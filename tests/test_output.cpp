@@ -3,6 +3,7 @@
 // with the final frame count, that the stats header is verbatim, and that the
 // cadences (fdt/pdt/wdt) fire independently.
 #include "dns/output.hpp"
+#include "check.hpp"
 
 #include <cstdio>
 #include <filesystem>
@@ -12,16 +13,9 @@
 
 namespace {
 
-int failures = 0;
+using dnstest::check;
 
-void check(bool ok, const char* what)
-{
-    if (!ok)
-    {
-        std::printf("FAIL: %s\n", what);
-        ++failures;
-    }
-}
+
 
 std::string slurp(const std::string& p)
 {
@@ -182,6 +176,6 @@ int main()
               "an empty prefix is rejected");
     }
 
-    if (failures == 0) std::printf("output: OK\n");
-    return failures == 0 ? 0 : 1;
+    if (dnstest::gFailures == 0) std::printf("output: OK\n");
+    return dnstest::finish();
 }

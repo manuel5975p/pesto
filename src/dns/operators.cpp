@@ -239,4 +239,48 @@ double maxAbsDivergence(const Grid& g, const VectorField& U)
     return m;
 }
 
+VectorField prolongMac(const Grid& gc, double hc, const VectorField& C,
+                       const Grid& gf, double hf)
+{
+    auto F = VectorField::zeros(gf);
+    const bool flat = gc.nz == 1 || gf.nz == 1;
+
+    // Sample the coarse array at continuous coarse indices, clamped to range.
+    auto sample = [&](const std::vector<double>& q, double ci, double cj, double ck) {
+        const auto lerp1 = [](double a, double b, double t) { return a + (b - a) * t; };
+        ci = std::clamp(ci, 0.0, double(gc.nx - 1));
+        cj = std::clamp(cj, 0.0, double(gc.ny - 1));
+        ck = flat ? 0.0 : std::clamp(ck, 0.0, double(gc.nz - 1));
+        const int i0 = std::min(int(ci), gc.nx - 1), i1 = std::min(i0 + 1, gc.nx - 1);
+        const int j0 = std::min(int(cj), gc.ny - 1), j1 = std::min(j0 + 1, gc.ny - 1);
+        const int k0 = flat ? 0 : std::min(int(ck), gc.nz - 1);
+        const int k1 = flat ? 0 : std::min(k0 + 1, gc.nz - 1);
+        const double tx = ci - i0, ty = cj - j0, tz = flat ? 0.0 : ck - k0;
+        const double c00 = lerp1(q[gc.idx(i0, j0, k0)], q[gc.idx(i1, j0, k0)], tx);
+        const double c10 = lerp1(q[gc.idx(i0, j1, k0)], q[gc.idx(i1, j1, k0)], tx);
+        const double c01 = lerp1(q[gc.idx(i0, j0, k1)], q[gc.idx(i1, j0, k1)], tx);
+        const double c11 = lerp1(q[gc.idx(i0, j1, k1)], q[gc.idx(i1, j1, k1)], tx);
+        return lerp1(lerp1(c00, c10, ty), lerp1(c01, c11, ty), tz);
+    };
+
+    for (int k = 0; k < gf.nz; ++k)
+        for (int j = 0; j < gf.ny; ++j)
+            for (int i = 0; i < gf.nx; ++i)
+            {
+                // Face-normal axis uses the face map, the other two the centre
+                // map; that is what makes this a MAC interpolation and not a
+                // collocated one.
+                const double Xf = (i - 1) * hf, Yf = (j - 1) * hf, Zf = (k - 1) * hf;
+                const double Xc = (i - 0.5) * hf, Yc = (j - 0.5) * hf,
+                             Zc = (k - 0.5) * hf;
+                const std::size_t q = gf.idx(i, j, k);
+                F.u[q] = sample(C.u, Xf / hc + 1.0, Yc / hc + 0.5, Zc / hc + 0.5);
+                F.v[q] = sample(C.v, Xc / hc + 0.5, Yf / hc + 1.0, Zc / hc + 0.5);
+                F.w[q] = flat ? 0.0
+                              : sample(C.w, Xc / hc + 0.5, Yc / hc + 0.5,
+                                       Zf / hc + 1.0);
+            }
+    return F;
+}
+
 } // namespace dns
