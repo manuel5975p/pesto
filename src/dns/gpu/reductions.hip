@@ -30,6 +30,16 @@ struct PlainSum
     __host__ __device__ double operator()(int c) const { return double(x[c]); }
 };
 
+// PlainSum's FP64 twin (the buffer is already double: the per-item tallies).
+// A named functor, like every other reduce input here, rather than a lambda:
+// nvcc's extended __device__ lambda cannot have its return type queried from
+// host code, which is exactly what the transform iterator does.
+struct PlainSum64
+{
+    const double* x;
+    __host__ __device__ double operator()(int c) const { return x[c]; }
+};
+
 struct SqDiff3
 {
     const Real *au, *av, *aw, *bu, *bv, *bw;
@@ -211,8 +221,7 @@ double maxAbsDivergence(const GpuGrid& g, const DeviceField& U, ReduceScratch& s
 double sumDouble(const double* q, std::size_t n, ReduceScratch& s)
 {
     if (n == 0) return 0.0;
-    return reduce(s, n, [q] __device__(int i) { return q[i]; },
-                  rocprim::plus<double>(), 0.0);
+    return reduce(s, n, PlainSum64{q}, rocprim::plus<double>(), 0.0);
 }
 
 double velocityGradientSq(const GpuGrid& g, const DeviceField& U, ReduceScratch& s)

@@ -12,7 +12,23 @@ endif()
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wall$<SEMICOLON>-Wextra$<SEMICOLON>-Wpedantic>)
 
 option(DNS_WITH_FFTW "Use FFTW3 for the pressure Poisson solve" ON)
-option(DNS_WITH_HIP "Build the HIP GPU backend" OFF)
+
+# The GPU backend, in two flavours of the SAME sources. src/dns/gpu/*.hip is
+# written in HIP and compiled by hipcc for AMD; for NVIDIA the identical files
+# are compiled as CUDA (LANGUAGE CUDA => nvcc -x cu) against the header shim in
+# src/compat/cuda, which renames the ~40 hip*/rocprim names onto their CUDA
+# equivalents. There is no second implementation and no per-backend #if in any
+# solver: see src/compat/cuda/README.md.
+option(DNS_WITH_HIP "Build the GPU backend with HIP (ROCm / AMD)" OFF)
+option(DNS_WITH_CUDA "Build the GPU backend with CUDA (NVIDIA)" OFF)
+if(DNS_WITH_HIP AND DNS_WITH_CUDA)
+    message(FATAL_ERROR
+        "DNS_WITH_HIP and DNS_WITH_CUDA are mutually exclusive: they build the "
+        "same sources into the same dns_gpu target. Pick one backend.")
+endif()
+if(DNS_WITH_HIP OR DNS_WITH_CUDA)
+    set(DNS_WITH_GPU ON)
+endif()
 
 find_package(ZLIB REQUIRED) # fieldpng.cpp (PNG frame export)
 
@@ -31,9 +47,11 @@ add_library(dns_core
     src/dns/output.cpp
     src/dns/comp.cpp
     src/dns/curvmesh.cpp
+    src/dns/interrupt.cpp
     src/dns/meshsdf.cpp
     src/dns/poisson.cpp
     src/dns/scene.cpp
+    src/dns/shmframes.cpp
     src/dns/timestepper.cpp
     src/dns/trimesh.cpp
     src/dns/vtk_writer.cpp
@@ -57,6 +75,32 @@ endif()
 # recomposition; `dns <subcommand>` covers the whole former 15-binary surface.
 add_executable(dns apps/dns_main.cpp)
 target_link_libraries(dns PRIVATE dns_core)
+
+# The one GPU source list, shared by both backends.
+set(DNS_GPU_SOURCES
+    src/dns/gpu/bodyforce.hip
+    src/dns/gpu/comp.hip
+    src/dns/gpu/comp_channel.hip
+    src/dns/gpu/comp_far.hip
+    src/dns/gpu/comp_ghost.hip
+    src/dns/gpu/comp_nscbc.hip
+    src/dns/gpu/cutcell.hip
+    src/dns/gpu/cutflux.hip
+    src/dns/gpu/cutpoisson.hip
+    src/dns/gpu/derived.hip
+    src/dns/gpu/device_util.hip
+    src/dns/gpu/ghostfill.hip
+    src/dns/gpu/kernels.hip
+    src/dns/gpu/les.hip
+    src/dns/gpu/poisson.hip
+    src/dns/gpu/reductions.hip
+    src/dns/gpu/runner_channel.hip
+    src/dns/gpu/runner_comp.hip
+    src/dns/gpu/runner_incomp.hip
+    src/dns/gpu/runner_periodic.hip
+    src/dns/gpu/timestepper.hip
+    src/dns/gpu/tunnel.hip
+)
 
 if(DNS_WITH_HIP)
     # GPU arch is flexible: an explicit -DCMAKE_HIP_ARCHITECTURES wins;
@@ -94,34 +138,11 @@ if(DNS_WITH_HIP)
     find_package(hipfft REQUIRED)
     find_package(rocprim REQUIRED)
 
-    add_library(dns_gpu
-        src/dns/gpu/bodyforce.hip
-        src/dns/gpu/comp.hip
-        src/dns/gpu/comp_channel.hip
-        src/dns/gpu/comp_far.hip
-        src/dns/gpu/comp_ghost.hip
-        src/dns/gpu/comp_nscbc.hip
-        src/dns/gpu/cutcell.hip
-        src/dns/gpu/cutflux.hip
-        src/dns/gpu/cutpoisson.hip
-        src/dns/gpu/derived.hip
-        src/dns/gpu/device_util.hip
-        src/dns/gpu/ghostfill.hip
-        src/dns/gpu/kernels.hip
-        src/dns/gpu/les.hip
-        src/dns/gpu/poisson.hip
-        src/dns/gpu/reductions.hip
-        src/dns/gpu/runner_channel.hip
-        src/dns/gpu/runner_comp.hip
-        src/dns/gpu/runner_incomp.hip
-        src/dns/gpu/runner_periodic.hip
-        src/dns/gpu/timestepper.hip
-        src/dns/gpu/tunnel.hip
-    )
+    add_library(dns_gpu ${DNS_GPU_SOURCES})
     target_link_libraries(dns_gpu
         PUBLIC dns_core hip::host
         PRIVATE hip::hipfft roc::rocprim)
-    target_compile_definitions(dns_gpu PUBLIC DNS_WITH_HIP=1)
+    target_compile_definitions(dns_gpu PUBLIC DNS_WITH_GPU=1 DNS_WITH_HIP=1)
     target_compile_options(dns_gpu PRIVATE
         $<$<COMPILE_LANGUAGE:HIP>:-Wall$<SEMICOLON>-Wextra>)
 
@@ -129,6 +150,84 @@ if(DNS_WITH_HIP)
     # (Target predates enable_language(HIP), so set its HIP arch explicitly.)
     target_link_libraries(dns PRIVATE dns_gpu)
     set_property(TARGET dns PROPERTY HIP_ARCHITECTURES ${CMAKE_HIP_ARCHITECTURES})
+endif()
+
+if(DNS_WITH_CUDA)
+    # Same policy as the HIP branch above: an explicit
+    # -DCMAKE_CUDA_ARCHITECTURES wins; otherwise ask the installed driver what
+    # is in the machine ("native", which nvcc resolves at compile time) and fall
+    # back to a fat binary when no device answers (CI, headless build hosts).
+    # 75 = Turing, 86 = Ampere consumer (RTX 30xx), 89 = Ada, 120 = Blackwell.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(_dns_have_nv "")
+        find_program(DNS_NVIDIA_SMI NAMES nvidia-smi)
+        if(DNS_NVIDIA_SMI)
+            execute_process(COMMAND ${DNS_NVIDIA_SMI} -L
+                            OUTPUT_VARIABLE _dns_nv_out RESULT_VARIABLE _dns_nv_rc
+                            ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+            if(_dns_nv_rc EQUAL 0 AND _dns_nv_out MATCHES "GPU 0")
+                set(_dns_have_nv ON)
+            endif()
+        endif()
+        if(_dns_have_nv)
+            set(CMAKE_CUDA_ARCHITECTURES native)
+            message(STATUS "DNS: CUDA arch: native (device detected)")
+        else()
+            set(CMAKE_CUDA_ARCHITECTURES 75 86 89 120)
+            message(STATUS "DNS: no NVIDIA device detected, building fat binary "
+                           "for ${CMAKE_CUDA_ARCHITECTURES} "
+                           "(override with -DCMAKE_CUDA_ARCHITECTURES)")
+        endif()
+    else()
+        message(STATUS "DNS: using requested CUDA arch: ${CMAKE_CUDA_ARCHITECTURES}")
+    endif()
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+
+    # CMake 4.3's NVIDIA-CUDA compiler module stops at the c++20 dialect, so a
+    # target inheriting CXX_STANDARD 23 is rejected as "does not know the flags"
+    # -- even though nvcc has accepted -std=c++23 for several releases. The
+    # library is C++23 by necessity (std::expected is the error channel, and it
+    # is in the GPU headers), so downgrading the GPU TUs is not an option.
+    # Teach CMake the flag, but only after CHECKING it: a version guess would be
+    # wrong in one direction or the other, and a bad guess turns into a wall of
+    # template errors instead of one clear message. Guarded on the variable
+    # being absent, so a future CMake that knows CUDA23 wins.
+    if(NOT CMAKE_CUDA23_STANDARD_COMPILE_OPTION)
+        include(CheckSourceCompiles)
+        set(CMAKE_REQUIRED_FLAGS "-std=c++23")
+        check_source_compiles(CUDA
+            "#include <expected>\nint main(){ std::expected<int,int> e{1}; return *e - 1; }"
+            DNS_NVCC_HAS_CXX23)
+        unset(CMAKE_REQUIRED_FLAGS)
+        if(NOT DNS_NVCC_HAS_CXX23)
+            message(FATAL_ERROR
+                "nvcc ${CMAKE_CUDA_COMPILER_VERSION} cannot compile C++23 "
+                "(<expected>), which dns_core's headers require. Use a newer "
+                "CUDA toolkit, or build the HIP backend instead.")
+        endif()
+        set(CMAKE_CUDA23_STANDARD_COMPILE_OPTION "-std=c++23")
+        set(CMAKE_CUDA23_EXTENSION_COMPILE_OPTION "-std=c++23")
+        set(CMAKE_CUDA_STANDARD_LATEST 23)
+    endif()
+
+    add_library(dns_gpu ${DNS_GPU_SOURCES})
+    # The .hip extension is not a CUDA extension; this is what routes the
+    # unchanged sources through nvcc (-x cu) instead of the C++ compiler.
+    set_source_files_properties(${DNS_GPU_SOURCES} PROPERTIES LANGUAGE CUDA)
+    # PUBLIC: dns_main.cpp and the test_gpu_*.cpp tests are CXX TUs that include
+    # gpu/device_util.hpp, so they need <hip/hip_runtime.h> to resolve too.
+    target_include_directories(dns_gpu PUBLIC src/compat/cuda)
+    target_link_libraries(dns_gpu
+        PUBLIC dns_core CUDA::cudart
+        PRIVATE CUDA::cufft)
+    target_compile_definitions(dns_gpu PUBLIC DNS_WITH_GPU=1 DNS_WITH_CUDA=1)
+    # Same warnings as the HIP branch; nvcc needs them handed to the host
+    # compiler explicitly.
+    target_compile_options(dns_gpu PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)
+
+    target_link_libraries(dns PRIVATE dns_gpu)
 endif()
 
 # --- dns-ui: the interactive obstacle editor / grid viewer -------------------
@@ -205,14 +304,23 @@ if(DNS_WITH_UI)
         apps/dns_ui.cpp
         src/ui/app.cpp
         src/ui/doc.cpp
+        src/ui/field.cpp
+        src/ui/livemesh.cpp
+        src/ui/pickobj.cpp
         src/ui/draw.cpp
+        src/ui/gizmo.cpp
         src/ui/gui.cpp
+        src/ui/guicheck.cpp
+        src/ui/runner.cpp
         src/ui/text.cpp
         src/ui/view.cpp
         src/ui/vk.cpp
     )
     add_dependencies(dns-ui dns_ui_shaders)
     target_include_directories(dns-ui PRIVATE src ${_dns_spv_dir})
+    # --check opens every shipped scene, so it needs to find them.
+    target_compile_definitions(dns-ui PRIVATE
+        DNS_EXAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples")
     target_link_libraries(dns-ui PRIVATE dns_core SDL3::SDL3 Vulkan::Vulkan harfbuzz)
 
     # `dns-ui --check` drives the whole non-graphical half (document build,
@@ -249,7 +357,7 @@ if(BUILD_TESTING)
         set_tests_properties(hit_mini PROPERTIES TIMEOUT 900
             LABELS "slow;validation;literature")
     endif()
-    if(DNS_WITH_HIP)
+    if(DNS_WITH_GPU)
         foreach(t gpu_buffer gpu_operators gpu_reductions gpu_poisson
                   gpu_poisson_neumann gpu_poisson2d gpu_projection gpu_tgv
                   gpu_cutcell gpu_cutcell2d gpu_cutcell_sphere gpu_conservation
@@ -265,9 +373,14 @@ if(BUILD_TESTING)
         endforeach()
 
         # These define their own kernels (the pre-recomposition kernel variants,
-        # as identity oracles), so they are HIP TUs rather than plain .cpp.
+        # as identity oracles), so they are HIP TUs rather than plain .cpp --
+        # and so they need the same .hip -> CUDA routing as the library.
         foreach(t gpu_tunnel_bc gpu_bodyforce)
             add_executable(test_${t} tests/test_${t}.hip)
+            if(DNS_WITH_CUDA)
+                set_source_files_properties(tests/test_${t}.hip
+                    PROPERTIES LANGUAGE CUDA)
+            endif()
             target_link_libraries(test_${t} PRIVATE dns_gpu)
             add_test(NAME ${t} COMMAND test_${t})
             set_tests_properties(${t} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)

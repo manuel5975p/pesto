@@ -12,8 +12,18 @@
 
 namespace dns::gpu {
 
-// True iff at least one HIP device is usable (tests skip otherwise).
+// True iff at least one GPU device is usable (tests skip otherwise).
 bool deviceAvailable();
+
+// Which toolchain compiled this backend. The sources are identical either way
+// (src/compat/cuda/README.md); the label exists so a stored provenance line --
+// e.g. the `backend=` field in the TGV CSV headers under data/validation --
+// records which one actually produced the numbers.
+#if DNS_WITH_CUDA
+inline constexpr const char* backendName = "cuda";
+#else
+inline constexpr const char* backendName = "hip";
+#endif
 
 // Narrowing upload / widening download of a whole staggered field.
 hipError_t uploadField(const VectorField& src, DeviceField& dst);

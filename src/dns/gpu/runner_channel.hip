@@ -1,3 +1,4 @@
+#include "dns/interrupt.hpp"
 #include "dns/gpu/runner_channel.hpp"
 
 #include "dns/curvmesh.hpp"
@@ -189,6 +190,11 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
 
     while (t < r.tEnd)
     {
+        // A stop signal ends the run the SAME way reaching tEnd does: return
+        // normally, so every destructor runs -- the stats file is flushed and
+        // the shared-memory segment is unlinked. Terminating mid-step instead
+        // leaves a segment that outlives its own run, flagged as live.
+        if (stopRequested()) break;
         // 1e-9: the channel's own collapse threshold (wall units put dt on a
         // different scale than the body runs). NOT shared with comp's 1e-6.
         if (auto e = internal::recomputeDt(
@@ -233,7 +239,8 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
                 while (nextProf <= t) nextProf += r.profileDt;
             }
         }
-        if (out.wantsFrame(t) || out.wantsPng(t) || out.wantsWeb(t))
+        if (out.wantsFrame(t) || out.wantsPng(t) || out.wantsWeb(t)
+            || out.wantsShm(t))
             writeFrame(t);
     }
     (void)hipDeviceSynchronize();

@@ -230,6 +230,68 @@ void testBuildGeometry()
           "boundary-crossing object rejected");
 }
 
+// A cube is a CUBE, not a pillar. The rule lives in dns::sceneCube and both
+// --body cube and --scene go through it, so this pins the rule once.
+void testCube()
+{
+    using std::numbers::pi;
+    const int n = 64;
+    const double L = 2 * pi, h = L / n;
+
+    // --- 3D: finite in z, and every edge the same length --------------------
+    const auto g3 = dns::Grid::make(n, n, n, L, L, L);
+    const double r = L / 16.0;
+    const double cz = 0.5 * L;
+    const auto c = dns::sceneCube(g3, 0.5 * L, 0.5 * L, cz, r);
+
+    // The cross-section is the L1 ball of half-DIAGONAL r, so its side is
+    // r*sqrt2 -- and a cube is as tall as its side.
+    const double side = r * std::numbers::sqrt2;
+    check(std::abs((c.z1 - c.z0) - side) < 1e-12, "cube height equals its side");
+    check(std::abs(0.5 * (c.z0 + c.z1) - cz) < 1e-12, "cube is centred on cz");
+    check(c.z0 > 0 && c.z1 < L, "cube does not span the box");
+
+    // The sdf agrees: solid at the centre, fluid just past a z face -- which
+    // is the whole complaint, since the old prism was solid all the way out.
+    const auto sdf = dns::sdfOf(c);
+    check(sdf(0.5 * L, 0.5 * L, cz) < 0, "solid at the cube centre");
+    check(sdf(0.5 * L, 0.5 * L, c.z1 + 2 * g3.hz) > 0, "fluid above the cube");
+    check(sdf(0.5 * L, 0.5 * L, c.z0 - 2 * g3.hz) > 0, "fluid below the cube");
+
+    // And the CUT agrees, to the accuracy the partial-z aperture buys: the
+    // solid volume is side^3. A binary in/out z test would land on a multiple
+    // of hz instead, so this is also the pin on that aperture being exact.
+    const auto cut = dns::CutGeometry::make(g3, c);
+    double solid = 0;
+    for (std::size_t i = 0; i < g3.size(); ++i) solid += 1.0 - cut.lambda[i];
+    solid *= g3.hx * g3.hy * g3.hz;
+    // Exact, not approximate: lambda is the exact 2D area fraction times the
+    // exact 1D z overlap, and for a prism that product IS the volume fraction.
+    // A binary z test would round the height to a multiple of hz and miss by
+    // percents, so the tight tolerance is the point.
+    const double want = side * side * side;
+    check(std::abs(solid - want) / want < 1e-12,
+          "cut solid volume is the cube's volume, exactly");
+
+    // --- 2D: degenerates back to the prism ----------------------------------
+    const auto g2 = dns::Grid::make(n, n, 1, L, L, 1.0);
+    const auto c2 = dns::sceneCube(g2, 0.5 * L, 0.5 * L, 0.5, r);
+    check(c2.z0 == 0.0 && c2.z1 == g2.hz,
+          "at nz == 1 the cube is the z-invariant cross-section");
+
+    // --- the editor's box agrees with the builder ---------------------------
+    // sceneObjectBox is what the viewport picks and draws against; a stale
+    // full-depth box there would select a cube from eight diameters away.
+    const dns::Placement ref{0.5 * L, 0.5 * L, cz, 2 * r};
+    dns::SceneObject o;
+    o.kind = dns::SceneObjectKind::Cube;
+    o.d = 1.0;
+    const auto bb = dns::sceneObjectBox(g3, ref, o);
+    check(std::abs(bb[2] - c.z0) < 1e-12 && std::abs(bb[5] - c.z1) < 1e-12,
+          "sceneObjectBox reports the cube's real z extent");
+    check(!dns::needs3d(o), "a cube still has a valid 2D reading");
+}
+
 } // namespace
 
 int main()
@@ -239,6 +301,7 @@ int main()
     testConfigTokens();
     testCliAndValidate();
     testBuildGeometry();
+    testCube();
     if (dnstest::gFailures) { std::printf("%d failure(s)\n", dnstest::gFailures); return 1; }
     std::printf("ok\n");
     return 0;

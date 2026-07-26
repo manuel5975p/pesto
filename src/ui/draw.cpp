@@ -1,5 +1,6 @@
 #include "ui/draw.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace {
@@ -285,12 +286,23 @@ std::expected<void, std::string> Renderer::build(Vk& vk)
                                       &pipeTriBlend_),
             "vkCreateGraphicsPipelines(tri blend)");
 
+    // Overlay triangles: depth OFF. A gizmo handle you cannot see because the
+    // body is in front of it is a handle you cannot grab.
+    gp.pDepthStencilState = &dsOff;
+    VKCHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, nullptr,
+                                      &pipeTriOverlay_),
+            "vkCreateGraphicsPipelines(tri overlay)");
+
     stages(*lineM, st);
     gp.pVertexInputState = &viL;
     gp.pInputAssemblyState = &iaLine;
     gp.pDepthStencilState = &dsOn;
     VKCHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, nullptr, &pipeLine_),
             "vkCreateGraphicsPipelines(line)");
+    gp.pDepthStencilState = &dsOff;
+    VKCHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, nullptr,
+                                      &pipeLineOverlay_),
+            "vkCreateGraphicsPipelines(line overlay)");
 
     stages(*uiM, st);
     gp.pVertexInputState = &vi2;
@@ -354,19 +366,25 @@ void Renderer::destroy(GpuMesh& m)
 }
 
 void Renderer::drawTriangles(const GpuMesh& m, const Mat4& mvp, const Vec3& light,
-                             float alpha, bool depthWrite)
+                             Rgba tint, bool depthTest, bool depthWrite)
 {
     if (!m.count) return;
     const VkCommandBuffer cb = vk_->cmd();
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                      depthWrite ? pipeTriOpaque_ : pipeTriBlend_);
+                      !depthTest  ? pipeTriOverlay_
+                      : depthWrite ? pipeTriOpaque_
+                                   : pipeTriBlend_);
     Push3 p{};
     p.mvp = mvp;
     p.light[0] = light.x;
     p.light[1] = light.y;
     p.light[2] = light.z;
-    p.tint[0] = p.tint[1] = p.tint[2] = 1.0f;
-    p.tint[3] = alpha;
+    // The shaders have always multiplied by pc.tint; the old signature just
+    // pinned rgb to white and exposed only the alpha.
+    p.tint[0] = float(tint.r) / 255.0f;
+    p.tint[1] = float(tint.g) / 255.0f;
+    p.tint[2] = float(tint.b) / 255.0f;
+    p.tint[3] = float(tint.a) / 255.0f;
     vkCmdPushConstants(cb, layout3_,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(p), &p);
@@ -375,16 +393,20 @@ void Renderer::drawTriangles(const GpuMesh& m, const Mat4& mvp, const Vec3& ligh
     vkCmdDraw(cb, m.count, 1, 0, 0);
 }
 
-void Renderer::drawLines(const GpuMesh& m, const Mat4& mvp, float alpha)
+void Renderer::drawLines(const GpuMesh& m, const Mat4& mvp, Rgba tint,
+                         bool depthTest)
 {
     if (!m.count) return;
     const VkCommandBuffer cb = vk_->cmd();
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeLine_);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      depthTest ? pipeLine_ : pipeLineOverlay_);
     Push3 p{};
     p.mvp = mvp;
     p.light[2] = 1.0f;
-    p.tint[0] = p.tint[1] = p.tint[2] = 1.0f;
-    p.tint[3] = alpha;
+    p.tint[0] = float(tint.r) / 255.0f;
+    p.tint[1] = float(tint.g) / 255.0f;
+    p.tint[2] = float(tint.b) / 255.0f;
+    p.tint[3] = float(tint.a) / 255.0f;
     vkCmdPushConstants(cb, layout3_,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(p), &p);
@@ -422,6 +444,9 @@ std::expected<void, std::string> Renderer::drawUi(std::span<const Vtx2> verts,
     std::memcpy(b.mapped, verts.data(), verts.size_bytes());
 
     const VkCommandBuffer cb = vk_->cmd();
+    // The 2D stream is in WINDOW pixels; a viewport left over from the 3D
+    // region would shift and squash every panel. Restore it before drawing.
+    resetViewport();
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeUi_);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout2_, 0, 1,
                             &dset_, 0, nullptr);
@@ -440,6 +465,35 @@ std::expected<void, std::string> Renderer::drawUi(std::span<const Vtx2> verts,
     return {};
 }
 
+void Renderer::setViewport(float x, float y, float w, float h)
+{
+    const VkCommandBuffer cb = vk_->cmd();
+    if (!cb) return;
+    const VkExtent2D e = vk_->extent();
+    // Clamp into the framebuffer: Vulkan rejects a scissor that leaves it, and
+    // a window can be resized to less than the docked columns want.
+    const float x0 = std::max(0.0f, x), y0 = std::max(0.0f, y);
+    const float x1 = std::min(float(e.width), x + w);
+    const float y1 = std::min(float(e.height), y + h);
+    const float vw = std::max(1.0f, x1 - x0), vh = std::max(1.0f, y1 - y0);
+
+    VkViewport vp{x0, y0, vw, vh, 0, 1};
+    VkRect2D sc{{int32_t(x0), int32_t(y0)}, {uint32_t(vw), uint32_t(vh)}};
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &sc);
+}
+
+void Renderer::resetViewport()
+{
+    const VkCommandBuffer cb = vk_->cmd();
+    if (!cb) return;
+    const VkExtent2D e = vk_->extent();
+    VkViewport vp{0, 0, float(e.width), float(e.height), 0, 1};
+    VkRect2D sc{{0, 0}, e};
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &sc);
+}
+
 Renderer::~Renderer()
 {
     if (!vk_) return;
@@ -449,6 +503,8 @@ Renderer::~Renderer()
     if (pipeTriOpaque_) vkDestroyPipeline(dev, pipeTriOpaque_, nullptr);
     if (pipeTriBlend_) vkDestroyPipeline(dev, pipeTriBlend_, nullptr);
     if (pipeLine_) vkDestroyPipeline(dev, pipeLine_, nullptr);
+    if (pipeTriOverlay_) vkDestroyPipeline(dev, pipeTriOverlay_, nullptr);
+    if (pipeLineOverlay_) vkDestroyPipeline(dev, pipeLineOverlay_, nullptr);
     if (pipeUi_) vkDestroyPipeline(dev, pipeUi_, nullptr);
     if (dpool_) vkDestroyDescriptorPool(dev, dpool_, nullptr);
     if (dsl_) vkDestroyDescriptorSetLayout(dev, dsl_, nullptr);

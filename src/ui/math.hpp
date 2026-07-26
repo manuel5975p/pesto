@@ -109,4 +109,125 @@ inline Mat4 orthographic(float halfW, float halfH, float zn, float zf)
     return r;
 }
 
+// --- rays, planes, boxes -----------------------------------------------------
+//
+// Everything a translate gizmo and an object pick need, as pure functions. They
+// live here rather than inline in app.cpp so `dns-ui --check` can drive them
+// with no window and no device -- which is the only way the drag solve gets
+// tested at all.
+
+struct Vec2
+{
+    float x = 0, y = 0;
+    Vec2() = default;
+    Vec2(float a, float b) : x(a), y(b) {}
+    Vec2 operator+(const Vec2& o) const { return {x + o.x, y + o.y}; }
+    Vec2 operator-(const Vec2& o) const { return {x - o.x, y - o.y}; }
+    Vec2 operator*(float s) const { return {x * s, y * s}; }
+};
+inline float dot(const Vec2& a, const Vec2& b) { return a.x * b.x + a.y * b.y; }
+inline float length(const Vec2& a) { return std::sqrt(dot(a, a)); }
+
+// `d` is NOT required to be unit length; each user documents what it means.
+struct Ray { Vec3 o, d; };
+struct Aabb3 { Vec3 lo, hi; };
+// dot(n, p) == dist, n unit.
+struct Plane { Vec3 n; float dist = 0; };
+
+inline Plane planeThrough(const Vec3& p, const Vec3& n)
+{
+    const Vec3 u = normalize(n);
+    return {u, dot(u, p)};
+}
+
+// Slab test. tEnter may be negative when the origin is inside the box.
+inline bool rayAabb(const Ray& r, const Aabb3& b, float& tEnter, float& tExit)
+{
+    float t0 = -1e30f, t1 = 1e30f;
+    const float o[3] = {r.o.x, r.o.y, r.o.z};
+    const float d[3] = {r.d.x, r.d.y, r.d.z};
+    const float lo[3] = {b.lo.x, b.lo.y, b.lo.z};
+    const float hi[3] = {b.hi.x, b.hi.y, b.hi.z};
+    for (int a = 0; a < 3; ++a) {
+        if (std::abs(d[a]) < 1e-12f) {
+            if (o[a] < lo[a] || o[a] > hi[a]) return false;
+            continue;
+        }
+        float ta = (lo[a] - o[a]) / d[a], tb = (hi[a] - o[a]) / d[a];
+        if (ta > tb) std::swap(ta, tb);
+        t0 = std::max(t0, ta);
+        t1 = std::min(t1, tb);
+    }
+    if (t1 < std::max(t0, 0.0f)) return false;
+    tEnter = t0;
+    tExit = t1;
+    return true;
+}
+
+// False when the ray is (near) parallel to the plane.
+inline bool rayPlane(const Ray& r, const Plane& p, float& t, float eps = 1e-7f)
+{
+    const float dn = dot(p.n, r.d);
+    if (std::abs(dn) < eps) return false;
+    t = (p.dist - dot(p.n, r.o)) / dn;
+    return true;
+}
+
+// Closest approach between the INFINITE line a + u*t and the ray. Returns the
+// line parameter and the ray parameter. False when the two are within eps of
+// parallel -- the caller must then hold its previous value rather than solve,
+// or the object flies to infinity as the view swings through the axis.
+inline bool closestLineRay(const Vec3& a, const Vec3& u, const Ray& r,
+                           float& tLine, float& sRay, float eps = 1e-6f)
+{
+    const Vec3 w0 = a - r.o;
+    const float A = dot(u, u), B = dot(u, r.d), C = dot(r.d, r.d);
+    const float D = dot(u, w0), E = dot(r.d, w0);
+    const float det = A * C - B * B;
+    if (std::abs(det) < eps) return false;
+    tLine = (B * E - C * D) / det;
+    sRay = (A * E - B * D) / det;
+    return true;
+}
+
+// Pixel-space distance from p to the segment ab.
+inline float distPointSegment2(const Vec2& p, const Vec2& a, const Vec2& b)
+{
+    const Vec2 ab = b - a;
+    const float len2 = dot(ab, ab);
+    if (len2 < 1e-12f) return length(p - a);
+    float t = dot(p - a, ab) / len2;
+    t = t < 0 ? 0 : (t > 1 ? 1 : t);
+    return length(p - (a + ab * t));
+}
+
+// Point in a convex polygon, either winding.
+inline bool pointInConvex2(const Vec2& p, const Vec2* poly, int n)
+{
+    bool neg = false, pos = false;
+    for (int i = 0; i < n; ++i) {
+        const Vec2& a = poly[i];
+        const Vec2& b = poly[(i + 1) % n];
+        const float cr = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        if (cr < 0) neg = true;
+        if (cr > 0) pos = true;
+        if (neg && pos) return false;
+    }
+    return true;
+}
+
+// World -> VIEWPORT pixels, top-left origin. False when the point is behind the
+// eye. The projections above already negate m[5], so NDC y points down and
+// there is no second flip here: getting that wrong mirrors every gizmo hit-test
+// vertically, which is why `--check` round-trips this against Camera::ray.
+inline bool worldToScreen(const Mat4& viewProj, const Vec3& p, float vpW,
+                          float vpH, Vec2& out)
+{
+    float w = 0;
+    const Vec3 clip = viewProj.transform(p, w);
+    if (w <= 1e-6f) return false;
+    out = {(clip.x / w * 0.5f + 0.5f) * vpW, (clip.y / w * 0.5f + 0.5f) * vpH};
+    return true;
+}
+
 } // namespace ui

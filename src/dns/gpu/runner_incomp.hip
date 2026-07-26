@@ -1,3 +1,4 @@
+#include "dns/interrupt.hpp"
 #include "dns/gpu/runner_incomp.hpp"
 
 #include "dns/gpu/cutflux.hpp"
@@ -231,6 +232,11 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     const auto wall0 = std::chrono::steady_clock::now();
     while (t < r.tEnd)
     {
+        // A stop signal ends the run the SAME way reaching tEnd does: return
+        // normally, so every destructor runs -- the stats file is flushed and
+        // the shared-memory segment is unlinked. Terminating mid-step instead
+        // leaves a segment that outlives its own run, flagged as live.
+        if (stopRequested()) break;
         const double conv =
             dFlag ? maxCourantPerDtCut(gg, *dU, dCut->ax, dCut->ay, dCut->az,
                                        dCut->lambda, *red)
@@ -304,7 +310,8 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
         stage(*dU, *dS, 0.75, dt);
         stage(*dS, *dU, 1.0 / 3.0, dt);
 
-        if (out.wantsFrame(t) || out.wantsPng(t) || out.wantsWeb(t))
+        if (out.wantsFrame(t) || out.wantsPng(t) || out.wantsWeb(t)
+            || out.wantsShm(t))
             writeFrame(t);
 
         if (tally)

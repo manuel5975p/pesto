@@ -5,6 +5,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm> // std::min(initializer_list): NOT in <bits/stl_algobase.h>
 #include <array>
 #include <cmath>
 #include <cstddef>

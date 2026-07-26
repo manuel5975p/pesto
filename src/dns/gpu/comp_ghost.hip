@@ -3,6 +3,7 @@
 #include "dns/gpu/internal/comp_flux.hpp"
 #include "dns/gpu/device_util.hpp"
 
+#include <algorithm> // std::max(initializer_list): NOT in <bits/stl_algobase.h>
 #include <cassert>
 #include <cmath>
 #include <vector>

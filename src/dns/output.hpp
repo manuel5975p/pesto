@@ -91,6 +91,9 @@ public:
     bool wantsFrame(double t) const;
     bool wantsPng(double t) const;
     bool wantsWeb(double t) const;
+    // The live shared-memory bridge (--emit shm). Same cadence as the web
+    // frames; separate predicate because a run can want one without the other.
+    bool wantsShm(double t) const;
 
     // Writes whichever kinds are enabled and due at time t. Advances the
     // cadences it consumed.

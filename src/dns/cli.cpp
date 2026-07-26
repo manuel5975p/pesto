@@ -80,6 +80,7 @@ Emit emitOf(string_view s, bool& ok)
     if (s == "bin") return Emit::Bin;
     if (s == "png") return Emit::Png;
     if (s == "web") return Emit::Web;
+    if (s == "shm") return Emit::Shm;
     if (s == "volume") return Emit::Volume;
     if (s == "slices") return Emit::Slices;
     if (s == "vtk") return Emit::Vtk;
@@ -671,6 +672,12 @@ OUTPUT (--emit is repeatable; default = stats,bin)
   --emit png         png_<out>/{vort,speed}_%05d.png  (nz > 1: the centre
                      z-plane)
   --emit web         web_<out>/ live browser frames + planes.json
+  --emit shm         live frames in POSIX SHARED MEMORY (/dev/shm/dns_<out>),
+                     nothing written to disk. Same planes as --emit web plus
+                     the 3D field when nz > 1, published under a seqlock so a
+                     slow or dead viewer can never stall the solver. This is
+                     what `dns-ui` attaches to; pair it with --emit none for a
+                     run that leaves no artefacts at all.
   --emit volume      <out>_{vol,lam}.bin full 3D field per frame
   --emit slices      three centre planes instead of the volume
   --emit vtk         <out>_%05d.vtk legacy structured points

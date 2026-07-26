@@ -1,14 +1,17 @@
-# `dns-ui` — interactive obstacle editor and grid viewer
+# `dns-ui` — scene editor, run cockpit and live viewer
 
-`dns-ui` is a **pre-run inspector**. It solves nothing. You place bodies, choose
-a resolution, and it shows you the grid and the cut cells the solver would
+`dns-ui` lets you build a case, run it, and watch it. You place bodies, choose a
+resolution, and it shows you the grid and the cut cells the solver would
 actually receive — the fluid-volume fraction λ per cell and the open aperture
 per face, after `sanitizeCut()`, which is exactly what `gpu/cutpoisson` and
-`gpu/cutflux` consume.
+`gpu/cutflux` consume. Press **RUN** and it spawns the solver and renders the
+live field.
 
-It is the second binary in the tree and the only exception to the one-binary
-rule in `CLAUDE.md`, for that reason: it is not a solver mode, and it never
-touches `dns_gpu`.
+**It still solves nothing itself.** It links `dns_core` only — never `dns_gpu` —
+and starts on a machine with no GPU. Running means *spawning `dns` as a child
+process*; watching means *mapping the shared-memory segment that run publishes*.
+That is what keeps it the second binary in the tree and the only exception to
+the one-binary rule in `CLAUDE.md`: it is a front end, not a solver mode.
 
 ## Build and run
 
@@ -16,8 +19,11 @@ touches `dns_gpu`.
 cmake -S . -B build -DDNS_WITH_UI=ON        # SDL3 3.4.0 + HarfBuzz 14.2.1 are fetched
 ninja -C build dns-ui
 build/dns-ui
+build/dns-ui --scene examples/tandem_cylinders.toml   # open a scene
 build/dns-ui --check                        # headless self-check, no GPU/window/font
 ```
+
+`DNS_UI_SCALE=2.0 build/dns-ui` overrides the UI scale (default 1.6).
 
 `DNS_WITH_UI` is **off by default**: turning it on adds a source download and a
 few minutes of dependency build to a fresh configure, and the solver does not
@@ -91,33 +97,214 @@ that is the spacing the body actually sits on.
 The DNS/LES label is `Case::lesLabel` — not a guess — and names the model and Cs
 when it is LES.
 
-## Interaction
+## Layout
 
-| input | action |
-| --- | --- |
-| LMB drag | orbit (3D) / pan (2D) |
-| RMB or shift+LMB | pan |
-| wheel | zoom |
-| click an object | select it (scene mode); drag to move it in the view plane |
-| double-click a number | type an exact value |
-| shift while dragging a number | fine adjust |
-| `F` / `B` | frame the domain / the body |
-| `G` `C` `M` `A` | grid / cut cells / solid mask / apertures |
-| `Del` | remove the selected object |
+Everything is docked; nothing floats over the viewport.
 
-`nz == 1` is not orbited: the camera is pinned to look straight down −z in
-orthographic projection. An oblique view of a 2D cut foreshortens the apertures
-the tool exists to show.
+```
+menu:  dns-ui  frame  body  ortho  view  log  undo  redo  RUN/stop
++-----------+----------------------------+---------------+
+| Case      |                            | Diagnostics   |
+|  material |                            |  cut cells    |
+|  flow     |        VIEWPORT            |  layers       |
+|  numerics |                            |  live results |
+|  grid     |                            |  export       |
++-----------+                            |               |
+| Geometry  |                            |               |
++-----------+----------------------------+---------------+
+| Run: cd / cl / K / maxDiv plots  |  solver log         |
++------------------------------------------------------- +
+| status: hints           BL 2.27 · 1 mm body · Re 197.9  |
++---------------------------------------------------------+
+```
 
-Dragging an object queues a rebuild in the background thread; the selection box
-follows the pointer immediately because it is computed from the edited offsets,
-not from the last completed build.
+The four dividers drag, and they are **painted after the regions**, with a grip
+at the centre — drawn before them the panels covered the bar, and an invisible
+handle is not a handle (the bottom dock in particular read as a fixed height).
+The dock's divider exists while it is **collapsed** too: dragging the closed
+header's top edge upward opens the dock at the height you dragged it to.
+
+The viewport is a real region: the scene is projected into its rect and
+Vulkan-scissored to it, so a panel can never be overdrawn by 3D geometry, and a
+press outside it is never stolen by the UI.
+
+## Numeric fields
+
+Every number in the UI is one widget: **drag** to change, **double-click** to
+type, **shift** for fine (0.1×), **ctrl** for coarse (10×), **←/→** to nudge one
+quantum while the pointer is over it. The filled bar behind the value is where
+it sits in its range.
+
+Two rules do the work, and both are in `Gui::dragRate` / `Gui::dragFill`:
+
+* A range that **cannot go negative is a scale**, and drags as a constant
+  fraction of its own value (1% per pixel on top of the base step). This is what
+  makes a multi-decade field reachable at both ends — `diameter` spans
+  `[D/1000, 1000 D]`, and no fixed absolute step both resolves the small end and
+  reaches the large one. A **signed** range (a position, an array pitch) stays
+  purely linear: dragging an object at `x = 50 D` must not run fifty times
+  faster than dragging one at the origin.
+* The **track** is drawn only for a range that means something. Positions are
+  declared `[-1e4, 1e4] m` for want of a real bound, and a proportion of a
+  sentinel is not a proportion. Where it is drawn it is log-mapped past ~1.5
+  decades, so 128 cells in `[8, 4096]` reads as mid-track rather than 3% — but a
+  range starting *at* zero (LES `Cs` in `[0,1]`) stays linear, because it is an
+  ordinary knob and log-mapping it against an invented floor would park
+  `Cs = 0.1` at 83%.
+
+The field commits a snap of a **continuous shadow value**, not the sum of its own
+committed increments. That is what fixes the two ways it used to feel broken:
+held against `lo`/`hi` it accumulated the whole overshoot as an invisible debt
+that had to be dragged back off before the value would move again, and a field
+whose quantum was coarser than one pixel of travel (`cells z`, 0.25 cells/px
+against a quantum of 1) re-rounded to its old value every frame and could not be
+dragged at all. `checkDragLaw` in `guicheck.cpp` pins all of it.
+
+## Physical units
+
+The solver is dimensionless (`uInf = 1`, Re and Mach are its inputs). The editor
+takes the tangible quantities instead — a **material** (ν, sound speed, ρ), a
+**body size in m**, a **freestream in m/s** — and Re and Mach are DERIVED
+read-outs shown beside them, so they cannot disagree. Cell sizes, the domain and
+the run time read as `31.2 um`, `8 mm`, `2.667 ms`.
+
+One consequence is physics, not a limitation: **Re and Mach are no longer
+independent.** One material plus one freestream fixes both. Re 200 *and* Ma 0.2
+in air needs a 44 µm body.
+
+## Editing objects
+
+Objects live in **scene** mode (the `scene` body kind); with a single `--body`
+there is nothing to select.
+
+| action | how |
+|---|---|
+| add | `+cyl` … `+mesh` arms the tool; the next viewport click places it |
+| select | click it, or a row in the list; ctrl adds, shift ranges |
+| cycle | click the same pixel again to step through overlapping objects |
+| move | drag a **gizmo** handle, or type x/y/z in metres |
+| scale | `diameter` in metres |
+| name | the `name` field — it becomes the `cd_<name>` force column |
+| duplicate / array | buttons; array makes N copies at a fixed pitch |
+| remove | `remove`, or `Del` |
+| undo | `Ctrl+Z` / `Ctrl+Shift+Z`, one entry per gesture |
+
+New objects are placed by a search that never overlaps an existing body and
+never crosses the domain boundary, degrading (overlap, then a smaller diameter)
+with a notice rather than failing the build.
+
+### The gizmo
+
+Three axis arrows, three plane quads and a camera-facing centre handle, sized
+constant in screen space. The drag is **absolute**, not incremental: it solves
+from the current ray and the state captured at grab time, so the point you
+grabbed stays under the cursor, it cannot drift over a long drag, and zooming
+mid-drag is harmless. Snapping is `free` / `grid` (to mesh nodes) / `D/n`, and
+**ctrl inverts** whichever is selected.
+
+The z handle is hidden for cylinders and lenses: the scene builder never reads
+their `z` (they span the box depth by construction), so a z handle would move a
+number that changes nothing. Spheres, meshes and cubes are finite in z and do
+read it, so they keep the handle whenever `nz > 1`.
+
+## Running, and watching
+
+**RUN** spawns `build/dns` with the exact command the export panel prints, adding
+`--emit shm`. The button is state-aware: **stop** while a run is in flight — ours
+*or* one started in a terminal, which it stops by the PID the segment carries.
+
+Live results arrive through **POSIX shared memory**, not files
+(`src/dns/shmframes.hpp`). The writer bumps a seqlock to odd, copies, bumps it to
+even; the reader copies between two equal even observations and discards a torn
+one. **The solver never blocks on the viewer** — a stalled or killed viewer
+cannot slow a run down. Nothing is written to disk.
+
+The viewer attaches to *any* `--emit shm` run on the machine, not only one it
+started.
+
+| view | control |
+|---|---|
+| cut plane | axis (`yz`/`xz`/`xy`) + **plane position**, sliced from the volume by the viewer, so dragging it is instant |
+| volumetric fog | the selected field as back-to-front translucent slices; density, threshold, softness, slice count |
+| field | `vort` / `speed` — every field's volume is published, so either can be sliced or fogged |
+| colour | `field` (the field's own ramp) / `vs mean` / `vs tunnel` — see below |
+| timeline | scrub back through the frames already received — see below |
+| plots | cd / cl / K / maxDiv in the dock, parsed from the solver's own stdout |
+
+### The frame rate is the run's, not the viewer's
+
+Everything above redraws when a frame *arrives*, so the output frame rate is the
+solver's publish cadence: **`--wdt`**, the web/shm frame interval, in solver time
+units. The Flow panel edits it as **frame interval** and shows how many frames
+that is over the run and how far apart they are in real time; the exported
+command carries it, so the printed line reproduces the run that was watched.
+The solver's own default (0.15) is a couple of dozen frames for a one
+flow-through case — the editor starts at 0.05 instead. It is not free: a frame
+every few steps costs the run real time, which the panel warns about past 20k
+frames.
+
+### Rewind
+
+Every frame the viewer decodes is kept, so a run can be scrubbed back through
+**while it is still running**, and a finished run stays scrubbable until the
+window is closed. The timeline slider, the `|< < > live` buttons and the
+left/right arrow keys all move it; stepping off the end returns to following the
+run, so there is no state to get stuck in.
+
+What is kept is the **planes only**. One 512³ volume is 512 MB and a history of
+them would be the machine's memory, so a rewound frame shows the published
+centre planes: the fog and the off-centre cut plane follow the live frame, and
+the panel says so rather than showing stale data as if it were current. The
+history is capped at 256 MB — thousands of frames of a 512² run — and evicts the
+oldest first. Switching the coloured field restarts it, because the same frames
+decoded as a different quantity are a different series.
+
+**Relative colouring.** A magnitude like `speed` has no natural zero, so its own
+ramp answers "how fast" — rarely the question. Re-centring it on a reference
+speed answers "where is the flow *not* the tunnel": slower reads blue, faster
+reads red, at-reference sinks into the background, exactly like the vorticity
+view. `vs tunnel` uses the case's own `uInf`; `vs mean` measures the frame's mean
+over the fluid cells (solid cells excluded). The span is measured from the data,
+not from the field's fixed range — at Re 200 the wake deficit is a few percent of
+uInf, and scaling that against `[0, 1.6]` would leave the picture one flat
+colour. `contrast` narrows the span without moving the reference.
+
+It applies to the fog as well, and there it also picks what is *visible*: the
+fog threshold drops anything near the middle of the ramp, which with a reference
+speed means "show me only where the flow departs from the tunnel".
+
+### Why the fog is not layered
+
+A slice stack is only correct **back to front**, and three things have to hold
+or it stops looking like fog:
+
+- the slices are traversed from the far end along the view direction, and the
+  mesh records which octant it was built for — orbiting past a diagonal flips
+  the slice axis and the stack is rebuilt. Composited the other way round it
+  reads inside-out;
+- density is authored **per cell of depth**, not per slice drawn. When the stack
+  is thinned (`fog slices` below the depth of the volume) each slice carries the
+  opacity the cells it stands in for would have, `1-(1-a)^step`, so changing the
+  slice count changes how smooth the fog is and not how thick;
+- the threshold **ramps** (`fog softness`) and the colour is carried on the quad
+  corners, shared between neighbours. A hard cut on a smooth field draws its own
+  iso-contour and the fog comes out as nested shells; flat quads make each slice
+  a mosaic of tiles. Both read as layering. Drag the softness to zero to see it.
+
+The fog has no solid mask — the segment publishes one per plane but not per
+volume — so inside a body the fog shows whatever the field holds there.
+
+Volumes are capped at 512 MB (one field of a 512³ run is 512 MB on its own):
+above that the run publishes planes only and the viewer says so.
 
 ## Export
 
-The Export panel prints the equivalent `build/dns flow ...` command line —
-runnable as printed, `--ft` included — and writes the object list as a
-`docs/scene.md` scene TOML. Nothing else is ever written.
+The Export panel prints the equivalent `build/dns flow …` command line —
+runnable as printed — and writes the object list as a `docs/scene.md` scene TOML.
+The editor's scene is *defined* as `parseScene(sceneToml())`: every build round
+trips through the real parser, so a file it writes is one the CLI accepts, and an
+empty scene or a bad name surfaces as the CLI's own exit-3 message. Nothing else
+is ever written.
 
 ## Caveat inherited from the solver
 

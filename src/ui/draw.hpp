@@ -87,9 +87,36 @@ public:
     // planes): they still depth-TEST against the opaque surfaces, they just do
     // not occlude each other, which for a stack of aligned boxes reads far
     // better than an arbitrary winner.
+    // tint multiplies the vertex colour (its alpha scales the alpha), which is
+    // what Push3 has always carried and both 3D shaders have always applied.
+    //
+    // depthTest == false is the OVERLAY: the gizmo and the selection outline
+    // must be visible THROUGH the body. It also matters that they do not WRITE
+    // depth -- the line pipeline does, which both occluded the old selection
+    // box and punched it into the depth buffer for everything drawn after.
     void drawTriangles(const GpuMesh&, const Mat4& mvp, const Vec3& lightDir,
-                       float alpha, bool depthWrite);
-    void drawLines(const GpuMesh&, const Mat4& mvp, float alpha);
+                       Rgba tint, bool depthTest, bool depthWrite);
+    void drawLines(const GpuMesh&, const Mat4& mvp, Rgba tint, bool depthTest);
+
+    // The pre-tint spellings, so existing call sites read unchanged.
+    void drawTriangles(const GpuMesh& m, const Mat4& v, const Vec3& l, float a,
+                       bool w)
+    {
+        drawTriangles(m, v, l, Rgba{255, 255, 255, uint8_t(a * 255.0f)}, true, w);
+    }
+    void drawLines(const GpuMesh& m, const Mat4& v, float a)
+    {
+        drawLines(m, v, Rgba{255, 255, 255, uint8_t(a * 255.0f)}, true);
+    }
+
+    // Restricts subsequent 3D draws to a sub-rect of the framebuffer, in
+    // pixels. This is what makes the viewport a REGION rather than the whole
+    // window with panels floating on top: the scene is projected into the rect
+    // and clipped to it, so a docked panel can never be drawn over by 3D
+    // geometry. drawUi() restores the full-window viewport itself, since the
+    // 2D stream is laid out in window pixels and carries its own scissors.
+    void setViewport(float x, float y, float w, float h);
+    void resetViewport();
 
     // --- per-frame 2D -------------------------------------------------------
     // Binds the glyph atlas for subsequent 2D draws. Must be called once
@@ -108,6 +135,8 @@ private:
     VkPipeline pipeTriOpaque_ = VK_NULL_HANDLE;
     VkPipeline pipeTriBlend_ = VK_NULL_HANDLE;
     VkPipeline pipeLine_ = VK_NULL_HANDLE;
+    VkPipeline pipeTriOverlay_ = VK_NULL_HANDLE;
+    VkPipeline pipeLineOverlay_ = VK_NULL_HANDLE;
     VkPipeline pipeUi_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout dsl_ = VK_NULL_HANDLE;
     VkDescriptorPool dpool_ = VK_NULL_HANDLE;

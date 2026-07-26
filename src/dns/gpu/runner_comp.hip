@@ -1,3 +1,4 @@
+#include "dns/interrupt.hpp"
 #include "dns/gpu/runner_comp.hpp"
 
 #include "dns/curvmesh.hpp"
@@ -249,6 +250,11 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
 
     while (t < r.tEnd)
     {
+        // A stop signal ends the run the SAME way reaching tEnd does: return
+        // normally, so every destructor runs -- the stats file is flushed and
+        // the shared-memory segment is unlinked. Terminating mid-step instead
+        // leaves a segment that outlives its own run, flagged as live.
+        if (stopRequested()) break;
         // 1e-6: the compressible collapse threshold. NOT shared with the
         // channel's 1e-9 -- the dt scales differ.
         if (auto e = internal::recomputeDt(
@@ -314,7 +320,8 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         // that used to suppress them hid the first `ramp` time units of every
         // run for no numerical reason -- the sinks pace themselves via
         // fdt/pdt/wdt either way.
-        if (out.wantsFrame(t) || out.wantsPng(t) || out.wantsWeb(t))
+        if (out.wantsFrame(t) || out.wantsPng(t) || out.wantsWeb(t)
+            || out.wantsShm(t))
             writeFrame(t);
     }
     (void)hipDeviceSynchronize();

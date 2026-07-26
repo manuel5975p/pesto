@@ -191,8 +191,13 @@ CutGeometry CutGeometry::make(const Grid& g, const RotatedCube& c)
     CutGeometry cut{zeros(g), zeros(g), zeros(g), zeros(g)};
     for (int k = 0; k < g.nz; ++k)
     {
-        const double zc = (k + 0.5) * g.hz, zf = k * g.hz;
-        const bool cellInSlab = zc >= c.z0 && zc <= c.z1;
+        const double zf = k * g.hz;
+        // Fraction of THIS cell's z extent inside the slab. A centre-in/out
+        // test was enough while the prism spanned every cell it touched; a
+        // cube has two z faces that land mid-cell, and staircasing them would
+        // leave z first-order against exact apertures in x and y. The slab is
+        // axis-aligned, so the exact fraction is just the 1D overlap.
+        const double zFrac = overlap(zf, zf + g.hz, c.z0, c.z1) / g.hz;
         const bool faceInSlab = zf >= c.z0 && zf <= c.z1; // w-face on/inside prism
         for (int j = 0; j < g.ny; ++j)
             for (int i = 0; i < g.nx; ++i)
@@ -201,11 +206,17 @@ CutGeometry CutGeometry::make(const Grid& g, const RotatedCube& c)
                 const double xf = i * g.hx, yf = j * g.hy;
                 const double areaFrac = diamondAreaFrac(xf, yf, g.hx, g.hy, c);
 
-                cut.lambda[id] = cellInSlab ? 1.0 - areaFrac : 1.0;
-                cut.ax[id] = cellInSlab
-                    ? segFluidFrac(std::abs(xf - c.cx), c.cy, yf, yf + g.hy, c) : 1.0;
-                cut.ay[id] = cellInSlab
-                    ? segFluidFrac(std::abs(yf - c.cy), c.cx, xf, xf + g.hx, c) : 1.0;
+                cut.lambda[id] = 1.0 - areaFrac * zFrac;
+                // ax/ay are FACE apertures: rectangles spanning [zf, zf+hz] in
+                // z, so the solid blocks zFrac of their height.
+                cut.ax[id] =
+                    1.0 - zFrac * (1.0 - segFluidFrac(std::abs(xf - c.cx), c.cy,
+                                                      yf, yf + g.hy, c));
+                cut.ay[id] =
+                    1.0 - zFrac * (1.0 - segFluidFrac(std::abs(yf - c.cy), c.cx,
+                                                      xf, xf + g.hx, c));
+                // az lies ON the plane z = zf: a plane is in the slab or it is
+                // not, so this one is genuinely binary.
                 cut.az[id] = faceInSlab ? 1.0 - areaFrac : 1.0;
             }
     }

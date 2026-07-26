@@ -15,8 +15,8 @@ namespace dns {
 
 // What a run writes. Which kinds a subcommand accepts is a validator question,
 // not a type-system one.
-enum class Emit { Stats, Bin, Png, Web, Volume, Slices, Vtk, Error, Spectrum,
-                  Snapshot, None };
+enum class Emit { Stats, Bin, Png, Web, Shm, Volume, Slices, Vtk, Error,
+                  Spectrum, Snapshot, None };
 
 // Body centre and diameter in grid (world) coordinates, ghost offset included.
 struct Placement

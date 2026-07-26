@@ -164,13 +164,21 @@ build/dns flow --body cylinder --far tunnel --n 256  --nz 1 --re 60  --dr 8 --ft
 build/dns flow --body cylinder --far tunnel --n 512  --nz 1 --re 60  --dr 8 --ft 12 --fdt 1e9 --out /tmp/a60b
 build/dns flow --body cylinder --far tunnel --n 1024 --nz 1 --re 60  --dr 8 --ft 12 --fdt 1e9 --out /tmp/a60c
 build/dns flow --body cylinder --far tunnel --n 512  --nz 8 --re 60  --dr 8 --ft 12 --fdt 1e9 --out /tmp/a60z
-build/dns flow --body cube     --far tunnel --n 256  --nz 8 --re 300        --ft  6 --fdt 1e9 --out /tmp/cube
+build/dns flow --body cube     --far tunnel --n 256  --nz 1 --re 300        --ft  6 --fdt 1e9 --out /tmp/cube
 build/dns flow --body sphere   --far tunnel --n 160  --re 300 --dr 8 --ft 12 --fdt 1e9 --out /tmp/s300
 build/dns flow --body sphere.stl --far tunnel --n 96 --re 300 --dr 8 --ft 12 --fdt 1e9 --out /tmp/ms
 build/dns flow --physics compressible --body cylinder --far sponge --n 256 --re 60  --mach 0.2 --ft 20 --fdt 1e9 --out /tmp/c60
 build/dns flow --physics compressible --body cylinder --far sponge --n 512 --re 800 --mach 0.2 --ft 15 --fdt 1e9 --out /tmp/c800
 build/dns flow --physics compressible --body sphere.stl --far nscbc --open --n 96 --nz 96 --re 100 --mach 0.2 --ft 12 --out /tmp/cms
 ```
+
+The cube line was `--nz 8` while `--body cube` meant a 45°-rotated square prism
+spanning the full depth — a quasi-2D diamond cylinder with eight spanwise cells,
+which by the 2D invariant is the `--nz 1` case it now names. A cube is z-finite
+as of 2026-07-26 (side `D/√2`, `dns::sceneCube`), so at `--nz 8` that same
+command would place a body less than one cell tall. Nothing measured is
+invalidated — the cube has no published anchor — but a 3D cube run is a NEW
+case and needs `nz` chosen so the side spans cells, not the old `--nz 8`.
 
 The two `--far sponge` lines are NOT an endorsement of sponge: they name the
 boundary condition the existing anchor values were measured under, explicitly,

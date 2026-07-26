@@ -16,6 +16,7 @@
 #include "dns/diagnostics.hpp"
 #include "dns/geometry.hpp"
 #include "dns/hit_ic.hpp"
+#include "dns/interrupt.hpp"
 #include "dns/meshsdf.hpp"
 #include "dns/operators.hpp"
 #include "dns/output.hpp"
@@ -27,7 +28,7 @@
 #include "dns/units.hpp"
 #include "dns/vtk_writer.hpp"
 
-#if DNS_WITH_HIP
+#if DNS_WITH_GPU
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/kernels.hpp"
 #include "dns/gpu/reductions.hpp"
@@ -86,7 +87,7 @@ RunOutput::Config outputConfig(const Case& c, const std::string& simJson,
     return oc;
 }
 
-#if DNS_WITH_HIP
+#if DNS_WITH_GPU
 bool haveGpu(const Case& c)
 {
     if (c.backend == Backend::Cpu) return false;
@@ -96,7 +97,7 @@ bool haveGpu(const Case& c)
 bool haveGpu(const Case&) { return false; }
 #endif
 
-#if DNS_WITH_HIP
+#if DNS_WITH_GPU
 
 // --- flow: incompressible --------------------------------------------------
 
@@ -382,7 +383,7 @@ int runFlowCompressible(const Case& c, CaseGeometry& geo)
     return 0;
 }
 
-#endif // DNS_WITH_HIP
+#endif // DNS_WITH_GPU
 
 
 // Grid sequencing: converge on n/2^(L-1), prolong, repeat, finish on n. Each
@@ -443,8 +444,8 @@ int runFlowSequenced(const Case& c, const RawConfig& raw, const Scene* scene)
 int runFlow(const Case& c, const RawConfig& raw, const Scene* scene)
 {
     if (!haveGpu(c))
-        return die(exitNoGpu, "no HIP device (dns flow is GPU-only)");
-#if DNS_WITH_HIP
+        return die(exitNoGpu, "no GPU device (dns flow is GPU-only)");
+#if DNS_WITH_GPU
     if (c.seqLevels > 1) return runFlowSequenced(c, raw, scene);
     const auto t0 = std::chrono::steady_clock::now();
     auto geo = buildCaseGeometry(c, scene);
@@ -465,8 +466,8 @@ int runFlow(const Case& c, const RawConfig& raw, const Scene* scene)
 int runChannel(const Case& c)
 {
     if (!haveGpu(c))
-        return die(exitNoGpu, "no HIP device (dns channel is GPU-only)");
-#if DNS_WITH_HIP
+        return die(exitNoGpu, "no GPU device (dns channel is GPU-only)");
+#if DNS_WITH_GPU
     const auto& g = c.grid;
     const double gamma = 1.4, delta = 1.0, rho0 = 1.0;
     const ChannelStretchY remap{double(g.ny) * g.hy, g.ny, c.stretchBeta,
@@ -572,7 +573,7 @@ int runTgv(const Case& c)
     };
     const double outEvery = 0.1;
 
-#if DNS_WITH_HIP
+#if DNS_WITH_GPU
     if (haveGpu(c))
     {
         std::optional<RunOutput> slices;
@@ -589,7 +590,8 @@ int runTgv(const Case& c)
             if (!f) return die(exitOutput, f.error());
             frames = std::move(*f);
         }
-        std::printf("# 3D TGV n=%d Re=%g cfl=%g backend=hip\n", g.nx, c.re, c.cfl);
+        std::printf("# 3D TGV n=%d Re=%g cfl=%g backend=%s\n", g.nx, c.re, c.cfl,
+                    gpu::backendName);
         gpu::TgvRun tr;
         tr.nu = nu;
         tr.cfl = sp.cfl;
@@ -598,7 +600,7 @@ int runTgv(const Case& c)
         tr.volume = vol;
         auto st = gpu::runTgv3d(g, U, tr, frames ? &*frames : nullptr);
         if (!st) return die(st.error().code, st.error().message);
-        std::fprintf(stderr, "done: %ld steps (hip)\n", st->steps);
+        std::fprintf(stderr, "done: %ld steps (%s)\n", st->steps, gpu::backendName);
         return 0;
     }
 #endif
@@ -627,8 +629,8 @@ int runTgv(const Case& c)
 
 int runHit(const Case& c)
 {
-    if (!haveGpu(c)) return die(exitNoGpu, "no HIP device (dns hit is GPU-only)");
-#if DNS_WITH_HIP
+    if (!haveGpu(c)) return die(exitNoGpu, "no GPU device (dns hit is GPU-only)");
+#if DNS_WITH_GPU
     const auto& g = c.grid;
     const auto d = HitDesign::make(g.nx, c.nu, c.urms);
     const double nu = d.nuBox(), epsF = d.epsBox(), tE = d.tEddyBox();
@@ -699,8 +701,8 @@ int runHit(const Case& c)
 
 int runBench(const Case& c)
 {
-    if (!haveGpu(c)) return die(exitNoGpu, "no HIP device (dns bench is GPU-only)");
-#if DNS_WITH_HIP
+    if (!haveGpu(c)) return die(exitNoGpu, "no GPU device (dns bench is GPU-only)");
+#if DNS_WITH_GPU
     const auto& g = c.grid;
     auto U = VectorField::zeros(g);
     taylorGreen3D(g, U);
@@ -739,6 +741,9 @@ int runBench(const Case& c)
 
 int main(int argc, char** argv)
 {
+    // Before anything allocates or opens a file: a stop signal must unwind
+    // through the destructors, not terminate mid-step.
+    dns::installInterruptHandler();
     // Phase 0.5: --config FILE.toml is an alternative SPELLING of the command
     // line -- it expands to the exact tokens parse() takes, spliced in before
     // the explicit flags so the command line wins where an option repeats.

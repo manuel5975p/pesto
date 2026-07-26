@@ -47,15 +47,23 @@ sealing and mass-balance plumbing is special-cased and stays on `--body`.
 | kind       | extra keys                                | dimensionality |
 |------------|-------------------------------------------|----------------|
 | `cylinder` | —                                         | z-invariant    |
-| `cube`     | — (45°-rotated square prism, full z span) | z-invariant*   |
+| `cube`     | — (45°-rotated cube, side `d/√2`)         | z-finite*      |
 | `lens`     | `aspect` (> 1)                            | z-invariant    |
 | `sphere`   | —                                         | 3D (needs `--nz`) |
 | `mesh`     | `path` (.stl/.gltf/.glb), `scale`, `pitch`, `yaw`, `robust` | 3D (needs `--nz`) |
 
 All objects take `name` (`[A-Za-z0-9_-]`, the force-column label; defaults to
 `kind + index`, must be unique), `x`, `y`, `z`, `d`. A 3D object on a native-2D
-grid (`nz == 1`) is rejected at geometry build. *cube counts as 3D for the
-sampling layer at `nz > 1` (its z caps sit on the box faces).
+grid (`nz == 1`) is rejected at geometry build.
+
+*A cube is z-FINITE but not 3D-only: `d` is its frontal width across the
+diagonal, so its side — and its z extent, centred on `z` — is `d/√2`, and it
+reads `z` like a sphere does. At `nz == 1` it degenerates to the full-depth
+prism instead of being rejected, because a cube's 2D reading is its
+cross-section. Either way it is excluded from the z-invariant sampling
+short-cut: replicating one x-y layer would extrude it back into a pillar.
+`dns::sceneCube` is the one definition of all of this, and `--body cube`, the
+scene builder and the editor all call it.
 
 ### Model selection
 

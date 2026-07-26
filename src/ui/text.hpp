@@ -48,6 +48,10 @@ public:
     // DNS_UI_FONT / DNS_UI_FONT_MONO or a short list of standard locations;
     // "no usable font" is a startup error, not a silent blank UI.
     static std::expected<std::unique_ptr<TextEngine>, std::string> create(Vk&);
+    // Metrics-only: shapes and rasterizes with the real font but owns no atlas
+    // texture and uploads nothing. This is what lets `dns-ui --check` drive the
+    // widget layer with no Vulkan device and no window.
+    static std::expected<std::unique_ptr<TextEngine>, std::string> createHeadless();
     ~TextEngine();
 
     TextEngine(const TextEngine&) = delete;
@@ -90,6 +94,8 @@ private:
     const Glyph* glyph(FontId, uint32_t gid, float px);
     Face& faceOf(FontId f) { return faces_[int(f)]; }
     const Face& faceOf(FontId f) const { return faces_[int(f)]; }
+
+    static std::expected<std::unique_ptr<TextEngine>, std::string> build(Vk*);
 
     Vk* vk_ = nullptr;
     Face faces_[2];

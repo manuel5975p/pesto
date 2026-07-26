@@ -232,7 +232,7 @@ std::expected<std::vector<char>, std::string> readAll(const std::string& path)
 
 } // namespace
 
-std::expected<std::unique_ptr<TextEngine>, std::string> TextEngine::create(Vk& vk)
+std::expected<std::unique_ptr<TextEngine>, std::string> TextEngine::build(Vk* vk)
 {
     static const char* sansCandidates[] = {
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
@@ -258,7 +258,7 @@ std::expected<std::unique_ptr<TextEngine>, std::string> TextEngine::create(Vk& v
     }();
 
     auto te = std::unique_ptr<TextEngine>(new TextEngine());
-    te->vk_ = &vk;
+    te->vk_ = vk;
 
     const std::string paths[2] = {sans, mono};
     for (int i = 0; i < 2; ++i) {
@@ -300,12 +300,27 @@ std::expected<std::unique_ptr<TextEngine>, std::string> TextEngine::create(Vk& v
     te->atlasW_ = kAtlasW;
     te->atlasH_ = kAtlasH;
     te->pixels_.assign(size_t(kAtlasW) * kAtlasH, 0);
-    auto tex = vk.createCoverageTexture(kAtlasW, kAtlasH);
-    if (!tex) return std::unexpected(tex.error());
-    te->atlas_ = *tex;
+    // Headless (--check): no device, so no atlas texture and no upload. Shaping,
+    // metrics and the CPU rasterizer need nothing from Vulkan, which is what
+    // makes the whole widget layer testable without a window.
+    if (vk) {
+        auto tex = vk->createCoverageTexture(kAtlasW, kAtlasH);
+        if (!tex) return std::unexpected(tex.error());
+        te->atlas_ = *tex;
+    }
     te->dirty_ = true;
     if (auto r = te->flush(); !r) return std::unexpected(r.error());
     return te;
+}
+
+std::expected<std::unique_ptr<TextEngine>, std::string> TextEngine::create(Vk& vk)
+{
+    return build(&vk);
+}
+
+std::expected<std::unique_ptr<TextEngine>, std::string> TextEngine::createHeadless()
+{
+    return build(nullptr);
 }
 
 TextEngine::~TextEngine()
@@ -443,6 +458,7 @@ std::expected<void, std::string> TextEngine::flush()
 {
     if (!dirty_) return {};
     dirty_ = false;
+    if (!vk_) return {};   // headless: nothing to upload to
     return vk_->uploadCoverage(atlas_, pixels_.data());
 }
 

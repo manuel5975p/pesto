@@ -2,6 +2,7 @@
 
 #include "dns/fieldpng.hpp"
 #include "dns/vtk_writer.hpp"
+#include "dns/shmframes.hpp"
 #include "dns/webframes.hpp"
 
 #include <algorithm>
@@ -63,6 +64,10 @@ struct RunOutput::Impl
     std::map<std::string, std::ofstream> bins;
     std::map<std::string, std::ofstream> series;
     std::vector<WebPlane> webs;
+    // The live shared-memory bridge (--emit shm). Lazily created on the first
+    // frame, when the field list is finally known.
+    ShmFrames shm;
+    bool shmReady = false;
 
     std::string pngDir;
     double nextFrame = 0, nextPng = 0, nextWeb = 0;
@@ -281,13 +286,18 @@ bool RunOutput::wantsWeb(double t) const
 {
     return has(p_->cfg.kinds, Emit::Web) && t >= p_->nextWeb;
 }
+bool RunOutput::wantsShm(double t) const
+{
+    return has(p_->cfg.kinds, Emit::Shm) && t >= p_->nextWeb;
+}
 
 std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv)
 {
     auto& p = *p_;
     const auto& k = p.cfg.kinds;
     const bool doBin = wantsFrame(t), doPng = wantsPng(t), doWeb = wantsWeb(t);
-    if (!doBin && !doPng && !doWeb) return {};
+    const bool doShm = wantsShm(t);
+    if (!doBin && !doPng && !doWeb && !doShm) return {};
 
     const int nx = p.geo.w, ny = p.geo.h, nz = p.geo.d;
     const int i0 = p.geo.i0, j0 = p.geo.j0, k0 = p.geo.k0;
@@ -513,6 +523,106 @@ std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv
                 return std::unexpected("web frame write failed");
         }
         p.nextWeb += p.cfg.wdt;
+    }
+
+    if (doShm)
+    {
+        // Same planes as the web path, straight into shared memory: no
+        // quantization, no filenames, no page cache. Created on the first
+        // frame because the field list is only known here.
+        const int ic = p.geo.ic, jc = p.geo.jc, kc = p.geo.kc;
+        std::vector<ShmFrames::PlaneSpec> specs;
+        specs.push_back({2, 0.0f, nx, ny});
+        if (nz > 1)
+        {
+            specs.push_back({1, 0.0f, nx, nz});
+            specs.push_back({0, 0.0f, ny, nz});
+        }
+        if (!p.shmReady)
+        {
+            std::vector<ShmField> fs;
+            for (const auto& f : fv.fields)
+            {
+                ShmField sf;
+                std::snprintf(sf.name, sizeof sf.name, "%s", f.name.c_str());
+                sf.lo = float(f.diverging ? -f.hi : f.lo);
+                sf.hi = float(f.hi);
+                sf.diverging = f.diverging ? 1 : 0;
+                fs.push_back(sf);
+            }
+            // The volume rides along in 3D: it is what a volumetric render
+            // needs, and it is the same data --emit volume would write.
+            const int vw = nz > 1 ? nx : 0, vh = nz > 1 ? ny : 0,
+                      vd = nz > 1 ? nz : 0;
+            if (auto r = p.shm.create(ShmFrames::nameFor(p.cfg.prefix), fs, specs,
+                                      vw, vh, vd);
+                !r)
+                return std::unexpected(r.error());
+            // The body centre is only known here as the frame geometry's
+            // centre indices; the viewer uses it to frame the plane, and it has
+            // the exact placement from its own validated Case anyway.
+            p.shm.setGrid(p.g.nx, p.g.ny, p.g.nz, i0, j0, k0, nx, ny, nz, p.g.hx,
+                          p.g.hy, p.g.hz, (p.geo.ic + 0.5) * p.g.hx,
+                          (p.geo.jc + 0.5) * p.g.hy, (p.geo.kc + 0.5) * p.g.hz,
+                          p.geo.D);
+            p.shmReady = true;
+        }
+
+        std::vector<std::vector<float>> store;
+        std::vector<std::vector<const float*>> planeData;
+        std::vector<const float*> planeMask;
+        auto sel2 = [&](int axis) {
+            return [axis, ic, jc, kc, i0, j0, k0](int a, int b) {
+                return axis == 2 ? std::array{i0 + a, j0 + b, kc}
+                     : axis == 1 ? std::array{i0 + a, jc, k0 + b}
+                                 : std::array{ic, j0 + a, k0 + b};
+            };
+        };
+        store.reserve(specs.size() * (fv.fields.size() + 1));
+        for (const auto& sp : specs)
+        {
+            std::vector<const float*> ptr;
+            for (const auto& f : fv.fields)
+            {
+                store.emplace_back();
+                p.gather(f.data, sp.w, sp.h, sel2(sp.axis), store.back());
+                ptr.push_back(store.back().data());
+            }
+            planeData.push_back(std::move(ptr));
+            if (!p.geo.mask.empty())
+            {
+                store.emplace_back();
+                p.gather(p.geo.mask.data(), sp.w, sp.h, sel2(sp.axis), store.back());
+                planeMask.push_back(store.back().data());
+            }
+            else
+            {
+                planeMask.push_back(nullptr);
+            }
+        }
+
+        // Every field's volume, so the viewer can slice or fog whichever one
+        // is selected instead of being stuck with the first.
+        std::vector<std::vector<float>> vols;
+        std::vector<const float*> volPtr;
+        if (nz > 1 && p.shm.hasVolume())
+        {
+            const std::size_t n = std::size_t(nx) * ny * nz;
+            vols.resize(fv.fields.size());
+            for (std::size_t f = 0; f < fv.fields.size(); ++f)
+            {
+                vols[f].resize(n);
+                std::size_t q = 0;
+                for (int kk = 0; kk < nz; ++kk)
+                    for (int j = 0; j < ny; ++j)
+                        for (int i = 0; i < nx; ++i, ++q)
+                            vols[f][q] =
+                                fv.fields[f].data[p.g.idx(i0 + i, j0 + j, k0 + kk)];
+                volPtr.push_back(vols[f].data());
+            }
+        }
+        p.shm.publish(t, planeData, planeMask, volPtr);
+        if (!doWeb) p.nextWeb += p.cfg.wdt;
     }
     return {};
 }

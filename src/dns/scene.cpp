@@ -75,11 +75,9 @@ std::expected<SceneObject, std::string> parseObject(const toml::table& o,
                 return std::unexpected(bad(where, "`name` must be a non-empty "
                                                   "string"));
             // The label becomes a CSV column suffix: keep it token-shaped.
-            for (char c : *s)
-                if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_'
-                      || c == '-'))
-                    return std::unexpected(bad(where, "`name` must be "
-                                                      "[A-Za-z0-9_-]"));
+            if (!validSceneName(*s))
+                return std::unexpected(bad(where, "`name` must be "
+                                                  "[A-Za-z0-9_-]"));
             ob.label = *s;
             continue;
         }
@@ -195,6 +193,15 @@ const char* name(SceneObjectKind k)
     return "?";
 }
 
+RotatedCube sceneCube(const Grid& g, double cx, double cy, double cz, double r)
+{
+    // 2D: no third dimension to be a cube in, so the prism reading stands.
+    if (g.nz == 1) return RotatedCube{cx, cy, r, 0.0, g.hz};
+    // Half the SIDE of the rotated square, whose half-DIAGONAL is r.
+    const double hh = r / std::numbers::sqrt2;
+    return RotatedCube{cx, cy, r, cz - hh, cz + hh};
+}
+
 bool Scene::zInvariant() const
 {
     return std::ranges::none_of(objects, [](const SceneObject& o) {
@@ -205,10 +212,7 @@ bool Scene::zInvariant() const
 
 bool Scene::has3d() const
 {
-    return std::ranges::any_of(objects, [](const SceneObject& o) {
-        return o.kind == SceneObjectKind::Sphere
-               || o.kind == SceneObjectKind::Mesh;
-    });
+    return std::ranges::any_of(objects, needs3d);
 }
 
 std::string Scene::describe() const
@@ -280,14 +284,83 @@ std::expected<Scene, std::string> parseScene(std::string_view text)
     // Default labels, then require uniqueness (they become CSV columns).
     for (std::size_t i = 0; i < sc.objects.size(); ++i)
         if (sc.objects[i].label.empty())
-            sc.objects[i].label = std::string(name(sc.objects[i].kind))
-                                  + std::to_string(i);
+            sc.objects[i].label = defaultSceneName(sc.objects[i].kind, i);
+    if (auto n = checkSceneNames(sc); !n) return std::unexpected(n.error());
+    return sc;
+}
+
+// --- rules shared with tools (scene.hpp) -------------------------------------
+
+bool validSceneName(std::string_view s)
+{
+    if (s.empty()) return false;
+    for (char c : s)
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-'))
+            return false;
+    return true;
+}
+
+std::string defaultSceneName(SceneObjectKind k, std::size_t index)
+{
+    return std::string(name(k)) + std::to_string(index);
+}
+
+std::expected<void, std::string> checkSceneNames(const Scene& sc)
+{
+    for (const auto& o : sc.objects)
+        if (!validSceneName(o.label))
+            return std::unexpected("scene: object `name` must be non-empty and "
+                                   "[A-Za-z0-9_-] (got '" + o.label + "')");
     for (std::size_t i = 0; i < sc.objects.size(); ++i)
         for (std::size_t j = i + 1; j < sc.objects.size(); ++j)
             if (sc.objects[i].label == sc.objects[j].label)
                 return std::unexpected("scene: duplicate object name '"
                                        + sc.objects[i].label + "'");
-    return sc;
+    return {};
+}
+
+bool needs3d(const SceneObject& o)
+{
+    return o.kind == SceneObjectKind::Sphere || o.kind == SceneObjectKind::Mesh;
+}
+
+std::array<double, 6> sceneObjectBox(const Grid& g, const Placement& ref,
+                                     const SceneObject& o)
+{
+    const double lzFull = g.nz == 1 ? g.hz : double(g.nz) * g.hz;
+    const double cx = ref.cx + o.x * ref.D, cy = ref.cy + o.y * ref.D,
+                 cz = ref.cz + o.z * ref.D, D = o.d * ref.D, r = D / 2.0;
+    std::array<double, 6> bb{cx - r, cy - r, 0.0, cx + r, cy + r, lzFull};
+    if (o.kind == SceneObjectKind::Sphere)
+    {
+        bb[2] = cz - r;
+        bb[5] = cz + r;
+    }
+    else if (o.kind == SceneObjectKind::Cube)
+    {
+        // A cube is as tall as its side, not as tall as the box (sceneCube).
+        const RotatedCube c = sceneCube(g, cx, cy, cz, r);
+        bb[2] = c.z0;
+        bb[5] = c.z1;
+    }
+    else if (o.kind == SceneObjectKind::Lens)
+    {
+        const double w = o.aspect * r;
+        bb[0] = cx - w;
+        bb[3] = cx + w;
+    }
+    return bb;
+}
+
+bool sceneBoxInside(const Grid& g, const std::array<double, 6>& bb)
+{
+    const double lzFull = g.nz == 1 ? g.hz : double(g.nz) * g.hz;
+    // z is exempt for z-invariant objects: they span the box by design.
+    const bool zSpans = bb[2] == 0.0 && bb[5] == lzFull;
+    const double lx = double(g.nx) * g.hx, ly = double(g.ny) * g.hy;
+    return !(bb[0] <= g.hx || bb[3] >= lx - g.hx || bb[1] <= g.hy
+             || bb[4] >= ly - g.hy
+             || (!zSpans && g.nz > 1 && (bb[2] <= g.hz || bb[5] >= lzFull - g.hz)));
 }
 
 std::expected<Scene, std::string> loadScene(const std::string& path)
@@ -305,7 +378,6 @@ std::expected<SceneGeometry, std::string>
 buildSceneGeometry(const Grid& g, const Placement& ref, const Scene& scene)
 {
     using std::numbers::pi;
-    const double lzFull = g.nz == 1 ? g.hz : double(g.nz) * g.hz;
 
     SceneGeometry out;
     std::vector<Sdf> parts;
@@ -315,7 +387,9 @@ buildSceneGeometry(const Grid& g, const Placement& ref, const Scene& scene)
     {
         const double cx = ref.cx + o.x * ref.D, cy = ref.cy + o.y * ref.D,
                      cz = ref.cz + o.z * ref.D, D = o.d * ref.D, r = D / 2.0;
-        std::array<double, 6> bb{cx - r, cy - r, 0.0, cx + r, cy + r, lzFull};
+        // Shared with the editor (scene.hpp): one definition of an object's
+        // box. The mesh case overwrites it once the file is loaded.
+        std::array<double, 6> bb = sceneObjectBox(g, ref, o);
         switch (o.kind)
         {
         case SceneObjectKind::Cylinder:
@@ -327,18 +401,14 @@ buildSceneGeometry(const Grid& g, const Placement& ref, const Scene& scene)
                                        + "' is 3D (sphere); nz == 1 leaves it "
                                          "with no solid cells -- pass --nz");
             parts.push_back(sdfOf(Sphere{cx, cy, cz, r}));
-            bb[2] = cz - r;
-            bb[5] = cz + r;
             break;
         case SceneObjectKind::Cube:
-            parts.push_back(sdfOf(RotatedCube{cx, cy, r, 0.0, lzFull}));
+            parts.push_back(sdfOf(sceneCube(g, cx, cy, cz, r)));
             break;
         case SceneObjectKind::Lens:
         {
             const double hh = r, w = o.aspect * hh;
             parts.push_back(sdfOf(Lens{cx, cy, w, hh}));
-            bb[0] = cx - w;
-            bb[3] = cx + w;
             break;
         }
         case SceneObjectKind::Mesh:
@@ -383,11 +453,7 @@ buildSceneGeometry(const Grid& g, const Placement& ref, const Scene& scene)
         // through the box boundary is the fence/floor rig, which a scene does
         // not model (their wall sealing and mass-balance plumbing is special).
         // z is exempt for z-invariant objects (they span the box by design).
-        const bool zSpans = bb[2] == 0.0 && bb[5] == lzFull;
-        const double lx = double(g.nx) * g.hx, ly = double(g.ny) * g.hy;
-        if (bb[0] <= g.hx || bb[3] >= lx - g.hx || bb[1] <= g.hy
-            || bb[4] >= ly - g.hy
-            || (!zSpans && g.nz > 1 && (bb[2] <= g.hz || bb[5] >= lzFull - g.hz)))
+        if (!sceneBoxInside(g, bb))
             return std::unexpected("scene object '" + o.label
                                    + "' reaches the domain boundary; shrink d, "
                                      "move it, or raise --dr");

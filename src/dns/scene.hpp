@@ -53,14 +53,11 @@ struct Scene
     std::vector<SceneObject> objects;
 
     // True when the union sdf may be sampled on ONE x-y layer and replicated.
-    // Excludes sphere, mesh AND cube. The cube exclusion is deliberately
-    // conservative, not an oversight: a scene cube does span the full z extent
-    // (scene.cpp builds RotatedCube{.., 0, lzFull}), so its SIGN is
-    // z-invariant -- but its sdf VALUE is not, near the two z faces, and the
-    // z-invariant path also short-circuits az to lambda. Including cubes would
-    // change a sampled cut, and a changed cut moves every measured
-    // coefficient. It costs sampling speed only; do not "fix" it without
-    // re-measuring.
+    // Excludes sphere, mesh AND cube. The cube exclusion USED to be merely
+    // conservative -- a cube spanned the full z extent, so only its sdf VALUE
+    // varied in z, not its sign. It is now load-bearing: a cube is z-finite
+    // (sceneCube), so replicating one layer would extrude it back into the
+    // pillar it is no longer. Do not relax it.
     bool zInvariant() const;
     // Any genuinely 3D object present (sphere or mesh)? Such a scene needs
     // nz > 1 or it has no solid cells.
@@ -68,6 +65,52 @@ struct Scene
     // One-line-per-object summary for --dry-run.
     std::string describe() const;
 };
+
+// --- rules shared with tools -------------------------------------------------
+//
+// These are the scene rules a tool (the editor) needs to ASK about rather than
+// restate. Each is the ONE definition: parseScene() and buildSceneGeometry()
+// below call them too, so a second, drifting opinion cannot exist. Adding a
+// rule here and not routing the core's own caller through it defeats the point.
+
+// The force-column name rule: non-empty and [A-Za-z0-9_-]. A label becomes a
+// CSV column suffix (cd_<name>), which is why it is token-shaped.
+bool validSceneName(std::string_view);
+
+// The parser's default label for an unnamed object: kind + index.
+std::string defaultSceneName(SceneObjectKind, std::size_t index);
+
+// Non-empty, valid and pairwise unique. Same message the parser emits.
+std::expected<void, std::string> checkSceneNames(const Scene&);
+
+// True when this object alone needs nz > 1 (sphere or mesh). Scene::has3d() is
+// any_of over this.
+bool needs3d(const SceneObject&);
+
+// The cube rule, in ONE place. A cube's cross-section is the L1 ball of
+// half-diagonal r -- a square rotated 45 deg about z -- so `r` is the FRONTAL
+// half-width and 2r = D is the reference length every drag coefficient divides
+// by, exactly as for the cylinder and the sphere. The square's SIDE is
+// therefore r*sqrt2, and a cube is as tall as its side: z spans
+// cz +- r/sqrt2, NOT the box.
+//
+// At nz == 1 there is no third dimension to be tall in, so the cube degenerates
+// to the z-invariant prism -- the 2D reading of a cube is its cross-section,
+// the same reading that makes a 2D cylinder the cross-section of an infinite
+// one. Only in that degenerate case does a cube span the box.
+RotatedCube sceneCube(const Grid&, double cx, double cy, double cz, double r);
+
+// The world box an object occupies: the same arithmetic buildSceneGeometry()
+// uses. MESH objects report the NOMINAL d*D box -- the real one is only known
+// once the file is loaded, so for a mesh this is advisory and the builder
+// overwrites it.
+std::array<double, 6> sceneObjectBox(const Grid&, const Placement& ref,
+                                     const SceneObject&);
+
+// The interior rule buildSceneGeometry() enforces before accepting an object:
+// the solid must sit strictly inside, z exempt for objects that span the box
+// by design.
+bool sceneBoxInside(const Grid&, const std::array<double, 6>& bb);
 
 // Strict parse of the scene TOML: unknown keys, wrong types and missing
 // required fields are hard errors, never silent defaults (duplicate keys the

@@ -1,4 +1,4 @@
-# dns — incompressible & compressible DNS/LES on a MAC grid (CPU + HIP)
+# dns — incompressible & compressible DNS/LES on a MAC grid (CPU + GPU)
 
 One binary: `build/dns <flow|tgv|hit|channel|bench> [flags]`. The 15 old apps are gone
 (recomposed 2026-07-20); every capability is reachable from `dns`. `dns --help`
@@ -25,50 +25,73 @@ Staggered MAC grid, 2nd-order central differences, skew-symmetric
 
 Backends:
 * **CPU** (`dns_core`): serial, double precision — the correctness oracle.
-* **GPU** (`dns_gpu`): HIP/ROCm (arch auto-detected; gfx1100 and gfx1201 both
-  exercised), FP32 fields with FP64 reductions,
-  hipFFT Poisson, fused RHS+RK-stage kernel; mirrors the CPU API 1:1 and is
-  tested for parity. ~86 ms/step at 512³ on an RX 7900 XTX (~7 GiB VRAM).
-  No HIP header leaks into a public header.
+* **GPU** (`dns_gpu`): FP32 fields with FP64 reductions, hipFFT/cuFFT Poisson,
+  fused RHS+RK-stage kernel; mirrors the CPU API 1:1 and is tested for parity.
+  ~86 ms/step at 512³ on an RX 7900 XTX (~7 GiB VRAM). No GPU-runtime header
+  leaks into a public header. Two toolchains, ONE set of sources:
+  * `DNS_WITH_HIP` — HIP/ROCm on AMD (arch auto-detected; gfx1100 and gfx1201
+    both exercised).
+  * `DNS_WITH_CUDA` — the same `src/dns/gpu/*.hip` files compiled as CUDA for
+    NVIDIA, via the ~40-name header shim in `src/compat/cuda` (read its
+    README). No second implementation, and no per-backend `#if` in any solver.
 
 Box units: `uInf = 1`, `rho_inf = 1`. Re and Mach are the physical inputs.
 
 ## 2. Build and test
 
 ```sh
-cmake -B build -G Ninja -DDNS_WITH_HIP=ON   # OFF for CPU-only
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDNS_WITH_HIP=ON  # AMD
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDNS_WITH_CUDA=ON # NVIDIA
 ninja -C build
 ctest --test-dir build                      # GPU tests skip (rc 77) without a device
 ```
 
+Both backend options default OFF, which is the CPU-only build; setting both is
+a configure error (they build the same sources into the same `dns_gpu`).
+
 Options: `DNS_WITH_FFTW` (ON), `DNS_WITH_HIP` (OFF; `CMAKE_HIP_ARCHITECTURES`
 is AUTO-DETECTED from the installed device — set it explicitly only to
 cross-compile; a wrong arch shows up as a HIP `getStatFunc` assertion),
+`DNS_WITH_CUDA` (OFF; `CMAKE_CUDA_ARCHITECTURES` likewise auto-detected —
+`native` when a device answers, else a fat 75/86/89/120 binary. Needs an nvcc
+that accepts `-std=c++23`, which configure verifies by compiling `<expected>`
+rather than guessing from the version),
 `BUILD_TESTING` (master test switch),
 `DNS_HEAVY_VALIDATION` (heavy tier, ~25 min, RUN_SERIAL),
 `DNS_VALIDATION_BASELINE` (quarantined literature-band `val_*`, OFF — see §15),
 `DNS_WITH_UI` (OFF; builds `dns-ui`, below).
 Build type: Release.
 
-### `dns-ui` — obstacle editor and grid viewer
+### `dns-ui` — scene editor, run cockpit and live viewer
 
 ```sh
 cmake -B build -G Ninja -DDNS_WITH_UI=ON    # fetches SDL3 3.4.0 + HarfBuzz 14.2.1
 ninja -C build dns-ui
-build/dns-ui                                # interactive
+build/dns-ui                                # scene editor + run cockpit + live viewer
+build/dns-ui --scene examples/tandem_cylinders.toml
 build/dns-ui --check                        # headless self-check (ctest: ui_check)
 ```
 
-A second binary, and the only exception to the one-binary rule: it solves
-nothing. It is a pre-run inspector — place bodies, choose a resolution, and see
-the grid and the **cut cells** (fluid fraction λ, face apertures, post-
-`sanitizeCut`) the solver would actually receive, plus the resolution verdict
-`(D/h)/√Re` that decides DNS from under-resolved. It links `dns_core` only and
-drives the same `validate()` / `buildCaseGeometry()` / `sanitizeCut()` the
-runners do, so it cannot disagree with them; a rejected edit shows the
-validator's own message and exit code. Dependencies are SDL3, Vulkan and
-HarfBuzz and nothing else — no FreeType (glyph outlines come from `hb-draw`),
-no widget toolkit. Full description: `docs/ui.md`.
+A second binary, and the only exception to the one-binary rule — because it
+**solves nothing itself**. Place bodies (in metres, with a material), see the
+grid and the **cut cells** (fluid fraction λ, face apertures, post-
+`sanitizeCut`) the solver would actually receive plus the resolution verdict
+`(D/h)/√Re`, then press RUN and watch the field live.
+
+It links `dns_core` only — never `dns_gpu` — and starts on a machine with no
+GPU. Running means spawning `dns` as a **child process** with the command the
+export panel prints; watching means mapping the **shared-memory** segment that
+run publishes (`--emit shm`, seqlock, no disk). Editing drives the same
+`validate()` / `buildCaseGeometry()` / `sanitizeCut()` the runners do, so it
+cannot disagree with them; a rejected edit shows the validator's own message and
+exit code, and its scene TOML round-trips through the real `parseScene`.
+
+Live: cut planes at any position (sliced from the published volume by the
+viewer), volumetric fog of vorticity or speed, and cd/cl/K/maxDiv plots. Objects
+are moved with a translate gizmo, snapping to mesh nodes.
+
+Dependencies are SDL3, Vulkan and HarfBuzz and nothing else — no FreeType (glyph
+outlines come from `hb-draw`), no widget toolkit. Full description: `docs/ui.md`.
 
 ## 3. CLI
 
@@ -93,8 +116,12 @@ replace the positional. Explicit CLI flags override the file.
 ### `flow` — orthogonal flag groups
 
 * **Body** `--body cylinder|sphere|cube|lens|fence|floor|none|FILE.stl|.gltf|.glb`
-  (exactly one, required). `cylinder` = z-aligned circle, `cube` = 45° rotated
-  square prism, `lens` = two-disk intersection with sharp tips (2D),
+  (exactly one, required). `cylinder` = z-aligned circle, `cube` = an actual
+  cube, its square cross-section rotated 45° about z so `D` is the frontal
+  width across the diagonal (the side is therefore `D/√2`, and so is the z
+  extent, centred on `cz`); at `nz == 1` it degenerates to the z-invariant
+  prism, the same 2D reading that makes a 2D cylinder an infinite one's
+  cross-section. `lens` = two-disk intersection with sharp tips (2D),
   `fence` = wall-mounted blocker sealed to the tunnel floor, top edge at D
   above it, thickness D/8 — the 2D shear-layer rig; `floor` = raised solid slab
   over the full streamwise extent with its surface at D above the wall, i.e. a

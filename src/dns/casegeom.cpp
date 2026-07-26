@@ -69,9 +69,11 @@ buildCaseGeometry(const Case& c, const Scene* scene)
     }
     case BodyKind::Cube:
     {
-        // 45-degree rotated square prism spanning the full z extent.
-        const RotatedCube cube{p.cx, p.cy, p.D / 2.0, 0.0,
-                               g.nz == 1 ? g.hz : double(g.nz) * g.hz};
+        // An actual cube: the 45-degree rotated square, extruded to its own
+        // side length about cz. sceneCube is the one definition of that rule
+        // (and of its 2D degeneration back to a prism) -- --scene's cube goes
+        // through the same call.
+        const RotatedCube cube = sceneCube(g, p.cx, p.cy, p.cz, p.D / 2.0);
         out.sdf = sdfOf(cube);
         out.cut = CutGeometry::make(g, cube);
         break;
