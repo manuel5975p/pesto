@@ -49,6 +49,7 @@ add_library(dns_core
     src/dns/curvmesh.cpp
     src/dns/interrupt.cpp
     src/dns/meshsdf.cpp
+    src/dns/ogrid.cpp
     src/dns/poisson.cpp
     src/dns/scene.cpp
     src/dns/shmframes.cpp
@@ -79,8 +80,10 @@ target_link_libraries(dns PRIVATE dns_core)
 # The one GPU source list, shared by both backends.
 set(DNS_GPU_SOURCES
     src/dns/gpu/bodyforce.hip
+    src/dns/gpu/boussinesq.hip
     src/dns/gpu/comp.hip
     src/dns/gpu/comp_channel.hip
+    src/dns/gpu/comp_conv.hip
     src/dns/gpu/comp_far.hip
     src/dns/gpu/comp_ghost.hip
     src/dns/gpu/comp_nscbc.hip
@@ -92,10 +95,14 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/ghostfill.hip
     src/dns/gpu/kernels.hip
     src/dns/gpu/les.hip
+    src/dns/gpu/ogrid_bc.hip
     src/dns/gpu/poisson.hip
     src/dns/gpu/reductions.hip
     src/dns/gpu/runner_channel.hip
     src/dns/gpu/runner_comp.hip
+    src/dns/gpu/runner_conv.hip
+    src/dns/gpu/runner_ogrid.hip
+    src/dns/gpu/runner_rb.hip
     src/dns/gpu/runner_incomp.hip
     src/dns/gpu/runner_periodic.hip
     src/dns/gpu/timestepper.hip
@@ -333,7 +340,7 @@ endif()
 include(CTest)
 if(BUILD_TESTING)
     set(DNS_TESTS cli geometry output poisson projection tgv tgv3d cutcell cutcell_sphere comp comp_curv meshsdf
-        fieldpng webframes channel_config scene sgs_op framemap)
+        fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)
     endif()
@@ -365,7 +372,8 @@ if(BUILD_TESTING)
                   gpu_comp_ghost gpu_comp_ghost_focal gpu_comp_les
                   gpu_comp_ghost3d gpu_comp_mesh
                   gpu_comp_far gpu_comp_nscbc gpu_les_smag gpu_derived
-                  gpu_channel gpu_cutflux)
+                  gpu_poisson_wally
+                  gpu_channel gpu_cutflux gpu_ogrid)
             add_executable(test_${t} tests/test_${t}.cpp)
             target_link_libraries(test_${t} PRIVATE dns_gpu)
             add_test(NAME ${t} COMMAND test_${t})
@@ -385,6 +393,26 @@ if(BUILD_TESTING)
             add_test(NAME ${t} COMMAND test_${t})
             set_tests_properties(${t} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
         endforeach()
+
+        # dns conv is an app composition (IC + sink + runner), so it is driven
+        # through the binary and read back from its stats CSV.
+        add_executable(test_gpu_conv tests/test_gpu_conv.cpp)
+        target_link_libraries(test_gpu_conv PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_conv PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_conv dns)
+        add_test(NAME gpu_conv COMMAND test_gpu_conv)
+        set_tests_properties(gpu_conv PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+
+        # The Boussinesq branch, including the cross-validation against the
+        # compressible one -- also driven through the binary.
+        add_executable(test_gpu_rb tests/test_gpu_rb.cpp)
+        target_link_libraries(test_gpu_rb PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_rb PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_rb dns)
+        add_test(NAME gpu_rb COMMAND test_gpu_rb)
+        set_tests_properties(gpu_rb PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 
         # Open far-field path is app-local; drive the built binary.
         add_executable(test_gpu_open_incomp tests/test_gpu_open_incomp.cpp)

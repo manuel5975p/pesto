@@ -160,6 +160,82 @@ whose quantum was coarser than one pixel of travel (`cells z`, 0.25 cells/px
 against a quantum of 1) re-rounded to its old value every frame and could not be
 dragged at all. `checkDragLaw` in `guicheck.cpp` pins all of it.
 
+## Two cases: `flow` and `convection`
+
+The `case` selector at the top of the Case panel chooses which subcommand the
+document is. They are two cases, not two settings of one — a convection cell
+has no body, no free stream and no far field (its lateral faces are `--sides`,
+not a far field), and a body flow has no plates and
+no Rayleigh number — so the panels gate wholesale rather than greying out knobs
+the other case has no meaning for. In convection mode the Geometry region says
+so instead of offering a body picker whose every choice the validator would
+reject.
+
+### `convection`
+
+Same idiom as the rest of the editor: you edit the tangible quantities and the
+dimensionless ones are derived read-outs.
+
+| you edit | derived |
+| --- | --- |
+| layer height (m), temperature drop (K), mean temperature (K), material | **Rayleigh number** |
+| | free-fall velocity and time, and the run length in seconds |
+| | the **physical** Mach number the layer actually convects at |
+
+`Ra = g·α·ΔT·H³/(ν·κ)` with `α = 1/T` and `κ = ν/Pr`, so one material plus a
+height plus a drop fixes it — exactly as one material plus a body size plus a
+freestream fixes Re.
+
+**model** picks Boussinesq (incompressible) or fully compressible. They are two
+models, not two solvers, and the panel only offers each one's own knobs:
+`solver Mach`, `viscosity` and the stratification read-out appear for
+compressible only, because the Boussinesq branch *rejects* them by name.
+
+**`solver Mach` is not the physical Mach.** The read-out above it is what a real
+layer convects at (~1e-3 for air); the editable one is what sets gravity,
+`g = M²γ/dtemp`, and therefore how stratified the layer is and how many steps a
+free-fall time costs. The panel prints the **adiabatic fraction** beside it —
+the share of the imposed drop gravity's own adiabatic gradient consumes — and
+goes red at 100%, where the layer is subadiabatic and the validator rejects it.
+
+**hot patch** heats a centred fraction of the floor. It is a *side* fraction, so
+the panel prints the resulting heated **area** (its square in 3D), and warns
+that below 1 the case is a localised plume rather than Rayleigh–Bénard.
+
+**sides** sits beside **box aspect** because the two are the container: with
+periodic sides the aspect is a sampling window on an unbounded layer, with
+closed sides it *is* the cavity and fixes the roll count. Closing them makes x
+(and z, in 3D) no-slip adiabatic walls; the panel says so and warns that Nu
+becomes an aspect-dependent cavity number below the periodic one, and that the
+1708 onset belongs to the unbounded layer. It is emitted only when closed, so a
+document that never touches it exports the command it always did. The Geometry
+region — the read-out panel in convection mode — reports which faces are walls;
+the grid panel notes that the printed grid is the allocation, two ghost rows for
+the plates plus two columns per closed side, not the fluid count that was typed.
+
+The grid panel's load-bearing row becomes the **thermal** boundary layer,
+`H/(2·Nu·h)`, estimated from the a-priori `Nu ≈ 0.1·Ra^(1/3)`. Five points
+across it is the floor; under that, the wall gradient — and therefore the
+Nusselt number — is a property of the grid.
+
+The run dock plots **Nu floor / Nu lid / Nu flux / u rms** instead of
+cd/cl/K/maxDiv. Floor and lid side by side is the diagnostic: they fluctuate
+independently and must agree in the mean, which is the heat balance closing.
+
+### `thermal` (compressible body flow)
+
+Folded away by default, and every knob in it is off by default, because a run
+naming none of them is bit-for-bit the constant-viscosity, adiabatic-wall
+solver every measured cd/cl anchor was taken on. It carries `--visc sutherland`
+(with the `Tinf` anchor Sutherland's dimensional 110.4 K needs), `--prandtl`,
+the **body** wall condition (`--wall` / `--twall` — the box walls are always
+adiabatic mirrors), `--nscbc-tinflow`, and `--temp`.
+
+`--temp` adds a third published field, `T − Tinf`, which then appears in the
+live viewer's `field` selector like any other — the selector is driven by the
+segment's own field table, so a run that publishes a temperature is colourable
+and foggable by it with no viewer change.
+
 ## Physical units
 
 The solver is dimensionless (`uInf = 1`, Re and Mach are its inputs). The editor
@@ -221,6 +297,13 @@ cannot slow a run down. Nothing is written to disk.
 
 The viewer attaches to *any* `--emit shm` run on the machine, not only one it
 started.
+
+**Stopping during start-up.** `stop` sends SIGTERM, and the solver's handler
+only sets a flag that its time loop polls — so a run stopped while it is still
+acquiring the GPU does not see it until the loop starts. The editor escalates
+to SIGKILL after two seconds, and a SIGKILLed run never reaches the destructor
+that unlinks its segment, leaving a corpse the next RUN has to step over. A stop
+issued once the run is live (i.e. once the viewer has attached) is always clean.
 
 | view | control |
 |---|---|

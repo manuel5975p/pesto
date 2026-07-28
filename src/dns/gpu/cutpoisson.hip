@@ -20,8 +20,10 @@ using internal::reduceInto;
 
 namespace {
 
-__global__ void kApplyCut(GpuGrid g, const Real* lam, const Real* ax, const Real* ay,
-                          const Real* az, const Real* x, Real* y)
+__global__ void kApplyCut(GpuGrid g, const Real* __restrict__ lam,
+                          const Real* __restrict__ ax, const Real* __restrict__ ay,
+                          const Real* __restrict__ az, const Real* __restrict__ x,
+                          Real* y)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
@@ -30,9 +32,10 @@ __global__ void kApplyCut(GpuGrid g, const Real* lam, const Real* ax, const Real
     if (lam[c] <= 0) { y[c] = 0; return; }
     const Real ix = Real(1) / (g.hx * g.hx), iy = Real(1) / (g.hy * g.hy),
                iz = Real(1) / (g.hz * g.hz);
-    const std::size_t xp = gidx(g, i + 1, j, k), xm = gidx(g, i - 1, j, k);
-    const std::size_t yp = gidx(g, i, j + 1, k), ym = gidx(g, i, j - 1, k);
-    const std::size_t zp = gidx(g, i, j, k + 1), zm = gidx(g, i, j, k - 1);
+    const Offsets o = offsetsAt(g, i, j, k);
+    const std::size_t xp = c + o.p[0], xm = c + o.m[0];
+    const std::size_t yp = c + o.p[1], ym = c + o.m[1];
+    const std::size_t zp = c + o.p[2], zm = c + o.m[2];
     const Real m = ix * (ax[xp] * (x[xp] - x[c]) - ax[c] * (x[c] - x[xm]))
                  + iy * (ay[yp] * (x[yp] - x[c]) - ay[c] * (x[c] - x[ym]))
                  + iz * (az[zp] * (x[zp] - x[c]) - az[c] * (x[c] - x[zm]));
@@ -276,6 +279,19 @@ int DeviceCutPoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p,
     // the loop at iteration 0 and report a perfect solve on a field that has
     // already diverged. Require rr to be a finite number to CONTINUE, and
     // report non-convergence when it is not.
+    //
+    // The convergence test is evaluated EVERY iteration, and the D2H copy that
+    // drives it is the loop's only host synchronization. Rationing it (test
+    // every K, K > 1) is the obvious optimization and it does not pay -- it was
+    // built and measured, 2026-07-26, cylinder Re60 256^2 tunnel, one iteration
+    // costing 0.316 ms against a sync costing ~0.02 ms:
+    //     K = 1: 39.8 pcg/step, 12.9 ms/step
+    //     K = 2: 41.5 pcg/step, 13.4 ms/step
+    //     K = 4: 44.0 pcg/step, 13.9 ms/step
+    // The overshoot (up to K-1 wasted iterations per solve) costs an order of
+    // magnitude more than the syncs it removes, in 2D and in 3D alike (sphere
+    // 128^3: 52 -> 56 pcg/step, 58.0 -> 60.6 ms/step). Do not re-try it without
+    // first making a CG iteration cheap.
     int it = 0;
     if (!std::isfinite(rr)) return maxIters_;
     for (; it < maxIters_ && std::isfinite(rr) && rr > target; ++it)

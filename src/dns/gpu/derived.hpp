@@ -24,6 +24,13 @@ void vorticityZ(const GpuGrid&, const DeviceField& U, DeviceScalar& out);
 // |u| at cell centres from a MAC field (face pairs averaged to the centre).
 void speedMac(const GpuGrid&, const DeviceField& U, DeviceScalar& out);
 
+// The three CELL-CENTRED velocity components of a MAC field, each the average
+// of the cell's two opposing faces -- the same averaging speedMac does
+// internally, exposed so a caller can feed the centred curl/speed helpers
+// below (which the compressible runners already use) from a staggered field.
+void centreVelocity(const GpuGrid&, const DeviceField& U, DeviceScalar& u,
+                    DeviceScalar& v, DeviceScalar& w);
+
 // |curl u| and |u| at cell centres from CELL-CENTRED velocity components
 // (the compressible primitives rho-1 * m), 3D central differences with
 // periodic wrap -- the comp_mesh host stencil. At nz == 1 the z differences

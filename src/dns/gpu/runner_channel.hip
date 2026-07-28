@@ -24,17 +24,7 @@ namespace dns::gpu {
 using internal::fail;
 using internal::finishTiming;
 
-namespace {
-
-
-// One-sided 2nd-order wall gradient from the first two off-wall values with
-// u(0) = 0 pinned: du/dy|0 = (u1 d2^2 - u2 d1^2) / (d1 d2 (d2 - d1)).
-double wallGradient(double u1, double u2, double d1, double d2)
-{
-    return (u1 * d2 * d2 - u2 * d1 * d1) / (d1 * d2 * (d2 - d1));
-}
-
-} // namespace
+using internal::wallGradientPinned;
 
 std::expected<RunStats, RunError>
 runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
@@ -58,8 +48,9 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     dev->setStageHook([&](DeviceCompState& s) { wall->apply(s); });
     // Body force as an RHS term on the live stage primitives: it rides
     // SSP-RK3 exactly, like the NSCBC rhs overwrite (never a state edit).
-    dev->setRhsHook([&](const DeviceCompState&, DeviceCompState& k) {
-        addBodyForceX(gg, r.fBody, dev->u(), k);
+    dev->setRhsHook([&](const DeviceCompState&, DeviceCompState& out,
+                        const StageCombine& cmb) {
+        addBodyForceX(gg, r.fBody, cmb.cr, dev->u(), out);
     });
 
     (void)ds->upload(ic);
@@ -143,12 +134,12 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
         w.ke = 0.5 * g.hx * g.hz * ke;
         auto favreU = [&](int j) { return ps[j * 8 + 1] / ps[j * 8 + 0]; };
         w.utauBot = std::sqrt(std::max(
-            nu * wallGradient(favreU(jLo), favreU(jLo + 1), yc[jLo],
-                              yc[jLo + 1]),
+            nu * wallGradientPinned(favreU(jLo), favreU(jLo + 1), yc[jLo],
+                                    yc[jLo + 1]),
             0.0));
         const double dTop1 = 2 * r.delta - yc[jHi], dTop2 = 2 * r.delta - yc[jHi - 1];
         w.utauTop = std::sqrt(std::max(
-            nu * wallGradient(favreU(jHi), favreU(jHi - 1), dTop1, dTop2),
+            nu * wallGradientPinned(favreU(jHi), favreU(jHi - 1), dTop1, dTop2),
             0.0));
         return w;
     };
@@ -183,6 +174,12 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     RunStats st;
     double t = 0.0;
     long lastLog = 0;
+    // The PRINT cadence needs its own counter. Sharing lastLog with the CSV
+    // cadence made the progress line unreachable: lastLog is reset every
+    // statsEvery steps, so `steps - lastLog >= 10 * statsEvery` was never true
+    // and the line appeared only at tEnd -- which left dns-ui's live plots
+    // empty for the whole run.
+    long lastPrint = 0;
     double dtStab = 0.0;
     int sinceDt = 1 << 30;
     double nextProf = r.profileDt > 0 ? r.profileDt : -1;
@@ -223,13 +220,14 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
                                       w->utauBot, w->utauTop, retau,
                                       w->ke};
                 (void)out.row("stats", row);
-                if (st.steps - lastLog >= 10 * r.statsEvery || t >= r.tEnd)
+                if (st.steps - lastPrint >= 10 * r.statsEvery || t >= r.tEnd)
                 {
                     std::printf("t=%.2f/%.2f ub=%.2f Re_tau=%.1f "
                                 "(bot %.3f top %.3f) dt=%.2e\n",
                                 t, r.tEnd, w->ubulk, retau, w->utauBot,
                                 w->utauTop, dt);
                     std::fflush(stdout);
+                    lastPrint = st.steps;
                 }
                 lastLog = st.steps;
             }

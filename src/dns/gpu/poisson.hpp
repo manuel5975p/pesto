@@ -22,7 +22,14 @@ namespace dns::gpu {
 //              per non-degenerate axis (an nz == 1 axis has no ghosts and
 //              stays untransformed); ghost-ring entries of rhs are ignored
 //              and p's ghost ring is written as zero.
-enum class PoissonBc { Periodic, NeumannBox };
+//  PeriodicXZWallY: periodic in x and z over the FULL extent, homogeneous
+//              Neumann on the two y wall faces of the interior rows [1, ny-2]
+//              (the wall-bounded channel/convection box). Only y carries
+//              ghost rows; rhs's are ignored and p's are written as zero.
+//              Solved by FFT over x and z and an exact tridiagonal solve in y
+//              per (kx, kz) mode -- no DCT, so it needs no power-of-two-ish
+//              structure in y and stays exact for any ny.
+enum class PoissonBc { Periodic, NeumannBox, PeriodicXZWallY };
 
 class DevicePoissonSolver
 {

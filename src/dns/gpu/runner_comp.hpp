@@ -6,6 +6,7 @@
 #pragma once
 
 #include "dns/comp.hpp"
+#include "dns/transport.hpp"
 #include "dns/config.hpp"
 #include "dns/framemap.hpp"
 #include "dns/gpu/runner_incomp.hpp"   // RunStats, RunError
@@ -20,6 +21,16 @@ struct CompRun
 {
     double gamma = 1.4;
     double mu = 0;
+    // The gas. Carries the viscosity law, Pr, R and gamma; `gamma`/`mu` above
+    // stay as the reference values the boundary configs quote. Default-
+    // constructed (constant viscosity) reproduces the pre-thermal solver
+    // bit-for-bit -- dns_main fills it from the validated Case.
+    Transport tr;
+    // Body surface thermal condition. Adiabatic is the historical wall.
+    bool wallIsothermal = false;
+    double Twall = 0;   // solver units; read only when wallIsothermal
+    // NSCBC entropy inflow holds T instead of rho (see comp_nscbc.hpp).
+    bool nscbcThermalInflow = false;
     // NOTE: no `mach` here. Mach reaches the solver through pInf (set from it
     // in dns_main); a second copy was plumbed to the GPU and never read.
     double uInf = 1.0, rhoInf = 1.0, pInf = 1.0;
@@ -92,6 +103,12 @@ struct CompRun
     double curlMax = 0;          // 0 = 8/D signed, 15/D magnitude
     bool vortAsinh = false;      // png: asinh(v/toe), toe = curlMax/32
     bool speedDelta = false;     // frames carry |u| - uInf (diverging)
+    // --temp: add a third frame channel carrying T - Tinf on the diverging
+    // map. OFF by default, and deliberately so -- turning it on changes what
+    // every artefact of a run contains (one more png series, one more web/shm
+    // plane), which is not something a thermal knob should do behind the
+    // user's back.
+    bool tempFrames = false;
     int statsEvery = 200;        // steps between force rows
 };
 

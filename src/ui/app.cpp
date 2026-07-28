@@ -28,6 +28,20 @@ std::string bigInt(std::size_t v)
 }
 
 const char* const kPhysicsNames[] = {"incomp", "comp"};
+// `dns flow` and `dns conv` are two cases, not two settings of one: the panels
+// below gate wholesale on this rather than greying knobs the other case has no
+// meaning for.
+const char* const kSubNames[] = {"flow", "convection"};
+// The convection model. Boussinesq is FIRST and the default: it is the M -> 0
+// limit taken analytically, so it needs no Mach number, carries no
+// stratification, and runs the same case in a fortieth of the steps.
+const char* const kConvModelNames[] = {"boussinesq", "compressible"};
+// The lateral faces. Periodic is FIRST and the default: it is the classical
+// Rayleigh-Benard setup, an unbounded layer sampled over one box. Closed is a
+// sealed cavity -- a different experiment, not a detail (see the panel).
+const char* const kConvSidesNames[] = {"periodic", "closed"};
+const char* const kViscNames[] = {"constant", "sutherland"};
+const char* const kWallNames[] = {"adiabatic", "isothermal"};
 const char* const kSgsNames[] = {"smag", "sigma"};
 const char* const kAxisNames[] = {"x", "y", "z"};
 
@@ -692,10 +706,19 @@ void App::buildUi()
                      th.smallPx);
         }
         if (b.ok) {
+            // The one-line verdict, in whichever terms the case has: a body
+            // boundary layer and a Reynolds number, or a thermal boundary
+            // layer and a Rayleigh number.
             const std::string r =
-                "BL " + num(b.blCells, 3) + (b.bodyResolved ? " resolved" : " UNDER") +
-                "   ·   " + metres(doc_.st.phys.dBody) + " body   ·   Re " +
-                num(doc_.st.re(), 4);
+                b.cas().sub == dns::Subcommand::Conv
+                    ? "thermal BL " + num(b.blCells, 3) +
+                          (b.bodyResolved ? " resolved" : " UNDER") + "   ·   " +
+                          metres(doc_.st.convH) + " layer   ·   Ra " +
+                          num(doc_.st.convRayleigh(), 4)
+                    : "BL " + num(b.blCells, 3) +
+                          (b.bodyResolved ? " resolved" : " UNDER") + "   ·   " +
+                          metres(doc_.st.phys.dBody) + " body   ·   Re " +
+                          num(doc_.st.re(), 4);
             const float tw = g.textWidth(r, FontId::Sans, th.smallPx);
             g.textAt(r, w_ - tw - th.px(12), sy + lay_.statusH - th.px(7),
                      b.bodyResolved ? th.good : th.warn, FontId::Sans, th.smallPx);
@@ -716,6 +739,12 @@ void App::leftRegion()
     auto& ph = doc_.st.phys;
 
     g.beginRegion("Case", 0, lay_.menuH, lay_.leftW, lay_.caseH);
+
+    // Which case this is. Everything below gates on it.
+    g.label("case", th.textDim);
+    if (g.choice("", doc_.st.sub, {kSubNames, 2})) doc_.touch();
+    g.separator();
+    const bool conv = doc_.st.isConv();
 
     // --- material -----------------------------------------------------------
     if (g.sectionHeader("material", showMaterial_)) {
@@ -748,8 +777,118 @@ void App::leftRegion()
         }
     }
 
+    // --- convection ---------------------------------------------------------
+    // The SI face again: a layer height and a temperature drop are what a
+    // person has, and the Rayleigh number is DERIVED from them and the
+    // material -- exactly as Re is derived from a body size and a freestream.
+    if (conv && g.sectionHeader("convection", showConv_)) {
+        if (g.choice("model", doc_.st.convPhysics, {kConvModelNames, 2}))
+            doc_.touch();
+        if (g.dragUnit("layer height", doc_.st.convH, 0.001, 1e-5, 10.0, "m", 4))
+            doc_.touch();
+        if (g.dragUnit("temperature drop", doc_.st.convDT, 0.5, 1e-3, 2000.0,
+                       "K", 4))
+            doc_.touch();
+        if (g.dragUnit("mean temperature", doc_.st.convTmean, 1.0, 1.0, 5000.0,
+                       "K", 5))
+            doc_.touch();
+        if (g.dragDouble("Prandtl", doc_.st.prandtl, 0.005, 1e-3, 1e4, 4))
+            doc_.touch();
+        if (g.dragDouble("box aspect", doc_.st.convAspect, 0.05, 0.1, 32.0, 3))
+            doc_.touch();
+        // The lateral faces. Aspect and sides together are the container, which
+        // is why they sit next to each other: with periodic sides the aspect is
+        // only a sampling window on an unbounded layer, with closed sides it is
+        // the cavity itself and fixes the roll count.
+        if (g.choice("sides", doc_.st.convSides, {kConvSidesNames, 2}))
+            doc_.touch();
+        if (doc_.st.convSides == 1) {
+            g.label("no-slip adiabatic side walls: a sealed cavity", th.textDim);
+            // The two numbers people quote against a convection cell -- the
+            // 1708 onset and the Ra-Nu scaling -- are the unbounded layer's,
+            // and this box is not that. Measured 2026-07-26 at Ra 5e4, 2D:
+            // Nu 3.97 -> 3.65 (Boussinesq), 3.79 -> 3.40 (compressible).
+            g.label("Nu is an aspect-dependent cavity number, below the",
+                    th.warn);
+            g.label("periodic one; onset 1708 is the unbounded layer's",
+                    th.warn);
+        }
+        g.separator();
+
+        const double ra = doc_.st.convRayleigh();
+        g.field("Rayleigh", num(ra, 5), th.accent);
+        // 1708 is the onset for rigid isothermal plates; below it the layer
+        // only conducts, which is a legitimate run and a surprising picture.
+        if (ra < 1708.0 && doc_.st.hotPatch >= 1.0)
+            g.label("below onset (~1708): the layer will just conduct", th.warn);
+        const double uff = ph.freeFall(doc_.st.convDT, doc_.st.convH,
+                                       doc_.st.convTmean);
+        const double tff = ph.freeFallSeconds(doc_.st.convDT, doc_.st.convH,
+                                              doc_.st.convTmean);
+        g.field("free fall", num(uff, 4) + " m/s   (" + seconds(tff) + ")");
+        g.field("Mach (physical)",
+                num(ph.convMachPhysical(doc_.st.convDT, doc_.st.convH,
+                                        doc_.st.convTmean), 3),
+                th.textDim);
+        g.separator();
+
+        // The heated fraction of the floor. A SIDE fraction, so in 3D the
+        // heated area is its square -- the read-out says which, because
+        // "middle third" means two different things in 2D and 3D.
+        if (g.dragDouble("hot patch", doc_.st.hotPatch, 0.005, 0.02, 1.0, 3))
+            doc_.touch();
+        if (doc_.st.hotPatch < 1.0) {
+            const double area = doc_.st.nz == 1
+                                    ? doc_.st.hotPatch
+                                    : doc_.st.hotPatch * doc_.st.hotPatch;
+            g.field("heated area", num(100.0 * area, 3) + " % of the floor",
+                    th.textDim);
+            g.label("a patch is a localised plume, not Rayleigh-Benard:",
+                    th.warn);
+            g.label("no 1D conduction state, onset 1708 does not apply",
+                    th.warn);
+        }
+        g.separator();
+
+        if (g.dragDouble("run length", doc_.st.convTt, 0.5, 0.1, 1e5, 4))
+            doc_.touch();
+        g.field("free-fall times", num(doc_.st.convTt, 4) + "   (" +
+                                       seconds(doc_.st.convTt * tff) + ")",
+                th.textDim);
+        if (g.dragDouble("trip", doc_.st.convKick, 0.005, 0.0, 2.0, 3))
+            doc_.touch();
+        if (g.dragDouble("frame interval", doc_.st.wdt, 0.0005, 1e-4, 10.0, 4))
+            doc_.touch();
+
+        // Compressible-only. The Boussinesq branch REJECTS these by name, so
+        // showing them there would be offering an error.
+        if (doc_.st.convPhysics == 1) {
+            g.separator();
+            if (g.dragDouble("solver Mach", doc_.st.convMach, 0.002, 1e-3, 0.9,
+                             4))
+                doc_.touch();
+            // This is NOT the physical Mach above: it is what sets gravity,
+            // g = M^2 gamma / dtemp, and therefore how stratified the layer is
+            // and how many steps a free-fall time costs. The adiabatic
+            // fraction is the honest read-out of the compromise.
+            const double eps = doc_.st.convDtemp();
+            const double frac = eps > 0 ? doc_.st.convMach * doc_.st.convMach
+                                              * 0.4 / (eps * eps)
+                                        : 1.0;
+            g.field("adiabatic fraction", num(100.0 * frac, 3) + " %",
+                    frac >= 1.0 ? th.bad : frac > 0.25 ? th.warn : th.textDim);
+            if (frac >= 1.0)
+                g.label("subadiabatic: the layer cannot convect", th.bad);
+            else if (frac > 0.25)
+                g.label("gravity eats much of the drop; lower solver Mach",
+                        th.warn);
+            if (g.choice("viscosity", doc_.st.visc, {kViscNames, 2}))
+                doc_.touch();
+        }
+    }
+
     // --- flow ---------------------------------------------------------------
-    if (g.sectionHeader("flow", showFlow_)) {
+    if (!conv && g.sectionHeader("flow", showFlow_)) {
         if (g.choice("model", doc_.st.physics, {kPhysicsNames, 2})) {
             // Switching model invalidates the far field half the time; move it
             // to a legal one rather than letting the case go red until the user
@@ -820,10 +959,61 @@ void App::leftRegion()
             g.label("sponge eats the near field - explicit fallback only", th.warn);
     }
 
+    // --- thermal (compressible body flow) -----------------------------------
+    // Folded away by default, and every knob in it is off by default, because
+    // a run that names none of them is bit-for-bit the constant-viscosity,
+    // adiabatic-wall solver every measured cd/cl anchor was taken on. Turning
+    // one on is a deliberate act, and the panel says what it costs.
+    if (!conv && doc_.st.physics == 1
+        && g.sectionHeader("thermal", showThermal_)) {
+        if (g.choice("viscosity", doc_.st.visc, {kViscNames, 2})) doc_.touch();
+        if (doc_.st.visc == 1) {
+            // Sutherland's 110.4 K is dimensional, so a temperature-dependent
+            // run needs one anchor. Nothing else reads it.
+            if (g.dragUnit("Tinf", doc_.st.tinf, 1.0, 1.0, 5000.0, "K", 5))
+                doc_.touch();
+            g.label("mu(T) and kappa(T) = mu cp / Pr", th.textDim);
+        }
+        if (g.dragDouble("Prandtl", doc_.st.prandtl, 0.005, 1e-3, 1e4, 4))
+            doc_.touch();
+        g.separator();
+
+        // The BODY surface condition -- not the box walls, which are always
+        // adiabatic mirrors.
+        int wall = doc_.st.wallIso ? 1 : 0;
+        if (g.choice("body wall", wall, {kWallNames, 2})) {
+            doc_.st.wallIso = wall == 1;
+            doc_.touch();
+        }
+        if (doc_.st.wallIso) {
+            if (g.dragDouble("Twall / Tinf", doc_.st.twall, 0.01, 0.05, 20.0, 4))
+                doc_.touch();
+            // validate() rejects an isothermal wall with no body, so say it
+            // here rather than letting the case go red.
+            if (doc_.st.bodyKind == 0)
+                g.label("an isothermal wall needs a body", th.bad);
+            g.label("wall heat flux appears as the qw stats column",
+                    th.textDim);
+        }
+        g.separator();
+
+        // NSCBC-only, and validate() says so.
+        if (g.checkbox("--nscbc-tinflow (inflow holds T)",
+                       doc_.st.nscbcTinflow))
+            doc_.touch();
+        if (doc_.st.nscbcTinflow && doc_.st.far != 3)
+            g.label("needs --far nscbc", th.bad);
+        if (g.checkbox("--temp (temperature frame channel)",
+                       doc_.st.tempFrames))
+            doc_.touch();
+        if (doc_.st.tempFrames)
+            g.label("adds a third published field: T - Tinf", th.textDim);
+    }
+
     // --- numerics -----------------------------------------------------------
     // Folded away by default: these are the knobs you reach for after the
     // physical case is right, and two of them are documented foot-guns.
-    if (g.sectionHeader("numerics", showNumerics_)) {
+    if (!conv && g.sectionHeader("numerics", showNumerics_)) {
         if (g.dragDouble("LES Cs (0 = DNS)", doc_.st.les, 0.002, 0.0, 1.0, 3))
             doc_.touch();
         if (doc_.st.les > 0)
@@ -842,11 +1032,28 @@ void App::leftRegion()
         if (g.dragInt("cells y (0 = follow x)", doc_.st.ny, 0.5, 0, 4096))
             doc_.touch();
         if (g.dragInt("cells z (1 = 2D)", doc_.st.nz, 0.25, 1, 2048)) doc_.touch();
-        if (g.dragDouble("domain (box in D)", doc_.st.dr, 0.02, 0.5, 128, 2))
-            doc_.touch();
-        // --dr is a length measured in D, so its SI value needs no grid factor.
-        g.field("domain size", metres(doc_.st.dr * ph.dBody), th.textDim);
-        if (doc_.st.physics == 1) {
+        // --dr measures the box in body diameters; a convection cell has no
+        // body and its box comes from the layer height and the aspect ratio
+        // instead, so the row is not shown rather than shown and ignored.
+        if (!conv) {
+            if (g.dragDouble("domain (box in D)", doc_.st.dr, 0.02, 0.5, 128, 2))
+                doc_.touch();
+            // --dr is a length in D, so its SI value needs no grid factor.
+            g.field("domain size", metres(doc_.st.dr * ph.dBody), th.textDim);
+        } else {
+            g.field("box", num(doc_.st.convAspect, 3) + " x 1 x " +
+                               (doc_.st.nz == 1
+                                    ? std::string("-")
+                                    : num(doc_.st.convAspect, 3)) +
+                               "  layer heights",
+                    th.textDim);
+            g.field("box size", metres(doc_.st.convAspect * doc_.st.convH) +
+                                    " x " + metres(doc_.st.convH),
+                    th.textDim);
+            g.label("--ny is the FLUID rows; two ghost rows are added",
+                    th.textDim);
+        }
+        if (!conv && doc_.st.physics == 1) {
             if (g.checkbox("--focal auto", doc_.st.focalAuto)) doc_.touch();
             if (doc_.st.focalAuto) {
                 if (g.dragDouble("ratio R", doc_.st.focalRatio, 0.01, 1.01, 64, 2))
@@ -860,13 +1067,26 @@ void App::leftRegion()
         g.separator();
         if (b.ok) {
             const dns::Grid& gr = b.cas().grid;
+            // Which case these numbers came FROM, not which one is selected.
+            // The build is asynchronous, so between flipping the case selector
+            // and the rebuild landing, `doc_.st` and `b` disagree -- and every
+            // row below reads `b`. Gating them on the live selector printed a
+            // convection read-out over a body-flow case: `fluid cells` came out
+            // 0 x n x 0 (a flow case resolves no fluid counts) under a grid row
+            // that was the cylinder's.
+            const bool convBuilt = b.cas().sub == dns::Subcommand::Conv;
             g.field("grid", std::to_string(gr.nx) + " x " + std::to_string(gr.ny) +
                                 " x " + std::to_string(gr.nz));
             g.field("cells", bigInt(gr.size()));
             // Spacings in metres. These DO need the box factor: unlike --dr and
             // the object offsets, h is a box length, not a multiple of D.
             const double dBox = b.geo.D > 0 ? b.geo.D : b.cas().placement.D;
-            const double mpb = ph.metresPerBox(dBox);
+            // metresPerBox is dBody/dBox, and a convection cell has no body:
+            // its physical length scale is the LAYER HEIGHT, which is 1 box
+            // unit. Using the body size here would scale every spacing by a
+            // millimetre that has nothing to do with the case.
+            const double mpb = convBuilt ? (dBox > 0 ? doc_.st.convH / dBox : 0.0)
+                                         : ph.metresPerBox(dBox);
             // In 2D, hz is 1 box unit by validator fiat (CLAUDE.md: nz == 1 is
             // the exact 2D restriction, hz = 1 enforced). Printing it as a
             // metre spacing would invent a third dimension the case does not
@@ -881,6 +1101,32 @@ void App::leftRegion()
                         metres(b.cas().focalHFine[0] * mpb) + ", " +
                             metres(b.cas().focalHFine[1] * mpb) + ", " +
                             metres(b.cas().focalHFine[2] * mpb));
+            if (convBuilt) {
+                // The load-bearing row for a convection cell is the THERMAL
+                // boundary layer at the plates, delta = H / (2 Nu), not a body
+                // boundary layer. Nu is not known before the run, so this uses
+                // the a-priori Nu ~ 0.1 Ra^(1/3), which runs high against this
+                // repo's own measurements and therefore errs toward calling the
+                // grid coarser than it is.
+                g.field("layer H", metres(dBox * mpb));
+                // The grid row above is the ALLOCATION: two mirror rows for the
+                // plates, and two more columns per closed lateral axis. The
+                // FLUID counts are what was typed, so print both rather than
+                // let the reader wonder which one they are looking at.
+                g.field("fluid cells",
+                        std::to_string(b.cas().nxInterior) + " x " +
+                            std::to_string(gr.ny - 2) + " x " +
+                            std::to_string(b.cas().nzInterior),
+                        th.textDim);
+                g.field("cells across H", num(b.dOverH, 4),
+                        b.dOverH >= 64 ? th.good
+                                       : (b.dOverH >= 32 ? th.warn : th.bad));
+                g.field("thermal BL cells H/(2 Nu h)", num(b.blCells, 3),
+                        b.bodyResolved ? th.good : th.bad);
+                if (!b.bodyResolved)
+                    g.label("under-resolved: Nu becomes a property of the grid",
+                            th.warn);
+            } else {
             g.field("body D", metres(dBox * mpb));
             g.field("D / h", num(b.dOverH, 4),
                     b.dOverH >= 16 ? th.good : (b.dOverH >= 8 ? th.warn : th.bad));
@@ -891,6 +1137,7 @@ void App::leftRegion()
                     b.bodyResolved ? th.good : th.bad);
             if (!b.bodyResolved && !b.cas().lesLabel)
                 g.label("under-resolved: expect trapped ripples", th.warn);
+            }
             g.field("label", b.label, b.cas().lesLabel ? th.warn : th.good);
             if (b.cas().focalActive)
                 g.field("dt penalty", num(b.cas().focalDtFactor, 3));
@@ -914,6 +1161,27 @@ void App::geometryRegion()
 
     g.beginRegion("Geometry", 0, lay_.geomY, lay_.leftW,
                   lay_.dockY - lay_.geomY);
+
+    // A convection cell has no body. The region stays (the docking layout is
+    // fixed) but it says so instead of offering a body picker whose every
+    // choice the conv validator would reject.
+    if (doc_.st.isConv()) {
+        g.label("no body: the case is a heated layer", th.textDim);
+        g.label("floor and lid are no-slip isothermal plates", th.textDim);
+        // Read-out, not a second edit point: `sides` is set in the convection
+        // section, beside the aspect ratio it acts with.
+        if (doc_.st.convSides == 1) {
+            g.label(doc_.st.nz == 1
+                        ? "x sides are no-slip adiabatic walls (2D: z wraps)"
+                        : "x and z sides are no-slip adiabatic walls",
+                    th.textDim);
+            g.label("one ghost column per wall; fluid extent unchanged",
+                    th.textDim);
+        } else
+            g.label("sides are periodic", th.textDim);
+        g.endPanel();
+        return;
+    }
 
     int bk = doc_.st.bodyKind;
     if (g.choice("", bk, {bodyNames(), 5})) {
@@ -1414,6 +1682,8 @@ void App::checkFogOrder()
 
 // The solver's own stats lines, parsed straight out of the captured stdout:
 //   t=8.21/12.57 cd=1.456 (cdf=0.506) cl=-0.173 K=22.9 maxDiv=1.16e-04 ...
+// and, for a convection run,
+//   t=12.00/40.00 Nu=10.559/10.548 (flux 10.486) urms=0.244 dt=4.13e-03
 // No second channel and no file -- the run log IS the series.
 void App::parseSeries()
 {
@@ -1442,6 +1712,26 @@ void App::parseSeries()
         series_.cl.push_back(cl);
         series_.k.push_back(kk);
         series_.div.push_back(dv);
+
+        // Convection: "Nu=10.559/10.548 (flux 10.486) urms=0.244". The two
+        // wall values share one key, so the second is read past the slash.
+        float nb = 0, nt = 0, nf = 0, ur = 0;
+        if (num("Nu=", nb)) {
+            const std::size_t p = ln.find("Nu=");
+            const std::size_t sl = ln.find('/', p);
+            if (sl != std::string::npos) {
+                try { nt = std::stof(ln.substr(sl + 1)); } catch (...) {}
+            }
+        }
+        num("(flux ", nf);
+        // The compressible runner prints urms as a ratio to the free-fall
+        // velocity and the Boussinesq one in box units; both are the same
+        // column, so the longer key is tried first.
+        if (!num("urms/uff=", ur)) num("urms=", ur);
+        series_.nuBot.push_back(nb);
+        series_.nuTop.push_back(nt);
+        series_.nuFlux.push_back(nf);
+        series_.urms.push_back(ur);
     }
     seriesConsumed_ = lines.size();
 }
@@ -1811,13 +2101,28 @@ void App::dockRegion()
     const int nPlots = 4;
     const float pw = std::max(th.px(80), (plotsW - th.px(8) * (nPlots + 1)) / nPlots);
     float px = th.px(8);
-    plot(px, top, pw, ph, "cd", series_.t, series_.cd, th.accent);
-    px += pw + th.px(8);
-    plot(px, top, pw, ph, "cl", series_.t, series_.cl, rgb(0x5fd08a));
-    px += pw + th.px(8);
-    plot(px, top, pw, ph, "K", series_.t, series_.k, rgb(0xf0b45a));
-    px += pw + th.px(8);
-    plot(px, top, pw, ph, "maxDiv", series_.t, series_.div, rgb(0xef6b6b));
+    if (doc_.st.isConv()) {
+        // Floor and lid Nusselt numbers side by side is the diagnostic: they
+        // fluctuate independently and must agree in the MEAN, which is the
+        // heat balance closing.
+        plot(px, top, pw, ph, "Nu floor", series_.t, series_.nuBot, th.accent);
+        px += pw + th.px(8);
+        plot(px, top, pw, ph, "Nu lid", series_.t, series_.nuTop,
+             rgb(0x5fd08a));
+        px += pw + th.px(8);
+        plot(px, top, pw, ph, "Nu flux", series_.t, series_.nuFlux,
+             rgb(0xf0b45a));
+        px += pw + th.px(8);
+        plot(px, top, pw, ph, "u rms", series_.t, series_.urms, rgb(0xef6b6b));
+    } else {
+        plot(px, top, pw, ph, "cd", series_.t, series_.cd, th.accent);
+        px += pw + th.px(8);
+        plot(px, top, pw, ph, "cl", series_.t, series_.cl, rgb(0x5fd08a));
+        px += pw + th.px(8);
+        plot(px, top, pw, ph, "K", series_.t, series_.k, rgb(0xf0b45a));
+        px += pw + th.px(8);
+        plot(px, top, pw, ph, "maxDiv", series_.t, series_.div, rgb(0xef6b6b));
+    }
 
     // The tail of the raw log on the right: the plots are a summary, the log is
     // the truth, and a warning only ever appears in the latter.

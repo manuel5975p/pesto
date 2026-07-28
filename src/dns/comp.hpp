@@ -6,6 +6,7 @@
 #pragma once
 
 #include "dns/grid.hpp"
+#include "dns/transport.hpp"
 
 #include <expected>
 #include <memory>
@@ -31,24 +32,27 @@ struct CompState
 // fluxes (Stokes hypothesis) + Fourier heat flux, SSP-RK3 in time.
 struct Comp
 {
-    Grid g;             // fully periodic
-    double gamma = 1.4; // ratio of specific heats
-    double mu = 0.0;    // dynamic viscosity (constant)
-    double Pr = 0.72;   // Prandtl number
-    double Rgas = 1.0;  // specific gas constant, p = rho R T
+    Grid g;              // fully periodic
+    // The gas: gamma, R, Pr and the viscosity law. Constructed constant-mu by
+    // make(); assign a Sutherland Transport (dns/transport.hpp) for a
+    // temperature-dependent run.
+    Transport tr;
 
     // Null = uniform Cartesian (the validated path, untouched). Non-null
     // switches rhs/stableDt to the finite-volume curvilinear form on a
     // distorted regular mesh (curvmesh.hpp).
     std::shared_ptr<const CurvMetrics> curv;
 
-    // gamma > 1, mu >= 0
+    // gamma > 1, mu >= 0. Constant viscosity, Pr = 0.72, R = 1.
     static Comp make(const Grid& g, double gamma, double mu);
 
     // Curvilinear variant; mesh defects (inverted cells, bad sizes) are
     // user-triggered and reported, never asserted.
     static std::expected<Comp, std::string> make(const CurvMesh& mesh,
                                                  double gamma, double mu);
+
+    double gamma() const { return tr.gamma; }
+    double mu() const { return tr.muRef; }
 
     // p = (gamma-1)(E - |m|^2 / (2 rho)). PRECONDITION rho > 0, established by
     // stableDt() -- which reports a diverged field rather than asserting -- so

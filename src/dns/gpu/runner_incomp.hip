@@ -67,19 +67,30 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     auto dGhost = DeviceGhostFill::make(g, cut, sdf);
     auto dU = DeviceField::make(g.size());
     auto dU0 = DeviceField::make(g.size());
-    // Steady mode only: the field as of the previous stats row. Differencing
-    // adjacent steps loses the signal to FP32 cancellation.
-    auto dSnap = DeviceField::make(g.size());
     auto dS = DeviceField::make(g.size());
     auto dG = DeviceField::make(g.size());
-    auto dTmp = DeviceScalar::make(g.size());
-    auto dVort = DeviceScalar::make(g.size());
-    auto dSpeed = DeviceScalar::make(g.size());
     auto red = ReduceScratch::make();
     auto scr = DeviceCutProjectionScratch::make(g.size());
-    if (!dCut || !dGhost || !dU || !dU0 || !dSnap || !dS || !dG || !dTmp || !dVort
-        || !dSpeed || !red || !scr)
+    if (!dCut || !dGhost || !dU || !dU0 || !dS || !dG || !red || !scr)
         return fail(6, "GPU allocation failed");
+
+    // Steady mode only: the field as of the previous stats row. Differencing
+    // adjacent steps loses the signal to FP32 cancellation.
+    std::optional<DeviceField> dSnap;
+    if (r.steadyTol > 0)
+    {
+        auto s = DeviceField::make(g.size());
+        if (!s) return fail(6, "GPU allocation failed");
+        dSnap = std::move(*s);
+    }
+    // Outlet flux-correction staging; the fringe far field never asks for it.
+    std::optional<DeviceScalar> dTmp;
+    if (!r.fringe)
+    {
+        auto s = DeviceScalar::make(g.size());
+        if (!s) return fail(6, "GPU allocation failed");
+        dTmp = std::move(*s);
+    }
 
     std::optional<DeviceSmagorinsky> les;
     if (r.les > 0)
@@ -143,23 +154,37 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     // RHS is compatible.
     int pcgIters = 0;
     auto stage = [&](const DeviceField& in, DeviceField& outF, double a, double dt) {
-        (void)dGhost->fillFrom(in, *dG);
+        dGhost->fillFrom(in, *dG);
+        // The solid-face mask rides in the stage kernel's tail instead of
+        // costing a second full read-modify-write pass over the three arrays
+        // the stage has just written -- and so does the Brinkman decay, WHEN
+        // nothing runs between them. With LES it cannot: the eddy-diffusion
+        // add sits between the RHS and the penalization, so both stay
+        // separate passes there and the folded mask ahead of them is a no-op
+        // (the trailing mask re-zeroes the same faces).
+        const StageTail tail{
+            .lam = (r.penalize > 0 && !les) ? dCut->lambda.data() : nullptr,
+            .idte = r.penalize > 0 ? Real((1.0 - a) * dt) / Real(r.penalize)
+                                   : Real(0),
+            .ax = dCut->ax.data(),
+            .ay = dCut->ay.data(),
+            .az = dCut->az.data()};
         if (dFlag)
             fusedRhsStageCut(gg, Real(r.nu), Real(0), 0, 0, 0, Real(a), *dU0,
                              Real(1.0 - a), in, *dG, *dCut, *dFlag, Real(dt),
-                             outF);
+                             outF, tail);
         else
             fusedRhsStage(gg, Real(r.nu), Real(0), 0, 0, 0, Real(a), *dU0,
-                          Real(1.0 - a), in, *dG, Real(dt), outF);
+                          Real(1.0 - a), in, *dG, Real(dt), outF, tail);
         if (les)
         {
             les->computeNut(*dG, *dCut);
             les->addEddyDiffusion(*dG, Real((1.0 - a) * dt), outF);
+            if (r.penalize > 0)
+                penalizeSolidBand(gg, *dCut, Real(r.penalize),
+                                  Real((1.0 - a) * dt), outF);
+            maskSolidFaces(gg, *dCut, outF);
         }
-        if (r.penalize > 0)
-            penalizeSolidBand(gg, *dCut, Real(r.penalize),
-                              Real((1.0 - a) * dt), outF);
-        maskSolidFaces(gg, *dCut, outF);
         if (r.fringe) fringe->apply(outF);
         else
         {
@@ -189,10 +214,30 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     const float vortScale =
         float(r.vortMax > 0 ? r.vortMax : 8.0 * r.uInf / r.D);
     const float speedMax = float(1.6 * r.uInf);
-    std::vector<Real> hVort(g.size()), hSpeed(g.size());
-    std::vector<float> vortF(g.size()), speedF(g.size());
+    // Frame scratch is allocated on the FIRST frame: two device and four host
+    // full-grid arrays that a stats-only run (every validation case, every
+    // steady solve) used to pay for unconditionally.
+    std::optional<DeviceScalar> dVort, dSpeed;
+    std::vector<Real> hVort, hSpeed;
+    std::vector<float> vortF, speedF;
     const float vortToe = r.vortAsinh ? vortScale / 32.0f : 0.0f;
     auto writeFrame = [&](double t) {
+        if (!dVort)
+        {
+            auto a = DeviceScalar::make(g.size());
+            auto b = DeviceScalar::make(g.size());
+            if (!a || !b)
+            {
+                std::fprintf(stderr, "frame scratch allocation failed\n");
+                return;
+            }
+            dVort = std::move(*a);
+            dSpeed = std::move(*b);
+            hVort.resize(g.size());
+            hSpeed.resize(g.size());
+            vortF.resize(g.size());
+            speedF.resize(g.size());
+        }
         vorticityZ(gg, *dU, *dVort);
         speedMac(gg, *dU, *dSpeed);
         (void)dVort->download(hVort.data());
@@ -229,6 +274,12 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     bool residValid = false;  // a residual needs TWO snapshots; the first tally
                               // only takes one, and 0.0 must never read as
                               // "converged" (it did: stopped at step 1)
+    // The stable-dt bound and the Courant number it came from, carried across
+    // the steps that reuse them (--dt-recompute > 1). `conv` also feeds the
+    // reported cfl column, which is then the Courant number of the step the
+    // bound was measured on -- the same one that sets dt.
+    double dtStab = 0.0, conv = 0.0;
+    int sinceDt = 1 << 30;
     const auto wall0 = std::chrono::steady_clock::now();
     while (t < r.tEnd)
     {
@@ -237,23 +288,30 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
         // the shared-memory segment is unlinked. Terminating mid-step instead
         // leaves a segment that outlives its own run, flagged as live.
         if (stopRequested()) break;
-        const double conv =
-            dFlag ? maxCourantPerDtCut(gg, *dU, dCut->ax, dCut->ay, dCut->az,
-                                       dCut->lambda, *red)
-                  : maxCourantPerDt(gg, *dU, *red);
-        const double diff = r.nu > 0 ? 6.0 * r.nu / (h * h) : 0.0;
-        const double dtStab = r.cfl / std::max(conv, diff);
-        dt = std::min(r.tEnd - t, dtStab);
-
-        // If the CFL limiter (not the end-of-run clamp) has collapsed dt, the
-        // field has diverged: dump the argmax cells and stop with exit 7.
-        if (dtStab < 1e-4 && st.steps > 0)
+        // 1e-4: the INCOMPRESSIBLE collapse threshold, and it is not the
+        // compressible 1e-6 or the channel's 1e-9 -- the dt scales differ.
+        // Step 0 is exempt (the initial condition has not been projected into
+        // a stable state yet), as it always was.
+        if (auto e = internal::recomputeDt(
+                sinceDt, dtStab, r.dtRecompute, r.dtMargin,
+                st.steps > 0 ? 1e-4 : 0.0,
+                [&] {
+                    conv = dFlag ? maxCourantPerDtCut(gg, *dU, dCut->ax, dCut->ay,
+                                                      dCut->az, dCut->lambda, *red)
+                                 : maxCourantPerDt(gg, *dU, *red);
+                    const double diff = r.nu > 0 ? 6.0 * r.nu / (h * h) : 0.0;
+                    return r.cfl / std::max(conv, diff);
+                });
+            !e)
         {
+            // The CFL limiter (not the end-of-run clamp) collapsed dt: the
+            // field has diverged. Dump the argmax cells and stop with exit 7.
             auto host = VectorField::zeros(g);
             (void)downloadField(*dU, host);
             reportBlowup(g, host, cut.lambda, t);
-            return fail(7, "the velocity field diverged (dt collapsed)");
+            return fail(7, "the velocity field diverged (" + e.error() + ")");
         }
+        dt = std::min(r.tEnd - t, dtStab);
 
         if (r.ramp > 0 && t < r.ramp)
         {

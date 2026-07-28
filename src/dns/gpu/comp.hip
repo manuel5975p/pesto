@@ -13,6 +13,7 @@
 #include <cassert>
 #include <climits>
 #include <cmath>
+#include <utility>
 
 namespace dns::gpu {
 
@@ -49,46 +50,45 @@ __global__ void kCompSmagNut(GpuGrid g, Real smagCd, int sigma, const Real* rho,
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
+    const Offsets o = offsetsAt(g, i, j, k);
     const Real inv[3] = {Real(0.5) / g.hx, Real(0.5) / g.hy, Real(0.5) / g.hz};
     const Real* vc[3] = {u, v, w};
     Real gd[3][3]; // gd[c][d] = d vc[c] / d x_d
-    for (int cc = 0; cc < 3; ++cc) {
-        gd[cc][0] = (vc[cc][gidx(g, i + 1, j, k)] -
-                     vc[cc][gidx(g, i - 1, j, k)]) * inv[0];
-        gd[cc][1] = (vc[cc][gidx(g, i, j + 1, k)] -
-                     vc[cc][gidx(g, i, j - 1, k)]) * inv[1];
-        gd[cc][2] = (vc[cc][gidx(g, i, j, k + 1)] -
-                     vc[cc][gidx(g, i, j, k - 1)]) * inv[2];
-    }
+    for (int cc = 0; cc < 3; ++cc)
+        for (int d = 0; d < 3; ++d)
+            gd[cc][d] = (vc[cc][c + o.p[d]] - vc[cc][c + o.m[d]]) * inv[d];
     nut[c] = rho[c] * smagCd * sgsRate(sigma, gd);
 }
 
-__global__ void kCompRhs(GpuGrid g, Real mu, Real kappa, PrimView q, Real* orho,
-                         Real* omx, Real* omy, Real* omz, Real* oE,
-                         const Real* nut, Real kapScale)
+// out = cmb.ca a + cmb.cb b + cmb.cr * (-div F): the rhs and the RK
+// combination in one pass (see StageCombine in comp.hpp).
+__global__ void kCompStage(GpuGrid g, ViscView vv, PrimView q,
+                           StageCombine cmb, Real* orho, Real* omx, Real* omy,
+                           Real* omz, Real* oE, const Real* nut, Real kapScale)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
+    const Offsets o = offsetsAt(g, i, j, k);
     Real drho = 0, dmx = 0, dmy = 0, dmz = 0, dE = 0;
     for (int a = 0; a < 3; ++a) {
-        const int ox = a == 0, oy = a == 1, oz = a == 2;
         const Real h = a == 0 ? g.hx : a == 1 ? g.hy : g.hz;
-        const Flux hi = faceFlux(g, mu, kappa, q, i, j, k, a, nut, kapScale);
+        const Flux hi =
+            faceFlux(g, vv, q, o, c, c + o.p[a], a, nut, kapScale);
         const Flux lo =
-            faceFlux(g, mu, kappa, q, i - ox, j - oy, k - oz, a, nut, kapScale);
+            faceFlux(g, vv, q, o, c + o.m[a], c, a, nut, kapScale);
         drho -= (hi.rho - lo.rho) / h;
         dmx -= (hi.mx - lo.mx) / h;
         dmy -= (hi.my - lo.my) / h;
         dmz -= (hi.mz - lo.mz) / h;
         dE -= (hi.E - lo.E) / h;
     }
-    orho[c] = drho;
-    omx[c] = dmx;
-    omy[c] = dmy;
-    omz[c] = dmz;
-    oE[c] = dE;
+    const Real rhs[5] = {drho, dmx, dmy, dmz, dE};
+    Real* out[5] = {orho, omx, omy, omz, oE};
+    for (int v = 0; v < 5; ++v)
+        out[v][c] = cmb.ca * cmb.a[v][c] + cmb.cb * cmb.b[v][c] +
+                    cmb.cr * rhs[v];
 }
 
 // Curvilinear twin of kCompSmagNut. The velocity gradient comes from the mesh
@@ -105,31 +105,32 @@ __global__ void kCompSmagNutCurv(GpuGrid g, Real cs2, int sigma, CurvView m,
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
+    const Offsets o = offsetsAt(g, i, j, k);
     const Real* vc[3] = {u, v, w};
     Real gd[3][3];
-    curvVelGradCentre(g, m, i, j, k,
+    curvVelGradCentre(m, o, c,
                       [&](std::size_t cell, int comp) { return vc[comp][cell]; },
                       gd);
     const Real cd = cs2 * curvDelta2(g, m.invVol[c]);
     nut[c] = rho[c] * cd * sgsRate(sigma, gd);
 }
 
-__global__ void kCompRhsCurv(GpuGrid g, Real mu, Real kappa, PrimView q,
-                             CurvView m, Real* orho, Real* omx, Real* omy,
-                             Real* omz, Real* oE, const Real* nut,
-                             Real kapScale)
+__global__ void kCompStageCurv(GpuGrid g, ViscView vv, PrimView q,
+                               CurvView m, StageCombine cmb, Real* orho,
+                               Real* omx, Real* omy, Real* omz, Real* oE,
+                               const Real* nut, Real kapScale)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
+    const Offsets o = offsetsAt(g, i, j, k);
     Real drho = 0, dmx = 0, dmy = 0, dmz = 0, dE = 0;
     for (int a = 0; a < 3; ++a) {
-        const int ox = a == 0, oy = a == 1, oz = a == 2;
         const Flux hi =
-            faceFluxCurv(g, mu, kappa, q, m, i, j, k, a, nut, kapScale);
-        const Flux lo = faceFluxCurv(g, mu, kappa, q, m, i - ox, j - oy, k - oz,
-                                     a, nut, kapScale);
+            faceFluxCurv(vv, q, m, o, c, c + o.p[a], a, nut, kapScale);
+        const Flux lo =
+            faceFluxCurv(vv, q, m, o, c + o.m[a], c, a, nut, kapScale);
         drho -= hi.rho - lo.rho;
         dmx -= hi.mx - lo.mx;
         dmy -= hi.my - lo.my;
@@ -137,11 +138,11 @@ __global__ void kCompRhsCurv(GpuGrid g, Real mu, Real kappa, PrimView q,
         dE -= hi.E - lo.E;
     }
     const Real iv = m.invVol[c];
-    orho[c] = drho * iv;
-    omx[c] = dmx * iv;
-    omy[c] = dmy * iv;
-    omz[c] = dmz * iv;
-    oE[c] = dE * iv;
+    const Real rhs[5] = {drho * iv, dmx * iv, dmy * iv, dmz * iv, dE * iv};
+    Real* out[5] = {orho, omx, omy, omz, oE};
+    for (int v = 0; v < 5; ++v)
+        out[v][c] = cmb.ca * cmb.a[v][c] + cmb.cb * cmb.b[v][c] +
+                    cmb.cr * rhs[v];
 }
 
 // Curvilinear acoustic bound: (|u| + c) / width, width = 1/aov per axis;
@@ -163,17 +164,6 @@ struct WavePerDtCurv
         return m;
     }
 };
-
-// out = ca a + cb b + cr k, all five components.
-__global__ void kAxpy5(std::size_t n, Real ca, const Real* const* av, Real cb,
-                       const Real* const* bv, Real cr, const Real* const* kv,
-                       Real* const* ov)
-{
-    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (c >= n) return;
-    for (int q = 0; q < 5; ++q)
-        ov[q][c] = ca * av[q][c] + cb * bv[q][c] + cr * kv[q][c];
-}
 
 struct WavePerDt
 {
@@ -201,6 +191,23 @@ struct MinRho
     __host__ __device__ double operator()(int c) const { return double(rho[c]); }
 };
 
+// T = p / (rho R) per cell. Sutherland's mu(T) is monotone increasing, so ONE
+// max-T reduction bounds mu over the whole field -- no per-cell viscosity
+// reduction is needed for the diffusive dt limit.
+struct MaxT
+{
+    const Real *rho, *mx, *my, *mz, *E;
+    double gamma, Rgas;
+    __host__ __device__ double operator()(int c) const
+    {
+        const double r = rho[c];
+        const double u = mx[c] / r, v = my[c] / r, w = mz[c] / r;
+        const double p = (gamma - 1.0) *
+            (double(E[c]) - 0.5 * (u * u + v * v + w * w) * r);
+        return p / (r * Rgas);
+    }
+};
+
 // Dynamic eddy viscosity mu_t = rho (C Delta)^2 op(grad u) at cell c (op as in
 // kCompSmagNut), computed straight from the conserved state (no primitive
 // scratch) so it can feed the const stableDt viscous limit. smagCd = C^2 Delta^2.
@@ -218,15 +225,14 @@ struct SmagMax
     __host__ __device__ double operator()(int c) const
     {
         int i, j, k;
-        decompose(g, c, i, j, k);
+        decompose(g, std::size_t(c), i, j, k);
+        const Offsets o = offsetsAt(g, i, j, k);
         const double inv[3] = {0.5 / g.hx, 0.5 / g.hy, 0.5 / g.hz};
-        const int nb[3][2] = {{int(gidx(g, i + 1, j, k)), int(gidx(g, i - 1, j, k))},
-                              {int(gidx(g, i, j + 1, k)), int(gidx(g, i, j - 1, k))},
-                              {int(gidx(g, i, j, k + 1)), int(gidx(g, i, j, k - 1))}};
         double gd[3][3];
         for (int cc = 0; cc < 3; ++cc)
             for (int d = 0; d < 3; ++d)
-                gd[cc][d] = (vel(nb[d][0], cc) - vel(nb[d][1], cc)) * inv[d];
+                gd[cc][d] = (vel(int(c + o.p[d]), cc) -
+                             vel(int(c + o.m[d]), cc)) * inv[d];
         return double(rho[c]) * smagCd * sgsRate(sigma, gd);
     }
 };
@@ -249,8 +255,9 @@ struct SmagMaxCurv
     {
         int i, j, k;
         decompose(g, std::size_t(c), i, j, k);
+        const Offsets o = offsetsAt(g, i, j, k);
         double gd[3][3];
-        curvVelGradCentre(g, m, i, j, k,
+        curvVelGradCentre(m, o, std::size_t(c),
                           [&](std::size_t cell, int comp) {
                               return vel(cell, comp);
                           },
@@ -360,13 +367,14 @@ hipError_t DeviceCompState::download(CompState& h) const
 }
 
 std::expected<DeviceComp, hipError_t> DeviceComp::make(const Grid& g,
-                                                       double gamma, double mu,
+                                                       const Transport& tr,
                                                        double csLes, SgsModel sgs)
 {
-    assert(gamma > 1.0 && mu >= 0.0 && csLes >= 0.0);
-    DeviceComp d(GpuGrid::from(g), Real(gamma), Real(mu), Real(csLes), sgs);
+    assert(tr.gamma > 1.0 && tr.muRef >= 0.0 && tr.Pr > 0.0 && tr.Tref > 0.0 &&
+           csLes >= 0.0);
+    DeviceComp d(GpuGrid::from(g), tr, Real(csLes), sgs);
     const std::size_t n = g.size();
-    for (auto* s : {&d.k_, &d.q1_, &d.q2_}) {
+    for (auto* s : {&d.q1_, &d.q2_}) {
         auto e = DeviceCompState::make(n);
         if (!e) return std::unexpected(e.error());
         *s = std::move(*e);
@@ -381,10 +389,15 @@ std::expected<DeviceComp, hipError_t> DeviceComp::make(const Grid& g,
         if (!e) return std::unexpected(e.error());
         d.nut_ = std::move(*e);
     }
-    auto pt = DeviceBuffer<const Real*>::make(20);
-    if (!pt) return std::unexpected(pt.error());
-    d.ptrs_ = std::move(*pt);
     return d;
+}
+
+std::expected<DeviceComp, hipError_t> DeviceComp::make(const Grid& g,
+                                                       double gamma, double mu,
+                                                       double csLes, SgsModel sgs)
+{
+    return make(g, Transport::air(mu, 1.0, 0.0, 0.72, gamma, 1.0, false), csLes,
+                sgs);
 }
 
 std::expected<DeviceComp, hipError_t> DeviceComp::make(const CurvMetrics& m,
@@ -392,7 +405,16 @@ std::expected<DeviceComp, hipError_t> DeviceComp::make(const CurvMetrics& m,
                                                        double csLes,
                                                        SgsModel sgs)
 {
-    auto d = make(m.g, gamma, mu, csLes, sgs);
+    return make(m, Transport::air(mu, 1.0, 0.0, 0.72, gamma, 1.0, false), csLes,
+                sgs);
+}
+
+std::expected<DeviceComp, hipError_t> DeviceComp::make(const CurvMetrics& m,
+                                                       const Transport& tr,
+                                                       double csLes,
+                                                       SgsModel sgs)
+{
+    auto d = make(m.g, tr, csLes, sgs);
     if (!d) return d;
     auto cv = DeviceCurv::make(m);
     if (!cv) return std::unexpected(cv.error());
@@ -413,9 +435,9 @@ CurvView DeviceCurv::view() const
 
 CurvView DeviceComp::curvView() const { return curv_->view(); }
 
-DeviceComp::DeviceComp(const GpuGrid& g, Real gamma, Real mu, Real csLes,
+DeviceComp::DeviceComp(const GpuGrid& g, const Transport& tr, Real csLes,
                        SgsModel sgs)
-    : g_(g), gamma_(gamma), mu_(mu), csLes_(csLes), sgs_(sgs)
+    : g_(g), tr_(tr), csLes_(csLes), sgs_(sgs)
 {
     // Delta^2 = (hx hy hz)^(2/3) in 3D; hx hy when nz == 1 (unit z-depth).
     const double d2 = g.nz > 1
@@ -428,24 +450,25 @@ void DeviceComp::primitives(const DeviceCompState& s)
 {
     const std::size_t n = g_.size();
     kPrim<<<launchBlocks(n), blockSize>>>(
-        g_, gamma_, Rgas_, s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
+        g_, Real(tr_.gamma), Real(tr_.Rgas), s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
         s.E.data(), u_.data(), v_.data(), w_.data(), e_.data(), p_.data(),
         T_.data());
     checkLastKernel("kPrim");
 }
 
-void DeviceComp::rhs(const DeviceCompState& s, DeviceCompState& out)
+void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
+                       DeviceCompState& out)
 {
     primitives(s);
-    const Real kappa = kappaCond();
+    const ViscView vv = viscView(tr_);
     const PrimView q{s.rho.data(), u_.data(), v_.data(), w_.data(), e_.data(),
                      p_.data(), T_.data()};
     const std::size_t n = g_.size();
-    const Real kapLes = gamma_ * Rgas_ / ((gamma_ - Real(1)) * prt_); // cp/Pr_t
+    const Real kapLes = Real(tr_.cp() / prt_); // eddy conductivity scale
+    const Real* nutp = nullptr;
+    Real kapScale = Real(0);
     if (curv_) {
         const CurvView cv = curvView();
-        const Real* nutp = nullptr;
-        Real kapScale = Real(0);
         if (csLes_ > Real(0)) {
             kCompSmagNutCurv<<<launchBlocks(n), blockSize>>>(
                 g_, csLes_ * csLes_, sgs_ == SgsModel::Sigma ? 1 : 0, cv,
@@ -454,15 +477,13 @@ void DeviceComp::rhs(const DeviceCompState& s, DeviceCompState& out)
             nutp = nut_.data();
             kapScale = kapLes;
         }
-        kCompRhsCurv<<<launchBlocks(n), blockSize>>>(
-            g_, mu_, kappa, q, cv, out.rho.data(), out.mx.data(),
+        kCompStageCurv<<<launchBlocks(n), blockSize>>>(
+            g_, vv, q, cv, cmb, out.rho.data(), out.mx.data(),
             out.my.data(), out.mz.data(), out.E.data(), nutp, kapScale);
-        checkLastKernel("kCompRhsCurv");
-        if (rhsHook_) rhsHook_(s, out);
+        checkLastKernel("kCompStageCurv");
+        if (rhsHook_) rhsHook_(s, out, cmb);
         return;
     }
-    const Real* nutp = nullptr;
-    Real kapScale = Real(0);
     if (csLes_ > Real(0)) {
         kCompSmagNut<<<launchBlocks(n), blockSize>>>(
             g_, smagCd_, sgs_ == SgsModel::Sigma ? 1 : 0, s.rho.data(),
@@ -471,12 +492,11 @@ void DeviceComp::rhs(const DeviceCompState& s, DeviceCompState& out)
         nutp = nut_.data();
         kapScale = kapLes;
     }
-    kCompRhs<<<launchBlocks(n), blockSize>>>(g_, mu_, kappa, q, out.rho.data(),
-                                             out.mx.data(), out.my.data(),
-                                             out.mz.data(), out.E.data(), nutp,
-                                             kapScale);
-    checkLastKernel("kCompRhs");
-    if (rhsHook_) rhsHook_(s, out);
+    kCompStage<<<launchBlocks(n), blockSize>>>(
+        g_, vv, q, cmb, out.rho.data(), out.mx.data(), out.my.data(),
+        out.mz.data(), out.E.data(), nutp, kapScale);
+    checkLastKernel("kCompStage");
+    if (rhsHook_) rhsHook_(s, out, cmb);
 }
 
 namespace {
@@ -506,32 +526,31 @@ void penalizeMomentum(const GpuGrid& g, const DeviceScalar& lam, Real eta,
 
 void DeviceComp::step(DeviceCompState& s, Real dt)
 {
-    const std::size_t n = g_.size();
-
-    auto axpy = [&](Real ca, const DeviceCompState& a, Real cb,
-                    const DeviceCompState& b, Real cr, const DeviceCompState& k,
-                    DeviceCompState& o) {
-        const Real* h[20] = {
-            a.rho.data(), a.mx.data(), a.my.data(), a.mz.data(), a.E.data(),
-            b.rho.data(), b.mx.data(), b.my.data(), b.mz.data(), b.E.data(),
-            k.rho.data(), k.mx.data(), k.my.data(), k.mz.data(), k.E.data(),
-            o.rho.data(), o.mx.data(), o.my.data(), o.mz.data(), o.E.data()};
-        (void)ptrs_.upload(h);
-        const Real* const* d = ptrs_.data();
-        kAxpy5<<<launchBlocks(n), blockSize>>>(
-            n, ca, d, cb, d + 5, cr, d + 10,
-            const_cast<Real* const*>(reinterpret_cast<const Real* const*>(d + 15)));
-        checkLastKernel("kAxpy5");
+    // Shu-Osher SSP-RK3. Each stage writes its combination straight out of the
+    // rhs kernel, so two stage buffers suffice: q1_ is free again after stage
+    // 2 consumed it, stage 3 writes there, and the result is swapped into s.
+    //
+    // The output NEVER aliases cmb.a, and must not: the boundary rhs hook runs
+    // as a SECOND kernel over the same cells and re-reads a, which an aliased
+    // output would already have overwritten. (It did, and every NSCBC check
+    // failed.) The swap is a buffer-handle exchange, not a copy -- no caller
+    // may hold a raw device pointer into the state across a step.
+    auto cmb = [](const DeviceCompState& a, Real ca, const DeviceCompState& b,
+                  Real cb, Real cr) {
+        return StageCombine{{a.rho.data(), a.mx.data(), a.my.data(),
+                             a.mz.data(), a.E.data()},
+                            {b.rho.data(), b.mx.data(), b.my.data(),
+                             b.mz.data(), b.E.data()},
+                            ca, cb, cr};
     };
     if (hook_) hook_(s);
-    rhs(s, k_);
-    axpy(Real(1), s, Real(0), s, dt, k_, q1_);
+    stage(s, cmb(s, Real(1), s, Real(0), dt), q1_);
     if (hook_) hook_(q1_);
-    rhs(q1_, k_);
-    axpy(Real(0.75), s, Real(0.25), q1_, Real(0.25) * dt, k_, q2_);
+    stage(q1_, cmb(s, Real(0.75), q1_, Real(0.25), Real(0.25) * dt), q2_);
     if (hook_) hook_(q2_);
-    rhs(q2_, k_);
-    axpy(Real(1.0 / 3.0), s, Real(2.0 / 3.0), q2_, Real(2.0 / 3.0) * dt, k_, s);
+    stage(q2_, cmb(s, Real(1.0 / 3.0), q2_, Real(2.0 / 3.0),
+                   Real(2.0 / 3.0) * dt), q1_);
+    std::swap(s, q1_);
 }
 
 double DeviceComp::stableDt(const DeviceCompState& s, ReduceScratch& r,
@@ -543,15 +562,24 @@ double DeviceComp::stableDt(const DeviceCompState& s, ReduceScratch& r,
                                s.mz.data(), s.E.data(), curv_->aov[0].data(),
                                curv_->aov[1].data(),
                                g_.nz > 1 ? curv_->aov[2].data() : nullptr,
-                               double(gamma_)},
+                               double(tr_.gamma)},
                  rocprim::maximum<double>(), 0.0)
         : reduce(r, g_.size(),
                  WavePerDt{s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
-                           s.E.data(), double(gamma_), 1.0 / g_.hx, 1.0 / g_.hy,
+                           s.E.data(), double(tr_.gamma), 1.0 / g_.hx, 1.0 / g_.hy,
                            g_.nz > 1 ? 1.0 / g_.hz : 0.0},
                  rocprim::maximum<double>(), 0.0);
     double dt = cfl / wmax;
-    double muEff = double(mu_);
+    // Sutherland: mu is largest where T is largest, and the law is monotone,
+    // so the field maximum comes from one extra reduction rather than a
+    // per-cell viscosity pass. Constant viscosity skips the reduction entirely.
+    double muEff = tr_.muRef;
+    if (tr_.sutherland && tr_.muRef > 0.0)
+        muEff = tr_.mu(reduce(r, g_.size(),
+                              MaxT{s.rho.data(), s.mx.data(), s.my.data(),
+                                   s.mz.data(), s.E.data(), double(tr_.gamma),
+                                   double(tr_.Rgas)},
+                              rocprim::maximum<double>(), 0.0));
     if (csLes_ > Real(0)) {
         const int sig = sgs_ == SgsModel::Sigma ? 1 : 0;
         const double nutMax = curv_
@@ -576,7 +604,13 @@ double DeviceComp::stableDt(const DeviceCompState& s, ReduceScratch& r,
             h = std::min<double>(g_.hx, g_.hy);
             if (g_.nz > 1) h = std::min<double>(h, g_.hz);
         }
-        const double dtv = 0.25 * h * h * rhomin / muEff;
+        // The binding diffusivity is the THERMAL one: kappa/(rho cv) =
+        // gamma nu / Pr, 1.94x the momentum nu for air. Bounding only nu -- as
+        // this did before the energy equation carried a real conductivity --
+        // overestimates the stable dt by that factor whenever the diffusive
+        // limit binds. The SGS part rides the same (conservative) factor.
+        const double dtv =
+            0.25 * h * h * rhomin / (muEff * tr_.diffusivityFactor());
         if (dtv < dt) dt = dtv;
     }
     return dt;

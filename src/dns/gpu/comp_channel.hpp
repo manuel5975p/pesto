@@ -44,8 +44,8 @@ private:
 // k.E += f * u, with u the live stage primitive. Applied inside the RHS hook
 // so it rides SSP-RK3 exactly; the ghost rows are excluded (the stage hook
 // overwrites them anyway).
-void addBodyForceX(const GpuGrid& g, double f, const DeviceScalar& u,
-                   DeviceCompState& k);
+void addBodyForceX(const GpuGrid& g, double f, Real cr, const DeviceScalar& u,
+                   DeviceCompState& out);
 
 // Deterministic FP64 per-y-plane moment sums: for every row j,
 //   out[j*8 + 0..7] = sum over (i,k) of {rho, rho u, rho v, rho u^2,

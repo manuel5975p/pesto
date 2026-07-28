@@ -17,6 +17,7 @@
 #include "ui/livemesh.hpp"
 #include "ui/runner.hpp"
 
+#include "dns/cli.hpp"
 #include "dns/shmframes.hpp"
 #include "ui/view.hpp"
 
@@ -85,7 +86,9 @@ bool checkOne(const char* title, ui::DocState st, bool wantSurface)
         std::printf("   FAILED: no grid geometry\n");
         ok = false;
     }
-    if (b.nCut == 0 && st.bodyKind != 0) {
+    // A convection cell has no body, so "no cut cells" is the correct state
+    // there and only a body case is required to produce them.
+    if (b.nCut == 0 && st.bodyKind != 0 && !st.isConv()) {
         std::printf("   FAILED: body has no cut cells\n");
         ok = false;
     }
@@ -96,6 +99,275 @@ bool checkOne(const char* title, ui::DocState st, bool wantSurface)
         ok = false;
     }
     return ok;
+}
+
+// The POSIX shared-memory names the self-check owns. They are MACHINE-GLOBAL:
+// a segment left behind by a previous --check (or by a run killed before its
+// RunOutput destructor ran) is still there on the next invocation, and the
+// live-bridge checks then attach to a corpse instead of the publisher they
+// just created. Measured before this cleanup existed: --check failed roughly
+// one run in three, always on "the reader saw frames while the writer ran",
+// and always with a stale /dev/shm/dns_uicheck present.
+//
+// So the suite clears them on the way in AND on the way out, and reports a
+// leak rather than tolerating one -- a self-check that leaves state behind is
+// a self-check that fails for reasons that have nothing to do with the code.
+const char* const kCheckSegments[] = {"/dns_uicheck", "/dns_uicheck_seq",
+                                      "/dns_uicorpse"};
+
+int unlinkCheckSegments()
+{
+    int found = 0;
+    for (const char* n : kCheckSegments)
+        if (::shm_unlink(n) == 0) ++found;
+    return found;
+}
+
+// THE COMMAND ROUND-TRIP GATE, the conv/thermal analogue of the scene
+// serialize-parse gate in Doc::build.
+//
+// The editor prints a command line and also spawns it, so the printed command
+// and the inspected case have to be the same case. Here that is enforced
+// rather than assumed: the exported argv is fed back through the REAL CLI
+// parser and validator, and the resolved grid and driving parameters must
+// match the ones the document built. A flag the editor forgets to emit, emits
+// twice, or emits with the wrong name shows up as a mismatch or an exit code,
+// not as a run that quietly differs from the picture.
+bool checkCommandRoundTrip(const char* title, const ui::DocState& st)
+{
+    ui::Doc doc;
+    doc.st = st;
+    doc.touch();
+    for (int i = 0; i < 4000 && !doc.current().ok && !doc.current().errorCode; ++i) {
+        doc.poll();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const ui::Build& b = doc.current();
+    std::printf("   %-34s ", title);
+    if (!b.ok) {
+        std::printf("FAILED: document did not build (%s)\n", b.error.c_str());
+        return false;
+    }
+    auto args = doc.commandArgs("dns", "scene.toml");
+    std::vector<char*> argv;
+    for (auto& a : args) argv.push_back(a.data());
+    auto raw = dns::cli::parse(int(argv.size()), argv.data());
+    if (!raw) {
+        std::printf("FAILED: CLI rejected the exported command\n");
+        return false;
+    }
+    auto cas = dns::validate(*raw);
+    if (!cas) {
+        std::printf("FAILED: exit %d, %s\n", cas.error().code,
+                    dns::format(cas.error()).c_str());
+        return false;
+    }
+    const dns::Grid& a = b.cas().grid;
+    const dns::Grid& c = cas->grid;
+    bool ok = a.nx == c.nx && a.ny == c.ny && a.nz == c.nz;
+    // The exported command prints numbers at 4 significant digits (doc.cpp's
+    // num()), and that same string is what gets executed -- so the run can
+    // differ from the inspected case by up to ~5e-4 relative, deliberately, in
+    // exchange for a command a person can read. The gate is therefore about
+    // WIRING, not about the last digit: a missing, duplicated or misnamed flag
+    // moves a value by orders of magnitude, not by 0.05%.
+    auto near = [](double x, double y) {
+        return std::abs(x - y) <= 1e-3 * std::max(1.0, std::abs(y));
+    };
+    ok = ok && cas->physics == b.cas().physics
+            && cas->sub == b.cas().sub;
+    if (st.isConv())
+        ok = ok && near(cas->rayleigh, b.cas().rayleigh)
+                && near(cas->prandtl, b.cas().prandtl)
+                && near(cas->hotPatch, b.cas().hotPatch)
+                && cas->closedSides == b.cas().closedSides
+                && near(cas->tEnd, b.cas().tEnd);
+    else
+        ok = ok && near(cas->re, b.cas().re)
+                && cas->sutherland == b.cas().sutherland
+                && cas->bodyIsothermal == b.cas().bodyIsothermal
+                && near(cas->twallRatio, b.cas().twallRatio)
+                && cas->nscbcThermalInflow == b.cas().nscbcThermalInflow
+                && cas->tempFrames == b.cas().tempFrames;
+    if (!ok)
+        std::printf("FAILED: grid %dx%dx%d vs %dx%dx%d  phys %d/%d  re %.6g/%.6g "
+                    "Ra %.6g/%.6g patch %.6g/%.6g closed %d/%d "
+                    "tEnd %.6g/%.6g\n",
+                    a.nx, a.ny, a.nz, c.nx, c.ny, c.nz, int(b.cas().physics),
+                    int(cas->physics), b.cas().re, cas->re, b.cas().rayleigh,
+                    cas->rayleigh, b.cas().hotPatch, cas->hotPatch,
+                    int(b.cas().closedSides), int(cas->closedSides),
+                    b.cas().tEnd, cas->tEnd);
+    else
+        std::printf("ok\n");
+    return ok;
+}
+
+// End to end: the editor's own command, spawned the way RUN spawns it, and
+// the viewer attaching to what it publishes. This is the check that the whole
+// convection path is wired -- Doc -> argv -> solver -> shared memory -> the
+// field list the viewer offers -- and in particular that `temp` is among the
+// published fields, which is what makes the temperature visible at all.
+//
+// GPU-only, like every conv run. Exit 5 is "no GPU device" and is a SKIP here,
+// not a failure: --check is documented as running on a machine without one.
+bool checkConvRun()
+{
+    std::printf("\n== convection run, end to end\n");
+    int bad = 0;
+    auto ok = [&](bool cond, const char* what) {
+        std::printf("   %-52s %s\n", what, cond ? "ok" : "FAILED");
+        if (!cond) ++bad;
+    };
+
+    namespace fs = std::filesystem;
+    std::string exe;
+    for (const char* c : {"./dns", "build/dns", "./build/dns"}) {
+        std::error_code ec;
+        if (fs::exists(c, ec)) { exe = fs::absolute(c, ec).string(); break; }
+    }
+    if (exe.empty()) {
+        std::printf("   SKIP: no dns binary beside the check\n");
+        return true;
+    }
+
+    // Small, 2D, and short: this is a wiring test, not a physics one.
+    ui::DocState st;
+    st.sub = ui::DocState::Conv;
+    st.n = 48;
+    st.ny = 24;
+    st.nz = 1;
+    st.convTt = 1e4;      // long enough that it is still running when stopped
+    st.wdt = 0.02;
+    ui::Doc doc;
+    doc.st = st;
+
+    auto argv = doc.commandArgs(exe, "scene.toml");
+    argv.push_back("--out");
+    argv.push_back("uicheck");
+    argv.push_back("--emit");
+    argv.push_back("shm");
+    argv.push_back("--emit");
+    argv.push_back("stats");
+
+    ui::Runner r;
+    const std::string err = r.start(argv, ".");
+    ok(err.empty(), "the editor's conv command starts");
+    if (!err.empty()) return false;
+
+    ui::LiveField lf;
+    bool attached = false;
+    for (int i = 0; i < 600 && !attached; ++i) {
+        r.poll();
+        if (!r.running()) break;
+        attached = lf.attach("dns_uicheck").empty();
+        if (!attached) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    if (!attached && !r.running() && r.exitCode() == 5) {
+        std::printf("   SKIP: no GPU device (conv is GPU-only)\n");
+        return true;
+    }
+    ok(attached, "the viewer attaches to the conv run");
+
+    bool hasTemp = false, gotFrame = false;
+    if (attached) {
+        for (const auto& f : lf.fields())
+            if (std::string(f.name) == "temp") hasTemp = true;
+        ok(hasTemp, "the run publishes a 'temp' field the viewer can colour by");
+        for (int i = 0; i < 600 && !gotFrame; ++i) {
+            if (lf.poll()) gotFrame = true;
+            else std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        ok(gotFrame, "live convection frames arrive");
+        ok(!gotFrame || !lf.planes().empty(), "the frame carries a plane");
+    }
+
+    // The solver's progress line must be the one the dock knows how to parse.
+    // It prints every 500 steps, which is far longer than the first frame takes
+    // to arrive -- so this waits for it rather than sampling once and calling a
+    // run that has not reached its first log line a failure.
+    bool sawNu = false;
+    for (int i = 0; i < 800 && !sawNu && r.running(); ++i) {
+        r.poll();
+        for (const auto& ln : r.lines())
+            if (ln.rfind("t=", 0) == 0 && ln.find("Nu=") != std::string::npos)
+                sawNu = true;
+        if (!sawNu) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    ok(sawNu, "the run prints the Nu= line the dock plots");
+
+    lf.detach();
+    r.stop();
+    bool gone = false;
+    for (int i = 0; i < 300 && !gone; ++i) {
+        ui::LiveField p2;
+        gone = !p2.attach("dns_uicheck").empty();
+        if (!gone) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ok(gone, "the conv run's segment is gone after stop");
+    return bad == 0;
+}
+
+bool checkConvCommands()
+{
+    std::printf("\n== exported command round-trips through the CLI\n");
+    int bad = 0;
+
+    ui::DocState conv;
+    conv.sub = ui::DocState::Conv;
+    conv.n = 128;
+    conv.ny = 64;
+    conv.nz = 1;
+    bad += !checkCommandRoundTrip("conv, Boussinesq", conv);
+
+    ui::DocState convComp = conv;
+    convComp.convPhysics = 1;
+    bad += !checkCommandRoundTrip("conv, compressible", convComp);
+
+    ui::DocState convSuth = convComp;
+    convSuth.visc = 1;
+    bad += !checkCommandRoundTrip("conv, compressible + sutherland", convSuth);
+
+    ui::DocState patch = conv;
+    patch.hotPatch = 1.0 / 3.0;
+    bad += !checkCommandRoundTrip("conv, hot patch", patch);
+
+    // --sides closed changes the GRID (a ghost column per walled axis), so the
+    // gate's grid equality is what catches an editor that emits the flag
+    // without the case knowing, or the reverse.
+    ui::DocState closed = conv;
+    closed.convSides = 1;
+    bad += !checkCommandRoundTrip("conv, closed sides", closed);
+
+    ui::DocState closed3d = conv;
+    closed3d.convSides = 1;
+    closed3d.nz = 64;
+    bad += !checkCommandRoundTrip("conv, closed sides 3D", closed3d);
+
+    ui::DocState closedComp = convComp;
+    closedComp.convSides = 1;
+    bad += !checkCommandRoundTrip("conv, closed sides + compressible", closedComp);
+
+    ui::DocState flow;   // the default incompressible cylinder
+    bad += !checkCommandRoundTrip("flow, incompressible", flow);
+
+    ui::DocState thermal;
+    thermal.physics = 1;
+    thermal.n = 128;
+    thermal.nz = 1;
+    thermal.far = 3;
+    thermal.phys.dBody = 1e-4;
+    thermal.phys.uInf = 68.6;
+    thermal.visc = 1;
+    thermal.tinf = 300.0;
+    thermal.prandtl = 0.71;
+    thermal.wallIso = true;
+    thermal.twall = 1.5;
+    thermal.nscbcTinflow = true;
+    thermal.tempFrames = true;
+    bad += !checkCommandRoundTrip("flow, full thermal", thermal);
+
+    return bad == 0;
 }
 
 // The SI <-> box mapping (ui/units.hpp). Pure arithmetic, so it is checked
@@ -630,6 +902,19 @@ bool checkLive()
                         ++seen;
                     }
                 writer.join();
+                // Drain once after the writer is done. The publishes are 12x8
+                // floats, so the writer can finish all 2000 of them before the
+                // reader thread evaluates `!stop` even once -- the loop then
+                // runs zero times and `seen` stays 0 through no fault of the
+                // seqlock. At least one frame was published, so after the join
+                // there is always one to read.
+                if (crd.poll() && !crd.planes().empty()) {
+                    const auto& v = crd.planes()[0].value;
+                    const float first = v.empty() ? 0.0f : v[0];
+                    for (float x : v)
+                        if (x != first) { ++torn; break; }
+                    ++seen;
+                }
                 ok(torn == 0, "no torn frame under a concurrent writer");
                 ok(seen > 0, "the reader saw frames while the writer ran");
             }
@@ -1252,6 +1537,7 @@ bool checkRunStop()
     ok(!again.attach("dns_uicheck").empty(),
        "the segment is gone once the run is stopped");
 
+
     // A segment whose publisher was SIGKILLed is a corpse, and the viewer must
     // not attach to it: doing so shows a dead run as live and blocks RUN.
     {
@@ -1291,14 +1577,46 @@ bool checkRunStop()
     // And a second run must be startable straight after.
     const std::string err2 = r.start(argv, ".");
     ok(err2.empty(), "a second run starts after a stop");
+    // Wait until it is actually LIVE before stopping it. A solver stopped
+    // during start-up has installed its SIGTERM handler but has not yet
+    // reached the loop that polls the flag, so it survives SIGTERM, gets
+    // SIGKILLed after the escalation window, and never unlinks its segment.
+    // The first run above waits for exactly this reason; this one did not, and
+    // that -- not the shared-memory code -- is what left /dev/shm/dns_uicheck
+    // behind on every run and made the NEXT --check flaky.
+    ui::LiveField live2;
+    for (int i = 0; i < 400; ++i) {
+        r.poll();
+        if (!r.running()) break;
+        if (live2.attach("dns_uicheck").empty()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    live2.detach();
     r.stop();
     ok(!r.running(), "the second run stops too");
+    // ...and its segment must be gone before the check returns. stop() sends
+    // SIGTERM; the unlink happens in the CHILD's RunOutput destructor, so it
+    // lands a little later. The first stop above already waits for the process
+    // to die before asserting the segment is gone; this one used to return
+    // immediately, which left /dev/shm/dns_uicheck behind on every single run
+    // and made the NEXT invocation's live-bridge checks attach to it.
+    bool gone2 = false;
+    for (int i = 0; i < 200 && !gone2; ++i) {
+        ui::LiveField probe2;
+        gone2 = !probe2.attach("dns_uicheck").empty();
+        if (!gone2) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ok(gone2, "the second run's segment is gone too");
     return bad == 0;
 }
 
 int check()
 {
     int failures = 0;
+    // Anything still here belongs to a previous run, not to this one.
+    if (const int stale = unlinkCheckSegments())
+        std::printf("(cleared %d stale shared-memory segment%s from an earlier "
+                    "run)\n", stale, stale == 1 ? "" : "s");
     failures += !checkUnits();
     failures += ui::guiCheck() != 0;
     failures += !checkDoc();
@@ -1360,6 +1678,77 @@ int check()
     les.les = 1.35;
     les.sgs = 1;   // sigma
     failures += !checkOne("3D sphere, sigma LES", les, true);
+
+    // --- thermal ------------------------------------------------------------
+    // Every thermal knob at once on the compressible body path. The point is
+    // that the editor emits a combination the validator accepts: --twall needs
+    // --wall isothermal, --nscbc-tinflow needs --far nscbc, and all of them
+    // need compressible. Getting any of those wrong is an exit-2 here.
+    ui::DocState thermal = comp;
+    thermal.visc = 1;          // sutherland
+    thermal.tinf = 300.0;
+    thermal.prandtl = 0.71;
+    thermal.wallIso = true;
+    thermal.twall = 1.5;
+    thermal.nscbcTinflow = true;
+    thermal.tempFrames = true;
+    failures += !checkOne("2D cylinder, compressible, full thermal", thermal,
+                          false);
+
+    // --- convection ---------------------------------------------------------
+    // 2D Boussinesq: no body, no far field, no Mach. A 2 cm layer of air with
+    // a 20 K drop is Ra ~ 4e4, comfortably supercritical and resolvable at
+    // this size.
+    ui::DocState conv;
+    conv.sub = ui::DocState::Conv;
+    conv.n = 128;
+    conv.ny = 64;
+    conv.nz = 1;
+    failures += !checkOne("2D Rayleigh-Benard, Boussinesq", conv, false);
+
+    ui::DocState conv3 = conv;
+    conv3.n = 64;
+    conv3.ny = 32;
+    conv3.nz = 64;
+    failures += !checkOne("3D Rayleigh-Benard, Boussinesq", conv3, false);
+
+    // The compressible branch of the same case. --mach here is the SOLVER's,
+    // not the layer's physical one, and it is what sets gravity -- so a value
+    // too large for the imposed drop makes the layer subadiabatic and the
+    // validator rejects it by name. 0.05 against dtemp ~ 0.068 is safely
+    // superadiabatic.
+    ui::DocState convComp = conv;
+    convComp.convPhysics = 1;
+    convComp.convMach = 0.05;
+    failures += !checkOne("2D Rayleigh-Benard, compressible", convComp, false);
+
+    // A heated strip rather than a heated plate. Also the case that proves the
+    // patch reaches the solver: --hot-patch is only emitted below 1.
+    ui::DocState patch = conv;
+    patch.hotPatch = 1.0 / 3.0;
+    failures += !checkOne("2D convection, middle-third hot patch", patch, false);
+
+    // A sealed cavity. The grid it builds is not the one that was typed -- a
+    // ghost column per walled axis -- so this is the case that says the
+    // document -> case -> geometry -> view path survives that, in 2D (x only)
+    // and in 3D (x and z), and that the panels' read-outs have a case to read.
+    ui::DocState closed = conv;
+    closed.convSides = 1;
+    failures += !checkOne("2D convection, closed sides", closed, false);
+
+    ui::DocState closed3 = conv3;
+    closed3.convSides = 1;
+    failures += !checkOne("3D convection, closed sides", closed3, false);
+
+    failures += !checkConvCommands();
+    failures += !checkConvRun();
+
+    // Nothing the suite created may outlive it.
+    if (const int leaked = unlinkCheckSegments()) {
+        std::printf("\n== cleanup\n   FAILED: %d shared-memory segment%s "
+                    "outlived the check\n", leaked, leaked == 1 ? "" : "s");
+        ++failures;
+    }
 
     std::printf("\n%s\n", failures ? "FAILED" : "all cases ok");
     return failures ? 7 : 0;

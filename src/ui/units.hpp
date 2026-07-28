@@ -22,6 +22,7 @@
 // Grid spacings and the domain DO need the box factor, metresPerBox().
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <span>
 
@@ -87,6 +88,49 @@ struct Physical
     double metresPerBox(double dBox) const
     {
         return dBox > 0 ? dBody / dBox : 0.0;
+    }
+
+    // --- convection (dns conv) ---------------------------------------------
+    // The same idea one step further: a convection cell has no body and no
+    // freestream, so its tangible face is a LAYER HEIGHT, an imposed
+    // temperature drop and a mean temperature, and the Rayleigh number is
+    // derived from them exactly as Re is derived above.
+    //
+    //   Ra = g alpha dT H^3 / (nu kappa),  alpha = 1/T for an ideal gas,
+    //                                      kappa = nu / Pr
+    //      = g dT H^3 Pr / (T nu^2)
+    //
+    // Pre: all of dT, H, T, nu, Pr > 0; returns 0 otherwise rather than an
+    // inf, because this is called every frame from the UI thread and a panel
+    // must never print a NaN the validator has not seen yet.
+    static constexpr double gravity = 9.80665;   // [m/s^2]
+
+    double rayleigh(double dT, double h, double tMean, double pr) const
+    {
+        if (!(dT > 0 && h > 0 && tMean > 0 && pr > 0 && nu > 0)) return 0.0;
+        return gravity * dT * h * h * h * pr / (tMean * nu * nu);
+    }
+
+    // The free-fall velocity sqrt(g alpha dT H) and the time H/U it defines --
+    // the unit `--tt` counts in, so the panel can say how long a run is in
+    // seconds.
+    double freeFall(double dT, double h, double tMean) const
+    {
+        if (!(dT > 0 && h > 0 && tMean > 0)) return 0.0;
+        return std::sqrt(gravity * (dT / tMean) * h);
+    }
+    double freeFallSeconds(double dT, double h, double tMean) const
+    {
+        const double u = freeFall(dT, h, tMean);
+        return u > 0 ? h / u : 0.0;
+    }
+    // The Mach number the layer ACTUALLY convects at. It is ~1e-3 for air,
+    // which is why the compressible branch cannot be run at it and treats its
+    // own --mach as a cost knob instead.
+    double convMachPhysical(double dT, double h, double tMean) const
+    {
+        const double u = freeFall(dT, h, tMean);
+        return (u > 0 && c > 0) ? u / c : 0.0;
     }
 
     // One flow-through in seconds: the box reports tEnd = ft * L / uInf, and

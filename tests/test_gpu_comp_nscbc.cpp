@@ -57,8 +57,9 @@ struct Rig
         if (!dev || !far || !nsc || !ds || !red) std::exit(EXIT_FAILURE);
         dev->setStageHook([this](gpu::DeviceCompState& st) { far->apply(st); });
         dev->setRhsHook([this](const gpu::DeviceCompState& st,
-                               gpu::DeviceCompState& k) {
-            nsc->apply(*dev, st, k);
+                               gpu::DeviceCompState& out,
+                               const gpu::StageCombine& cmb) {
+            nsc->apply(*dev, st, out, cmb);
         });
     }
 
@@ -208,8 +209,9 @@ struct OpenRig
     {
         if (!dev || !nsc || !ds || !red) std::exit(EXIT_FAILURE);
         dev->setRhsHook([this](const gpu::DeviceCompState& st,
-                               gpu::DeviceCompState& k) {
-            nsc->apply(*dev, st, k);
+                               gpu::DeviceCompState& out,
+                               const gpu::StageCombine& cmb) {
+            nsc->apply(*dev, st, out, cmb);
         });
     }
 
@@ -433,8 +435,9 @@ struct StretchRig
         if (!dev || !far || !nsc || !ds || !red) std::exit(EXIT_FAILURE);
         dev->setStageHook([this](gpu::DeviceCompState& st) { far->apply(st); });
         dev->setRhsHook([this](const gpu::DeviceCompState& st,
-                               gpu::DeviceCompState& k) {
-            nsc->apply(*dev, st, k, remap);
+                               gpu::DeviceCompState& out,
+                               const gpu::StageCombine& cmb) {
+            nsc->apply(*dev, st, out, cmb, remap);
         });
     }
 

@@ -144,8 +144,9 @@ void laminarPoiseuille()
     if (!dev || !ds || !red || !wall) { check(false, "alloc"); return; }
 
     dev->setStageHook([&](gpu::DeviceCompState& s) { wall->apply(s); });
-    dev->setRhsHook([&](const gpu::DeviceCompState&, gpu::DeviceCompState& k) {
-        gpu::addBodyForceX(gg, f, dev->u(), k);
+    dev->setRhsHook([&](const gpu::DeviceCompState&, gpu::DeviceCompState& out,
+                        const gpu::StageCombine& cmb) {
+        gpu::addBodyForceX(gg, f, cmb.cr, dev->u(), out);
     });
 
     auto s = CompState::zeros(g);

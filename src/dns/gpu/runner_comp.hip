@@ -85,8 +85,8 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         if (!m) return fail(2, "focal mesh: " + m.error());
         mtr = std::move(*m);
     }
-    auto dev = mtr ? DeviceComp::make(*mtr, r.gamma, r.mu, r.les, r.sgs)
-                   : DeviceComp::make(g, r.gamma, r.mu, r.les, r.sgs);
+    auto dev = mtr ? DeviceComp::make(*mtr, r.tr, r.les, r.sgs)
+                   : DeviceComp::make(g, r.tr, r.les, r.sgs);
     auto ds = DeviceCompState::make(g.size());
     auto red = ReduceScratch::make();
     if (!dev || !ds || !red) return fail(6, "GPU allocation failed");
@@ -140,6 +140,9 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         nc.zc = r.cz;
         nc.aBody = 0.5 * r.D;
         nc.floorRows = r.floorRows;
+        nc.thermalInflow = r.nscbcThermalInflow;
+        nc.Rgas = r.tr.Rgas;
+        nc.TInf = r.pInf / (r.rhoInf * r.tr.Rgas);
         auto m = DeviceCompNscbc::make(g, nc);
         if (!m) return fail(6, "NSCBC init failed");
         nsc = std::move(*m);
@@ -148,8 +151,14 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     // The ghost wall classifies against the physical cell centres of whichever
     // mesh is active; the focal remap is the exact identity when off, so the
     // Cartesian tables are unchanged.
+    const GhostWallThermal wallBc{
+        .mode = r.wallIsothermal ? GhostWallThermal::Mode::Isothermal
+                                 : GhostWallThermal::Mode::Adiabatic,
+        .Twall = r.Twall,
+        .Rgas = r.tr.Rgas};
     auto ghost = DeviceCompGhost::make(g, sdf, r.gamma, r.rhoInf, r.pInf,
-                                       bbox ? bbox->data() : nullptr, fremap);
+                                       bbox ? bbox->data() : nullptr, fremap,
+                                       wallBc);
     if (!ghost) return fail(6, "ghost wall init failed");
 
     // --penalize: the band decay rides the stage hook (runs once per RK
@@ -165,10 +174,11 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     };
     dev->setStageHook(applyBc);
     if (nsc)
-        dev->setRhsHook([&](const DeviceCompState& s, DeviceCompState& k) {
-            if (stretched) nsc->apply(*dev, s, k, remap);
-            else if (focal) nsc->apply(*dev, s, k, fremap);
-            else nsc->apply(*dev, s, k);
+        dev->setRhsHook([&](const DeviceCompState& s, DeviceCompState& out,
+                            const StageCombine& cmb) {
+            if (stretched) nsc->apply(*dev, s, out, cmb, remap);
+            else if (focal) nsc->apply(*dev, s, out, cmb, fremap);
+            else nsc->apply(*dev, s, out, cmb);
         });
 
     (void)ds->upload(ic);
@@ -185,7 +195,9 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     if (!du || !dv || !dw || !dVort || !dSpeed)
         return fail(6, "GPU allocation failed");
 
-    const std::string cols[] = {"t", "dt", "cd", "cl", "cs", "wmax"};
+    // qw is the wall heat flux (an energy RATE into the body, comp_ghost.hpp);
+    // it is identically zero on the default adiabatic wall.
+    const std::string cols[] = {"t", "dt", "cd", "cl", "cs", "wmax", "qw"};
     out.declareSeries("stats", cols);
 
     const float vortScale =
@@ -195,12 +207,26 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     const char* vortName = r.signedVorticity ? "vort" : "curl";
     std::vector<Real> hVort(g.size()), hSpeed(g.size());
     std::vector<float> vortF(g.size()), speedF(g.size());
+    // --temp: T - Tinf on the diverging map, so the freestream is the neutral
+    // background exactly as --speed-map delta does for velocity. The clip is
+    // whichever thermal excursion the case can actually produce -- an
+    // isothermal wall's own offset, or the stagnation rise (gamma-1)/2 M^2
+    // Tinf that an adiabatic body still generates.
+    const double TInf = r.pInf / (r.rhoInf * r.tr.Rgas);
+    const double machSq = r.uInf * r.uInf * r.rhoInf / (r.tr.gamma * r.pInf);
+    const float tempScale = float(std::max(
+        r.wallIsothermal ? std::abs(r.Twall - TInf) : 0.0,
+        0.5 * (r.tr.gamma - 1.0) * machSq * TInf));
+    std::vector<Real> hTemp(r.tempFrames ? g.size() : 0);
+    std::vector<float> tempF(r.tempFrames ? g.size() : 0);
     // Display raster: on a clustered mesh the frame arrays are resampled onto
     // the uniform physical grid RunOutput was built with (dns/framemap.hpp).
     const bool resample = r.raster && r.raster->active();
     const std::size_t rn = resample ? r.raster->renderGrid().size() : 0;
     std::vector<float> vortR(rn), speedR(rn);
+    std::vector<float> tempR(r.tempFrames ? rn : 0);
     auto writeFrame = [&](double t) {
+        if (r.tempFrames) dev->primitives(*ds);
         primitiveVelocity(gg, ds->rho, ds->mx, ds->my, ds->mz, *du, *dv, *dw);
         if (r.signedVorticity && stretched)
             vorticityZRemap(gg, remap, *du, *dv, *dVort);
@@ -219,20 +245,35 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         }
         const float* vortOut = vortF.data();
         const float* speedOut = speedF.data();
+        const float* tempOut = nullptr;
+        if (r.tempFrames)
+        {
+            (void)dev->T().download(hTemp.data());
+            for (std::size_t c = 0; c < g.size(); ++c)
+                tempF[c] = float(double(hTemp[c]) - TInf);
+            tempOut = tempF.data();
+        }
         if (resample)
         {
             r.raster->apply(vortF.data(), vortR.data());
             r.raster->apply(speedF.data(), speedR.data());
             vortOut = vortR.data();
             speedOut = speedR.data();
+            if (r.tempFrames)
+            {
+                r.raster->apply(tempF.data(), tempR.data());
+                tempOut = tempR.data();
+            }
         }
-        const FrameField ff[2]{
+        const FrameField ff[3]{
             {vortName, vortOut, 0, vortScale, r.signedVorticity,
              r.vortAsinh && r.signedVorticity ? vortScale / 32.0f : 0.0f},
             r.speedDelta
                 ? FrameField{"dspeed", speedOut, 0, float(0.6 * r.uInf), true}
-                : FrameField{"speed", speedOut, 0, speedMax, false}};
-        if (auto e = out.frame(t, FrameViews{ff}); !e)
+                : FrameField{"speed", speedOut, 0, speedMax, false},
+            {"temp", tempOut, -tempScale, tempScale, true}};
+        const std::span<const FrameField> fv(ff, r.tempFrames ? 3u : 2u);
+        if (auto e = out.frame(t, FrameViews{fv}); !e)
             std::fprintf(stderr, "frame write failed: %s\n", e.error().c_str());
     };
 
@@ -304,7 +345,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
             }
             const double wmax =
                 r.cfl / dtStab * std::min({g.hx, g.hy, g.hz});
-            const double row[] = {t, dt, st.cd, st.cl, st.cs, wmax};
+            const double row[] = {t, dt, st.cd, st.cl, st.cs, wmax, F.heat};
             (void)out.row("stats", row);
             if (st.steps - lastLog >= 10 * r.statsEvery || t >= r.tEnd)
             {

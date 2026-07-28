@@ -290,6 +290,55 @@ void staticForce(const Grid& g, double wx, double bf, const char* tag)
           tag);
 }
 
+// Wall heat on the CURVILINEAR tally: kBodyFluxCurv's Fourier term maps the
+// index-space temperature gradient through the face inverse Jacobian and
+// contracts it with the face area vector, so a clustered mesh must reproduce
+// the Cartesian signs and the exact linearity in Twall - Tinf. A uniform
+// quiescent gas is used, where the tally is pure conduction and nothing else.
+void focalWallHeat(const Grid& g, double wx, double bf, const char* tag)
+{
+    using WT = gpu::GhostWallThermal;
+    const AxisRemap3 R = focalAboutBody(4.0, wx, bf);
+    const double mu = rhoInf * 2 * Rb / 100.0;
+    const auto mesh = CurvMesh::fromRemap(g, R);
+    const auto cpu = Comp::make(mesh, gam, mu);
+    if (!cpu) { check(false, "focal heat CPU make"); return; }
+    auto dev = gpu::DeviceComp::make(*cpu->curv, gam, mu);
+    auto ds = gpu::DeviceCompState::make(g.size());
+    if (!dev || !ds) { check(false, "focal heat GPU alloc"); return; }
+    const double Tinf = pInf / rhoInf; // R = 1
+    auto host = CompState::zeros(g);
+    for (std::size_t c = 0; c < g.size(); ++c) {
+        host.rho[c] = rhoInf;
+        host.E[c] = pInf / (gam - 1.0);
+    }
+    auto heatAt = [&](WT w) {
+        auto gh = gpu::DeviceCompGhost::make(g, circle, gam, rhoInf, pInf,
+                                             nullptr, R, w);
+        if (!gh) { check(false, "focal heat ghost make"); return 0.0; }
+        check(gh->curvilinear(), "focal heat ghost is curvilinear");
+        (void)ds->upload(host);
+        gh->apply(*ds);
+        return gh->force(*dev, *ds).heat;
+    };
+    const double qAd = heatAt(WT{});
+    const double qHot = heatAt(
+        WT{.mode = WT::Mode::Isothermal, .Twall = 1.5 * Tinf, .Rgas = 1.0});
+    const double qCold = heatAt(
+        WT{.mode = WT::Mode::Isothermal, .Twall = 0.5 * Tinf, .Rgas = 1.0});
+    const double q10 = heatAt(
+        WT{.mode = WT::Mode::Isothermal, .Twall = 1.1 * Tinf, .Rgas = 1.0});
+    const double q20 = heatAt(
+        WT{.mode = WT::Mode::Isothermal, .Twall = 1.2 * Tinf, .Rgas = 1.0});
+    std::printf("%s: heat adiabatic %.3e hot %.4e cold %.4e ratio %.4f\n", tag,
+                qAd, qHot, qCold, q20 / q10);
+    check(qAd == 0.0, "focal adiabatic wall reports exactly zero heat");
+    check(qHot < 0.0, "focal hot wall drives heat into the fluid");
+    check(qCold > 0.0, "focal cold wall pulls heat out of the fluid");
+    check(std::abs(q20 / q10 - 2.0) < 0.02,
+          "focal wall heat is linear in Twall - Tinf for small differences");
+}
+
 } // namespace
 
 int main()
@@ -301,6 +350,8 @@ int main()
     mirrorBandDepth(g, 5.0, 0.25, "anisotropic: mirror band is 2 cells deep");
     staticForce(g, 3.0, 0.5, "isotropic fine cells: no static force");
     staticForce(g, 5.0, 0.25, "anisotropic fine cells: no static force");
+    focalWallHeat(g, 3.0, 0.5, "isotropic fine cells: wall heat");
+    focalWallHeat(g, 5.0, 0.25, "anisotropic fine cells: wall heat");
     focalWall(g, 3.0, 0.5, "isotropic fine cells");
     // Anisotropic fine cells are what a wake-following tube actually
     // produces, and they are what broke the mirror band: with the

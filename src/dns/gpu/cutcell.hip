@@ -22,55 +22,63 @@ namespace {
 
 constexpr Real openTol = Real(CutGeometry::openTol);
 
-__global__ void kDivergenceCut(GpuGrid g, const Real* ax, const Real* ay,
-                               const Real* az, const Real* u, const Real* v,
-                               const Real* w, Real* out, Real scale)
+__global__ void kDivergenceCut(GpuGrid g, const Real* __restrict__ ax,
+                               const Real* __restrict__ ay,
+                               const Real* __restrict__ az,
+                               const Real* __restrict__ u, const Real* __restrict__ v,
+                               const Real* __restrict__ w, Real* out, Real scale)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
-    const std::size_t xp = gidx(g, i + 1, j, k), yp = gidx(g, i, j + 1, k),
-                      zp = gidx(g, i, j, k + 1);
+    const Offsets o = offsetsAt(g, i, j, k);
+    const std::size_t xp = c + o.p[0], yp = c + o.p[1], zp = c + o.p[2];
     out[c] = scale * ((ax[xp] * u[xp] - ax[c] * u[c]) / g.hx
                     + (ay[yp] * v[yp] - ay[c] * v[c]) / g.hy
                     + (az[zp] * w[zp] - az[c] * w[c]) / g.hz);
 }
 
-__global__ void kSubtractGradientCut(GpuGrid g, const Real* ax, const Real* ay,
-                                     const Real* az, const Real* p, Real scale,
+__global__ void kSubtractGradientCut(GpuGrid g, const Real* __restrict__ ax,
+                                     const Real* __restrict__ ay,
+                                     const Real* __restrict__ az,
+                                     const Real* __restrict__ p, Real scale,
                                      Real* u, Real* v, Real* w)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
-    if (ax[c] > openTol) u[c] -= scale * (p[c] - p[gidx(g, i - 1, j, k)]) / g.hx;
-    if (ay[c] > openTol) v[c] -= scale * (p[c] - p[gidx(g, i, j - 1, k)]) / g.hy;
-    if (az[c] > openTol) w[c] -= scale * (p[c] - p[gidx(g, i, j, k - 1)]) / g.hz;
+    const Offsets o = offsetsAt(g, i, j, k);
+    if (ax[c] > openTol) u[c] -= scale * (p[c] - p[c + o.m[0]]) / g.hx;
+    if (ay[c] > openTol) v[c] -= scale * (p[c] - p[c + o.m[1]]) / g.hy;
+    if (az[c] > openTol) w[c] -= scale * (p[c] - p[c + o.m[2]]) / g.hz;
 }
 
 // exp(-dt*(1-lambda_face)/eta) split decay per face component; lambda_face is
 // the average of the two adjacent cell fractions (the same staggering the
 // cut-flux volume uses). Interior faces (lambda_face == 1) are untouched
 // EXACTLY (factor branch, not exp(0) roundoff).
-__global__ void kPenalize(GpuGrid g, const Real* lam, Real idte, Real* u,
-                          Real* v, Real* w)
+__global__ void kPenalize(GpuGrid g, const Real* __restrict__ lam, Real idte,
+                          Real* u, Real* v, Real* w)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
-    const Real lu = Real(0.5) * (lam[gidx(g, i - 1, j, k)] + lam[c]);
-    const Real lv = Real(0.5) * (lam[gidx(g, i, j - 1, k)] + lam[c]);
-    const Real lw = Real(0.5) * (lam[gidx(g, i, j, k - 1)] + lam[c]);
+    const Offsets o = offsetsAt(g, i, j, k);
+    const Real lu = Real(0.5) * (lam[c + o.m[0]] + lam[c]);
+    const Real lv = Real(0.5) * (lam[c + o.m[1]] + lam[c]);
+    const Real lw = Real(0.5) * (lam[c + o.m[2]] + lam[c]);
     if (lu < Real(1)) u[c] *= exp(-idte * (Real(1) - lu));
     if (lv < Real(1)) v[c] *= exp(-idte * (Real(1) - lv));
     if (lw < Real(1)) w[c] *= exp(-idte * (Real(1) - lw));
 }
 
-__global__ void kMaskSolidFaces(std::size_t n, const Real* ax, const Real* ay,
-                                const Real* az, Real* u, Real* v, Real* w)
+__global__ void kMaskSolidFaces(std::size_t n, const Real* __restrict__ ax,
+                                const Real* __restrict__ ay,
+                                const Real* __restrict__ az, Real* u, Real* v,
+                                Real* w)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= n) return;
@@ -93,8 +101,8 @@ struct AbsDivCut
         if (lam[c] <= 0) return 0.0;
         int i, j, k;
         decompose(g, std::size_t(c), i, j, k);
-        const std::size_t xp = gidx(g, i + 1, j, k), yp = gidx(g, i, j + 1, k),
-                          zp = gidx(g, i, j, k + 1);
+        const Offsets o = offsetsAt(g, i, j, k);
+        const std::size_t xp = c + o.p[0], yp = c + o.p[1], zp = c + o.p[2];
         const double d =
             (double(ax[xp]) * u[xp] - double(ax[c]) * u[c]) / g.hx
           + (double(ay[yp]) * v[yp] - double(ay[c]) * v[c]) / g.hy

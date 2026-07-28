@@ -134,4 +134,33 @@ void speedCentred(const GpuGrid& g, const DeviceScalar& u, const DeviceScalar& v
     checkLastKernel("speedCentred");
 }
 
+namespace {
+
+__global__ void kCentreVelocity(GpuGrid g, const Real* __restrict__ fu,
+                                const Real* __restrict__ fv,
+                                const Real* __restrict__ fw, Real* u, Real* v,
+                                Real* w)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= g.size()) return;
+    int i, j, k;
+    decompose(g, c, i, j, k);
+    const Offsets o = offsetsAt(g, i, j, k);
+    u[c] = Real(0.5) * (fu[c] + fu[c + o.p[0]]);
+    v[c] = Real(0.5) * (fv[c] + fv[c + o.p[1]]);
+    // nz == 1: the two z faces of the cell are the same face, so the average
+    // is that face's value -- and w is identically zero there anyway.
+    w[c] = g.nz > 1 ? Real(0.5) * (fw[c] + fw[c + o.p[2]]) : fw[c];
+}
+
+} // namespace
+
+void centreVelocity(const GpuGrid& g, const DeviceField& U, DeviceScalar& u,
+                    DeviceScalar& v, DeviceScalar& w)
+{
+    kCentreVelocity<<<launchBlocks(g.size()), blockSize>>>(
+        g, U.u.data(), U.v.data(), U.w.data(), u.data(), v.data(), w.data());
+    checkLastKernel("centreVelocity");
+}
+
 } // namespace dns::gpu

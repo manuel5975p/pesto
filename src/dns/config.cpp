@@ -1,12 +1,16 @@
 #include "dns/config.hpp"
 
+#include "dns/ogrid.hpp"
+
 #include "dns/remap.hpp"
 #include "dns/scene.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <format>
 #include <numbers>
+#include <string>
 #include <string_view>
 
 namespace dns {
@@ -147,6 +151,35 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
             return bad(2, "--n", "grid exceeds INT_MAX cells");
         c.grid = Grid::make(r.n, r.n, r.n, 2 * pi, 2 * pi, 2 * pi);
         c.nzInterior = r.n;
+        // bench times the SOLVER the user names, so it needs the physics
+        // parameters the solver reads: viscosity, Mach (compressible pressure
+        // level) and the SGS constant. Before, --physics compressible parsed
+        // and then ran the incompressible stepper anyway.
+        c.nu = r.nu > 0 ? r.nu : 1.0 / r.re;
+        if (!std::isfinite(c.nu) || c.nu < 0)
+            return bad(2, "--nu", "must be finite and >= 0");
+        c.mach = r.mach;
+        if (r.physics == Physics::Compressible) {
+            if (!(std::isfinite(c.mach) && c.mach > 0 && c.mach < 1))
+                return bad(2, "--mach", "must be in (0,1) -- the flux is "
+                                        "Kennedy-Gruber central with no shock "
+                                        "capturing");
+        } else if (r.given.contains("--mach")) {
+            return bad(2, "--mach", "--mach is compressible-only");
+        }
+        c.cs = r.les;
+        if (!(std::isfinite(c.cs) && c.cs >= 0))
+            return bad(2, "--les", "must be finite and >= 0");
+        if (c.cs > 0 && r.physics != Physics::Compressible)
+            return bad(2, "--les", "bench --les times the compressible SGS path; "
+                                   "add --physics compressible (the incompressible "
+                                   "eddy viscosity is a runner-level substep, not "
+                                   "part of the periodic stepper this benchmarks)");
+        c.sgsModel = r.sgs;
+        if (r.given.contains("--sgs") && c.cs == 0)
+            return bad(2, "--sgs", "selects the SGS model for --les; give --les CS "
+                                   "(> 0) or drop --sgs");
+        c.lesLabel = c.cs > 0;
         c.meta = {r.n, r.n, r.n, c.grid.hx, c.grid.hy, c.grid.hz,
                   0, 0, 0, 0, 0, false, "none", "periodic", name(c.physics), 0,
                   ""};
@@ -312,6 +345,261 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         return c;
     }
 
+    // --- conv ---------------------------------------------------------------
+    // Rayleigh-Benard: heated floor, cooled lid, gravity in -y, periodic x/z.
+    //
+    // Box units fix everything: layer height H = 1, mid-layer temperature
+    // Tref = 1, Rgas = 1 and rho_ref = 1, hence p_ref = 1 and the reference
+    // sound speed is sqrt(gamma). The three inputs then close the case:
+    //
+    //   --dtemp eps   the imposed drop, Tbot/Ttop = 1 +/- eps/2
+    //   --mach M      M = Uf0/c with Uf0 = sqrt(g eps H) -- this is what SETS
+    //                 gravity, g = M^2 gamma / eps, and with it how far the
+    //                 run is from the incompressible limit
+    //   --rayleigh Ra on the SUPERADIABATIC drop, which is what fixes nu
+    //
+    // The stratification is not a detail: gravity itself carries an adiabatic
+    // temperature gradient g/cp, so only dTsuper = dT - (g/cp) H drives
+    // convection (Schwarzschild). A subadiabatic layer is stably stratified
+    // and simply will not convect, which is a configuration error and not a
+    // result -- so it is rejected here, by name, with the two knobs that fix
+    // it. The adiabatic fraction is M^2 (gamma-1) / eps^2, so it shrinks
+    // quadratically as the Mach number drops toward the Boussinesq limit.
+    if (r.sub == Subcommand::Conv)
+    {
+        if (r.given.contains("--re"))
+            return bad(2, "--re", "convection is configured by --rayleigh and "
+                                  "--prandtl, not a body Reynolds number "
+                                  "(there is no body and no free stream)");
+        if (r.given.contains("--ft"))
+            return bad(2, "--ft", "convection run length is --tt (free-fall "
+                                  "times H/Uf)");
+        if (r.n < 4) return bad(2, "--n", "must be >= 4");
+        const int nyI = r.ny;
+        if (nyI < 8)
+            return bad(2, "--ny", "must be >= 8 fluid cells (wall-normal "
+                                  "resolution; two ghost rows are added)");
+        const int nz = r.nz;
+        if (nz < 1) return bad(2, "--nz", "must be >= 1 (interior cells; 1 = "
+                                          "native 2D)");
+        if (nz != 1 && nz < 4)
+            return bad(2, "--nz", "must be 1 (native 2D) or >= 4");
+
+        if (!finitePos(r.rayleigh))
+            return bad(2, "--rayleigh", "must be finite and > 0");
+        c.rayleigh = r.rayleigh;
+        if (!(std::isfinite(r.dtemp) && r.dtemp > 0 && r.dtemp < 2))
+            return bad(2, "--dtemp", "must be in (0,2): the imposed drop as a "
+                                     "fraction of the mid-layer temperature, "
+                                     "so the lid sits at 1 - dtemp/2 > 0");
+        c.dtemp = r.dtemp;
+        c.mach = r.mach;
+        if (!(std::isfinite(c.mach) && c.mach > 0 && c.mach < 1))
+            return bad(2, "--mach", "must be in (0,1) -- the flux is "
+                                    "Kennedy-Gruber central with no shock "
+                                    "capturing");
+        c.prandtl = r.prandtl;
+        if (!finitePos(c.prandtl))
+            return bad(2, "--prandtl", "must be finite and > 0");
+        c.sutherland = r.visc == 1;
+        c.tinfK = r.tinf;
+        if (c.sutherland && !finitePos(c.tinfK))
+            return bad(2, "--tinf", "must be finite and > 0 (it is the "
+                                    "dimensional anchor Sutherland's 110.4 K "
+                                    "needs)");
+        if (c.physics == Physics::Incompressible)
+        {
+            // Boussinesq: the M -> 0 limit taken analytically. There is no
+            // sound speed, so the knobs that only exist to place the run
+            // relative to one are not silently ignored -- they are rejected.
+            if (r.given.contains("--mach"))
+                return bad(2, "--mach", "the Boussinesq limit has no sound "
+                                        "speed: --mach only means something "
+                                        "for --physics compressible, where it "
+                                        "sets gravity");
+            if (r.given.contains("--dtemp"))
+                return bad(2, "--dtemp", "the Boussinesq equations depend on "
+                                         "the imposed drop only through Ra, so "
+                                         "the drop is scaled to 1 and --dtemp "
+                                         "would be a second, conflicting name "
+                                         "for --rayleigh");
+            if (c.sutherland)
+                return bad(2, "--visc", "Sutherland's mu(T) is inconsistent "
+                                        "with a divergence-free velocity "
+                                        "field: constant transport properties "
+                                        "are part of the Boussinesq "
+                                        "approximation. Use --physics "
+                                        "compressible for mu(T)");
+            if (r.given.contains("--tinf"))
+                return bad(2, "--tinf", "nothing in the Boussinesq branch is "
+                                        "dimensional (it exists only to anchor "
+                                        "Sutherland's 110.4 K)");
+        }
+        if (!(std::isfinite(r.convAspect) && r.convAspect > 0))
+            return bad(2, "--aspect", "must be finite and > 0 (box width and "
+                                      "depth in layer heights)");
+        c.convAspect = r.convAspect;
+        if (!(std::isfinite(r.hotPatch) && r.hotPatch > 0 && r.hotPatch <= 1))
+            return bad(2, "--hot-patch", "must be in (0,1]: the heated side "
+                                         "fraction of the floor (1 = the whole "
+                                         "plate)");
+        c.hotPatch = r.hotPatch;
+        // --sides closed turns the lateral faces into no-slip adiabatic walls,
+        // carried by the same one-cell ghost ring as the plates. At nz == 1
+        // only x closes: 2D is exact periodic wrap in z, not a code path, so a
+        // z ghost ring there would be a third dimension the case does not have.
+        c.closedSides = r.sides == 1;
+
+        const double gamma = 1.4, Rgas = 1.0, H = 1.0, Tref = 1.0;
+        c.convH = H;
+        if (c.physics == Physics::Incompressible)
+        {
+            // Free-fall scaling: H = dT = g*alpha = 1, hence Uff = t_ff = 1 and
+            // Ra alone fixes both diffusivities. No stratification exists here,
+            // so the superadiabatic drop IS the imposed one and Ra and Nu are
+            // measured against the same thing.
+            c.tBot = 0.5;
+            c.tTop = -0.5;
+            c.dtemp = 1.0;
+            c.dtempSuper = 1.0;
+            c.gravity = 1.0;   // g*alpha, the buoyancy coefficient
+            c.uFreeFall = 1.0;
+            c.mach = 0;        // there is no sound speed to be a fraction of
+            c.nu = std::sqrt(c.prandtl / c.rayleigh);
+            c.kappaDiff = 1.0 / std::sqrt(c.rayleigh * c.prandtl);
+            c.re = c.uFreeFall * H / c.nu;   // = sqrt(Ra/Pr)
+        }
+        else {
+        c.tBot = Tref * (1 + 0.5 * c.dtemp);
+        c.tTop = Tref * (1 - 0.5 * c.dtemp);
+        // g from the Mach number: M = sqrt(g eps H) / sqrt(gamma R Tref).
+        c.gravity = c.mach * c.mach * gamma * Rgas * Tref / (c.dtemp * H);
+        const double cp = gamma * Rgas / (gamma - 1.0);
+        const double dTad = c.gravity / cp * H;
+        c.dtempSuper = c.dtemp * Tref - dTad;
+        if (!(c.dtempSuper > 0))
+            return bad(2, "--mach",
+                       std::format("the layer is subadiabatic and cannot "
+                                   "convect: gravity's own adiabatic drop "
+                                   "(g/cp) H = {:.4g} already exceeds the "
+                                   "imposed {:.4g}. Lower --mach (the "
+                                   "adiabatic fraction is M^2 (gamma-1) / "
+                                   "dtemp^2 = {:.3g}) or raise --dtemp",
+                                   dTad, c.dtemp * Tref,
+                                   c.mach * c.mach * (gamma - 1)
+                                       / (c.dtemp * c.dtemp)));
+        // Free-fall velocity on the superadiabatic excess -- the velocity the
+        // run actually reaches, and the unit --tt counts in.
+        c.uFreeFall = std::sqrt(c.gravity * c.dtempSuper / Tref * H);
+        // Ra = g (dTsuper/Tref) H^3 / (nu kappa) with kappa = nu/Pr.
+        c.nu = std::sqrt(c.gravity * (c.dtempSuper / Tref) * H * H * H
+                         * c.prandtl / c.rayleigh);
+        c.kappaDiff = c.nu / c.prandtl;
+        c.re = c.uFreeFall * H / c.nu;   // free-fall Reynolds number
+        }
+
+        const int nyT = nyI + 2;         // + the two wall-mirror ghost rows
+        // The ghost rows are geometric mirrors of the first fluid rows, so the
+        // wall faces sit half a cell outside them: the mapped extent is
+        // H + 2*(H/nyI) and the wall-to-wall height stays exactly H.
+        const double hy = H / nyI;
+        const double ly = H + 2 * hy;
+        c.lxBox = c.convAspect * H;
+        c.lzBox = nz == 1 ? 1.0 : c.convAspect * H;
+        // A closed lateral axis gets the plates' treatment exactly: the fluid
+        // extent stays lxBox/lzBox and the two ghost columns extend the mapped
+        // box by one spacing each side, so the wall faces sit half a cell
+        // outside them and the wall-to-wall width is exactly lxBox.
+        const int nxT = c.closedSides ? r.n + 2 : r.n;
+        const int nzT = c.closedSides && nz > 1 ? nz + 2 : nz;
+        const double hx = c.lxBox / r.n, hz = c.lzBox / nz;
+        const double lx = c.closedSides ? c.lxBox + 2 * hx : c.lxBox;
+        const double lz = c.closedSides && nz > 1 ? c.lzBox + 2 * hz : c.lzBox;
+        const std::size_t cells = std::size_t(nxT) * nyT * nzT;
+        if (cells > std::size_t(2147483647))
+            return bad(2, "--n", "grid exceeds INT_MAX cells");
+        c.grid = Grid::make(nxT, nyT, nzT, lx, ly, lz);
+        c.nxInterior = r.n;
+        c.nzInterior = nz;
+        c.h = c.grid.hy;
+        c.L = c.lxBox;
+        c.pRef = Rgas * Tref;   // rho_ref = 1 at mid-layer
+
+        // The compressible branch is acoustically limited, the Boussinesq one
+        // advectively; 0.4 and 0.8 are those two solvers' own defaults.
+        c.cfl = r.given.contains("--cfl")
+                    ? r.cfl
+                    : (c.physics == Physics::Incompressible ? 0.8 : 0.4);
+        if (!(c.cfl > 0 && c.cfl <= 1)) return bad(2, "--cfl", "must be in (0,1]");
+        c.kick = r.kick;
+        if (!(std::isfinite(c.kick) && c.kick >= 0))
+            return bad(2, "--kick", "must be finite and >= 0");
+        if (!finitePos(r.tt)) return bad(2, "--tt", "must be finite and > 0");
+        c.ft = r.tt;
+        c.tEnd = r.tt * H / c.uFreeFall;   // free-fall times -> box time
+        c.profileDt = r.profileDt;
+        if (!(std::isfinite(c.profileDt) && c.profileDt >= 0))
+            return bad(2, "--profile-dt", "must be finite and >= 0 (0 = off)");
+        c.dtRecompute = r.given.contains("--dt-recompute") ? r.dtRecompute : 16;
+        if (c.dtRecompute < 1) return bad(2, "--dt-recompute", "must be >= 1");
+        c.fdt = r.fdt;
+        c.pdt = r.pdt > 0 ? r.pdt : c.fdt;
+        c.wdt = r.wdt > 0 ? r.wdt : c.fdt;
+        for (auto [v, f] : {std::pair{c.fdt, "--fdt"}, {c.pdt, "--pdt"},
+                            {c.wdt, "--wdt"}})
+            if (!finitePos(v)) return bad(2, f, "must be finite and > 0");
+        c.planes = r.planes;
+        if (c.planes != 1 && c.planes != 3)
+            return bad(2, "--planes", "must be 1 (centre only) or 3");
+        c.pngDown = r.pngDown;
+        if (c.pngDown < 1)
+            return bad(2, "--png-down", "must be >= 1 (1 = full resolution)");
+        if (c.pngDown > 1 && (c.grid.nx % c.pngDown || c.grid.ny % c.pngDown))
+            return bad(2, "--png-down", "must divide both nx and ny evenly");
+        if (c.emit.empty()) c.emit.insert(Emit::Stats);
+        if (c.emit.contains(Emit::None) && c.emit.size() > 1)
+            return bad(2, "--emit", "--emit none cannot be combined with "
+                                    "other kinds");
+        // Below onset the layer just conducts; that is a legitimate run (the
+        // subcritical control), but it is not what the user usually wants, so
+        // it is an advisory and not an error.
+        if (c.rayleigh < 1708.0 && c.hotPatch >= 1.0)
+            c.warnings.push_back(std::format(
+                "Ra = {:.4g} is below the onset of convection (~1708 for "
+                "rigid isothermal plates): the layer will stay quiescent and "
+                "report Nu = 1", c.rayleigh));
+        if (c.hotPatch < 1.0)
+            c.warnings.push_back(std::format(
+                "--hot-patch {:.4g}: only that side fraction of the floor is "
+                "heated, so this is a localised plume and not classical "
+                "Rayleigh-Benard -- the 1708 onset does not apply and nuBot is "
+                "a net floor-averaged flux, not a Nusselt number",
+                c.hotPatch));
+        if (nz == 1)
+            c.warnings.push_back("nz == 1: 2D convection has no vortex "
+                                 "stretching -- roll structure and Nu are "
+                                 "qualitative");
+        // A closed cavity is a different experiment from the unbounded layer,
+        // and the two numbers people quote against it -- the 1708 onset and the
+        // Ra-Nu scaling -- are both the unbounded ones. Say so rather than let
+        // a cavity result be read as classical Rayleigh-Benard.
+        if (c.closedSides)
+            c.warnings.push_back(std::format(
+                "--sides closed: the lateral faces are no-slip adiabatic "
+                "walls, so the roll count is fixed by --aspect {:.4g} and the "
+                "corner regions are viscously braked -- Nu is a cavity number "
+                "below the periodic one at the same Ra, and the ~1708 onset "
+                "(and the Ra-Nu scaling) are the unbounded layer's",
+                c.convAspect));
+        c.far = FarField::Periodic;
+        c.bodyKind = BodyKind::None;
+        c.meta = {c.grid.nx, c.grid.ny, c.grid.nz, c.grid.hx, c.grid.hy,
+                  c.grid.hz, H, c.re, c.mach, c.fdt, 0, false,
+                  "convection", c.closedSides ? "closed-sides" : "periodic",
+                  name(c.physics), c.kick, ""};
+        return c;
+    }
+
     // --- flow ---------------------------------------------------------------
     // A scene file replaces --body: main loads it (phase 1.5) and hands the
     // parsed Scene to the geometry build; the validator only records the path
@@ -424,7 +712,64 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     c.nzInterior = nzI;
 
     c.uInf = 1.0;
-    if (comp)
+    if (r.ogrid)
+    {
+        // Body-fitted O-grid (dns/ogrid.hpp): the domain is the DISC of radius
+        // rFar around the body, not a box, and the wall is a mesh face -- so
+        // every immersed-body and box knob is meaningless here and rejected by
+        // name rather than silently ignored. --n is the angular cell count,
+        // --ny the radial one INCLUDING the two ghost rows.
+        if (!comp)
+            return bad(2, "--ogrid", "the body-fitted O-grid is compressible-"
+                                     "only (the curvilinear path is)");
+        if (c.bodyKind == BodyKind::None)
+            return bad(2, "--ogrid", "wraps a body; there is none");
+        // A 3D O-grid around a closed surface has polar singularities (cells
+        // collapse on the axis, det -> 0), which is a different mesh topology,
+        // not a parameter. Only bodies with a z-invariant cross-section wrap.
+        if (c.bodyKind == BodyKind::Sphere)
+            return bad(2, "--ogrid", "a sphere needs a 3D O-grid, whose polar "
+                                     "axis is a mesh singularity (collapsed "
+                                     "cells, det = 0). Bodies with a "
+                                     "z-invariant cross-section only: cylinder, "
+                                     "lens, cube, or a z-invariant mesh");
+        if (c.bodyKind == BodyKind::Fence || c.bodyKind == BodyKind::Floor)
+            return bad(2, "--ogrid", "wall-mounted bodies are not star-shaped "
+                                     "about a centre and have no annulus "
+                                     "around them");
+        for (const char* f : {"--focal", "--stretch", "--cut-flux",
+                              "--penalize", "--open", "--far", "--dr", "--seq"})
+            if (r.given.contains(f))
+                return bad(2, f, std::string(f) +
+                               " belongs to the Cartesian box with an immersed "
+                               "body; --ogrid replaces both (the wall IS a mesh "
+                               "face, and the far field is the outer circle)");
+        if (r.n < 16)
+            return bad(2, "--n", "is the ANGULAR cell count on an O-grid; "
+                                 "below 16 the contour is not resolved");
+        if (ny < 6)
+            return bad(2, "--ny", "is the RADIAL cell count on an O-grid, two "
+                                  "of which are ghost rows; >= 6 needed");
+        if (!(std::isfinite(r.ogridFar) && r.ogridFar > 1.0))
+            return bad(2, "--ogrid-far", "far-boundary radius in DIAMETERS; "
+                                         "must be finite and > 1");
+        if (!(std::isfinite(r.ogridBeta) && r.ogridBeta >= 0))
+            return bad(2, "--ogrid-beta", "radial clustering; must be finite "
+                                          "and >= 0 (0 = uniform)");
+        const double D = pi / 4.0;
+        c.ogrid = true;
+        c.ogridRFar = r.ogridFar * D;
+        c.ogridBeta = r.ogridBeta;
+        // Spanwise extent: pi D, the usual cylinder-DNS span. nz == 1 keeps
+        // the unit depth the 2D convention requires.
+        c.ogridSpan = nzI > 1 ? pi * D : 1.0;
+        c.grid = ogridGrid(r.n, ny, nzI, 0.5 * D, c.ogridRFar, c.ogridSpan);
+        c.L = 2.0 * c.ogridRFar;
+        c.h = c.grid.hy; // nominal radial spacing; the mesh reports the real h1
+        // The body sits at the origin: the mesh is built about its centre.
+        c.placement = {0.0, 0.0, 0.0, D};
+    }
+    else if (comp)
     {
         // D = pi/4 fixed, h scales with ny AND --dr: box = dr*D in y
         // (dr*(n/ny)*D in x), D spans ny/dr cells. The dr = 8 default keeps
@@ -510,6 +855,38 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     c.nu = c.uInf * c.placement.D / c.re;
     c.cfl = r.given.contains("--cfl") ? r.cfl : (comp ? 0.4 : 0.8);
     if (!(c.cfl > 0 && c.cfl <= 1)) return bad(2, "--cfl", "must be in (0,1]");
+
+    // Thermal model. Every knob here is compressible-only and OFF by default:
+    // a constant-viscosity adiabatic-wall run is bit-for-bit what it was, so
+    // no measured anchor in the repo moves until a run asks for temperature.
+    c.tinfK = r.tinf;
+    c.prandtl = r.prandtl;
+    c.sutherland = r.visc == 1;
+    c.twallRatio = r.twall;
+    c.bodyIsothermal = r.given.contains("--wall") && r.wallIso == 1;
+    c.nscbcThermalInflow = r.nscbcTinflow;
+    if (!comp)
+        for (const char* f : {"--tinf", "--prandtl", "--visc", "--wall",
+                              "--twall", "--nscbc-tinflow"})
+            if (r.given.contains(f))
+                return bad(2, f, std::string(f) + " is compressible-only "
+                                 "(the incompressible solver carries no energy "
+                                 "equation)");
+    if (!(std::isfinite(c.tinfK) && c.tinfK > 0))
+        return bad(2, "--tinf", "must be finite and > 0 (kelvin)");
+    if (!(std::isfinite(c.prandtl) && c.prandtl > 0))
+        return bad(2, "--prandtl", "must be finite and > 0");
+    if (!(std::isfinite(c.twallRatio) && c.twallRatio > 0))
+        return bad(2, "--twall", "must be finite and > 0 (a ratio to Tinf)");
+    if (r.given.contains("--twall") && !c.bodyIsothermal)
+        return bad(2, "--twall", "sets the temperature of an ISOTHERMAL wall; "
+                                 "add --wall isothermal (the default body wall "
+                                 "is adiabatic)");
+    if (c.bodyIsothermal && c.bodyKind == BodyKind::None)
+        return bad(2, "--wall", "an isothermal wall needs a body; there is none");
+    if (c.nscbcThermalInflow && c.far != FarField::Nscbc)
+        return bad(2, "--nscbc-tinflow", "is the NSCBC entropy inflow target; "
+                                         "use --far nscbc");
 
     c.cs = r.les;
     if (!(std::isfinite(c.cs) && c.cs >= 0))
@@ -1054,6 +1431,11 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
                                     "set --vort-max (~ the peak |vorticity| in "
                                     "uInf/D, e.g. sqrt(Re))");
     c.speedDelta = r.speedMap == 1;
+    c.tempFrames = r.tempFrames;
+    if (c.tempFrames && !comp)
+        return bad(2, "--temp", "the incompressible solver carries no energy "
+                                "equation and no temperature field; use "
+                                "--physics compressible");
     c.vortSigned = r.vortSigned;
     if (c.vortSigned && !comp)
         return bad(2, "--vort-signed", "incompressible frames are already "
@@ -1088,6 +1470,98 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
 
 std::string Case::describe() const
 {
+    // Shared by both conv branches.
+    const std::string patchLabel =
+        hotPatch >= 1.0
+            ? std::string("uniformly heated")
+            : std::format("heated on a centred patch of side fraction {:.4g}"
+                          " ({:.1f}% of the area); the rest sits at the lid"
+                          " temperature", hotPatch,
+                          100.0 * (grid.nz == 1 ? hotPatch
+                                                : hotPatch * hotPatch));
+    // The lateral faces, in the terms the run actually has: which axes closed
+    // and what a closed one is (a no-slip adiabatic wall, ghost ring and all).
+    const std::string sidesLabel =
+        !closedSides
+            ? std::string("periodic (unbounded layer sampled over one box)")
+            : std::format("CLOSED: no-slip adiabatic walls on {} (+1 ghost "
+                          "column each side); fluid extent unchanged",
+                          grid.nz == 1 ? "x (z stays the exact 2D wrap)"
+                                       : "x and z");
+    if (sub == Subcommand::Conv && physics == Physics::Incompressible)
+    {
+        char buf[2048];
+        std::snprintf(buf, sizeof buf,
+            "case:\n"
+            "  mode       Rayleigh-Benard convection, BOUSSINESQ "
+            "(incompressible)\n"
+            "  grid       %d x %d x %d (%d fluid rows + 2 ghost)  "
+            "box %.6g x %.6g x %.6g%s\n"
+            "  walls      no-slip isothermal plates at T = %+.3g / %+.3g "
+            "(drop 1 over H=1)\n"
+            "  sides      %s\n"
+            "  floor      %s\n"
+            "  driving    Ra=%.6g  Pr=%.4g   (free-fall scaling: "
+            "H = dT = g*alpha = 1)\n"
+            "  derived    nu=%.6g  kappa=%.6g  Uff=1  Re_ff=%.6g  t_ff=1  "
+            "cfl=%.3g\n"
+            "  limit      no sound speed, no acoustic dt, no adiabatic "
+            "gradient: Ra and Nu share the full drop\n"
+            "  run        tt=%.6g free-fall times (tEnd=%.6g)  kick=%.3g  "
+            "profile-dt=%.3g\n"
+            "  label      DNS%s\n"
+            "  out        %s\n",
+            grid.nx, grid.ny, grid.nz, grid.ny - 2,
+            lxBox, convH, lzBox, grid.nz == 1 ? "  [native 2D]" : "",
+            tBot, tTop, sidesLabel.c_str(), patchLabel.c_str(),
+            rayleigh, prandtl, nu, kappaDiff, re, cfl,
+            ft, tEnd, kick, profileDt,
+            grid.nz == 1 ? " (2D: qualitative only, no vortex stretching)"
+                         : "",
+            outPrefix.c_str());
+        return buf;
+    }
+    if (sub == Subcommand::Conv)
+    {
+        char buf[2048];
+        std::snprintf(buf, sizeof buf,
+            "case:\n"
+            "  mode       Rayleigh-Benard convection (no-slip isothermal y "
+            "walls)\n"
+            "  grid       %d x %d x %d (%d fluid rows + 2 ghost)  "
+            "box %.6g x %.6g x %.6g%s\n"
+            "  walls      floor T=%.6g, lid T=%.6g (imposed drop %.6g over "
+            "H=%.6g)\n"
+            "  sides      %s\n"
+            "  floor      %s\n"
+            "  gravity    g=%.6g in -y; adiabatic drop (g/cp)H=%.6g "
+            "(%.1f%% of the imposed)\n"
+            "  driving    Ra=%.6g on the superadiabatic drop %.6g  Pr=%.4g  "
+            "Mach=%.3g\n"
+            "  derived    nu=%.6g  kappa=%.6g  Uff=%.6g  Re_ff=%.6g  "
+            "t_ff=%.6g  cfl=%.3g\n"
+            "  transport  %s\n"
+            "  run        tt=%.6g free-fall times (tEnd=%.6g)  kick=%.3g  "
+            "profile-dt=%.3g\n"
+            "  label      DNS%s\n"
+            "  out        %s\n",
+            grid.nx, grid.ny, grid.nz, grid.ny - 2,
+            lxBox, convH, lzBox, grid.nz == 1 ? "  [native 2D]" : "",
+            tBot, tTop, dtemp, convH, sidesLabel.c_str(), patchLabel.c_str(),
+            gravity, dtemp - dtempSuper,
+            dtemp > 0 ? 100.0 * (dtemp - dtempSuper) / dtemp : 0.0,
+            rayleigh, dtempSuper, prandtl, mach,
+            nu, prandtl > 0 ? nu / prandtl : 0.0, uFreeFall, re,
+            uFreeFall > 0 ? convH / uFreeFall : 0.0, cfl,
+            sutherland
+                ? "Sutherland mu(T), kappa(T) = mu cp / Pr"
+                : "constant mu, kappa",
+            ft, tEnd, kick, profileDt,
+            grid.nz == 1 ? " (2D: qualitative only, no vortex stretching)"
+                         : "",
+            outPrefix.c_str());
+        return buf;
+    }
     if (sub == Subcommand::Channel)
     {
         char buf[2048];
@@ -1151,6 +1625,39 @@ std::string Case::describe() const
                       : "time-march to tEnd",
         outPrefix.c_str());
     std::string s = buf;
+    // Thermal model: printed only when a run actually asked for one, so a
+    // mechanical case's --dry-run reads exactly as it always did.
+    if (physics == Physics::Compressible &&
+        (sutherland || bodyIsothermal || nscbcThermalInflow))
+    {
+        const double Tinf = mach > 0 ? 1.0 / (1.4 * mach * mach) : 0.0;
+        char t[512];
+        std::snprintf(t, sizeof t,
+            "  thermal    visc=%s  Pr=%.6g  Tinf=%.6g box (%.6g K)\n"
+            "             body wall %s%s  nscbc inflow holds %s\n",
+            sutherland ? "sutherland" : "constant", prandtl, Tinf, tinfK,
+            bodyIsothermal ? "isothermal" : "adiabatic",
+            bodyIsothermal
+                ? (" Twall/Tinf=" + std::to_string(twallRatio)).c_str()
+                : "",
+            nscbcThermalInflow ? "T" : "rho");
+        s += t;
+    }
+    if (ogrid)
+    {
+        char t[512];
+        std::snprintf(t, sizeof t,
+            "  o-grid     BODY-FITTED: %d angular x %d radial (2 ghost rows)"
+            " x %d spanwise\n"
+            "             rFar=%.6g (%.6g D)  beta=%.6g  span=%.6g\n"
+            "             the wall is a MESH FACE -- no cut cells, no immersed"
+            " body,\n"
+            "             forces are an exact surface integral\n",
+            grid.nx, grid.ny, grid.nz, ogridRFar,
+            placement.D > 0 ? ogridRFar / placement.D : 0.0, ogridBeta,
+            ogridSpan);
+        s += t;
+    }
     if (stretchBeta > 0)
     {
         char m[256];

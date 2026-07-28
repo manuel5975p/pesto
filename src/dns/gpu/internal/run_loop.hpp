@@ -64,6 +64,17 @@ recomputeDt(int& sinceDt, double& dtStab, int recomputeEvery, double margin,
     return {};
 }
 
+// One-sided 2nd-order wall gradient of a quantity whose WALL VALUE is pinned
+// to zero, from its first two off-wall values: f'(0) = (f1 d2^2 - f2 d1^2) /
+// (d1 d2 (d2 - d1)). Both wall-bounded runners measure a wall flux this way --
+// the channel its friction velocity from u, the convection cell its Nusselt
+// number from T - Twall -- and both must subtract the pinned value themselves.
+// Pre: 0 < d1 < d2.
+inline double wallGradientPinned(double f1, double f2, double d1, double d2)
+{
+    return (f1 * d2 * d2 - f2 * d1 * d1) / (d1 * d2 * (d2 - d1));
+}
+
 // Wall-clock ms/step, recorded on the stats and handed to the output sink.
 // Identical in all three runners.
 inline void finishTiming(RunStats& st,

@@ -5,45 +5,72 @@
 #include <cassert>
 
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/internal/stencil.hpp"
 
 namespace dns::gpu {
 
 namespace {
 
-__device__ inline Real avg(Real a, Real b) { return Real(0.5) * (a + b); }
+using internal::applyStageTail;
+using internal::avg;
+using internal::Inv;
+using internal::invOf;
 
-__global__ void kDivergence(GpuGrid g, const Real* u, const Real* v, const Real* w,
+// The four plain cell divergences one fused stage needs: at the centre cell and
+// at each of its three minus-neighbours. Each convective correction averages
+// the centre with one minus-neighbour, so the centre value used to be evaluated
+// three times per thread.
+struct DivQuad
+{
+    Real c, xm, ym, zm;
+};
+
+// Pre: `o` are the offsets at c. The minus cells differ from c along ONE axis,
+// so o's other two offsets stay valid there (index.hpp), and the missing plus
+// neighbour along that axis is c itself.
+__device__ inline DivQuad divQuad(const Real* __restrict__ u,
+                                  const Real* __restrict__ v,
+                                  const Real* __restrict__ w, const Offsets& o,
+                                  const Inv& iv, std::size_t c)
+{
+    const std::size_t xm = c + o.m[0], ym = c + o.m[1], zm = c + o.m[2];
+    return {.c = (u[c + o.p[0]] - u[c]) * iv.x + (v[c + o.p[1]] - v[c]) * iv.y
+               + (w[c + o.p[2]] - w[c]) * iv.z,
+            .xm = (u[c] - u[xm]) * iv.x + (v[xm + o.p[1]] - v[xm]) * iv.y
+                + (w[xm + o.p[2]] - w[xm]) * iv.z,
+            .ym = (u[ym + o.p[0]] - u[ym]) * iv.x + (v[c] - v[ym]) * iv.y
+                + (w[ym + o.p[2]] - w[ym]) * iv.z,
+            .zm = (u[zm + o.p[0]] - u[zm]) * iv.x + (v[zm + o.p[1]] - v[zm]) * iv.y
+                + (w[c] - w[zm]) * iv.z};
+}
+
+__global__ void kDivergence(GpuGrid g, const Real* __restrict__ u,
+                            const Real* __restrict__ v, const Real* __restrict__ w,
                             Real* out, Real scale)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
-    out[c] = scale * ((u[gidx(g, i + 1, j, k)] - u[c]) / g.hx
-                    + (v[gidx(g, i, j + 1, k)] - v[c]) / g.hy
-                    + (w[gidx(g, i, j, k + 1)] - w[c]) / g.hz);
+    const Offsets o = offsetsAt(g, i, j, k);
+    const Inv iv = invOf(g);
+    out[c] = scale * ((u[c + o.p[0]] - u[c]) * iv.x
+                    + (v[c + o.p[1]] - v[c]) * iv.y
+                    + (w[c + o.p[2]] - w[c]) * iv.z);
 }
 
-__global__ void kSubtractGradient(GpuGrid g, const Real* p, Real scale,
+__global__ void kSubtractGradient(GpuGrid g, const Real* __restrict__ p, Real scale,
                                   Real* u, Real* v, Real* w)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
-    u[c] -= scale * (p[c] - p[gidx(g, i - 1, j, k)]) / g.hx;
-    v[c] -= scale * (p[c] - p[gidx(g, i, j - 1, k)]) / g.hy;
-    w[c] -= scale * (p[c] - p[gidx(g, i, j, k - 1)]) / g.hz;
-}
-
-// Plain cell divergence at (i,j,k) -- the skew-symmetric correction input.
-__device__ Real cellDiv(const GpuGrid& g, const Real* u, const Real* v,
-                        const Real* w, int i, int j, int k)
-{
-    const std::size_t c = gidx(g, i, j, k);
-    return (u[gidx(g, i + 1, j, k)] - u[c]) / g.hx
-         + (v[gidx(g, i, j + 1, k)] - v[c]) / g.hy
-         + (w[gidx(g, i, j, k + 1)] - w[c]) / g.hz;
+    const Offsets o = offsetsAt(g, i, j, k);
+    const Inv iv = invOf(g);
+    u[c] -= scale * (p[c] - p[c + o.m[0]]) * iv.x;
+    v[c] -= scale * (p[c] - p[c + o.m[1]]) * iv.y;
+    w[c] -= scale * (p[c] - p[c + o.m[2]]) * iv.z;
 }
 
 // Convective fluxes per momentum component at face (i,j,k) in skew-symmetric
@@ -53,140 +80,155 @@ __device__ Real cellDiv(const GpuGrid& g, const Real* u, const Real* v,
 // residual it is what keeps the operator energy-conserving -- the plain
 // divergence form injects energy ~ u^2*div(u) at cut faces and diverges
 // under-resolved shear layers. Mirrors dns/operators.cpp exactly.
-__device__ Real convX(const GpuGrid& g, const Real* u, const Real* v, const Real* w,
-                      std::size_t c, int i, int j, int k)
+__device__ Real convX(const Real* __restrict__ u, const Real* __restrict__ v,
+                      const Real* __restrict__ w, const Offsets& o, const Inv& iv,
+                      std::size_t c, const DivQuad& d)
 {
-        const Real uc  = avg(u[c], u[gidx(g, i + 1, j, k)]);
-        const Real ucm = avg(u[gidx(g, i - 1, j, k)], u[c]);
-        const Real vjp = avg(v[gidx(g, i, j + 1, k)], v[gidx(g, i - 1, j + 1, k)]);
-        const Real vj  = avg(v[c], v[gidx(g, i - 1, j, k)]);
-        const Real ujp = avg(u[c], u[gidx(g, i, j + 1, k)]);
-        const Real ujm = avg(u[gidx(g, i, j - 1, k)], u[c]);
-        const Real wkp = avg(w[gidx(g, i, j, k + 1)], w[gidx(g, i - 1, j, k + 1)]);
-        const Real wk  = avg(w[c], w[gidx(g, i - 1, j, k)]);
-        const Real ukp = avg(u[c], u[gidx(g, i, j, k + 1)]);
-        const Real ukm = avg(u[gidx(g, i, j, k - 1)], u[c]);
-        return -((uc * uc - ucm * ucm) / g.hx
-               + (vjp * ujp - vj * ujm) / g.hy
-               + (wkp * ukp - wk * ukm) / g.hz)
-             + Real(0.5) * u[c] * avg(cellDiv(g, u, v, w, i - 1, j, k),
-                                      cellDiv(g, u, v, w, i, j, k));
+    const std::size_t xm = c + o.m[0];
+    const Real uc  = avg(u[c], u[c + o.p[0]]);
+    const Real ucm = avg(u[xm], u[c]);
+    const Real vjp = avg(v[c + o.p[1]], v[xm + o.p[1]]);
+    const Real vj  = avg(v[c], v[xm]);
+    const Real ujp = avg(u[c], u[c + o.p[1]]);
+    const Real ujm = avg(u[c + o.m[1]], u[c]);
+    const Real wkp = avg(w[c + o.p[2]], w[xm + o.p[2]]);
+    const Real wk  = avg(w[c], w[xm]);
+    const Real ukp = avg(u[c], u[c + o.p[2]]);
+    const Real ukm = avg(u[c + o.m[2]], u[c]);
+    return -((uc * uc - ucm * ucm) * iv.x
+           + (vjp * ujp - vj * ujm) * iv.y
+           + (wkp * ukp - wk * ukm) * iv.z)
+         + Real(0.5) * u[c] * avg(d.xm, d.c);
 }
 
-__device__ Real convY(const GpuGrid& g, const Real* u, const Real* v, const Real* w,
-                      std::size_t c, int i, int j, int k)
+__device__ Real convY(const Real* __restrict__ u, const Real* __restrict__ v,
+                      const Real* __restrict__ w, const Offsets& o, const Inv& iv,
+                      std::size_t c, const DivQuad& d)
 {
-        const Real vc  = avg(v[c], v[gidx(g, i, j + 1, k)]);
-        const Real vcm = avg(v[gidx(g, i, j - 1, k)], v[c]);
-        const Real uip = avg(u[gidx(g, i + 1, j, k)], u[gidx(g, i + 1, j - 1, k)]);
-        const Real ui  = avg(u[c], u[gidx(g, i, j - 1, k)]);
-        const Real vip = avg(v[c], v[gidx(g, i + 1, j, k)]);
-        const Real vim = avg(v[gidx(g, i - 1, j, k)], v[c]);
-        const Real wkp = avg(w[gidx(g, i, j, k + 1)], w[gidx(g, i, j - 1, k + 1)]);
-        const Real wk  = avg(w[c], w[gidx(g, i, j - 1, k)]);
-        const Real vkp = avg(v[c], v[gidx(g, i, j, k + 1)]);
-        const Real vkm = avg(v[gidx(g, i, j, k - 1)], v[c]);
-        return -((uip * vip - ui * vim) / g.hx
-               + (vc * vc - vcm * vcm) / g.hy
-               + (wkp * vkp - wk * vkm) / g.hz)
-             + Real(0.5) * v[c] * avg(cellDiv(g, u, v, w, i, j - 1, k),
-                                      cellDiv(g, u, v, w, i, j, k));
+    const std::size_t ym = c + o.m[1];
+    const Real vc  = avg(v[c], v[c + o.p[1]]);
+    const Real vcm = avg(v[ym], v[c]);
+    const Real uip = avg(u[c + o.p[0]], u[ym + o.p[0]]);
+    const Real ui  = avg(u[c], u[ym]);
+    const Real vip = avg(v[c], v[c + o.p[0]]);
+    const Real vim = avg(v[c + o.m[0]], v[c]);
+    const Real wkp = avg(w[c + o.p[2]], w[ym + o.p[2]]);
+    const Real wk  = avg(w[c], w[ym]);
+    const Real vkp = avg(v[c], v[c + o.p[2]]);
+    const Real vkm = avg(v[c + o.m[2]], v[c]);
+    return -((uip * vip - ui * vim) * iv.x
+           + (vc * vc - vcm * vcm) * iv.y
+           + (wkp * vkp - wk * vkm) * iv.z)
+         + Real(0.5) * v[c] * avg(d.ym, d.c);
 }
 
-__device__ Real convZ(const GpuGrid& g, const Real* u, const Real* v, const Real* w,
-                      std::size_t c, int i, int j, int k)
+__device__ Real convZ(const Real* __restrict__ u, const Real* __restrict__ v,
+                      const Real* __restrict__ w, const Offsets& o, const Inv& iv,
+                      std::size_t c, const DivQuad& d)
 {
-        const Real wc  = avg(w[c], w[gidx(g, i, j, k + 1)]);
-        const Real wcm = avg(w[gidx(g, i, j, k - 1)], w[c]);
-        const Real uip = avg(u[gidx(g, i + 1, j, k)], u[gidx(g, i + 1, j, k - 1)]);
-        const Real ui  = avg(u[c], u[gidx(g, i, j, k - 1)]);
-        const Real wip = avg(w[c], w[gidx(g, i + 1, j, k)]);
-        const Real wim = avg(w[gidx(g, i - 1, j, k)], w[c]);
-        const Real vjp = avg(v[gidx(g, i, j + 1, k)], v[gidx(g, i, j + 1, k - 1)]);
-        const Real vj  = avg(v[c], v[gidx(g, i, j, k - 1)]);
-        const Real wjp = avg(w[c], w[gidx(g, i, j + 1, k)]);
-        const Real wjm = avg(w[gidx(g, i, j - 1, k)], w[c]);
-        return -((uip * wip - ui * wim) / g.hx
-               + (vjp * wjp - vj * wjm) / g.hy
-               + (wc * wc - wcm * wcm) / g.hz)
-             + Real(0.5) * w[c] * avg(cellDiv(g, u, v, w, i, j, k - 1),
-                                      cellDiv(g, u, v, w, i, j, k));
+    const std::size_t zm = c + o.m[2];
+    const Real wc  = avg(w[c], w[c + o.p[2]]);
+    const Real wcm = avg(w[zm], w[c]);
+    const Real uip = avg(u[c + o.p[0]], u[zm + o.p[0]]);
+    const Real ui  = avg(u[c], u[zm]);
+    const Real wip = avg(w[c], w[c + o.p[0]]);
+    const Real wim = avg(w[c + o.m[0]], w[c]);
+    const Real vjp = avg(v[c + o.p[1]], v[zm + o.p[1]]);
+    const Real vj  = avg(v[c], v[zm]);
+    const Real wjp = avg(w[c], w[c + o.p[1]]);
+    const Real wjm = avg(w[c + o.m[1]], w[c]);
+    return -((uip * wip - ui * wim) * iv.x
+           + (vjp * wjp - vj * wjm) * iv.y
+           + (wc * wc - wcm * wcm) * iv.z)
+         + Real(0.5) * w[c] * avg(d.zm, d.c);
 }
 
-// nu * 7-point Laplacian of q at (i,j,k).
-__device__ Real scaledLap(const GpuGrid& g, Real nu, const Real* q, std::size_t c,
-                          int i, int j, int k)
+// nu * 7-point Laplacian of q at c.
+__device__ inline Real scaledLap(const Real* __restrict__ q, const Offsets& o,
+                                 const Inv& iv, Real nu, std::size_t c)
 {
-    const Real ax = Real(1) / (g.hx * g.hx);
-    const Real ay = Real(1) / (g.hy * g.hy);
-    const Real az = Real(1) / (g.hz * g.hz);
-    return nu * (ax * (q[gidx(g, i + 1, j, k)] - 2 * q[c] + q[gidx(g, i - 1, j, k)])
-               + ay * (q[gidx(g, i, j + 1, k)] - 2 * q[c] + q[gidx(g, i, j - 1, k)])
-               + az * (q[gidx(g, i, j, k + 1)] - 2 * q[c] + q[gidx(g, i, j, k - 1)]));
+    return nu * (iv.xx * (q[c + o.p[0]] - 2 * q[c] + q[c + o.m[0]])
+               + iv.yy * (q[c + o.p[1]] - 2 * q[c] + q[c + o.m[1]])
+               + iv.zz * (q[c + o.p[2]] - 2 * q[c] + q[c + o.m[2]]));
 }
 
-__global__ void kConvection(GpuGrid g, const Real* u, const Real* v, const Real* w,
+__global__ void kConvection(GpuGrid g, const Real* __restrict__ u,
+                            const Real* __restrict__ v, const Real* __restrict__ w,
                             Real* ou, Real* ov, Real* ow)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
-    ou[c] = convX(g, u, v, w, c, i, j, k);
-    ov[c] = convY(g, u, v, w, c, i, j, k);
-    ow[c] = convZ(g, u, v, w, c, i, j, k);
+    const Offsets o = offsetsAt(g, i, j, k);
+    const Inv iv = invOf(g);
+    const DivQuad d = divQuad(u, v, w, o, iv, c);
+    ou[c] = convX(u, v, w, o, iv, c, d);
+    ov[c] = convY(u, v, w, o, iv, c, d);
+    ow[c] = convZ(u, v, w, o, iv, c, d);
 }
 
 // One pass per RK stage: out = a*x + b*(in + dt*rhs), where
-// rhs = convection(in) + nu*lap(diff) + A*(in - mean). diff usually IS in;
-// embedded-boundary apps pass a ghost-filled copy so only the viscous term
-// sees the sub-cell wall (convection keeps the energy-stable masked zeros).
-// out must not alias in/diff (stencil).
+// rhs = convection(in) + nu*lap(diff) + A*(in - mean), followed by the optional
+// StageTail. diff usually IS in; embedded-boundary apps pass a ghost-filled
+// copy so only the viscous term sees the sub-cell wall (convection keeps the
+// energy-stable masked zeros).
+//
+// The six stencil inputs are restrict-qualified: none of them is written here
+// (out aliases neither), so their mutual aliasing -- in == diff is the common
+// call -- is not a restrict violation, while a store through ou can no longer
+// be assumed to clobber them. xu/xv/xw are deliberately NOT qualified: the
+// SSP-RK3 closing stage passes out == x.
 __global__ void kFusedRhsStage(GpuGrid g, Real nu, Real A, Real mx, Real my, Real mz,
                                Real a, const Real* xu, const Real* xv, const Real* xw,
-                               Real b, const Real* u, const Real* v, const Real* w,
-                               const Real* du, const Real* dv, const Real* dw,
-                               Real dt, Real* ou, Real* ov, Real* ow)
+                               Real b, const Real* __restrict__ u,
+                               const Real* __restrict__ v, const Real* __restrict__ w,
+                               const Real* __restrict__ du,
+                               const Real* __restrict__ dv,
+                               const Real* __restrict__ dw, Real dt, StageTail tail,
+                               Real* ou, Real* ov, Real* ow)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
-    Real ru = convX(g, u, v, w, c, i, j, k) + scaledLap(g, nu, du, c, i, j, k)
-            + A * (u[c] - mx);
-    Real rv = convY(g, u, v, w, c, i, j, k) + scaledLap(g, nu, dv, c, i, j, k)
-            + A * (v[c] - my);
-    Real rw = convZ(g, u, v, w, c, i, j, k) + scaledLap(g, nu, dw, c, i, j, k)
-            + A * (w[c] - mz);
-    ou[c] = a * xu[c] + b * (u[c] + dt * ru);
-    ov[c] = a * xv[c] + b * (v[c] + dt * rv);
-    ow[c] = a * xw[c] + b * (w[c] + dt * rw);
+    const Offsets o = offsetsAt(g, i, j, k);
+    const Inv iv = invOf(g);
+    const DivQuad d = divQuad(u, v, w, o, iv, c);
+    const Real ru = convX(u, v, w, o, iv, c, d) + scaledLap(du, o, iv, nu, c)
+                  + A * (u[c] - mx);
+    const Real rv = convY(u, v, w, o, iv, c, d) + scaledLap(dv, o, iv, nu, c)
+                  + A * (v[c] - my);
+    const Real rw = convZ(u, v, w, o, iv, c, d) + scaledLap(dw, o, iv, nu, c)
+                  + A * (w[c] - mz);
+    Real qu = a * xu[c] + b * (u[c] + dt * ru);
+    Real qv = a * xv[c] + b * (v[c] + dt * rv);
+    Real qw = a * xw[c] + b * (w[c] + dt * rw);
+    applyStageTail(tail, o, c, qu, qv, qw);
+    ou[c] = qu;
+    ov[c] = qv;
+    ow[c] = qw;
 }
 
-__global__ void kAddScaledLaplacian(GpuGrid g, Real nu, const Real* u, const Real* v,
-                                    const Real* w, Real* ou, Real* ov, Real* ow)
+__global__ void kAddScaledLaplacian(GpuGrid g, Real nu, const Real* __restrict__ u,
+                                    const Real* __restrict__ v,
+                                    const Real* __restrict__ w, Real* ou, Real* ov,
+                                    Real* ow)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
-    const Real ax = Real(1) / (g.hx * g.hx);
-    const Real ay = Real(1) / (g.hy * g.hy);
-    const Real az = Real(1) / (g.hz * g.hz);
-    const std::size_t xp = gidx(g, i + 1, j, k), xm = gidx(g, i - 1, j, k);
-    const std::size_t yp = gidx(g, i, j + 1, k), ym = gidx(g, i, j - 1, k);
-    const std::size_t zp = gidx(g, i, j, k + 1), zm = gidx(g, i, j, k - 1);
-    ou[c] += nu * (ax * (u[xp] - 2 * u[c] + u[xm]) + ay * (u[yp] - 2 * u[c] + u[ym])
-                 + az * (u[zp] - 2 * u[c] + u[zm]));
-    ov[c] += nu * (ax * (v[xp] - 2 * v[c] + v[xm]) + ay * (v[yp] - 2 * v[c] + v[ym])
-                 + az * (v[zp] - 2 * v[c] + v[zm]));
-    ow[c] += nu * (ax * (w[xp] - 2 * w[c] + w[xm]) + ay * (w[yp] - 2 * w[c] + w[ym])
-                 + az * (w[zp] - 2 * w[c] + w[zm]));
+    const Offsets o = offsetsAt(g, i, j, k);
+    const Inv iv = invOf(g);
+    ou[c] += scaledLap(u, o, iv, nu, c);
+    ov[c] += scaledLap(v, o, iv, nu, c);
+    ow[c] += scaledLap(w, o, iv, nu, c);
 }
 
 __global__ void kAddForcing(std::size_t n, Real A, Real mx, Real my, Real mz,
-                            const Real* u, const Real* v, const Real* w,
-                            Real* ou, Real* ov, Real* ow)
+                            const Real* __restrict__ u, const Real* __restrict__ v,
+                            const Real* __restrict__ w, Real* ou, Real* ov, Real* ow)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= n) return;
@@ -207,8 +249,9 @@ __global__ void kSubtractMean(std::size_t n, Real mx, Real my, Real mz, Real* u,
 
 __global__ void kRkCombine(std::size_t n, Real a, const Real* xu, const Real* xv,
                            const Real* xw, Real b, const Real* zu, const Real* zv,
-                           const Real* zw, Real dt, const Real* ru, const Real* rv,
-                           const Real* rw, Real* ou, Real* ov, Real* ow)
+                           const Real* zw, Real dt, const Real* __restrict__ ru,
+                           const Real* __restrict__ rv, const Real* __restrict__ rw,
+                           Real* ou, Real* ov, Real* ow)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= n) return;
@@ -271,20 +314,21 @@ void rkCombine(const GpuGrid& g, Real a, const DeviceField& x, Real b,
 
 void fusedRhsStage(const GpuGrid& g, Real nu, Real A, Real mx, Real my, Real mz,
                    Real a, const DeviceField& x, Real b, const DeviceField& in,
-                   const DeviceField& diff, Real dt, DeviceField& out)
+                   const DeviceField& diff, Real dt, DeviceField& out,
+                   const StageTail& tail)
 {
     kFusedRhsStage<<<launchBlocks(g.size()), blockSize>>>(
         g, nu, A, mx, my, mz, a, x.u.data(), x.v.data(), x.w.data(), b, in.u.data(),
         in.v.data(), in.w.data(), diff.u.data(), diff.v.data(), diff.w.data(), dt,
-        out.u.data(), out.v.data(), out.w.data());
+        tail, out.u.data(), out.v.data(), out.w.data());
     checkLastKernel("fusedRhsStage");
 }
 
 void fusedRhsStage(const GpuGrid& g, Real nu, Real A, Real mx, Real my, Real mz,
                    Real a, const DeviceField& x, Real b, const DeviceField& in,
-                   Real dt, DeviceField& out)
+                   Real dt, DeviceField& out, const StageTail& tail)
 {
-    fusedRhsStage(g, nu, A, mx, my, mz, a, x, b, in, in, dt, out);
+    fusedRhsStage(g, nu, A, mx, my, mz, a, x, b, in, in, dt, out, tail);
 }
 
 void subtractMean(const GpuGrid& g, Real mx, Real my, Real mz, DeviceField& U)

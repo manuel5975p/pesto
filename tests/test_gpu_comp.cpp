@@ -2,6 +2,7 @@
 // isentropic vortex, and FP32 conservation drift bound.
 #include "dns/comp.hpp"
 #include "dns/gpu/comp.hpp"
+#include "dns/transport.hpp"
 #include "gpu_test_util.hpp"
 #include "check.hpp"
 
@@ -30,13 +31,13 @@ CompState vortexState(const Comp& c, double beta)
             const double f = beta / (2 * pi) * std::exp(0.5 * (1.0 - r2));
             const double u = 1.0 - f * dy, v = 1.0 + f * dx;
             const double T =
-                1.0 - (c.gamma - 1) * beta * beta / (8 * c.gamma * pi * pi) * std::exp(1 - r2);
-            const double rho = std::pow(T, 1.0 / (c.gamma - 1)), p = rho * T;
+                1.0 - (c.gamma() - 1) * beta * beta / (8 * c.gamma() * pi * pi) * std::exp(1 - r2);
+            const double rho = std::pow(T, 1.0 / (c.gamma() - 1)), p = rho * T;
             const std::size_t k = c.g.idx(i, j, 0);
             s.rho[k] = rho;
             s.mx[k] = rho * u;
             s.my[k] = rho * v;
-            s.E[k] = p / (c.gamma - 1) + 0.5 * rho * (u * u + v * v);
+            s.E[k] = p / (c.gamma() - 1) + 0.5 * rho * (u * u + v * v);
         }
     return s;
 }
@@ -106,6 +107,49 @@ int main()
     std::printf("FP32 drift: rho %.2e mx %.2e my %.2e E %.2e\n", s1[0] - s0[0],
                 s1[1] - s0[1], s1[2] - s0[2], s1[3] - s0[3]);
     check(ok, "FP32 conservation drift bounded");
+
+    // Sutherland mu(T), kappa(T): the device evaluates the law in FP32 from
+    // the face-average temperature and the CPU in FP64 from the same average,
+    // so this is the parity check that pins ViscView against dns::Transport.
+    // The vortex carries a real temperature dip, so mu genuinely varies.
+    {
+        const double Tref = 1.0; // the isentropic vortex is built around T = 1
+        const auto gas =
+            Transport::air(2e-3, Tref, 288.15, 0.72, 1.4, 1.0, true);
+        auto cpuS = Comp::make(g, 1.4, 2e-3);
+        cpuS.tr = gas;
+        auto ss = vortexState(cpuS, 5.0);
+        auto sgs2 = ss;
+        auto devS = gpu::DeviceComp::make(g, gas);
+        auto dss = gpu::DeviceCompState::make(g.size());
+        if (!devS || !dss) return EXIT_FAILURE;
+        (void)dss->upload(sgs2);
+
+        const double dc = *cpuS.stableDt(ss), dg = devS->stableDt(*dss, *scratch);
+        std::printf("sutherland dt cpu %.6e gpu %.6e\n", dc, dg);
+        check(std::abs(dc - dg) < 1e-4 * dc, "sutherland stableDt parity");
+
+        const double dts = 0.9 * dc;
+        for (int it = 0; it < 20; ++it) {
+            cpuS.step(ss, dts);
+            devS->step(*dss, gpu::Real(dts));
+        }
+        (void)dss->download(sgs2);
+        const double sr = relLinf(sgs2.rho, ss.rho), sm = relLinf(sgs2.mx, ss.mx),
+                     se = relLinf(sgs2.E, ss.E);
+        std::printf("sutherland 20-step rel Linf: rho %.2e mx %.2e E %.2e\n",
+                    sr, sm, se);
+        check(sr < 1e-4 && sm < 1e-4 && se < 1e-4,
+              "sutherland step parity within FP32");
+
+        // And the law is engaged: the same state under constant viscosity must
+        // take a measurably different trajectory.
+        auto cpuC = Comp::make(g, 1.4, 2e-3);
+        auto sConst = vortexState(cpuC, 5.0);
+        for (int it = 0; it < 20; ++it) cpuC.step(sConst, dts);
+        check(relLinf(sConst.E, ss.E) > 1e-8,
+              "mu(T) changes the trajectory (the law is really on)");
+    }
 
     return dnstest::gFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

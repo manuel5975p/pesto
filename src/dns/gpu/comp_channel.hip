@@ -48,16 +48,19 @@ __global__ void kChannelWallY(GpuGrid g, int isothermal, Real gam, Real Rgas,
     E[c] = p1 / (gam - Real(1)) + r0 * ke1;
 }
 
-__global__ void kBodyForceX(GpuGrid g, Real f, const Real* u, Real* kmx,
-                            Real* kE)
+// Additive rhs contribution: the stage kernel already wrote the interior
+// combination, so the force enters scaled by the same cr (comp.hpp,
+// StageCombine) that multiplied the interior rhs.
+__global__ void kBodyForceX(GpuGrid g, Real f, Real cr, const Real* u,
+                            Real* omx, Real* oE)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
     if (j < 1 || j > g.ny - 2) return; // ghost rows: the stage hook owns them
-    kmx[c] += f;
-    kE[c] += f * u[c];
+    omx[c] += cr * f;
+    oE[c] += cr * f * u[c];
 }
 
 // One thread per y row; each sums its whole (i,k) plane in FP64 in a fixed
@@ -106,11 +109,11 @@ void DeviceChannelWall::apply(DeviceCompState& s) const
     checkLastKernel("kChannelWallY");
 }
 
-void addBodyForceX(const GpuGrid& g, double f, const DeviceScalar& u,
-                   DeviceCompState& k)
+void addBodyForceX(const GpuGrid& g, double f, Real cr, const DeviceScalar& u,
+                   DeviceCompState& out)
 {
-    kBodyForceX<<<launchBlocks(g.size()), blockSize>>>(g, Real(f), u.data(),
-                                                       k.mx.data(), k.E.data());
+    kBodyForceX<<<launchBlocks(g.size()), blockSize>>>(
+        g, Real(f), cr, u.data(), out.mx.data(), out.E.data());
     checkLastKernel("kBodyForceX");
 }
 

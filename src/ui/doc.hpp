@@ -60,6 +60,14 @@ struct SceneItem
 // short and honest about what was actually inspected.
 struct DocState
 {
+    // Which case this document is. `dns flow` (a body in a stream) and
+    // `dns conv` (a heated layer) share the grid, the material and the run
+    // controls and nothing else: conv has no body, no free stream and no far
+    // field, and flow has no plates and no Rayleigh number. The panels gate on
+    // this rather than showing a knob the validator would reject.
+    enum Sub { Flow = 0, Conv = 1 };
+    int sub = Flow;
+
     // A 96^3 box by default: 3D from the start, and small enough that the cut
     // rebuilds interactively while you drag an object.
     int n = 96;
@@ -112,7 +120,60 @@ struct DocState
     double meshScale = 0;  // mesh, 0 = fit extent to D
     bool robust = false;   // mesh
 
+    // --- thermal (flow, compressible only) ---------------------------------
+    // Every one of these is off or neutral by default, and rawFrom only marks
+    // them `given` when they are ON -- so a document that never opens the
+    // panel exports exactly the command it always did, and the measured cd/cl
+    // anchors stay valid (CLAUDE.md: every thermal knob is off by default).
+    int visc = 0;             // 0 constant, 1 sutherland
+    double tinf = 288.15;     // K; Sutherland's dimensional anchor
+    double prandtl = 0.72;
+    bool wallIso = false;     // body surface: false adiabatic, true isothermal
+    double twall = 1.0;       // Twall / Tinf, read only when wallIso
+    bool nscbcTinflow = false;
+    bool tempFrames = false;  // --temp: a third frame channel, T - Tinf
+
+    // --- convection (dns conv) ---------------------------------------------
+    // The SI face, in the editor's usual idiom: a layer height and an imposed
+    // temperature drop are what a person has, and the Rayleigh number is
+    // DERIVED from them and the material (units.hpp). convPhysics selects the
+    // model -- 0 Boussinesq (incompressible), 1 fully compressible.
+    int convPhysics = 0;
+    double convH = 0.02;      // layer height [m]
+    double convDT = 20.0;     // imposed floor-to-lid drop [K]
+    double convTmean = 293.15;// mean temperature [K]; sets alpha = 1/T
+    double convAspect = 2.0;  // box width and depth in layer heights
+    double hotPatch = 1.0;    // heated side fraction of the floor; 1 = all
+    // Lateral faces: 0 periodic (an unbounded layer sampled over one box),
+    // 1 closed (no-slip adiabatic side walls -- a sealed cavity). Emitted only
+    // when closed, so a document that never touches it exports the command it
+    // always did.
+    int convSides = 0;
+    double convTt = 30.0;     // run length in free-fall times
+    double convKick = 0.02;
+    // The compressible branch's own Mach number. NOT the physical one (that is
+    // ~1e-3 for air and unaffordable): it sets gravity, g = M^2 gamma / dtemp,
+    // and with it how stratified the layer is and how many steps a free-fall
+    // time costs. The panel shows the physical Mach beside it so the two are
+    // never confused.
+    double convMach = 0.05;
+
     std::vector<SceneItem> items;   // used when bodyKind selects "scene"
+
+    bool isConv() const { return sub == Conv; }
+    // The physics selector the active subcommand uses. flow keeps `physics`;
+    // conv has its own so switching subcommand does not silently re-model the
+    // other one.
+    int activePhysics() const { return isConv() ? convPhysics : physics; }
+    // dtemp as the solver takes it: the drop as a fraction of the mean.
+    double convDtemp() const
+    {
+        return convTmean > 0 ? convDT / convTmean : 0.0;
+    }
+    double convRayleigh() const
+    {
+        return phys.rayleigh(convDT, convH, convTmean, prandtl);
+    }
 };
 
 // The dns::Scene this document means: the ONE place model/cs/sgs are merged

@@ -71,4 +71,36 @@ void channelIC(const Case& c, const ChannelStretchY& remap, double delta,
                double rho0, double gamma, CompState& state,
                std::vector<float>& mask);
 
+// Rayleigh-Benard: the HYDROSTATIC conduction state plus the same
+// deterministic curl(psi) trip the channel uses.
+//
+// Starting from rest and uniform pressure would not be a state of this problem
+// at all -- gravity would collapse the layer and ring the box acoustically for
+// the whole run. So the IC integrates dp/dy = -rho g through the linear
+// conduction profile T(y), which for a linear T is exactly
+// p(y) = pRef (T(y)/Tref)^(-g/(R a)) with a = dT/dy, and takes rho from the
+// equation of state. That state is a genuine (unstable) equilibrium: it stays
+// put to machine precision until the trip grows.
+//
+// The trip is solenoidal, hence acoustically silent, and its envelope vanishes
+// with zero derivative at both walls so it respects no-slip exactly.
+//
+// The two ghost rows are marked 0 in `mask`: the wall mirror owns them.
+void convIC(const Case& c, double gamma, CompState& state,
+            std::vector<float>& mask);
+
+// Boussinesq Rayleigh-Benard (--physics incompressible): the linear conduction
+// profile and the same solenoidal trip, on the MAC grid.
+//
+// No hydrostatic pressure is needed or wanted here -- the projection owns the
+// pressure, and in the Boussinesq equations the hydrostatic part is absorbed
+// into it by construction. That is the whole difference from convIC, which has
+// to integrate dp/dy = -rho g explicitly because its density is a state
+// variable.
+//
+// The trip is the analytic curl of a streamfunction sampled at the MAC face
+// positions, so it is solenoidal to truncation rather than exactly; the first
+// projection removes the remainder, exactly as it does for channelIC.
+void rbIC(const Case& c, VectorField& U, Scalar& T);
+
 } // namespace dns

@@ -15,17 +15,40 @@ namespace dns::gpu {
 
 namespace {
 
-__global__ void kGhostFill(std::size_t count, const int* face, const int* comp,
-                           const int* nbr, const Real* w, Real* u, Real* v,
-                           Real* wz)
+// The mirror sum reads only OPEN faces (make() drops every closed sample) and
+// writes only closed ones, so the samples may come from a SEPARATE source
+// field: the destination is write-only here, and src == dst stays legal.
+__global__ void kGhostFill(std::size_t count, const int* __restrict__ face,
+                           const int* __restrict__ comp,
+                           const int* __restrict__ nbr, const Real* __restrict__ w,
+                           const Real* su, const Real* sv, const Real* sw, Real* u,
+                           Real* v, Real* wz)
 {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (t >= count) return;
-    Real* q = comp[t] == 0 ? u : comp[t] == 1 ? v : wz;
-    Real s = 0;
+    const int cp = comp[t];
+    const Real* s = cp == 0 ? su : cp == 1 ? sv : sw;
+    Real* q = cp == 0 ? u : cp == 1 ? v : wz;
+    Real acc = 0;
     for (int m = 0; m < 8; ++m)
-        s += w[8 * t + m] * q[nbr[8 * t + m]];
-    q[face[t]] = s;
+        acc += w[8 * t + m] * s[nbr[8 * t + m]];
+    q[face[t]] = acc;
+}
+
+// Whole-field copy of the three components in ONE launch. It replaces three
+// hipMemcpy D2D calls, each of which is a blocking host synchronization: at
+// three RK stages that was nine pipeline stalls per step, for a transfer the
+// solver never has to wait on.
+__global__ void kCopyField(std::size_t n, const Real* __restrict__ su,
+                           const Real* __restrict__ sv, const Real* __restrict__ sw,
+                           Real* __restrict__ du, Real* __restrict__ dv,
+                           Real* __restrict__ dw)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    du[c] = su[c];
+    dv[c] = sv[c];
+    dw[c] = sw[c];
 }
 
 int pmod(int i, int n) { return ((i % n) + n) % n; }
@@ -157,28 +180,27 @@ DeviceGhostFill::make(const Grid& g, const CutGeometry& cut, const Sdf& sdf)
                            std::move(*w), n);
 }
 
-hipError_t DeviceGhostFill::fillFrom(const DeviceField& in, DeviceField& diff) const
+void DeviceGhostFill::fillFrom(const DeviceField& in, DeviceField& diff) const
 {
-    const std::size_t bytes = in.u.size() * sizeof(Real);
-    if (auto e = hipMemcpy(diff.u.data(), in.u.data(), bytes,
-                           hipMemcpyDeviceToDevice); e != hipSuccess)
-        return e;
-    if (auto e = hipMemcpy(diff.v.data(), in.v.data(), bytes,
-                           hipMemcpyDeviceToDevice); e != hipSuccess)
-        return e;
-    if (auto e = hipMemcpy(diff.w.data(), in.w.data(), bytes,
-                           hipMemcpyDeviceToDevice); e != hipSuccess)
-        return e;
-    apply(diff);
-    return hipSuccess;
+    const std::size_t n = in.u.size();
+    kCopyField<<<launchBlocks(n), blockSize>>>(n, in.u.data(), in.v.data(),
+                                               in.w.data(), diff.u.data(),
+                                               diff.v.data(), diff.w.data());
+    checkLastKernel("ghostCopy");
+    fill(in, diff);
 }
 
 void DeviceGhostFill::apply(DeviceField& U) const
 {
+    fill(U, U);
+}
+
+void DeviceGhostFill::fill(const DeviceField& src, DeviceField& dst) const
+{
     if (count_ == 0) return;
     kGhostFill<<<launchBlocks(count_), blockSize>>>(
-        count_, face_.data(), comp_.data(), nbr_.data(), w_.data(), U.u.data(),
-        U.v.data(), U.w.data());
+        count_, face_.data(), comp_.data(), nbr_.data(), w_.data(), src.u.data(),
+        src.v.data(), src.w.data(), dst.u.data(), dst.v.data(), dst.w.data());
     checkLastKernel("ghostFill");
 }
 

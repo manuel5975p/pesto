@@ -27,6 +27,20 @@ struct IncompRun
     double qRef = 1.0;        // 0.5 rho uInf^2 * frontal area
     double D = 1.0;           // body diameter, sets the frame colour scales
     double cfl = 0.8;
+    // Steps between stable-dt recomputes. Every recompute is a max-reduce over
+    // the whole field AND the one mandatory host synchronization of the step,
+    // so N > 1 buys the pipeline a run of N steps it never has to drain --
+    // at the price of holding dt fixed across them, which CHANGES THE
+    // TRAJECTORY. 1 = recompute every step, today's behaviour and the default,
+    // so nothing moves unless the caller asks for it. Same field and same
+    // meaning as the compressible runner's --dt-recompute.
+    int dtRecompute = 1;
+    // Safety factor on a held dt, the companion of dtRecompute: a bound
+    // measured N steps ago is stale and the flow may have accelerated since.
+    // 1.0 = no derating, bit-for-bit today's dt, and only safe at
+    // dtRecompute == 1; raising dtRecompute must lower this with it (the
+    // compressible runner pairs 16 with 0.95).
+    double dtMargin = 1.0;
     double tEnd = 0;
     double tol = 1e-4;        // CG per-cell RMS residual target
     int maxIters = 500;

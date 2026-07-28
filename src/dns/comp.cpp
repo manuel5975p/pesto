@@ -34,7 +34,7 @@ Prim primitives(const Comp& c, const CompState& s)
         q.u[2][i] = s.mz[i] / s.rho[i];
         q.e[i] = s.E[i] / s.rho[i];
         q.p[i] = c.pressure(s.rho[i], s.mx[i], s.my[i], s.mz[i], s.E[i]);
-        q.T[i] = q.p[i] / (s.rho[i] * c.Rgas);
+        q.T[i] = q.p[i] / (s.rho[i] * c.tr.Rgas);
     }
     return q;
 }
@@ -46,8 +46,6 @@ void rhsCurv(const Comp& c, const CurvMetrics& m, const CompState& s,
              CompState& out)
 {
     const Grid& g = c.g;
-    const double cp = c.gamma * c.Rgas / (c.gamma - 1.0);
-    const double kappa = c.mu * cp / c.Pr;
     const Prim q = primitives(c, s);
 
     // Central index-space derivative (dxi = 1) of f along axis d.
@@ -75,7 +73,11 @@ void rhsCurv(const Comp& c, const CurvMetrics& m, const CompState& s,
                {rm * Un * um[0] + pm * Sv[0], rm * Un * um[1] + pm * Sv[1],
                 rm * Un * um[2] + pm * Sv[2]},
                rm * Un * em + pm * Un};
-        if (c.mu == 0.0) return f;
+        if (c.tr.muRef == 0.0) return f;
+        // One face temperature drives both coefficients (see the device twin
+        // in gpu/internal/comp_flux.hpp).
+        const double Tf = 0.5 * (q.T[ca] + q.T[cb]);
+        const double mu = c.tr.mu(Tf), kappa = c.tr.kappa(Tf);
 
         // d{u,v,w,T}/dxi at the face: normal compact, tangential averaged.
         double dxi[4][3];
@@ -100,8 +102,8 @@ void rhsCurv(const Comp& c, const CurvMetrics& m, const CompState& s,
         for (int cx = 0; cx < 3; ++cx) {
             double ts = 0.0; // (tau . S)_cx
             for (int d = 0; d < 3; ++d)
-                ts += (c.mu * (gr[cx][d] + gr[d][cx]) -
-                       (cx == d ? 2.0 / 3.0 * c.mu * divu : 0.0)) * Sv[d];
+                ts += (mu * (gr[cx][d] + gr[d][cx]) -
+                       (cx == d ? 2.0 / 3.0 * mu * divu : 0.0)) * Sv[d];
             f.m[cx] -= ts;
             eflux += um[cx] * ts;
         }
@@ -144,7 +146,7 @@ CompState CompState::zeros(const Grid& g)
 Comp Comp::make(const Grid& g, double gamma, double mu)
 {
     assert(gamma > 1.0 && mu >= 0.0);
-    return {g, gamma, mu, 0.72, 1.0, nullptr};
+    return {g, Transport::air(mu, 1.0, 0.0, 0.72, gamma, 1.0, false), nullptr};
 }
 
 std::expected<Comp, std::string> Comp::make(const CurvMesh& mesh, double gamma,
@@ -163,7 +165,7 @@ std::expected<Comp, std::string> Comp::make(const CurvMesh& mesh, double gamma,
 // once per cell in the inner loops).
 double Comp::pressure(double rho, double mx, double my, double mz, double E) const
 {
-    return (gamma - 1.0) * (E - 0.5 * (mx * mx + my * my + mz * mz) / rho);
+    return (tr.gamma - 1.0) * (E - 0.5 * (mx * mx + my * my + mz * mz) / rho);
 }
 
 void Comp::rhs(const CompState& s, CompState& out) const
@@ -171,8 +173,6 @@ void Comp::rhs(const CompState& s, CompState& out) const
     if (curv) return rhsCurv(*this, *curv, s, out);
 
     const double h[3] = {g.hx, g.hy, g.hz};
-    const double cp = gamma * Rgas / (gamma - 1.0);
-    const double kappa = mu * cp / Pr;
     const Prim q = primitives(*this, s);
 
     auto at = [&](const std::vector<double>& f, int i, int j, int k) {
@@ -201,7 +201,9 @@ void Comp::rhs(const CompState& s, CompState& out) const
         Flux f{rm * un, {rm * un * um[0], rm * un * um[1], rm * un * um[2]},
                rm * un * em + pm * un};
         f.m[a] += pm;
-        if (mu == 0.0) return f;
+        if (tr.muRef == 0.0) return f;
+        const double Tf = 0.5 * (q.T[ca] + q.T[cb]);
+        const double mu = tr.mu(Tf), kappa = tr.kappa(Tf);
 
         // Face gradients: normal derivatives compact, tangential averaged.
         double du[3][3]; // du[c][d] = d u_c / d x_d at the face
@@ -281,7 +283,7 @@ std::expected<double, std::string> Comp::stableDt(const CompState& s,
     // Release the assert vanished and sqrt(gamma*p/r) with p < 0 produced a
     // NaN dt, which the time loop then never recovered from -- silent
     // non-termination instead of exit 7.
-    double wmax = 0.0, rhomin = s.rho[0];
+    double wmax = 0.0, rhomin = s.rho[0], tmax = 0.0;
     for (std::size_t i = 0; i < g.size(); ++i) {
         const double r = s.rho[i];
         if (!(r > 0.0) || !std::isfinite(r))
@@ -293,7 +295,7 @@ std::expected<double, std::string> Comp::stableDt(const CompState& s,
             return std::unexpected("compressible state diverged: pressure is "
                                    + std::to_string(p) + " at cell "
                                    + std::to_string(i));
-        const double c = std::sqrt(gamma * p / r);
+        const double c = std::sqrt(tr.gamma * p / r);
         double w = 0.0;
         if (curv) {
             const double sp = std::sqrt(s.mx[i] * s.mx[i] + s.my[i] * s.my[i] +
@@ -307,9 +309,10 @@ std::expected<double, std::string> Comp::stableDt(const CompState& s,
         }
         wmax = std::max(wmax, w);
         rhomin = std::min(rhomin, s.rho[i]);
+        tmax = std::max(tmax, p / (r * tr.Rgas));
     }
     double dt = cfl / wmax;
-    if (mu > 0.0) {
+    if (tr.muRef > 0.0) {
         double h;
         if (curv) {
             h = curv->hmin;
@@ -317,7 +320,11 @@ std::expected<double, std::string> Comp::stableDt(const CompState& s,
             h = std::min(g.hx, g.hy);
             if (g.nz > 1) h = std::min(h, g.hz);
         }
-        dt = std::min(dt, 0.25 * h * h * rhomin / mu);
+        // Thermal diffusivity gamma nu / Pr binds before the momentum one for
+        // air; mu(T) is monotone, so its field max is mu(Tmax). Both mirror
+        // gpu/comp.hip exactly -- test_gpu_comp pins the parity.
+        dt = std::min(dt, 0.25 * h * h * rhomin /
+                              (tr.mu(tmax) * tr.diffusivityFactor()));
     }
     if (!(dt > 0.0) || !std::isfinite(dt))
         return std::unexpected("compressible stable dt is not positive-finite");

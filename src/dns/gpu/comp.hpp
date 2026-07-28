@@ -5,6 +5,7 @@
 
 #include "dns/comp.hpp"
 #include "dns/cutcell.hpp"
+#include "dns/transport.hpp"
 #include "dns/sgs.hpp"
 #include "dns/gpu/device_buffer.hpp"
 #include "dns/gpu/index.hpp"
@@ -53,6 +54,23 @@ struct DeviceCurv
     CurvView view() const;
 };
 
+// The RK combination a stage kernel applies on top of the rhs it just built:
+//   out = ca * a + cb * b + cr * rhs,   a/b in (rho, mx, my, mz, E) order.
+// Materializing the rhs into its own five arrays and combining it in a second
+// pass cost 40 B/cell/stage of pure memory traffic plus a whole conserved
+// state of VRAM; the combination rides the tail of the rhs kernel instead.
+//
+// A boundary hook that OVERWRITES rhs rows (NSCBC) still expresses an RHS and
+// never a state overwrite -- it just writes that rhs THROUGH this same
+// combination on its own rows. An additive hook (the channel body force) scales
+// its contribution by cr.
+struct StageCombine
+{
+    const Real* a[5];
+    const Real* b[5];
+    Real ca, cb, cr;
+};
+
 // Owns RK3 / primitive scratch; periodic domain (BCs via the stage hook).
 class DeviceComp
 {
@@ -65,6 +83,12 @@ public:
     // bit-for-bit unchanged. Delta^2 = (hx hy hz)^(2/3) in 3D, hx hy when
     // nz == 1 (the |S| z-shear terms cancel by periodic wrap).
     static std::expected<DeviceComp, hipError_t>
+    make(const Grid& g, const Transport& tr, double csLes = 0.0,
+         SgsModel sgs = SgsModel::Smagorinsky);
+
+    // Constant-viscosity shorthand (gamma, mu, Pr = 0.72, R = 1): the gas the
+    // solver had before transport was temperature-dependent, bit-for-bit.
+    static std::expected<DeviceComp, hipError_t>
     make(const Grid& g, double gamma, double mu, double csLes = 0.0,
          SgsModel sgs = SgsModel::Smagorinsky);
 
@@ -75,6 +99,9 @@ public:
     // velocity gradient taken through the mesh metrics and Delta^2 the
     // PER-CELL volume^(2/3), so a clustered mesh filters at the local
     // spacing. csLes == 0 is molecular DNS, bit-for-bit unchanged.
+    static std::expected<DeviceComp, hipError_t>
+    make(const CurvMetrics& m, const Transport& tr, double csLes = 0.0,
+         SgsModel sgs = SgsModel::Smagorinsky);
     static std::expected<DeviceComp, hipError_t>
     make(const CurvMetrics& m, double gamma, double mu, double csLes = 0.0,
          SgsModel sgs = SgsModel::Smagorinsky);
@@ -111,45 +138,60 @@ public:
     const DeviceScalar& T() const { return T_; }
 
     const GpuGrid& grid() const { return g_; }
-    Real gamma() const { return gamma_; }
-    Real mu() const { return mu_; }
+    Real gamma() const { return Real(tr_.gamma); }
+    Real mu() const { return Real(tr_.muRef); }
     bool les() const { return csLes_ > Real(0); }
 
-    // Heat conductivity mu cp / Pr (surface-force tally needs it).
-    Real kappaCond() const { return mu_ * gamma_ * Rgas_ / ((gamma_ - Real(1)) * Pr_); }
+    // The gas: viscosity law, Prandtl number, R and gamma. Everything that
+    // needs mu or kappa goes through this, so a temperature-dependent law
+    // reaches the surface tallies and the boundary kernels for free.
+    const Transport& transport() const { return tr_; }
+
+    // Heat conductivity at the reference temperature, mu cp / Pr.
+    Real kappaCond() const { return Real(tr_.muRef * tr_.cp() / tr_.Pr); }
 
     // Called on every RK stage input before its rhs (boundary conditions and
     // embedded-boundary fill); the hook may mutate the state in place.
     void setStageHook(std::function<void(DeviceCompState&)> h) { hook_ = std::move(h); }
 
-    // Called after the periodic rhs of every RK stage with the stage state s
-    // and its rhs k; may overwrite rhs rows (NSCBC characteristic
-    // boundaries). Stage primitives are live in the scratch during the call.
-    void setRhsHook(std::function<void(const DeviceCompState&, DeviceCompState&)> h)
+    // Called after the periodic rhs of every RK stage with the stage state s,
+    // the stage OUTPUT state out, and the combination the interior cells were
+    // written through; may overwrite rhs rows (NSCBC characteristic
+    // boundaries) by writing its own rhs through `cmb`. Stage primitives are
+    // live in the scratch during the call.
+    void setRhsHook(
+        std::function<void(const DeviceCompState&, DeviceCompState&,
+                           const StageCombine&)> h)
     {
         rhsHook_ = std::move(h);
     }
 
 private:
-    DeviceComp(const GpuGrid& g, Real gamma, Real mu, Real csLes, SgsModel sgs);
+    DeviceComp(const GpuGrid& g, const Transport& tr, Real csLes, SgsModel sgs);
 
-    void rhs(const DeviceCompState& s, DeviceCompState& out);
+    // One RK stage: out = cmb.ca a + cmb.cb b + cmb.cr L(s), boundary hooks
+    // included. `s` supplies the stencil, `out` may alias cmb.a (read at the
+    // own cell only) but never the stencil state.
+    void stage(const DeviceCompState& s, const StageCombine& cmb,
+               DeviceCompState& out);
     // Device pointer table of curv_; pre: curvilinear().
     CurvView curvView() const;
 
     GpuGrid g_;
-    Real gamma_, mu_, Pr_ = Real(0.72), Rgas_ = Real(1);
+    Transport tr_;
     Real csLes_ = Real(0);  // SGS model constant (0 = molecular DNS)
     Real smagCd_ = Real(0); // C^2 * Delta^2 (filter width folded in)
     SgsModel sgs_ = SgsModel::Smagorinsky;
     Real prt_ = Real(0.9);  // turbulent Prandtl number
-    DeviceCompState k_, q1_, q2_;
+    // Two stage buffers, not three: SSP-RK3 needs the running state plus one
+    // stage output at a time once the rhs is not materialized separately.
+    DeviceCompState q1_, q2_;
     std::optional<DeviceCurv> curv_; // engaged = curvilinear rhs/stableDt
     DeviceScalar u_, v_, w_, e_, p_, T_;
     DeviceScalar nut_;      // per-cell dynamic eddy viscosity (LES only)
-    DeviceBuffer<const Real*> ptrs_; // axpy pointer table
     std::function<void(DeviceCompState&)> hook_;
-    std::function<void(const DeviceCompState&, DeviceCompState&)> rhsHook_;
+    std::function<void(const DeviceCompState&, DeviceCompState&,
+                       const StageCombine&)> rhsHook_;
 };
 
 // Brinkman-style solid-band penalization (--penalize eta): cell momentum

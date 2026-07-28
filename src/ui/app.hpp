@@ -207,6 +207,8 @@ private:
     std::string status_;
     bool showDescribe_ = false;
     bool showMaterial_ = true, showFlow_ = true, showGridPanel_ = true;
+    bool showThermal_ = false;   // compressible flow: mu(T), walls, T frames
+    bool showConv_ = true;       // the convection case's own section
     bool showObjects_ = true, showNumerics_ = false;
     bool showCutPanel_ = true, showLayers_ = true, showExport_ = false;
     // Click-to-place: +cyl arms a kind, the next viewport click positions it.
@@ -236,7 +238,14 @@ private:
     unsigned liveTick_ = 0;
     bool liveOptOut_ = false;   // an explicit detach; must survive the scan
     // Series parsed out of the run's own stdout, for the plots in the dock.
-    struct Series { std::vector<float> t, cd, cl, k, div; };
+    // Both cases' progress series. `dns flow` prints cd/cl/K/maxDiv on its
+    // stdout line and `dns conv` prints Nu/urms, so the dock parses whichever
+    // is there and plots the four that mean something for the case in flight.
+    struct Series
+    {
+        std::vector<float> t, cd, cl, k, div;
+        std::vector<float> nuBot, nuTop, nuFlux, urms;
+    };
     Series series_;
     std::size_t seriesConsumed_ = 0;
     bool runFollow_ = true;   // stick to the tail of the log

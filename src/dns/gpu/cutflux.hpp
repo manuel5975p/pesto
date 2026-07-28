@@ -16,6 +16,7 @@
 
 #include "dns/gpu/cutcell.hpp"
 #include "dns/gpu/index.hpp"
+#include "dns/gpu/kernels.hpp"
 
 namespace dns::gpu {
 
@@ -34,10 +35,12 @@ struct DeviceCutFlag
 // wall; kBodyFriction depends on that contract), fluid->fluid links scale by
 // the averaged aperture. Everything divides by lambda_tilde = max(lambda_face,
 // 1/2) -- the small-cell floor on the time term only; face fluxes stay exact.
+// `tail` is applied by BOTH kernels, so a flagged cell gets exactly the tail
+// the plain kernel gave the rest of the grid.
 void fusedRhsStageCut(const GpuGrid& g, Real nu, Real A, Real mx, Real my,
                       Real mz, Real a, const DeviceField& x, Real b,
                       const DeviceField& in, const DeviceField& diff,
                       const DeviceCutGeometry& cut, const DeviceCutFlag& flag,
-                      Real dt, DeviceField& out);
+                      Real dt, DeviceField& out, const StageTail& tail = {});
 
 } // namespace dns::gpu

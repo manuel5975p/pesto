@@ -47,6 +47,16 @@ public:
         bool openY = false;
         bool openZ = false;
         double sigLat = 0.25; // lateral pressure-anchor strength
+        // Thermal inflow: the entropy wave relaxes toward the density the
+        // TARGET TEMPERATURE implies at the LOCAL pressure, rho -> p/(R TInf),
+        // instead of toward rhoInf. The two agree at the fixed point and
+        // differ off it: the density form lets T_in drift with the incoming
+        // pressure field, which is wrong the moment transport depends on T or
+        // a wall exchanges heat. false is the historical arithmetic, bit-for-
+        // bit. TInf is in solver units (pInf / (rhoInf R)).
+        bool thermalInflow = false;
+        double TInf = 0.0;
+        double Rgas = 1.0;
         // Potential-corrected far-field targets: relax/anchor toward
         // freestream + wake source (strength Q set via setWakeSource, from the
         // measured drag) + displacement doublet (radius aBody about
@@ -75,11 +85,12 @@ public:
     // Periodic grid, nx >= 4 (ny/nz >= 4 on open axes); subsonic freestream.
     static std::expected<DeviceCompNscbc, hipError_t> make(const Grid& g, Config c);
 
-    // Overwrite the rhs of every open-boundary cell of k with the
-    // characteristic form; install via DeviceComp::setRhsHook (stage
-    // primitives are live).
+    // Overwrite the rhs of every open-boundary cell with the characteristic
+    // form, written into the stage output through the same RK combination the
+    // interior used (dns/gpu/comp.hpp, StageCombine); install via
+    // DeviceComp::setRhsHook (stage primitives are live).
     void apply(const DeviceComp& d, const DeviceCompState& s,
-               DeviceCompState& k) const;
+               DeviceCompState& out, const StageCombine& cmb) const;
 
     // Stretched-y (curvilinear) variant: the PointRemap travels as a template
     // argument of the kernel, so every one-sided normal derivative, Yoo-Im
@@ -88,14 +99,16 @@ public:
     // faceFluxCurv on d's metric tables -- the interior scheme, exactly.
     // Pre: d is the curvilinear DeviceComp built from the same remap's nodes.
     void apply(const DeviceComp& d, const DeviceCompState& s,
-               DeviceCompState& k, const TanhStretchY& remap) const;
+               DeviceCompState& out, const StageCombine& cmb,
+               const TanhStretchY& remap) const;
 
     // Focal (per-axis interior clustering) variant: same contract, one more
     // kernel instantiation. AxisRemap3 is ONE concrete type whatever the
     // focal box is -- the coefficients travel as data, so x/y/z clustering
     // in any combination costs no extra instantiations.
     void apply(const DeviceComp& d, const DeviceCompState& s,
-               DeviceCompState& k, const AxisRemap3& remap) const;
+               DeviceCompState& out, const StageCombine& cmb,
+               const AxisRemap3& remap) const;
 
     // Inflow target u (quiet-start ramp tracking); must stay subsonic.
     void setFreestream(double u) { u_ = u; }

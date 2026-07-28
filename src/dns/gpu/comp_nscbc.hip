@@ -44,14 +44,16 @@ constexpr Real kLatBand = Real(0.01);
 // arithmetic UNTOUCHED (cv unused), so the validated uniform NSCBC runs are
 // bit-identical.
 template <class Remap>
-__global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, Real mu,
-                            Real kappa, Real gam, PrimView q,
+__global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
+                            Real gam, PrimView q,
                             int openY, int openZ, int fr, Real invLx, Real invLy,
                             Real invLz, Real sigma, Real etaIn, Real omM2,
                             Real betaT, Real sigLat, Real etaLat, Real uT,
                             Real rhoI, Real pI, int pot, Real Q, Real dbl,
-                            Real xc, Real yc, Real zc, Real* krho, Real* kmx,
-                            Real* kmy, Real* kmz, Real* kE)
+                            Real xc, Real yc, Real zc, Real invRT,
+                            StageCombine cmb,
+                            Real* orho, Real* omx, Real* omy, Real* omz,
+                            Real* oE)
 {
     constexpr bool remapped = !std::is_same_v<Remap, IdentityRemap>;
     // Disjoint boundary enumeration: x faces own their full slabs, y faces
@@ -172,9 +174,9 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, Real mu,
         const int ox = a == 0, oy = a == 1, oz = a == 2;
         if (!onFace(a)) { // exact transverse flux divergence (z cancels at
             if constexpr (remapped) {                             // nz == 1)
-                const Flux fh = faceFluxCurv(g, mu, kappa, q, cv, i, j, k, a);
-                const Flux fl = faceFluxCurv(g, mu, kappa, q, cv, i - ox,
-                                             j - oy, k - oz, a);
+                const Flux fh = faceFluxCurv(g, vv, q, cv, i, j, k, a);
+                const Flux fl =
+                    faceFluxCurv(g, vv, q, cv, i - ox, j - oy, k - oz, a);
                 const Real iv = cv.invVol[c]; // fluxes carry the face area
                 trho -= (fh.rho - fl.rho) * iv;
                 tm[0] -= (fh.mx - fl.mx) * iv;
@@ -182,9 +184,9 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, Real mu,
                 tm[2] -= (fh.mz - fl.mz) * iv;
                 tE -= (fh.E - fl.E) * iv;
             } else {
-                const Flux fh = faceFlux(g, mu, kappa, q, i, j, k, a);
+                const Flux fh = faceFlux(g, vv, q, i, j, k, a);
                 const Flux fl =
-                    faceFlux(g, mu, kappa, q, i - ox, j - oy, k - oz, a);
+                    faceFlux(g, vv, q, i - ox, j - oy, k - oz, a);
                 trho -= (fh.rho - fl.rho) / hh[a];
                 tm[0] -= (fh.mx - fl.mx) / hh[a];
                 tm[1] -= (fh.my - fl.my) / hh[a];
@@ -210,10 +212,13 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, Real mu,
         const Real un = vc[a];
         const Real dun = dn(vf[a]), dp_ = dn(q.p), dr_ = dn(q.rho);
 
+        // Thermal inflow (invRT = 1/(R TInf), 0 = off): the entropy target is
+        // the density the target temperature implies at the LOCAL pressure.
+        const Real rTgt = invRT > Real(0) ? p * invRT : rhoI;
         Real L1, L2, L3, L4, L5;
         if (a == 0 && !hi) { // stiff subsonic inflow: only L1 leaves
             L1 = (un - cs) * (dp_ - r * cs * dun);
-            L2 = etaIn * cs * c2 * invL[0] * (r - rhoI);
+            L2 = etaIn * cs * c2 * invL[0] * (r - rTgt);
             L3 = etaIn * cs * invL[0] * (vc[t1] - tgt[t1]);
             L4 = etaIn * cs * invL[0] * (vc[t2] - tgt[t2]);
             L5 = etaIn * omM2 * r * c2 * invL[0] * (un - tgt[0]);
@@ -245,7 +250,7 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, Real mu,
                 const Real Lout2 = un * (c2 * dr_ - dp_);
                 const Real Lout3 = un * dn(vf[t1]);
                 const Real Lout4 = un * dn(vf[t2]);
-                const Real Lin2 = etaLat * cs * c2 * invL[a] * (r - rhoI);
+                const Real Lin2 = etaLat * cs * c2 * invL[a] * (r - rTgt);
                 const Real Lin3 = etaLat * cs * invL[a] * (vc[t1] - tgt[t1]);
                 const Real Lin4 = etaLat * cs * invL[a] * (vc[t2] - tgt[t2]);
                 const Real w =
@@ -270,13 +275,21 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, Real mu,
         dpdt += -Real(0.5) * (L1 + L5);
     }
 
-    krho[c] = drdt + trho;
-    kmx[c] = vc[0] * drdt + r * dvdt[0] + tm[0];
-    kmy[c] = vc[1] * drdt + r * dvdt[1] + tm[1];
-    kmz[c] = vc[2] * drdt + r * dvdt[2] + tm[2];
-    kE[c] = dpdt / (gam - Real(1)) +
+    // The characteristic rhs REPLACES the interior one on this row, and is
+    // written through the stage combination the interior cells used (comp.hpp,
+    // StageCombine) -- still an rhs overwrite, never a state overwrite.
+    const Real rhs[5] = {
+        drdt + trho,
+        vc[0] * drdt + r * dvdt[0] + tm[0],
+        vc[1] * drdt + r * dvdt[1] + tm[1],
+        vc[2] * drdt + r * dvdt[2] + tm[2],
+        dpdt / (gam - Real(1)) +
             Real(0.5) * (vc[0] * vc[0] + vc[1] * vc[1] + vc[2] * vc[2]) * drdt +
-            r * (vc[0] * dvdt[0] + vc[1] * dvdt[1] + vc[2] * dvdt[2]) + tE;
+            r * (vc[0] * dvdt[0] + vc[1] * dvdt[1] + vc[2] * dvdt[2]) + tE};
+    Real* out[5] = {orho, omx, omy, omz, oE};
+    for (int v = 0; v < 5; ++v)
+        out[v][c] = cmb.ca * cmb.a[v][c] + cmb.cb * cmb.b[v][c] +
+                    cmb.cr * rhs[v];
 }
 
 // Shared launch: both public apply overloads funnel here; the remap type
@@ -284,8 +297,8 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, Real mu,
 template <class Remap>
 void launchNscbc(const GpuGrid& g, const DeviceCompNscbc::Config& c, double u,
                  double cInf, double Q, const DeviceComp& d,
-                 const DeviceCompState& s, DeviceCompState& k, const Remap& R,
-                 const CurvView& cv)
+                 const DeviceCompState& s, DeviceCompState& out,
+                 const StageCombine& cmb, const Remap& R, const CurvView& cv)
 {
     const double M = u / cInf;
     const PrimView q{s.rho.data(), d.u().data(), d.v().data(), d.w().data(),
@@ -300,14 +313,16 @@ void launchNscbc(const GpuGrid& g, const DeviceCompNscbc::Config& c, double u,
     const double a2 = c.aBody * c.aBody;
     const double dbl = g.nz == 1 ? u * a2 : 0.5 * u * a2 * c.aBody;
     kNscbcCells<<<launchBlocks(nb), blockSize>>>(
-        g, R, cv, d.mu(), d.kappaCond(), Real(c.gamma), q, int(c.openY),
+        g, R, cv, viscView(d.transport()), Real(c.gamma), q, int(c.openY),
         int(c.openZ), c.floorRows,
         Real(1.0 / (g.nx * g.hx)), Real(1.0 / (g.ny * g.hy)),
         Real(1.0 / (g.nz * g.hz)), Real(c.sigma), Real(c.etaIn),
         Real(1.0 - M * M), Real(betaT), Real(c.sigLat), Real(c.etaLat),
         Real(u), Real(c.rhoInf), Real(c.pInf), int(c.potCorrect), Real(Q),
-        Real(dbl), Real(c.xc), Real(c.yc), Real(c.zc), k.rho.data(),
-        k.mx.data(), k.my.data(), k.mz.data(), k.E.data());
+        Real(dbl), Real(c.xc), Real(c.yc), Real(c.zc),
+        Real(c.thermalInflow ? 1.0 / (c.Rgas * c.TInf) : 0.0), cmb,
+        out.rho.data(),
+        out.mx.data(), out.my.data(), out.mz.data(), out.E.data());
     checkLastKernel("kNscbcCells");
 }
 
@@ -328,7 +343,8 @@ std::expected<DeviceCompNscbc, hipError_t> DeviceCompNscbc::make(const Grid& g,
                       std::isfinite(c.xc) && std::isfinite(c.yc) &&
                       std::isfinite(c.zc))) &&
                     c.floorRows >= -1 && c.floorRows <= g.ny - 5 &&
-                    (c.floorRows < 0 || (!c.openY && !c.openZ));
+                    (c.floorRows < 0 || (!c.openY && !c.openZ)) &&
+                    (!c.thermalInflow || (c.TInf > 0 && c.Rgas > 0));
     if (!ok) return std::unexpected(hipErrorInvalidValue);
     return DeviceCompNscbc(g, c);
 }
@@ -340,9 +356,10 @@ DeviceCompNscbc::DeviceCompNscbc(const Grid& g, const Config& c)
 }
 
 void DeviceCompNscbc::apply(const DeviceComp& d, const DeviceCompState& s,
-                            DeviceCompState& k) const
+                            DeviceCompState& out, const StageCombine& cmb) const
 {
-    launchNscbc(g_, c_, u_, cInf_, Q_, d, s, k, IdentityRemap{}, CurvView{});
+    launchNscbc(g_, c_, u_, cInf_, Q_, d, s, out, cmb, IdentityRemap{},
+                CurvView{});
 }
 
 namespace {
@@ -363,19 +380,21 @@ bool curvViewOf(const DeviceComp& d, CurvView& cv)
 } // namespace
 
 void DeviceCompNscbc::apply(const DeviceComp& d, const DeviceCompState& s,
-                            DeviceCompState& k, const TanhStretchY& remap) const
+                            DeviceCompState& out, const StageCombine& cmb,
+                            const TanhStretchY& remap) const
 {
     CurvView cv;
     if (!curvViewOf(d, cv)) return;
-    launchNscbc(g_, c_, u_, cInf_, Q_, d, s, k, remap, cv);
+    launchNscbc(g_, c_, u_, cInf_, Q_, d, s, out, cmb, remap, cv);
 }
 
 void DeviceCompNscbc::apply(const DeviceComp& d, const DeviceCompState& s,
-                            DeviceCompState& k, const AxisRemap3& remap) const
+                            DeviceCompState& out, const StageCombine& cmb,
+                            const AxisRemap3& remap) const
 {
     CurvView cv;
     if (!curvViewOf(d, cv)) return;
-    launchNscbc(g_, c_, u_, cInf_, Q_, d, s, k, remap, cv);
+    launchNscbc(g_, c_, u_, cInf_, Q_, d, s, out, cmb, remap, cv);
 }
 
 } // namespace dns::gpu

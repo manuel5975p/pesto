@@ -115,6 +115,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     else if (sub == "hit") c.sub = Subcommand::Hit;
     else if (sub == "bench") c.sub = Subcommand::Bench;
     else if (sub == "channel") c.sub = Subcommand::Channel;
+    else if (sub == "conv") c.sub = Subcommand::Conv;
     else
         return std::unexpected(CliError{
             "dns: unknown subcommand '" + string(sub) + "'\n"
@@ -133,6 +134,12 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                               c.nz = 160; c.physics = Physics::Compressible;
                               c.stretch = 2.0; c.kick = 0.2; c.cfl = 0.4;
                               break;
+    // A cube of cells over a layer twice as wide as it is tall, and a trip
+    // small enough to leave the conduction state visible before it grows.
+    case Subcommand::Conv: c.out = "conv"; c.n = 128; c.ny = 64; c.nz = 128;
+                           c.physics = Physics::Compressible; c.kick = 0.02;
+                           c.cfl = 0.4; c.mach = 0.05; c.tt = 30;
+                           c.profileDt = 0.0; break;
     }
 
     // Numeric / string options valid in this subcommand.
@@ -153,6 +160,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--bumps", &c.bumps}, {"--bump-h", &c.bumpH},
              {"--scale", &c.scale}, {"--pitch", &c.pitch}, {"--yaw", &c.yaw},
              {"--mach", &c.mach}, {"--les", &c.les}, {"--cfl", &c.cfl},
+             {"--tinf", &c.tinf}, {"--prandtl", &c.prandtl},
+             {"--twall", &c.twall},
              {"--penalize", &c.penalize},
              {"--sponge-cells", &c.spongeCells}, {"--fringe-axes", &c.fringeAxes},
              {"--nscbc-beta", &c.nscbcBeta}, {"--nscbc-strip", &c.nscbcStrip},
@@ -160,6 +169,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--focal-ratio", &c.focalRatio},
              {"--focal-blend", &c.focalBlend},
              {"--focal-wake", &c.focalWake}, {"--focal-pad", &c.focalPad},
+             {"--ogrid-far", &c.ogridFar}, {"--ogrid-beta", &c.ogridBeta},
              {"--ramp", &c.ramp}, {"--kick", &c.kick}, {"--tol", &c.tol},
              {"--max-iters", &c.maxIters}, {"--dt-recompute", &c.dtRecompute},
              {"--steady", &c.steady}, {"--seq", &c.seq},
@@ -172,12 +182,24 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         add({{"--urms", &c.urms}, {"--nu", &c.nu}, {"--spin", &c.spin},
              {"--stats", &c.stats}, {"--fdt", &c.fdt}});
     if (c.sub == Subcommand::Bench)
-        add({{"--steps", &c.steps}});
+        add({{"--steps", &c.steps}, {"--nu", &c.nu}, {"--mach", &c.mach},
+             {"--les", &c.les}});
     if (c.sub == Subcommand::Channel)
         add({{"--ny", &c.ny}, {"--re-tau", &c.reTau}, {"--mach", &c.mach},
              {"--stretch", &c.stretch}, {"--kick", &c.kick},
              {"--tt", &c.tt}, {"--lx", &c.lx}, {"--lz", &c.lzBox},
              {"--cfl", &c.cfl}, {"--dt-recompute", &c.dtRecompute},
+             {"--profile-dt", &c.profileDt},
+             {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
+             {"--planes", &c.planes}, {"--png-down", &c.pngDown}});
+    if (c.sub == Subcommand::Conv)
+        add({{"--ny", &c.ny}, {"--rayleigh", &c.rayleigh},
+             {"--dtemp", &c.dtemp}, {"--aspect", &c.convAspect},
+             {"--hot-patch", &c.hotPatch},
+             {"--prandtl", &c.prandtl}, {"--tinf", &c.tinf},
+             {"--mach", &c.mach}, {"--kick", &c.kick},
+             {"--tt", &c.tt}, {"--cfl", &c.cfl},
+             {"--dt-recompute", &c.dtRecompute},
              {"--profile-dt", &c.profileDt},
              {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
              {"--planes", &c.planes}, {"--png-down", &c.pngDown}});
@@ -188,11 +210,17 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         {"--backend", {{"cpu", int(Backend::Cpu)}, {"gpu", int(Backend::Gpu)},
                        {"auto", int(Backend::Auto)}}, &backendSel},
     };
-    if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench)
+    if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench
+        || c.sub == Subcommand::Conv)
         enums.push_back({"--physics",
                          {{"incompressible", int(Physics::Incompressible)},
                           {"compressible", int(Physics::Compressible)}},
                          &physicsSel});
+    if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench)
+        enums.push_back({"--sgs",
+                         {{"smag", int(SgsModel::Smagorinsky)},
+                          {"sigma", int(SgsModel::Sigma)}},
+                         &sgsSel});
     if (c.sub == Subcommand::Flow)
     {
         enums.push_back({"--far",
@@ -202,18 +230,20 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                           {"nscbc", int(FarField::Nscbc)},
                           {"periodic", int(FarField::Periodic)}},
                          &farSel});
-        enums.push_back({"--sgs",
-                         {{"smag", int(SgsModel::Smagorinsky)},
-                          {"sigma", int(SgsModel::Sigma)}},
-                         &sgsSel});
         enums.push_back({"--vort-map",
                          {{"linear", 0}, {"asinh", 1}}, &c.vortMap});
         enums.push_back({"--speed-map",
                          {{"abs", 0}, {"delta", 1}}, &c.speedMap});
     }
-    if (c.sub == Subcommand::Channel)
+    if (c.sub == Subcommand::Flow || c.sub == Subcommand::Channel)
         enums.push_back({"--wall", {{"isothermal", 1}, {"adiabatic", 0}},
                          &c.wallIso});
+    if (c.sub == Subcommand::Flow || c.sub == Subcommand::Conv)
+        enums.push_back({"--visc", {{"constant", 0}, {"sutherland", 1}},
+                         &c.visc});
+    if (c.sub == Subcommand::Conv)
+        enums.push_back({"--sides", {{"periodic", 0}, {"closed", 1}},
+                         &c.sides});
 
     // Boolean flags (no value).
     std::vector<std::pair<const char*, bool*>> flags{
@@ -226,6 +256,9 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         flags.push_back({"--pot", &c.farPot});
         flags.push_back({"--cut-flux", &c.cutFlux});
         flags.push_back({"--noslip", &c.noslip});
+        flags.push_back({"--nscbc-tinflow", &c.nscbcTinflow});
+        flags.push_back({"--ogrid", &c.ogrid});
+        flags.push_back({"--temp", &c.tempFrames});
     }
 
     std::vector<string> known;
@@ -411,6 +444,7 @@ subcommands:
   tgv     Taylor-Green vortex — 2D analytic check or 3D Re1600 benchmark
   hit     forced homogeneous isotropic turbulence (SI-configured)
   channel wall-resolved turbulent channel flow (compressible, forced)
+  conv    Rayleigh-Bénard convection: heated floor, cooled lid, gravity
   bench   step-time and throughput benchmark
 
 common options (every subcommand):
@@ -623,6 +657,56 @@ MESH & WALLS (compressible)
                      (boundary layers grow on them) instead of
                      free-slip. Rejected with --open.
 
+BODY-FITTED O-GRID (compressible)
+  --ogrid            wrap the body in an ANNULAR body-fitted mesh instead
+                     of immersing it in a Cartesian box. The inner mesh
+                     boundary IS the body surface, so there are no cut
+                     cells and no ghost staircase: the wall is resolved
+                     exactly, forces and the wall heat flux are exact
+                     surface integrals, and the sub-cell boundary layer
+                     that forces the upstream ripples is gone.
+                     The domain becomes the DISC of radius --ogrid-far
+                     around the body, so --n is the ANGULAR cell count
+                     and --ny the RADIAL one (two of which are ghost
+                     rows). Rejects --focal/--stretch/--cut-flux/
+                     --penalize/--open/--far/--dr/--seq: those all
+                     describe a box with a body immersed in it.
+                     Bodies with a z-invariant cross-section only
+                     (cylinder, lens, cube, z-invariant mesh) -- a
+                     sphere would need a 3D O-grid, whose polar axis is
+                     a mesh singularity.
+  --ogrid-far R      far-boundary radius, in diameters.               [20]
+  --ogrid-beta B     radial tanh clustering toward the wall; 0 =
+                     uniform. Higher = thinner first cell.             [3]
+
+THERMAL (compressible only; every knob is off by default, and a run
+that names none of them is bit-for-bit the constant-viscosity,
+adiabatic-wall solver every published anchor was measured on)
+  --visc constant|sutherland
+                     viscosity law. `sutherland` makes mu and the
+                     conductivity kappa = mu cp / Pr functions of the
+                     local temperature (air, S = 110.4 K); the
+                     face value uses the face-average T, so the scheme
+                     stays exactly conservative.               [constant]
+  --tinf K           freestream STATIC temperature in kelvin. The
+                     solver works in box units where T carries the
+                     scale 1/(gamma M^2); this is the one dimensional
+                     anchor Sutherland's law needs, and nothing else
+                     reads it.                                  [288.15]
+  --prandtl P        molecular Prandtl number.                    [0.72]
+  --wall adiabatic|isothermal
+                     the BODY surface condition. Adiabatic is the
+                     historical wall (zero wall-normal dT/dn).
+                                                              [adiabatic]
+  --twall RATIO      isothermal wall temperature, as a ratio Twall/Tinf.
+                     Requires --wall isothermal.                     [1]
+  --nscbc-tinflow    NSCBC entropy inflow holds the TEMPERATURE
+                     (rho -> p/(R Tinf) at the local pressure) instead
+                     of the density. The two agree at the fixed point;
+                     the density form lets the inflow temperature drift
+                     with the incoming pressure, which is wrong once
+                     transport depends on T or a wall exchanges heat.
+
 START-UP
   --ramp T           quiet start: IC at rest, freestream raised
                      smoothly over [0,T] (compressible: uniform
@@ -640,7 +724,13 @@ START-UP
 SOLVER
   --tol RMS          CG per-cell RMS residual target (incomp)      [1e-4]
   --max-iters N      CG iteration cap                               [500]
-  --dt-recompute N   steps between stableDt recomputes (comp)        [16]
+  --dt-recompute N   steps between stableDt recomputes. The dt reduction
+                     is one mandatory device reduction and host sync per
+                     step; N > 1 amortizes it, with a safety margin on
+                     the reused dt. Default 16 on the compressible
+                     cylinder (a validated perf fix), 1 everywhere else --
+                     raising it CHANGES THE TRAJECTORY (not the
+                     statistics).                                 [16 / 1]
 
 RUN LENGTH
   --ft N             flow-throughs to integrate                      [20]
@@ -700,6 +790,14 @@ OUTPUT (--emit is repeatable; default = stats,bin)
                      asinh (linear toe = vort-max/32, log above: BL and
                      weak wake filaments both read at high Re). Display
                      only -- bin/web data stay raw.             [linear]
+  --temp             add a THIRD frame channel, temp = T - Tinf, on the
+                     diverging map (freestream = neutral background, hot red,
+                     cold blue). Compressible only. Off by default because it
+                     changes what every artefact of the run contains: one more
+                     png series, one more web/shm plane. The clip is the
+                     larger of the isothermal wall's offset and the stagnation
+                     rise (gamma-1)/2 M^2 Tinf, so an adiabatic body still
+                     reads.
   --speed-map M      abs: |u| on viridis, 0..1.6 uInf. delta: frames carry
                      dspeed = |u| - uInf on the diverging map (freestream
                      = background, overspeed red, deficit blue); bin
@@ -785,13 +883,133 @@ OUTPUT
                      2D or 3D)
   --fdt/--pdt/--wdt  frame cadences as in dns flow
 )";
+    case Subcommand::Conv:
+        return
+R"(dns conv — Rayleigh-Bénard convection
+
+Compressible DNS of a fluid layer heated from below: no-slip isothermal walls
+(hot floor, cold lid), periodic or closed sides, gravity in -y. There is no body, no
+free stream and no forcing besides the heated floor -- buoyancy is gravity
+acting on the density the equation of state already gives, so nothing here is
+Boussinesq-approximated.
+
+Box units: layer height H = 1, mid-layer temperature Tref = 1, R = rho_ref = 1
+(hence p_ref = 1 and the reference sound speed is sqrt(gamma) = 1.183).
+
+STRATIFICATION -- the one thing that is not textbook Rayleigh-Bénard. Gravity
+carries its own adiabatic temperature gradient g/cp, so only the SUPERADIABATIC
+excess dTsuper = dtemp - (g/cp) H drives convection (Schwarzschild). --rayleigh
+is defined on dTsuper, so its critical value is the textbook ~1708; the
+reported Nusselt numbers are normalised on the FULL imposed drop, so quiescent
+conduction reads exactly Nu = 1. The adiabatic fraction is M^2 (gamma-1)/dtemp^2
+-- it vanishes quadratically as --mach drops toward the Boussinesq limit, and a
+subadiabatic (stably stratified) layer is REJECTED, not silently run.
+
+GRID
+  --n N              lateral FLUID cells in x                       [128]
+  --ny N             wall-normal FLUID cells (two mirror ghost rows
+                     are added internally)                           [64]
+  --nz N             spanwise FLUID cells (z); 1 = native 2D
+                     (qualitative only -- no vortex stretching)     [128]
+  --aspect A         box width and depth in layer heights            [2]
+  --sides periodic|closed                                    [periodic]
+                     the LATERAL faces. periodic: an unbounded layer
+                     sampled over one box, the classical Rayleigh-Benard
+                     setup. closed: a sealed cavity -- x (and z when
+                     nz > 1) become no-slip ADIABATIC walls, carried by
+                     the same one-cell ghost ring as the plates, so the
+                     grid gains two cells per closed axis while the fluid
+                     extent stays --aspect * H. Rolls then have a fixed
+                     count set by the aspect ratio and the corner regions
+                     are viscously braked, so Nu comes out BELOW the
+                     periodic value at the same Ra: an aspect-ratio
+                     dependent cavity number, not the textbook one, and
+                     neither the ~1708 onset nor the Ra-Nu scaling of the
+                     unbounded layer applies to it. The deficit shrinks as
+                     the box widens -- measured 8-15% at --aspect 2.
+                     Both physics carry it; at nz == 1 only x closes,
+                     because the 2D restriction is exact periodic wrap
+                     in z.
+  --hot-patch F      heat only a CENTRED fraction F of the floor, in
+                     (0,1]; outside it the floor sits at the lid
+                     temperature. 1 = the uniformly heated plate, and a
+                     run omitting the flag is bit-for-bit that. In 3D the
+                     fraction applies to both x and z (a centred square
+                     patch of side F*L); at nz == 1 it is the middle
+                     strip in x, which is the 2D reading. F = 1/3 heats
+                     the middle third.
+                     With F < 1 the layer is no longer classical
+                     Rayleigh-Benard: there is no 1D conduction state, the
+                     onset Ra ~ 1708 does not apply, and the reported
+                     nuBot becomes the NET floor-area-averaged heat flux
+                     (the cold surround absorbs heat) rather than a
+                     Nusselt number.                                   [1]
+
+PHYSICS
+  --physics compressible|incompressible                 [compressible]
+                     compressible: density is a state variable, the time
+                     step is acoustic, and the layer is stratified (see
+                     above). incompressible: the BOUSSINESQ limit, taken
+                     analytically -- divergence-free velocity, density kept
+                     only in the buoyancy term. No sound speed, hence no
+                     acoustic dt (the same case runs ~40x fewer steps), no
+                     stratification and no adiabatic gradient, so Ra and Nu
+                     are measured against the same full drop. Free-fall
+                     scaling pins H = dT = g*alpha = 1, so
+                     nu = sqrt(Pr/Ra), kappa = 1/sqrt(Ra Pr) and the
+                     free-fall time is exactly 1.
+                     These are two MODELS, not two solvers for one problem:
+                     --mach, --dtemp, --visc sutherland and --tinf only mean
+                     something against a sound speed and are REJECTED on the
+                     incompressible branch rather than ignored. --sides,
+                     --hot-patch and the grid are shared by both.
+  --rayleigh RA      Rayleigh number on the superadiabatic drop    [1e6]
+                     (below ~1708 the layer only conducts)
+  --dtemp E          imposed (Tfloor - Tlid)/Tref; the walls sit at
+                     1 +/- E/2                                     [0.1]
+  --prandtl P        molecular Prandtl number                     [0.72]
+  --mach M           M = sqrt(g dtemp H)/c: this is what SETS gravity,
+                     g = M^2 gamma / dtemp. Lower = closer to the
+                     incompressible limit and more steps per
+                     free-fall time.                               [0.05]
+  --visc constant|sutherland   viscosity law; sutherland also makes
+                     kappa = mu cp / Pr temperature-dependent  [constant]
+  --tinf K           dimensional anchor for Sutherland's 110.4 K [288.15]
+  --cfl C            Courant target                                [0.4]
+
+START-UP
+  --kick A           deterministic solenoidal trip on the hydrostatic
+                     conduction state, as a fraction of the free-fall
+                     velocity; 0 = untripped (a perfectly symmetric
+                     layer takes far longer to break)              [0.02]
+
+RUN LENGTH
+  --tt N             free-fall times H/Uff to integrate              [30]
+  --dt-recompute N   steps between stableDt recomputes               [16]
+
+OUTPUT
+  --emit stats       <out>_stats.csv (t,dt,nuBot,nuTop,nuFlux,urms,KE;
+                     incompressible adds maxDiv). nuBot/nuTop are
+                     wall-gradient Nusselt numbers, nuFlux the interior
+                     heat-flux one -- all three normalised on the FULL
+                     imposed drop, so quiescent conduction reads 1  [on]
+  --profile-dt DT    <out>_profiles.csv y-profile dump interval
+                     (t,y,T,rho,v,vT,nu); 0 = off                     [0]
+  --emit png|web|bin mid-plane frames: temp (T - Tref, diverging), speed
+                     and vorticity. png renders the centre z-plane.
+  --fdt/--pdt/--wdt  frame cadences as in dns flow
+)";
     case Subcommand::Bench:
         return
 R"(dns bench — step-time and throughput benchmark
   --n N            cells per side                                  [256]
   --steps N        timed steps after 3 warm-up steps                [20]
   --physics incompressible|compressible          [incompressible]
-  Reports ms/step, Mcell-updates/s, VRAM in use.
+  --re RE          sets the viscosity nu = 1/RE (--nu overrides)     [60]
+  --mach M         compressible only: uniform pressure 1/(gamma M^2) [0.2]
+  --les CS         compressible only: time the SGS path too          [off]
+  --sgs smag|sigma which nut(grad u) --les uses                    [smag]
+  Reports ms/step, Mcell-updates/s and the VRAM this run allocates.
 )";
     }
     return {};

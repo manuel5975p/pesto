@@ -14,7 +14,7 @@
 
 namespace dns {
 
-enum class Subcommand { Flow, Tgv, Hit, Bench, Channel };
+enum class Subcommand { Flow, Tgv, Hit, Bench, Channel, Conv };
 enum class Physics { Incompressible, Compressible };
 enum class FarField { Tunnel, Fringe, Sponge, Nscbc, Periodic };
 enum class Backend { Cpu, Gpu, Auto };
@@ -54,6 +54,15 @@ struct RawConfig
     double re = 60.0, mach = 0.2, les = 0.0, cfl = 0.0, nu = 0.0;
     SgsModel sgs = SgsModel::Smagorinsky;   // which nut(grad u), used iff les > 0
 
+    // thermal (compressible). tinf is the DIMENSIONAL freestream static
+    // temperature; it exists only to give Sutherland's 110.4 K a scale, so a
+    // constant-viscosity run never reads it. visc: 0 constant, 1 Sutherland.
+    double tinf = 288.15;
+    int visc = 0;
+    double prandtl = 0.72;
+    double twall = 1.0;        // body wall temperature, as a ratio to tinf
+    bool nscbcTinflow = false; // NSCBC entropy inflow holds T, not rho
+
     // far field
     FarField far = FarField::Tunnel;
     bool open = false;
@@ -79,6 +88,13 @@ struct RawConfig
     double focalWake = 5.0;   // auto: extra plateau downstream, in diameters
     double focalPad = 0.25;   // auto: AABB inflation, in diameters
 
+    // Body-fitted O-grid (compressible): the mesh's inner boundary IS the
+    // body surface, so there is no immersed body and no cut cell. --n is the
+    // angular cell count, --ny the radial one (two of which are ghost rows).
+    bool ogrid = false;
+    double ogridFar = 20.0;  // far-boundary radius, in diameters
+    double ogridBeta = 3.0;  // radial tanh clustering toward the wall
+
     // start-up (compressible)
     double ramp = 2.0, kick = 0.05;
 
@@ -101,6 +117,7 @@ struct RawConfig
                              // instead of |curl| + sequential
     int vortMap = 0;         // 0 linear clip, 1 asinh (png display only)
     int speedMap = 0;        // 0 |u| viridis, 1 delta: |u|-uInf diverging
+    bool tempFrames = false; // --temp: add a T - Tinf frame channel
 
     // hit
     double urms = 60.0, spin = 10.0, stats = 10.0;
@@ -112,6 +129,13 @@ struct RawConfig
     double lzBox = 0;      // box span;   0 = 4 pi/3 delta (KMM)
     double profileDt = 1.0; // y-profile dump interval; 0 = off
     int wallIso = 1;       // 1 isothermal (default), 0 adiabatic
+
+    // conv (Rayleigh-Benard: heated floor, cooled lid, gravity in -y)
+    double rayleigh = 1e6;  // Rayleigh number on the SUPERADIABATIC drop
+    double dtemp = 0.1;     // imposed (Tbot - Ttop) / Tref
+    double convAspect = 2;  // Lx / H = Lz / H
+    double hotPatch = 1.0;  // heated side fraction of the floor; 1 = all of it
+    int sides = 0;          // 0 periodic lateral faces, 1 closed (--sides)
 
     // bench
     int steps = 20;
@@ -140,6 +164,13 @@ public:
     int seqLevels = 1;      // grid-sequencing levels (1 = off)
     double cs = 0, dr = 0, aspect = 0;
     SgsModel sgsModel = SgsModel::Smagorinsky;
+
+    // Thermal model (compressible). tinfK anchors Sutherland's dimensional
+    // constant; sutherland selects mu(T), kappa(T) = mu(T) cp / Pr. twallRatio
+    // is Twall / Tinf and is read only when bodyIsothermal. See
+    // dns/transport.hpp for what box-unit temperature means here.
+    double tinfK = 288.15, prandtl = 0.72, twallRatio = 1.0;
+    bool sutherland = false, bodyIsothermal = false, nscbcThermalInflow = false;
     double penalize = 0;
     double ramp = 0, kick = 0, nscbcBeta = 0;
     double scale = 0, pitch = 0, yaw = 0;
@@ -169,6 +200,13 @@ public:
     double focalGrowth = 1;   // max adjacent cell-to-cell growth ratio
     double focalDtFactor = 1; // hmin_focal / hmin_uniform (the dt penalty)
 
+    // Body-fitted O-grid (dns/ogrid.hpp). ogridRFar is resolved to WORLD
+    // units; the grid is (n angular) x (ny radial, incl. 2 ghost rows) x nz,
+    // and its reference box comes from ogridGrid(). Mutually exclusive with
+    // every immersed-body knob -- the wall is a mesh face here.
+    bool ogrid = false;
+    double ogridRFar = 0, ogridBeta = 0, ogridSpan = 0;
+
     // hit (SI inputs)
     double urms = 0, spin = 0, stats = 0;
 
@@ -180,6 +218,44 @@ public:
     double profileDt = 0;  // y-profile dump interval; 0 = off
     double lxBox = 0, lzBox = 0;
     bool wallIso = true;   // isothermal walls (adiabatic heats unboundedly)
+
+    // conv (Rayleigh-Benard; see the validate() conv branch for the full
+    // derivation). Box units: H = 1, Tref = Rgas = rho_ref = 1, so p_ref = 1
+    // and the sound speed at the reference state is sqrt(gamma).
+    //
+    // The layer is stratified, so gravity itself carries part of the imposed
+    // temperature drop: only the SUPERADIABATIC excess dTsuper = dT - (g/cp) H
+    // is available to drive convection (Schwarzschild). `rayleigh` is defined
+    // on dTsuper -- so its critical value is the textbook 1708 -- while the
+    // Nusselt numbers the runner reports are normalised on the FULL dT, which
+    // is what makes quiescent conduction read exactly Nu = 1.
+    double rayleigh = 0;   // Ra on dTsuper
+    double dtemp = 0;      // imposed dT / Tref
+    double dtempSuper = 0; // dT - (g/cp) H, > 0 (validator-enforced)
+    double gravity = 0;    // magnitude; the vector is (0, -gravity, 0)
+    double convH = 1;      // layer height, wall face to wall face
+    double tBot = 0, tTop = 0;  // isothermal wall temperatures
+    double uFreeFall = 0;  // sqrt(gravity * dTsuper / Tref * H)
+    double convAspect = 0; // Lx / H = Lz / H
+    // Side fraction of a CENTRED hot patch on the floor, in (0,1]. Outside it
+    // the floor sits at the lid temperature. 1 = the uniformly heated plate
+    // and is bit-for-bit the case without the flag. Below 1 the reported
+    // nuBot is a net floor-area-averaged flux, not a classical Nusselt number:
+    // the cold surround absorbs heat, so the Ra-Nu scaling does not apply.
+    double hotPatch = 1.0;
+    // --sides closed: the lateral faces are no-slip ADIABATIC walls instead of
+    // periodic, carried by the same one-cell ghost ring as the y plates. So
+    // the grid gains two cells in x (and in z when nz > 1, never at nz == 1 --
+    // the 2D restriction keeps z periodic) while the FLUID extent stays
+    // convAspect * H, and `nxInterior`/`nzInterior` are the fluid counts.
+    // Both physics carry it; false is bit-for-bit the periodic solver.
+    bool closedSides = false;
+    int nxInterior = 0;    // fluid cells in x (grid.nx minus the ghost ring)
+    // Boussinesq branch (--physics incompressible) only. Free-fall scaling
+    // pins H = dT = g*alpha = 1, so nu = sqrt(Pr/Ra) and kappa = 1/sqrt(Ra Pr)
+    // and the free-fall time is exactly 1. There is no Mach number and no
+    // stratification here, so dtempSuper == dtemp and gravity is not a knob.
+    double kappaDiff = 0;  // thermal diffusivity
 
     std::string outPrefix;
     std::set<Emit> emit;
@@ -194,6 +270,9 @@ public:
                              // (display only; bin/web stay raw)
     bool speedDelta = false; // frames carry dspeed = |u| - uInf (diverging,
                              // freestream = background) instead of |u|
+    bool tempFrames = false; // --temp: frames carry a third channel, T - Tinf
+                             // on the diverging map. Off by default: it
+                             // changes what every artefact of the run holds.
 
     RunMeta meta;
 

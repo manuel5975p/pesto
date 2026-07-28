@@ -1,5 +1,6 @@
 #include "dns/curvmesh.hpp"
 
+#include <cassert>
 #include <cmath>
 #include <format>
 
@@ -25,6 +26,35 @@ int floorDiv(int i, int n)
     int q = i / n;
     if (i % n < 0) --q;
     return q;
+}
+
+// One axis of node(), resolved: the stored rows this index reads, their
+// weights, and the box image added to that axis' coordinate. Two rows are
+// enough -- Extend is the only mode that needs more than one.
+struct AxisTerms
+{
+    int idx[2] = {0, 0};
+    double w[2] = {1.0, 0.0};
+    int n = 1;          // active terms
+    double shift = 0.0; // Translate image, added to this axis' coordinate
+};
+
+AxisTerms axisTerms(AxisWrap mode, int i, int n, double h)
+{
+    if (mode == AxisWrap::Extend) {
+        assert(n >= 2); // build() rejects a degenerate Extend axis
+        // node(i) = node(0) + i (node(1) - node(0)) below the bottom, and
+        // node(n-1) + s (node(n-1) - node(n-2)), s = i-n+1, above the top.
+        if (i < 0) return {{0, 1}, {1.0 - i, double(i)}, 2, 0.0};
+        if (i >= n) {
+            const double s = i - n + 1;
+            return {{n - 1, n - 2}, {1.0 + s, -s}, 2, 0.0};
+        }
+        return {{i, 0}, {1.0, 0.0}, 1, 0.0};
+    }
+    const int q = floorDiv(i, n);
+    const double shift = mode == AxisWrap::Translate ? q * n * h : 0.0;
+    return {{i - q * n, 0}, {1.0, 0.0}, 1, shift};
 }
 
 // Signed volume of tetra (o, a, b, c) times 6.
@@ -87,10 +117,25 @@ CurvMesh CurvMesh::channelY(const Grid& g, double beta, double delta)
 
 std::array<double, 3> CurvMesh::node(int i, int j, int k) const
 {
-    const int qi = floorDiv(i, g.nx), qj = floorDiv(j, g.ny), qk = floorDiv(k, g.nz);
-    const std::size_t c = g.idx(i - qi * g.nx, j - qj * g.ny, k - qk * g.nz);
-    return {x[c] + qi * g.nx * g.hx, y[c] + qj * g.ny * g.hy,
-            z[c] + qk * g.nz * g.hz};
+    const AxisTerms A = axisTerms(wrap[0], i, g.nx, g.hx);
+    const AxisTerms B = axisTerms(wrap[1], j, g.ny, g.hy);
+    const AxisTerms C = axisTerms(wrap[2], k, g.nz, g.hz);
+    // The (0,0,0) term carries weight exactly 1 whenever every axis is
+    // single-term, so all-Translate reproduces `x[c] + q nx hx` bit-for-bit.
+    const std::size_t c0 = g.idx(A.idx[0], B.idx[0], C.idx[0]);
+    const double w0 = A.w[0] * B.w[0] * C.w[0];
+    double p[3] = {w0 * x[c0], w0 * y[c0], w0 * z[c0]};
+    for (int c = 0; c < C.n; ++c)
+        for (int b = 0; b < B.n; ++b)
+            for (int a = 0; a < A.n; ++a) {
+                if (a == 0 && b == 0 && c == 0) continue;
+                const std::size_t s = g.idx(A.idx[a], B.idx[b], C.idx[c]);
+                const double w = A.w[a] * B.w[b] * C.w[c];
+                p[0] += w * x[s];
+                p[1] += w * y[s];
+                p[2] += w * z[s];
+            }
+    return {p[0] + A.shift, p[1] + B.shift, p[2] + C.shift};
 }
 
 std::expected<CurvMetrics, std::string> CurvMetrics::build(const CurvMesh& m)
@@ -108,9 +153,17 @@ std::expected<CurvMetrics, std::string> CurvMetrics::build(const CurvMesh& m)
                 return std::unexpected(
                     "nz == 1 requires a planar node layer (constant z), or the "
                     "exact 2D restriction breaks");
+    const int na[3] = {g.nx, g.ny, g.nz};
+    for (int a = 0; a < 3; ++a)
+        if (m.wrap[a] == AxisWrap::Extend && na[a] < 2)
+            return std::unexpected(std::format(
+                "axis {} is Extend but has {} cell(s): linear extension needs "
+                "two node rows",
+                a, na[a]));
 
     CurvMetrics t;
     t.g = g;
+    t.wrap = m.wrap;
     for (int a = 0; a < 3; ++a) {
         for (int c = 0; c < 3; ++c) t.S[a][c].assign(n, 0.0);
         for (int e = 0; e < 9; ++e) t.Ji[a][e].assign(n, 0.0);
@@ -205,8 +258,14 @@ std::expected<CurvMetrics, std::string> CurvMetrics::build(const CurvMesh& m)
             for (int i = 0; i < g.nx; ++i) {
                 const std::size_t c = g.idx(i, j, k);
                 for (int a = 0; a < 3; ++a) {
+                    const int li[3] = {i - (a == 0), j - (a == 1), k - (a == 2)};
+                    // An Extend axis has no lo neighbour at index 0: the wrap
+                    // would read the far end's face. Clamp to the cell's own
+                    // face, the only local width there is.
+                    const bool clamp =
+                        m.wrap[a] == AxisWrap::Extend && li[a] < 0;
                     const std::size_t lo =
-                        g.idx(i - (a == 0), j - (a == 1), k - (a == 2));
+                        clamp ? c : g.idx(li[0], li[1], li[2]);
                     auto norm = [&](std::size_t f) {
                         return std::sqrt(t.S[a][0][f] * t.S[a][0][f] +
                                          t.S[a][1][f] * t.S[a][1][f] +

@@ -118,8 +118,52 @@ Doc::~Doc()
 
 // DocState -> RawConfig. Free, because both the (const) accessor and the
 // worker thread need it and the worker must not touch a Doc.
+// The convection half of rawFrom. Split out because it shares almost nothing
+// with the body-flow case: no body, no far field, no --dr, and its Rayleigh
+// number comes from the SI face rather than a --re.
+static dns::RawConfig rawConvFrom(const DocState& s)
+{
+    dns::RawConfig r;
+    r.sub = dns::Subcommand::Conv;
+    r.out = "conv";
+    r.n = s.n;
+    r.ny = s.ny > 0 ? s.ny : s.n;
+    r.nz = s.nz;
+    r.physics = s.convPhysics == 1 ? dns::Physics::Compressible
+                                   : dns::Physics::Incompressible;
+    r.rayleigh = s.convRayleigh();
+    r.prandtl = s.prandtl;
+    r.convAspect = s.convAspect;
+    r.hotPatch = s.hotPatch;
+    r.sides = s.convSides;
+    r.tt = s.convTt;
+    r.kick = s.convKick;
+    r.wdt = s.wdt;
+    r.given = {"--n", "--ny", "--nz", "--physics", "--rayleigh", "--prandtl",
+               "--aspect", "--tt", "--kick", "--wdt"};
+    if (s.hotPatch < 1.0) r.given.insert("--hot-patch");
+    if (s.convSides == 1) r.given.insert("--sides");
+    // Compressible-only knobs. The Boussinesq branch REJECTS these by name
+    // rather than ignoring them, so offering them there would be offering an
+    // error -- see the validator's conv branch.
+    if (s.convPhysics == 1) {
+        r.mach = s.convMach;
+        r.dtemp = s.convDtemp();
+        r.visc = s.visc;
+        r.given.insert("--mach");
+        r.given.insert("--dtemp");
+        if (s.visc == 1) {
+            r.tinf = s.convTmean;
+            r.given.insert("--visc");
+            r.given.insert("--tinf");
+        }
+    }
+    return r;
+}
+
 static dns::RawConfig rawFrom(const DocState& s)
 {
+    if (s.isConv()) return rawConvFrom(s);
     dns::RawConfig r;
     r.sub = dns::Subcommand::Flow;
     r.out = "flow";
@@ -193,6 +237,35 @@ static dns::RawConfig rawFrom(const DocState& s)
         r.given.insert("--sgs");
     }
 
+    // Thermal knobs (compressible only, and the validator says so for every
+    // one of them). Marked `given` only when they are actually engaged: a
+    // document that leaves them alone must export the command it always did,
+    // because that is what keeps the measured anchors valid.
+    if (s.physics == 1) {
+        r.prandtl = s.prandtl;
+        r.given.insert("--prandtl");
+        if (s.visc == 1) {
+            r.visc = 1;
+            r.tinf = s.tinf;
+            r.given.insert("--visc");
+            r.given.insert("--tinf");
+        }
+        if (s.wallIso) {
+            r.wallIso = 1;
+            r.twall = s.twall;
+            r.given.insert("--wall");
+            r.given.insert("--twall");
+        }
+        if (s.nscbcTinflow) {
+            r.nscbcTinflow = true;
+            r.given.insert("--nscbc-tinflow");
+        }
+        if (s.tempFrames) {
+            r.tempFrames = true;
+            r.given.insert("--temp");
+        }
+    }
+
     if (s.physics == 1 && s.focalAuto) {
         r.focal = "auto";
         r.focalRatio = s.focalRatio;
@@ -261,6 +334,48 @@ void Doc::build(const DocState& s, uint64_t rev, Build& out)
     }
     out.caseOpt = *cas;
     out.describe = cas->describe();
+
+    if (s.isConv()) {
+        // A convection cell has no body, so there is no sdf to sample and no
+        // cut to sanitize -- the whole geometry stage is skipped, which is also
+        // why a conv document rebuilds instantly at any resolution. The cut is
+        // filled all-fluid so every viewport layer that walks it finds nothing
+        // solid rather than walking an empty array.
+        const dns::Grid& g = out.cas().grid;
+        out.geo.cut = dns::CutGeometry{dns::Scalar(g.size(), 1.0),
+                                       dns::Scalar(g.size(), 1.0),
+                                       dns::Scalar(g.size(), 1.0),
+                                       dns::Scalar(g.size(), 1.0)};
+        out.geo.D = out.cas().convH;   // the layer height IS the length scale
+        out.nCells = g.size();
+        out.remap.fx = dns::Focal1D::identity(double(g.nx) * g.hx);
+        out.remap.fy = dns::Focal1D::identity(double(g.ny) * g.hy);
+        out.remap.fz = dns::Focal1D::identity(double(g.nz) * g.hz);
+        out.remapActive = false;
+
+        // The resolution question here is not a body boundary layer but the
+        // THERMAL one at the plates, delta = H / (2 Nu). Nu is not known before
+        // the run, so this uses the standard a-priori Nu ~ 0.1 Ra^(1/3) -- which
+        // runs ~20% high against this repo's own measurements (Nu 7.98 at
+        // Ra 1e6, 10.56 at 2e6), and therefore errs toward reporting the layer
+        // as thinner and the grid as coarser than it is.
+        const double nuEst =
+            out.cas().rayleigh > 0
+                ? std::max(1.0, 0.1 * std::cbrt(out.cas().rayleigh))
+                : 1.0;
+        const double dTh = out.cas().convH / (2.0 * nuEst);
+        out.dOverH = out.cas().convH / g.hy;   // cells across the layer
+        out.blCells = dTh / g.hy;
+        // Five points across the thermal layer is the usual floor for a
+        // resolved Rayleigh-Benard DNS; below it the wall gradient -- and so
+        // the Nusselt number -- is a property of the grid.
+        out.bodyResolved = out.blCells >= 5.0;
+        out.label = "DNS";
+        out.ok = true;
+        out.buildSeconds = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - t0).count();
+        return;
+    }
 
     auto geo = dns::buildCaseGeometry(*cas, scene ? &sc : nullptr);
     if (!geo) {
@@ -896,10 +1011,41 @@ std::string Doc::writeScene(const std::string& path) const
 std::vector<std::string> Doc::commandArgs(const std::string& exe,
                                           const std::string& scenePath) const
 {
+    auto add2 = [](std::vector<std::string>& v, const char* flag,
+                   const std::string& val) {
+        v.push_back(flag);
+        v.push_back(val);
+    };
+    if (st.isConv()) {
+        std::vector<std::string> c{exe, "conv"};
+        auto addc = [&](const char* f, const std::string& v) { add2(c, f, v); };
+        addc("--physics", st.convPhysics == 1 ? "compressible"
+                                              : "incompressible");
+        addc("--n", std::to_string(st.n));
+        addc("--ny", std::to_string(st.ny > 0 ? st.ny : st.n));
+        addc("--nz", std::to_string(st.nz));
+        addc("--aspect", num(st.convAspect));
+        addc("--rayleigh", num(st.convRayleigh()));
+        addc("--prandtl", num(st.prandtl));
+        if (st.convPhysics == 1) {
+            addc("--mach", num(st.convMach));
+            addc("--dtemp", num(st.convDtemp()));
+            if (st.visc == 1) {
+                addc("--visc", "sutherland");
+                addc("--tinf", num(st.convTmean));
+            }
+        }
+        if (st.hotPatch < 1.0) addc("--hot-patch", num(st.hotPatch));
+        if (st.convSides == 1) addc("--sides", "closed");
+        addc("--kick", num(st.convKick));
+        addc("--tt", num(st.convTt));
+        addc("--wdt", num(st.wdt));
+        return c;
+    }
+
     std::vector<std::string> a{exe, "flow"};
     auto add = [&](const char* flag, const std::string& v) {
-        a.push_back(flag);
-        a.push_back(v);
+        add2(a, flag, v);
     };
     add("--n", std::to_string(st.n));
     if (st.ny > 0) add("--ny", std::to_string(st.ny));
@@ -937,6 +1083,21 @@ std::vector<std::string> Doc::commandArgs(const std::string& exe,
     if (st.les > 0 && !sceneMode()) {
         add("--les", num(st.les));
         add("--sgs", st.sgs == 1 ? "sigma" : "smag");
+    }
+    // Thermal, same gating as rawFrom(): only what is engaged is printed, so
+    // the command reproduces the case that was inspected and nothing more.
+    if (st.physics == 1) {
+        add("--prandtl", num(st.prandtl));
+        if (st.visc == 1) {
+            add("--visc", "sutherland");
+            add("--tinf", num(st.tinf));
+        }
+        if (st.wallIso) {
+            add("--wall", "isothermal");
+            add("--twall", num(st.twall));
+        }
+        if (st.nscbcTinflow) a.push_back("--nscbc-tinflow");
+        if (st.tempFrames) a.push_back("--temp");
     }
     if (st.cutFlux) a.push_back("--cut-flux");
     if (st.penalize > 0) add("--penalize", num(st.penalize));

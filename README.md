@@ -1,6 +1,6 @@
 # dns — incompressible & compressible DNS/LES on a MAC grid (CPU + GPU)
 
-One binary: `build/dns <flow|tgv|hit|channel|bench> [flags]`. The 15 old apps are gone
+One binary: `build/dns <flow|tgv|hit|channel|conv|bench> [flags]`. The 15 old apps are gone
 (recomposed 2026-07-20); every capability is reachable from `dns`. `dns --help`
 and `dns <sub> --help` are authoritative and kept in sync with behaviour — read
 them rather than guessing flags. Historical plan/analysis documents live in
@@ -103,6 +103,7 @@ outlines come from `hb-draw`), no widget toolkit. Full description: `docs/ui.md`
 | `tgv` | Taylor-Green vortex — 2D analytic check or 3D Re1600 benchmark |
 | `hit` | forced homogeneous isotropic turbulence (SI-configured) |
 | `channel` | wall-resolved turbulent channel flow (compressible, forced; spec: `docs/channel.md`) |
+| `conv` | Rayleigh-Bénard convection: heated floor, cooled lid, gravity |
 | `bench` | step-time and throughput benchmark |
 
 Common to every subcommand: `--backend cpu|gpu|auto` (auto), `--out PREFIX`
@@ -192,6 +193,193 @@ climbs until dt collapses: short transients only), `--cfl` 0.4. Start-up
 Run length `--tt` 30 eddy turnovers (δ/u_τ = 1), `--dt-recompute` 16. Output
 adds `--profile-dt` 1.0 (`<out>_profiles.csv`, Favre-averaged over x and z).
 
+### `conv` — Rayleigh-Bénard convection
+
+The only buoyant flow in the tree, and the only one with gravity. A fluid layer
+heated from below between no-slip **isothermal** walls at two different
+temperatures, with lateral faces that are either periodic or sealed
+(`--sides`), gravity in −y. No body, no free stream, no forcing but the heated
+floor.
+
+Buoyancy needs no model here: the solver is fully compressible, so density
+already responds to temperature through the equation of state and the whole
+effect is ρ(T)·g — one source term (`gpu/comp_conv.hpp`, `addGravityY`) added
+through the RHS hook, exactly like the channel's body force, so it rides SSP-RK3
+and leaves the fused stage kernel untouched. There is no Boussinesq
+approximation anywhere.
+
+Box units close the case: layer height H = 1, mid-layer temperature T_ref = 1,
+R = ρ_ref = 1, hence p_ref = 1 and the reference sound speed is √γ = 1.183.
+
+* **Grid** `--n` 128 (lateral FLUID cells in x), `--ny` 64 (wall-normal FLUID
+  cells; two mirror ghost rows are added internally), `--nz` 128 (spanwise FLUID
+  cells; 1 = native 2D), `--aspect` 2 (box width and depth in layer heights),
+  `--sides periodic|closed` (lateral faces: an unbounded layer or a sealed
+  cavity — see below).
+* **Physics** `--rayleigh` 1e6, `--dtemp` 0.1 (imposed (T_floor − T_lid)/T_ref;
+  the walls sit at 1 ± dtemp/2), `--prandtl` 0.72, `--mach` 0.05,
+  `--visc constant|sutherland`, `--tinf` 288.15, `--cfl` 0.4.
+* **Start-up** `--kick` 0.02 — a deterministic solenoidal trip on the
+  hydrostatic conduction state, as a fraction of the free-fall velocity.
+* **Run length** `--tt` 30 free-fall times H/U_ff, `--dt-recompute` 16.
+* **Output** `stats` = `t,dt,nuBot,nuTop,nuFlux,urms,KE`, `--profile-dt` 0
+  (`<out>_profiles.csv`: `t,y,T,rho,v,vT,nu`). Frames carry a **temp** channel
+  (T − T_ref, diverging) besides speed and vorticity.
+
+**`--mach` is what sets gravity.** M is defined as √(g·dtemp·H)/c, so
+g = M²γ/dtemp. It is therefore not an incidental knob: it fixes both how far
+the run is from the incompressible limit and how many steps a free-fall time
+costs.
+
+**Stratification is not a detail.** Gravity carries its own adiabatic
+temperature gradient g/c_p, so only the *superadiabatic* excess
+ΔT_super = dtemp − (g/c_p)·H drives convection (Schwarzschild). Two conventions
+follow, and they are deliberately different:
+
+* `--rayleigh` is defined on ΔT_super, so its critical value is the textbook
+  ~1708 and the subcritical layer really does just conduct;
+* the reported Nusselt numbers are normalised on the **full** imposed drop, so
+  quiescent conduction reads exactly Nu = 1.
+
+The adiabatic fraction is M²(γ−1)/dtemp², which vanishes quadratically as the
+Mach number drops toward the Boussinesq limit (10% at the defaults, 1.6% at
+`--mach 0.02`). A **subadiabatic** layer is stably stratified and cannot
+convect; the validator rejects it by name rather than running it to a null
+result.
+
+Measured on this repo (2D, Pr 0.72, coarse grids — pinned in `gpu_conv`, not a
+converged Nusselt measurement): Ra 1000 → Nu 1.00 and the layer stays at rest;
+Ra 2e4 → Nu 3.00; Ra 5e4 → Nu 3.81. The wall Nusselt numbers at both plates and
+the interior heat-flux one agree to well under 5%, which is the heat balance
+closing.
+
+#### `conv --physics incompressible` — the Boussinesq branch
+
+`--physics` selects the model, and the two are genuinely different models
+rather than two solvers for one problem. Boussinesq is the M → 0 limit taken
+*analytically* instead of paid for: divergence-free velocity, density variation
+retained only in the buoyancy term. Consequences:
+
+* **no sound speed, so no acoustic timestep.** dt comes from advection,
+  diffusion and free fall. The same case that costs 87 k steps compressible
+  takes ~2 k here.
+* **no stratification and no adiabatic gradient.** ΔT_super ≡ ΔT, so Ra and Nu
+  are measured against the same thing and the Schwarzschild bookkeeping the
+  compressible branch needs simply does not arise.
+* **free-fall scaling**: H = ΔT = g·α = 1, so plates sit at ±½,
+  ν = √(Pr/Ra), κ = 1/√(Ra·Pr), and U_ff = t_ff = 1 exactly — `--tt` is time.
+
+Knobs that only mean something relative to a sound speed are **rejected, not
+ignored**: `--mach` (it is what sets gravity in the compressible branch),
+`--dtemp` (the drop is scaled to 1; it would be a second name for `--rayleigh`),
+`--visc sutherland` (μ(T) is inconsistent with a divergence-free field —
+constant properties are part of the approximation), and `--tinf`.
+
+Pressure comes from `PoissonBc::PeriodicXZWallY` (`gpu/poisson.hip`): FFT over
+x and z, then an exact tridiagonal solve in y per (k_x, k_z) mode with mirror
+Neumann at the plates. No DCT, so it is exact for any n_y. Test:
+`gpu_poisson_wally`. With `--sides closed` the lateral faces are zero-flux too,
+so the box becomes the all-Neumann one and `PoissonBc::NeumannBox` takes over
+(test: `gpu_poisson_neumann`).
+
+**Cross-validation.** The two branches share the case derivation and the
+artefact sink and no physics code at all. At Ra 5e4, 2D, matched sampling
+windows: compressible Nu 3.79, Boussinesq 3.97 — 4.6% apart. Pinned in `gpu_rb`,
+banded at 15% (two different models, finite sampling, and the compressible
+branch normalises Nu on the full drop while its Ra is on the superadiabatic
+one). It is the strongest correctness statement in either path — a sign error, a
+mis-scaled buoyancy or a wrong wall condition in either one breaks it.
+
+**A trap worth knowing about.** The Boussinesq equations with symmetric plates
+are exactly equivariant under the up-down flip (y → H−y, T → −T, v → −v). A trip
+respecting that symmetry leaves the run locked in the symmetric state forever,
+and the two wall Nusselt numbers then agree to *six digits at every instant* —
+which reads as a flawless heat balance and is really the balance being
+unfalsifiable. `rbIC` carries a `cos(πy/H)` factor to break it, and `gpu_rb`
+checks both that the means agree and that the instantaneous values don't.
+
+#### `--hot-patch F` — heat only part of the floor
+
+Heats a **centred** patch of side fraction F, in (0,1]; outside it the floor
+sits at the lid temperature. Works on both `--physics` branches. `F = 1` is the
+uniformly heated plate and is **bit-for-bit** a run that omits the flag
+(pinned in `gpu_rb`).
+
+In 3D the fraction applies to *both* x and z, so it is a centred square of side
+F·L covering F² of the floor area — `--hot-patch 0.577` is a third of the area,
+`--hot-patch 0.3333` is a third of each side (11% of the area). At `--nz 1` the
+z test is vacuous and it is simply the middle strip in x, which is the 2D
+reading of "part of the floor".
+
+Below F = 1 this stops being classical Rayleigh–Bénard and the validator says
+so: there is no 1D conduction state, the Ra ≈ 1708 onset does not apply, and
+`nuBot` becomes the **net floor-area-averaged heat flux** — the cold surround
+absorbs heat, so it is not a Nusselt number and the Ra–Nu scaling is
+meaningless for it. `nuTop` remains a genuine lid Nusselt number, and the two
+still have to balance in a statistically steady state.
+
+Frame rendering follows: the temperature channel's diverging map is centred on
+the **area-mean wall temperature** rather than the mid-layer one, because with a
+small patch the bulk equilibrates near the lid and a mid-layer-centred map
+paints the whole box one colour. Identical at F = 1.
+
+#### `--sides periodic|closed` — the lateral faces
+
+`periodic` (the default) is the classical setup: an unbounded layer sampled over
+one box. `closed` is a **sealed cavity** — x, and z when `--nz > 1`, become
+**no-slip adiabatic walls**, carried by the same one-cell ghost ring the plates
+use. So the grid gains two cells per closed axis while the fluid extent stays
+`--aspect · H`, the spacing does not move, and `--n`/`--nz` keep meaning fluid
+cells. At `--nz 1` only x closes: 2D is exact periodic wrap in z, not a
+degenerate wall. Works on both `--physics` branches, and a run that omits the
+flag (or spells out `--sides periodic`) is **bit-for-bit** the periodic solver —
+verified against the pre-flag build on all four paths, 2D and 3D.
+
+Adiabatic and not isothermal on purpose: the drop across the *plates* is the
+experiment, and a conducting sidewall would be a second, uncontrolled source. So
+a side wall copies T and p (hence ρ and E, the mirrored velocity having the same
+magnitude) and antimirrors momentum; the plates keep their Dirichlet image.
+
+Pressure follows: a closed side is a zero-flux face for p exactly as a plate is,
+so the whole box becomes the all-Neumann one and the Boussinesq branch switches
+from `PoissonBc::PeriodicXZWallY` to the existing `PoissonBc::NeumannBox`. No
+mixed transform was needed. The compressible branch has no pressure solve and
+only gains the two lateral wall kernels.
+
+A cavity is a **different experiment**, not a variation on the layer, and the
+validator says so by name: the roll count is fixed by `--aspect` instead of
+selected by the flow, the corner regions are viscously braked, and Nu comes out
+*below* the periodic value at the same Ra — an aspect-ratio dependent cavity
+number, to which neither the ≈1708 onset nor the Ra–Nu scaling of the unbounded
+layer applies. The deficit is a property of the aspect ratio and shrinks as the
+box widens; everything below is at `--aspect 2`, measured 2026-07-26 on
+deterministic runs:
+
+| case | periodic | closed |
+| --- | --- | --- |
+| 2D Boussinesq (96×48) | Nu 3.97 | 3.65 |
+| 2D compressible (96×48) | Nu 3.81 | 3.38 |
+| 3D Boussinesq (32×24×32) | Nu 4.20 | 3.58 |
+
+Below onset the cavity stays exactly as quiescent as the layer (Ra 1000 → Nu
+1.00, u_rms/U_ff ~ 5e-4), which is what proves the lateral wall fill forces
+nothing. The heat balance is the leak test: with insulating sides, floor input
+can only equal lid output if nothing crosses the lateral walls — it closes to
+under 5% (2D compressible, 3D Boussinesq) and the two physics branches agree
+about the cavity to 7.3%. Pinned in `gpu_conv` and `gpu_rb`, **including a 3D
+cavity in both** — closing z brings in a second ghost ring, a third DCT axis in
+the all-Neumann solve and the z wall pass with its corner ghosts, and that is
+exactly the class of defect that leaves every 2D case green (see
+`gpu_poisson_wally`'s history). The grid, the warning and the enveloped IC are
+pinned in `conv_config`.
+
+The trip follows the walls: `convIC`/`rbIC` multiply each stream-function factor
+by an envelope that vanishes with its slope at a closed face, so the initial
+velocity respects no-slip there. On the MAC branch that is exact — u lives *on*
+the lateral wall faces and is a hard zero — and on the collocated compressible
+branch it is 2nd order in the lateral spacing, the same statement the plates
+already carried.
+
 ### `tgv`, `hit`, `bench`
 
 * `tgv`: `--n` 64, `--nz` (=n), `--re` 1600, `--nu` (overrides `--re` when > 0),
@@ -226,8 +414,9 @@ and exits 0 — use it to check a config without touching the GPU.
 ```
 cli/config (parse + validate, pure)  [+ dns/scene, dns/remap, dns/sgs]
   → bodies/geometry (sdf + cut sampling)  [+ dns/curvmesh, dns/framemap]
-    → gpu/{tunnel,bodyforce,les,cutpoisson,cutflux,derived,comp_channel}
-      → gpu/runner_{incomp,comp,channel}   (the three time loops)
+    → gpu/{tunnel,bodyforce,les,cutpoisson,cutflux,derived,comp_channel,
+           comp_conv,boussinesq}
+      → gpu/runner_{incomp,comp,channel,conv,rb}   (the time loops)
         → output (RunOutput, the one artefact sink)
 ```
 
@@ -235,7 +424,8 @@ Post-recompose additions, placed by layer: `dns/scene` (scene-file model, feeds
 config), `dns/remap` + `dns/sgs` (pure headers: axis remaps and the SGS
 operator), `dns/curvmesh` + `dns/framemap` (mesh mapping and the
 physical↔index frame raster), `gpu/cutflux` (incompressible cut-cell flux),
-`gpu/comp_channel` + `gpu/runner_channel` (the channel path).
+`gpu/comp_channel` + `gpu/runner_channel` (the channel path), `gpu/comp_conv` + `gpu/runner_conv` (buoyancy, the two-temperature
+walls and Rayleigh-Bénard).
 
 `apps/` is `dns_main.cpp` alone. `main` is four phases:
 **Parse → Validate → Acquire → Run**. Phases 1-2 touch NEITHER filesystem NOR
@@ -309,6 +499,72 @@ fast; Re60 onset needs `t > 100` or `--kick 0.3` (steady-symmetric cd 1.96 @512
 walled vs the shedding-era anchor 1.82 — a different attractor, not a bug).
 `--ramp 0` = legacy impulsive taper IC. `boostX(GpuGrid, DeviceCompState&, du)`
 is a free function in `comp.hpp` so sponge-free setups keep the quiet start.
+
+**Throughput** (RX 9070 XT / gfx1201, 256^3 periodic box, 100 timed steps,
+interleaved A/B against cc31d0d -- *not* the 20-step `bench` shape, which is
+warm-up dominated):
+
+| | before | after | |
+|---|---|---|---|
+| DNS | 35.0 ms/step (479 Mcell/s) | **13.6 (1234)** | 2.58x |
+| LES Smagorinsky | 37.5 (448) | **15.6 (1073)** | 2.40x |
+| LES sigma-model | 49.9 (336) | **16.0 (1048)** | 3.12x |
+| VRAM | 1.77 GiB | **1.46** | -18% |
+
+Sources: wrap-corrected neighbour offsets computed once per thread
+(`gpu/index.hpp`, `Offsets`) instead of ~150 `gidx` calls per cell; the RK
+combination fused into the tail of the RHS kernel (`StageCombine`), which
+removes a whole conserved state of VRAM, one full read+write pass per stage and
+three blocking host->device copies per step; and the sigma-model rewritten
+scale-normalized in FP32 without transcendentals (SS11).
+
+### 6.1 Temperature — `--visc`, `--tinf`, `--prandtl`, `--wall`, `--twall`
+
+The gas is air: diatomic and **calorically perfect** (γ = 1.4 fixed, cv
+constant). The vibrational mode is frozen below ~600 K, so γ(T) is deliberately
+not modelled and every energy conversion stays linear in T.
+
+`dns/transport.hpp` (`dns::Transport`) is the one gas object — γ, R, Pr and the
+viscosity law — and it is `DNS_HD` and trivially copyable, so the host, the CPU
+reference and the HIP kernels share it. `Comp::tr`, `DeviceComp::transport()`,
+and `gpu::viscView()` (the FP32 kernel view) are the only ways mu and kappa
+reach anything.
+
+* `--visc constant|sutherland` — the viscosity law. Default **constant**:
+  every measured anchor in this README was taken with it, and a run that names
+  none of the thermal flags is bit-for-bit the pre-thermal solver. `sutherland`
+  makes `mu(T) = mu_ref (T/T_ref)^{3/2} (T_ref+S)/(T+S)` and
+  `kappa(T) = mu(T) cp / Pr`. Evaluated **once per face on the face-average
+  temperature** — the same average the Fourier flux already uses — so both
+  sides of a face see one consistent pair and the scheme stays exactly
+  conservative (pinned in `transport`).
+* `--tinf K` (288.15) — the freestream **static** temperature in kelvin. Box
+  units carry T with the scale `T_inf = p_inf/(rho_inf R) = 1/(γ M²)`;
+  Sutherland's 110.4 K is dimensional, so this is the single anchor that maps
+  it onto that scale (`S_box = 110.4/T_inf[K] · T_inf[box]`). Nothing else
+  reads it — a constant-viscosity run never needs it.
+* `--prandtl P` (0.72) — molecular Prandtl number.
+* `--wall adiabatic|isothermal` + `--twall RATIO` — the **body** surface
+  condition. Adiabatic (the historical wall: p and rho copied through the
+  ghost, i.e. zero wall-normal dT/dn) is the default. Isothermal holds
+  `Twall = RATIO · T_inf` on the wall face via the ghost image factor that the
+  velocity mirror already uses. The surface tally reports the wall heat flux
+  alongside cd/cl.
+* `--nscbc-tinflow` — the NSCBC entropy-wave inflow relaxes toward
+  `rho -> p/(R T_inf)` at the **local** pressure instead of toward `rho_inf`.
+  The two agree at the fixed point and differ off it: the density form lets the
+  inflow temperature drift with the incoming pressure field, which is wrong the
+  moment transport depends on T or a wall exchanges heat.
+
+**The diffusive dt limit changed.** The explicit limit is now
+`0.25 h² rho_min / (mu_max · max(1, γ/Pr))`. The energy equation carries
+`kappa/(rho cv) = γ nu / Pr`, which for air is **1.94× the momentum nu** — the
+old momentum-only bound overestimated the stable dt by that factor on any
+diffusively limited run. Compressible runs are essentially always acoustically
+limited (a Re60 cylinder at D/h = 8 by ~28×), so this costs nothing in practice
+and closes a latent trap at high resolution / low Re. With Sutherland on,
+`mu_max` comes from ONE extra max-T reduction — the law is monotone in T, so
+`max mu = mu(max T)` exactly.
 
 ## 7. Boundary conditions / far field
 
@@ -774,6 +1030,87 @@ interior stencil reaches quiescent deep cells, and cd went 1.49 → −7.6 (a
 thrust). Isotropic cells make the two identical, which is why the Cartesian
 path never saw it. Pinned structurally in `test_gpu_comp_ghost_focal`.
 
+### 12.2 Body-fitted O-grid — `--ogrid` (the wall IS a mesh face)
+
+`src/dns/ogrid.*` (mesh), `src/dns/gpu/ogrid_bc.*` (boundary rows),
+`src/dns/gpu/runner_ogrid.*` (time loop); tests `ogrid`, `gpu_ogrid`.
+
+`--focal` clusters a Cartesian box around an immersed body. `--ogrid` removes
+the immersion entirely: the domain becomes the **disc** of radius
+`--ogrid-far` (in diameters, default 20) around the body, meshed as an annulus
+whose **inner boundary is the body surface**. There are no cut cells, no ghost
+staircase and no sub-cell boundary layer — which is what actually forces the
+upstream ripples (§9). Forces and the wall heat flux become exact surface
+integrals over one row of real mesh faces.
+
+Topology, following the channel's ghost-row convention wrapped into a ring:
+
+| axis | meaning | continuation | rows |
+|---|---|---|---|
+| i | angular, **clockwise** (`θ_i = −2πi/nx`) | `AxisWrap::Cyclic` | `--n` cells |
+| j | radial | `AxisWrap::Extend` | `--ny` cells **incl. 2 ghost rows** |
+| k | spanwise | `AxisWrap::Translate` | `--nz` cells, span πD |
+
+Node row 1 is the wall, node row `ny−1` the far boundary; cell 0 is the inner
+ghost (inside the solid), 1…ny−2 fluid, ny−1 the outer ghost. The ghost rows are
+overwritten by the BC every RK stage, exactly as in the channel — cell j = 0 has
+no valid lo face, so no flux divergence may be taken there.
+
+θ runs **clockwise on purpose**: `e_θ × e_r = −z`, so (increasing θ, outward r,
++z) is left-handed and every cell would come out with a negative volume, which
+`CurvMetrics::build` rejects. Anything computing an angle, a surface tangent or
+an integration orientation must use that sign or cd/cl flip.
+
+Node placement is a transfinite blend of the wall-normal ray with the radial ray,
+both scaled by one radial distribution (one-sided tanh, `--ogrid-beta`, 0 =
+uniform):
+
+```
+P(θ,t) = C + D(t)·[ (1−w(t))·Ln(θ)·n(θ) + w(t)·(F−C) ],   w = 3t²−2t³
+```
+
+so the first cell leaves the wall exactly along the normal and the outer boundary
+is an exact circle. Blending toward the fixed far POINT instead of the far RAY
+degenerates (`dP/dt(1) = 0`, the outermost cell collapses); `Ln` is the unique
+scale putting the wall-normal ray **on** the far circle, so both blended curves
+share endpoints. For a circular contour the bracket collapses to `(rFar−rw)e_r`
+for every `w` and the mesh is the **exact polar annulus** (measured: node error
+1.3e-13, face closure 1.4e-17).
+
+Scope: bodies with a **z-invariant cross-section** — cylinder, lens, cube,
+z-invariant mesh — extruded in z. `--body sphere` is **rejected**: a 3D O-grid
+around a closed surface has polar singularities (cells collapse on the axis,
+det → 0), which is a different mesh topology, not a parameter. A general wing
+needs a section that is star-shaped about the given centre; the builder reports
+the failing angle by name if it is not.
+
+`--ogrid` rejects `--focal`, `--stretch`, `--cut-flux`, `--penalize`, `--open`,
+`--far`, `--dr` and `--seq`: all of those describe a box with a body immersed in
+it. The far field is the outer circle, handled by a characteristic (LODI)
+condition in the local radial normal — never a sponge.
+
+**Measured, Re 100 cylinder, M 0.2** (`--ogrid --n 192 --ny 96 --ogrid-far 20
+--ogrid-beta 3.5 --ramp 1.5`, 38 shedding cycles of the limit cycle,
+t = 178…356):
+
+| | O-grid | unbounded literature |
+|---|---|---|
+| cd | **1.388** | 1.32 – 1.37 |
+| St = fD/u | **0.169** | ≈ 0.164 |
+| cl amplitude | **0.322** | ≈ 0.32 |
+
+i.e. the O-grid lands in the *unbounded* band, which the box path cannot: its
+blockage excess is real and grows with Re (§15), so its bands are repo-calibrated
+rather than literature. The small remaining excess is consistent with the finite
+`rFar = 20 D` plus the M² compressibility correction. Adiabatic wall heat over
+the same run: 1.3e-11 (exactly the zero it is defined to be). This is a single
+measurement, not a converged study — treat it as a smoke anchor until it is
+re-measured under `docs/validation.md` Tier C.
+
+Cell volumes sum to the **polygonal** annulus `½ nx sin(2π/nx)(rFar²−rw²)·span`,
+not `π(rFar²−rw²)·span`: the cells are straight-edged. The π form is low by
+`Δθ²/6` (1.6e-3 at nx = 64) — do not "fix" a conservation check against it.
+
 ## 13. 2D == `nz == 1`, no separate code
 
 There is NO 2D code path. `nz == 1` IS the exact 2D restriction: the periodic wrap
@@ -805,13 +1142,19 @@ green.
   * incompressible `flow`: `t, dt, K, cd, cl, cdf, cfl, maxDiv, pcgIters, resid`
   * compressible `flow`: `t, dt, cd, cl, cs, wmax`
   * `channel`: `t, dt, ubulk, utauBot, utauTop, retau, KE`
+  * `conv` compressible: `t, dt, nuBot, nuTop, nuFlux, urms, KE`
+  * `conv` incompressible: `t, dt, nuBot, nuTop, nuFlux, urms, KE, maxDiv`
 * `bin` — `<out>_{vort,speed,mask}.bin`, float32 mid-plane, one frame per `--fdt`.
 * `png` — live PNG frames (`src/dns/fieldpng.*`, test `fieldpng`); at `--nz`
   > 1 the centre z-plane is rendered (channel precedent). High-Re framing:
   `--vort-max V` (clip in uInf/D; auto 8/15 saturates ~15× at Re 1e5),
   `--vort-map asinh` (display-only compression, bin/web stay raw),
   `--speed-map delta` (|u|−uInf diverging, freestream = background),
-  `--vort-signed` (3D compressible: signed wz instead of |curl|):
+  `--vort-signed` (3D compressible: signed wz instead of |curl|),
+  `--temp` (compressible only: a THIRD channel, `temp_%05d.png` carrying
+  T − T∞ on the diverging map, clipped at the larger of the isothermal wall's
+  own offset and the stagnation rise (γ−1)/2·M²·T∞ — off by default, because
+  turning it on changes what every artefact of the run contains):
   `png_<out>/vort_%05d.png` (diverging cool-warm, clip ±8 uInf/D, body
   dark) and `speed_%05d.png` (viridis, 0..1.6 uInf), one pair per `--pdt` frame
   (0 = follow `--fdt`), alongside the `.bin` frames. Writer = hand-rolled zlib PNG

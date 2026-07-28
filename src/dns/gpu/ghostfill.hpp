@@ -44,8 +44,9 @@ public:
     void apply(DeviceField& U) const;
 
     // diff = in with ghost faces filled: the field the viscous term reads.
+    // Asynchronous on the default stream, like every other launcher here.
     // Pre: buffers same size, diff does not alias in.
-    hipError_t fillFrom(const DeviceField& in, DeviceField& diff) const;
+    void fillFrom(const DeviceField& in, DeviceField& diff) const;
 
     std::size_t count() const { return count_; }
 
@@ -56,6 +57,10 @@ private:
           w_(std::move(w)), count_(n)
     {
     }
+
+    // Ghost faces of dst = the mirror sum over src's open faces. src == dst is
+    // legal: a ghost face is never one of its own samples.
+    void fill(const DeviceField& src, DeviceField& dst) const;
 
     DeviceBuffer<int> face_; // ghost face linear index
     DeviceBuffer<int> comp_; // 0 = u, 1 = v, 2 = w

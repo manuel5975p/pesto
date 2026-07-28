@@ -36,16 +36,16 @@ CompState vortexState(const Comp& c, double x0, double y0, double beta,
             const double f = beta / (2.0 * pi) * std::exp(0.5 * (1.0 - r2));
             const double u = uInf - f * dy;
             const double v = vInf + f * dx;
-            const double T = 1.0 - (c.gamma - 1.0) * beta * beta /
-                                       (8.0 * c.gamma * pi * pi) *
+            const double T = 1.0 - (c.gamma() - 1.0) * beta * beta /
+                                       (8.0 * c.gamma() * pi * pi) *
                                        std::exp(1.0 - r2);
-            const double rho = std::pow(T, 1.0 / (c.gamma - 1.0));
+            const double rho = std::pow(T, 1.0 / (c.gamma() - 1.0));
             const double p = rho * T;
             const std::size_t k = c.g.idx(i, j, 0);
             s.rho[k] = rho;
             s.mx[k] = rho * u;
             s.my[k] = rho * v;
-            s.E[k] = p / (c.gamma - 1.0) + 0.5 * rho * (u * u + v * v);
+            s.E[k] = p / (c.gamma() - 1.0) + 0.5 * rho * (u * u + v * v);
         }
     return s;
 }
@@ -102,12 +102,12 @@ void testAcoustic()
             const double x = (i + 0.5) * g.hx;
             const double dr = eps * std::exp(-(x - x0) * (x - x0) / (sig * sig));
             const double rho = 1.0 + dr;
-            const double p = 1.0 / c.gamma + dr; // dp = c0^2 drho
+            const double p = 1.0 / c.gamma() + dr; // dp = c0^2 drho
             const double u = dr;                 // du = c0 drho / rho0
             const std::size_t k = g.idx(i, j, 0);
             s.rho[k] = rho;
             s.mx[k] = rho * u;
-            s.E[k] = p / (c.gamma - 1.0) + 0.5 * rho * u * u;
+            s.E[k] = p / (c.gamma() - 1.0) + 0.5 * rho * u * u;
         }
     advance(c, s, 3.0);
     int imax = 0;
@@ -132,12 +132,12 @@ void testTaylorGreen()
             const double x = (i + 0.5) * g.hx, y = (j + 0.5) * g.hy;
             const double u = M * std::sin(x) * std::cos(y);
             const double v = -M * std::cos(x) * std::sin(y);
-            const double p = 1.0 / c.gamma + 0.25 * M * M * (std::cos(2 * x) + std::cos(2 * y));
+            const double p = 1.0 / c.gamma() + 0.25 * M * M * (std::cos(2 * x) + std::cos(2 * y));
             const std::size_t k = g.idx(i, j, 0);
             s.rho[k] = 1.0;
             s.mx[k] = u;
             s.my[k] = v;
-            s.E[k] = p / (c.gamma - 1.0) + 0.5 * (u * u + v * v);
+            s.E[k] = p / (c.gamma() - 1.0) + 0.5 * (u * u + v * v);
         }
     auto ke = [&](const CompState& q) {
         double K = 0.0;
@@ -170,7 +170,7 @@ void testConservation()
             s.rho[k] = rho;
             s.mx[k] = rho * u;
             s.my[k] = rho * v;
-            s.E[k] = p / (c.gamma - 1.0) + 0.5 * rho * (u * u + v * v);
+            s.E[k] = p / (c.gamma() - 1.0) + 0.5 * rho * (u * u + v * v);
         }
     auto sums = [&](const CompState& q, double out[4]) {
         out[0] = out[1] = out[2] = out[3] = 0.0;

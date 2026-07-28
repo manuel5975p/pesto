@@ -71,11 +71,7 @@ bool checkReconstruction(const char* name, const Grid& g, CutGeometry cut,
     auto ref = U;
     maskSolidFaces(g, cut, ref); // the state the stage field is in
     (void)gpu::uploadField(ref, *dU);
-    if (ghost->fillFrom(*dU, *dG) != hipSuccess)
-    {
-        std::fprintf(stderr, "FAIL: fillFrom\n");
-        return false;
-    }
+    ghost->fillFrom(*dU, *dG);
     auto out = VectorField::zeros(g);
     (void)gpu::downloadField(*dG, out);
 

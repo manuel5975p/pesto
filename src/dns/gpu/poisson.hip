@@ -227,6 +227,116 @@ std::expected<DeviceBuffer<Real>, hipError_t> neumannEigenvalues(int m, double h
     return buf;
 }
 
+// -------------------------- periodic x/z, wall y ---------------------------
+//
+// The wall-bounded box: periodic in x and z, homogeneous Neumann on the two y
+// wall faces. FFT over x and z diagonalises those two directions, leaving one
+// INDEPENDENT tridiagonal system per (kx, kz) mode along y:
+//
+//   p[j-1]/hy^2 + (lamx + lamz - 2/hy^2) p[j] + p[j+1]/hy^2 = rhs[j]
+//
+// with the mirror condition folding the wall neighbour onto the first interior
+// row, i.e. the end diagonals lose one 1/hy^2. Solved exactly by Thomas, one
+// thread per mode. This is deliberately NOT the DCT route: y needs no
+// transform at all, so the solve stays exact for any ny and the delicate
+// Makhoul machinery above is not extended to a mixed-transform case.
+
+__global__ void kPackYInterior(GpuGrid g, int my, const Real* src,
+                               hipfftComplex* dst)
+{
+    const std::size_t total = std::size_t(g.nx) * my * g.nz;
+    const std::size_t m = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (m >= total) return;
+    const int i = int(m % g.nx);
+    const int j = int((m / g.nx) % my);
+    const int k = int(m / (std::size_t(g.nx) * my));
+    dst[m] = hipfftComplex{src[gidx(g, i, j + 1, k)], Real(0)};
+}
+
+__global__ void kUnpackYInterior(GpuGrid g, int my, Real norm,
+                                 const hipfftComplex* src, Real* dst)
+{
+    const std::size_t m = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (m >= g.size()) return;
+    int i, j, k;
+    decompose(g, m, i, j, k);
+    if (j < 1 || j > my)
+    {
+        dst[m] = Real(0); // ghost rows belong to the wall mirror, not here
+        return;
+    }
+    const std::size_t q =
+        std::size_t(i) + std::size_t(g.nx) * (std::size_t(j - 1) + std::size_t(my) * k);
+    dst[m] = src[q].x * norm;
+}
+
+// One thread per (kx, kz) mode; sweeps y serially. `cp` is per-mode Thomas
+// scratch of my reals. The (0,0) mode is the pure-Neumann singular one: its
+// solution is defined only up to a constant, so the first row is pinned to
+// zero and the constant is removed afterwards by subtracting the mode's mean.
+__global__ void kTridiagY(int nx, int my, int nz, Real ihy2, const Real* lamx,
+                          const Real* lamz, hipfftComplex* q, Real* cp)
+{
+    const std::size_t modes = std::size_t(nx) * nz;
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= modes) return;
+    const int kx = int(t % nx), kz = int(t / nx);
+    const Real lam = lamx[kx] + lamz[kz];
+    const bool singular = kx == 0 && kz == 0;
+
+    auto at = [&](int j) {
+        return std::size_t(kx)
+             + std::size_t(nx) * (std::size_t(j) + std::size_t(my) * kz);
+    };
+    auto diag = [&](int j) {
+        // Mirror at both walls removes one off-diagonal coupling from the end
+        // rows: b = lam - 1/hy^2 there, lam - 2/hy^2 in the interior.
+        const Real ends = (j == 0 ? Real(1) : Real(0))
+                        + (j == my - 1 ? Real(1) : Real(0));
+        return lam - (Real(2) - ends) * ihy2;
+    };
+
+    // Forward elimination.
+    Real b0 = singular ? Real(1) : diag(0);
+    Real c0 = singular ? Real(0) : ihy2;
+    hipfftComplex d0 = singular ? hipfftComplex{Real(0), Real(0)} : q[at(0)];
+    cp[t * my] = c0 / b0;
+    q[at(0)] = hipfftComplex{d0.x / b0, d0.y / b0};
+    for (int j = 1; j < my; ++j)
+    {
+        const Real a = ihy2, c = j == my - 1 ? Real(0) : ihy2;
+        const Real m = diag(j) - a * cp[t * my + (j - 1)];
+        cp[t * my + j] = c / m;
+        const hipfftComplex prev = q[at(j - 1)];
+        const hipfftComplex cur = q[at(j)];
+        q[at(j)] = hipfftComplex{(cur.x - a * prev.x) / m,
+                                 (cur.y - a * prev.y) / m};
+    }
+    // Back substitution.
+    for (int j = my - 2; j >= 0; --j)
+    {
+        const hipfftComplex nxt = q[at(j + 1)];
+        const Real f = cp[t * my + j];
+        hipfftComplex cur = q[at(j)];
+        cur.x -= f * nxt.x;
+        cur.y -= f * nxt.y;
+        q[at(j)] = cur;
+    }
+    if (!singular) return;
+    // Restore the zero-mean gauge the pin destroyed.
+    Real sx = 0, sy = 0;
+    for (int j = 0; j < my; ++j) { sx += q[at(j)].x; sy += q[at(j)].y; }
+    sx /= Real(my);
+    sy /= Real(my);
+    for (int j = 0; j < my; ++j)
+    {
+        hipfftComplex cur = q[at(j)];
+        cur.x -= sx;
+        cur.y -= sy;
+        q[at(j)] = cur;
+    }
+}
+
 } // namespace
 
 struct DevicePoissonSolver::Impl
@@ -247,12 +357,19 @@ struct DevicePoissonSolver::Impl
     DeviceBuffer<Real> packA, packB;
     DeviceBuffer<hipfftComplex> cbuf;
 
+    // PeriodicXZWallY mode: batched 1D C2C plans along x and along z over the
+    // y-interior slab, plus the Thomas scratch.
+    hipfftHandle planX{}, planZ{};
+    DeviceBuffer<Real> thomas;
+
     ~Impl()
     {
         if (fwd) (void)hipfftDestroy(fwd);
         if (bwd) (void)hipfftDestroy(bwd);
         for (auto p : plan)
             if (p) (void)hipfftDestroy(p);
+        if (planX) (void)hipfftDestroy(planX);
+        if (planZ) (void)hipfftDestroy(planZ);
     }
 };
 
@@ -294,6 +411,54 @@ DevicePoissonSolver::make(const GpuGrid& g, PoissonBc bc)
             : hipfftPlan3d(&impl->fwd, g.nz, g.ny, g.nx, HIPFFT_R2C) == HIPFFT_SUCCESS
               && hipfftPlan3d(&impl->bwd, g.nz, g.ny, g.nx, HIPFFT_C2R) == HIPFFT_SUCCESS;
         if (!ok) return std::unexpected(hipErrorUnknown);
+        return DevicePoissonSolver(std::move(impl));
+    }
+
+    if (bc == PoissonBc::PeriodicXZWallY)
+    {
+        // Only y carries ghosts here: x and z are periodic over their full
+        // extent, so their eigenvalues are the full-length periodic ones and
+        // the C2C transforms run over every cell.
+        assert(g.ny >= 4);
+        impl->mx = g.nx;
+        impl->my = g.ny - 2;
+        impl->mz = g.nz;
+        const std::size_t total = std::size_t(g.nx) * impl->my * g.nz;
+
+        auto lx = periodicEigenvalues(g.nx, g.nx, g.hx);
+        if (!lx) return std::unexpected(lx.error());
+        auto lz = periodicEigenvalues(g.nz, g.nz, g.hz);
+        if (!lz) return std::unexpected(lz.error());
+        impl->lamx = std::move(*lx);
+        impl->lamz = std::move(*lz);
+
+        auto c = DeviceBuffer<hipfftComplex>::make(total);
+        if (!c) return std::unexpected(c.error());
+        impl->cbuf = std::move(*c);
+        auto th = DeviceBuffer<Real>::make(total);
+        if (!th) return std::unexpected(th.error());
+        impl->thomas = std::move(*th);
+
+        // x is contiguous: stride 1, one transform per (j,k). z is the slowest
+        // axis: stride nx*my, and its batch index runs over the contiguous
+        // (i,j) pair, so dist 1.
+        //
+        // inembed/onembed MUST be non-null here. hipFFT (like cuFFT) ignores
+        // EVERY advanced-layout parameter when they are null and falls back to
+        // the packed contiguous layout -- so a null-embed z plan silently
+        // transforms the wrong axis instead of failing, which is exactly what
+        // it did: 2D stayed green (no z pass at all) while every 3D case came
+        // back wrong.
+        int nX = g.nx, nZ = g.nz;
+        if (hipfftPlanMany(&impl->planX, 1, &nX, &nX, 1, g.nx, &nX, 1, g.nx,
+                           HIPFFT_C2C, impl->my * g.nz)
+            != HIPFFT_SUCCESS)
+            return std::unexpected(hipErrorUnknown);
+        if (g.nz > 1
+            && hipfftPlanMany(&impl->planZ, 1, &nZ, &nZ, g.nx * impl->my, 1, &nZ,
+                              g.nx * impl->my, 1, HIPFFT_C2C, g.nx * impl->my)
+                   != HIPFFT_SUCCESS)
+            return std::unexpected(hipErrorUnknown);
         return DevicePoissonSolver(std::move(impl));
     }
 
@@ -365,6 +530,39 @@ void DevicePoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p)
 
         auto rb = hipfftExecC2R(s.bwd, s.spec.data(), p.data());
         checkFft(rb, "ExecC2R");
+        return;
+    }
+
+    if (s.bc == PoissonBc::PeriodicXZWallY)
+    {
+        const std::size_t total = std::size_t(s.g.nx) * s.my * s.g.nz;
+        kPackYInterior<<<launchBlocks(total), blockSize>>>(s.g, s.my, rhs.data(),
+                                                           s.cbuf.data());
+        checkLastKernel("packYInterior");
+
+        checkFft(hipfftExecC2C(s.planX, s.cbuf.data(), s.cbuf.data(),
+                               HIPFFT_FORWARD), "ExecC2C x forward");
+        if (s.g.nz > 1)
+            checkFft(hipfftExecC2C(s.planZ, s.cbuf.data(), s.cbuf.data(),
+                                   HIPFFT_FORWARD), "ExecC2C z forward");
+
+        const Real ihy2 = Real(1.0 / (s.g.hy * s.g.hy));
+        kTridiagY<<<launchBlocks(std::size_t(s.g.nx) * s.g.nz), blockSize>>>(
+            s.g.nx, s.my, s.g.nz, ihy2, s.lamx.data(), s.lamz.data(),
+            s.cbuf.data(), s.thomas.data());
+        checkLastKernel("tridiagY");
+
+        if (s.g.nz > 1)
+            checkFft(hipfftExecC2C(s.planZ, s.cbuf.data(), s.cbuf.data(),
+                                   HIPFFT_BACKWARD), "ExecC2C z backward");
+        checkFft(hipfftExecC2C(s.planX, s.cbuf.data(), s.cbuf.data(),
+                               HIPFFT_BACKWARD), "ExecC2C x backward");
+
+        // hipFFT's inverse is unnormalised on both transformed axes.
+        const Real norm = Real(1.0 / (double(s.g.nx) * s.g.nz));
+        kUnpackYInterior<<<launchBlocks(s.g.size()), blockSize>>>(
+            s.g, s.my, norm, s.cbuf.data(), p.data());
+        checkLastKernel("unpackYInterior");
         return;
     }
 

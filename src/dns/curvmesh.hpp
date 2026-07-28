@@ -1,6 +1,9 @@
-// Distorted regular (structured curvilinear, fully periodic) mesh for the
-// compressible solver: logically the Grid, one node per cell (its low
-// corner), periodic images offset by the axis-aligned box (lx, ly, lz).
+// Distorted regular (structured curvilinear) mesh for the compressible
+// solver: logically the Grid, one node per cell (its low corner). Each axis
+// continues past its ends by its own AxisWrap -- by default the translated
+// periodic image offset by the axis-aligned box (lx, ly, lz), which is what
+// every Cartesian-topology mesh here wants; an O-grid needs a closed angular
+// axis and a linearly extended radial one instead.
 // CurvMetrics turns nodes into the finite-volume tables the scheme consumes.
 #pragma once
 
@@ -14,10 +17,34 @@
 
 namespace dns {
 
+// How node() continues past either end of one axis. The mesh stores exactly
+// one node per cell, so every stencil that reaches index n needs a rule --
+// CurvMetrics::build reaches one node past the top of every axis, which is
+// the only reason this enum has to exist.
+enum class AxisWrap
+{
+    // Periodic image offset by the box: node(i + n) = node(i) + L_axis. Every
+    // distorted, stretched and channel mesh in the tree; the default, so a
+    // mesh that says nothing keeps the historical behaviour bit-for-bit.
+    Translate,
+    // Closed axis: node(i + n) = node(i) EXACTLY, no offset. The angular axis
+    // of an O-grid, whose last cell's hi face IS the first cell's lo face.
+    Cyclic,
+    // Not periodic at all: linear extension off each end,
+    //   node(-1) = 2 node(0) - node(1),  node(n) = 2 node(n-1) - node(n-2).
+    // The radial axis of an O-grid: it never wraps the far boundary back onto
+    // the wall, and it supplies the outer ghost row's top nodes for free.
+    // Needs n >= 2 (build() rejects a degenerate Extend axis).
+    Extend,
+};
+
 struct CurvMesh
 {
     Grid g;                      // logical grid; periods are nx*hx, ny*hy, nz*hz
     std::vector<double> x, y, z; // node coordinates, Grid::idx layout
+    // Per-axis continuation for node(); all-Translate is the historical mesh.
+    std::array<AxisWrap, 3> wrap = {AxisWrap::Translate, AxisWrap::Translate,
+                                    AxisWrap::Translate};
 
     // Undistorted mesh: node (i,j,k) = (i hx, j hy, k hz).
     static CurvMesh uniform(const Grid& g);
@@ -58,7 +85,8 @@ struct CurvMesh
     // have sized the grid with ly = 2*delta + 2*ChannelStretchY::firstCell.
     static CurvMesh channelY(const Grid& g, double beta, double delta);
 
-    // Node position for any logical index; periodic images add the box.
+    // Node position for any logical index, continued per axis by wrap[a].
+    // Pre: an Extend axis needs n >= 2; Translate/Cyclic accept any index.
     std::array<double, 3> node(int i, int j, int k) const;
 };
 
@@ -67,16 +95,23 @@ struct CurvMesh
 struct CurvMetrics
 {
     Grid g;
+    std::array<AxisWrap, 3> wrap = {AxisWrap::Translate, AxisWrap::Translate,
+                                    AxisWrap::Translate}; // copied from the mesh
     // S[a][c]: component c of the +a-face area vector of each cell. The face
     // is the exact bilinear quad of its 4 nodes, so per-cell closure
-    // sum_faces S = 0 holds identically (freestream preservation).
+    // sum_faces S = 0 holds identically (freestream preservation) -- the lo
+    // face of cell i is read as S[a](i-1). On an Extend axis cell 0 has no lo
+    // neighbour, so S[a](n-1) is NOT its lo face: cell 0 is a ghost whose
+    // state the BC overwrites, and no flux divergence may be taken there.
     std::array<std::array<std::vector<double>, 3>, 3> S;
     // Ji[a][d*3+c]: d xi_d / d x_c at the +a face (index space has dxi = 1).
     std::array<std::array<std::vector<double>, 9>, 3> Ji;
     // Exact hex volumes via consistently-diagonalized face triangles: cells
     // tile the box, sum vol == lx ly lz.
     std::vector<double> vol;
-    // Per-axis mean cross-face area / volume (acoustic CFL width 1/aov).
+    // Per-axis mean cross-face area / volume (acoustic CFL width 1/aov); at
+    // index 0 of an Extend axis the missing lo neighbour is clamped to the
+    // cell's own face.
     std::array<std::vector<double>, 3> aov;
     double hmin = 0.0; // min cell width over cells and non-degenerate axes
 

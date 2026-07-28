@@ -13,11 +13,14 @@ namespace {
 
 // Fill ghost cells from a sample point ds beyond the wall along the normal:
 // velocity linearly extrapolated through the no-slip surface (u_g =
-// -(dw/ds) u_sample; exact mirror when dw >= ds), pressure/density copied
-// (adiabatic Neumann wall).
-__global__ void kGhostFill(Real gamma, const int* gcell, const int* gnbr,
-                           const Real* gw, const Real* gscale, int m, Real* rho,
-                           Real* mx, Real* my, Real* mz, Real* E)
+// -(dw/ds) u_sample; exact mirror when dw >= ds). Thermodynamics: adiabatic
+// (iso == 0) copies pressure and density, a zero wall-normal dT/dn; isothermal
+// images the temperature about the wall face (see below) and rebuilds rho from
+// the EOS. iso == 0 executes exactly the arithmetic it always did.
+__global__ void kGhostFill(Real gamma, int iso, Real Twall, Real Rgas,
+                           const int* gcell, const int* gnbr, const Real* gw,
+                           const Real* gscale, int m, Real* rho, Real* mx,
+                           Real* my, Real* mz, Real* E)
 {
     const int q = blockIdx.x * blockDim.x + threadIdx.x;
     if (q >= m) return;
@@ -37,12 +40,40 @@ __global__ void kGhostFill(Real gamma, const int* gcell, const int* gnbr,
     }
     const Real a = gscale[q];
     const int c = gcell[q];
-    rho[c] = ri;
-    mx[c] = -a * ri * ui;
-    my[c] = -a * ri * vi;
-    mz[c] = -a * ri * wi;
+    // Isothermal image of the temperature. Let s be the outward wall-normal
+    // coordinate with s = 0 on the wall face: the ghost centre sits at
+    // s = -dw and the sample point at s = +dsmp, and a = gscale = dw/dsmp is
+    // the SAME ratio the velocity mirror above uses. The linear profile through
+    // the two known values T(0) = Twall and T(dsmp) = T_sample is
+    //   T(s) = Twall + (T_sample - Twall) * s / dsmp,
+    // so at the ghost centre
+    //   T_ghost = T(-dw) = Twall - (dw/dsmp) (T_sample - Twall)
+    //                    = Twall + a (Twall - T_sample).
+    // a == 1 -- ghost and sample equidistant from the face -- is the channel
+    // wall's 2 Twall - T_sample, i.e. that mirror is this image's special case.
+    // Pressure is still copied (zero wall-normal dp/dn) and density follows
+    // from p = rho R T, so the ghost state is thermodynamically consistent.
+    Real rg = ri;
+    if (iso) {
+        const Real Ts = pi / (Rgas * ri);
+        // Floor: a transient with T_sample > (1 + 1/a) Twall makes the exact
+        // image non-positive and rho = p/(R T) would come out negative -- an
+        // unrecoverable state. Clipping at 0.05 Twall (the channel wall's
+        // constant) caps the wall-normal gradient instead of imposing it: while
+        // it is active the wall UNDER-cools, the face temperature the image
+        // realizes being Twall + (T_floor - (Twall + a (Twall - T_sample)))
+        // / (1 + a) instead of Twall. It is a transient guard, not a boundary
+        // condition; a run that keeps hitting it is not resolving the thermal
+        // layer and its wall heat flux is not trustworthy.
+        const Real Tg = fmaxf(Twall + a * (Twall - Ts), Real(0.05) * Twall);
+        rg = pi / (Rgas * Tg);
+    }
+    rho[c] = rg;
+    mx[c] = -a * rg * ui;
+    my[c] = -a * rg * vi;
+    mz[c] = -a * rg * wi;
     E[c] = pi / (gamma - Real(1)) +
-           Real(0.5) * a * a * ri * (ui * ui + vi * vi + wi * wi);
+           Real(0.5) * a * a * rg * (ui * ui + vi * vi + wi * wi);
 }
 
 __global__ void kQuiescent(const int* cells, int m, Real rhoInf, Real EInf,
@@ -58,9 +89,69 @@ __global__ void kQuiescent(const int* cells, int m, Real rhoInf, Real EInf,
     E[c] = EInf;
 }
 
+// Fourier (conduction) part of the face energy flux, in the sign convention
+// faceFlux uses -- it enters f.E as -kappaFace dT/dn, with kappaFace the SAME
+// face-averaged, Sutherland-scaled value the flux evaluates. Recomputed here
+// instead of read off f.E because the wall tally must report conduction ALONE:
+// f.E also carries the convective and viscous-work terms, which on this
+// staircase wall are the mirror's own imperfection rather than a heat flux, and
+// they do not vanish on an adiabatic wall (measured; they made the adiabatic
+// column read a spurious nonzero rate). mu == 0 makes kappa == 0, so the
+// inviscid early-out of faceFlux is reproduced without a branch.
+__device__ inline Real faceConduction(const GpuGrid& g, ViscView vv, PrimView q,
+                                      int i, int j, int k, int axis)
+{
+    const Offsets o = offsetsAt(g, i, j, k);
+    const std::size_t a = gidx(g, i, j, k), b = a + o.p[axis];
+    const Real h = axis == 0 ? g.hx : axis == 1 ? g.hy : g.hz;
+    Real kapf = vv.kappa;
+    if (vv.sutherland) kapf *= vv.ratio(Real(0.5) * (q.T[a] + q.T[b]));
+    return -kapf * (q.T[b] - q.T[a]) / h;
+}
+
+// Curvilinear twin: the temperature gradient in index space mapped through the
+// face inverse Jacobian and contracted with the face area vector, exactly as
+// faceFluxCurv builds its Fourier term (so the result already carries area).
+__device__ inline Real faceConductionCurv(const GpuGrid& g, ViscView vv,
+                                          PrimView q, CurvView m, int i, int j,
+                                          int k, int axis)
+{
+    const Offsets o = offsetsAt(g, i, j, k);
+    const std::size_t a = gidx(g, i, j, k), b = a + o.p[axis];
+    const Real Sv[3] = {m.S[axis][0][a], m.S[axis][1][a], m.S[axis][2][a]};
+    Real dxi[3];
+    dxi[axis] = q.T[b] - q.T[a];
+    for (int d = 0; d < 3; ++d) {
+        if (d == axis) continue;
+        dxi[d] = Real(0.25) * (q.T[a + o.p[d]] - q.T[a + o.m[d]] +
+                               q.T[b + o.p[d]] - q.T[b + o.m[d]]);
+    }
+    Real gT[3];
+    for (int c = 0; c < 3; ++c)
+        gT[c] = dxi[0] * m.Ji[axis][0 + c][a] + dxi[1] * m.Ji[axis][3 + c][a] +
+                dxi[2] * m.Ji[axis][6 + c][a];
+    Real kapf = vv.kappa;
+    if (vv.sutherland) kapf *= vv.ratio(Real(0.5) * (q.T[a] + q.T[b]));
+    return -kapf * (gT[0] * Sv[0] + gT[1] * Sv[1] + gT[2] * Sv[2]);
+}
+
 // Exact discrete momentum flux fluid -> body: the same faceFlux the rhs uses,
-// summed over fluid/ghost interface faces, oriented into the body.
-__global__ void kBodyFlux(GpuGrid g, Real mu, Real kappa, PrimView q,
+// summed over fluid/ghost interface faces, oriented into the body. The fourth
+// staged span is the wall heat rate: the conduction through the same faces on
+// an isothermal wall, and EXACTLY zero on an adiabatic one.
+//
+// The adiabatic gate is not a shortcut. That wall's image sets the wall-normal
+// dT/dn to zero by construction, so its wall heat flux is zero by definition of
+// the boundary condition; what the interface faces still carry there is the
+// mirror band's own second-order offset (the ghost holds the SAMPLE point's
+// temperature, one cell out, not the fluid neighbour's) flowing into cells that
+// the next stage overwrites -- an artifact, not a flux. Measured on the Re100
+// M0.2 cylinder at t = 2: 2.8e-2, against 6.8 for a Twall = 1.5 Tinf wall on
+// the same rig. That same artifact does ride inside the isothermal number at
+// roughly the half-percent level, which is this tally's accuracy -- far inside
+// the staircase wall's own error, and the price of keeping the reported column
+// readable: nonzero means flux, never offset.
+__global__ void kBodyFlux(GpuGrid g, ViscView vv, int iso, PrimView q,
                           const int* fcell, const int* fdir, int m, double* acc)
 {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
@@ -70,10 +161,12 @@ __global__ void kBodyFlux(GpuGrid g, Real mu, Real kappa, PrimView q,
     const int d = fdir[t];
     const int axis = d / 2;
     const bool minus = d & 1;
-    const int ox = axis == 0, oy = axis == 1, oz = axis == 2;
-    const Flux f = minus
-        ? faceFlux(g, mu, kappa, q, i - ox, j - oy, k - oz, axis)
-        : faceFlux(g, mu, kappa, q, i, j, k, axis);
+    // Owning cell of the face: the fluid cell itself for a +face, its back
+    // neighbour for a -face.
+    const int fi = i - (minus ? (axis == 0) : 0),
+              fj = j - (minus ? (axis == 1) : 0),
+              fk = k - (minus ? (axis == 2) : 0);
+    const Flux f = faceFlux(g, vv, q, fi, fj, fk, axis);
     const Real area = axis == 0 ? g.hy * g.hz
                     : axis == 1 ? g.hx * g.hz
                                 : g.hx * g.hy;
@@ -83,11 +176,14 @@ __global__ void kBodyFlux(GpuGrid g, Real mu, Real kappa, PrimView q,
     acc[t] = double(sgn * f.mx * area);
     acc[m + t] = double(sgn * f.my * area);
     acc[2 * m + t] = double(sgn * f.mz * area);
+    acc[3 * m + t] =
+        iso ? double(sgn * faceConduction(g, vv, q, fi, fj, fk, axis) * area)
+            : 0.0;
 }
 
 // Curvilinear counterpart: faceFluxCurv already integrates over the exact
 // face area vector S, so there is no separate area multiply here.
-__global__ void kBodyFluxCurv(GpuGrid g, Real mu, Real kappa, PrimView q,
+__global__ void kBodyFluxCurv(GpuGrid g, ViscView vv, int iso, PrimView q,
                               CurvView m, const int* fcell, const int* fdir,
                               int n, double* acc)
 {
@@ -98,32 +194,39 @@ __global__ void kBodyFluxCurv(GpuGrid g, Real mu, Real kappa, PrimView q,
     const int d = fdir[t];
     const int axis = d / 2;
     const bool minus = d & 1;
-    const int ox = axis == 0, oy = axis == 1, oz = axis == 2;
-    const Flux f = minus
-        ? faceFluxCurv(g, mu, kappa, q, m, i - ox, j - oy, k - oz, axis)
-        : faceFluxCurv(g, mu, kappa, q, m, i, j, k, axis);
+    const int fi = i - (minus ? (axis == 0) : 0),
+              fj = j - (minus ? (axis == 1) : 0),
+              fk = k - (minus ? (axis == 2) : 0);
+    const Flux f = faceFluxCurv(g, vv, q, m, fi, fj, fk, axis);
     const Real sgn = minus ? Real(-1) : Real(1);
     acc[t] = double(sgn * f.mx);
     acc[n + t] = double(sgn * f.my);
     acc[2 * n + t] = double(sgn * f.mz);
+    acc[3 * n + t] =
+        iso ? double(sgn * faceConductionCurv(g, vv, q, m, fi, fj, fk, axis))
+            : 0.0;
 }
 
 } // namespace
 
 std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
     const Grid& g, const Sdf& sdf, double gamma, double rhoInf, double pInf,
-    const double* bbox)
+    const double* bbox, WallThermal wall)
 {
     const double L[3] = {g.nx * g.hx, g.ny * g.hy, g.nz * g.hz};
     return make(g, sdf, gamma, rhoInf, pInf, bbox,
                 AxisRemap3{Focal1D::identity(L[0]), Focal1D::identity(L[1]),
-                           Focal1D::identity(L[2])});
+                           Focal1D::identity(L[2])},
+                wall);
 }
 
 std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
     const Grid& g, const Sdf& sdf, double gamma, double rhoInf, double pInf,
-    const double* bbox, const AxisRemap3& R)
+    const double* bbox, const AxisRemap3& R, WallThermal wall)
 {
+    const bool iso = wall.mode == WallThermal::Mode::Isothermal;
+    if (iso && !(wall.Twall > 0.0 && wall.Rgas > 0.0))
+        return std::unexpected(hipErrorInvalidValue);
     const int nx = g.nx, ny = g.ny, nz = g.nz;
     const double hx = g.hx, hy = g.hy, hz = g.hz;
     const bool curv = R.fx.active || R.fy.active || R.fz.active;
@@ -313,6 +416,9 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
     out.gamma_ = Real(gamma);
     out.rhoInf_ = Real(rhoInf);
     out.pInf_ = Real(pInf);
+    out.iso_ = iso ? 1 : 0;
+    out.Twall_ = Real(wall.Twall);
+    out.Rgas_ = Real(wall.Rgas);
     out.nGhost_ = int(gcell.size());
     out.nDeep_ = int(deep.size());
     out.nFace_ = int(fcell.size());
@@ -334,7 +440,7 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
     if (auto e = up(out.deep_, deep); e != hipSuccess) return std::unexpected(e);
     if (auto e = up(out.fcell_, fcell); e != hipSuccess) return std::unexpected(e);
     if (auto e = up(out.fdir_, fdir); e != hipSuccess) return std::unexpected(e);
-    auto acc = DeviceBuffer<double>::make(std::size_t(std::max(out.nFace_, 1)) * 3);
+    auto acc = DeviceBuffer<double>::make(std::size_t(std::max(out.nFace_, 1)) * 4);
     if (!acc) return std::unexpected(acc.error());
     out.facc_ = std::move(*acc);
     auto red = ReduceScratch::make();
@@ -347,16 +453,24 @@ void DeviceCompGhost::apply(DeviceCompState& s)
 {
     const Real EInf = pInf_ / (gamma_ - Real(1));
     if (nDeep_ > 0) {
+        // The deep interior sits at (pInf, Twall): the mirror band is only two
+        // cells thick, so the interior stencil reaches these cells, and a body
+        // core left at the FREESTREAM temperature would put a step of
+        // Twall - Tinf one cell behind an isothermal wall and conduct straight
+        // through it. Density carries the change; E = pInf/(gamma-1) is the
+        // same internal energy either way, and rhoInf_ is used verbatim on the
+        // adiabatic path.
+        const Real rhoQ = iso_ ? pInf_ / (Rgas_ * Twall_) : rhoInf_;
         kQuiescent<<<launchBlocks(nDeep_), blockSize>>>(
-            deep_.data(), nDeep_, rhoInf_, EInf, s.rho.data(), s.mx.data(),
+            deep_.data(), nDeep_, rhoQ, EInf, s.rho.data(), s.mx.data(),
             s.my.data(), s.mz.data(), s.E.data());
         checkLastKernel("kQuiescent");
     }
     if (nGhost_ > 0) {
         kGhostFill<<<launchBlocks(nGhost_), blockSize>>>(
-            gamma_, gcell_.data(), gnbr_.data(), gw_.data(), gscale_.data(),
-            nGhost_, s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
-            s.E.data());
+            gamma_, iso_, Twall_, Rgas_, gcell_.data(), gnbr_.data(),
+            gw_.data(), gscale_.data(), nGhost_, s.rho.data(), s.mx.data(),
+            s.my.data(), s.mz.data(), s.E.data());
         checkLastKernel("kGhostFill");
     }
 }
@@ -364,7 +478,7 @@ void DeviceCompGhost::apply(DeviceCompState& s)
 DeviceCompGhost::Force DeviceCompGhost::force(DeviceComp& solver,
                                               const DeviceCompState& s)
 {
-    if (nFace_ == 0) return {0.0, 0.0, 0.0};
+    if (nFace_ == 0) return {.fx = 0.0, .fy = 0.0, .fz = 0.0, .heat = 0.0};
     solver.primitives(s);
     const PrimView q{s.rho.data(),      solver.u().data(), solver.v().data(),
                      solver.w().data(), solver.e().data(), solver.p().data(),
@@ -372,24 +486,24 @@ DeviceCompGhost::Force DeviceCompGhost::force(DeviceComp& solver,
     if (curv_) {
         const DeviceCurv* t = solver.curvTables();
         assert(t && "focal ghost force needs the curvilinear DeviceComp");
-        if (!t) return {0.0, 0.0, 0.0};
+        if (!t) return {.fx = 0.0, .fy = 0.0, .fz = 0.0, .heat = 0.0};
         const CurvView cv = t->view();
         kBodyFluxCurv<<<launchBlocks(nFace_), blockSize>>>(
-            g_, solver.mu(), solver.kappaCond(), q, cv, fcell_.data(),
+            g_, viscView(solver.transport()), iso_, q, cv, fcell_.data(),
             fdir_.data(), nFace_, facc_.data());
         checkLastKernel("kBodyFluxCurv");
     } else {
         kBodyFlux<<<launchBlocks(nFace_), blockSize>>>(
-            g_, solver.mu(), solver.kappaCond(), q, fcell_.data(), fdir_.data(),
-            nFace_, facc_.data());
+            g_, viscView(solver.transport()), iso_, q, fcell_.data(),
+            fdir_.data(), nFace_, facc_.data());
         checkLastKernel("kBodyFlux");
     }
-    // Three deterministic FP64 reductions over disjoint spans of facc_.
+    // Four deterministic FP64 reductions over disjoint spans of facc_.
     const std::size_t m = std::size_t(nFace_);
-    double f[3];
-    for (int c = 0; c < 3; ++c)
+    double f[4];
+    for (int c = 0; c < 4; ++c)
         f[c] = sumDouble(facc_.data() + c * m, m, red_);
-    return {f[0], f[1], f[2]};
+    return {.fx = f[0], .fy = f[1], .fz = f[2], .heat = f[3]};
 }
 
 } // namespace dns::gpu
