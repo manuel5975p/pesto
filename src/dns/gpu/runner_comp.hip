@@ -11,6 +11,7 @@
 #include "dns/gpu/derived.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/reductions.hpp"
+#include "dns/gpu/rotortable.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -18,7 +19,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <format>
+#include <numbers>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace dns::gpu {
@@ -156,10 +160,103 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                                  : GhostWallThermal::Mode::Adiabatic,
         .Twall = r.Twall,
         .Rgas = r.tr.Rgas};
-    auto ghost = DeviceCompGhost::make(g, sdf, r.gamma, r.rhoInf, r.pInf,
-                                       bbox ? bbox->data() : nullptr, fremap,
-                                       wallBc);
-    if (!ghost) return fail(6, "ghost wall init failed");
+    // A spinning body needs two things a static one does not: its surface
+    // MOVES (the mirror images about omega x r, not about rest, or the blade is
+    // a rotating hole that drives nothing), and its geometry CHANGES with time.
+    // The second is the azimuth table: every bin classified up front, replayed
+    // by the loop, because reclassifying costs a signed-distance sweep and the
+    // run takes thousands of steps per revolution.
+    std::optional<RotorTable> rotorTable;
+    std::optional<DeviceCompGhost> ghostOwned;
+    DeviceCompGhost* ghost = nullptr;
+    if (r.rotor.active())
+    {
+        // The turn alone: `sdf` is the body AT AZIMUTH 0 and already carries
+        // --blade-thicken (casegeom applied it), so re-applying the dilation
+        // here would double it. Dropping it is exact rather than approximate --
+        // a rotation is an isometry, so dilating then turning and turning then
+        // dilating are the same body.
+        Rotor turn = r.rotor;
+        turn.thicken = 0.0;
+        // The short-circuit box must cover the SWEPT volume, not the body's
+        // pose at one angle: a bin whose blade reached outside it would be
+        // classified as plain fluid and vanish.
+        std::array<double, 6> swept{};
+        if (bbox) swept = rotorSweepBounds(turn, *bbox);
+        const auto t0 = std::chrono::steady_clock::now();
+        auto tbl = buildRotorTable(g, turn, [&sdf] { return sdf; },
+                                   bbox ? swept.data() : nullptr, fremap);
+        if (!tbl) return fail(3, tbl.error());
+        const double secs =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+                .count();
+        std::printf("rotor: %d azimuth bins built in %.2f s, %.1f MB host "
+                    "(max %d ghosts, %d deep, %d faces)\n",
+                    r.rotor.bins, secs, double(tbl->bytes()) / (1 << 20),
+                    tbl->capacity.nGhost, tbl->capacity.nDeep,
+                    tbl->capacity.nFace);
+        // --rotor-mach is quoted on the NOMINAL tip radius D/2, because that is
+        // all the validator can know without opening the body. The real tip may
+        // be further out -- a lens, a scene, a mesh whose blades overhang -- and
+        // then the fastest material point in the flow is faster than the flag
+        // says. The KG central flux has no shock capturing, so this is a hard
+        // stop rather than a warning; it is checked HERE because the extent is
+        // only measurable once the body has been voxelized.
+        const double cInf = std::sqrt(r.gamma * r.pInf / r.rhoInf);
+        const double machTip = std::abs(r.rotor.omega) * tbl->tipRadius / cInf;
+        const double machInf = r.uInf / cInf;
+        std::printf("rotor: measured tip radius %.4g (nominal %.4g) -> tip "
+                    "Mach %.3f, +freestream %.3f\n",
+                    tbl->tipRadius, r.rotor.radius, machTip, machTip + machInf);
+        if (machTip + machInf >= 1.0)
+            return fail(2, std::format(
+                "the body reaches {:.4g} from the shaft, not the nominal "
+                "{:.4g}, so its real tip Mach is {:.3f} and with the "
+                "freestream {:.3f} >= 1. The flux is Kennedy-Gruber central "
+                "with no shock capturing. Lower --rotor-mach below {:.3f}, or "
+                "use a body that fits inside its own diameter",
+                tbl->tipRadius, r.rotor.radius, machTip, machTip + machInf,
+                r.rotor.radius / tbl->tipRadius * (1.0 - machInf) * 0.95));
+        // The mirror band must be at least two cells thick per side, so a body
+        // with NO deep-solid core anywhere is one whose two surfaces read
+        // through each other. Reported, not rejected: it is a resolution
+        // verdict on the user's own mesh, and only measurable once that mesh
+        // has been voxelized.
+        if (tbl->capacity.nDeep == 0)
+            std::printf("rotor: WARNING no deep-solid cells at any azimuth -- "
+                        "the body is nowhere thicker than the mirror band, so "
+                        "its two surfaces read through each other. Thicken it "
+                        "(--blade-thicken) or refine.\n");
+        std::fflush(stdout);
+        auto gh = DeviceCompGhost::fromTables(g, tbl->bins[0], tbl->capacity,
+                                              r.gamma, r.rhoInf, r.pInf, focal,
+                                              wallBc);
+        if (!gh) return fail(6, "ghost wall init failed");
+        rotorTable = std::move(*tbl);
+        ghostOwned = std::move(*gh);
+        ghost = &*ghostOwned;
+    }
+    else
+    {
+        auto gh = DeviceCompGhost::make(g, sdf, r.gamma, r.rhoInf, r.pInf,
+                                        bbox ? bbox->data() : nullptr, fremap,
+                                        wallBc);
+        if (!gh) return fail(6, "ghost wall init failed");
+        ghostOwned = std::move(*gh);
+        ghost = &*ghostOwned;
+    }
+    // Bin currently resident on the device. Bin 0 is loaded above, and the
+    // index is recomputed from the step's own time (never accumulated), so a
+    // long run cannot drift off the table.
+    int rotorBinLoaded = 0;
+    long rotorSwaps = 0;
+    // The body mask the artefacts show. A rotor's blade moves, so it is
+    // refreshed at FRAME time (rare) rather than at bin time (often), and by
+    // toggling the two bins' solid lists rather than rewriting the grid -- the
+    // cost is the surface, not the volume.
+    std::vector<float> rotorMask;
+    int rotorMaskBin = -1;
+    if (r.rotor.active()) rotorMask.assign(g.size(), 1.0f);
 
     // --penalize: the band decay rides the stage hook (runs once per RK
     // stage, so each application carries dt/3; penDt is set per step below).
@@ -197,8 +294,24 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
 
     // qw is the wall heat flux (an energy RATE into the body, comp_ghost.hpp);
     // it is identically zero on the default adiabatic wall.
-    const std::string cols[] = {"t", "dt", "cd", "cl", "cs", "wmax", "qw"};
+    // A rotor adds thrust and shaft torque, and their coefficients on the
+    // propeller convention (n = revolutions per unit time, D the disc
+    // diameter). Only when it is spinning: a static run's stats file must keep
+    // exactly the columns it has always had.
+    const std::vector<std::string> cols =
+        r.rotor.active()
+            ? std::vector<std::string>{"t",  "dt", "cd", "cl",     "cs",
+                                       "wmax", "qw", "thrust", "torque",
+                                       "ct", "cq"}
+            : std::vector<std::string>{"t", "dt", "cd", "cl", "cs", "wmax",
+                                       "qw"};
     out.declareSeries("stats", cols);
+    const int shaftAxis = rotorAxisIndex(r.rotor.axis);
+    // n = omega / 2 pi, revolutions per unit time; the propeller coefficients
+    // are rho n^2 D^4 and rho n^2 D^5, so they are undefined at omega = 0.
+    const double rotorN = std::abs(r.rotor.omega) / (2.0 * std::numbers::pi);
+    const double ctDen = r.rhoInf * rotorN * rotorN * std::pow(r.D, 4);
+    const double cqDen = ctDen * r.D;
 
     const float vortScale =
         float(r.curlMax > 0 ? r.curlMax
@@ -225,6 +338,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     const std::size_t rn = resample ? r.raster->renderGrid().size() : 0;
     std::vector<float> vortR(rn), speedR(rn);
     std::vector<float> tempR(r.tempFrames ? rn : 0);
+    std::vector<float> rotorMaskR(r.rotor.active() ? rn : 0);
     auto writeFrame = [&](double t) {
         if (r.tempFrames) dev->primitives(*ds);
         primitiveVelocity(gg, ds->rho, ds->mx, ds->my, ds->mz, *du, *dv, *dw);
@@ -305,6 +419,24 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
             return fail(7, e.error());
         const double dt = std::min(r.tEnd - t, dtStab);
 
+        // Advance the geometry to this step's azimuth, ONCE per step rather
+        // than once per RK stage. The tip moves a small fraction of a cell in a
+        // step at an acoustic dt, so the intra-step lag is far below the wall's
+        // own discretization error, while a per-stage swap would triple the
+        // copies to chase it. The bin comes from the absolute time, so it
+        // cannot drift; a step crossing several bins simply lands on the last.
+        if (rotorTable)
+        {
+            const int b = rotorBin(r.rotor, rotorAzimuth(r.rotor, t));
+            if (b != rotorBinLoaded)
+            {
+                if (ghost->load(rotorTable->bins[std::size_t(b)]) != hipSuccess)
+                    return fail(6, "rotor azimuth swap failed");
+                rotorBinLoaded = b;
+                ++rotorSwaps;
+            }
+        }
+
         penDt = dt / 3.0;
         dev->step(*ds, Real(dt));
         if (t < r.ramp)
@@ -328,7 +460,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
 
         if (st.steps - lastLog >= r.statsEvery || t >= r.tEnd)
         {
-            const auto F = ghost->force(*dev, *ds);
+            const auto F = ghost->force(*dev, *ds, r.rotor.shaft);
             const double span = g.nz > 1 ? g.nz * g.hz : 1.0;
             st.cd = F.fx / (r.qRef * span);
             st.cl = F.fy / (r.qRef * span);
@@ -345,13 +477,35 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
             }
             const double wmax =
                 r.cfl / dtStab * std::min({g.hx, g.hy, g.hz});
-            const double row[] = {t, dt, st.cd, st.cl, st.cs, wmax, F.heat};
-            (void)out.row("stats", row);
+            const double f[3] = {F.fx, F.fy, F.fz};
+            const double q[3] = {F.qx, F.qy, F.qz};
+            // Thrust is the force along the shaft, torque the moment about it;
+            // both signed, so a rotor pushing the wrong way reads negative
+            // rather than plausible.
+            const double thrust = f[shaftAxis], torque = q[shaftAxis];
+            if (r.rotor.active())
+            {
+                const double row[] = {t,      dt,     st.cd,  st.cl,
+                                      st.cs,  wmax,   F.heat, thrust,
+                                      torque, ctDen > 0 ? thrust / ctDen : 0.0,
+                                      cqDen > 0 ? torque / cqDen : 0.0};
+                (void)out.row("stats", row);
+            }
+            else
+            {
+                const double row[] = {t, dt, st.cd, st.cl, st.cs, wmax, F.heat};
+                (void)out.row("stats", row);
+            }
             if (st.steps - lastLog >= 10 * r.statsEvery || t >= r.tEnd)
             {
-                std::printf("t=%.2f/%.2f cd=%.3f cl=%+.3f cs=%+.3f wmax=%.2f "
-                            "dt=%.2e\n",
-                            t, r.tEnd, st.cd, st.cl, st.cs, wmax, dt);
+                if (r.rotor.active())
+                    std::printf("t=%.2f/%.2f T=%+.4g Q=%+.4g cd=%.3f "
+                                "wmax=%.2f dt=%.2e\n",
+                                t, r.tEnd, thrust, torque, st.cd, wmax, dt);
+                else
+                    std::printf("t=%.2f/%.2f cd=%.3f cl=%+.3f cs=%+.3f "
+                                "wmax=%.2f dt=%.2e\n",
+                                t, r.tEnd, st.cd, st.cl, st.cs, wmax, dt);
                 std::fflush(stdout);
             }
             lastLog = st.steps;
@@ -363,9 +517,40 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         // fdt/pdt/wdt either way.
         if (out.wantsFrame(t) || out.wantsPng(t) || out.wantsWeb(t)
             || out.wantsShm(t))
+        {
+            if (rotorTable && rotorMaskBin != rotorBinLoaded)
+            {
+                if (rotorMaskBin >= 0)
+                    for (int c : rotorTable->bins[std::size_t(rotorMaskBin)].solid)
+                        rotorMask[std::size_t(c)] = 1.0f;
+                for (int c : rotorTable->bins[std::size_t(rotorBinLoaded)].solid)
+                    rotorMask[std::size_t(c)] = 0.0f;
+                rotorMaskBin = rotorBinLoaded;
+                // Through the SAME display raster the fields go through: on a
+                // focal mesh RunOutput was built with a render-grid mask, and
+                // handing it a solver-grid one would be a size mismatch, not a
+                // slightly wrong picture.
+                if (resample)
+                {
+                    r.raster->apply(rotorMask.data(), rotorMaskR.data());
+                    out.updateMask(rotorMaskR);
+                }
+                else
+                    out.updateMask(rotorMask);
+            }
             writeFrame(t);
+        }
     }
     (void)hipDeviceSynchronize();
+    // Swaps per step is the diagnostic that says whether the bin count matched
+    // the time step: far below 1 means most steps saw a body that had not
+    // moved (correct, and free), while 1 means every step crossed a bin and the
+    // tip is outrunning the table.
+    if (rotorTable && st.steps > 0)
+        std::printf("rotor: %ld azimuth swaps over %ld steps (%.2f per step, "
+                    "%.1f revolutions)\n",
+                    rotorSwaps, st.steps, double(rotorSwaps) / double(st.steps),
+                    std::abs(r.rotor.omega) * t / (2.0 * std::numbers::pi));
     finishTiming(st, wall0, out);
     return st;
 }

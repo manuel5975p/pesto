@@ -64,6 +64,15 @@ carries, the viewer renders whatever it finds.
 Apps choose the set: defaults mirror today's vort+speed; extra primitives
 (p, rho, u, v) opt-in via a `--wfields` flag.
 
+**The mask is `static` by contract, and a MOVING body breaks that assumption.**
+A rotor run (`--rotor-mach`, README §12.3) has a body whose occupancy changes
+with azimuth. `RunOutput::updateMask` refreshes the mask the sinks that read it
+PER FRAME use — the PNG frames and the live shared-memory planes, so images and
+the cockpit view follow the blade. This format is not one of them: `mask.bin`
+here, and the one-shot `<prefix>_mask.bin`, both hold the mask the run STARTED
+with. Making them time-dependent is a format change (a per-frame mask field and
+a version bump), not a writer fix — do it deliberately or not at all.
+
 ## Sizes
 
 u16, 2048²: 8.4 MB/field/frame raw, ~2-4 MB gzipped on the wire; 512²:

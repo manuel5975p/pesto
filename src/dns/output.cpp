@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -144,6 +145,16 @@ RunOutput::~RunOutput()
 
 int RunOutput::frames() const { return p_->frames; }
 void RunOutput::setMsPerStep(double ms) { p_->msPerStep = ms; }
+
+void RunOutput::updateMask(std::span<const float> mask)
+{
+    // A size mismatch would silently mis-index every plane gather, so it is a
+    // programmer error the caller cannot reach by configuration: the mask is
+    // always the full grid the run was made with.
+    assert(mask.size() == p_->geo.mask.size());
+    if (mask.size() != p_->geo.mask.size()) return;
+    p_->geo.mask.assign(mask.begin(), mask.end());
+}
 
 std::expected<RunOutput, std::string>
 RunOutput::make(Config cfg, RunMeta meta, const Grid& g, FrameGeometry geo)

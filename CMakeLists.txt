@@ -51,6 +51,7 @@ add_library(dns_core
     src/dns/meshsdf.cpp
     src/dns/ogrid.cpp
     src/dns/poisson.cpp
+    src/dns/rotor.cpp
     src/dns/scene.cpp
     src/dns/shmframes.cpp
     src/dns/timestepper.cpp
@@ -98,6 +99,7 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/ogrid_bc.hip
     src/dns/gpu/poisson.hip
     src/dns/gpu/reductions.hip
+    src/dns/gpu/rotortable.hip
     src/dns/gpu/runner_channel.hip
     src/dns/gpu/runner_comp.hip
     src/dns/gpu/runner_conv.hip
@@ -340,7 +342,8 @@ endif()
 include(CTest)
 if(BUILD_TESTING)
     set(DNS_TESTS cli geometry output poisson projection tgv tgv3d cutcell cutcell_sphere comp comp_curv meshsdf
-        fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport)
+        fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport
+        rotor)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)
     endif()

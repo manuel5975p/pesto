@@ -206,9 +206,14 @@ tol_rel 0.01 is safe; widen to 0.015 only if drift is observed and note it here.
 
 ## Rejected benchmarks (and why)
 
-- **Taylor-Couette**: needs an INHOMOGENEOUS (rotating) ghost wall;
-  `DeviceGhostFill` mirrors homogeneous no-slip only. Solver feature first,
-  test later. Spin-down covers the same physics with a stationary wall.
+- **Taylor-Couette**: no longer blocked, not yet written. The solver feature it
+  was waiting on -- an INHOMOGENEOUS (rotating) ghost wall -- landed with the
+  rotor: `DeviceCompGhost` images the velocity about `u_wall = omega x r` when
+  built with a `WallVelocity` (README §12.3), and `gpu_rotor_wall` already pins
+  a spinning circle's torque against the Stokes value and its driven flow
+  against the wall speed. The incompressible `DeviceGhostFill` still mirrors
+  homogeneous no-slip only, so a Taylor-Couette case has to be a compressible
+  one. Spin-down covers the same physics with a stationary wall meanwhile.
 - **Stokes/Oseen sphere Re 1-10**: dt collapses (diffusion-limited) and the
   1/r far field makes 8D confinement a 20-50% uncorrectable bias.
 - **Kim & Lee impulsive start Re550**: boundary layer delta ~ sqrt(nu t) is

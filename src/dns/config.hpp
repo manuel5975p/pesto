@@ -4,6 +4,7 @@
 #pragma once
 
 #include "dns/grid.hpp"
+#include "dns/rotor.hpp"
 #include "dns/runmeta.hpp"
 #include "dns/sgs.hpp"
 
@@ -87,6 +88,19 @@ struct RawConfig
                               // plateau extent on that axis
     double focalWake = 5.0;   // auto: extra plateau downstream, in diameters
     double focalPad = 0.25;   // auto: AABB inflation, in diameters
+
+    // Rotor (compressible flow): the body spins about a fixed shaft through
+    // the placement centre. rotorMach is the TIP Mach and is the ONE switch --
+    // 0 leaves every path bit-for-bit the static solver. rotorSpan is the
+    // blade's half-extent along the shaft in diameters, which with the tip
+    // radius bounds the SWEPT volume without reading the mesh. bladeThicken
+    // dilates the body's sdf, in FINE cells; it changes the geometry and is
+    // reported as such.
+    double rotorMach = 0;
+    int rotorAxis = 0;        // 0 x, 1 y, 2 z
+    int rotorBins = 0;        // 0 = the natural count, 2 pi R / h_fine
+    double rotorSpan = 0.25;  // half-extent along the shaft, in diameters
+    double bladeThicken = 0;  // sdf dilation, in fine cells
 
     // Body-fitted O-grid (compressible): the mesh's inner boundary IS the
     // body surface, so there is no immersed body and no cut cell. --n is the
@@ -199,6 +213,17 @@ public:
     double focalHFine[3] = {0, 0, 0}, focalHCoarse[3] = {0, 0, 0};
     double focalGrowth = 1;   // max adjacent cell-to-cell growth ratio
     double focalDtFactor = 1; // hmin_focal / hmin_uniform (the dt penalty)
+
+    // Rotor motion (compressible flow). `rotor.active()` is the ONE test for
+    // "this run has moving geometry"; it is false unless --rotor-mach was
+    // given, and every geometry, wall and tally path then takes the static
+    // arithmetic it always took. rotorTipMach and rotorSpanD are carried for
+    // reporting; the resolved rate, bins, tip radius and dilation live in the
+    // Rotor itself.
+    Rotor rotor;
+    double rotorTipMach = 0;
+    double rotorSpanD = 0;     // blade half-extent along the shaft, in D
+    double bladeThickenCells = 0;
 
     // Body-fitted O-grid (dns/ogrid.hpp). ogridRFar is resolved to WORLD
     // units; the grid is (n angular) x (ny radial, incl. 2 ghost rows) x nz,

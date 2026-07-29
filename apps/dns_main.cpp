@@ -481,6 +481,9 @@ int runFlowCompressible(const Case& c, CaseGeometry& geo)
     // the centre-plane signed wz; native 2D always reports signed wz so the
     // diverging map keeps the sign of the shed vortices.
     rr.signedVorticity = g.nz == 1 || c.vortSigned;
+    // The resolved rotor, verbatim: the validator owns the shaft, rate, bins
+    // and dilation, and `active()` is false unless --rotor-mach was given.
+    rr.rotor = c.rotor;
 
     auto res = gpu::runCompressible(g, host, geo.sdf,
                                     geo.hasBbox ? &geo.bbox : nullptr, rr, *out);

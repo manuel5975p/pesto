@@ -4,6 +4,7 @@
 #include "cgltf.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -222,13 +223,25 @@ std::expected<TriMesh, std::string> loadMesh(const std::string& path)
     return m;
 }
 
+double sweptDiameter(const TriMesh& m, int axis)
+{
+    assert(!m.verts.empty() && axis >= 0 && axis < 3);
+    const int b = (axis + 1) % 3, c = (axis + 2) % 3;
+    double r = 0.0;
+    for (const auto& v : m.verts) r = std::max(r, std::hypot(v[b], v[c]));
+    return 2.0 * r;
+}
+
 void transform(TriMesh& m, double scale, double pitchRad, double yawRad,
-               std::array<double, 3> center)
+               std::array<double, 3> center, MeshAnchor anchor)
 {
     const Aabb bb = bounds(m);
-    const std::array<double, 3> c0{0.5 * (bb.lo[0] + bb.hi[0]),
-                                   0.5 * (bb.lo[1] + bb.hi[1]),
-                                   0.5 * (bb.lo[2] + bb.hi[2])};
+    const std::array<double, 3> c0 =
+        anchor == MeshAnchor::Origin
+            ? std::array<double, 3>{0.0, 0.0, 0.0}
+            : std::array<double, 3>{0.5 * (bb.lo[0] + bb.hi[0]),
+                                    0.5 * (bb.lo[1] + bb.hi[1]),
+                                    0.5 * (bb.lo[2] + bb.hi[2])};
     const double cp = std::cos(pitchRad), sp = std::sin(pitchRad);
     const double cy = std::cos(yawRad), sy = std::sin(yawRad);
     for (auto& v : m.verts)

@@ -165,10 +165,14 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--penalize", &c.penalize},
              {"--sponge-cells", &c.spongeCells}, {"--fringe-axes", &c.fringeAxes},
              {"--nscbc-beta", &c.nscbcBeta}, {"--nscbc-strip", &c.nscbcStrip},
+             {"--nscbc-etain", &c.nscbcEtaIn},
              {"--stretch", &c.stretch}, {"--focal", &c.focal},
              {"--focal-ratio", &c.focalRatio},
              {"--focal-blend", &c.focalBlend},
              {"--focal-wake", &c.focalWake}, {"--focal-pad", &c.focalPad},
+             {"--rotor-mach", &c.rotorMach}, {"--rotor-bins", &c.rotorBins},
+             {"--rotor-span", &c.rotorSpan},
+             {"--blade-thicken", &c.bladeThicken},
              {"--ogrid-far", &c.ogridFar}, {"--ogrid-beta", &c.ogridBeta},
              {"--ramp", &c.ramp}, {"--kick", &c.kick}, {"--tol", &c.tol},
              {"--max-iters", &c.maxIters}, {"--dt-recompute", &c.dtRecompute},
@@ -656,6 +660,41 @@ MESH & WALLS (compressible)
   --noslip           closed y walls become adiabatic NO-SLIP mirrors
                      (boundary layers grow on them) instead of
                      free-slip. Rejected with --open.
+
+ROTOR (compressible; the body SPINS about a fixed shaft)
+  --rotor-mach M     TIP Mach number: the blade tip travels at M times the
+                     freestream sound speed, so omega = M*c/(D/2). This is
+                     the ONE switch -- at 0 the run is bit-for-bit the
+                     static solver, geometry is built once and no azimuth
+                     table exists. Compressible --body/--scene runs only.
+                     The wall is a MOVING no-slip surface (velocity
+                     omega x r), and the run reports thrust and shaft
+                     torque alongside cd/cl.                            [0]
+  --rotor-axis A     shaft axis, x|y|z. The blade sweeps the plane normal
+                     to it and thrust acts along it; x is the freestream
+                     direction, i.e. an axial-flow rotor.               [x]
+  --rotor-bins N     azimuth bins. Geometry is precomputed at N evenly
+                     spaced angles and replayed, so the time loop never
+                     rebuilds it. 0 = the NATURAL count 2 pi R / h_fine:
+                     occupancy can only change when something crosses a
+                     cell boundary and the tip is fastest, so more bins
+                     than that only cost memory. Fewer bins quantize the
+                     motion and inject an impulse at (bins * rev/s).     [0]
+  --rotor-span S     blade half-extent ALONG the shaft, in diameters.
+                     With the tip radius this bounds the SWEPT volume
+                     from flags alone, which is what lets --focal auto
+                     place a plateau around a rotor whose mesh the
+                     validator may not read.                         [0.25]
+  --blade-thicken C  dilate the body's surface outward by C FINE cells
+                     (sdf - C*h, exactly a Minkowski sum with a ball, so
+                     the field stays a true distance and convex edges
+                     round rather than distort). This CHANGES THE BODY
+                     and is reported as such. It exists because the ghost
+                     wall needs a mirror band at least two cells thick on
+                     each side: a blade under 4 cells thick has its two
+                     surfaces reading through each other. The run reports
+                     the deep-solid cell count -- 0 means the blade is
+                     nowhere thicker than the band.                     [0]
 
 BODY-FITTED O-GRID (compressible)
   --ogrid            wrap the body in an ANNULAR body-fitted mesh instead

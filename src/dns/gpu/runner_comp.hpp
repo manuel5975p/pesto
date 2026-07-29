@@ -11,6 +11,7 @@
 #include "dns/framemap.hpp"
 #include "dns/gpu/runner_incomp.hpp"   // RunStats, RunError
 #include "dns/output.hpp"
+#include "dns/rotor.hpp"
 #include "dns/sdf.hpp"
 
 #include <expected>
@@ -110,6 +111,13 @@ struct CompRun
     // user's back.
     bool tempFrames = false;
     int statsEvery = 200;        // steps between force rows
+
+    // Rotor: the body SPINS about rotor.shaft. Inactive by default, and then
+    // nothing it touches runs -- the ghost wall gets no velocity, the tally
+    // takes no moment and the stats file keeps exactly the columns it had.
+    // `sdf` still describes the body at azimuth 0; the surface MOTION is what
+    // this adds.
+    Rotor rotor;
 };
 
 // `ic` is the initial conservative state; `sdf` is the body, used to build the

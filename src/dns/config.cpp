@@ -1052,11 +1052,21 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         // cell centres), but only the analytic ones: their AABB follows from
         // the placement alone, and validate() may not touch the filesystem to
         // read a mesh.
-        if (c.bodyKind == BodyKind::Mesh || c.bodyKind == BodyKind::Scene)
+        // A ROTOR is the exception, and for a reason that is not a loophole:
+        // its body sweeps a shaft-aligned cylinder of radius D/2 and half-
+        // height --rotor-span * D, so the extent that matters is the SWEPT one
+        // and that follows from the placement and two flags. --rotor-span is
+        // capped at 0.5 below, so the placement cube already contains it and
+        // the plateau derivation needs no change at all.
+        const bool sweptBox = r.rotorMach != 0;
+        if ((c.bodyKind == BodyKind::Mesh || c.bodyKind == BodyKind::Scene)
+            && !sweptBox)
             return bad(2, "--focal", "a mesh/scene body's bounding box is only "
                                      "known after the file is loaded, and "
                                      "validation touches no filesystem; give "
-                                     "the plateau explicitly for now");
+                                     "the plateau explicitly for now (a rotor "
+                                     "is exempt: its swept extent follows from "
+                                     "--dr and --rotor-span)");
         if (c.bodyKind == BodyKind::Fence || c.bodyKind == BodyKind::Floor)
             return bad(2, "--focal", "the wall-mounted bodies span the full "
                                      "domain width; there is no compact "
@@ -1285,6 +1295,166 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
                               "--focal-pad"})
             if (r.given.contains(f))
                 return bad(2, f, std::string(f) + " requires --focal");
+    }
+
+    // --- rotor: the body spins ------------------------------------------------
+    //
+    // rotorMach is the ONE switch. At 0 nothing below runs, c.rotor stays
+    // inactive, and every geometry/wall/tally path downstream takes the static
+    // arithmetic it always took -- that is what keeps the measured cd/cl
+    // anchors valid.
+    {
+        static constexpr const char* rotorFlags[] = {
+            "--rotor-axis", "--rotor-bins", "--rotor-span", "--blade-thicken"};
+        if (r.rotorMach == 0)
+        {
+            for (const char* f : rotorFlags)
+                if (r.given.contains(f))
+                    return bad(2, f, std::string(f) + " configures a spinning "
+                                   "body; give --rotor-mach to have one");
+        }
+        else
+        {
+            if (c.sub != Subcommand::Flow)
+                return bad(2, "--rotor-mach", "only `dns flow` immerses a body "
+                                              "that could spin");
+            if (!comp)
+                return bad(2, "--rotor-mach", "the moving wall is the "
+                               "compressible ghost wall; --rotor-mach needs "
+                               "--physics compressible");
+            if (c.ogrid)
+                return bad(2, "--rotor-mach", "an O-grid IS the body surface: "
+                               "spinning the body would spin the mesh, which "
+                               "is a different solver. Immerse it in the box");
+            if (c.bodyKind == BodyKind::None)
+                return bad(2, "--rotor-mach", "there is no body to spin");
+            if (c.bodyKind == BodyKind::Fence || c.bodyKind == BodyKind::Floor)
+                return bad(2, "--rotor-mach", "the wall-mounted bodies are "
+                               "sealed through the domain floor; they have no "
+                               "shaft and cannot turn");
+            if (c.cutFlux || c.penalize > 0)
+                return bad(2, "--rotor-mach", "apertures and the Brinkman band "
+                               "are built once from a static body; the moving "
+                               "wall is the ghost wall alone");
+            if (r.seq > 1 || r.steady > 0)
+                return bad(2, "--rotor-mach", "a spinning body has no steady "
+                               "state and no per-level restart; drop --seq / "
+                               "--steady");
+            if (!(std::isfinite(r.rotorMach) && r.rotorMach > 0))
+                return bad(2, "--rotor-mach", "must be finite and > 0 (the TIP "
+                                              "Mach number)");
+            // The KG central flux carries no shock capturing, so the FASTEST
+            // material point in the run has to stay subsonic -- that is the
+            // advancing tip, not the freestream.
+            if (r.rotorMach + c.mach >= 1.0)
+                return bad(2, "--rotor-mach", "tip Mach + freestream Mach must "
+                               "stay under 1: the advancing tip is the fastest "
+                               "point in the flow and the flux has no shock "
+                               "capturing");
+            if (!(std::isfinite(r.rotorSpan) && r.rotorSpan > 0
+                  && r.rotorSpan <= 0.5))
+                return bad(2, "--rotor-span", "blade half-extent along the "
+                               "shaft in diameters, in (0, 0.5]: beyond 0.5 the "
+                               "swept volume leaves the placement cube that "
+                               "bounds every extent check");
+            if (!(std::isfinite(r.bladeThicken) && r.bladeThicken >= 0))
+                return bad(2, "--blade-thicken", "must be finite and >= 0 "
+                                                 "(fine cells of dilation)");
+            // A rotor's mesh is placed and sized about its SHAFT, and its own
+            // origin IS that shaft (casegeom). Baking an attitude into it would
+            // tilt the model out of the axis it spins about, so the two
+            // deprecated angles are rejected outright rather than silently
+            // producing a wobbling body.
+            for (const char* f : {"--pitch", "--yaw"})
+                if (r.given.contains(f))
+                    return bad(2, f, std::string(f) + " tilts the body out of "
+                                   "the shaft it spins about; a rotor's mesh is "
+                                   "placed about its own origin. Bake attitude "
+                                   "into the mesh, or drop --rotor-mach");
+            if (c.grid.nz == 1 && r.rotorAxis != 2)
+                return bad(2, "--rotor-axis", "nz == 1 is the exact 2D "
+                               "restriction: only a z shaft keeps the motion in "
+                               "the plane. An x or y shaft sweeps the blade out "
+                               "of it, which 2D cannot represent");
+
+            // Fine spacing: the plateau's under --focal, the grid's otherwise.
+            // It sets both the natural bin count and what a "cell" of
+            // --blade-thicken means, so the two always agree.
+            const double hFine =
+                c.focalActive
+                    ? (c.grid.nz == 1
+                           ? std::min(c.focalHFine[0], c.focalHFine[1])
+                           : std::min({c.focalHFine[0], c.focalHFine[1],
+                                       c.focalHFine[2]}))
+                    : (c.grid.nz == 1 ? std::min(c.grid.hx, c.grid.hy)
+                                      : std::min({c.grid.hx, c.grid.hy,
+                                                  c.grid.hz}));
+
+            c.rotor.axis = r.rotorAxis == 0   ? RotorAxis::X
+                           : r.rotorAxis == 1 ? RotorAxis::Y
+                                              : RotorAxis::Z;
+            c.rotor.shaft = {c.placement.cx, c.placement.cy, c.placement.cz};
+            c.rotor.radius = 0.5 * c.placement.D;
+            // c = uInf / mach: pInf is chosen as rho uInf^2/(gamma M^2), so
+            // the freestream sound speed is exactly that. One definition, and
+            // it must not be restated anywhere else.
+            c.rotor.omega = rotorOmegaFromTipMach(r.rotorMach, c.uInf / c.mach,
+                                                  c.rotor.radius);
+            c.rotor.thicken = r.bladeThicken * hFine;
+
+            const int natural = rotorNaturalBins(c.rotor, hFine);
+            if (r.given.contains("--rotor-bins"))
+            {
+                if (r.rotorBins < 8)
+                    return bad(2, "--rotor-bins", "under 8 bins the body jumps "
+                                   "by more than a blade width per step change; "
+                                   "0 selects the natural count");
+                if (r.rotorBins > 1 << 16)
+                    return bad(2, "--rotor-bins", "over 65536 bins; the table "
+                                   "grows linearly and buys nothing past the "
+                                   "natural count");
+                c.rotor.bins = r.rotorBins;
+                if (r.rotorBins > natural)
+                    c.warnings.push_back(std::format(
+                        "--rotor-bins {} exceeds the natural count {} "
+                        "(2 pi R / h_fine): occupancy cannot change faster "
+                        "than that even at the tip, so the extra bins are "
+                        "duplicate geometry",
+                        r.rotorBins, natural));
+                else if (2 * r.rotorBins < natural)
+                    c.warnings.push_back(std::format(
+                        "--rotor-bins {} is under half the natural count {}: "
+                        "the tip crosses more than two cells per bin, so the "
+                        "motion is visibly quantized and injects an impulse at "
+                        "bins*rev/s",
+                        r.rotorBins, natural));
+            }
+            else
+                c.rotor.bins = natural;
+
+            // The dilated body must still be a body in this box: a dilation
+            // comparable to the radius turns a blade into a disc.
+            if (c.rotor.thicken > 0.25 * c.rotor.radius)
+                return bad(2, "--blade-thicken", "dilation exceeds a quarter of "
+                               "the tip radius; that is a different body, not a "
+                               "resolvable one");
+
+            c.rotorTipMach = r.rotorMach;
+            c.rotorSpanD = r.rotorSpan;
+            c.bladeThickenCells = r.bladeThicken;
+
+            // The blade has to be thick enough for the ghost wall's mirror
+            // band on BOTH sides. We cannot measure the mesh here (validation
+            // touches no filesystem), so this is the advisory; the run reports
+            // the measured deep-solid count, which is the real check.
+            c.warnings.push_back(std::format(
+                "rotor: the ghost wall needs a mirror band >= 2 cells thick "
+                "per side, so the blade must be >= 4 fine cells thick "
+                "(h_fine {:.4g}, D = {:.1f} fine cells). The run reports the "
+                "measured deep-solid cell count; 0 means the two blade "
+                "surfaces read through each other",
+                hFine, c.placement.D / hFine));
+        }
     }
 
     if (c.noslipY)
@@ -1691,6 +1861,50 @@ std::string Case::describe() const
                       focalRatio, focalGrowth, focalDtFactor);
         s += m;
         s += per;
+    }
+    if (rotor.active())
+    {
+        const char* ax[3] = {"x", "y", "z"};
+        const double hFine = focalActive
+                                 ? (grid.nz == 1
+                                        ? std::min(focalHFine[0], focalHFine[1])
+                                        : std::min({focalHFine[0], focalHFine[1],
+                                                    focalHFine[2]}))
+                                 : (grid.nz == 1 ? std::min(grid.hx, grid.hy)
+                                                 : std::min({grid.hx, grid.hy,
+                                                             grid.hz}));
+        const double tRev = 2.0 * std::numbers::pi / std::abs(rotor.omega);
+        const char* shaft = ax[rotorAxisIndex(rotor.axis)];
+        s += std::format(
+            "  rotor      SPINNING body: shaft along {} through the placement "
+            "centre\n"
+            "             tip Mach {:.4g} (freestream {:.4g}, sum {:.4g} < 1)  "
+            "omega={:.6g}  R={:.6g}\n"
+            "             t_rev={:.6g} -> {:.2f} revolutions in tEnd={:.6g}\n"
+            "             azimuth {} bins (natural {} = 2 pi R / h_fine); "
+            "geometry is\n"
+            "             precomputed per bin and replayed -- the time loop "
+            "never rebuilds it\n"
+            "             wall is MOVING no-slip (omega x r, tip speed "
+            "{:.6g}); run reports\n"
+            "             thrust and shaft torque about {}\n"
+            "             blade must be >= 4 fine cells thick (h_fine={:.3e}, "
+            "D/h_fine={:.1f}):\n"
+            "             >= {:.4g} in world units, or the two surfaces' "
+            "mirror bands overlap\n",
+            shaft, rotorTipMach, mach, rotorTipMach + mach, rotor.omega,
+            rotor.radius, tRev, tRev > 0 ? tEnd / tRev : 0.0, tEnd, rotor.bins,
+            rotorNaturalBins(rotor, hFine),
+            std::abs(rotor.omega) * rotor.radius, shaft, hFine,
+            hFine > 0 ? placement.D / hFine : 0.0, 4.0 * hFine);
+        if (rotor.thicken > 0)
+            s += std::format(
+                "  blade      THICKENED: surface dilated outward by {:.4g} "
+                "fine cells ({:.4g} world).\n"
+                "             This is a DIFFERENT BODY -- chord grows by "
+                "{:.4g}, edges round.\n"
+                "             Report it with every result.\n",
+                bladeThickenCells, rotor.thicken, 2.0 * rotor.thicken);
     }
     if (noslipY) s += "  walls      y walls no-slip (adiabatic mirror)\n";
     return s;

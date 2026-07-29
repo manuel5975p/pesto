@@ -145,12 +145,34 @@ buildCaseGeometry(const Case& c, const Scene* scene)
         const double ext0 = std::max({bb0.hi[0] - bb0.lo[0], bb0.hi[1] - bb0.lo[1],
                                       bb0.hi[2] - bb0.lo[2]});
         if (!(ext0 > 0)) return std::unexpected("degenerate mesh bounds");
-        const double scale = c.scale > 0 ? c.scale : p.D / ext0;
+        // A ROTOR is placed and sized by its SWEPT circle, not its bounding
+        // box, and both halves of that matter:
+        //   - the anchor is the mesh's own ORIGIN, which is the shaft. Three
+        //     blades put the bounding-box centre 10% of the tip radius off the
+        //     axis, and anchoring there would spin the model about a point that
+        //     is not its axis (measured: tip radius 0.49 against a nominal
+        //     0.3927).
+        //   - auto-fit matches the SWEPT diameter to D, so the nominal tip
+        //     radius D/2 the validator quotes --rotor-mach on and the real one
+        //     agree by construction. Fitting the static extent instead leaves
+        //     the tip 1/0.91 outside it.
+        const bool spun = c.rotor.active();
+        const int shaft = spun ? rotorAxisIndex(c.rotor.axis) : 0;
+        const double fit = spun ? sweptDiameter(mesh, shaft) : ext0;
+        if (!(fit > 0)) return std::unexpected("degenerate mesh extent");
+        const double scale = c.scale > 0 ? c.scale : p.D / fit;
         transform(mesh, scale, c.pitch * pi / 180.0, c.yaw * pi / 180.0,
-                  {p.cx, p.cy, p.cz});
+                  {p.cx, p.cy, p.cz},
+                  spun ? MeshAnchor::Origin : MeshAnchor::BoxCenter);
         const Aabb bb = bounds(mesh);
-        out.D = std::max({bb.hi[0] - bb.lo[0], bb.hi[1] - bb.lo[1],
-                          bb.hi[2] - bb.lo[2]});
+        // A rotor's characteristic length is its swept diameter, which is what
+        // CT/CQ are normalised on. It is `scale * fit` exactly: the placement
+        // is a scale plus a translation, and the validator rejects
+        // --pitch/--yaw with a rotor precisely so no rotation can tilt the
+        // model out of the shaft it is meant to spin about.
+        out.D = spun ? scale * fit
+                     : std::max({bb.hi[0] - bb.lo[0], bb.hi[1] - bb.lo[1],
+                                 bb.hi[2] - bb.lo[2]});
         out.bbox = {bb.lo[0], bb.lo[1], bb.lo[2], bb.hi[0], bb.hi[1], bb.hi[2]};
         out.hasBbox = true;
 
@@ -186,6 +208,34 @@ buildCaseGeometry(const Case& c, const Scene* scene)
         // geometry stays empty and must not be touched downstream.
         out.sdf = [](double, double, double) { return 1e9; };
         break;
+    }
+
+    // A rotor's geometry is the body AT AZIMUTH 0, and `rotorSdf` is the one
+    // definition of both the rigid turn (the exact identity at theta = 0, so
+    // nothing moves here) and the --blade-thicken dilation. Wrapping it here
+    // rather than at the runner is what keeps the sdf the ghost wall reads and
+    // the cut qRef measures the SAME body: a dilated sdf against an undilated
+    // cut would report a frontal area the solver is not using.
+    if (c.rotor.active() && c.bodyKind != BodyKind::None)
+    {
+        out.sdf = rotorSdf(c.rotor, out.sdf, 0.0);
+        if (c.rotor.thicken > 0)
+        {
+            // Only a real dilation resamples: at thicken == 0 the wrap is
+            // arithmetically the identity, so the exact closed-form cuts above
+            // stay exactly what they were.
+            auto r = sampleCut(g, out.sdf, {8, 8});
+            if (!r) return std::unexpected(r.error());
+            out.cut = std::move(*r);
+            // The bbox is the ghost wall's "provably far from the surface"
+            // short-circuit; a dilated body that outgrows it would be silently
+            // clipped off its own boundary.
+            for (int a = 0; a < 3; ++a)
+            {
+                out.bbox[a] -= c.rotor.thicken;
+                out.bbox[a + 3] += c.rotor.thicken;
+            }
+        }
     }
     return out;
 }

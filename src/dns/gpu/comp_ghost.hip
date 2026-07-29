@@ -17,10 +17,18 @@ namespace {
 // (iso == 0) copies pressure and density, a zero wall-normal dT/dn; isothermal
 // images the temperature about the wall face (see below) and rebuilds rho from
 // the EOS. iso == 0 executes exactly the arithmetic it always did.
+//
+// uw != nullptr makes the wall MOVE at that per-ghost velocity. The image is
+// the same one the isothermal temperature uses, about u_wall instead of about
+// rest: with s the outward wall-normal coordinate, u(s) = Uw + (u_s - Uw)
+// s/dsmp, so u(-dw) = (1 + a) Uw - a u_s. Uw = 0 recovers the resting mirror
+// and a == 1 makes it the familiar 2 Uw - u_s. The resting branch is kept
+// VERBATIM rather than folded into the general form: a*a*(ui*ui) and
+// (a*ui)*(a*ui) are not the same float, and the static path must not move.
 __global__ void kGhostFill(Real gamma, int iso, Real Twall, Real Rgas,
                            const int* gcell, const int* gnbr, const Real* gw,
-                           const Real* gscale, int m, Real* rho, Real* mx,
-                           Real* my, Real* mz, Real* E)
+                           const Real* gscale, const Real* uw, int m, Real* rho,
+                           Real* mx, Real* my, Real* mz, Real* E)
 {
     const int q = blockIdx.x * blockDim.x + threadIdx.x;
     if (q >= m) return;
@@ -69,6 +77,18 @@ __global__ void kGhostFill(Real gamma, int iso, Real Twall, Real Rgas,
         rg = pi / (Rgas * Tg);
     }
     rho[c] = rg;
+    if (uw) {
+        const Real b = Real(1) + a;
+        const Real ug = b * uw[3 * q + 0] - a * ui;
+        const Real vg = b * uw[3 * q + 1] - a * vi;
+        const Real wg = b * uw[3 * q + 2] - a * wi;
+        mx[c] = rg * ug;
+        my[c] = rg * vg;
+        mz[c] = rg * wg;
+        E[c] = pi / (gamma - Real(1)) +
+               Real(0.5) * rg * (ug * ug + vg * vg + wg * wg);
+        return;
+    }
     mx[c] = -a * rg * ui;
     my[c] = -a * rg * vi;
     mz[c] = -a * rg * wi;
@@ -207,29 +227,51 @@ __global__ void kBodyFluxCurv(GpuGrid g, ViscView vv, int iso, PrimView q,
             : 0.0;
 }
 
+// Moment of the force already staged by kBodyFlux/kBodyFluxCurv, about `pivot`:
+// spans 4..6 of the same buffer, from spans 0..2 and the face positions. A
+// separate pass on purpose -- it reads the STAGED values, so the reported
+// torque is the moment of exactly the reported drag, face for face, on either
+// mesh and with no second flux evaluation to drift from the first.
+__global__ void kBodyMoment(const Real* fpos, double px, double py, double pz,
+                            int m, double* acc)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= m) return;
+    const double rx = double(fpos[3 * t + 0]) - px;
+    const double ry = double(fpos[3 * t + 1]) - py;
+    const double rz = double(fpos[3 * t + 2]) - pz;
+    const double fx = acc[t], fy = acc[m + t], fz = acc[2 * m + t];
+    acc[4 * m + t] = ry * fz - rz * fy;
+    acc[5 * m + t] = rz * fx - rx * fz;
+    acc[6 * m + t] = rx * fy - ry * fx;
+}
+
 } // namespace
 
 std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
     const Grid& g, const Sdf& sdf, double gamma, double rhoInf, double pInf,
-    const double* bbox, WallThermal wall)
+    const double* bbox, WallThermal wall, const WallVelocity* uwall)
 {
     const double L[3] = {g.nx * g.hx, g.ny * g.hy, g.nz * g.hz};
     return make(g, sdf, gamma, rhoInf, pInf, bbox,
                 AxisRemap3{Focal1D::identity(L[0]), Focal1D::identity(L[1]),
                            Focal1D::identity(L[2])},
-                wall);
+                wall, uwall);
 }
 
-std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
-    const Grid& g, const Sdf& sdf, double gamma, double rhoInf, double pInf,
-    const double* bbox, const AxisRemap3& R, WallThermal wall)
+void CompGhostCapacity::cover(const CompGhostTables& t)
 {
-    const bool iso = wall.mode == WallThermal::Mode::Isothermal;
-    if (iso && !(wall.Twall > 0.0 && wall.Rgas > 0.0))
-        return std::unexpected(hipErrorInvalidValue);
+    nGhost = std::max(nGhost, t.nGhost());
+    nDeep = std::max(nDeep, t.nDeep());
+    nFace = std::max(nFace, t.nFace());
+}
+
+CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
+                                  const double* bbox, const AxisRemap3& R,
+                                  const GhostWallVelocity* uwall)
+{
     const int nx = g.nx, ny = g.ny, nz = g.nz;
     const double hx = g.hx, hy = g.hy, hz = g.hz;
-    const bool curv = R.fx.active || R.fy.active || R.fz.active;
     const Focal1D* ax[3] = {&R.fx, &R.fy, &R.fz};
     const double href[3] = {hx, hy, hz};
 
@@ -304,8 +346,17 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
                     (bbox && farFromBox(x, y, z)) ? outer : sdf(x, y, z);
             }
 
-    std::vector<int> gcell, gnbr, deep, fcell, fdir, solid;
-    std::vector<Real> gw, gscale;
+    CompGhostTables T;
+    auto& gcell = T.gcell;
+    auto& gnbr = T.gnbr;
+    auto& deep = T.deep;
+    auto& fcell = T.fcell;
+    auto& fdir = T.fdir;
+    auto& solid = T.solid;
+    auto& gw = T.gw;
+    auto& gscale = T.gscale;
+    auto& uw = T.uwall;
+    auto& fpos = T.fpos;
     std::vector<char> isGhost(g.size(), 0);
 
     for (int k = 0; k < nz; ++k)
@@ -390,6 +441,16 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
                     gnbr.push_back(nb[s]);
                     gw.push_back(Real(w[s] / wsum));
                 }
+                // Wall velocity at the FOOT OF THE NORMAL, not at the ghost
+                // centre: that point is on the surface, so a rotor's omega x r
+                // there is the actual surface speed the fluid sees.
+                if (uwall) {
+                    const auto v = (*uwall)(x + dw * nv[0], y + dw * nv[1],
+                                            z + dw * nv[2]);
+                    uw.push_back(Real(v[0]));
+                    uw.push_back(Real(v[1]));
+                    uw.push_back(Real(v[2]));
+                }
             }
 
     // Interface faces: fluid cell next to a ghost cell.
@@ -407,9 +468,49 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
                     if (isGhost[nc]) {
                         fcell.push_back(int(c));
                         fdir.push_back(d);
+                        // Physical centre of the shared face: the cell centre
+                        // stepped half a REFERENCE cell along the axis, then
+                        // mapped. On the identity remap this is the Cartesian
+                        // face centre exactly.
+                        const int a = d / 2;
+                        const double s = (d & 1) ? -0.5 : 0.5;
+                        const int ijk[3] = {i, j, k};
+                        double ref[3];
+                        for (int q = 0; q < 3; ++q)
+                            ref[q] = (ijk[q] + 0.5 + (q == a ? s : 0.0))
+                                     * href[q];
+                        fpos.push_back(Real(R.fx.map(ref[0])));
+                        fpos.push_back(Real(R.fy.map(ref[1])));
+                        fpos.push_back(Real(R.fz.map(ref[2])));
                     }
                 }
             }
+
+    return T;
+}
+
+std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
+    const Grid& g, const Sdf& sdf, double gamma, double rhoInf, double pInf,
+    const double* bbox, const AxisRemap3& R, WallThermal wall,
+    const WallVelocity* uwall)
+{
+    CompGhostTables T = classifyCompGhost(g, sdf, bbox, R, uwall);
+    CompGhostCapacity cap;
+    cap.cover(T);
+    const bool curv = R.fx.active || R.fy.active || R.fz.active;
+    return fromTables(g, T, cap, gamma, rhoInf, pInf, curv, wall);
+}
+
+std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::fromTables(
+    const Grid& g, const CompGhostTables& t, CompGhostCapacity cap,
+    double gamma, double rhoInf, double pInf, bool curv, WallThermal wall)
+{
+    const bool iso = wall.mode == WallThermal::Mode::Isothermal;
+    if (iso && !(wall.Twall > 0.0 && wall.Rgas > 0.0))
+        return std::unexpected(hipErrorInvalidValue);
+    if (cap.nGhost < t.nGhost() || cap.nDeep < t.nDeep()
+        || cap.nFace < t.nFace())
+        return std::unexpected(hipErrorInvalidValue);
 
     DeviceCompGhost out;
     out.g_ = GpuGrid::from(g);
@@ -419,34 +520,74 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
     out.iso_ = iso ? 1 : 0;
     out.Twall_ = Real(wall.Twall);
     out.Rgas_ = Real(wall.Rgas);
-    out.nGhost_ = int(gcell.size());
-    out.nDeep_ = int(deep.size());
-    out.nFace_ = int(fcell.size());
     out.curv_ = curv;
-    out.solid_ = std::move(solid);
-    out.deepHost_ = deep;
-    auto up = [](auto& dst, const auto& src) -> hipError_t {
-        if (src.empty()) return hipSuccess;
-        auto b = DeviceBuffer<std::decay_t<decltype(src[0])>>::make(src.size());
+    out.moving_ = !t.uwall.empty();
+    out.cap_ = cap;
+    // Buffers are sized for the CAPACITY, so replaying another azimuth is a
+    // copy and never a reallocation. A capacity axis of 0 allocates nothing and
+    // the corresponding data() stays null, which the kernels already read as
+    // "resting wall" / "nothing to do".
+    auto alloc = [](auto& dst, std::size_t n) -> hipError_t {
+        if (n == 0) return hipSuccess;
+        auto b = DeviceBuffer<std::decay_t<decltype(*dst.data())>>::make(n);
         if (!b) return b.error();
-        if (auto e = b->upload(src.data()); e != hipSuccess) return e;
         dst = std::move(*b);
         return hipSuccess;
     };
-    if (auto e = up(out.gcell_, gcell); e != hipSuccess) return std::unexpected(e);
-    if (auto e = up(out.gnbr_, gnbr); e != hipSuccess) return std::unexpected(e);
-    if (auto e = up(out.gw_, gw); e != hipSuccess) return std::unexpected(e);
-    if (auto e = up(out.gscale_, gscale); e != hipSuccess) return std::unexpected(e);
-    if (auto e = up(out.deep_, deep); e != hipSuccess) return std::unexpected(e);
-    if (auto e = up(out.fcell_, fcell); e != hipSuccess) return std::unexpected(e);
-    if (auto e = up(out.fdir_, fdir); e != hipSuccess) return std::unexpected(e);
-    auto acc = DeviceBuffer<double>::make(std::size_t(std::max(out.nFace_, 1)) * 4);
+    const std::size_t ng = std::size_t(cap.nGhost);
+    const std::size_t nf = std::size_t(cap.nFace);
+    if (auto e = alloc(out.gcell_, ng); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.gnbr_, 8 * ng); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.gw_, 8 * ng); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.gscale_, ng); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.uwall_, t.uwall.empty() ? 0 : 3 * ng);
+        e != hipSuccess)
+        return std::unexpected(e);
+    if (auto e = alloc(out.deep_, std::size_t(cap.nDeep)); e != hipSuccess)
+        return std::unexpected(e);
+    if (auto e = alloc(out.fcell_, nf); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.fdir_, nf); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.fpos_, 3 * nf); e != hipSuccess) return std::unexpected(e);
+    auto acc = DeviceBuffer<double>::make(std::max<std::size_t>(nf, 1) * 7);
     if (!acc) return std::unexpected(acc.error());
     out.facc_ = std::move(*acc);
     auto red = ReduceScratch::make();
     if (!red) return std::unexpected(red.error());
     out.red_ = std::move(*red);
+    if (auto e = out.load(t); e != hipSuccess) return std::unexpected(e);
     return out;
+}
+
+hipError_t DeviceCompGhost::load(const CompGhostTables& t)
+{
+    if (cap_.nGhost < t.nGhost() || cap_.nDeep < t.nDeep()
+        || cap_.nFace < t.nFace())
+        return hipErrorInvalidValue;
+    // A wall that moves must keep moving and one at rest must stay at rest:
+    // the kernel selects its branch on whether the buffer exists, so a bin
+    // whose velocities were dropped would silently freeze the surface.
+    if (t.uwall.empty() != (uwall_.data() == nullptr))
+        return hipErrorInvalidValue;
+    auto put = [](auto& dst, const auto& src) -> hipError_t {
+        if (src.empty()) return hipSuccess;
+        return hipMemcpy(dst.data(), src.data(),
+                         src.size() * sizeof(src[0]), hipMemcpyHostToDevice);
+    };
+    if (auto e = put(gcell_, t.gcell); e != hipSuccess) return e;
+    if (auto e = put(gnbr_, t.gnbr); e != hipSuccess) return e;
+    if (auto e = put(gw_, t.gw); e != hipSuccess) return e;
+    if (auto e = put(gscale_, t.gscale); e != hipSuccess) return e;
+    if (auto e = put(uwall_, t.uwall); e != hipSuccess) return e;
+    if (auto e = put(deep_, t.deep); e != hipSuccess) return e;
+    if (auto e = put(fcell_, t.fcell); e != hipSuccess) return e;
+    if (auto e = put(fdir_, t.fdir); e != hipSuccess) return e;
+    if (auto e = put(fpos_, t.fpos); e != hipSuccess) return e;
+    nGhost_ = t.nGhost();
+    nDeep_ = t.nDeep();
+    nFace_ = t.nFace();
+    solid_ = t.solid;
+    deepHost_ = t.deep;
+    return hipSuccess;
 }
 
 void DeviceCompGhost::apply(DeviceCompState& s)
@@ -469,16 +610,17 @@ void DeviceCompGhost::apply(DeviceCompState& s)
     if (nGhost_ > 0) {
         kGhostFill<<<launchBlocks(nGhost_), blockSize>>>(
             gamma_, iso_, Twall_, Rgas_, gcell_.data(), gnbr_.data(),
-            gw_.data(), gscale_.data(), nGhost_, s.rho.data(), s.mx.data(),
-            s.my.data(), s.mz.data(), s.E.data());
+            gw_.data(), gscale_.data(), uwall_.data(), nGhost_, s.rho.data(),
+            s.mx.data(), s.my.data(), s.mz.data(), s.E.data());
         checkLastKernel("kGhostFill");
     }
 }
 
 DeviceCompGhost::Force DeviceCompGhost::force(DeviceComp& solver,
-                                              const DeviceCompState& s)
+                                              const DeviceCompState& s,
+                                              const std::array<double, 3>& pivot)
 {
-    if (nFace_ == 0) return {.fx = 0.0, .fy = 0.0, .fz = 0.0, .heat = 0.0};
+    if (nFace_ == 0) return {};
     solver.primitives(s);
     const PrimView q{s.rho.data(),      solver.u().data(), solver.v().data(),
                      solver.w().data(), solver.e().data(), solver.p().data(),
@@ -486,7 +628,7 @@ DeviceCompGhost::Force DeviceCompGhost::force(DeviceComp& solver,
     if (curv_) {
         const DeviceCurv* t = solver.curvTables();
         assert(t && "focal ghost force needs the curvilinear DeviceComp");
-        if (!t) return {.fx = 0.0, .fy = 0.0, .fz = 0.0, .heat = 0.0};
+        if (!t) return {};
         const CurvView cv = t->view();
         kBodyFluxCurv<<<launchBlocks(nFace_), blockSize>>>(
             g_, viscView(solver.transport()), iso_, q, cv, fcell_.data(),
@@ -498,12 +640,17 @@ DeviceCompGhost::Force DeviceCompGhost::force(DeviceComp& solver,
             fdir_.data(), nFace_, facc_.data());
         checkLastKernel("kBodyFlux");
     }
-    // Four deterministic FP64 reductions over disjoint spans of facc_.
+    kBodyMoment<<<launchBlocks(nFace_), blockSize>>>(
+        fpos_.data(), pivot[0], pivot[1], pivot[2], nFace_, facc_.data());
+    checkLastKernel("kBodyMoment");
+    // Deterministic FP64 reductions over disjoint spans of facc_; span 3 is
+    // the wall heat and is skipped by the moment, hence the 4..6 offset.
     const std::size_t m = std::size_t(nFace_);
-    double f[4];
-    for (int c = 0; c < 4; ++c)
+    double f[7];
+    for (int c = 0; c < 7; ++c)
         f[c] = sumDouble(facc_.data() + c * m, m, red_);
-    return {.fx = f[0], .fy = f[1], .fz = f[2], .heat = f[3]};
+    return {.fx = f[0], .fy = f[1], .fz = f[2], .heat = f[3],
+            .qx = f[4], .qy = f[5], .qz = f[6]};
 }
 
 } // namespace dns::gpu

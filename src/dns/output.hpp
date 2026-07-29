@@ -87,6 +87,18 @@ public:
     [[nodiscard]] std::expected<void, std::string>
     row(std::string_view series, std::span<const double>);
 
+    // Replace the body mask, for a run whose body MOVES.
+    //
+    // Reaches the sinks that read the mask per frame -- the PNG frames and the
+    // live shared-memory planes -- so a rotor's images and its cockpit view
+    // follow the blade. It does NOT reach the two sinks that write the mask
+    // ONCE, by their own contract: `<prefix>_mask.bin` is a single plane
+    // written in phase 3c, and the web format carries the mask in its `static`
+    // section (docs/viewer-format.md). Both would need a format change to
+    // become time-dependent, so for a moving body they hold the mask the run
+    // STARTED with. Pre: same size as the mask the run was made with.
+    void updateMask(std::span<const float> mask);
+
     // True when t has reached the next .bin / png / web cadence.
     bool wantsFrame(double t) const;
     bool wantsPng(double t) const;

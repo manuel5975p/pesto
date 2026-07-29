@@ -1111,6 +1111,108 @@ Cell volumes sum to the **polygonal** annulus `½ nx sin(2π/nx)(rFar²−rw²)�
 not `π(rFar²−rw²)·span`: the cells are straight-edged. The π form is low by
 `Δθ²/6` (1.6e-3 at nx = 64) — do not "fix" a conservation check against it.
 
+## 12.3 Rotors — `--rotor-mach` (the body spins)
+
+`--rotor-mach M` makes the immersed body rotate about a fixed shaft through the
+placement centre, at the rate that puts its NOMINAL tip (radius `D/2`) at Mach
+`M`. It is the one switch: at 0 the geometry is built once, the wall is at rest,
+the stats file has the columns it always had, and every path is bit-for-bit the
+static solver. Compressible `dns flow` only — the moving wall is the ghost wall,
+and there is no incompressible counterpart.
+
+Two things a spinning body needs that a static one does not.
+
+**The surface moves.** The ghost image is taken about `u_wall = ω × r` instead
+of about rest, using the SAME linear image the isothermal thermal wall uses:
+with `a = dw/dsmp` the extrapolation factor already in the tables,
+`u_ghost = (1+a) u_wall − a u_sample`, which is the resting mirror at
+`u_wall = 0` and the familiar `2 u_wall − u_sample` at `a = 1`. Without this the
+blade is a rotating HOLE: it sheds a wake and produces essentially no thrust.
+The velocity is sampled once per ghost cell at the foot of the wall normal, so
+it costs nothing per step. This is also what `docs/validation.md` was waiting
+for to make Taylor–Couette possible.
+
+**The geometry moves.** Occupancy is a pure function of azimuth, so it is
+precomputed at `--rotor-bins` angles and replayed — reclassifying costs a
+signed-distance sweep, and a compressible run takes thousands of steps per
+revolution. The table lives in HOST memory (~1 MB per bin) and a bin change
+copies into device buffers sized for the largest bin, so it is a copy and never
+an allocation. The default bin count is the natural one, `2πR/h_fine`: occupancy
+cannot change faster than the tip crosses a cell. The azimuth is COMPUTED from
+the step's own time (`θ = ω t`), never accumulated, and the bin index is integer
+arithmetic mod bins, so a revolution closes exactly however long the run is.
+Geometry is held fixed across a whole step, not per RK stage — at an acoustic
+`dt` the tip moves a small fraction of a cell, far below the wall's own
+discretization error.
+
+Reported per stats row when a rotor is active: `thrust` (force along the shaft),
+`torque` (moment about it), and `ct`/`cq` on the propeller convention
+`ρ n² D⁴` / `ρ n² D⁵`. The moment is taken over the SAME staged FP64 face values
+the drag is, so torque and drag can never disagree about which faces are the
+body.
+
+**Resolution is the gate, and it is measured, not assumed.** The ghost wall
+needs a mirror band at least two cells thick on each side
+(`gpu/comp_ghost.hpp`), so a blade under 4 fine cells thick has its two surfaces
+reading through each other. The run reports the deep-solid cell count at build
+time and warns loudly when it is 0 at every azimuth. `--blade-thicken C` dilates
+the body outward by `C` fine cells — `sdf − C·h`, exactly a Minkowski sum with a
+ball, so the field stays a true distance and convex edges round rather than
+distort. It CHANGES THE BODY: chord grows by `2C·h`, and the achieved dilation
+must be reported with every result, the same discipline as the DNS/LES label.
+
+**The real tip may be faster than the flag says.** `--rotor-mach` is quoted on
+`D/2` because that is all `validate()` can know without opening the body file. A
+body that reaches further — a lens, a scene, an overhanging mesh — has a faster
+tip, and the Kennedy–Gruber flux has no shock capturing. The run measures the
+true tip radius from the classified interface faces and stops with the corrected
+number rather than diverging.
+
+That guard is necessary, not sufficient. Flow ACCELERATING over a spinning bluff
+body goes locally sonic well below a tip Mach of 1: measured, a 3.5:1 lens at a
+real tip Mach of 0.53 plus a 0.2 freestream passes the guard and still diverges.
+Treat the tip Mach as a budget to spend, not a limit to approach.
+
+`--rotor-axis x|y|z` picks the shaft (`x`, along the freestream, is an
+axial-flow rotor); at `nz == 1` only a `z` shaft is legal, since any other
+sweeps the blade out of the plane. `--rotor-span S` is the blade's half-extent
+along the shaft in diameters, capped at 0.5 — with the tip radius it bounds the
+SWEPT volume from flags alone, which is what lets `--focal auto` place a plateau
+around a rotor whose mesh the validator may not read.
+
+### A propeller to test with — `tools/propeller.py`
+
+    python3 tools/propeller.py prop.stl --blades 3 --pitch 0.8
+
+Emits a parametric propeller as a binary STL, tens of triangles per blade
+(36 at the default 5 spanwise stations): a lens cross-section lofted along a
+constant-pitch twist, plus a prism hub. Shaft is `+x`, matching
+`--rotor-axis x`. It prints, for the geometry it just wrote, the exact
+`--scale` to pass, the cells-across-`D` the blade would need, and why the run
+needs `--robust`.
+
+Two things about it are not incidental:
+
+**Pass the printed `--scale`, do not rely on auto-fit.** `dns` sizes a mesh by
+its largest STATIC extent, which for an odd blade count is smaller than the
+circle the blades sweep — 0.91 of it at three blades. Auto-fit would put the
+real tip 10% outside the nominal `D/2` and understate the tip Mach by the same
+factor. The printed scale makes the swept diameter equal `D`. (Because the
+compressible `D` is pinned at `π/4`, that scale is a constant of the case, not
+of the grid.) The run's measured tip radius reports the truth either way.
+
+**Pass `--robust`.** Hub and blades are separate closed shells that OVERLAP at
+the root. Every edge still joins exactly two triangles, so `watertight()`
+returns true and the usual warning does not fire — but the closest-triangle
+sign test is wrong inside the overlap (a point in a blade whose nearest
+triangle is on the hub reads as fluid, notching the root). The generalized
+winding number sums over both shells and is `≥ 1` inside either. At this
+triangle count it costs nothing.
+
+The default `--thickness 0.12` is an honest airfoil and is NOT resolvable on an
+affordable grid: it needs ~370 cells across `D`. Raise `--thickness`, or make
+it up with `--blade-thicken`, and say which in the writeup.
+
 ## 13. 2D == `nz == 1`, no separate code
 
 There is NO 2D code path. `nz == 1` IS the exact 2D restriction: the periodic wrap
