@@ -22,3 +22,4 @@ png_*/
 
 # Local tool logs (reconfig, viewer server, ...)
 *.log
+.claude/

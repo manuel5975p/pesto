@@ -18,7 +18,10 @@
 #pragma once
 
 #include "dns/gpu/comp.hpp"
+#include "dns/gpu/nscbc_modal.hpp"
 #include "dns/remap.hpp"
+
+#include <memory>
 
 namespace dns::gpu {
 
@@ -42,6 +45,33 @@ public:
         // cycle matching the sponge's cd sigma and St, 1.0 diverges (full
         // cancellation is ill-posed at low M). < 0 = freestream Mach.
         double betaTrans = 0.5;
+        // Angle-adaptive transverse coefficient. betaTrans is a CONSTANT, and
+        // the constant that cancels the LODI angle error is not: for an
+        // outgoing acoustic wave at incidence theta the exact incoming
+        // amplitude is L1 = -i omega p cos t (1 - cos t) while the transverse
+        // term carries Tp = i omega p sin^2 t, so the coefficient that
+        // reproduces it is beta_opt = cos t / (1 + cos t) -- and 0.5 is only
+        // its NORMAL-INCIDENCE limit. The face can recover its own theta with
+        // no extra state, because the same two quantities give it away:
+        //     Tp / Lout = (1 - cos t) / cos t
+        // with Lout the outgoing acoustic amplitude (L5 at a hi face, L1 at a
+        // lo one). Writing X = Tp/Lout, beta_opt = betaTrans * 2/(2 + X), and
+        // substituting reproduces L1 EXACTLY at every angle rather than
+        // through O(t^2) -- the Engquist-Majda symbol summed, not truncated,
+        // and without the auxiliary time history an exact ABC normally costs.
+        // X is clamped to [0, 18] (beta never exceeds betaTrans, so this is
+        // never more aggressive than the constant form, and grazing incidence
+        // out to ~87 deg is covered). X == 0 gives betaTrans back exactly, so
+        // a normal-incidence face is bit-for-bit unchanged.
+        bool betaAuto = false;
+        // Same coefficient, formed per transverse DCT-II MODE of the outflow
+        // plane instead of per cell (gpu/nscbc_modal.hpp). A per-cell ratio
+        // averages a superposition of angles; a modal one separates it, because
+        // the free-slip laterals make the cosine basis the exact transverse
+        // eigenbasis. Costs one plane and two transforms per stage, applies to
+        // the x-hi face ONLY, and is mutually exclusive with betaAuto.
+        // Pre: !openY, !openZ, floorRows < 0, uniform mesh.
+        bool betaModal = false;
         // Characteristic far-field lateral faces (default = leave the lateral
         // axes to the caller: periodic, walls, ...). openZ ignored at nz == 1.
         bool openY = false;
@@ -110,6 +140,9 @@ public:
                DeviceCompState& out, const StageCombine& cmb,
                const AxisRemap3& remap) const;
 
+    // Device bytes the modal closure owns; 0 when it is off.
+    std::size_t abcBytes() const { return abc_ ? abc_->bytes() : 0; }
+
     // Inflow target u (quiet-start ramp tracking); must stay subsonic.
     void setFreestream(double u) { u_ = u; }
     double freestream() const { return u_; }
@@ -120,12 +153,16 @@ public:
     void setWakeSource(double Q) { Q_ = Q; }
 
 private:
-    DeviceCompNscbc(const Grid& g, const Config& c);
+    DeviceCompNscbc(const Grid& g, const Config& c,
+                    std::unique_ptr<NscbcModalAbc> abc);
 
     GpuGrid g_;
     Config c_;
     double u_, cInf_;
     double Q_ = 0;
+    // Scratch, rewritten every stage: held by pointer so apply() stays const
+    // (it is an rhs producer, not a state owner) and the class stays movable.
+    std::unique_ptr<NscbcModalAbc> abc_;
 };
 
 } // namespace dns::gpu

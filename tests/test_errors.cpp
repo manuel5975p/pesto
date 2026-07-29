@@ -95,6 +95,24 @@ int main()
     expect("flow --physics compressible --body cylinder --far nscbc "
            "--re 2000 --dry-run", 2,
            "pure NSCBC above Re 800 is rejected");
+    expect("flow --physics compressible --body cylinder --far nscbc "
+           "--nscbc-abc modal --dry-run", 0,
+           "--nscbc-abc modal validates on the shipped walled-lateral case");
+    expect("flow --physics compressible --body cylinder --far sponge "
+           "--nscbc-abc modal --dry-run", 2,
+           "--nscbc-abc requires --far nscbc");
+    expect("flow --physics compressible --body cylinder --far nscbc --open "
+           "--nscbc-abc modal --dry-run", 2,
+           "--nscbc-abc modal is rejected, not ignored, with open laterals");
+    // adaptive forms the same ratio inside the NSCBC kernel, so it needs no
+    // separable plane and IS legal there -- which is the all-open box a static
+    // rotor runs in.
+    expect("flow --physics compressible --body cylinder --far nscbc --open "
+           "--nscbc-abc adaptive --dry-run", 0,
+           "--nscbc-abc adaptive works on open lateral faces");
+    expect("flow --physics compressible --body floor --far nscbc "
+           "--nscbc-abc modal --dry-run", 2,
+           "--nscbc-abc is rejected where the outflow plane is part solid");
     expect("flow --physics compressible --body cylinder --far sponge --pot "
            "--dry-run", 2,
            "--pot requires an open far field (sponge rejected)");

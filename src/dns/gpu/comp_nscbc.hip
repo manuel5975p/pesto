@@ -8,6 +8,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <memory>
 #include <type_traits>
 
 namespace dns::gpu {
@@ -19,6 +20,11 @@ namespace {
 // removes the discontinuity as un crosses 0. Promote to Config if a scan wants
 // it.
 constexpr Real kLatBand = Real(0.01);
+
+// Clamp on X = Tp/Lout in the angle-adaptive transverse coefficient: 18 is
+// cos(theta) ~ 0.053, about 87 deg, past which a face is not absorbing
+// anything anyway and the ratio is dominated by whatever noise is on Lout.
+constexpr Real kBetaXMax = Real(18);
 
 // One thread per open-boundary cell (x extremes always; y/z extremes when
 // open). Per boundary axis n the characteristic amplitudes in +axis
@@ -48,10 +54,10 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
                             Real gam, PrimView q,
                             int openY, int openZ, int fr, Real invLx, Real invLy,
                             Real invLz, Real sigma, Real etaIn, Real omM2,
-                            Real betaT, Real sigLat, Real etaLat, Real uT,
+                            Real betaT, int bAuto, Real sigLat, Real etaLat, Real uT,
                             Real rhoI, Real pI, int pot, Real Q, Real dbl,
                             Real xc, Real yc, Real zc, Real invRT,
-                            StageCombine cmb,
+                            StageCombine cmb, const Real* linHi,
                             Real* orho, Real* omx, Real* omy, Real* omz,
                             Real* oE)
 {
@@ -238,8 +244,29 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
             const Real s = hi ? Real(1) : Real(-1);
             const Real sig = a == 0 ? sigma : sigLat;
             const Real om = a == 0 ? omM2 : Real(1); // lateral normal M ~ 0
-            const Real Lin = sig * om * cs * invL[a] * (p - pPt) -
-                             betaT * (Tp - s * r * cs * Tun);
+            // This face's OUTGOING acoustic amplitude, hoisted: with bAuto it
+            // is also what tells the face its own angle of incidence.
+            const Real Lout = hi ? (un + cs) * (dp_ + r * cs * dun)
+                                 : (un - cs) * (dp_ - r * cs * dun);
+            const Real Tt = Tp - s * r * cs * Tun;
+            // beta_opt = betaT 2/(2 + Tt/Lout): exact for one oblique wave at
+            // any angle (comp_nscbc.hpp). X <= 0 gives betaT back BIT-FOR-BIT,
+            // which is every normal-incidence face, so this is a refinement of
+            // the constant form in the oblique regime and nothing else.
+            Real bt = betaT;
+            if (bAuto) {
+                const Real X = Lout != Real(0) ? Tt / Lout : Real(0);
+                bt = betaT * Real(2) /
+                     (Real(2) + fmin(fmax(X, Real(0)), kBetaXMax));
+            }
+            // linHi (gpu/nscbc_modal.hpp) carries the SAME product with the
+            // coefficient formed per transverse DCT mode instead of per cell;
+            // it owns the x-hi plane alone. Null = evaluate it here, which at
+            // bAuto == 0 is the shipped arithmetic bit-for-bit.
+            const Real trans = linHi && a == 0 && hi
+                                   ? linHi[j + std::size_t(g.ny) * k]
+                                   : bt * Tt;
+            const Real Lin = sig * om * cs * invL[a] * (p - pPt) - trans;
             if (a == 0) { // x-outflow entropy/shear leave: one-sided compute
                 L2 = un * (c2 * dr_ - dp_);
                 L3 = un * dn(vf[t1]);
@@ -260,10 +287,10 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
                 L4 = w * Lout4 + (Real(1) - w) * Lin4;
             }
             if (hi) {
-                L5 = (un + cs) * (dp_ + r * cs * dun);
+                L5 = Lout;
                 L1 = Lin;
             } else {
-                L1 = (un - cs) * (dp_ - r * cs * dun);
+                L1 = Lout;
                 L5 = Lin;
             }
         }
@@ -298,7 +325,8 @@ template <class Remap>
 void launchNscbc(const GpuGrid& g, const DeviceCompNscbc::Config& c, double u,
                  double cInf, double Q, const DeviceComp& d,
                  const DeviceCompState& s, DeviceCompState& out,
-                 const StageCombine& cmb, const Remap& R, const CurvView& cv)
+                 const StageCombine& cmb, const Remap& R, const CurvView& cv,
+                 const Real* linHi)
 {
     const double M = u / cInf;
     const PrimView q{s.rho.data(), d.u().data(), d.v().data(), d.w().data(),
@@ -317,10 +345,11 @@ void launchNscbc(const GpuGrid& g, const DeviceCompNscbc::Config& c, double u,
         int(c.openZ), c.floorRows,
         Real(1.0 / (g.nx * g.hx)), Real(1.0 / (g.ny * g.hy)),
         Real(1.0 / (g.nz * g.hz)), Real(c.sigma), Real(c.etaIn),
-        Real(1.0 - M * M), Real(betaT), Real(c.sigLat), Real(c.etaLat),
+        Real(1.0 - M * M), Real(betaT), int(c.betaAuto), Real(c.sigLat),
+        Real(c.etaLat),
         Real(u), Real(c.rhoInf), Real(c.pInf), int(c.potCorrect), Real(Q),
         Real(dbl), Real(c.xc), Real(c.yc), Real(c.zc),
-        Real(c.thermalInflow ? 1.0 / (c.Rgas * c.TInf) : 0.0), cmb,
+        Real(c.thermalInflow ? 1.0 / (c.Rgas * c.TInf) : 0.0), cmb, linHi,
         out.rho.data(),
         out.mx.data(), out.my.data(), out.mz.data(), out.E.data());
     checkLastKernel("kNscbcCells");
@@ -344,22 +373,45 @@ std::expected<DeviceCompNscbc, hipError_t> DeviceCompNscbc::make(const Grid& g,
                       std::isfinite(c.zc))) &&
                     c.floorRows >= -1 && c.floorRows <= g.ny - 5 &&
                     (c.floorRows < 0 || (!c.openY && !c.openZ)) &&
-                    (!c.thermalInflow || (c.TInf > 0 && c.Rgas > 0));
+                    (!c.thermalInflow || (c.TInf > 0 && c.Rgas > 0)) &&
+                    // The modal closure lives on the x-hi plane alone: a
+                    // characteristic lateral face is not separable, and a solid
+                    // floor cuts the plane the transform assumes whole. The
+                    // per-cell form needs none of that and is unrestricted.
+                    !(c.betaModal && c.betaAuto) &&
+                    (!c.betaModal || (!c.openY && !c.openZ && c.floorRows < 0));
     if (!ok) return std::unexpected(hipErrorInvalidValue);
-    return DeviceCompNscbc(g, c);
+
+    std::unique_ptr<NscbcModalAbc> abc;
+    if (c.betaModal)
+    {
+        auto m = NscbcModalAbc::make(GpuGrid::from(g),
+                                     {.gamma = c.gamma, .beta = c.betaTrans});
+        if (!m) return std::unexpected(m.error());
+        abc = std::make_unique<NscbcModalAbc>(std::move(*m));
+    }
+    return DeviceCompNscbc(g, c, std::move(abc));
 }
 
-DeviceCompNscbc::DeviceCompNscbc(const Grid& g, const Config& c)
+DeviceCompNscbc::DeviceCompNscbc(const Grid& g, const Config& c,
+                                 std::unique_ptr<NscbcModalAbc> abc)
     : g_(GpuGrid::from(g)), c_(c), u_(c.uInf),
-      cInf_(std::sqrt(c.gamma * c.pInf / c.rhoInf))
+      cInf_(std::sqrt(c.gamma * c.pInf / c.rhoInf)), abc_(std::move(abc))
 {
 }
 
 void DeviceCompNscbc::apply(const DeviceComp& d, const DeviceCompState& s,
                             DeviceCompState& out, const StageCombine& cmb) const
 {
+    const Real* lin = nullptr;
+    if (abc_)
+    {   // Same stage primitives the kernel below reads, one pass earlier.
+        abc_->compute(s.rho.data(), d.u().data(), d.v().data(), d.w().data(),
+                      d.p().data());
+        lin = abc_->plane();
+    }
     launchNscbc(g_, c_, u_, cInf_, Q_, d, s, out, cmb, IdentityRemap{},
-                CurvView{});
+                CurvView{}, lin);
 }
 
 namespace {
@@ -385,7 +437,7 @@ void DeviceCompNscbc::apply(const DeviceComp& d, const DeviceCompState& s,
 {
     CurvView cv;
     if (!curvViewOf(d, cv)) return;
-    launchNscbc(g_, c_, u_, cInf_, Q_, d, s, out, cmb, remap, cv);
+    launchNscbc(g_, c_, u_, cInf_, Q_, d, s, out, cmb, remap, cv, nullptr);
 }
 
 void DeviceCompNscbc::apply(const DeviceComp& d, const DeviceCompState& s,
@@ -394,7 +446,7 @@ void DeviceCompNscbc::apply(const DeviceComp& d, const DeviceCompState& s,
 {
     CurvView cv;
     if (!curvViewOf(d, cv)) return;
-    launchNscbc(g_, c_, u_, cInf_, Q_, d, s, out, cmb, remap, cv);
+    launchNscbc(g_, c_, u_, cInf_, Q_, d, s, out, cmb, remap, cv, nullptr);
 }
 
 } // namespace dns::gpu

@@ -20,6 +20,11 @@ enum class Physics { Incompressible, Compressible };
 enum class FarField { Tunnel, Fringe, Sponge, Nscbc, Periodic };
 enum class Backend { Cpu, Gpu, Auto };
 enum class BodyKind { None, Cylinder, Sphere, Cube, Lens, Fence, Floor, Mesh, Scene };
+// Which coefficient multiplies the Yoo-Im transverse term in the NSCBC
+// outflow's incoming acoustic amplitude. YooIm = the fixed --nscbc-beta (the
+// theta = 0 value of the exact coefficient); the other two derive it from the
+// data, per face cell or per transverse DCT mode. See docs/nscbc.md.
+enum class NscbcAbc { YooIm, Adaptive, Modal };
 
 // One field per CLI flag. `given` records which flags the user actually typed,
 // so the validator can distinguish "left at the default" from "set to the
@@ -69,6 +74,18 @@ struct RawConfig
     bool open = false;
     int spongeCells = 0, fringeAxes = 0;
     double nscbcBeta = 0.5;
+    // Where that coefficient comes from: fixed, per face cell, or per
+    // transverse DCT mode of the outflow plane. The derived forms read the
+    // face's own incidence angle off Tp/Lout and scale nscbcBeta by
+    // 2/(2 + Tp/Lout), which reproduces the exact incoming amplitude at that
+    // angle. Normal incidence is bit-for-bit the constant form.
+    NscbcAbc nscbcAbc = NscbcAbc::YooIm;
+    // Inflow relaxation stiffness. 100 is sized against a body's blockage sag
+    // and is an ACOUSTIC MIRROR (measured: it returns 81% of a normal wave's
+    // amplitude, and 11% of a radial pulse's energy in an open box against
+    // 0.04% at 0.5). A run with no freestream to sag -- a static rotor, an
+    // acoustic study -- wants it soft.
+    double nscbcEtaIn = 100.0;
     int nscbcStrip = 0;
     bool farPot = false;
 
@@ -186,7 +203,8 @@ public:
     double tinfK = 288.15, prandtl = 0.72, twallRatio = 1.0;
     bool sutherland = false, bodyIsothermal = false, nscbcThermalInflow = false;
     double penalize = 0;
-    double ramp = 0, kick = 0, nscbcBeta = 0;
+    double ramp = 0, kick = 0, nscbcBeta = 0, nscbcEtaIn = 0;
+    NscbcAbc nscbcAbc = NscbcAbc::YooIm;
     double scale = 0, pitch = 0, yaw = 0;
     int dimples = 0, bumps = 0, maxIters = 0, dtRecompute = 1;
     double bumpH = 8;   // spike height in cells

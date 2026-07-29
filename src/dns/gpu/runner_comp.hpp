@@ -75,7 +75,13 @@ struct CompRun
     int floorRows = -1;
     int spongeCells = 0;         // 0 = clamp(0.1 nx, 8, nx/2 - 1)
     double nscbcBeta = 0.5;      // Yoo-Im transverse correction, in [0,1)
+    bool nscbcBetaAuto = false;  // scale it by the per-cell incidence angle
+    double nscbcEtaIn = 100.0;   // inflow relaxation stiffness (> 0)
     int nscbcStrip = 0;          // absorbing strip inside the NSCBC rows
+    // Where the outflow's transverse coefficient comes from: the fixed
+    // nscbcBeta above, or derived per face cell / per transverse DCT mode
+    // (gpu/nscbc_modal.hpp). YooIm is bit-for-bit the pre-flag solver.
+    NscbcAbc nscbcAbc = NscbcAbc::YooIm;
     // Potential-corrected NSCBC targets: wake source from the EMA-smoothed
     // measured drag + displacement doublet about the body centre.
     bool nscbcPot = false;

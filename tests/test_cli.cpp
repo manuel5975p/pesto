@@ -83,6 +83,18 @@ int main()
             "--re 800 --mach 0.2");
     accepts("flow --physics compressible --body cylinder --far nscbc "
             "--nscbc-beta 0.5 --n 512");
+    accepts("flow --physics compressible --body cylinder --far nscbc "
+            "--nscbc-abc modal --n 512");
+    accepts("flow --physics compressible --body cylinder --far nscbc "
+            "--nscbc-abc adaptive --nscbc-beta 0.4 --n 512");
+    // Not separable laterally, and not a uniform outflow plane: rejected, not
+    // silently ignored (docs/nscbc.md).
+    rejects("flow --physics compressible --body cylinder --far nscbc --open "
+            "--nscbc-abc modal --n 512");
+    rejects("flow --physics compressible --body none --far nscbc --stretch 2 "
+            "--nscbc-abc modal --n 128 --ny 128");
+    accepts("flow --physics compressible --body none --far nscbc --stretch 2 "
+            "--nscbc-abc adaptive --n 128 --ny 128");
     accepts("flow --physics compressible --body cylinder --far nscbc --open --n 512");
     accepts("flow --physics compressible --body cylinder --far nscbc --open "
             "--pot --n 512");

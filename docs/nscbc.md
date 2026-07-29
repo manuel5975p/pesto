@@ -81,72 +81,224 @@ direction as the incompressible `--open` fringe result). Unit level: plane
 acoustic pulse reflection 0.6%, vortex-exit residual 2.5%, uniform freestream
 machine-exact, stiff-inflow pull exact.
 
-## Caveats / open items
+## Interior acoustics, measured 2026-07-28 (test `gpu_acoustics`)
 
-- Quiet-start-era sponge no longer reproduces the impulsive-era Re800 anchor
-  (cd 1.894 vs 1.71, St 0.250 vs 0.2445): the Re800 anchors are
-  start-condition-sensitive and need regeneration regardless of NSCBC.
-- 2026-07-18: the comp cylinder app's grid convention was fixed to scale
-  resolution with ny (domain fixed 8D; bit-identical at ny = 512). Numbers in
-  this file measured at 512² hold; pre-fix n = 256 runs were geometry-broken.
-- Not yet validated: 3D, the STL-body wiring, saturated
-  long-window Re60 shedding.
-- Reflection is small, not zero (plane-wave-normal exact only); a vortex
-  crossing still leaves a few-% residual. At Re2000 this residual PUMPS:
-  pure NSCBC blew up at 2048² (t = 63.6; final frames show vorticity sheets
-  on the free-slip walls and shed from the stiff inflow row — box modes
-  between stiff inflow, walls and soft outflow), and at 1024² it survives
-  contaminated (cd σ 0.58, clAmp 4.8). Fix = `--nscbc-strip N`: a thin sponge
-  strip (sigMax 0.5, N ≈ ny/64 ≈ 1–1.5% of nx) inside the NSCBC rows, the
-  standard production hybrid. 1024² Re2000 triplet, window [50, 96]:
-  pure 1.846 ± 0.582 (clAmp 4.8), strip-12 1.902 ± 0.341 (2.4, calmest of
-  all three), sponge 2.087 ± 0.370 (2.8). Use `--far nscbc` alone up to ~Re800;
-  add `--nscbc-strip` beyond.
+Before any boundary: what the scheme does to a sound wave. A linear wave
+(p'/p∞ = 1e-3) in a PERIODIC box returns to its own initial state after every
+traversal, so amplitude ratio and phase shift after k of them ARE the numerical
+dissipation and dispersion — no analytic solution to discretize, no boundary in
+the loop. Per wavelength travelled, 128 cells, cfl 0.4:
 
-## Six-face NSCBC (2026-07-18, later)
+| ppw | amp ratio | phase err (rad) | c_num/c |
+|-----|-----------|-----------------|---------|
+| 128 | 0.999937  | -2.55e-03 | 0.99959 |
+| 64  | 0.999976  | -1.00e-02 | 0.99840 |
+| 32  | 0.999902  | -4.03e-02 | 0.99358 |
+| 16  | 0.999111  | -1.60e-01 | 0.97451 |
+| 8   | 0.994831  | -6.25e-01 | 0.90050 |
+| 6.1 | 0.992451  | -1.05e+00 | 0.83240 |
+| 4   | 0.991869  | -2.28e+00 | 0.63701 |
+| 3   | 0.996581  | -3.73e+00 | 0.40651 |
+| 2   | **1.000000** | -6.28e+00 | **0.00000** |
 
-`DeviceCompNscbc` generalized from x-rows to all open faces; one kernel
-(`kNscbcCells`), disjoint slab enumeration (x faces own full slabs, y faces
-interior-x strips, z faces the interior core), `openY/openZ` in Config
-(openZ ignored at nz == 1; open axes need n >= 4).
+Dispersion is clean second order (measured exponents 1.96 / 1.99 / 2.01 / 1.98
+over 8→128 ppw). The wave rides a mean flow exactly — phase error identical at
+M 0, 0.2 and 0.5 — and the time error is invisible next to the spatial one
+(unchanged from cfl 0.4 down to 0.1), so the number in the table is the stencil
+alone. Linear in amplitude to p'/p∞ = 1e-2; at 1e-1 the wave steepens.
 
-- Lateral faces are characteristic far field: incoming acoustic = soft
-  pressure anchor `sigLat (p - pInf) c/L` (default 0.25) with the Yoo-Im
-  transverse correction (sign of the rho-c-Tu term flips with the face side:
-  incoming invariant is p -+ rho c u_n at hi/lo). The boundary-normal
-  velocity is NEVER relaxed — the body's displacement/dipole field vents
-  through the face; a lateral velocity clamp is a wall in disguise (measured
-  with the sponge far field).
-- Entropy/shear waves (lambda = u_n) upwind on the sign of the outward
-  normal velocity: outgoing = one-sided interior differences, incoming =
-  gentle freestream relax `etaLat c/L` (default 0.25 — deliberately soft,
-  unlike the stiff x-inflow).
-- Edges/corners: per-axis LODI contributions summed (Lodato-style closure);
-  non-boundary axes keep the exact faceFlux divergence; transverse
-  derivatives go one-sided where a central stencil would wrap across another
-  open face.
-- `boostX(g, s, du)` is now a free function in `gpu/comp.hpp`
-  (`DeviceCompFar::boost` delegates), so sponge-free apps keep the quiet
-  start.
+**The last row is the one to remember: the 2Δ mode is exactly stationary and
+exactly undamped.** A central skew-symmetric flux has no upwind dissipation, so
+acoustic content at the mesh scale does not decay — it stops travelling. Sound
+put into 3-4 cells crawls at 0.4-0.6 c and stays. The only sinks anywhere in
+the scheme are molecular ν and the explicit SGS model, which is why the
+"upstream ripples" gotcha ends in *do not reach for a filter*: nothing in the
+flux will ever remove that energy, so the cure is to stop generating it (resolve
+the source) rather than to damp it.
 
-Wiring (historical: the two separate apps this predates are gone). The mesh app
-dropped sponge + walls entirely — always all-face NSCBC, with `--nscbc-beta`
-added. The cylinder app kept free-slip walls as its default and took
-`--nscbc --open` for a laterally open box.
+## Absorption, measured 2026-07-28 (test `gpu_nscbc_absorb`)
 
-Today both are one path: `--far nscbc` (all-face characteristic boundaries,
-free-slip laterals), `--far nscbc --open` for laterally open, `--nscbc-beta`
-for the Yoo-Im transverse weight, and `--nscbc-strip N` for the hybrid strip.
+How absorbing the faces actually are, as reflection coefficients: a plane
+acoustic pulse (p'/p∞ = 1%, σ = 0.08 in a 2.56 box) released mid-domain,
+integrated until it plus three σ of tail have cleared the face, residual
+max |p − p∞| normalized by the incident amplitude. n = 256 unless stated.
 
-Measured:
-- Unit (test gpu_comp_nscbc): 2D/3D uniform freestream is a fixed point to
-  FP32 rounding; radial acoustic pulse exits ALL faces with 2.4% residual
-  (soft-inflow rig); vortex skimming the open y-hi face exits with 2.9%.
-- Sphere Re100 M0.2 dr6 (STL body, all-face NSCBC, quiet start): 64³ cd 1.10,
-  96³ cd 1.146, cl/cs ~ 1e-3 — vs the walled-sponge-era 96³ anchor 1.226 and
-  literature unbounded ~1.09: the free-slip-image blockage excess is gone.
-- Cylinder Re800 512 `--nscbc --open` smoke (short window): cd 1.71 ± 0.17,
-  clean shedding, stable through ramp + onset; below walled NSCBC 1.776 =
-  lateral confinement removed.
-- Not yet validated laterally open: long-window shedding statistics,
-  Re2000-class (the stiff-inflow box-mode caution above still applies).
+| mean Mach | R outflow | R inflow (etaIn 100) |
+|-----------|-----------|----------------------|
+| 0.2       | 0.0073    | 0.8435               |
+| 0.05      | 0.0106    | 0.8148               |
+| 0.01      | 0.0115    | 0.8126               |
+| 0 (quiescent) | 0.0116 | 0.8100              |
+
+**The outflow absorbs at every Mach including zero** — a stagnant outflow is
+not the problem it looks like — and refines away: n = 128/256/512 gives
+0.0258/0.0073/0.0041 at M 0.2 (observed order 1.8 then 0.8; percent-level, the
+σ pressure anchor is the floor, not a wall). Linear over amp 1e-3…1e-2; below
+that a fixed residual floor ~1e-5 p∞ dominates the ratio, and at amp 0.1
+nonlinear steepening puts it back at 3.2%.
+
+**The stiff inflow is an acoustic mirror, and it does not refine away**
+(order ≈ 0 to −0.2 over the same triplet). `etaIn` is sized against blockage
+sag, not acoustics, and the trade is steep — R inflow at M 0 for
+etaIn 0.5/2/10/30/100 = 0.020/0.060/0.231/0.493/0.810, with the quiescent
+all-face radial residual 0.0034/0.0036/0.0156/0.0336/0.0520. The 2.4% all-face
+figure quoted above was measured on the *soft*-inflow rig (etaIn 2); production
+runs etaIn 100 and there is no CLI knob for it.
+
+**Two earlier results on this page were wrong and are retracted** (2026-07-29).
+An angle-of-incidence table and a "the face is a vorticity source" conclusion
+were published here on 2026-07-28. Both were artifacts of the measurement, and
+both are corrected below. What they got right: the outflow is excellent
+head-on, the stiff inflow is a mirror, and `--nscbc-strip` is a
+normal-incidence fix. What they got wrong is stated so nobody re-derives it.
+
+*Retracted 1 — the vorticity.* The mode split scanned the WHOLE grid with a
+periodic central difference, which at the x extremes subtracts the outflow row
+from the inflow row: an O(amp) difference over one cell, reading as O(amp/h)
+and GROWING with refinement. Peeling cells off each face before the scan:
+
+| margin | peak vorticity | at (i,j), of (256,128) |
+|--------|----------------|------------------------|
+| 0  | 1.5119 | (255, 74) — the last column |
+| 1  | 0.2426 | (1, 62) — the other wrap |
+| 2  | 0.0061 | (69, 125) |
+| 8  | 0.0029 | (59, 119) |
+
+Peeling cells off, however, also peels off exactly where a vortex sheet laid
+down by the face WOULD live, so it cannot settle the question on its own. The
+scan that does is a non-wrapping one — one-sided at every extreme, margin 0.
+Measured 2026-07-29, 45° ridge on a 1024×128 rig: peak |ω| = **0.2198** of the
+incident scale, at **(846, 126)**. Real, an order below the 1.51 the wrapped
+metric reported, and sitting in the x-INTERIOR hard against the free-slip y
+wall — **not on the characteristic face**.
+
+So the standing argument that "λ₂..₄ = u = 0 in a quiescent box, so `L3 = u
+∂v/∂n` vanishes and the outflow row can never evolve its tangential velocity,
+freezing a vortex sheet" does not survive measurement: the row is clean and the
+lateral wall closure is where the residual sits. The face is **not** a vorticity
+source, the oblique residual **is** acoustic, and an acoustic ABC is the right
+thing to aim at after all. `modeSplit` now takes a margin ≥ 2 and documents why;
+`gpu_nscbc_order` carries the non-wrapping scan and pins the peak location.
+
+*Retracted 2 — the angle table.* Measuring an oblique reflection has a WINDOW
+and the old rig missed it at both ends. An oblique plane ridge is a DIAGONAL
+band spanning `x = xc ± (Ly/2)·tanθ`, so it has not cleared the box until its
+most-upstream point has covered `(Lbox − xc + (Ly/2)tanθ + 3σ)/(c cosθ)` —
+which the old stop time of `(Lbox/2 + 3σ)/(c cosθ)` does not reach past ~45°.
+Meanwhile the reflection starts leaving the FAR face after `Lbox/(c cosθ)`, so
+running longer under-reports. In a box as tall as it is wide those two cross at
+~45° and **there is no valid measurement time past it**. The published 60° and
+75° numbers were mostly incident wave that had not left yet; running the same
+case 4× longer dropped 75° from 0.2480 to 0.0042.
+
+## Angle of incidence, re-measured 2026-07-29 (test `gpu_nscbc_order`)
+
+Rig sized so the window exists at every angle (`xc > (Ly/2)tanθ + 3σ`):
+1024×128, σ = 0.03, band parked at 0.9·Lbox, sampled at 1.3·t_clear. Fraction
+of incident acoustic energy reflected off the OUTFLOW, quiescent:
+
+| θ | β=0 | β=0.2 | β=0.3 | β=0.4 | β=0.5 | β=0.6 | **auto** | R₁² (EM-1) | β_opt |
+|---|-----|-------|-------|-------|-------|-------|----------|------------|-------|
+| 0°  | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.500 |
+| 15° | 0.0115 | 0.0100 | 0.0096 | 0.0093 | 0.0092 | 0.0092 | 0.0096 | 0.0003 | 0.491 |
+| 30° | 0.0489 | 0.0399 | 0.0376 | 0.0364 | 0.0361 | 0.0366 | 0.0367 | 0.0052 | 0.464 |
+| 45° | 0.1071 | 0.0683 | 0.0614 | 0.0594 | 0.0608 | 0.0647 | 0.0627 | 0.0294 | 0.414 |
+| 60° | 0.2238 | 0.1116 | 0.1001 | 0.1017 | 0.1104 | 0.1232 | **0.0968** | 0.1111 | 0.333 |
+| 75° | 0.5682 | 0.2744 | 0.2889 | 0.3202 | 0.3552 | 0.3900 | 0.3677 | 0.3467 | 0.206 |
+
+β = 0 lands on the Engquist–Majda first-order coefficient
+R₁ = (1−cosθ)/(1+cosθ) within a factor of 2 at 60–75°, which is the check that
+the rig measures a reflection and not a leftover.
+
+**The measured optimum tracks β_opt(θ) = cosθ/(1+cosθ), not the constant 0.5.**
+0.5 is only its normal-incidence limit; the best fixed β falls from ~0.5 at 30°
+to 0.2 at 75°, exactly as β_opt does (0.464 → 0.206).
+
+### `--nscbc-beta-auto`: the exact coefficient, read off the face
+
+The face can recover its own incidence angle with no extra state, because the
+two quantities it already computes give it away. For an outgoing acoustic wave,
+`Tp/Lout = (1−cosθ)/cosθ` (Lout = L5 at a hi face, L1 at a lo one) — pointwise
+and independent of the pulse shape, since both are the same `f′(s)` times an
+angle factor. Writing X = Tp/Lout and substituting β = betaT·2/(2+X) into
+`Lin = −β·Tp`:
+
+    Lin = −Tp·Lout/(2·Lout + Tp) = −i ω p cosθ(1 − cosθ) = L1_exact
+
+**exactly, at every angle** — not through O(θ²). It is the Engquist–Majda
+symbol summed rather than truncated, obtained without the auxiliary time
+history an exact ABC normally costs. X is clamped to [0, 18]; X = 0 returns
+betaT bit-for-bit, so a normal-incidence face is unchanged.
+
+Two ways to form that ratio, and the difference is the whole point:
+
+- **`--nscbc-abc adaptive`** — per face cell, inside the NSCBC kernel. Needs no
+  plane and no transform, so it works on **every** open face and on any mesh,
+  including the all-open box a static rotor runs in.
+- **`--nscbc-abc modal`** — per transverse DCT-II mode of the whole outflow
+  plane (`gpu/nscbc_modal.*`). With the shipped `--far nscbc` laterals
+  (free-slip mirror walls) the cosine basis is the *exact* transverse
+  eigenbasis, so each mode carries one k_t and the ratio is formed inside it.
+  x-hi plane only, uniform mesh, walled laterals — rejected, never ignored,
+  everywhere else.
+
+| θ | best fixed β | adaptive | modal |
+|---|---|---|---|
+| 0°  | 0.0000 | 0.0000 (+0.0%) | 0.0000 (+0.0%) |
+| 15° | 0.0092 | 0.0096 (+3.8%) | 0.0094 (+1.9%) |
+| 30° | 0.0361 | 0.0367 (+1.6%) | 0.0367 (+1.6%) |
+| 45° | 0.0594 | 0.0627 (+5.6%) | 0.0632 (+6.4%) |
+| 60° | 0.1001 | **0.0968 (−3.2%)** | 0.1031 (+3.0%) |
+| 75° | 0.2744 | 0.3677 (+34.0%) | **0.2771 (+1.0%)** |
+
+Both reach the per-angle optimum without being told the angle. **`adaptive`
+collapses at grazing incidence and `modal` does not**, and that is not luck: at
+75° the field a face cell sees is a superposition — incident wave, its wall
+images, and a reflection that is no longer small — so a pointwise ratio reads
+an *average* angle. The DCT separates it instead. Pinned in `gpu_nscbc_order`.
+
+Cost: `modal` is 3 Real planes + 1 complex plane on the face (12 and 20 B per
+face cell), 2 transforms per stage, and 0.20 → 0.31 ms/step on a 192² 2D
+cylinder — launch-latency bound, not bandwidth. `adaptive` is free.
+
+The single-angle table understates it, because a real face sees every angle at
+once. Radial pulse, all four faces characteristic, quiescent, n = 256, fraction
+of pulse energy left:
+
+| etaIn | β=0.2 | β=0.3 | β=0.4 | β=0.5 | β=0.6 | auto |
+|-------|-------|-------|-------|-------|-------|------|
+| 100 (production) | 0.1156 | 0.1133 | 0.1121 | 0.1116 | 0.1117 | 0.1129 |
+| 0.5 (soft)       | 0.0007 | 0.0006 | 0.0005 | 0.0004 | 0.0004 | **0.0004** |
+
+**And that table is the real finding.** In the geometry a static rotor actually
+runs in — compact source, all faces open, no freestream — the transverse
+coefficient is worth ~3% and the inflow stiffness is worth a factor of 280.
+(`modal` is not even available there: an all-characteristic lateral face is not
+separable, so the validator refuses it and `adaptive` is the one that applies.)
+`etaIn` is the boundary condition on that case; β is a rounding error on it.
+Hence `--nscbc-etain` (below). Note also that `--far nscbc` with a soft inflow
+absorbs a radial pulse to **0.04% of its energy** — the far field is not the
+limitation it was taken for, once the mirror is off.
+
+### On Mur / Engquist–Majda second order
+
+Mur's second-order ABC is the FDTD discretization of the Engquist–Majda B2
+one-way operator, `∂ₓ∂ₜp + (1/c)∂ₜₜp − (c/2)∂_yy p = 0`, whose reflection
+coefficient is the square of B1's: R₂ = [(1−cosθ)/(1+cosθ)]².
+
+In a characteristic framework that operator is not a separate boundary
+condition — it is a statement about the incoming amplitude. For an outgoing
+oblique wave at the x-hi face, with `p = A exp(i(kx x + ky y − ωt))`,
+`u = kx p/(ρω)`, `v = ky p/(ρω)`:
+
+    L1_exact = (u−c)(∂ₓp − ρc ∂ₓu) = −i ω p cosθ (1 − cosθ)
+    Tp       = γ p ∂_y v  =  i ω p sin²θ        (the code's transverse term)
+
+so `L1 = −½ Tp` reproduces L1_exact through O(θ²) — and `Lin = … − betaT·(Tp −
+s ρc Tun)` with **betaT = 0.5 is exactly that**. The default already carries
+the Mur-2 content; β = 1 is the full cancellation that is ill-posed at low M
+(measured: diverges at t = 35), β = 0 is bare B1. So implementing Mur-2 as a
+separate boundary would re-derive a term already in the kernel — the useful
+move is not a higher fixed order but the exact coefficient, which is what
+`--nscbc-beta-auto` above does, and it needs no truncation at all.
+

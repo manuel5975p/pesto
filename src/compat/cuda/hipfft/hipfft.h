@@ -22,6 +22,8 @@ inline constexpr int HIPFFT_BACKWARD = CUFFT_INVERSE;  // +1 in both
 #define hipfftPlan1d cufftPlan1d
 #define hipfftPlan2d cufftPlan2d
 #define hipfftPlan3d cufftPlan3d
+#define hipfftPlanMany cufftPlanMany
+#define hipfftGetSize cufftGetSize
 #define hipfftDestroy cufftDestroy
 #define hipfftExecR2C cufftExecR2C
 #define hipfftExecC2R cufftExecC2R

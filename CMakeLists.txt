@@ -88,6 +88,7 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/comp_far.hip
     src/dns/gpu/comp_ghost.hip
     src/dns/gpu/comp_nscbc.hip
+    src/dns/gpu/nscbc_modal.hip
     src/dns/gpu/cutcell.hip
     src/dns/gpu/cutflux.hip
     src/dns/gpu/cutpoisson.hip
@@ -374,8 +375,10 @@ if(BUILD_TESTING)
                   gpu_energy_stability gpu_ghostfill gpu_comp gpu_comp_curv
                   gpu_comp_ghost gpu_comp_ghost_focal gpu_comp_les
                   gpu_comp_ghost3d gpu_comp_mesh
-                  gpu_comp_far gpu_comp_nscbc gpu_les_smag gpu_derived
-                  gpu_poisson_wally
+                  gpu_comp_far gpu_comp_nscbc gpu_nscbc_absorb gpu_nscbc_order
+                  gpu_acoustics
+                  gpu_les_smag gpu_derived
+                  gpu_poisson_wally gpu_rotor_wall gpu_rotor_table
                   gpu_channel gpu_cutflux gpu_ogrid)
             add_executable(test_${t} tests/test_${t}.cpp)
             target_link_libraries(test_${t} PRIVATE dns_gpu)

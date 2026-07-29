@@ -28,6 +28,9 @@ Semantic notes, i.e. the places where 1:1 needed a check rather than a typedef:
   headers have moved across CCCL releases. Two lines each, and version-proof.
 - `hipfftComplex` is `float2`, `cufftComplex` is `float2`. The aggregate
   initialisation in `gpu/poisson.hip` works unchanged.
+- `hipfftPlanMany` / `hipfftGetSize` take the same argument lists as their
+  cuFFT namesakes (`gpu/poisson.hip`'s `PeriodicXZWallY` plans and
+  `gpu/nscbc_modal.hip`'s memory report).
 - `HIPFFT_FORWARD`/`HIPFFT_BACKWARD` are -1/+1 in both.
 - The headers must stay compilable by the plain HOST compiler: `dns_main.cpp`
   and the `test_gpu_*.cpp` tests are CXX TUs that include `gpu/device_util.hpp`

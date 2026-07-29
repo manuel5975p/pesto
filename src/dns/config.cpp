@@ -934,9 +934,12 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
 
     // Far-field parameters.
     c.nscbcBeta = r.nscbcBeta;
+    c.nscbcEtaIn = r.given.contains("--nscbc-etain") ? r.nscbcEtaIn : 100.0;
     c.nscbcStrip = r.nscbcStrip;
     if (c.far == FarField::Nscbc)
     {
+        if (!(std::isfinite(c.nscbcEtaIn) && c.nscbcEtaIn > 0))
+            return bad(2, "--nscbc-etain", "must be > 0");
         // Empirically bracketed stability window (masterplan §6.3): 0 pumps a
         // growing global mode, 1.0 diverges at t = 35.
         if (!(std::isfinite(c.nscbcBeta) && c.nscbcBeta >= 0 && c.nscbcBeta < 1))
@@ -952,6 +955,44 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     }
     else if (r.given.contains("--nscbc-strip") && c.nscbcStrip > 0)
         return bad(2, "--nscbc-strip", "requires --far nscbc");
+    if (c.far != FarField::Nscbc && r.given.contains("--nscbc-etain"))
+        return bad(2, "--nscbc-etain", "requires --far nscbc");
+    // The derived outflow coefficients. `adaptive` is formed inside the NSCBC
+    // kernel from quantities it already has, so it constrains nothing beyond
+    // needing the closure at all. `modal` owns ONE plane -- the uniform x-hi
+    // face of a laterally walled box -- and each rejection below is a case
+    // where that plane is not what the transform assumes. Rejected, never
+    // silently ignored.
+    c.nscbcAbc = r.nscbcAbc;
+    if (c.nscbcAbc != NscbcAbc::YooIm && c.far != FarField::Nscbc)
+        return bad(2, "--nscbc-abc", "is the NSCBC outflow's transverse "
+                                     "coefficient; use --far nscbc");
+    if (c.nscbcAbc == NscbcAbc::Modal)
+    {
+        if (c.open)
+            return bad(2, "--nscbc-abc modal",
+                       "needs walled lateral faces: with --open the far-field "
+                       "problem is not separable in the transverse directions, "
+                       "so the modal basis it transforms in does not exist "
+                       "(--nscbc-abc adaptive works there)");
+        if (r.stretch > 0 || !r.focal.empty())
+            return bad(2, "--nscbc-abc modal",
+                       "is derived on the UNIFORM outflow plane; --stretch and "
+                       "--focal remap it (--nscbc-abc adaptive works there)");
+        if (r.ogrid)
+            return bad(2, "--nscbc-abc modal",
+                       "is a Cartesian x-face closure; the body-fitted O-grid "
+                       "has no such face");
+        if (c.bodyKind == BodyKind::Floor)
+            return bad(2, "--nscbc-abc modal",
+                       "needs a whole outflow plane; --body floor makes its "
+                       "lower rows solid");
+        if (c.grid.nz > 1)
+            c.warnings.emplace_back(
+                "--nscbc-abc modal transforms the outflow plane along y only; "
+                "z is periodic, not mirror-symmetric, so a spanwise-oblique "
+                "wave still sees a per-z-line coefficient");
+    }
     c.farPot = r.farPot;
     if (c.farPot && c.bodyKind == BodyKind::None)
         return bad(2, "--pot", "models the body's wake source and displacement "
@@ -1795,6 +1836,14 @@ std::string Case::describe() const
                       : "time-march to tEnd",
         outPrefix.c_str());
     std::string s = buf;
+    // Derived outflow coefficient: printed only when asked for, so a default
+    // case's --dry-run reads exactly as it always did. It CHANGES the boundary
+    // arithmetic, so like the DNS/LES label it must be visible.
+    if (nscbcAbc != NscbcAbc::YooIm)
+        s += std::string("  nscbc      outflow transverse coefficient derived ")
+             + (nscbcAbc == NscbcAbc::Modal ? "per transverse DCT mode"
+                                            : "per face cell")
+             + " (--nscbc-abc; --nscbc-beta caps it)\n";
     // Thermal model: printed only when a run actually asked for one, so a
     // mechanical case's --dry-run reads exactly as it always did.
     if (physics == Physics::Compressible &&

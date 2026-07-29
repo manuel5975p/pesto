@@ -153,7 +153,8 @@ replace the positional. Explicit CLI flags override the file.
 * **Far field** `--far tunnel|fringe|sponge|nscbc|periodic` + `--open` for the
   lateral faces (§7). Tuning: `--sponge-cells N` (0 = 10% of n),
   `--fringe-axes 2|3` (0 = auto: 2 when `--nz 1`), `--nscbc-beta` (0.5),
-  `--nscbc-strip` (0), `--pot`.
+  `--nscbc-strip` (0), `--nscbc-etain` (100),
+  `--nscbc-abc yooim|adaptive|modal` (yooim), `--pot`.
 * **Solver** `--tol` (1e-4, CG per-cell RMS residual), `--max-iters` (500),
   `--dt-recompute` (16, comp). The pressure solve is NOT selectable: it follows
   `--far` (periodic FFT for `fringe`/`periodic`, Neumann-box DCT otherwise).
@@ -680,6 +681,51 @@ strip12 1.902±0.341 / 2.4 (calmest), sponge 2.087±0.370 / 2.8; the cd ordering
 the confinement ordering. 2048² strip32 ran clean to t ≈ 25 (user-stopped, not
 validated long). Rule: `--far nscbc` alone ≤ Re800; add `--nscbc-strip ~ny/64`
 beyond (the validator enforces this). `N = 0` is byte-identical to pure six-face.
+
+### `--nscbc-etain` — the inflow was an acoustic mirror
+`docs/nscbc.md`, measured in `gpu_nscbc_absorb`.
+
+The inflow relaxation stiffness was a compile-time 100. It earns that against a
+body's blockage sag (etaIn 2 sagged u_in to 0.79 u∞ at the Re60 cylinder and
+biased cd 30% low), **so 100 is still the default and every existing run is
+unchanged** — but it returns 0.81 of a normal wave's amplitude, and it does not
+refine away. In the geometry a static rotor runs in (compact source, all faces
+open, no freestream) it keeps 11% of a radial pulse's energy against **0.04%**
+at etaIn 0.5: a factor of 280, where the transverse coefficient below is worth
+3%. A run with no freestream to sag has nothing to buy with it.
+
+### `--nscbc-abc` — the incidence-angle limit, and how much of it is reachable
+`gpu/nscbc_modal.*`, measured in `gpu_nscbc_order`, full writeup `docs/nscbc.md`.
+
+A FIXED `--nscbc-beta` is a Taylor coefficient: for an outgoing wave at
+incidence θ the exact coefficient of the same Yoo-Im term is
+`β(θ) = cos θ/(1 + cos θ)`, and 0.5 is its θ = 0 value (this is Mur-2 in
+characteristic form). Measured fixed-β sweep, 2D quiescent, energy reflected:
+the optimum is 0.5 / 0.4 / 0.3 / 0.2 at θ = 30/45/60/75° against an exact
+0.464 / 0.414 / 0.333 / 0.206 — the theory's target, confirmed.
+
+`--nscbc-abc` derives β from the data instead. `L5` and `Tp` are both already
+computed on the face and are in phase, and `Tp/L5 = (1−cos θ)/cos θ`, so
+`β = L5/(2L5 + Tp)` — exact in angle, **local in time** (no Hagstrom-Warburton
+auxiliary stack), and bounded by 1/2, so it never leaves the window 0.5 already
+tops. `adaptive` forms that ratio per face cell — no plane, no transform, so it
+works on every open face and any mesh. `modal` forms it per transverse DCT-II
+mode of the whole outflow plane (with walled laterals the cosine basis is the
+exact transverse eigenbasis; Makhoul kernels shared with the Neumann Poisson
+solver, `gpu/internal/dct.hpp`), and is rejected — never ignored — with
+`--open`, `--stretch`, `--focal`, `--ogrid` or `--body floor`.
+
+Measured energy reflected against the best hand-tuned constant β, θ = 15…75°:
+adaptive +3.8 / +1.6 / +5.6 / **−3.2** / +34.0 %, modal +1.9 / +1.6 / +6.4 /
++3.0 / **+1.0** %. Both find the per-angle optimum without being told the angle;
+**adaptive collapses at grazing incidence and modal does not**, because at 75°
+a face cell sees a superposition and a pointwise ratio reads an average angle
+while the DCT separates it. Cost: modal is 20 B per face cell and ~0.1 ms/step
+of launch latency on a 192² 2D case; adaptive is free. `yooim` is the default
+and is bit-for-bit the pre-flag solver.
+
+Keep the prize in proportion: this buys single-digit percent of the reflected
+energy, while `--nscbc-etain` above is worth 280× in the same box.
 
 ### `--pot` — potential-corrected far field
 Compressible `--far nscbc`, incompressible `--far tunnel --open`; rejected

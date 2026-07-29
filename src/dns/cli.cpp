@@ -210,6 +210,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
 
     int physicsSel = int(c.physics), farSel = int(c.far), backendSel = int(c.backend),
         sgsSel = int(c.sgs);
+    int abcSel = int(c.nscbcAbc);
     std::vector<EnumOpt> enums{
         {"--backend", {{"cpu", int(Backend::Cpu)}, {"gpu", int(Backend::Gpu)},
                        {"auto", int(Backend::Auto)}}, &backendSel},
@@ -234,6 +235,13 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                           {"nscbc", int(FarField::Nscbc)},
                           {"periodic", int(FarField::Periodic)}},
                          &farSel});
+        enums.push_back({"--nscbc-abc",
+                         {{"yooim", int(NscbcAbc::YooIm)},
+                          {"adaptive", int(NscbcAbc::Adaptive)},
+                          {"modal", int(NscbcAbc::Modal)}},
+                         &abcSel});
+        enums.push_back({"--rotor-axis",
+                         {{"x", 0}, {"y", 1}, {"z", 2}}, &c.rotorAxis});
         enums.push_back({"--vort-map",
                          {{"linear", 0}, {"asinh", 1}}, &c.vortMap});
         enums.push_back({"--speed-map",
@@ -355,6 +363,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     c.physics = Physics(physicsSel);
     c.far = FarField(farSel);
     c.sgs = SgsModel(sgsSel);
+    c.nscbcAbc = NscbcAbc(abcSel);
     if (!c.given.contains("--out")) c.out = string(sub);
     return c;
 }
@@ -598,6 +607,31 @@ FAR FIELD (--far, exactly one)
   --nscbc-beta B     Yoo-Im transverse correction, in [0,1)         [0.5]
                      Measured: 0 pumps a growing global mode;
                      1.0 diverges at t=35. Values >= 1 are rejected.
+  --nscbc-abc M      where the outflow's transverse coefficient comes
+                     from. The exact value for a wave at incidence t is
+                     cos t/(1+cos t); a fixed --nscbc-beta is its t = 0
+                     value 1/2, and these derive it from the data.
+                     Normal incidence is unchanged bit-for-bit. [yooim]
+                       yooim     the fixed --nscbc-beta (default)
+                       adaptive  per face cell, from the outgoing /
+                                 transverse amplitude ratio; every open
+                                 face, any mesh
+                       modal     per transverse DCT mode of the whole
+                                 outflow plane (the free-slip laterals
+                                 are that basis exactly); x-hi only,
+                                 uniform mesh, walled laterals
+                     Measured (docs/nscbc.md): matches the best hand-
+                     tuned constant beta to within 6% out to 60 deg
+                     without being told the angle -- but the prize is
+                     small, and in an all-open box --nscbc-etain is
+                     worth ~280x what this is.
+  --nscbc-etain E    inflow relaxation stiffness, > 0                 [100]
+                     100 resists a body's blockage sag (etaIn 2 biased
+                     cd 30% low at the Re60 cylinder) but IS an acoustic
+                     mirror: measured 81% amplitude returned on a normal
+                     wave, and 11% of a radial pulse's energy kept in an
+                     open box against 0.04% at 0.5. With no freestream
+                     to sag (a static rotor) there is nothing to buy.
   --nscbc-strip N    absorbing strip inside the NSCBC rows; 0 = pure
                      characteristic. Required above Re 800; use ~ny/64
                      (pure NSCBC diverges at Re 2000, 2048^2).         [0]
