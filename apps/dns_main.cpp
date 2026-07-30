@@ -469,6 +469,8 @@ int runFlowCompressible(const Case& c, CaseGeometry& geo)
     rr.nscbcAbc = c.nscbcAbc;
     rr.nscbcEtaIn = c.nscbcEtaIn;
     rr.nscbcStrip = c.nscbcStrip;
+    rr.nscbcSink = c.nscbcSink;
+    rr.nscbcSinkAmp = c.nscbcSinkAmp;
     rr.nscbcPot = c.farPot;
     rr.cx = c.placement.cx;
     rr.cy = c.placement.cy;

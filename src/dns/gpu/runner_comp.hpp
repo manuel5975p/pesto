@@ -78,6 +78,10 @@ struct CompRun
     bool nscbcBetaAuto = false;  // scale it by the per-cell incidence angle
     double nscbcEtaIn = 100.0;   // inflow relaxation stiffness (> 0)
     int nscbcStrip = 0;          // absorbing strip inside the NSCBC rows
+    // Scale-selective damping band (gpu/comp_sink): sub-6dx sink inside the
+    // open faces, additive rhs under the NSCBC overwrite. 0 = off, bit-inert.
+    int nscbcSink = 0;
+    double nscbcSinkAmp = 1.0;   // sigma_max = amp c/h, (0, 2]
     // Where the outflow's transverse coefficient comes from: the fixed
     // nscbcBeta above, or derived per face cell / per transverse DCT mode
     // (gpu/nscbc_modal.hpp). YooIm is bit-for-bit the pre-flag solver.

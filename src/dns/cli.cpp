@@ -166,6 +166,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--sponge-cells", &c.spongeCells}, {"--fringe-axes", &c.fringeAxes},
              {"--nscbc-beta", &c.nscbcBeta}, {"--nscbc-strip", &c.nscbcStrip},
              {"--nscbc-etain", &c.nscbcEtaIn},
+             {"--nscbc-sink", &c.nscbcSink},
+             {"--nscbc-sink-amp", &c.nscbcSinkAmp},
              {"--stretch", &c.stretch}, {"--focal", &c.focal},
              {"--focal-ratio", &c.focalRatio},
              {"--focal-blend", &c.focalBlend},
@@ -635,6 +637,17 @@ FAR FIELD (--far, exactly one)
   --nscbc-strip N    absorbing strip inside the NSCBC rows; 0 = pure
                      characteristic. Required above Re 800; use ~ny/64
                      (pure NSCBC diverges at Re 2000, 2048^2).         [0]
+  --nscbc-sink N     scale-selective damping band of N cells inside the
+                     open faces (x always; y/z with --open); 0 = off.
+                     Damps only sub-6dx content -- the waves whose group
+                     velocity c cos(kh) is <= 0, which never reach a
+                     face and which no characteristic closure can act
+                     on (measured spectrum: docs/nscbc.md). Resolved
+                     scales pass (< 2 permille at 16dx); there is no
+                     freestream reference, so nothing sags and nothing
+                     reflects. 16 is the measured default width.       [0]
+  --nscbc-sink-amp A sink strength: sigma_max = A c/h. (0, 2]; 2 is the
+                     SSP-RK3 stability cap at cfl 0.4.               [1.0]
   --pot              potential-corrected far field: targets/inlet are
                      freestream + wake source (strength from the
                      measured drag, EMA) + displacement doublet instead

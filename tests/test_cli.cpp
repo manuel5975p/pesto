@@ -100,6 +100,24 @@ int main()
             "--n 512"); // D = L/4, smallest allowed compressible box
     accepts("flow --physics compressible --body cylinder --far nscbc "
             "--nscbc-strip 12 --n 1024 --re 2000");
+    // The scale-selective sink band: nscbc-only, uniform mesh only, whole
+    // faces only, alpha capped by the RK3 bound. Rejected, never ignored.
+    accepts("flow --physics compressible --body cylinder --far nscbc "
+            "--nscbc-sink 16 --n 512");
+    accepts("flow --physics compressible --body cylinder --far nscbc --open "
+            "--nscbc-sink 16 --nscbc-sink-amp 2 --n 512");
+    rejects("flow --physics compressible --body cylinder --far sponge "
+            "--nscbc-sink 16 --n 512");
+    rejects("flow --physics compressible --body cylinder --far nscbc "
+            "--nscbc-sink 16 --nscbc-sink-amp 2.5 --n 512");
+    rejects("flow --physics compressible --body cylinder --far nscbc "
+            "--nscbc-sink-amp 1 --n 512"); // amp without a width
+    rejects("flow --physics compressible --body cylinder --far nscbc "
+            "--nscbc-sink 300 --n 512");   // band does not fit twice
+    rejects("flow --physics compressible --body none --far nscbc --stretch 2 "
+            "--nscbc-sink 16 --n 128 --ny 128"); // remapped band unmeasured
+    rejects("flow --physics compressible --body floor --far nscbc "
+            "--nscbc-sink 16 --n 512");    // solid floor rows own the band
     accepts("flow --physics compressible --body m.stl --far nscbc --open --n 96 "
             "--nz 96 --les 0.17");
     accepts("flow --physics compressible --body m.stl --far nscbc --open --n 128 "

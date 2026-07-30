@@ -16,6 +16,7 @@
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_far.hpp"
 #include "dns/gpu/comp_nscbc.hpp"
+#include "dns/gpu/comp_sink.hpp"
 #include "gpu_test_util.hpp"
 #include "check.hpp"
 
@@ -49,10 +50,14 @@ struct PlaneRig
     std::expected<gpu::DeviceCompState, hipError_t> ds;
     std::expected<gpu::ReduceScratch, hipError_t> red;
 
+    std::optional<gpu::DeviceCompSink> snk;
+
     // strip = --nscbc-strip N: the production hybrid is a sponge band of N
     // cells at sigMax 0.5 INSIDE the characteristic rows (runner_comp.hip:124).
+    // sink = --nscbc-sink N: the scale-selective band (gpu/comp_sink),
+    // composed exactly as runner_comp does -- additive under the overwrite.
     PlaneRig(int nx, double uMean, double etaIn, int strip = 0, int ny = 8,
-             double betaTrans = 0.5)
+             double betaTrans = 0.5, int sink = 0)
         : g(Grid::make(nx, ny, 1, Lbox, ny * (Lbox / nx), 1.0)),
           dev(gpu::DeviceComp::make(g, gam, 0.0)),
           far(gpu::DeviceCompFar::make(
@@ -68,11 +73,18 @@ struct PlaneRig
           red(gpu::ReduceScratch::make())
     {
         if (!dev || !far || !nsc || !ds || !red) std::exit(EXIT_FAILURE);
+        if (sink > 0) {
+            auto s = gpu::DeviceCompSink::make(
+                g, {.nb = sink, .alpha = 1.0, .cInf = cInf});
+            if (!s) std::exit(EXIT_FAILURE);
+            snk.emplace(std::move(*s));
+        }
         dev->setStageHook([this](gpu::DeviceCompState& st) { far->apply(st); });
         dev->setRhsHook([this](const gpu::DeviceCompState& st,
                                gpu::DeviceCompState& out,
                                const gpu::StageCombine& cmb) {
             nsc->apply(*dev, st, out, cmb);
+            if (snk) snk->apply(st, out, cmb);
         });
     }
 
@@ -191,10 +203,10 @@ struct PlaneRig
 // inside the box, so the residual it leaves is the reflection and not the
 // pulse still on its way out.
 double planeReflection(int nx, double mach, double amp, int dir,
-                       double etaIn = 100.0, int strip = 0)
+                       double etaIn = 100.0, int strip = 0, int sink = 0)
 {
     const double uMean = mach * cInf;
-    PlaneRig r(nx, uMean, etaIn, strip);
+    PlaneRig r(nx, uMean, etaIn, strip, 8, 0.5, sink);
     const double x0 = 0.5 * Lbox, sig = 0.08;
     r.set([&](double x, double) {
         const double pp =
@@ -371,6 +383,24 @@ int main()
                     out);
     }
 
+    // The scale-selective sink against the SAME faces. A resolved pulse
+    // (sigma = 8h Gaussian: spectrally empty above kh ~ pi/4) must pass the
+    // band untouched in BOTH directions -- if these rows move, the sink is
+    // not selective and every reflection coefficient above is invalidated.
+    // Conversely the sink must NOT fix the inflow mirror: that reflection is
+    // resolved-scale, and it belongs to etaIn (or the strip), not to a
+    // sub-6dx band. A sink that helped here would be eating the near field.
+    std::printf("\n--nscbc-sink against the same faces, amp 1%%, n = 256, etaIn 100\n");
+    std::printf("   sink   R_inflow(M 0)  R_outflow(M 0)\n");
+    const int sinks[3] = {0, 8, 16};
+    double inSink[3] = {}, outSink[3] = {};
+    for (int i = 0; i < 3; ++i) {
+        inSink[i] = planeReflection(256, 0.0, 0.01, -1, 100.0, 0, sinks[i]);
+        outSink[i] = planeReflection(256, 0.0, 0.01, +1, 100.0, 0, sinks[i]);
+        std::printf("  %5d       %9.4f       %9.4f\n", sinks[i], inSink[i],
+                    outSink[i]);
+    }
+
     std::printf("\nradial pulse, all four faces characteristic, amp 1%%\n");
     std::printf("   mach  etaIn     n    R_allface\n");
     double radStiff = 0, radSoft = 0;
@@ -412,6 +442,15 @@ int main()
     // percent, and ny/16 into a fraction of one.
     check(inStrip[1] < 0.15, "--nscbc-strip 4 kills the inflow mirror");
     check(inStrip[3] < 0.01, "--nscbc-strip 16 absorbs the inflow to < 1%");
+    // The sink is selective at the system level: a resolved pulse crosses its
+    // band unchanged both ways, so it neither degrades the outflow nor
+    // "fixes" the inflow mirror -- that reflection is resolved-scale and is
+    // etaIn's (or the strip's) to absorb, which is exactly the division of
+    // labour docs/nscbc.md prescribes.
+    check(std::abs(outSink[2] - outSink[0]) < 0.01,
+          "--nscbc-sink 16 leaves the resolved outflow reflection unchanged");
+    check(std::abs(inSink[2] - inSink[0]) < 0.05,
+          "--nscbc-sink does not (and must not) fix the resolved inflow mirror");
 
     return dnstest::finish();
 }

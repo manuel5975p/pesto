@@ -103,6 +103,14 @@ struct RawConfig
     // acoustic study -- wants it soft.
     double nscbcEtaIn = 100.0;
     int nscbcStrip = 0;
+    // Scale-selective absorbing band inside the open faces (gpu/comp_sink):
+    // an explicit sink for the sub-6dx content the central flux cannot
+    // transport to a face (docs/nscbc.md, "Small scales and the strip
+    // hand-off"). Unlike the strip it carries no freestream reference, so
+    // resolved scales and the displacement flow pass through. 0 = off,
+    // bit-for-bit the bare characteristic boundary.
+    int nscbcSink = 0;
+    double nscbcSinkAmp = 1.0; // sigma_max = amp c/h; SSP-RK3 caps amp at 2
     bool farPot = false;
 
     // body discretization
@@ -219,12 +227,12 @@ public:
     double tinfK = 288.15, prandtl = 0.72, twallRatio = 1.0;
     bool sutherland = false, bodyIsothermal = false, nscbcThermalInflow = false;
     double penalize = 0;
-    double ramp = 0, kick = 0, nscbcBeta = 0, nscbcEtaIn = 0;
+    double ramp = 0, kick = 0, nscbcBeta = 0, nscbcEtaIn = 0, nscbcSinkAmp = 0;
     NscbcAbc nscbcAbc = NscbcAbc::YooIm;
     double scale = 0, pitch = 0, yaw = 0;
     int dimples = 0, bumps = 0, maxIters = 0, dtRecompute = 1;
     double bumpH = 8;   // spike height in cells
-    int spongeCells = 0, fringeAxes = 0, nscbcStrip = 0, planes = 3;
+    int spongeCells = 0, fringeAxes = 0, nscbcStrip = 0, nscbcSink = 0, planes = 3;
     int steps = 0;
     unsigned seed = 1;
     bool open = false, robust = false, lesLabel = false, quiet = false, dryRun = false;

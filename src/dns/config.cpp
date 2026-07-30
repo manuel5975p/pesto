@@ -973,6 +973,8 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
     c.nscbcBeta = r.nscbcBeta;
     c.nscbcEtaIn = r.given.contains("--nscbc-etain") ? r.nscbcEtaIn : 100.0;
     c.nscbcStrip = r.nscbcStrip;
+    c.nscbcSink = r.nscbcSink;
+    c.nscbcSinkAmp = r.nscbcSinkAmp;
     if (c.far == FarField::Nscbc)
     {
         if (!finitePos(c.nscbcEtaIn))
@@ -988,10 +990,41 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
         if (c.re > 800 && c.nscbcStrip == 0)
             return bad(2, "--nscbc-strip", "pure NSCBC is validated only up to "
                                            "Re 800 (it diverges at Re 2000, 2048^2); "
-                                           "pass --nscbc-strip ~ny/64");
+                                           "pass --nscbc-strip ~ny/64 (or see "
+                                           "--nscbc-sink, docs/nscbc.md)");
+        if (c.nscbcSink < 0 || 2 * c.nscbcSink >= c.grid.nx ||
+            (c.open && c.nscbcSink > 0 && 2 * c.nscbcSink >= c.grid.ny))
+            return bad(2, "--nscbc-sink", "band must be >= 0 and fit twice on "
+                                          "every open axis");
+        if (!(std::isfinite(c.nscbcSinkAmp) && c.nscbcSinkAmp > 0 &&
+              c.nscbcSinkAmp <= 2.0))
+            return bad(2, "--nscbc-sink-amp",
+                       "must be in (0, 2]; sigma dt <= 2 * cfl * axes is the "
+                       "SSP-RK3 real-axis bound at cfl 0.4");
+        // The sink's cutoff is quoted in CELLS on a uniform mesh; under a
+        // remap the physical cutoff varies across the band, which needs its
+        // own measurement before it is allowed. Rejected, never ignored.
+        if (c.nscbcSink > 0 && (r.stretch > 0 || !r.focal.empty()))
+            return bad(2, "--nscbc-sink", "is measured on the uniform mesh; "
+                                          "--stretch/--focal remap the band "
+                                          "(unmeasured -- not yet allowed)");
+        if (c.nscbcSink > 0 && c.bodyKind == BodyKind::Floor)
+            return bad(2, "--nscbc-sink", "band rows overlap the solid floor "
+                                          "rows the ghost wall owns "
+                                          "(--body floor)");
+        if (c.nscbcSink > 0 && r.ogrid)
+            return bad(2, "--nscbc-sink", "is a Cartesian face band; the "
+                                          "body-fitted O-grid has no such "
+                                          "faces");
     }
     else if (r.given.contains("--nscbc-strip") && c.nscbcStrip > 0)
         return bad(2, "--nscbc-strip", "requires --far nscbc");
+    if (c.far != FarField::Nscbc && r.given.contains("--nscbc-sink") &&
+        c.nscbcSink > 0)
+        return bad(2, "--nscbc-sink", "requires --far nscbc");
+    if (r.given.contains("--nscbc-sink-amp") && c.nscbcSink == 0)
+        return bad(2, "--nscbc-sink-amp", "sets the strength of the "
+                                          "--nscbc-sink band; pass a width");
     if (c.far != FarField::Nscbc && r.given.contains("--nscbc-etain"))
         return bad(2, "--nscbc-etain", "requires --far nscbc");
     // The derived outflow coefficients. `adaptive` is formed inside the NSCBC
@@ -1901,6 +1934,13 @@ std::string Case::describe() const
              + (nscbcAbc == NscbcAbc::Modal ? "per transverse DCT mode"
                                             : "per face cell")
              + " (--nscbc-abc; --nscbc-beta caps it)\n";
+    // The sink is an explicit energy sink and is reported like the DNS/LES
+    // label: a run that carries one says so in its resolved case.
+    if (nscbcSink > 0)
+        s += std::format(
+            "  nscbc      scale-selective sink: {}-cell band, sin^4 cutoff "
+            "(~86% at 4dx, ~1% at 16dx), sigma_max = {:.3g} c/h\n",
+            nscbcSink, nscbcSinkAmp);
     // Thermal model: printed only when a run actually asked for one, so a
     // mechanical case's --dry-run reads exactly as it always did.
     if (physics == Physics::Compressible &&

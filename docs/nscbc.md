@@ -148,6 +148,22 @@ additive term in the band inside; the face's one-sided `Lout` reads row nx−2,
 so the sink's field IS the face's upstream sample — the combined system is
 measured together, never inferred from the parts.
 
+**The combined system, measured 2026-07-30** (`--nscbc-sink N`, default width
+16, `--nscbc-sink-amp` 1, opt-in). Operator: a 2Δ ripple in the band decays on
+the analytic σ·sin⁴ profile to 3% at α = 1 and at the α = 2 stability cap; a
+16Δ packet crosses losing < 2‰; a 4Δ packet in the band drops 0.769 → 0.023;
+all five fields conserve to roundoff (flux form). System (`gpu_nscbc_absorb`):
+the resolved outflow reflection is unchanged-to-improved (R 0.0116 → 0.0063 at
+M 0 — the sink eats the small-scale part of the residual), and the inflow
+mirror is NOT fixed (0.810 → 0.802): that reflection is resolved-scale and
+belongs to etaIn or the strip, exactly the division of labour above. The
+near-field cost the strip pays and the sink does not: a resolved vortex (core
+16h) riding M 0.2 reaches mid-band with 0.9999 of its peak vorticity under
+sink 16, and 0.6813 under strip 16 — the freestream relaxation has already
+eaten a third of the wake before it left the box. The strip remains the
+inflow-mirror fix while etaIn has no per-family split; the sink is the
+small-scale one.
+
 ## Absorption, measured 2026-07-28 (test `gpu_nscbc_absorb`)
 
 How absorbing the faces actually are, as reflection coefficients: a plane

@@ -7,6 +7,7 @@
 #include "dns/gpu/comp_far.hpp"
 #include "dns/gpu/comp_ghost.hpp"
 #include "dns/gpu/comp_nscbc.hpp"
+#include "dns/gpu/comp_sink.hpp"
 #include "dns/gpu/derived.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/internal/derived_remap.hpp"
@@ -157,6 +158,22 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         nsc = std::move(*m);
     }
 
+    // --nscbc-sink: the scale-selective band under the characteristic rows
+    // (gpu/comp_sink.hpp). Validator guarantees the uniform mesh; 0 = off,
+    // no object, no kernel, bit-for-bit the bare boundary.
+    std::optional<DeviceCompSink> snk;
+    if (nscbc && r.nscbcSink > 0)
+    {
+        auto m = DeviceCompSink::make(
+            g, {.nb = r.nscbcSink,
+                .alpha = r.nscbcSinkAmp,
+                .cInf = std::sqrt(r.gamma * r.pInf / r.rhoInf),
+                .openY = r.open,
+                .openZ = r.open && g.nz > 1});
+        if (!m) return fail(6, "sink init failed");
+        snk = std::move(*m);
+    }
+
     // The ghost wall classifies against the physical cell centres of whichever
     // mesh is active; the focal remap is the exact identity when off, so the
     // Cartesian tables are unchanged.
@@ -281,6 +298,10 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
             if (stretched) nsc->apply(*dev, s, out, cmb, remap);
             else if (focal) nsc->apply(*dev, s, out, cmb, fremap);
             else nsc->apply(*dev, s, out, cmb);
+            // The sink ADDS on top of the characteristic rows too, on
+            // purpose: their mesh-scale content is exactly what the
+            // decomposition mishandles (docs/nscbc.md, the hand-off).
+            if (snk) snk->apply(s, out, cmb);
         });
 
     (void)ds->upload(ic);

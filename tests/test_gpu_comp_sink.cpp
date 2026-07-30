@@ -62,12 +62,15 @@ struct Rig
 
     // sinkNb > 0 layers the scale-selective band under the characteristic
     // rows, exactly as runner_comp composes the two: nscbc overwrites its
-    // rows' rhs, then the sink ADDS its term on top.
-    Rig(int nx, int ny, double uMean, int sinkNb = 0, double sinkAlpha = 1.0)
+    // rows' rhs, then the sink ADDS its term on top. strip > 0 is the
+    // --nscbc-strip freestream sponge instead, for the comparison rows.
+    Rig(int nx, int ny, double uMean, int sinkNb = 0, double sinkAlpha = 1.0,
+        int strip = 0)
         : g(Grid::make(nx, ny, 1, Lbox, ny * (Lbox / nx), 1.0)),
           dev(gpu::DeviceComp::make(g, gam, 0.0)),
           far(gpu::DeviceCompFar::make(
-              g, {rhoInf, uMean, pInf, gam, 8, 0.0, false, false})),
+              g, {rhoInf, uMean, pInf, gam, strip > 0 ? strip : 8,
+                  strip > 0 ? 0.5 : 0.0, false, false})),
           nsc(gpu::DeviceCompNscbc::make(
               g, gpu::DeviceCompNscbc::Config{rhoInf, uMean, pInf, gam})),
           ds(gpu::DeviceCompState::make(g.size())),
@@ -303,6 +306,30 @@ CompState fillState(const Grid& g, auto prim) // prim(x, y) -> {rho, u, v, p}
     return h;
 }
 
+// The near-field discriminator: a RESOLVED Gaussian vortex (core 16h) rides
+// M 0.2 from mid-box to the middle of the band; peak vorticity retained at
+// that moment. The sink's symbol at a 16h structure is ~1e-4 -- it must not
+// touch it -- while the strip relaxes the full state toward freestream and
+// visibly bites the wake before it has even left. This is the measured form
+// of "the strip eats the near field".
+double midBandRetention(int sinkNb, int strip)
+{
+    const double uMean = 0.2 * cInf;
+    Rig r(256, 128, uMean, sinkNb, 1.0, strip);
+    const double h = r.g.hx, kw = 16 * h;
+    const double x0 = 0.6 * Lbox, y0 = 0.5 * r.g.ny * r.g.hy;
+    const double A = 0.02 * cInf;
+    r.set([&](double x, double y) {
+        const double dx = x - x0, dy = y - y0;
+        const double e = std::exp(-(dx * dx + dy * dy) / (kw * kw));
+        return std::array{rhoInf, uMean + A * 2 * dy / kw * e,
+                          -A * 2 * dx / kw * e, pInf};
+    });
+    const double w0 = r.vorticityPeak().v;
+    r.run((Lbox - 8 * h - x0) / uMean);
+    return r.vorticityPeak().v / w0;
+}
+
 // Host mirror of the band profile: the per-cell damping rate of a 2dx mode,
 // sigma_eff(i) = (faceSig(i) + faceSig(i-1)) / 2 with zero-flux domain faces.
 double sinkRate2dx(int i, int n, int nb, double sigMax)
@@ -466,6 +493,15 @@ int main()
                 "  sink off %.4f  sink 16 %.4f\n",
                 off16, on16, left[1], onMid4, offBand4, onBand4);
 
+    // ---- near field: sink vs the freestream strip -------------------------
+    const double retNone = midBandRetention(0, 0);
+    const double retSink = midBandRetention(16, 0);
+    const double retStrip = midBandRetention(0, 16);
+    std::printf("\nresolved vortex (core 16h) riding M 0.2 into mid-band,\n"
+                "peak |omega| retained at that moment:\n"
+                "  bare %.4f   sink 16 %.4f   strip 16 %.4f\n",
+                retNone, retSink, retStrip);
+
     std::printf("\n");
     // The facts this file exists to pin (the sink's specification), measured
     // 2026-07-30 at n = 256: E_left/E_0 = 0.0215 / 0.2319 / 0.6869 / 0.9783
@@ -516,5 +552,12 @@ int main()
           "the band does not touch a mid-box 4dx packet (locality)");
     check(onBand4 < 0.1 && onBand4 < 0.5 * offBand4,
           "a 4dx packet parked in the band is absorbed");
+    // The division of labour with --nscbc-strip, measured: a resolved wake
+    // structure reaches the middle of the sink band carrying its vorticity;
+    // the freestream strip has already eaten a bite of it by the same moment.
+    check(retSink > 0.95 * retNone,
+          "the sink leaves a resolved vortex in its band untouched");
+    check(retStrip < 0.8 * retNone,
+          "...where the freestream strip visibly eats it (the near-field cost)");
     return dnstest::finish();
 }
