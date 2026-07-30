@@ -159,6 +159,40 @@ double vortexResidual()
     return resid / v0;
 }
 
+// A vortex STRONG enough that its core drives local backflow through the
+// outflow face (max swirl ~ 0.86 A / uInf freestreams): the case the
+// one-sided L2/L3/L4 were SUSPECTED to mismodel. Measured 2026-07-30: they
+// do not -- an etaOut relax blend over the tanh(un) switch was prototyped
+// and the residual moved in the 4th decimal at every rate (0.0280/0.0281/
+// 0.0280/0.0280 over etaOut 0/0.25/0.5/1.0 at A = 2 uInf; 0.0513 vs 0.0511
+// at A = 4 uInf). The amplitudes are proportional to un and shut off
+// smoothly through a stagnation on their own. The knob was dropped; this
+// rig stays as the fact pin.
+double backflowVortexResidual(double ampOverU)
+{
+    Rig r(256, 64, 1e-4);
+    const double Lx = r.g.nx * r.g.hx, Ly = r.g.ny * r.g.hy;
+    const double x0 = 0.75 * Lx, y0 = 0.5 * Ly, kw = 8 * r.g.hx;
+    const double A = ampOverU * uInf;
+    double v0 = 0.0;
+    setState(r, [&](double x, double y) {
+        const double dx = x - x0, dy = y - y0;
+        const double e = A * std::exp(-(dx * dx + dy * dy) / (kw * kw));
+        const double u = uInf + 2 * dy / kw * e, v = -2 * dx / kw * e;
+        v0 = std::max(v0, std::abs(v));
+        return std::array{rhoInf, u, v, pInf};
+    });
+    r.run((Lx - x0 + 6 * kw) / uInf + 4 * kw / cInf);
+    auto h = CompState::zeros(r.g);
+    (void)r.ds->download(h);
+    double resid = 0.0;
+    for (std::size_t c = 0; c < r.g.size(); ++c) {
+        if (!std::isfinite(h.my[c])) return 1e9;
+        resid = std::max(resid, std::abs(h.my[c] / h.rho[c]));
+    }
+    return resid / v0;
+}
+
 // Uniform +5% velocity offset: the inflow relaxation must pull u back toward
 // uInf (returns |<u at inflow row> - uInf| / offset after a while).
 double inflowPull()
@@ -672,6 +706,16 @@ int main()
     const double vres = vortexResidual();
     std::printf("vortex residual |v|/v0: %.3f\n", vres);
     check(vres < 0.15, "vortex exits, residual < 15% of peak");
+
+    // Backflow through the outflow: even a core driving 4x-freestream
+    // backflow exits cleanly on the plain one-sided amplitudes (the etaOut
+    // dead end is documented at backflowVortexResidual).
+    const double bf2 = backflowVortexResidual(2.0);
+    const double bf4 = backflowVortexResidual(4.0);
+    std::printf("backflow vortex residual: A = 2 uInf -> %.4f, 4 uInf -> %.4f\n",
+                bf2, bf4);
+    check(bf2 < 0.15 && bf4 < 0.15,
+          "backflow-driving vortices exit cleanly without a backflow model");
 
     const double pull = inflowPull();
     std::printf("inflow offset remaining: %.3f\n", pull);

@@ -104,6 +104,9 @@ public:
         // (measured with the sponge far field: lateral u-relax cd 1.98 ~=
         // walls 1.96, rho/p-only 1.91).
         double etaLat = 0.25;
+        // There is deliberately no outflow backflow knob: an etaOut relax
+        // blend on the x-hi L2/L3/L4 was prototyped and measured inert even
+        // under 4x-freestream backflow (comp_nscbc.hip has the numbers).
         // Full-width solid floor crossing the x planes (--body floor): rows
         // j <= floorRows are fully solid there -- the ghost wall owns their
         // state, so the characteristic overwrite is skipped and they keep

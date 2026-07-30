@@ -273,6 +273,14 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
                                    : bt * Tt;
             const Real Lin = sig * om * cs * invL[a] * (p - pPt) - trans;
             if (a == 0) { // x-outflow entropy/shear leave: one-sided compute
+                // Deliberately NO backflow model here. A lateral-style
+                // etaOut relax blend was prototyped and measured 2026-07-30
+                // (gpu_comp_nscbc backflow rig, vortex swirl up to 4x the
+                // freestream driving real backflow through the face): the
+                // residual moved in the 4th decimal at every rate. These
+                // amplitudes are PROPORTIONAL to un, so they shut off
+                // smoothly through a stagnation on their own -- there is
+                // nothing for a blend to fix. Do not re-derive it.
                 L2 = un * (c2 * dr_ - dp_);
                 L3 = un * dn(vf[t1]);
                 L4 = un * dn(vf[t2]);

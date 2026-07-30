@@ -271,6 +271,19 @@ face writes at small scale, the soft rate stops writing it at large scale.
 The vortex-on-face transparency rig (`gpu_comp_nscbc`) is etaLat-insensitive
 (0.026–0.027 across the scan), so softening costs nothing measured.
 
+## Backflow at the outflow: measured a non-problem (test `gpu_comp_nscbc`)
+
+The suspected gap: under a vortex core strong enough to drive local backflow
+through x-hi, the one-sided L2/L3/L4 read an "outgoing" wave that is actually
+entering. A lateral-style etaOut relax blend over the tanh(un) switch was
+prototyped 2026-07-30 and measured INERT: residual 0.0280/0.0281/0.0280/0.0280
+over etaOut 0/0.25/0.5/1.0 at swirl 2× the freestream, 0.0513 vs 0.0511 at
+4×. The λ = u amplitudes are proportional to un, so they shut off smoothly
+through a stagnation on their own; the brief inflow advects back out on the
+next revolution of the core. The knob was dropped — `backflowVortexResidual`
+stays as the fact pin. (Same discipline as `--nscbc-order`: a prototyped fix
+that measurement finds inert does not ship.)
+
 ## Angle of incidence, re-measured 2026-07-29 (test `gpu_nscbc_order`)
 
 Rig sized so the window exists at every angle (`xc > (Ly/2)tanθ + 3σ`):
