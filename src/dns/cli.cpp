@@ -166,6 +166,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--sponge-cells", &c.spongeCells}, {"--fringe-axes", &c.fringeAxes},
              {"--nscbc-beta", &c.nscbcBeta}, {"--nscbc-strip", &c.nscbcStrip},
              {"--nscbc-etain", &c.nscbcEtaIn},
+             {"--nscbc-etain-shear", &c.nscbcEtaInShear},
              {"--nscbc-etalat", &c.nscbcEtaLat},
              {"--nscbc-sink", &c.nscbcSink},
              {"--nscbc-sink-amp", &c.nscbcSinkAmp},
@@ -638,6 +639,15 @@ FAR FIELD (--far, exactly one)
   --nscbc-strip N    absorbing strip inside the NSCBC rows; 0 = pure
                      characteristic. Required above Re 800; use ~ny/64
                      (pure NSCBC diverges at Re 2000, 2048^2).         [0]
+  --nscbc-etain-shear E
+                     inflow rate for the lambda = u family (entropy +
+                     shear) alone, > 0; default: follow --nscbc-etain.
+                     The 100 default is the L5 sag guard -- an argument
+                     about the NORMAL velocity anchor -- and clamping
+                     entropy and shear at the same rate makes the
+                     inflow a mirror for turbulence too. Soften this
+                     one to make the inflow vortically transparent
+                     while the freestream stays pinned.
   --nscbc-etalat E   lateral (open-face) incoming relax rate, > 0     [0.25]
                      The relax writes tangential velocity onto the face
                      under acoustic load -- a vorticity source that

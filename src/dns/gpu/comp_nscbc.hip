@@ -53,7 +53,8 @@ template <class Remap>
 __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
                             Real gam, PrimView q,
                             int openY, int openZ, int fr, Real invLx, Real invLy,
-                            Real invLz, Real sigma, Real etaIn, Real omM2,
+                            Real invLz, Real sigma, Real etaIn, Real etaInS,
+                            Real omM2,
                             Real betaT, int bAuto, Real sigLat, Real etaLat, Real uT,
                             Real rhoI, Real pI, int pot, Real Q, Real dbl,
                             Real xc, Real yc, Real zc, Real invRT,
@@ -228,10 +229,17 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
         const Real rTgt = invRT > Real(0) ? p * invRT : rhoI;
         Real L1, L2, L3, L4, L5;
         if (a == 0 && !hi) { // stiff subsonic inflow: only L1 leaves
+            // etaIn is sized against the freestream SAG -- an argument about
+            // L5 (the normal velocity anchor) alone. The lambda = u family
+            // (entropy L2, shear L3/L4) rides its own rate etaInS
+            // (--nscbc-etain-shear), which defaults to etaIn: same value,
+            // same arithmetic, bit-identical. Softening it makes the inflow
+            // transparent to vorticity and entropy without letting the
+            // freestream sag.
             L1 = (un - cs) * (dp_ - r * cs * dun);
-            L2 = etaIn * cs * c2 * invL[0] * (r - rTgt);
-            L3 = etaIn * cs * invL[0] * (vc[t1] - tgt[t1]);
-            L4 = etaIn * cs * invL[0] * (vc[t2] - tgt[t2]);
+            L2 = etaInS * cs * c2 * invL[0] * (r - rTgt);
+            L3 = etaInS * cs * invL[0] * (vc[t1] - tgt[t1]);
+            L4 = etaInS * cs * invL[0] * (vc[t2] - tgt[t2]);
             L5 = etaIn * omM2 * r * c2 * invL[0] * (un - tgt[0]);
         } else { // outflow / lateral far field
             // Yoo-Im transverse correction on the incoming acoustic wave:
@@ -358,6 +366,7 @@ void launchNscbc(const GpuGrid& g, const DeviceCompNscbc::Config& c, double u,
         int(c.openZ), c.floorRows,
         Real(1.0 / (g.nx * g.hx)), Real(1.0 / (g.ny * g.hy)),
         Real(1.0 / (g.nz * g.hz)), Real(c.sigma), Real(c.etaIn),
+        Real(c.etaInShear < 0 ? c.etaIn : c.etaInShear),
         Real(1.0 - M * M), Real(betaT), int(c.betaAuto), Real(c.sigLat),
         Real(c.etaLat),
         Real(u), Real(c.rhoInf), Real(c.pInf), int(c.potCorrect), Real(Q),
@@ -377,7 +386,10 @@ std::expected<DeviceCompNscbc, hipError_t> DeviceCompNscbc::make(const Grid& g,
     const double cInf =
         c.rhoInf > 0 && c.pInf > 0 ? std::sqrt(c.gamma * c.pInf / c.rhoInf) : 0;
     const bool ok = g.nx >= 4 && c.rhoInf > 0 && c.pInf > 0 && c.gamma > 1 &&
-                    c.sigma > 0 && c.etaIn > 0 && c.uInf >= 0 && c.uInf < cInf &&
+                    c.sigma > 0 && c.etaIn > 0 &&
+                    (c.etaInShear < 0 ||
+                     (c.etaInShear > 0 && std::isfinite(c.etaInShear))) &&
+                    c.uInf >= 0 && c.uInf < cInf &&
                     (!c.openY || (g.ny >= 4 && c.sigLat > 0 && c.etaLat > 0)) &&
                     (!c.openZ || (g.nz >= 4 && c.sigLat > 0 && c.etaLat > 0)) &&
                     (!c.potCorrect ||

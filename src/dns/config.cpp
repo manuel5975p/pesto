@@ -973,6 +973,7 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
     c.nscbcBeta = r.nscbcBeta;
     c.nscbcEtaIn = r.given.contains("--nscbc-etain") ? r.nscbcEtaIn : 100.0;
     c.nscbcStrip = r.nscbcStrip;
+    c.nscbcEtaInShear = r.nscbcEtaInShear;
     c.nscbcEtaLat = r.nscbcEtaLat;
     c.nscbcSink = r.nscbcSink;
     c.nscbcSinkAmp = r.nscbcSinkAmp;
@@ -1028,6 +1029,13 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
                                           "--nscbc-sink band; pass a width");
     if (c.far != FarField::Nscbc && r.given.contains("--nscbc-etain"))
         return bad(2, "--nscbc-etain", "requires --far nscbc");
+    if (r.given.contains("--nscbc-etain-shear"))
+    {
+        if (c.far != FarField::Nscbc)
+            return bad(2, "--nscbc-etain-shear", "requires --far nscbc");
+        if (!finitePos(c.nscbcEtaInShear))
+            return bad(2, "--nscbc-etain-shear", "must be > 0");
+    }
     if (r.given.contains("--nscbc-etalat"))
     {
         if (c.far != FarField::Nscbc || !c.open)

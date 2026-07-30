@@ -271,6 +271,28 @@ face writes at small scale, the soft rate stops writing it at large scale.
 The vortex-on-face transparency rig (`gpu_comp_nscbc`) is etaLat-insensitive
 (0.026–0.027 across the scan), so softening costs nothing measured.
 
+## Per-family inflow stiffness, measured 2026-07-30 (test `gpu_nscbc_absorb`)
+
+`--nscbc-etain-shear` splits the λ = u family (entropy L2, shear L3/L4) off
+the sag guard: L5 keeps `--nscbc-etain`, the family rides its own rate
+(default: follow etaIn, bit-identical). Two measured facts define what it is
+and is not for:
+
+- **The acoustic mirror is the sag guard's own.** Softening the family 400×
+  (etaInShear 100 → 0.25 with etaIn held at 100) moves R_inflow by 0.1%
+  (0.8100 → 0.8093). A normal wave reflects off the `u = uInf` clamp itself,
+  so no per-family split can fix the mirror while the freestream stays
+  pinned — only `--nscbc-etain` or the strip can, exactly as measured above.
+- **What the family rate owns is what the face writes under vortical load**:
+  a resolved vortex parked three cores off the inflow makes the face rows
+  write vorticity at 0.0069 of the core scale at the shipped 100, falling
+  monotonely to 0.0050 at 0.25 — the inflow twin of the lateral etaLat
+  source, at 1/30 the amplitude (the load is a near field, not a wave).
+
+Its real customer is turbulent inflow: L3/L4 at 100 would clamp every
+injected eddy at the face. The knob exists so that campaign starts with the
+family rate already split and measured.
+
 ## Backflow at the outflow: measured a non-problem (test `gpu_comp_nscbc`)
 
 The suspected gap: under a vortex core strong enough to drive local backflow

@@ -102,6 +102,11 @@ struct RawConfig
     // 0.04% at 0.5). A run with no freestream to sag -- a static rotor, an
     // acoustic study -- wants it soft.
     double nscbcEtaIn = 100.0;
+    // Inflow lambda = u family rate (entropy + shear). etaIn is the L5 sag
+    // guard; clamping the other amplitudes at 100 makes the inflow a mirror
+    // for vorticity and entropy too. < 0 = follow --nscbc-etain
+    // (bit-identical).
+    double nscbcEtaInShear = -1;
     // Lateral (open-face) incoming relax rate for the shear/entropy blend.
     // Measured 2026-07-30 (gpu_nscbc_order): the relax term writes tangential
     // velocity onto the face under acoustic load, a vorticity source that
@@ -235,7 +240,7 @@ public:
     bool sutherland = false, bodyIsothermal = false, nscbcThermalInflow = false;
     double penalize = 0;
     double ramp = 0, kick = 0, nscbcBeta = 0, nscbcEtaIn = 0, nscbcEtaLat = 0,
-           nscbcSinkAmp = 0;
+           nscbcEtaInShear = -1, nscbcSinkAmp = 0;
     NscbcAbc nscbcAbc = NscbcAbc::YooIm;
     double scale = 0, pitch = 0, yaw = 0;
     int dimples = 0, bumps = 0, maxIters = 0, dtRecompute = 1;

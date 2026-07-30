@@ -118,6 +118,13 @@ int main()
             "--nscbc-sink 16 --n 128 --ny 128"); // remapped band unmeasured
     rejects("flow --physics compressible --body floor --far nscbc "
             "--nscbc-sink 16 --n 512");    // solid floor rows own the band
+    // The inflow lambda = u family rate.
+    accepts("flow --physics compressible --body cylinder --far nscbc "
+            "--nscbc-etain-shear 0.25 --n 512");
+    rejects("flow --physics compressible --body cylinder --far sponge "
+            "--nscbc-etain-shear 0.25 --n 512");
+    rejects("flow --physics compressible --body cylinder --far nscbc "
+            "--nscbc-etain-shear 0 --n 512"); // must be > 0
     // The lateral relax rate: only open laterals ever read it.
     accepts("flow --physics compressible --body cylinder --far nscbc --open "
             "--nscbc-etalat 0.05 --n 512");

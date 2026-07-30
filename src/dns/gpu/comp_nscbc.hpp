@@ -104,6 +104,12 @@ public:
         // (measured with the sponge far field: lateral u-relax cd 1.98 ~=
         // walls 1.96, rho/p-only 1.91).
         double etaLat = 0.25;
+        // Inflow lambda = u family rate (entropy L2, shear L3/L4). etaIn is
+        // sized against freestream sag -- an L5 argument -- and clamping the
+        // OTHER amplitudes at 100 makes the inflow a mirror for vorticity
+        // and entropy too. < 0 = follow etaIn (same value, same arithmetic,
+        // bit-identical).
+        double etaInShear = -1;
         // There is deliberately no outflow backflow knob: an etaOut relax
         // blend on the x-hi L2/L3/L4 was prototyped and measured inert even
         // under 4x-freestream backflow (comp_nscbc.hip has the numbers).

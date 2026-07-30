@@ -57,7 +57,7 @@ struct PlaneRig
     // sink = --nscbc-sink N: the scale-selective band (gpu/comp_sink),
     // composed exactly as runner_comp does -- additive under the overwrite.
     PlaneRig(int nx, double uMean, double etaIn, int strip = 0, int ny = 8,
-             double betaTrans = 0.5, int sink = 0)
+             double betaTrans = 0.5, int sink = 0, double etaInShear = -1)
         : g(Grid::make(nx, ny, 1, Lbox, ny * (Lbox / nx), 1.0)),
           dev(gpu::DeviceComp::make(g, gam, 0.0)),
           far(gpu::DeviceCompFar::make(
@@ -67,6 +67,7 @@ struct PlaneRig
               gpu::DeviceCompNscbc::Config c{rhoInf, uMean, pInf, gam};
               c.etaIn = etaIn;
               c.betaTrans = betaTrans;
+              c.etaInShear = etaInShear;
               return c;
           }())),
           ds(gpu::DeviceCompState::make(g.size())),
@@ -181,6 +182,32 @@ struct PlaneRig
         return m;
     }
 
+    // Peak |dv/dx - du/dy| over i in [iLo, iHi], NON-WRAPPING one-sided
+    // differences at every extreme, margin 0 -- the face-row scan a boundary
+    // claim needs (a wrapped difference across the x extremes fabricates
+    // O(amp/h); see modeSplit).
+    double vortPeak(int iLo, int iHi)
+    {
+        auto h = CompState::zeros(g);
+        (void)ds->download(h);
+        auto vel = [&](int i, int j, int comp) {
+            const std::size_t c = g.idx(i, j, 0);
+            return (comp ? h.my[c] : h.mx[c]) / h.rho[c];
+        };
+        double pk = 0.0;
+        for (int j = 0; j < g.ny; ++j)
+            for (int i = iLo; i <= iHi; ++i) {
+                const int ip = std::min(i + 1, g.nx - 1), im = std::max(i - 1, 0);
+                const int jp = std::min(j + 1, g.ny - 1), jm = std::max(j - 1, 0);
+                const double dvdx =
+                    (vel(ip, j, 1) - vel(im, j, 1)) / ((ip - im) * g.hx);
+                const double dudy =
+                    (vel(i, jp, 0) - vel(i, jm, 0)) / ((jp - jm) * g.hy);
+                pk = std::max(pk, std::abs(dvdx - dudy));
+            }
+        return pk;
+    }
+
     // max |p - pInf| over the domain, normalized by the incident amplitude.
     double pressureResidual(double amp)
     {
@@ -203,10 +230,11 @@ struct PlaneRig
 // inside the box, so the residual it leaves is the reflection and not the
 // pulse still on its way out.
 double planeReflection(int nx, double mach, double amp, int dir,
-                       double etaIn = 100.0, int strip = 0, int sink = 0)
+                       double etaIn = 100.0, int strip = 0, int sink = 0,
+                       double etaInShear = -1)
 {
     const double uMean = mach * cInf;
-    PlaneRig r(nx, uMean, etaIn, strip, 8, 0.5, sink);
+    PlaneRig r(nx, uMean, etaIn, strip, 8, 0.5, sink, etaInShear);
     const double x0 = 0.5 * Lbox, sig = 0.08;
     r.set([&](double x, double) {
         const double pp =
@@ -228,6 +256,28 @@ double planeReflection(int nx, double mach, double amp, int dir,
 // ~45 deg and there is no valid measurement time past it. This file's rig is
 // 256x8; every angle number it used to print past 45 deg was mostly incident
 // wave that had not left yet.
+
+// The inflow as a VORTICITY writer: a resolved vortex parked three core
+// widths off the stiff x-lo face, quiescent. Its induced tangential velocity
+// loads the face rows, and the lambda = u relax etaInS c/L (v - 0) writes
+// vorticity onto them at a rate proportional to etaInS -- the inflow twin of
+// the measured lateral-face source. Reported: peak |omega| on the face rows
+// (i <= 2; the core's own tail there is e^-9 A) over the core's peak, after
+// one box acoustic time.
+double inflowVortexWrite(double etaInShear)
+{
+    PlaneRig r(256, 0.0, 100.0, 0, 64, 0.5, 0, etaInShear);
+    const double h = r.g.hx, kw = 8 * h, Ly = r.g.ny * r.g.hy;
+    const double x0 = 3 * kw, y0 = 0.5 * Ly, A = 0.05 * cInf;
+    r.set([&](double x, double y) {
+        const double dx = x - x0, dy = y - y0;
+        const double e = A * std::exp(-(dx * dx + dy * dy) / (kw * kw));
+        return std::array{rhoInf, 2 * dy / kw * e, -2 * dx / kw * e, pInf};
+    });
+    const double w0 = r.vortPeak(0, r.g.nx - 1);
+    r.run(Lbox / cInf);
+    return r.vortPeak(0, 2) / w0;
+}
 
 // All four faces characteristic, quiescent box: the rotor's own case. etaIn is
 // the knob under test -- 100 is the production inflow, 2 is what the existing
@@ -401,6 +451,30 @@ int main()
                     outSink[i]);
     }
 
+    // The inflow lambda = u family rate: what the face WRITES under a
+    // vortical load, per rate. -1 = follow etaIn (100, the shipped inflow).
+    std::printf("\ninflow vorticity written under a parked vortex, "
+                "--nscbc-etain-shear scan\n");
+    std::printf("   etaInShear   face-row peak|omega|/w0\n");
+    const double shears[4] = {-1.0, 10.0, 1.0, 0.25};
+    double wIn[4] = {};
+    for (int i = 0; i < 4; ++i) {
+        wIn[i] = inflowVortexWrite(shears[i]);
+        std::printf("   %8.2f       %9.4f\n", shears[i], wIn[i]);
+    }
+
+    // Which family owns the acoustic mirror? A normal wave carries both a
+    // density part (L2's to relax) and a normal-velocity part (L5's). Soften
+    // the lambda = u family ALONE and read how much of the 0.81 follows it.
+    std::printf("\nacoustic mirror split: R_inflow(M 0), etaIn 100 held\n");
+    std::printf("   etaInShear   R_inflow\n");
+    double rShear[3] = {};
+    const double rsh[3] = {-1.0, 0.5, 0.25};
+    for (int i = 0; i < 3; ++i) {
+        rShear[i] = planeReflection(256, 0.0, 0.01, -1, 100.0, 0, 0, rsh[i]);
+        std::printf("   %8.2f    %9.4f\n", rsh[i], rShear[i]);
+    }
+
     std::printf("\nradial pulse, all four faces characteristic, amp 1%%\n");
     std::printf("   mach  etaIn     n    R_allface\n");
     double radStiff = 0, radSoft = 0;
@@ -451,6 +525,17 @@ int main()
           "--nscbc-sink 16 leaves the resolved outflow reflection unchanged");
     check(std::abs(inSink[2] - inSink[0]) < 0.05,
           "--nscbc-sink does not (and must not) fix the resolved inflow mirror");
+    // The per-family split, measured: softening the lambda = u family 400x
+    // moves the acoustic mirror by 0.1% -- the mirror is the L5 sag guard
+    // ITSELF, so no per-family softening can fix it while u stays pinned
+    // (only --nscbc-etain or the strip can). What the family rate does own is
+    // what the face WRITES under a vortical load, and that falls monotonely
+    // as it softens. Its real customer is turbulent inflow, where L3/L4 at
+    // 100 would clamp every injected eddy.
+    check(rShear[2] > 0.75,
+          "the acoustic mirror is L5's own: soft shear cannot fix it");
+    check(wIn[3] <= wIn[0] && wIn[2] <= wIn[1],
+          "the vorticity the inflow writes falls as the family rate softens");
 
     return dnstest::finish();
 }

@@ -77,6 +77,7 @@ struct CompRun
     double nscbcBeta = 0.5;      // Yoo-Im transverse correction, in [0,1)
     bool nscbcBetaAuto = false;  // scale it by the per-cell incidence angle
     double nscbcEtaIn = 100.0;   // inflow relaxation stiffness (> 0)
+    double nscbcEtaInShear = -1; // inflow lambda=u rate; < 0 = follow etaIn
     double nscbcEtaLat = 0.25;   // open-lateral incoming relax rate (> 0)
     int nscbcStrip = 0;          // absorbing strip inside the NSCBC rows
     // Scale-selective damping band (gpu/comp_sink): sub-6dx sink inside the
