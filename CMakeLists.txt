@@ -88,6 +88,7 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/comp_far.hip
     src/dns/gpu/comp_ghost.hip
     src/dns/gpu/comp_nscbc.hip
+    src/dns/gpu/comp_sink.hip
     src/dns/gpu/nscbc_modal.hip
     src/dns/gpu/cutcell.hip
     src/dns/gpu/cutflux.hip
