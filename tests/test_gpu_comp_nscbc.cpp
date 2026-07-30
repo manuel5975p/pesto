@@ -191,9 +191,11 @@ struct OpenRig
     std::expected<gpu::ReduceScratch, hipError_t> red;
 
     // openZ < 0 = default (nz > 1); pass explicit 0/1 to gate a single lateral
-    // axis (openZOnly* tests need openY = false, openZ = true).
+    // axis (openZOnly* tests need openY = false, openZ = true). etaLat is the
+    // incoming-relax rate of the lateral shear/entropy blend (Config default
+    // 0.25); exposed for the transparency scan.
     OpenRig(int nx, int ny, int nz, double mu, double uT, double etaIn,
-            bool openY = true, int openZ = -1)
+            bool openY = true, int openZ = -1, double etaLat = 0.25)
         : g(Grid::make(nx, ny, nz, nx * 0.01, ny * 0.01,
                        nz > 1 ? nz * 0.01 : 1.0)),
           dev(gpu::DeviceComp::make(g, gam, mu)),
@@ -202,6 +204,7 @@ struct OpenRig
               c.etaIn = etaIn;
               c.openY = openY;
               c.openZ = openZ < 0 ? (nz > 1) : (openZ != 0);
+              c.etaLat = etaLat;
               return c;
           }())),
           ds(gpu::DeviceCompState::make(g.size())),
@@ -375,9 +378,9 @@ double openZOnlyPulseExit(double amp)
 // induced normal velocity sweeps through 0 along the face over many steps, so
 // the discontinuous entropy/shear switch chattered here. Fix B blends it
 // smoothly. Finite everywhere; residual |v|/v0 at end.
-double lateralVortexAlongFace()
+double lateralVortexAlongFace(double etaLat = 0.25)
 {
-    OpenRig r(192, 96, 1, 1e-4, uInf, 100.0);
+    OpenRig r(192, 96, 1, 1e-4, uInf, 100.0, true, -1, etaLat);
     const double Lx = r.g.nx * r.g.hx, Ly = r.g.ny * r.g.hy;
     const double x0 = 0.5 * Lx, kw = 6 * r.g.hx, y0 = Ly, A = 0.1 * uInf;
     double v0 = 0.0;
@@ -701,6 +704,12 @@ int main()
     const double fres = lateralVortexAlongFace();
     std::printf("lateral vortex-on-face residual |v|/v0: %.3f\n", fres);
     check(fres < 0.2, "vortex on open lateral face, residual < 20%");
+    // Vortical transparency vs the lateral relax rate: is the default 0.25
+    // near the optimum, and does stiffening reproduce the wall-in-disguise?
+    const double fSoft = lateralVortexAlongFace(0.05);
+    const double fStiff = lateralVortexAlongFace(1.0);
+    std::printf("  etaLat scan: 0.05 -> %.3f, 0.25 -> %.3f, 1.0 -> %.3f\n",
+                fSoft, fres, fStiff);
 
     const double sdrift = stretchedFreestreamDrift();
     std::printf("stretched freestream drift: %.2e\n", sdrift);

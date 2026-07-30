@@ -166,6 +166,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--sponge-cells", &c.spongeCells}, {"--fringe-axes", &c.fringeAxes},
              {"--nscbc-beta", &c.nscbcBeta}, {"--nscbc-strip", &c.nscbcStrip},
              {"--nscbc-etain", &c.nscbcEtaIn},
+             {"--nscbc-etalat", &c.nscbcEtaLat},
              {"--nscbc-sink", &c.nscbcSink},
              {"--nscbc-sink-amp", &c.nscbcSinkAmp},
              {"--stretch", &c.stretch}, {"--focal", &c.focal},
@@ -637,6 +638,13 @@ FAR FIELD (--far, exactly one)
   --nscbc-strip N    absorbing strip inside the NSCBC rows; 0 = pure
                      characteristic. Required above Re 800; use ~ny/64
                      (pure NSCBC diverges at Re 2000, 2048^2).         [0]
+  --nscbc-etalat E   lateral (open-face) incoming relax rate, > 0     [0.25]
+                     The relax writes tangential velocity onto the face
+                     under acoustic load -- a vorticity source that
+                     SCALES with E (measured 0.20/0.80/2.16 of the
+                     incident scale at 0.05/0.25/1.0). Soft is vortical
+                     transparency; stiff is a wall in disguise. Needs
+                     --open (walled laterals never read it).
   --nscbc-sink N     scale-selective damping band of N cells inside the
                      open faces (x always; y/z with --open); 0 = off.
                      Damps only sub-6dx content -- the waves whose group

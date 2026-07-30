@@ -23,13 +23,16 @@
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_far.hpp"
 #include "dns/gpu/comp_nscbc.hpp"
+#include "dns/gpu/comp_sink.hpp"
 #include "gpu_test_util.hpp"
 #include "check.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <numbers>
+#include <optional>
 #include <vector>
 
 using namespace dns;
@@ -63,29 +66,44 @@ struct Rig
     std::expected<gpu::DeviceCompState, hipError_t> ds;
     std::expected<gpu::ReduceScratch, hipError_t> red;
 
+    std::optional<gpu::DeviceCompSink> snk;
+
     // abc: 0 = fixed betaTrans, 1 = per face cell, 2 = per DCT mode.
-    Rig(int nx, int ny, int abc, double betaTrans = 0.5)
+    // openY switches the laterals from free-slip mirror walls to the
+    // characteristic treatment (--open); sink adds the scale-selective band
+    // (--nscbc-sink), on y too when it is open.
+    Rig(int nx, int ny, int abc, double betaTrans = 0.5, bool openY = false,
+        int sink = 0, double etaLat = 0.25)
         : g(Grid::make(nx, ny, 1, Lbox, ny * (Lbox / nx), 1.0)),
           dev(gpu::DeviceComp::make(g, gam, 0.0)),
           far(gpu::DeviceCompFar::make(
-              g, {rhoInf, 0.0, pInf, gam, 8, 0.0, false, false})),
+              g, {rhoInf, 0.0, pInf, gam, 8, 0.0, openY, false})),
           nsc(gpu::DeviceCompNscbc::make(g, [&] {
               gpu::DeviceCompNscbc::Config c{rhoInf, 0.0, pInf, gam};
               c.etaIn = 100.0;
               c.betaTrans = betaTrans;
               c.betaAuto = abc == 1;
               c.betaModal = abc == 2;
+              c.openY = openY;
+              c.etaLat = etaLat;
               return c;
           }())),
           ds(gpu::DeviceCompState::make(g.size())),
           red(gpu::ReduceScratch::make())
     {
         if (!dev || !far || !nsc || !ds || !red) std::exit(EXIT_FAILURE);
+        if (sink > 0) {
+            auto s = gpu::DeviceCompSink::make(
+                g, {.nb = sink, .alpha = 1.0, .cInf = cInf, .openY = openY});
+            if (!s) std::exit(EXIT_FAILURE);
+            snk.emplace(std::move(*s));
+        }
         dev->setStageHook([this](gpu::DeviceCompState& st) { far->apply(st); });
         dev->setRhsHook([this](const gpu::DeviceCompState& st,
                                gpu::DeviceCompState& out,
                                const gpu::StageCombine& cmb) {
             nsc->apply(*dev, st, out, cmb);
+            if (snk) snk->apply(st, out, cmb);
         });
     }
 
@@ -186,11 +204,12 @@ constexpr double wScale = (pScale / (rhoInf * cInf)) / sig;
 struct Window { double resid = 0, tClear = 0, tDrain = 0; Left left{}; };
 
 Window residual(double thetaDeg, int abc, double betaTrans, double tMul,
-                int nx = 1024, int ny = 128, double xc = 0.9 * Lbox)
+                int nx = 1024, int ny = 128, double xc = 0.9 * Lbox,
+                bool openY = false, int sink = 0, double etaLat = 0.25)
 {
     const double th = thetaDeg * std::numbers::pi / 180.0;
     const double ct = std::cos(th), st = std::sin(th);
-    Rig r(nx, ny, abc, betaTrans);
+    Rig r(nx, ny, abc, betaTrans, openY, sink, etaLat);
     const double Ly = ny * r.g.hy;
     const double s0 = xc * ct + 0.5 * Ly * st;
     r.set([&](double x, double y) {
@@ -311,6 +330,47 @@ int main()
                     w.left.peakI, w.left.peakJ);
     }
 
+    // Where the 0.22 residual LIVES and what removes it. Its peak sits in the
+    // x-interior against the free-slip y wall (the retraction's settling
+    // measurement), so the candidates are the wall closure itself and the
+    // wall-trapped small scales -- not the outflow row. Scan the two levers:
+    // characteristic laterals (--open) and the scale-selective band
+    // (--nscbc-sink, on y too once it is open).
+    std::printf("\nwhere the residual lives: the lateral closure, same 45 deg\n"
+                "ridge; entropy column on the incident rho scale\n");
+    std::printf("  laterals  sink | peak|omega|/wScale  at (i,j)   entropy\n");
+    struct LatRow { const char* name; bool openY; int sink; };
+    const LatRow latRows[4] = {{"walls", false, 0},
+                               {"walls", false, 16},
+                               {"open", true, 0},
+                               {"open", true, 16}};
+    double latV[4] = {};
+    for (int i = 0; i < 4; ++i) {
+        const Window w = residual(45.0, 0, 0.5, 1.3, 1024, 128, 0.9 * Lbox,
+                                  latRows[i].openY, latRows[i].sink);
+        latV[i] = w.left.vorticity / wScale;
+        std::printf("  %-8s  %4d |     %9.4f     (%4d,%4d)  %8.4f\n",
+                    latRows[i].name, latRows[i].sink, latV[i], w.left.peakI,
+                    w.left.peakJ, w.left.entropy / rScale);
+    }
+    // Is the open-lateral figure the RELAX RATE's doing? etaLat scan on the
+    // bare open case (no sink), same ridge -- then the best of both levers.
+    std::printf("  open laterals, etaLat scan (no sink):\n");
+    double latEta[3] = {};
+    const double etas[3] = {0.05, 0.25, 1.0};
+    for (int i = 0; i < 3; ++i) {
+        const Window w = residual(45.0, 0, 0.5, 1.3, 1024, 128, 0.9 * Lbox,
+                                  true, 0, etas[i]);
+        latEta[i] = w.left.vorticity / wScale;
+        std::printf("    etaLat %.2f | %9.4f     (%4d,%4d)\n", etas[i],
+                    latEta[i], w.left.peakI, w.left.peakJ);
+    }
+    const Window wBest = residual(45.0, 0, 0.5, 1.3, 1024, 128, 0.9 * Lbox,
+                                  true, 16, 0.05);
+    const double latBest = wBest.left.vorticity / wScale;
+    std::printf("    etaLat 0.05 + sink 16 | %9.4f     (%4d,%4d)\n", latBest,
+                wBest.left.peakI, wBest.left.peakJ);
+
     // beta is a CONSTANT and the coefficient that cancels the LODI angle error
     // is not: beta_opt(theta) = cos t/(1 + cos t), of which 0.5 is only the
     // normal-incidence limit. beta = 0 must land on Engquist-Majda first order,
@@ -379,6 +439,25 @@ int main()
           "spurious vorticity is an order below the retracted wrapped-metric value");
     check(peakI > 8 && peakI < 1024 - 9,
           "and its peak is NOT on an x boundary row -- the outflow lays down no sheet");
+    // The lateral closure, measured 2026-07-30. Four facts, in rising order of
+    // surprise: an x-only sink cannot reach a residual parked at the y wall
+    // (locality, again); BARE characteristic laterals are 4x WORSE than the
+    // walls they replace -- the incoming relax term itself writes tangential
+    // velocity onto the face and that IS a vorticity source; that source
+    // scales with etaLat (0.20 / 0.80 / 2.16 at 0.05 / 0.25 / 1.0), which is
+    // the "wall in disguise" made quantitative; and the working combination
+    // is open laterals + the y-band sink, which beats the walls baseline --
+    // soft etaLat on top is the best measured (the --nscbc-etalat flag).
+    check(std::abs(latV[1] - latV[0]) < 0.05,
+          "an x-only sink cannot reach the wall-parked residual");
+    check(latV[2] > 2.0 * latV[0],
+          "bare open laterals are worse than walls: the relax writes vorticity");
+    check(latEta[0] < 0.5 * latEta[1] && latEta[1] < latEta[2],
+          "the lateral vorticity source scales with etaLat");
+    check(latV[3] < 0.75 * latV[0],
+          "open laterals + y-band sink beat the free-slip walls");
+    check(latBest <= 1.05 * std::min({latV[3], latEta[0], latV[0]}),
+          "soft etaLat + sink is the best measured lateral configuration");
     check(std::abs(auto0 - fix0) < 1e-12,
           "a normal-incidence face is unchanged by the adaptive coefficient");
     check(std::abs(modal0 - fix0) < 1e-6,

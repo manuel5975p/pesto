@@ -118,6 +118,13 @@ int main()
             "--nscbc-sink 16 --n 128 --ny 128"); // remapped band unmeasured
     rejects("flow --physics compressible --body floor --far nscbc "
             "--nscbc-sink 16 --n 512");    // solid floor rows own the band
+    // The lateral relax rate: only open laterals ever read it.
+    accepts("flow --physics compressible --body cylinder --far nscbc --open "
+            "--nscbc-etalat 0.05 --n 512");
+    rejects("flow --physics compressible --body cylinder --far nscbc "
+            "--nscbc-etalat 0.05 --n 512"); // walled laterals never read it
+    rejects("flow --physics compressible --body cylinder --far sponge "
+            "--nscbc-etalat 0.05 --n 512");
     accepts("flow --physics compressible --body m.stl --far nscbc --open --n 96 "
             "--nz 96 --les 0.17");
     accepts("flow --physics compressible --body m.stl --far nscbc --open --n 128 "

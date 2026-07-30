@@ -142,6 +142,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         nc.betaAuto = r.nscbcAbc == NscbcAbc::Adaptive;
         nc.betaModal = r.nscbcAbc == NscbcAbc::Modal;
         nc.etaIn = r.nscbcEtaIn;
+        nc.etaLat = r.nscbcEtaLat;
         nc.openY = r.open;
         nc.openZ = r.open && g.nz > 1;
         nc.potCorrect = r.nscbcPot;

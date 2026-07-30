@@ -102,6 +102,13 @@ struct RawConfig
     // 0.04% at 0.5). A run with no freestream to sag -- a static rotor, an
     // acoustic study -- wants it soft.
     double nscbcEtaIn = 100.0;
+    // Lateral (open-face) incoming relax rate for the shear/entropy blend.
+    // Measured 2026-07-30 (gpu_nscbc_order): the relax term writes tangential
+    // velocity onto the face under acoustic load, a vorticity source that
+    // SCALES with this rate (0.20/0.80/2.16 of the incident scale at
+    // 0.05/0.25/1.0) -- soft is transparent, stiff is a wall in disguise.
+    // 0.25 is the shipped default, bit-identical.
+    double nscbcEtaLat = 0.25;
     int nscbcStrip = 0;
     // Scale-selective absorbing band inside the open faces (gpu/comp_sink):
     // an explicit sink for the sub-6dx content the central flux cannot
@@ -227,7 +234,8 @@ public:
     double tinfK = 288.15, prandtl = 0.72, twallRatio = 1.0;
     bool sutherland = false, bodyIsothermal = false, nscbcThermalInflow = false;
     double penalize = 0;
-    double ramp = 0, kick = 0, nscbcBeta = 0, nscbcEtaIn = 0, nscbcSinkAmp = 0;
+    double ramp = 0, kick = 0, nscbcBeta = 0, nscbcEtaIn = 0, nscbcEtaLat = 0,
+           nscbcSinkAmp = 0;
     NscbcAbc nscbcAbc = NscbcAbc::YooIm;
     double scale = 0, pitch = 0, yaw = 0;
     int dimples = 0, bumps = 0, maxIters = 0, dtRecompute = 1;

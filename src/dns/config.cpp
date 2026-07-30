@@ -973,6 +973,7 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
     c.nscbcBeta = r.nscbcBeta;
     c.nscbcEtaIn = r.given.contains("--nscbc-etain") ? r.nscbcEtaIn : 100.0;
     c.nscbcStrip = r.nscbcStrip;
+    c.nscbcEtaLat = r.nscbcEtaLat;
     c.nscbcSink = r.nscbcSink;
     c.nscbcSinkAmp = r.nscbcSinkAmp;
     if (c.far == FarField::Nscbc)
@@ -1027,6 +1028,20 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
                                           "--nscbc-sink band; pass a width");
     if (c.far != FarField::Nscbc && r.given.contains("--nscbc-etain"))
         return bad(2, "--nscbc-etain", "requires --far nscbc");
+    if (r.given.contains("--nscbc-etalat"))
+    {
+        if (c.far != FarField::Nscbc || !c.open)
+            return bad(2, "--nscbc-etalat", "is the OPEN lateral faces' relax "
+                                            "rate; needs --far nscbc --open "
+                                            "(walled laterals never read it)");
+        if (!finitePos(c.nscbcEtaLat))
+            return bad(2, "--nscbc-etalat", "must be > 0");
+        if (c.nscbcEtaLat > 0.5)
+            c.warnings.emplace_back(
+                "--nscbc-etalat > 0.5: the lateral relax writes vorticity onto "
+                "the face in proportion to this rate (a stiff clamp is a wall "
+                "in disguise; measured 2.16x the incident scale at 1.0)");
+    }
     // The derived outflow coefficients. `adaptive` is formed inside the NSCBC
     // kernel from quantities it already has, so it constrains nothing beyond
     // needing the closure at all. `modal` owns ONE plane -- the uniform x-hi

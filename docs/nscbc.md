@@ -239,6 +239,38 @@ running longer under-reports. In a box as tall as it is wide those two cross at
 75° numbers were mostly incident wave that had not left yet; running the same
 case 4× longer dropped 75° from 0.2480 to 0.0042.
 
+## The lateral closure, measured 2026-07-30 (test `gpu_nscbc_order`)
+
+Where the retraction's 0.2198 residual actually lives and what removes it.
+Same 45° ridge, peak |ω|/wScale by the non-wrapping scan, peak location
+alongside:
+
+| laterals | sink | peak \|ω\| | at (i,j) |
+|----------|------|-----------|----------|
+| free-slip walls | — | 0.2198 | (846,126) — the y wall |
+| free-slip walls | x-band 16 | 0.2200 | unchanged: an x band cannot reach it |
+| open (etaLat 0.25) | — | **0.8017** | (1007,0) — the lateral FACE |
+| open (etaLat 0.25) | 16 | 0.1164 | face rows |
+| open, etaLat 0.05 | — | 0.2005 | face rows |
+| open, etaLat 1.0 | — | 2.1649 | face rows |
+| open, etaLat 0.05 | 16 | **0.0319** | face rows |
+
+Three findings. (1) **Bare characteristic laterals are 4× worse than the
+walls they replace**: the incoming relax `etaLat·c/L·(v_t − tgt)` writes
+tangential velocity onto the face wherever the acoustic load varies along it,
+and that IS a vorticity source — it scales with the rate (0.20/0.80/2.16 at
+0.05/0.25/1.0), which is "a stiff lateral clamp is a wall in disguise" made
+quantitative. `--nscbc-etalat` now exposes the rate (default 0.25 unchanged;
+validator warns above 0.5). (2) The wall-parked residual of the walled rig is
+resolved-scale vorticity in a quiescent box — nothing local can remove it
+without eating the near field; with a freestream it advects out (the
+`vortexResidual` band). (3) The working configuration is **open laterals +
+soft etaLat + the y-band sink: 0.0319**, seven times below the walls
+baseline — each piece is measured to be necessary: the sink eats what the
+face writes at small scale, the soft rate stops writing it at large scale.
+The vortex-on-face transparency rig (`gpu_comp_nscbc`) is etaLat-insensitive
+(0.026–0.027 across the scan), so softening costs nothing measured.
+
 ## Angle of incidence, re-measured 2026-07-29 (test `gpu_nscbc_order`)
 
 Rig sized so the window exists at every angle (`xc > (Ly/2)tanθ + 3σ`):
