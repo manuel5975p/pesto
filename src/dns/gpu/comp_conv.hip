@@ -1,63 +1,32 @@
 #include "dns/gpu/comp_conv.hpp"
 
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/hotpatch.hpp"
 #include "dns/gpu/index.hpp"
+#include "dns/gpu/internal/plane_sums.hpp"
+#include "dns/gpu/internal/wall_ghost.hpp"
 
 namespace dns::gpu {
 
 namespace {
 
-// Ghost rows {0, ny-1} mirror rows {1, ny-2}; writes and reads are disjoint.
-// The thermodynamic ghost state is built so the wall face holds T = Twall and
-// dp/dn = 0 with the mirrored velocity: T0 = 2 Twall - T1 (floored at
-// Twall/20 so a transient cannot construct a negative-temperature ghost --
-// the same guard, and the same 0.05 factor, as the channel wall), p0 = p1,
-// rho0 = p0/(R T0), m0 = -rho0 u1, E0 from (p0, rho0, |u1|).
-//
-// The two walls carry their own temperature: Tbot on j = 0, Ttop on j = ny-1,
-// and the floor's is Tbot only inside the hot patch.
-
-// Centred hot patch on the floor; see the Boussinesq twin in
-// gpu/boussinesq.hip. Fractional in the FLUID index range, and vacuous at
-// nz == 1.
-__host__ __device__ inline bool inHotPatchComp(const GpuGrid& g, int i, int k,
-                                               Real patch, int ox, int oz)
-{
-    const Real fx = (Real(i - ox) + Real(0.5)) / Real(g.nx - 2 * ox)
-                  - Real(0.5);
-    if (fabsf(fx) > Real(0.5) * patch) return false;
-    if (g.nz == 1) return true;
-    const Real fz = (Real(k - oz) + Real(0.5)) / Real(g.nz - 2 * oz)
-                  - Real(0.5);
-    return fabsf(fz) <= Real(0.5) * patch;
-}
-
+// The two plates. The ghost state is the shared isothermal no-slip wall
+// (internal/wall_ghost.hpp) -- the same one the channel plates and the O-grid
+// body surface get. What is specific here is only WHICH temperature each
+// column sees: Ttop on the whole lid, Tbot on the floor inside the hot patch
+// and Ttop outside it.
 __global__ void kConvWallY(GpuGrid g, Real gam, Real Rgas, Real Tbot,
                            Real Ttop, Real patch, int ox, int oz, Real* rho,
                            Real* mx, Real* my, Real* mz, Real* E)
 {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t nxz = std::size_t(g.nx) * g.nz;
-    if (t >= 2 * nxz) return;
-    const bool hi = t >= nxz;
-    const int i = int(t % g.nx), k = int((t / g.nx) % g.nz);
-    const std::size_t c = gidx(g, i, hi ? g.ny - 1 : 0, k);
-    const std::size_t s = gidx(g, i, hi ? g.ny - 2 : 1, k);
+    int i, k;
+    bool hi;
+    std::size_t c, s;
+    if (!internal::yGhostPair(g, t, i, k, hi, c, s)) return;
     const Real Twall =
-        hi ? Ttop : (inHotPatchComp(g, i, k, patch, ox, oz) ? Tbot : Ttop);
-
-    const Real r1 = rho[s];
-    const Real u1 = mx[s] / r1, v1 = my[s] / r1, w1 = mz[s] / r1;
-    const Real ke1 = Real(0.5) * (u1 * u1 + v1 * v1 + w1 * w1);
-    const Real p1 = (gam - Real(1)) * (E[s] - r1 * ke1);
-    const Real T1 = p1 / (Rgas * r1);
-    const Real T0 = fmaxf(Real(2) * Twall - T1, Real(0.05) * Twall);
-    const Real r0 = p1 / (Rgas * T0);
-    rho[c] = r0;
-    mx[c] = -r0 * u1;
-    my[c] = -r0 * v1;
-    mz[c] = -r0 * w1;
-    E[c] = p1 / (gam - Real(1)) + r0 * ke1;
+        hi ? Ttop : (inHotPatch(g, i, k, patch, ox, oz) ? Tbot : Ttop);
+    internal::isothermalGhost(c, s, gam, Rgas, Twall, rho, mx, my, mz, E);
 }
 
 // Lateral no-slip ADIABATIC mirror (--sides closed). T and p are COPIED --
@@ -184,16 +153,6 @@ void addGravityY(const GpuGrid& g, double gy, Real cr, bool closed,
     checkLastKernel("kGravityY");
 }
 
-double convPatchAreaFraction(const GpuGrid& g, double patch, bool closed)
-{
-    const int ox = sideGhostX(closed), oz = sideGhostZ(g, closed);
-    std::size_t inside = 0;
-    for (int k = oz; k < g.nz - oz; ++k)
-        for (int i = ox; i < g.nx - ox; ++i)
-            if (inHotPatchComp(g, i, k, Real(patch), ox, oz)) ++inside;
-    return double(inside) / (double(g.nx - 2 * ox) * (g.nz - 2 * oz));
-}
-
 hipError_t convPlaneStats(const GpuGrid& g, bool closed, const DeviceScalar& rho,
                           const DeviceScalar& u, const DeviceScalar& v,
                           const DeviceScalar& w, const DeviceScalar& T,
@@ -201,19 +160,13 @@ hipError_t convPlaneStats(const GpuGrid& g, bool closed, const DeviceScalar& rho
                           std::vector<double>& host)
 {
     const std::size_t n = std::size_t(g.ny) * 6;
-    if (scratch.size() < n)
-    {
-        auto b = DeviceBuffer<double>::make(n);
-        if (!b) return b.error();
-        scratch = std::move(*b);
-    }
+    if (auto e = internal::ensurePlaneScratch(scratch, n); e != hipSuccess)
+        return e;
     kConvPlaneStats<<<launchBlocks(std::size_t(g.ny)), blockSize>>>(
         g, sideGhostX(closed), sideGhostZ(g, closed), rho.data(), u.data(),
         v.data(), w.data(), T.data(), scratch.data());
     checkLastKernel("kConvPlaneStats");
-    host.resize(n);
-    return hipMemcpy(host.data(), scratch.data(), n * sizeof(double),
-                     hipMemcpyDeviceToHost);
+    return internal::fetchPlaneScratch(scratch, n, host);
 }
 
 } // namespace dns::gpu

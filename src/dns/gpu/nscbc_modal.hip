@@ -177,17 +177,4 @@ void NscbcModalAbc::compute(const Real* rho, const Real* u, const Real* v,
 
 const Real* NscbcModalAbc::plane() const { return impl_->out.data(); }
 
-std::size_t NscbcModalAbc::bytes() const
-{
-    const Impl& s = *impl_;
-    std::size_t n = 3 * s.n * sizeof(Real) + s.n * sizeof(hipfftComplex);
-    // Measured 2026-07-29: rocFFT answers 0 for these plans -- it does not
-    // expose its internal scratch through this call -- so what this returns is
-    // the buffers this module owns, not the last byte on the card. Asked
-    // anyway, because the CUDA backend does answer.
-    std::size_t work = 0;
-    if (s.plan && hipfftGetSize(s.plan, &work) == HIPFFT_SUCCESS) n += work;
-    return n;
-}
-
 } // namespace dns::gpu

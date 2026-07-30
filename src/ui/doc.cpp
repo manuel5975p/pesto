@@ -13,15 +13,6 @@
 namespace ui {
 namespace {
 
-// Order must match DocState::bodyKind. "scene" is last because it is the one
-// entry that turns the object list on.
-const char* const kBodyNames[] = {"none",  "cylinder", "sphere", "cube", "lens",
-                                  "fence", "floor",    "mesh",   "scene", nullptr};
-const char* const kFarNames[] = {"tunnel", "fringe", "sponge", "nscbc", "periodic",
-                                 nullptr};
-const char* const kObjectKinds[] = {"cylinder", "sphere", "cube", "lens", "mesh",
-                                    nullptr};
-
 std::string num(double v, int dec = 4)
 {
     char b[64];
@@ -31,12 +22,15 @@ std::string num(double v, int dec = 4)
 
 } // namespace
 
-const char* const* bodyNames() { return kBodyNames; }
-int bodyNameCount() { return 9; }
-const char* const* farNames() { return kFarNames; }
-int farNameCount() { return 5; }
+// The pickers read the solver's own tables, so DocState::bodyKind and ::far
+// are indices into the ENUMS (dns/config.hpp) and cannot drift from them. The
+// editor used to keep its own copies plus a hand-written count.
+const char* const* bodyNames() { return dns::bodyKindNames().data(); }
+int bodyNameCount() { return int(dns::bodyKindNames().size()); }
+const char* const* farNames() { return dns::farFieldNames().data(); }
+int farNameCount() { return int(dns::farFieldNames().size()); }
 
-// Indices into kFarNames: 0 tunnel, 1 fringe, 2 sponge, 3 nscbc, 4 periodic.
+// Indices into farNames(): 0 tunnel, 1 fringe, 2 sponge, 3 nscbc, 4 periodic.
 // Measured against the validator, not guessed -- `dns flow --dry-run` over the
 // full body x far x physics matrix rejects the cross terms with "tunnel is an
 // incompressible far field" / "sponge is a compressible far field". Periodic is
@@ -69,8 +63,11 @@ BodyOpts bodyOptions(int bodyKind)
     default: return {};                                // none/cube/fence/scene
     }
 }
-const char* const* objectKindNames() { return kObjectKinds; }
-int objectKindCount() { return 5; }
+const char* const* objectKindNames()
+{
+    return dns::sceneObjectKindNames().data();
+}
+int objectKindCount() { return int(dns::sceneObjectKindNames().size()); }
 
 bool Doc::sceneMode() const { return st.bodyKind == 8; }
 
@@ -198,7 +195,7 @@ static dns::RawConfig rawFrom(const DocState& s)
         r.scene = "<editor>";   // recorded, never opened (phase 1.5 is ours)
         r.given.insert("--scene");
     } else {
-        r.body = s.bodyKind == 7 ? s.meshPath : kBodyNames[s.bodyKind];
+        r.body = s.bodyKind == 7 ? s.meshPath : dns::bodyKindNames()[s.bodyKind];
         r.given.insert("--body");
     }
 
@@ -1062,9 +1059,9 @@ std::vector<std::string> Doc::commandArgs(const std::string& exe,
         add("--physics", "compressible");
         add("--mach", num(st.mach()));
     }
-    add("--far", kFarNames[st.far]);
+    add("--far", dns::farFieldNames()[st.far]);
     if (sceneMode()) add("--scene", scenePath);
-    else add("--body", st.bodyKind == 7 ? st.meshPath : kBodyNames[st.bodyKind]);
+    else add("--body", st.bodyKind == 7 ? st.meshPath : dns::bodyKindNames()[st.bodyKind]);
 
     // Same capability gate as rawFrom(): the command that runs must be the
     // command that was inspected, so it cannot carry a flag the body does not

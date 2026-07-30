@@ -1183,14 +1183,19 @@ void App::geometryRegion()
         return;
     }
 
+    // Two rows of the ONE table (doc.hpp), split for width only: the second
+    // row takes whatever the first leaves, so a body kind added to the solver's
+    // enum appears here rather than falling off the end.
+    constexpr int kRow1 = 5;
     int bk = doc_.st.bodyKind;
-    if (g.choice("", bk, {bodyNames(), 5})) {
+    if (g.choice("", bk, {bodyNames(), kRow1})) {
         doc_.st.bodyKind = bk;
         doc_.touch();
     }
-    int bk2 = doc_.st.bodyKind >= 5 ? doc_.st.bodyKind - 5 : -1;
-    if (g.choice("", bk2, {bodyNames() + 5, 4})) {
-        doc_.st.bodyKind = bk2 + 5;
+    int bk2 = doc_.st.bodyKind >= kRow1 ? doc_.st.bodyKind - kRow1 : -1;
+    if (g.choice("", bk2,
+                 {bodyNames() + kRow1, std::size_t(bodyNameCount() - kRow1)})) {
+        doc_.st.bodyKind = bk2 + kRow1;
         doc_.touch();
     }
 

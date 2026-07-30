@@ -1,16 +1,18 @@
-#include "dns/interrupt.hpp"
 #include "dns/gpu/runner_incomp.hpp"
+
+#include "dns/interrupt.hpp"
 
 #include "dns/gpu/cutflux.hpp"
 #include "dns/gpu/cutpoisson.hpp"
 #include "dns/gpu/derived.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/ghostfill.hpp"
+#include "dns/gpu/internal/frame_scratch.hpp"
+#include "dns/gpu/internal/run_loop.hpp"
 #include "dns/gpu/kernels.hpp"
 #include "dns/gpu/les.hpp"
 #include "dns/gpu/reductions.hpp"
 #include "dns/gpu/tunnel.hpp"
-#include "dns/gpu/internal/run_loop.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -214,48 +216,23 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     const float vortScale =
         float(r.vortMax > 0 ? r.vortMax : 8.0 * r.uInf / r.D);
     const float speedMax = float(1.6 * r.uInf);
-    // Frame scratch is allocated on the FIRST frame: two device and four host
-    // full-grid arrays that a stats-only run (every validation case, every
-    // steady solve) used to pay for unconditionally.
-    std::optional<DeviceScalar> dVort, dSpeed;
-    std::vector<Real> hVort, hSpeed;
-    std::vector<float> vortF, speedF;
     const float vortToe = r.vortAsinh ? vortScale / 32.0f : 0.0f;
+    // The MAC field is differenced straight into the two derived scalars, so
+    // this runner needs no cell-centred velocity trio.
+    internal::FrameScratch fs;
     auto writeFrame = [&](double t) {
-        if (!dVort)
-        {
-            auto a = DeviceScalar::make(g.size());
-            auto b = DeviceScalar::make(g.size());
-            if (!a || !b)
-            {
-                std::fprintf(stderr, "frame scratch allocation failed\n");
-                return;
-            }
-            dVort = std::move(*a);
-            dSpeed = std::move(*b);
-            hVort.resize(g.size());
-            hSpeed.resize(g.size());
-            vortF.resize(g.size());
-            speedF.resize(g.size());
-        }
-        vorticityZ(gg, *dU, *dVort);
-        speedMac(gg, *dU, *dSpeed);
-        (void)dVort->download(hVort.data());
-        (void)dSpeed->download(hSpeed.data());
-        const float uOff = r.speedDelta ? float(r.uInf) : 0.0f;
-        for (std::size_t c = 0; c < g.size(); ++c)
-        {
-            vortF[c] = float(hVort[c]);
-            speedF[c] = float(hSpeed[c]) - uOff;
-        }
+        if (!fs.ensure(g.size(), 2, false)) return;
+        vorticityZ(gg, *dU, fs.vort());
+        speedMac(gg, *dU, fs.speed());
+        fs.take(0, fs.vort());
+        fs.take(1, fs.speed(), r.speedDelta ? r.uInf : 0.0);
         const FrameField ff[2]{
-            {"vort", vortF.data(), 0, vortScale, true, vortToe},
+            {"vort", fs.channel(0), 0, vortScale, true, vortToe},
             r.speedDelta
-                ? FrameField{"dspeed", speedF.data(), 0, float(0.6 * r.uInf),
+                ? FrameField{"dspeed", fs.channel(1), 0, float(0.6 * r.uInf),
                              true}
-                : FrameField{"speed", speedF.data(), 0, speedMax, false}};
-        if (auto e = out.frame(t, FrameViews{ff}); !e)
-            std::fprintf(stderr, "frame write failed: %s\n", e.error().c_str());
+                : FrameField{"speed", fs.channel(1), 0, speedMax, false}};
+        internal::FrameScratch::emit(out, t, ff);
     };
 
     RunStats st;
@@ -368,9 +345,7 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
         stage(*dU, *dS, 0.75, dt);
         stage(*dS, *dU, 1.0 / 3.0, dt);
 
-        if (out.wantsFrame(t) || out.wantsPng(t) || out.wantsWeb(t)
-            || out.wantsShm(t))
-            writeFrame(t);
+        if (out.wantsAnyFrame(t)) writeFrame(t);
 
         if (tally)
         {

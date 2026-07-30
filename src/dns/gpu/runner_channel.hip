@@ -1,13 +1,15 @@
-#include "dns/interrupt.hpp"
 #include "dns/gpu/runner_channel.hpp"
+
+#include "dns/interrupt.hpp"
 
 #include "dns/curvmesh.hpp"
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_channel.hpp"
 #include "dns/gpu/derived.hpp"
-#include "dns/gpu/internal/derived_remap.hpp"
-#include "dns/gpu/internal/run_loop.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/internal/derived_remap.hpp"
+#include "dns/gpu/internal/frame_scratch.hpp"
+#include "dns/gpu/internal/run_loop.hpp"
 #include "dns/gpu/reductions.hpp"
 #include "dns/remap.hpp"
 
@@ -66,14 +68,6 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     }
     const int jLo = 1, jHi = g.ny - 2; // fluid rows
 
-    auto du = DeviceScalar::make(g.size());
-    auto dv = DeviceScalar::make(g.size());
-    auto dw = DeviceScalar::make(g.size());
-    auto dVort = DeviceScalar::make(g.size());
-    auto dSpeed = DeviceScalar::make(g.size());
-    if (!du || !dv || !dw || !dVort || !dSpeed)
-        return fail(6, "GPU allocation failed");
-
     const std::string cols[] = {"t",       "dt",      "ubulk", "utauBot",
                                 "utauTop", "retau",   "KE"};
     out.declareSeries("stats", cols);
@@ -87,26 +81,21 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     const double ubEst = r.ubEst;
     const float vortScale = float(r.curlMax > 0 ? r.curlMax : r.reTau / 4.0);
     const float speedMax = float(1.6 * ubEst);
-    std::vector<Real> hVort(g.size()), hSpeed(g.size());
-    std::vector<float> vortF(g.size()), speedF(g.size());
+    internal::FrameScratch fs;
     auto writeFrame = [&](double t) {
-        primitiveVelocity(gg, ds->rho, ds->mx, ds->my, ds->mz, *du, *dv, *dw);
-        if (g.nz == 1) vorticityZRemap(gg, remap, *du, *dv, *dVort);
-        else curlMagCentred(gg, *du, *dv, *dw, *dVort);
-        speedCentred(gg, *du, *dv, *dw, *dSpeed);
-        (void)dVort->download(hVort.data());
-        (void)dSpeed->download(hSpeed.data());
-        for (std::size_t c = 0; c < g.size(); ++c)
-        {
-            vortF[c] = float(hVort[c]);
-            speedF[c] = float(hSpeed[c]);
-        }
+        if (!fs.ensure(g.size(), 2, true)) return;
+        primitiveVelocity(gg, ds->rho, ds->mx, ds->my, ds->mz, fs.u(), fs.v(),
+                          fs.w());
+        if (g.nz == 1) vorticityZRemap(gg, remap, fs.u(), fs.v(), fs.vort());
+        else curlMagCentred(gg, fs.u(), fs.v(), fs.w(), fs.vort());
+        speedCentred(gg, fs.u(), fs.v(), fs.w(), fs.speed());
+        fs.take(0, fs.vort());
+        fs.take(1, fs.speed());
         const FrameField ff[2]{
-            {g.nz == 1 ? "vort" : "curl", vortF.data(), 0, vortScale,
+            {g.nz == 1 ? "vort" : "curl", fs.channel(0), 0, vortScale,
              g.nz == 1},
-            {"speed", speedF.data(), 0, speedMax, false}};
-        if (auto e = out.frame(t, FrameViews{ff}); !e)
-            std::fprintf(stderr, "frame write failed: %s\n", e.error().c_str());
+            {"speed", fs.channel(1), 0, speedMax, false}};
+        internal::FrameScratch::emit(out, t, ff);
     };
 
     DeviceBuffer<double> planeScratch;
@@ -237,9 +226,7 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
                 while (nextProf <= t) nextProf += r.profileDt;
             }
         }
-        if (out.wantsFrame(t) || out.wantsPng(t) || out.wantsWeb(t)
-            || out.wantsShm(t))
-            writeFrame(t);
+        if (out.wantsAnyFrame(t)) writeFrame(t);
     }
     (void)hipDeviceSynchronize();
     finishTiming(st, wall0, out);

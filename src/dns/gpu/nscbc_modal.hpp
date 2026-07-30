@@ -74,9 +74,6 @@ public:
     // kernel subtracts from the incoming amplitude. Valid after compute().
     const Real* plane() const;
 
-    // Device bytes this closure owns (buffers + FFT work area).
-    std::size_t bytes() const;
-
 private:
     struct Impl;
     explicit NscbcModalAbc(std::unique_ptr<Impl> impl);

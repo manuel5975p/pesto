@@ -70,11 +70,6 @@ namespace dns::gpu {
 void applyRbWall(const GpuGrid& g, Real Tbot, Real Ttop, Real patch, bool closed,
                  DeviceField& U, DeviceScalar& T);
 
-// Area fraction of the floor the patch actually covers, counted in CELLS --
-// the discrete value, which is what the Nusselt normalisation must use rather
-// than the nominal patch^2. Host-side; mirrors the kernel's predicate exactly.
-double rbPatchAreaFraction(const GpuGrid& g, double patch, bool closed);
-
 // Mirror the pressure into the wall ghost cells: dp/dn = 0 at a wall. The
 // Poisson solve writes them as ZERO, and subtractGradient would then read that
 // zero as a real value and drive a spurious velocity through the wall face. A

@@ -1,9 +1,9 @@
 // Drives cli::parse + validate over the whole §2.4 migration table of
 // masterplan_recompose, plus the rejection cases the old parsers silently
 // swallowed (unknown flags became the grid size; atof garbage became a default).
-#include "dns/cli.hpp"
 #include "dns/config.hpp"
 #include "check.hpp"
+#include "cli_test_util.hpp"
 
 #include <cstdio>
 #include <string>
@@ -15,16 +15,8 @@ using dnstest::check;
 
 
 
-std::expected<dns::Case, dns::ConfigError> run(std::vector<std::string> args)
-{
-    std::vector<char*> argv;
-    argv.push_back(const_cast<char*>("dns"));
-    for (auto& a : args) argv.push_back(a.data());
-    auto raw = dns::cli::parse(int(argv.size()), argv.data());
-    if (!raw)
-        return std::unexpected(dns::ConfigError{1, "cli", raw.error().message});
-    return dns::validate(*raw);
-}
+using dnstest::runCli;
+using dnstest::rejected;
 
 std::vector<std::string> split(const std::string& s)
 {
@@ -41,14 +33,14 @@ std::vector<std::string> split(const std::string& s)
 
 void accepts(const std::string& cmd)
 {
-    auto c = run(split(cmd));
+    auto c = runCli(split(cmd));
     if (!c) std::printf("      -> %s\n", dns::format(c.error()).c_str());
     check(c.has_value(), "should accept: dns " + cmd);
 }
 
 void rejects(const std::string& cmd)
 {
-    auto c = run(split(cmd));
+    auto c = runCli(split(cmd));
     check(!c.has_value(), "should reject: dns " + cmd);
 }
 
@@ -196,7 +188,7 @@ int main()
     rejects("flow --body floor --bumps 128 --dr 10 --n 1024"); // pitch under 16h
     rejects("flow --physics compressible --body none --far nscbc --pot --n 128");
     {
-        auto c = run(split("flow --physics compressible --body none --far sponge "
+        auto c = runCli(split("flow --physics compressible --body none --far sponge "
                            "--stretch 2 --n 128 --ny 128 --nz 1"));
         check(c && c->stretchBeta == 2.0, "--stretch reaches the case");
         check(c && c->stretchH1 > 0 && c->stretchH1 < c->grid.hy,
@@ -250,7 +242,7 @@ int main()
     rejects("flow --physics compressible --body none --focal 2,4,2,4,2,4 "
             "--n 128 --nz 1");                          // z plateau at nz == 1
     {
-        auto c = run(split("flow --physics compressible --body none "
+        auto c = runCli(split("flow --physics compressible --body none "
                            "--focal 2,4,2,4,0,0 --n 128 --ny 128 --nz 1"));
         check(c && c->focalActive, "--focal reaches the case");
         check(c && c->focalHFine[0] < c->grid.hx
@@ -262,7 +254,7 @@ int main()
               "discrete growth ratio is bounded");
         check(c && c->focalDtFactor > 0 && c->focalDtFactor < 1,
               "dt factor reports the clustering cost");
-        auto d = run(split("flow --physics compressible --body none "
+        auto d = runCli(split("flow --physics compressible --body none "
                            "--focal 2,4,0,0,0,0 --n 128 --ny 128 --nz 1"));
         check(d && d->focalHFine[1] == d->grid.hy,
               "a degenerate pair leaves that axis uniform");
@@ -270,16 +262,16 @@ int main()
 
     // --nz is INTERIOR cells everywhere: the ghost ring is added internally.
     {
-        auto c = run(split("flow --body cylinder --n 64 --nz 8"));
+        auto c = runCli(split("flow --body cylinder --n 64 --nz 8"));
         check(c && c->grid.nz == 10, "--nz 8 allocates the ghost ring internally");
         check(c && c->nzInterior == 8, "--nz 8 reports 8 interior cells");
-        auto d = run(split("flow --body cylinder --n 64 --nz 1"));
+        auto d = runCli(split("flow --body cylinder --n 64 --nz 1"));
         check(d && d->grid.nz == 1, "--nz 1 is native 2D, no z ghosts");
     }
     // The two grid conventions stay separate (masterplan §6.12).
     {
-        auto i = run(split("flow --body cylinder --n 512"));
-        auto k = run(split("flow --physics compressible --body cylinder --n 512"));
+        auto i = runCli(split("flow --body cylinder --n 512"));
+        auto k = runCli(split("flow --physics compressible --body cylinder --n 512"));
         // Incompressible carries a ghost ring (nx = n+2); compressible does not.
         check(i && i->grid.nx == 514, "incompressible --n 512 -> 514 with ghosts");
         check(k && k->grid.nx == 512, "compressible --n is the interior extent");
@@ -291,9 +283,9 @@ int main()
     // measured twice 2026-07-23). If this rejection is ever relaxed, the
     // implementation has to come back with it.
     {
-        auto ok = run(split("flow --body cylinder --cut-flux --n 64 --nz 1"));
+        auto ok = runCli(split("flow --body cylinder --cut-flux --n 64 --nz 1"));
         check(ok.has_value(), "--cut-flux is accepted incompressibly");
-        auto comp = run(split("flow --physics compressible --body cylinder "
+        auto comp = runCli(split("flow --physics compressible --body cylinder "
                               "--cut-flux --n 64 --nz 1"));
         check(!comp && comp.error().field == "--cut-flux",
               "--cut-flux is REJECTED under --physics compressible");
@@ -304,16 +296,16 @@ int main()
 
     // --penalize scope: the three constraints at config.cpp's penalize block.
     {
-        auto ok = run(split("flow --body cylinder --penalize 0.01 --n 64 --nz 1"));
+        auto ok = runCli(split("flow --body cylinder --penalize 0.01 --n 64 --nz 1"));
         check(ok.has_value(), "--penalize is accepted with a body");
-        auto neg = run(split("flow --body cylinder --penalize -1 --n 64 --nz 1"));
+        auto neg = runCli(split("flow --body cylinder --penalize -1 --n 64 --nz 1"));
         check(!neg && neg.error().field == "--penalize",
               "--penalize must be finite and >= 0");
-        auto nobody = run(split("flow --physics compressible --body none "
+        auto nobody = runCli(split("flow --physics compressible --body none "
                                 "--penalize 0.01 --n 64 --nz 1"));
         check(!nobody && nobody.error().field == "--penalize",
               "--penalize without a body is rejected");
-        auto str = run(split("flow --physics compressible --body cylinder "
+        auto str = runCli(split("flow --physics compressible --body cylinder "
                              "--penalize 0.01 --stretch 2 --n 64 --nz 1"));
         check(!str.has_value(), "--penalize with --stretch is rejected");
     }

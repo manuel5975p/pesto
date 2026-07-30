@@ -133,7 +133,6 @@ public:
     bool hasVolume() const;
     // Copying the volume is the expensive part of a frame; off by default.
     void wantVolume(bool on) { wantVolume_ = on; }
-    bool wantsVolume() const { return wantVolume_; }
 
     // Grid geometry, so the viewer can place a plane in world coordinates.
     int i0() const { return i0_; }

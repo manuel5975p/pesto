@@ -115,6 +115,99 @@ struct RunOutput::Impl
         return f;
     }
 
+    // The three plane selectors: which (i,j,k) the (x,y) pixel of an xy, xz or
+    // yz plane image reads, in the WRITTEN window's coordinates. Every caller
+    // that cuts a plane -- .bin, slices, PNG, web -- asks for one of these;
+    // they used to be written out inline at each of those sites.
+    auto xySel(int kk) const
+    {
+        return [i0 = geo.i0, j0 = geo.j0, kk](int x, int y) {
+            return std::array{i0 + x, j0 + y, kk};
+        };
+    }
+    auto xzSel(int jj) const
+    {
+        return [i0 = geo.i0, k0 = geo.k0, jj](int x, int y) {
+            return std::array{i0 + x, jj, k0 + y};
+        };
+    }
+    auto yzSel(int ii) const
+    {
+        return [j0 = geo.j0, k0 = geo.k0, ii](int x, int y) {
+            return std::array{ii, j0 + x, k0 + y};
+        };
+    }
+
+    // Lazily built: the field list, and so the plane manifest, is only known
+    // at the first frame. Its own method rather than an immediately-invoked
+    // lambda inside frame(), which is what it was.
+    std::expected<void, std::string> buildWebPlanes(const FrameViews& fv,
+                                                    int nx, int ny, int nz)
+    {
+        Impl& p = *this;
+        const int per = std::clamp(p.cfg.planesPerAxis, 1, 3);
+        const int dI = std::max(1, nx / 16), dJ = std::max(1, ny / 16),
+                  dK = std::max(1, nz / 16);
+        std::string idx;
+        auto add = [&](const std::string& suf, const std::string& axis,
+                       double offD, int a, int b, auto sel) {
+            WebPlane wp;
+            char offs[40];
+            std::snprintf(offs, sizeof offs, "%+.3gD", offD);
+            wp.wf = std::make_unique<WebFrames>(
+                tagPrefix("web_", p.cfg.prefix) + suf, a, b,
+                p.cfg.simJson + ",\"plane\":\"" + axis + "\",\"off\":\"" +
+                    (offD == 0.0 ? "mid" : offs) + "\"}");
+            for (const auto& f : fv.fields)
+                wp.wf->addField(f.name,
+                                f.diverging ? "diverging" : "sequential",
+                                f.diverging ? -f.hi : f.lo, f.hi);
+            wp.sel = sel;
+            wp.a = a;
+            wp.b = b;
+            if (!p.geo.mask.empty())
+            {
+                std::vector<float> m;
+                p.gather(p.geo.mask.data(), a, b, wp.sel, m);
+                wp.wf->writeStatic("mask", m.data(), 0.0, 1.0);
+            }
+            char e[160];
+            std::snprintf(e, sizeof e,
+                          "%s{\"suf\":\"%s\",\"axis\":\"%s\",\"off\":%.4g}",
+                          idx.empty() ? "" : ",", suf.c_str(),
+                          axis.c_str(), offD);
+            idx += e;
+            p.webs.push_back(std::move(wp));
+        };
+        const double D = p.geo.D > 0 ? p.geo.D : 1.0;
+        auto cellsD = [&](int c) { return c * p.g.hx / D; };
+        const int ic = p.geo.ic, jc = p.geo.jc, kc = p.geo.kc;
+        add("", "xy", 0.0, nx, ny, xySel(kc));
+        if (nz == 1) return {};             // native 2D: one plane only
+        if (per == 3 && nz >= 16)
+        {
+            add("_xy_m", "xy", -cellsD(dK), nx, ny, xySel(kc - dK));
+            add("_xy_p", "xy", +cellsD(dK), nx, ny, xySel(kc + dK));
+        }
+        add("_xz", "xz", 0.0, nx, nz, xzSel(jc));
+        if (per == 3 && ny >= 16)
+        {
+            add("_xz_m", "xz", -cellsD(dJ), nx, nz, xzSel(jc - dJ));
+            add("_xz_p", "xz", +cellsD(dJ), nx, nz, xzSel(jc + dJ));
+        }
+        add("_yz", "yz", 0.0, ny, nz, yzSel(ic));
+        if (per == 3 && nx >= 16)
+        {
+            add("_yz_m", "yz", -cellsD(dI), ny, nz, yzSel(ic - dI));
+            add("_yz_p", "yz", +cellsD(dI), ny, nz, yzSel(ic + dI));
+        }
+        const std::string path =
+            tagPrefix("web_", p.cfg.prefix) + "/planes.json";
+        std::ofstream pf(path);
+        pf << "{\"planes\":[" << idx << "]}\n";
+        return closeChecked(pf, path);
+    }
+
     // Copies the plane selected by `sel` out of a full-grid field.
     void gather(const float* src, int a, int b,
                 const std::function<std::array<int, 3>(int, int)>& sel,
@@ -302,6 +395,11 @@ bool RunOutput::wantsShm(double t) const
     return has(p_->cfg.kinds, Emit::Shm) && t >= p_->nextWeb;
 }
 
+bool RunOutput::wantsAnyFrame(double t) const
+{
+    return wantsFrame(t) || wantsPng(t) || wantsWeb(t) || wantsShm(t);
+}
+
 std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv)
 {
     auto& p = *p_;
@@ -315,86 +413,7 @@ std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv
 
     // Lazily build the web planes: the field list is only known here.
     if (doWeb && p.webs.empty())
-        if (auto r = [&]() -> std::expected<void, std::string> {
-                const int per = std::clamp(p.cfg.planesPerAxis, 1, 3);
-                const int dI = std::max(1, nx / 16), dJ = std::max(1, ny / 16),
-                          dK = std::max(1, nz / 16);
-                std::string idx;
-                auto add = [&](const std::string& suf, const std::string& axis,
-                               double offD, int a, int b, auto sel) {
-                    WebPlane wp;
-                    char offs[40];
-                    std::snprintf(offs, sizeof offs, "%+.3gD", offD);
-                    wp.wf = std::make_unique<WebFrames>(
-                        tagPrefix("web_", p.cfg.prefix) + suf, a, b,
-                        p.cfg.simJson + ",\"plane\":\"" + axis + "\",\"off\":\"" +
-                            (offD == 0.0 ? "mid" : offs) + "\"}");
-                    for (const auto& f : fv.fields)
-                        wp.wf->addField(f.name,
-                                        f.diverging ? "diverging" : "sequential",
-                                        f.diverging ? -f.hi : f.lo, f.hi);
-                    wp.sel = sel;
-                    wp.a = a;
-                    wp.b = b;
-                    if (!p.geo.mask.empty())
-                    {
-                        std::vector<float> m;
-                        p.gather(p.geo.mask.data(), a, b, wp.sel, m);
-                        wp.wf->writeStatic("mask", m.data(), 0.0, 1.0);
-                    }
-                    char e[160];
-                    std::snprintf(e, sizeof e,
-                                  "%s{\"suf\":\"%s\",\"axis\":\"%s\",\"off\":%.4g}",
-                                  idx.empty() ? "" : ",", suf.c_str(),
-                                  axis.c_str(), offD);
-                    idx += e;
-                    p.webs.push_back(std::move(wp));
-                };
-                const double D = p.geo.D > 0 ? p.geo.D : 1.0;
-                auto cellsD = [&](int c) { return c * p.g.hx / D; };
-                const int ic = p.geo.ic, jc = p.geo.jc, kc = p.geo.kc;
-                auto xy = [&](int kk) {
-                    return [kk, i0, j0](int i, int j) {
-                        return std::array{i0 + i, j0 + j, kk};
-                    };
-                };
-                auto xz = [&](int jj) {
-                    return [jj, i0, k0](int i, int kk) {
-                        return std::array{i0 + i, jj, k0 + kk};
-                    };
-                };
-                auto yz = [&](int ii) {
-                    return [ii, j0, k0](int j, int kk) {
-                        return std::array{ii, j0 + j, k0 + kk};
-                    };
-                };
-                add("", "xy", 0.0, nx, ny, xy(kc));
-                if (nz == 1) return {};             // native 2D: one plane only
-                if (per == 3 && nz >= 16)
-                {
-                    add("_xy_m", "xy", -cellsD(dK), nx, ny, xy(kc - dK));
-                    add("_xy_p", "xy", +cellsD(dK), nx, ny, xy(kc + dK));
-                }
-                add("_xz", "xz", 0.0, nx, nz, xz(jc));
-                if (per == 3 && ny >= 16)
-                {
-                    add("_xz_m", "xz", -cellsD(dJ), nx, nz, xz(jc - dJ));
-                    add("_xz_p", "xz", +cellsD(dJ), nx, nz, xz(jc + dJ));
-                }
-                add("_yz", "yz", 0.0, ny, nz, yz(ic));
-                if (per == 3 && nx >= 16)
-                {
-                    add("_yz_m", "yz", -cellsD(dI), ny, nz, yz(ic - dI));
-                    add("_yz_p", "yz", +cellsD(dI), ny, nz, yz(ic + dI));
-                }
-                const std::string path =
-                    tagPrefix("web_", p.cfg.prefix) + "/planes.json";
-                std::ofstream pf(path);
-                pf << "{\"planes\":[" << idx << "]}\n";
-                return closeChecked(pf, path);
-            }();
-            !r)
-            return r;
+        if (auto r = p.buildWebPlanes(fv, nx, ny, nz); !r) return r;
 
     if (doBin)
     {
@@ -415,11 +434,7 @@ std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv
             if (has(k, Emit::Bin))
             {
                 auto& out = p.binFor(f.name);
-                p.gather(f.data, nx, ny,
-                         [kc = p.geo.kc, i0, j0](int i, int j) {
-                             return std::array{i0 + i, j0 + j, kc};
-                         },
-                         p.buf);
+                p.gather(f.data, nx, ny, p.xySel(p.geo.kc), p.buf);
                 out.write(reinterpret_cast<const char*>(p.buf.data()),
                           std::streamsize(p.buf.size() * sizeof(float)));
             }
@@ -432,15 +447,9 @@ std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv
                     out.write(reinterpret_cast<const char*>(p.buf.data()),
                               std::streamsize(p.buf.size() * sizeof(float)));
                 };
-                plane("xy", nx, ny, [kc, i0, j0](int i, int j) {
-                    return std::array{i0 + i, j0 + j, kc};
-                });
-                plane("xz", nx, nz, [jc, i0, k0](int i, int kk) {
-                    return std::array{i0 + i, jc, k0 + kk};
-                });
-                plane("yz", ny, nz, [ic, j0, k0](int j, int kk) {
-                    return std::array{ic, j0 + j, k0 + kk};
-                });
+                plane("xy", nx, ny, p.xySel(kc));
+                plane("xz", nx, nz, p.xzSel(jc));
+                plane("yz", ny, nz, p.yzSel(ic));
             }
         }
         ++p.frames;
@@ -451,20 +460,12 @@ std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv
     {
         for (const auto& f : fv.fields)
         {
-            p.gather(f.data, nx, ny,
-                     [kc = p.geo.kc, i0, j0](int i, int j) {
-                         return std::array{i0 + i, j0 + j, kc};
-                     },
-                     p.buf);
+            p.gather(f.data, nx, ny, p.xySel(p.geo.kc), p.buf);
             const auto path = std::format("{}/{}_{:05d}.png", p.pngDir, f.name,
                                           p.pngIdx);
             std::vector<float> m;
             if (!p.geo.mask.empty())
-                p.gather(p.geo.mask.data(), nx, ny,
-                         [kc = p.geo.kc, i0, j0](int i, int j) {
-                             return std::array{i0 + i, j0 + j, kc};
-                         },
-                         m);
+                p.gather(p.geo.mask.data(), nx, ny, p.xySel(p.geo.kc), m);
             // Optional box-average coarsening of the PNG frame (--png-down).
             // The field averages over each s*s block; a block is rendered solid
             // only if ALL its cells are solid, so the body outline never bleeds.

@@ -145,6 +145,28 @@ __global__ void kCompStageCurv(GpuGrid g, ViscView vv, PrimView q,
                     cmb.cr * rhs[v];
 }
 
+// The FP64 primitive recovery every stableDt reduction starts from: velocity
+// and pressure of one cell, straight off the conserved state. Written once so
+// the acoustic, thermal and density bounds cannot disagree about it -- three
+// copies of these four lines is exactly how a gamma or a kinetic-energy term
+// drifts between them. Pre: rho[c] > 0 (stableDt reports a diverged field
+// rather than asserting).
+struct CellPrim
+{
+    double u, v, w, p, rho;
+};
+
+__host__ __device__ inline CellPrim cellPrim(const Real* rho, const Real* mx,
+                                             const Real* my, const Real* mz,
+                                             const Real* E, double gamma, int c)
+{
+    const double r = rho[c];
+    const double u = mx[c] / r, v = my[c] / r, w = mz[c] / r;
+    const double p = (gamma - 1.0) *
+        (double(E[c]) - 0.5 * (u * u + v * v + w * w) * r);
+    return {u, v, w, p, r};
+}
+
 // Curvilinear acoustic bound: (|u| + c) / width, width = 1/aov per axis;
 // |u| >= |u . n| makes the bound conservative on skewed cells.
 struct WavePerDtCurv
@@ -154,11 +176,9 @@ struct WavePerDtCurv
     double gamma;
     __host__ __device__ double operator()(int c) const
     {
-        const double r = rho[c];
-        const double u = mx[c] / r, v = my[c] / r, w = mz[c] / r;
-        const double p = (gamma - 1.0) *
-            (double(E[c]) - 0.5 * (u * u + v * v + w * w) * r);
-        const double sp = sqrt(u * u + v * v + w * w) + sqrt(gamma * p / r);
+        const auto q = cellPrim(rho, mx, my, mz, E, gamma, c);
+        const double sp = sqrt(q.u * q.u + q.v * q.v + q.w * q.w)
+                        + sqrt(gamma * q.p / q.rho);
         double m = sp * double(ax[c] > ay[c] ? ax[c] : ay[c]);
         if (az && sp * az[c] > m) m = sp * az[c];
         return m;
@@ -171,14 +191,11 @@ struct WavePerDt
     double gamma, ihx, ihy, ihz; // degenerate axes pass 0
     __host__ __device__ double operator()(int c) const
     {
-        const double r = rho[c];
-        const double u = mx[c] / r, v = my[c] / r, w = mz[c] / r;
-        const double p = (gamma - 1.0) *
-            (double(E[c]) - 0.5 * (u * u + v * v + w * w) * r);
-        const double cs = sqrt(gamma * p / r);
-        double m = (fabs(u) + cs) * ihx;
-        const double wy = (fabs(v) + cs) * ihy;
-        const double wz = (fabs(w) + cs) * ihz;
+        const auto q = cellPrim(rho, mx, my, mz, E, gamma, c);
+        const double cs = sqrt(gamma * q.p / q.rho);
+        double m = (fabs(q.u) + cs) * ihx;
+        const double wy = (fabs(q.v) + cs) * ihy;
+        const double wz = (fabs(q.w) + cs) * ihz;
         if (wy > m) m = wy;
         if (wz > m) m = wz;
         return m;
@@ -200,11 +217,8 @@ struct MaxT
     double gamma, Rgas;
     __host__ __device__ double operator()(int c) const
     {
-        const double r = rho[c];
-        const double u = mx[c] / r, v = my[c] / r, w = mz[c] / r;
-        const double p = (gamma - 1.0) *
-            (double(E[c]) - 0.5 * (u * u + v * v + w * w) * r);
-        return p / (r * Rgas);
+        const auto q = cellPrim(rho, mx, my, mz, E, gamma, c);
+        return q.p / (q.rho * Rgas);
     }
 };
 
@@ -396,7 +410,7 @@ std::expected<DeviceComp, hipError_t> DeviceComp::make(const Grid& g,
                                                        double gamma, double mu,
                                                        double csLes, SgsModel sgs)
 {
-    return make(g, Transport::air(mu, 1.0, 0.0, 0.72, gamma, 1.0, false), csLes,
+    return make(g, Transport::constant(gamma, mu), csLes,
                 sgs);
 }
 
@@ -405,7 +419,7 @@ std::expected<DeviceComp, hipError_t> DeviceComp::make(const CurvMetrics& m,
                                                        double csLes,
                                                        SgsModel sgs)
 {
-    return make(m, Transport::air(mu, 1.0, 0.0, 0.72, gamma, 1.0, false), csLes,
+    return make(m, Transport::constant(gamma, mu), csLes,
                 sgs);
 }
 

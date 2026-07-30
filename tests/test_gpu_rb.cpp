@@ -29,6 +29,7 @@
 
 #include "dns/gpu/boussinesq.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/hotpatch.hpp"
 #include "validation_util.hpp"
 
 #include <algorithm>
@@ -146,7 +147,7 @@ int main()
     {
         auto frac = [](int nx, int ny, int nz, double patch, bool closed) {
             const dns::gpu::GpuGrid g{nx, ny, nz, 1.0f, 1.0f, 1.0f};
-            return dns::gpu::rbPatchAreaFraction(g, patch, closed);
+            return dns::gpu::hotPatchAreaFraction(g, patch, closed);
         };
         // 32 fluid columns either way; closed carries two ghosts on top.
         const double p2 = frac(32, 18, 1, 0.5, false);

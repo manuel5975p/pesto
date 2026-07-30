@@ -1,5 +1,7 @@
 #include "ui/draw.hpp"
 
+#include "ui/vkcheck.hpp"
+
 #include <algorithm>
 #include <cstring>
 
@@ -29,14 +31,6 @@ const uint32_t ui2d_frag[] =
 
 namespace ui {
 namespace {
-
-#define VKCHECK(expr, what)                                                    \
-    do {                                                                       \
-        const VkResult _r = (expr);                                            \
-        if (_r != VK_SUCCESS)                                                  \
-            return std::unexpected(std::string(what) + " failed (VkResult " +  \
-                                   std::to_string(int(_r)) + ")");             \
-    } while (0)
 
 // The 96 bytes both 3D pipelines push: mvp, light direction, tint.
 struct Push3

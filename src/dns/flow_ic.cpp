@@ -265,7 +265,7 @@ void convIC(const Case& c, double gamma, CompState& host,
 }
 
 
-void rbIC(const Case& c, VectorField& U, Scalar& T)
+void rbIC(const Case& c, VectorField& U, Scalar& T, std::vector<float>& mask)
 {
     const auto& g = c.grid;
     const double H = c.convH, delta = 0.5 * H;
@@ -334,10 +334,17 @@ void rbIC(const Case& c, VectorField& U, Scalar& T)
                 const std::size_t q = g.idx(i, j, k);
                 const double z = (k + 0.5) * g.hz - z0;
                 T[q] = tFloor + a * std::clamp(yc(j), 0.0, H);
-                if (j < 1 || j > g.ny - 2) continue; // ghost rows: the wall owns them
-                // Ghost columns likewise, once that side is a wall.
-                if (cxS && (i < 1 || i > g.nx - 2)) continue;
-                if (czS && (k < 1 || k > g.nz - 2)) continue;
+                // Ghost cells belong to the wall mirror -- the two rows always,
+                // and the lateral ghost columns once that side is a wall. The
+                // same rule, and the same mask contract, as convIC.
+                const bool fluid = j >= 1 && j <= g.ny - 2
+                    && (!cxS || (i >= 1 && i <= g.nx - 2))
+                    && (!czS || (k >= 1 && k <= g.nz - 2));
+                if (!fluid)
+                {
+                    mask[q] = 0.0f;
+                    continue;
+                }
 
                 const double xu = i * g.hx - x0, xv = (i + 0.5) * g.hx - x0;
                 const double czU = g.nz > 1 ? std::cos(bz * z + 0.5) * ez(z)

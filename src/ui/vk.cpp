@@ -1,5 +1,7 @@
 #include "ui/vk.hpp"
 
+#include "ui/vkcheck.hpp"
+
 #include <SDL3/SDL_vulkan.h>
 
 #include <algorithm>
@@ -7,16 +9,6 @@
 
 namespace ui {
 namespace {
-
-// Every Vulkan call in this file funnels through this so a driver failure
-// becomes a message rather than a silently half-built device.
-#define VKCHECK(expr, what)                                                    \
-    do {                                                                       \
-        const VkResult _r = (expr);                                            \
-        if (_r != VK_SUCCESS)                                                  \
-            return std::unexpected(std::string(what) + " failed (VkResult " +  \
-                                   std::to_string(int(_r)) + ")");             \
-    } while (0)
 
 VKAPI_ATTR VkBool32 VKAPI_CALL debugCb(VkDebugUtilsMessageSeverityFlagBitsEXT,
                                        VkDebugUtilsMessageTypeFlagsEXT,

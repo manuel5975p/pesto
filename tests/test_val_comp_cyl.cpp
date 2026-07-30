@@ -1,9 +1,11 @@
 // Validation A5/B5: compressible cylinder tunnel (Kennedy-Gruber, M 0.2).
 // argv[1] = case: re60 (Tier A) | re800 (Tier B heavy). ANCHOR-ONLY test: 2D
 // Re800 is a model (the real wake is 3D), and the Re60 M0.2 cd has no clean
-// literature value -- truth is the repo's own converged numbers. All checks
-// are anchor-gated, so the test SKIPS (rc 77) while anchors stay deferred.
-// Comp app geometry: D = pi/4 fixed, h = D/64, L = n*h (n=256 -> L=pi).
+// literature value -- truth is the repo's own converged numbers. A case whose
+// checks are ALL anchor-gated skips (rc 77): re60 is anchored (2026-07-29),
+// re800 is not.
+// Comp app geometry: D = pi/4 fixed, h = D/64 * (512/n), L = n*h = 8D = 2pi
+// at every n; --ft counts L, and the run adds the --ramp 2 quiet start on top.
 #include "validation_util.hpp"
 
 #include "dns/gpu/device_util.hpp"
@@ -34,7 +36,10 @@ int main(int argc, char** argv)
         if (!aCd && !aInc) valtest::skip("all anchor checks deferred");
 
         const std::string prefix = std::string(DNS_VAL_SCRATCH) + "/comp_re60";
-        const double tEnd = 20.0 * pi; // n=256 -> L=pi, --ft 20 -> t ~ 62.8
+        // Anchor window, not the run end: the run reaches t = 127.7 (2 + 20L),
+        // and cd is steady from t ~ 20 on -- the mean over [30, tWin] and over
+        // the last flow-throughs agree to 6 digits (measured 2026-07-29).
+        const double tWin = 20.0 * pi;
         const int rc = valtest::runBinary(
             std::string(DNS_BIN)
             + " flow --physics compressible --body cylinder --far sponge"
@@ -44,19 +49,28 @@ int main(int argc, char** argv)
         auto tab = valtest::loadCsv(prefix + "_stats.csv");
         if (!tab) { std::printf("FAIL: no stats csv\n"); return 1; }
         const double cdMean =
-            valtest::windowMean(tab->col("t"), tab->col("cd"), 30.0, tEnd);
-        std::printf("cd=%.4f (window [30, %.1f])\n", cdMean, tEnd);
+            valtest::windowMean(tab->col("t"), tab->col("cd"), 30.0, tWin);
+        std::printf("cd=%.4f (window [30, %.1f])\n", cdMean, tWin);
 
         if (aCd)
             valtest::check(std::abs(cdMean - aCd->value) <= aCd->tolRel * aCd->value,
                            "cd matches anchor comp_re60_n256_cd");
         if (aInc)
         {
-            // Mach-squared correction: small, strictly positive.
+            // Cross-branch offset at matched Re / box / D-in-cells, NOT a
+            // Mach correction: the compressible ghost-mirror wall drags 6.9%
+            // more than the incompressible cut-cell wall. Measured 2026-07-29,
+            // +0.1255. The M^2 reading this check used to assert is REFUTED --
+            // cd FALLS with Mach (1.9441 at M 0.2, 1.9666 at 0.1, 2.0016 at
+            // 0.05), so the incompressible limit of this branch sits further
+            // above 1.8187, not closer; and the gap does not close with
+            // resolution (n512 gives 1.9659). Band = measured +-50%: it pins
+            // the two branches to each other, which is the one thing neither
+            // single-branch anchor can catch.
             const double d = cdMean - aInc->value;
             std::printf("cd_comp - cd_incomp = %.4f\n", d);
-            valtest::check(d > 0.005 && d < 0.06,
-                           "cd_comp - cd_incomp in [0.005, 0.06] (M^2 sign check)");
+            valtest::check(d > 0.06 && d < 0.20,
+                           "cd_comp - cd_incomp in [0.06, 0.20] (cross-branch wall offset)");
         }
         for (const char* s : {"_stats.csv", ".json", "_vort.bin", "_speed.bin",
                               "_mask.bin"})

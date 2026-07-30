@@ -51,6 +51,16 @@ struct Transport
                 .sutherland = suth};
     }
 
+    // The gas the solver had before transport was temperature-dependent:
+    // constant mu, Pr = 0.72, R = 1. Bit-for-bit that solver, and the one
+    // factory a caller with only (gamma, mu) needs -- it exists so no other
+    // header has to offer a second (gamma, mu) constructor beside a Transport
+    // one. Pre: gamma > 1, mu >= 0.
+    static Transport constant(double gamma, double mu)
+    {
+        return air(mu, 1.0, 0.0, 0.72, gamma, 1.0, false);
+    }
+
     DNS_HD double cp() const { return gamma * Rgas / (gamma - 1.0); }
 
     // mu(T) / muRef = (T/Tref)^(3/2) (Tref + S) / (T + S), and EXACTLY 1 with

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <format>
 #include <numbers>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -35,42 +36,126 @@ const char* name(SgsModel m)
     return m == SgsModel::Sigma ? "sigma" : "smag";
 }
 
-const char* name(FarField f)
-{
-    switch (f)
-    {
-    case FarField::Tunnel: return "tunnel";
-    case FarField::Fringe: return "fringe";
-    case FarField::Sponge: return "sponge";
-    case FarField::Nscbc: return "nscbc";
-    case FarField::Periodic: return "periodic";
-    }
-    return "?";
-}
-
-const char* name(BodyKind b)
-{
-    switch (b)
-    {
-    case BodyKind::None: return "none";
-    case BodyKind::Cylinder: return "cylinder";
-    case BodyKind::Sphere: return "sphere";
-    case BodyKind::Cube: return "cube";
-    case BodyKind::Lens: return "lens";
-    case BodyKind::Fence: return "fence";
-    case BodyKind::Floor: return "floor";
-    case BodyKind::Mesh: return "mesh";
-    case BodyKind::Scene: return "scene";
-    }
-    return "?";
-}
-
 std::unexpected<ConfigError> bad(int code, const char* field, std::string msg)
 {
     return std::unexpected(ConfigError{code, field, std::move(msg)});
 }
 
+// The --body keywords, in one comma-separated string built from the shared
+// table -- so a body kind added to the enum lists itself in both --body error
+// messages. Mesh and Scene are excluded: they are kinds the validator assigns
+// from a path or from --scene, not words the user may type.
+std::string bodyKeywords()
+{
+    std::string s;
+    for (const char* n : bodyKindNames())
+    {
+        const std::string_view v(n);
+        if (v == "mesh" || v == "scene") continue;
+        if (!s.empty()) s += ", ";
+        s += v;
+    }
+    return s;
+}
+
+// Rejects whichever of `flags` the user actually GAVE -- a flag left at its
+// default is not an error, only one that was typed and cannot apply. The
+// message is the flag's own name followed by `reason`, which is the shape
+// every such rejection in this file uses.
+//
+// Returns the first offender, or nullopt when none was given:
+//   if (auto e = rejectGiven(r, {"--mach"}, "is compressible-only"); e)
+//       return std::unexpected(*e);
+std::optional<ConfigError> rejectGiven(const RawConfig& r,
+                                       std::initializer_list<const char*> flags,
+                                       std::string_view reason)
+{
+    for (const char* f : flags)
+        if (r.given.contains(f))
+            return ConfigError{2, f, std::string(f) + " " + std::string(reason)};
+    return std::nullopt;
+}
+
+// Frame cadences and the two PNG shaping flags. Every subcommand that writes
+// frames takes exactly these rules; they used to be spelled out once per
+// branch, and the copies had already drifted apart in their wording.
+// Pre: c.grid is resolved (--png-down must divide it).
+std::optional<ConfigError> validateFrameOutputs(const RawConfig& r, Case& c)
+{
+    c.fdt = r.fdt;
+    // pdt/wdt default to the .bin cadence, so a run that asks only for --fdt
+    // gets all three kinds on one clock.
+    c.pdt = r.pdt > 0 ? r.pdt : c.fdt;
+    c.wdt = r.wdt > 0 ? r.wdt : c.fdt;
+    for (auto [v, f] : {std::pair{c.fdt, "--fdt"}, {c.pdt, "--pdt"},
+                        {c.wdt, "--wdt"}})
+        if (!finitePos(v)) return ConfigError{2, f, "must be finite and > 0"};
+    c.planes = r.planes;
+    if (c.planes != 1 && c.planes != 3)
+        return ConfigError{2, "--planes",
+                           "must be 1 (centre only) or 3 (centre +/- n/16)"};
+    c.pngDown = r.pngDown;
+    if (c.pngDown < 1)
+        return ConfigError{2, "--png-down",
+                           "must be >= 1 (1 = full-resolution PNGs)"};
+    if (c.pngDown > 1 && (c.grid.nx % c.pngDown || c.grid.ny % c.pngDown))
+        return ConfigError{2, "--png-down",
+                           "must divide both nx and ny evenly for box-averaging"};
+    return std::nullopt;
+}
+
+// An empty --emit set takes the subcommand's own default; `none` is exclusive.
+std::optional<ConfigError> resolveEmit(Case& c,
+                                       std::initializer_list<Emit> fallback)
+{
+    if (c.emit.empty()) c.emit.insert(fallback);
+    if (c.emit.contains(Emit::None) && c.emit.size() > 1)
+        return ConfigError{2, "--emit",
+                           "--emit none cannot be combined with other kinds"};
+    return std::nullopt;
+}
+
 } // namespace
+
+// Index == the enum value; a static_assert on the size would not catch a
+// TRANSPOSED pair, so the tables are written in enum order and read only
+// through name()/bodyKindFromName().
+std::span<const char* const> bodyKindNames()
+{
+    static constexpr const char* kNames[] = {"none",  "cylinder", "sphere",
+                                             "cube",  "lens",     "fence",
+                                             "floor", "mesh",     "scene"};
+    return kNames;
+}
+
+std::span<const char* const> farFieldNames()
+{
+    static constexpr const char* kNames[] = {"tunnel", "fringe", "sponge",
+                                             "nscbc", "periodic"};
+    return kNames;
+}
+
+const char* name(BodyKind b)
+{
+    const auto n = bodyKindNames();
+    const auto i = std::size_t(b);
+    return i < n.size() ? n[i] : "?";
+}
+
+const char* name(FarField f)
+{
+    const auto n = farFieldNames();
+    const auto i = std::size_t(f);
+    return i < n.size() ? n[i] : "?";
+}
+
+std::optional<BodyKind> bodyKindFromName(std::string_view s)
+{
+    const auto n = bodyKindNames();
+    const auto it = std::ranges::find(n, s);
+    if (it == n.end()) return std::nullopt;
+    return BodyKind(it - n.begin());
+}
 
 std::string format(const ConfigError& e)
 {
@@ -109,498 +194,451 @@ std::expected<void, ConfigError> applySceneModel(const Scene& s, RawConfig& r)
     return {};
 }
 
-std::expected<Case, ConfigError> validate(const RawConfig& r)
+namespace {
+
+// The per-subcommand halves of validate(). Each takes the Case the shared
+// prologue has already filled in and finishes it, so the split falls exactly
+// where the rules stop being common: no subcommand's rules are visible to
+// another's, and the shared prologue is the only thing every case runs.
+
+// --- bench ------------------------------------------------------------------
+std::expected<Case, ConfigError> validateBench(const RawConfig& r, Case c)
 {
-    Case c;
-    c.sub = r.sub;
-    c.backend = r.backend;
-    c.physics = r.physics;
-    c.far = r.far;
-    c.seed = r.seed;
-    c.quiet = r.quiet;
-    c.dryRun = r.dryRun;
-    c.outPrefix = r.out;
-    c.emit = r.emit;
-
-    if (c.outPrefix.empty())
-        return bad(2, "--out", "output prefix must not be empty");
-    // webframes.cpp concatenates the prefix into a JSON manifest unescaped.
-    if (c.outPrefix.find_first_of("\"\\\n\r\t") != std::string::npos)
-        return bad(2, "--out", "output prefix must not contain quotes, backslashes "
-                               "or control characters (it is embedded in JSON)");
-
-    if (r.n < 1) return bad(2, "--n", "must be >= 1");
-    if (!finitePos(r.re)) return bad(2, "--re", "must be finite and > 0");
-    c.re = r.re;
-    c.n = r.n;
-
-    // --- bench / tgv / hit ---------------------------------------------------
-    if (r.sub == Subcommand::Bench)
-    {
-        if (r.steps < 1) return bad(2, "--steps", "must be >= 1");
-        c.steps = r.steps;
-        // bench builds an n^3 box, so it needs the grid guards every other
-        // branch applies and this one was missing: `--n 1300` overflowed the
-        // int indexing the tree assumes, and `--n 1` produced nz == 1 with
-        // hz == 2pi, violating the validator-enforced `nz == 1 => hz == 1`.
-        // n >= 4 forecloses both the degenerate-z case (bench has no 2D mode:
-        // the box is always n^3) and any n too small to time meaningfully.
-        if (r.n < 4) return bad(2, "--n", "must be >= 4 (bench is an n^3 box)");
-        const std::size_t benchCells = std::size_t(r.n) * r.n * r.n;
-        if (benchCells > std::size_t(2147483647))
-            return bad(2, "--n", "grid exceeds INT_MAX cells");
-        c.grid = Grid::make(r.n, r.n, r.n, 2 * pi, 2 * pi, 2 * pi);
-        c.nzInterior = r.n;
-        // bench times the SOLVER the user names, so it needs the physics
-        // parameters the solver reads: viscosity, Mach (compressible pressure
-        // level) and the SGS constant. Before, --physics compressible parsed
-        // and then ran the incompressible stepper anyway.
-        c.nu = r.nu > 0 ? r.nu : 1.0 / r.re;
-        if (!std::isfinite(c.nu) || c.nu < 0)
-            return bad(2, "--nu", "must be finite and >= 0");
-        c.mach = r.mach;
-        if (r.physics == Physics::Compressible) {
-            if (!(std::isfinite(c.mach) && c.mach > 0 && c.mach < 1))
-                return bad(2, "--mach", "must be in (0,1) -- the flux is "
-                                        "Kennedy-Gruber central with no shock "
-                                        "capturing");
-        } else if (r.given.contains("--mach")) {
-            return bad(2, "--mach", "--mach is compressible-only");
-        }
-        c.cs = r.les;
-        if (!(std::isfinite(c.cs) && c.cs >= 0))
-            return bad(2, "--les", "must be finite and >= 0");
-        if (c.cs > 0 && r.physics != Physics::Compressible)
-            return bad(2, "--les", "bench --les times the compressible SGS path; "
-                                   "add --physics compressible (the incompressible "
-                                   "eddy viscosity is a runner-level substep, not "
-                                   "part of the periodic stepper this benchmarks)");
-        c.sgsModel = r.sgs;
-        if (r.given.contains("--sgs") && c.cs == 0)
-            return bad(2, "--sgs", "selects the SGS model for --les; give --les CS "
-                                   "(> 0) or drop --sgs");
-        c.lesLabel = c.cs > 0;
-        c.meta = {r.n, r.n, r.n, c.grid.hx, c.grid.hy, c.grid.hz,
-                  0, 0, 0, 0, 0, false, "none", "periodic", name(c.physics), 0,
-                  ""};
-        return c;
-    }
-
-    if (r.sub == Subcommand::Tgv || r.sub == Subcommand::Hit)
-    {
-        const int nz = r.given.contains("--nz") ? r.nz : r.n;
-        if (nz < 1) return bad(2, "--nz", "must be >= 1");
-        if (nz != 1 && nz < 4) return bad(2, "--nz", "must be 1 (native 2D) or >= 4");
-        if (r.sub == Subcommand::Hit && nz < 4)
-            return bad(2, "--nz", "hit needs nz >= 4 (spectral initial condition)");
-        const std::size_t cells = std::size_t(r.n) * r.n * nz;
-        if (cells > std::size_t(2147483647))
-            return bad(2, "--n", "grid exceeds INT_MAX cells");
-        const double lz = nz == 1 ? 1.0 : 2 * pi;
-        c.grid = Grid::make(r.n, r.n, nz, 2 * pi, 2 * pi, lz);
-        c.nzInterior = nz;
-        c.cfl = r.given.contains("--cfl") ? r.cfl : 0.9;
-        if (!(c.cfl > 0 && c.cfl <= 1)) return bad(2, "--cfl", "must be in (0,1]");
-        c.ft = r.ft;
-        if (r.sub == Subcommand::Tgv && !finitePos(c.ft))
-            return bad(2, "--ft", "must be finite and > 0");
-        c.tEnd = c.ft;
-        c.nu = r.nu > 0 ? r.nu : 1.0 / r.re;
-        if (!std::isfinite(c.nu) || c.nu < 0)
-            return bad(2, "--nu", "must be finite and >= 0");
-        c.urms = r.urms;
-        c.spin = r.spin;
-        c.stats = r.stats;
-        if (r.sub == Subcommand::Hit)
-        {
-            if (!finitePos(r.urms)) return bad(2, "--urms", "must be finite and > 0");
-            if (!(r.spin >= 0 && r.stats > 0))
-                return bad(2, "--spin", "--spin >= 0 and --stats > 0 required");
-            c.nu = r.given.contains("--nu") ? r.nu : 1.5e-5;
-        }
-        if (c.emit.contains(Emit::Error) && nz != 1)
-            return bad(2, "--emit", "--emit error compares against the 2D analytic "
-                                    "Taylor-Green solution and requires --nz 1");
-        if (c.emit.empty()) c.emit.insert(Emit::Stats);
-        c.fdt = r.fdt;
-        c.meta = {r.n, r.n, nz, c.grid.hx, c.grid.hy, c.grid.hz,
-                  0, r.re, 0, c.fdt, 0, false, "none", "periodic",
-                  name(c.physics), 0, ""};
-        return c;
-    }
-
-    // --- channel ------------------------------------------------------------
-    // Wall units: delta = 1, u_tau = 1, f = 1, nu = 1/reTau. The box momentum
-    // balance (f * V = 2 tau_w * A_wall with Ly = 2 delta) pins tau_w = 1, so
-    // reTau is the run's friction Reynolds number by construction.
-    if (r.sub == Subcommand::Channel)
-    {
-        if (r.given.contains("--re"))
-            return bad(2, "--re", "channel is configured in wall units by "
-                                  "--re-tau, not a body Reynolds number");
-        if (r.given.contains("--ft"))
-            return bad(2, "--ft", "channel run length is --tt (eddy turnovers "
-                                  "of delta/u_tau = 1)");
-        if (r.n < 4) return bad(2, "--n", "must be >= 4");
-        const int nyI = r.ny;
-        if (nyI < 8)
-            return bad(2, "--ny", "must be >= 8 fluid cells (wall-normal "
-                                  "resolution; two ghost rows are added)");
-        const int nz = r.nz;
-        if (nz < 1) return bad(2, "--nz", "must be >= 1 (interior cells; 1 = "
-                                          "native 2D)");
-        if (nz != 1 && nz < 4)
-            return bad(2, "--nz", "must be 1 (native 2D) or >= 4");
-        if (!finitePos(r.reTau))
-            return bad(2, "--re-tau", "must be finite and > 0");
-        c.reTau = r.reTau;
-        c.re = r.reTau;
-        c.nu = 1.0 / r.reTau;
-        c.mach = r.mach;
-        if (!(std::isfinite(c.mach) && c.mach > 0 && c.mach < 1))
+    if (r.steps < 1) return bad(2, "--steps", "must be >= 1");
+    c.steps = r.steps;
+    // bench builds an n^3 box, so it needs the grid guards every other
+    // branch applies and this one was missing: `--n 1300` overflowed the
+    // int indexing the tree assumes, and `--n 1` produced nz == 1 with
+    // hz == 2pi, violating the validator-enforced `nz == 1 => hz == 1`.
+    // n >= 4 forecloses both the degenerate-z case (bench has no 2D mode:
+    // the box is always n^3) and any n too small to time meaningfully.
+    if (r.n < 4) return bad(2, "--n", "must be >= 4 (bench is an n^3 box)");
+    const std::size_t benchCells = std::size_t(r.n) * r.n * r.n;
+    if (benchCells > std::size_t(2147483647))
+        return bad(2, "--n", "grid exceeds INT_MAX cells");
+    c.grid = Grid::make(r.n, r.n, r.n, 2 * pi, 2 * pi, 2 * pi);
+    c.nzInterior = r.n;
+    // bench times the SOLVER the user names, so it needs the physics
+    // parameters the solver reads: viscosity, Mach (compressible pressure
+    // level) and the SGS constant. Before, --physics compressible parsed
+    // and then ran the incompressible stepper anyway.
+    c.nu = r.nu > 0 ? r.nu : 1.0 / r.re;
+    if (!std::isfinite(c.nu) || c.nu < 0)
+        return bad(2, "--nu", "must be finite and >= 0");
+    c.mach = r.mach;
+    if (r.physics == Physics::Compressible) {
+        if (!(finitePos(c.mach) && c.mach < 1))
             return bad(2, "--mach", "must be in (0,1) -- the flux is "
                                     "Kennedy-Gruber central with no shock "
                                     "capturing");
-        c.stretchBeta = r.stretch;
-        if (!(std::isfinite(c.stretchBeta) && c.stretchBeta >= 0
-              && c.stretchBeta <= 4))
-            return bad(2, "--stretch", "must be in [0,4] (tanh clustering "
-                                       "strength)");
-        c.wallIso = r.wallIso == 1;
-
-        const double delta = 1.0;
-        const int nyT = nyI + 2; // + the two wall-mirror ghost rows
-        const double h1 = ChannelStretchY::firstCell(nyT, c.stretchBeta, delta);
-        const double ly = 2 * delta + 2 * h1; // period fixed by the ghost rows
-        if (r.given.contains("--lx") && !finitePos(r.lx))
-            return bad(2, "--lx", "must be finite and > 0 (0/omitted = 4 pi)");
-        if (r.given.contains("--lz") && !finitePos(r.lzBox))
-            return bad(2, "--lz", "must be finite and > 0 (0/omitted = 4 pi/3)");
-        c.lxBox = r.lx > 0 ? r.lx : 4 * pi;
-        c.lzBox = nz == 1 ? 1.0 : (r.lzBox > 0 ? r.lzBox : 4 * pi / 3);
-        const std::size_t cells = std::size_t(r.n) * nyT * nz;
-        if (cells > std::size_t(2147483647))
-            return bad(2, "--n", "grid exceeds INT_MAX cells");
-        c.grid = Grid::make(r.n, nyT, nz, c.lxBox, ly, c.lzBox);
-        c.nzInterior = nz;
-        c.h = c.grid.hy;
-        c.L = c.lxBox;
-        c.chanH1 = h1;
-        c.stretchH1 = h1;
-        const ChannelStretchY R{ly, nyT, c.stretchBeta, delta};
-        double prev = h1;
-        for (int j = 2; j < nyT - 1; ++j)
-        {
-            const double dy = R.mapY((j + 1) * c.grid.hy) - R.mapY(j * c.grid.hy);
-            c.stretchGrowth = std::max(c.stretchGrowth,
-                                       std::max(dy / prev, prev / dy));
-            prev = dy;
-        }
-
-        // Bulk-velocity estimate (log law) fixes the sound speed for the
-        // requested BULK Mach: c_s = ubEst/Mach, p = rho c_s^2/gamma,
-        // Twall = p (rho = R = 1). The IC and the isothermal wall share it.
-        c.ubEst = 2.5 * std::log(std::max(c.reTau, 3.0)) + 2.6;
-        c.pRef = (c.ubEst / c.mach) * (c.ubEst / c.mach) / 1.4;
-
-        c.cfl = r.cfl;
-        if (!(c.cfl > 0 && c.cfl <= 1)) return bad(2, "--cfl", "must be in (0,1]");
-        c.kick = r.kick;
-        if (!(std::isfinite(c.kick) && c.kick >= 0))
-            return bad(2, "--kick", "must be finite and >= 0");
-        if (!finitePos(r.tt)) return bad(2, "--tt", "must be finite and > 0");
-        c.ft = r.tt;
-        c.tEnd = r.tt;
-        c.profileDt = r.profileDt;
-        if (!(std::isfinite(c.profileDt) && c.profileDt >= 0))
-            return bad(2, "--profile-dt", "must be finite and >= 0 (0 = off)");
-        c.dtRecompute = r.given.contains("--dt-recompute") ? r.dtRecompute : 16;
-        if (c.dtRecompute < 1) return bad(2, "--dt-recompute", "must be >= 1");
-        c.fdt = r.fdt;
-        c.pdt = r.pdt > 0 ? r.pdt : c.fdt;
-        c.wdt = r.wdt > 0 ? r.wdt : c.fdt;
-        for (auto [v, f] : {std::pair{c.fdt, "--fdt"}, {c.pdt, "--pdt"},
-                            {c.wdt, "--wdt"}})
-            if (!finitePos(v)) return bad(2, f, "must be finite and > 0");
-        c.planes = r.planes;
-        if (c.planes != 1 && c.planes != 3)
-            return bad(2, "--planes", "must be 1 (centre only) or 3");
-        c.pngDown = r.pngDown;
-        if (c.pngDown < 1)
-            return bad(2, "--png-down", "must be >= 1 (1 = full resolution)");
-        if (c.pngDown > 1 && (c.grid.nx % c.pngDown || c.grid.ny % c.pngDown))
-            return bad(2, "--png-down", "must divide both nx and ny evenly");
-        if (c.emit.empty()) c.emit.insert(Emit::Stats);
-        if (c.emit.contains(Emit::None) && c.emit.size() > 1)
-            return bad(2, "--emit", "--emit none cannot be combined with "
-                                    "other kinds");
-        // PNG is allowed at nz > 1 here: it renders the centre z-plane,
-        // which for a channel is exactly the picture you want.
-        c.physics = Physics::Compressible;
-        c.far = FarField::Periodic;
-        c.bodyKind = BodyKind::None;
-        c.meta = {c.grid.nx, c.grid.ny, c.grid.nz, c.grid.hx, c.grid.hy,
-                  c.grid.hz, 2 * delta, c.reTau, c.mach, c.fdt, 0, false,
-                  "channel", "periodic", "compressible", c.kick, ""};
-        return c;
+    } else if (r.given.contains("--mach")) {
+        return bad(2, "--mach", "--mach is compressible-only");
     }
+    c.cs = r.les;
+    if (!(std::isfinite(c.cs) && c.cs >= 0))
+        return bad(2, "--les", "must be finite and >= 0");
+    if (c.cs > 0 && r.physics != Physics::Compressible)
+        return bad(2, "--les", "bench --les times the compressible SGS path; "
+                               "add --physics compressible (the incompressible "
+                               "eddy viscosity is a runner-level substep, not "
+                               "part of the periodic stepper this benchmarks)");
+    c.sgsModel = r.sgs;
+    if (r.given.contains("--sgs") && c.cs == 0)
+        return bad(2, "--sgs", "selects the SGS model for --les; give --les CS "
+                               "(> 0) or drop --sgs");
+    c.lesLabel = c.cs > 0;
+    c.meta = {r.n, r.n, r.n, c.grid.hx, c.grid.hy, c.grid.hz,
+              0, 0, 0, 0, 0, false, "none", "periodic", name(c.physics), 0,
+              ""};
+    return c;
+}
 
-    // --- conv ---------------------------------------------------------------
-    // Rayleigh-Benard: heated floor, cooled lid, gravity in -y, periodic x/z.
-    //
-    // Box units fix everything: layer height H = 1, mid-layer temperature
-    // Tref = 1, Rgas = 1 and rho_ref = 1, hence p_ref = 1 and the reference
-    // sound speed is sqrt(gamma). The three inputs then close the case:
-    //
-    //   --dtemp eps   the imposed drop, Tbot/Ttop = 1 +/- eps/2
-    //   --mach M      M = Uf0/c with Uf0 = sqrt(g eps H) -- this is what SETS
-    //                 gravity, g = M^2 gamma / eps, and with it how far the
-    //                 run is from the incompressible limit
-    //   --rayleigh Ra on the SUPERADIABATIC drop, which is what fixes nu
-    //
-    // The stratification is not a detail: gravity itself carries an adiabatic
-    // temperature gradient g/cp, so only dTsuper = dT - (g/cp) H drives
-    // convection (Schwarzschild). A subadiabatic layer is stably stratified
-    // and simply will not convect, which is a configuration error and not a
-    // result -- so it is rejected here, by name, with the two knobs that fix
-    // it. The adiabatic fraction is M^2 (gamma-1) / eps^2, so it shrinks
-    // quadratically as the Mach number drops toward the Boussinesq limit.
-    if (r.sub == Subcommand::Conv)
+// --- tgv / hit --------------------------------------------------------------
+std::expected<Case, ConfigError> validatePeriodic(const RawConfig& r, Case c)
+{
+    const int nz = r.given.contains("--nz") ? r.nz : r.n;
+    if (nz < 1) return bad(2, "--nz", "must be >= 1");
+    if (nz != 1 && nz < 4) return bad(2, "--nz", "must be 1 (native 2D) or >= 4");
+    if (r.sub == Subcommand::Hit && nz < 4)
+        return bad(2, "--nz", "hit needs nz >= 4 (spectral initial condition)");
+    const std::size_t cells = std::size_t(r.n) * r.n * nz;
+    if (cells > std::size_t(2147483647))
+        return bad(2, "--n", "grid exceeds INT_MAX cells");
+    const double lz = nz == 1 ? 1.0 : 2 * pi;
+    c.grid = Grid::make(r.n, r.n, nz, 2 * pi, 2 * pi, lz);
+    c.nzInterior = nz;
+    c.cfl = r.given.contains("--cfl") ? r.cfl : 0.9;
+    if (!(c.cfl > 0 && c.cfl <= 1)) return bad(2, "--cfl", "must be in (0,1]");
+    c.ft = r.ft;
+    if (r.sub == Subcommand::Tgv && !finitePos(c.ft))
+        return bad(2, "--ft", "must be finite and > 0");
+    c.tEnd = c.ft;
+    c.nu = r.nu > 0 ? r.nu : 1.0 / r.re;
+    if (!std::isfinite(c.nu) || c.nu < 0)
+        return bad(2, "--nu", "must be finite and >= 0");
+    c.urms = r.urms;
+    c.spin = r.spin;
+    c.stats = r.stats;
+    if (r.sub == Subcommand::Hit)
     {
-        if (r.given.contains("--re"))
-            return bad(2, "--re", "convection is configured by --rayleigh and "
-                                  "--prandtl, not a body Reynolds number "
-                                  "(there is no body and no free stream)");
-        if (r.given.contains("--ft"))
-            return bad(2, "--ft", "convection run length is --tt (free-fall "
-                                  "times H/Uf)");
-        if (r.n < 4) return bad(2, "--n", "must be >= 4");
-        const int nyI = r.ny;
-        if (nyI < 8)
-            return bad(2, "--ny", "must be >= 8 fluid cells (wall-normal "
-                                  "resolution; two ghost rows are added)");
-        const int nz = r.nz;
-        if (nz < 1) return bad(2, "--nz", "must be >= 1 (interior cells; 1 = "
-                                          "native 2D)");
-        if (nz != 1 && nz < 4)
-            return bad(2, "--nz", "must be 1 (native 2D) or >= 4");
+        if (!finitePos(r.urms)) return bad(2, "--urms", "must be finite and > 0");
+        if (!(r.spin >= 0 && r.stats > 0))
+            return bad(2, "--spin", "--spin >= 0 and --stats > 0 required");
+        c.nu = r.given.contains("--nu") ? r.nu : 1.5e-5;
+    }
+    if (c.emit.contains(Emit::Error) && nz != 1)
+        return bad(2, "--emit", "--emit error compares against the 2D analytic "
+                                "Taylor-Green solution and requires --nz 1");
+    if (c.emit.empty()) c.emit.insert(Emit::Stats);
+    c.fdt = r.fdt;
+    c.meta = {r.n, r.n, nz, c.grid.hx, c.grid.hy, c.grid.hz,
+              0, r.re, 0, c.fdt, 0, false, "none", "periodic",
+              name(c.physics), 0, ""};
+    return c;
+}
 
-        if (!finitePos(r.rayleigh))
-            return bad(2, "--rayleigh", "must be finite and > 0");
-        c.rayleigh = r.rayleigh;
-        if (!(std::isfinite(r.dtemp) && r.dtemp > 0 && r.dtemp < 2))
-            return bad(2, "--dtemp", "must be in (0,2): the imposed drop as a "
-                                     "fraction of the mid-layer temperature, "
-                                     "so the lid sits at 1 - dtemp/2 > 0");
-        c.dtemp = r.dtemp;
-        c.mach = r.mach;
-        if (!(std::isfinite(c.mach) && c.mach > 0 && c.mach < 1))
-            return bad(2, "--mach", "must be in (0,1) -- the flux is "
-                                    "Kennedy-Gruber central with no shock "
-                                    "capturing");
-        c.prandtl = r.prandtl;
-        if (!finitePos(c.prandtl))
-            return bad(2, "--prandtl", "must be finite and > 0");
-        c.sutherland = r.visc == 1;
-        c.tinfK = r.tinf;
-        if (c.sutherland && !finitePos(c.tinfK))
-            return bad(2, "--tinf", "must be finite and > 0 (it is the "
-                                    "dimensional anchor Sutherland's 110.4 K "
-                                    "needs)");
-        if (c.physics == Physics::Incompressible)
-        {
-            // Boussinesq: the M -> 0 limit taken analytically. There is no
-            // sound speed, so the knobs that only exist to place the run
-            // relative to one are not silently ignored -- they are rejected.
-            if (r.given.contains("--mach"))
-                return bad(2, "--mach", "the Boussinesq limit has no sound "
-                                        "speed: --mach only means something "
-                                        "for --physics compressible, where it "
-                                        "sets gravity");
-            if (r.given.contains("--dtemp"))
-                return bad(2, "--dtemp", "the Boussinesq equations depend on "
-                                         "the imposed drop only through Ra, so "
-                                         "the drop is scaled to 1 and --dtemp "
-                                         "would be a second, conflicting name "
-                                         "for --rayleigh");
-            if (c.sutherland)
-                return bad(2, "--visc", "Sutherland's mu(T) is inconsistent "
-                                        "with a divergence-free velocity "
-                                        "field: constant transport properties "
-                                        "are part of the Boussinesq "
-                                        "approximation. Use --physics "
-                                        "compressible for mu(T)");
-            if (r.given.contains("--tinf"))
-                return bad(2, "--tinf", "nothing in the Boussinesq branch is "
-                                        "dimensional (it exists only to anchor "
-                                        "Sutherland's 110.4 K)");
-        }
-        if (!(std::isfinite(r.convAspect) && r.convAspect > 0))
-            return bad(2, "--aspect", "must be finite and > 0 (box width and "
-                                      "depth in layer heights)");
-        c.convAspect = r.convAspect;
-        if (!(std::isfinite(r.hotPatch) && r.hotPatch > 0 && r.hotPatch <= 1))
-            return bad(2, "--hot-patch", "must be in (0,1]: the heated side "
-                                         "fraction of the floor (1 = the whole "
-                                         "plate)");
-        c.hotPatch = r.hotPatch;
-        // --sides closed turns the lateral faces into no-slip adiabatic walls,
-        // carried by the same one-cell ghost ring as the plates. At nz == 1
-        // only x closes: 2D is exact periodic wrap in z, not a code path, so a
-        // z ghost ring there would be a third dimension the case does not have.
-        c.closedSides = r.sides == 1;
+// --- channel ----------------------------------------------------------------
+// Wall units: delta = 1, u_tau = 1, f = 1, nu = 1/reTau. The box momentum
+// balance (f * V = 2 tau_w * A_wall with Ly = 2 delta) pins tau_w = 1, so
+// reTau is the run's friction Reynolds number by construction.
+std::expected<Case, ConfigError> validateChannel(const RawConfig& r, Case c)
+{
+    if (r.given.contains("--re"))
+        return bad(2, "--re", "channel is configured in wall units by "
+                              "--re-tau, not a body Reynolds number");
+    if (r.given.contains("--ft"))
+        return bad(2, "--ft", "channel run length is --tt (eddy turnovers "
+                              "of delta/u_tau = 1)");
+    if (r.n < 4) return bad(2, "--n", "must be >= 4");
+    const int nyI = r.ny;
+    if (nyI < 8)
+        return bad(2, "--ny", "must be >= 8 fluid cells (wall-normal "
+                              "resolution; two ghost rows are added)");
+    const int nz = r.nz;
+    if (nz < 1) return bad(2, "--nz", "must be >= 1 (interior cells; 1 = "
+                                      "native 2D)");
+    if (nz != 1 && nz < 4)
+        return bad(2, "--nz", "must be 1 (native 2D) or >= 4");
+    if (!finitePos(r.reTau))
+        return bad(2, "--re-tau", "must be finite and > 0");
+    c.reTau = r.reTau;
+    c.re = r.reTau;
+    c.nu = 1.0 / r.reTau;
+    c.mach = r.mach;
+    if (!(finitePos(c.mach) && c.mach < 1))
+        return bad(2, "--mach", "must be in (0,1) -- the flux is "
+                                "Kennedy-Gruber central with no shock "
+                                "capturing");
+    c.stretchBeta = r.stretch;
+    if (!(std::isfinite(c.stretchBeta) && c.stretchBeta >= 0
+          && c.stretchBeta <= 4))
+        return bad(2, "--stretch", "must be in [0,4] (tanh clustering "
+                                   "strength)");
+    c.wallIso = r.wallIso == 1;
 
-        const double gamma = 1.4, Rgas = 1.0, H = 1.0, Tref = 1.0;
-        c.convH = H;
-        if (c.physics == Physics::Incompressible)
-        {
-            // Free-fall scaling: H = dT = g*alpha = 1, hence Uff = t_ff = 1 and
-            // Ra alone fixes both diffusivities. No stratification exists here,
-            // so the superadiabatic drop IS the imposed one and Ra and Nu are
-            // measured against the same thing.
-            c.tBot = 0.5;
-            c.tTop = -0.5;
-            c.dtemp = 1.0;
-            c.dtempSuper = 1.0;
-            c.gravity = 1.0;   // g*alpha, the buoyancy coefficient
-            c.uFreeFall = 1.0;
-            c.mach = 0;        // there is no sound speed to be a fraction of
-            c.nu = std::sqrt(c.prandtl / c.rayleigh);
-            c.kappaDiff = 1.0 / std::sqrt(c.rayleigh * c.prandtl);
-            c.re = c.uFreeFall * H / c.nu;   // = sqrt(Ra/Pr)
-        }
-        else {
-        c.tBot = Tref * (1 + 0.5 * c.dtemp);
-        c.tTop = Tref * (1 - 0.5 * c.dtemp);
-        // g from the Mach number: M = sqrt(g eps H) / sqrt(gamma R Tref).
-        c.gravity = c.mach * c.mach * gamma * Rgas * Tref / (c.dtemp * H);
-        const double cp = gamma * Rgas / (gamma - 1.0);
-        const double dTad = c.gravity / cp * H;
-        c.dtempSuper = c.dtemp * Tref - dTad;
-        if (!(c.dtempSuper > 0))
-            return bad(2, "--mach",
-                       std::format("the layer is subadiabatic and cannot "
-                                   "convect: gravity's own adiabatic drop "
-                                   "(g/cp) H = {:.4g} already exceeds the "
-                                   "imposed {:.4g}. Lower --mach (the "
-                                   "adiabatic fraction is M^2 (gamma-1) / "
-                                   "dtemp^2 = {:.3g}) or raise --dtemp",
-                                   dTad, c.dtemp * Tref,
-                                   c.mach * c.mach * (gamma - 1)
-                                       / (c.dtemp * c.dtemp)));
-        // Free-fall velocity on the superadiabatic excess -- the velocity the
-        // run actually reaches, and the unit --tt counts in.
-        c.uFreeFall = std::sqrt(c.gravity * c.dtempSuper / Tref * H);
-        // Ra = g (dTsuper/Tref) H^3 / (nu kappa) with kappa = nu/Pr.
-        c.nu = std::sqrt(c.gravity * (c.dtempSuper / Tref) * H * H * H
-                         * c.prandtl / c.rayleigh);
-        c.kappaDiff = c.nu / c.prandtl;
-        c.re = c.uFreeFall * H / c.nu;   // free-fall Reynolds number
-        }
-
-        const int nyT = nyI + 2;         // + the two wall-mirror ghost rows
-        // The ghost rows are geometric mirrors of the first fluid rows, so the
-        // wall faces sit half a cell outside them: the mapped extent is
-        // H + 2*(H/nyI) and the wall-to-wall height stays exactly H.
-        const double hy = H / nyI;
-        const double ly = H + 2 * hy;
-        c.lxBox = c.convAspect * H;
-        c.lzBox = nz == 1 ? 1.0 : c.convAspect * H;
-        // A closed lateral axis gets the plates' treatment exactly: the fluid
-        // extent stays lxBox/lzBox and the two ghost columns extend the mapped
-        // box by one spacing each side, so the wall faces sit half a cell
-        // outside them and the wall-to-wall width is exactly lxBox.
-        const int nxT = c.closedSides ? r.n + 2 : r.n;
-        const int nzT = c.closedSides && nz > 1 ? nz + 2 : nz;
-        const double hx = c.lxBox / r.n, hz = c.lzBox / nz;
-        const double lx = c.closedSides ? c.lxBox + 2 * hx : c.lxBox;
-        const double lz = c.closedSides && nz > 1 ? c.lzBox + 2 * hz : c.lzBox;
-        const std::size_t cells = std::size_t(nxT) * nyT * nzT;
-        if (cells > std::size_t(2147483647))
-            return bad(2, "--n", "grid exceeds INT_MAX cells");
-        c.grid = Grid::make(nxT, nyT, nzT, lx, ly, lz);
-        c.nxInterior = r.n;
-        c.nzInterior = nz;
-        c.h = c.grid.hy;
-        c.L = c.lxBox;
-        c.pRef = Rgas * Tref;   // rho_ref = 1 at mid-layer
-
-        // The compressible branch is acoustically limited, the Boussinesq one
-        // advectively; 0.4 and 0.8 are those two solvers' own defaults.
-        c.cfl = r.given.contains("--cfl")
-                    ? r.cfl
-                    : (c.physics == Physics::Incompressible ? 0.8 : 0.4);
-        if (!(c.cfl > 0 && c.cfl <= 1)) return bad(2, "--cfl", "must be in (0,1]");
-        c.kick = r.kick;
-        if (!(std::isfinite(c.kick) && c.kick >= 0))
-            return bad(2, "--kick", "must be finite and >= 0");
-        if (!finitePos(r.tt)) return bad(2, "--tt", "must be finite and > 0");
-        c.ft = r.tt;
-        c.tEnd = r.tt * H / c.uFreeFall;   // free-fall times -> box time
-        c.profileDt = r.profileDt;
-        if (!(std::isfinite(c.profileDt) && c.profileDt >= 0))
-            return bad(2, "--profile-dt", "must be finite and >= 0 (0 = off)");
-        c.dtRecompute = r.given.contains("--dt-recompute") ? r.dtRecompute : 16;
-        if (c.dtRecompute < 1) return bad(2, "--dt-recompute", "must be >= 1");
-        c.fdt = r.fdt;
-        c.pdt = r.pdt > 0 ? r.pdt : c.fdt;
-        c.wdt = r.wdt > 0 ? r.wdt : c.fdt;
-        for (auto [v, f] : {std::pair{c.fdt, "--fdt"}, {c.pdt, "--pdt"},
-                            {c.wdt, "--wdt"}})
-            if (!finitePos(v)) return bad(2, f, "must be finite and > 0");
-        c.planes = r.planes;
-        if (c.planes != 1 && c.planes != 3)
-            return bad(2, "--planes", "must be 1 (centre only) or 3");
-        c.pngDown = r.pngDown;
-        if (c.pngDown < 1)
-            return bad(2, "--png-down", "must be >= 1 (1 = full resolution)");
-        if (c.pngDown > 1 && (c.grid.nx % c.pngDown || c.grid.ny % c.pngDown))
-            return bad(2, "--png-down", "must divide both nx and ny evenly");
-        if (c.emit.empty()) c.emit.insert(Emit::Stats);
-        if (c.emit.contains(Emit::None) && c.emit.size() > 1)
-            return bad(2, "--emit", "--emit none cannot be combined with "
-                                    "other kinds");
-        // Below onset the layer just conducts; that is a legitimate run (the
-        // subcritical control), but it is not what the user usually wants, so
-        // it is an advisory and not an error.
-        if (c.rayleigh < 1708.0 && c.hotPatch >= 1.0)
-            c.warnings.push_back(std::format(
-                "Ra = {:.4g} is below the onset of convection (~1708 for "
-                "rigid isothermal plates): the layer will stay quiescent and "
-                "report Nu = 1", c.rayleigh));
-        if (c.hotPatch < 1.0)
-            c.warnings.push_back(std::format(
-                "--hot-patch {:.4g}: only that side fraction of the floor is "
-                "heated, so this is a localised plume and not classical "
-                "Rayleigh-Benard -- the 1708 onset does not apply and nuBot is "
-                "a net floor-averaged flux, not a Nusselt number",
-                c.hotPatch));
-        if (nz == 1)
-            c.warnings.push_back("nz == 1: 2D convection has no vortex "
-                                 "stretching -- roll structure and Nu are "
-                                 "qualitative");
-        // A closed cavity is a different experiment from the unbounded layer,
-        // and the two numbers people quote against it -- the 1708 onset and the
-        // Ra-Nu scaling -- are both the unbounded ones. Say so rather than let
-        // a cavity result be read as classical Rayleigh-Benard.
-        if (c.closedSides)
-            c.warnings.push_back(std::format(
-                "--sides closed: the lateral faces are no-slip adiabatic "
-                "walls, so the roll count is fixed by --aspect {:.4g} and the "
-                "corner regions are viscously braked -- Nu is a cavity number "
-                "below the periodic one at the same Ra, and the ~1708 onset "
-                "(and the Ra-Nu scaling) are the unbounded layer's",
-                c.convAspect));
-        c.far = FarField::Periodic;
-        c.bodyKind = BodyKind::None;
-        c.meta = {c.grid.nx, c.grid.ny, c.grid.nz, c.grid.hx, c.grid.hy,
-                  c.grid.hz, H, c.re, c.mach, c.fdt, 0, false,
-                  "convection", c.closedSides ? "closed-sides" : "periodic",
-                  name(c.physics), c.kick, ""};
-        return c;
+    const double delta = 1.0;
+    const int nyT = nyI + 2; // + the two wall-mirror ghost rows
+    const double h1 = ChannelStretchY::firstCell(nyT, c.stretchBeta, delta);
+    const double ly = 2 * delta + 2 * h1; // period fixed by the ghost rows
+    if (r.given.contains("--lx") && !finitePos(r.lx))
+        return bad(2, "--lx", "must be finite and > 0 (0/omitted = 4 pi)");
+    if (r.given.contains("--lz") && !finitePos(r.lzBox))
+        return bad(2, "--lz", "must be finite and > 0 (0/omitted = 4 pi/3)");
+    c.lxBox = r.lx > 0 ? r.lx : 4 * pi;
+    c.lzBox = nz == 1 ? 1.0 : (r.lzBox > 0 ? r.lzBox : 4 * pi / 3);
+    const std::size_t cells = std::size_t(r.n) * nyT * nz;
+    if (cells > std::size_t(2147483647))
+        return bad(2, "--n", "grid exceeds INT_MAX cells");
+    c.grid = Grid::make(r.n, nyT, nz, c.lxBox, ly, c.lzBox);
+    c.nzInterior = nz;
+    c.h = c.grid.hy;
+    c.L = c.lxBox;
+    c.chanH1 = h1;
+    c.stretchH1 = h1;
+    const ChannelStretchY R{ly, nyT, c.stretchBeta, delta};
+    double prev = h1;
+    for (int j = 2; j < nyT - 1; ++j)
+    {
+        const double dy = R.mapY((j + 1) * c.grid.hy) - R.mapY(j * c.grid.hy);
+        c.stretchGrowth = std::max(c.stretchGrowth,
+                                   std::max(dy / prev, prev / dy));
+        prev = dy;
     }
 
-    // --- flow ---------------------------------------------------------------
+    // Bulk-velocity estimate (log law) fixes the sound speed for the
+    // requested BULK Mach: c_s = ubEst/Mach, p = rho c_s^2/gamma,
+    // Twall = p (rho = R = 1). The IC and the isothermal wall share it.
+    c.ubEst = 2.5 * std::log(std::max(c.reTau, 3.0)) + 2.6;
+    c.pRef = (c.ubEst / c.mach) * (c.ubEst / c.mach) / 1.4;
+
+    c.cfl = r.cfl;
+    if (!(c.cfl > 0 && c.cfl <= 1)) return bad(2, "--cfl", "must be in (0,1]");
+    c.kick = r.kick;
+    if (!(std::isfinite(c.kick) && c.kick >= 0))
+        return bad(2, "--kick", "must be finite and >= 0");
+    if (!finitePos(r.tt)) return bad(2, "--tt", "must be finite and > 0");
+    c.ft = r.tt;
+    c.tEnd = r.tt;
+    c.profileDt = r.profileDt;
+    if (!(std::isfinite(c.profileDt) && c.profileDt >= 0))
+        return bad(2, "--profile-dt", "must be finite and >= 0 (0 = off)");
+    c.dtRecompute = r.given.contains("--dt-recompute") ? r.dtRecompute : 16;
+    if (c.dtRecompute < 1) return bad(2, "--dt-recompute", "must be >= 1");
+    if (auto e = validateFrameOutputs(r, c); e) return std::unexpected(*e);
+    if (auto e = resolveEmit(c, {Emit::Stats}); e) return std::unexpected(*e);
+    // PNG is allowed at nz > 1 here: it renders the centre z-plane,
+    // which for a channel is exactly the picture you want.
+    c.physics = Physics::Compressible;
+    c.far = FarField::Periodic;
+    c.bodyKind = BodyKind::None;
+    c.meta = {c.grid.nx, c.grid.ny, c.grid.nz, c.grid.hx, c.grid.hy,
+              c.grid.hz, 2 * delta, c.reTau, c.mach, c.fdt, 0, false,
+              "channel", "periodic", "compressible", c.kick, ""};
+    return c;
+}
+
+// --- conv -------------------------------------------------------------------
+// Rayleigh-Benard: heated floor, cooled lid, gravity in -y, periodic x/z.
+//
+// Box units fix everything: layer height H = 1, mid-layer temperature
+// Tref = 1, Rgas = 1 and rho_ref = 1, hence p_ref = 1 and the reference
+// sound speed is sqrt(gamma). The three inputs then close the case:
+//
+//   --dtemp eps   the imposed drop, Tbot/Ttop = 1 +/- eps/2
+//   --mach M      M = Uf0/c with Uf0 = sqrt(g eps H) -- this is what SETS
+//                 gravity, g = M^2 gamma / eps, and with it how far the
+//                 run is from the incompressible limit
+//   --rayleigh Ra on the SUPERADIABATIC drop, which is what fixes nu
+//
+// The stratification is not a detail: gravity itself carries an adiabatic
+// temperature gradient g/cp, so only dTsuper = dT - (g/cp) H drives
+// convection (Schwarzschild). A subadiabatic layer is stably stratified
+// and simply will not convect, which is a configuration error and not a
+// result -- so it is rejected here, by name, with the two knobs that fix
+// it. The adiabatic fraction is M^2 (gamma-1) / eps^2, so it shrinks
+// quadratically as the Mach number drops toward the Boussinesq limit.
+std::expected<Case, ConfigError> validateConv(const RawConfig& r, Case c)
+{
+    if (r.given.contains("--re"))
+        return bad(2, "--re", "convection is configured by --rayleigh and "
+                              "--prandtl, not a body Reynolds number "
+                              "(there is no body and no free stream)");
+    if (r.given.contains("--ft"))
+        return bad(2, "--ft", "convection run length is --tt (free-fall "
+                              "times H/Uf)");
+    if (r.n < 4) return bad(2, "--n", "must be >= 4");
+    const int nyI = r.ny;
+    if (nyI < 8)
+        return bad(2, "--ny", "must be >= 8 fluid cells (wall-normal "
+                              "resolution; two ghost rows are added)");
+    const int nz = r.nz;
+    if (nz < 1) return bad(2, "--nz", "must be >= 1 (interior cells; 1 = "
+                                      "native 2D)");
+    if (nz != 1 && nz < 4)
+        return bad(2, "--nz", "must be 1 (native 2D) or >= 4");
+
+    if (!finitePos(r.rayleigh))
+        return bad(2, "--rayleigh", "must be finite and > 0");
+    c.rayleigh = r.rayleigh;
+    if (!(finitePos(r.dtemp) && r.dtemp < 2))
+        return bad(2, "--dtemp", "must be in (0,2): the imposed drop as a "
+                                 "fraction of the mid-layer temperature, "
+                                 "so the lid sits at 1 - dtemp/2 > 0");
+    c.dtemp = r.dtemp;
+    c.mach = r.mach;
+    if (!(finitePos(c.mach) && c.mach < 1))
+        return bad(2, "--mach", "must be in (0,1) -- the flux is "
+                                "Kennedy-Gruber central with no shock "
+                                "capturing");
+    c.prandtl = r.prandtl;
+    if (!finitePos(c.prandtl))
+        return bad(2, "--prandtl", "must be finite and > 0");
+    c.sutherland = r.visc == 1;
+    c.tinfK = r.tinf;
+    if (c.sutherland && !finitePos(c.tinfK))
+        return bad(2, "--tinf", "must be finite and > 0 (it is the "
+                                "dimensional anchor Sutherland's 110.4 K "
+                                "needs)");
+    if (c.physics == Physics::Incompressible)
+    {
+        // Boussinesq: the M -> 0 limit taken analytically. There is no
+        // sound speed, so the knobs that only exist to place the run
+        // relative to one are not silently ignored -- they are rejected.
+        if (r.given.contains("--mach"))
+            return bad(2, "--mach", "the Boussinesq limit has no sound "
+                                    "speed: --mach only means something "
+                                    "for --physics compressible, where it "
+                                    "sets gravity");
+        if (r.given.contains("--dtemp"))
+            return bad(2, "--dtemp", "the Boussinesq equations depend on "
+                                     "the imposed drop only through Ra, so "
+                                     "the drop is scaled to 1 and --dtemp "
+                                     "would be a second, conflicting name "
+                                     "for --rayleigh");
+        if (c.sutherland)
+            return bad(2, "--visc", "Sutherland's mu(T) is inconsistent "
+                                    "with a divergence-free velocity "
+                                    "field: constant transport properties "
+                                    "are part of the Boussinesq "
+                                    "approximation. Use --physics "
+                                    "compressible for mu(T)");
+        if (r.given.contains("--tinf"))
+            return bad(2, "--tinf", "nothing in the Boussinesq branch is "
+                                    "dimensional (it exists only to anchor "
+                                    "Sutherland's 110.4 K)");
+    }
+    if (!finitePos(r.convAspect))
+        return bad(2, "--aspect", "must be finite and > 0 (box width and "
+                                  "depth in layer heights)");
+    c.convAspect = r.convAspect;
+    if (!(finitePos(r.hotPatch) && r.hotPatch <= 1))
+        return bad(2, "--hot-patch", "must be in (0,1]: the heated side "
+                                     "fraction of the floor (1 = the whole "
+                                     "plate)");
+    c.hotPatch = r.hotPatch;
+    // --sides closed turns the lateral faces into no-slip adiabatic walls,
+    // carried by the same one-cell ghost ring as the plates. At nz == 1
+    // only x closes: 2D is exact periodic wrap in z, not a code path, so a
+    // z ghost ring there would be a third dimension the case does not have.
+    c.closedSides = r.sides == 1;
+
+    const double gamma = 1.4, Rgas = 1.0, H = 1.0, Tref = 1.0;
+    c.convH = H;
+    if (c.physics == Physics::Incompressible)
+    {
+        // Free-fall scaling: H = dT = g*alpha = 1, hence Uff = t_ff = 1 and
+        // Ra alone fixes both diffusivities. No stratification exists here,
+        // so the superadiabatic drop IS the imposed one and Ra and Nu are
+        // measured against the same thing.
+        c.tBot = 0.5;
+        c.tTop = -0.5;
+        c.dtemp = 1.0;
+        c.dtempSuper = 1.0;
+        c.gravity = 1.0;   // g*alpha, the buoyancy coefficient
+        c.uFreeFall = 1.0;
+        c.mach = 0;        // there is no sound speed to be a fraction of
+        c.nu = std::sqrt(c.prandtl / c.rayleigh);
+        c.kappaDiff = 1.0 / std::sqrt(c.rayleigh * c.prandtl);
+        c.re = c.uFreeFall * H / c.nu;   // = sqrt(Ra/Pr)
+    }
+    else {
+    c.tBot = Tref * (1 + 0.5 * c.dtemp);
+    c.tTop = Tref * (1 - 0.5 * c.dtemp);
+    // g from the Mach number: M = sqrt(g eps H) / sqrt(gamma R Tref).
+    c.gravity = c.mach * c.mach * gamma * Rgas * Tref / (c.dtemp * H);
+    const double cp = gamma * Rgas / (gamma - 1.0);
+    const double dTad = c.gravity / cp * H;
+    c.dtempSuper = c.dtemp * Tref - dTad;
+    if (!(c.dtempSuper > 0))
+        return bad(2, "--mach",
+                   std::format("the layer is subadiabatic and cannot "
+                               "convect: gravity's own adiabatic drop "
+                               "(g/cp) H = {:.4g} already exceeds the "
+                               "imposed {:.4g}. Lower --mach (the "
+                               "adiabatic fraction is M^2 (gamma-1) / "
+                               "dtemp^2 = {:.3g}) or raise --dtemp",
+                               dTad, c.dtemp * Tref,
+                               c.mach * c.mach * (gamma - 1)
+                                   / (c.dtemp * c.dtemp)));
+    // Free-fall velocity on the superadiabatic excess -- the velocity the
+    // run actually reaches, and the unit --tt counts in.
+    c.uFreeFall = std::sqrt(c.gravity * c.dtempSuper / Tref * H);
+    // Ra = g (dTsuper/Tref) H^3 / (nu kappa) with kappa = nu/Pr.
+    c.nu = std::sqrt(c.gravity * (c.dtempSuper / Tref) * H * H * H
+                     * c.prandtl / c.rayleigh);
+    c.kappaDiff = c.nu / c.prandtl;
+    c.re = c.uFreeFall * H / c.nu;   // free-fall Reynolds number
+    }
+
+    const int nyT = nyI + 2;         // + the two wall-mirror ghost rows
+    // The ghost rows are geometric mirrors of the first fluid rows, so the
+    // wall faces sit half a cell outside them: the mapped extent is
+    // H + 2*(H/nyI) and the wall-to-wall height stays exactly H.
+    const double hy = H / nyI;
+    const double ly = H + 2 * hy;
+    c.lxBox = c.convAspect * H;
+    c.lzBox = nz == 1 ? 1.0 : c.convAspect * H;
+    // A closed lateral axis gets the plates' treatment exactly: the fluid
+    // extent stays lxBox/lzBox and the two ghost columns extend the mapped
+    // box by one spacing each side, so the wall faces sit half a cell
+    // outside them and the wall-to-wall width is exactly lxBox.
+    const int nxT = c.closedSides ? r.n + 2 : r.n;
+    const int nzT = c.closedSides && nz > 1 ? nz + 2 : nz;
+    const double hx = c.lxBox / r.n, hz = c.lzBox / nz;
+    const double lx = c.closedSides ? c.lxBox + 2 * hx : c.lxBox;
+    const double lz = c.closedSides && nz > 1 ? c.lzBox + 2 * hz : c.lzBox;
+    const std::size_t cells = std::size_t(nxT) * nyT * nzT;
+    if (cells > std::size_t(2147483647))
+        return bad(2, "--n", "grid exceeds INT_MAX cells");
+    c.grid = Grid::make(nxT, nyT, nzT, lx, ly, lz);
+    c.nxInterior = r.n;
+    c.nzInterior = nz;
+    c.h = c.grid.hy;
+    c.L = c.lxBox;
+    c.pRef = Rgas * Tref;   // rho_ref = 1 at mid-layer
+
+    // The compressible branch is acoustically limited, the Boussinesq one
+    // advectively; 0.4 and 0.8 are those two solvers' own defaults.
+    c.cfl = r.given.contains("--cfl")
+                ? r.cfl
+                : (c.physics == Physics::Incompressible ? 0.8 : 0.4);
+    if (!(c.cfl > 0 && c.cfl <= 1)) return bad(2, "--cfl", "must be in (0,1]");
+    c.kick = r.kick;
+    if (!(std::isfinite(c.kick) && c.kick >= 0))
+        return bad(2, "--kick", "must be finite and >= 0");
+    if (!finitePos(r.tt)) return bad(2, "--tt", "must be finite and > 0");
+    c.ft = r.tt;
+    c.tEnd = r.tt * H / c.uFreeFall;   // free-fall times -> box time
+    c.profileDt = r.profileDt;
+    if (!(std::isfinite(c.profileDt) && c.profileDt >= 0))
+        return bad(2, "--profile-dt", "must be finite and >= 0 (0 = off)");
+    c.dtRecompute = r.given.contains("--dt-recompute") ? r.dtRecompute : 16;
+    if (c.dtRecompute < 1) return bad(2, "--dt-recompute", "must be >= 1");
+    if (auto e = validateFrameOutputs(r, c); e) return std::unexpected(*e);
+    if (auto e = resolveEmit(c, {Emit::Stats}); e) return std::unexpected(*e);
+    // Below onset the layer just conducts; that is a legitimate run (the
+    // subcritical control), but it is not what the user usually wants, so
+    // it is an advisory and not an error.
+    if (c.rayleigh < 1708.0 && c.hotPatch >= 1.0)
+        c.warnings.push_back(std::format(
+            "Ra = {:.4g} is below the onset of convection (~1708 for "
+            "rigid isothermal plates): the layer will stay quiescent and "
+            "report Nu = 1", c.rayleigh));
+    if (c.hotPatch < 1.0)
+        c.warnings.push_back(std::format(
+            "--hot-patch {:.4g}: only that side fraction of the floor is "
+            "heated, so this is a localised plume and not classical "
+            "Rayleigh-Benard -- the 1708 onset does not apply and nuBot is "
+            "a net floor-averaged flux, not a Nusselt number",
+            c.hotPatch));
+    if (nz == 1)
+        c.warnings.push_back("nz == 1: 2D convection has no vortex "
+                             "stretching -- roll structure and Nu are "
+                             "qualitative");
+    // A closed cavity is a different experiment from the unbounded layer,
+    // and the two numbers people quote against it -- the 1708 onset and the
+    // Ra-Nu scaling -- are both the unbounded ones. Say so rather than let
+    // a cavity result be read as classical Rayleigh-Benard.
+    if (c.closedSides)
+        c.warnings.push_back(std::format(
+            "--sides closed: the lateral faces are no-slip adiabatic "
+            "walls, so the roll count is fixed by --aspect {:.4g} and the "
+            "corner regions are viscously braked -- Nu is a cavity number "
+            "below the periodic one at the same Ra, and the ~1708 onset "
+            "(and the Ra-Nu scaling) are the unbounded layer's",
+            c.convAspect));
+    c.far = FarField::Periodic;
+    c.bodyKind = BodyKind::None;
+    c.meta = {c.grid.nx, c.grid.ny, c.grid.nz, c.grid.hx, c.grid.hy,
+              c.grid.hz, H, c.re, c.mach, c.fdt, 0, false,
+              "convection", c.closedSides ? "closed-sides" : "periodic",
+              name(c.physics), c.kick, ""};
+    return c;
+}
+
+// --- flow -------------------------------------------------------------------
+std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
+{
     // A scene file replaces --body: main loads it (phase 1.5) and hands the
     // parsed Scene to the geometry build; the validator only records the path
     // and applies the body-independent checks.
@@ -613,17 +651,15 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         c.scenePath = r.scene;
     }
     else if (r.body.empty())
-        return bad(2, "--body", "required: one of cylinder, sphere, cube, lens, "
-                                "fence, floor, none, a .stl/.gltf/.glb file, or "
-                                "--scene FILE.toml");
-
-    else if (r.body == "none") c.bodyKind = BodyKind::None;
-    else if (r.body == "cylinder") c.bodyKind = BodyKind::Cylinder;
-    else if (r.body == "sphere") c.bodyKind = BodyKind::Sphere;
-    else if (r.body == "cube") c.bodyKind = BodyKind::Cube;
-    else if (r.body == "lens") c.bodyKind = BodyKind::Lens;
-    else if (r.body == "fence") c.bodyKind = BodyKind::Fence;
-    else if (r.body == "floor") c.bodyKind = BodyKind::Floor;
+        return bad(2, "--body", "required: one of " + bodyKeywords()
+                                + ", a .stl/.gltf/.glb file, or "
+                                  "--scene FILE.toml");
+    // Mesh and Scene are kinds the validator ASSIGNS, never keywords the user
+    // types: `--body mesh` falls through to the suffix test below and is then
+    // rejected by name, as it always was.
+    else if (const auto k = bodyKindFromName(r.body);
+             k && *k != BodyKind::Mesh && *k != BodyKind::Scene)
+        c.bodyKind = *k;
     else if (hasSuffix(r.body, ".stl") || hasSuffix(r.body, ".gltf")
              || hasSuffix(r.body, ".glb"))
     {
@@ -631,9 +667,9 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         c.meshPath = r.body;
     }
     else
-        return bad(2, "--body", "unrecognised body '" + r.body
-                                + "'; expected cylinder, sphere, cube, lens, fence, "
-                                  "floor, none, or a path ending in .stl/.gltf/.glb");
+        return bad(2, "--body", "unrecognised body '" + r.body + "'; expected "
+                                + bodyKeywords()
+                                + ", or a path ending in .stl/.gltf/.glb");
 
     // Body-free box (wall boundary layers, channel-like cases): the
     // incompressible runner requires solid cells, so this is compressible-only.
@@ -737,13 +773,14 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
             return bad(2, "--ogrid", "wall-mounted bodies are not star-shaped "
                                      "about a centre and have no annulus "
                                      "around them");
-        for (const char* f : {"--focal", "--stretch", "--cut-flux",
-                              "--penalize", "--open", "--far", "--dr", "--seq"})
-            if (r.given.contains(f))
-                return bad(2, f, std::string(f) +
-                               " belongs to the Cartesian box with an immersed "
-                               "body; --ogrid replaces both (the wall IS a mesh "
-                               "face, and the far field is the outer circle)");
+        if (auto e = rejectGiven(
+                r, {"--focal", "--stretch", "--cut-flux", "--penalize", "--open",
+                    "--far", "--dr", "--seq"},
+                "belongs to the Cartesian box with an immersed body; --ogrid "
+                "replaces both (the wall IS a mesh face, and the far field is "
+                "the outer circle)");
+            e)
+            return std::unexpected(*e);
         if (r.n < 16)
             return bad(2, "--n", "is the ANGULAR cell count on an O-grid; "
                                  "below 16 the contour is not resolved");
@@ -838,7 +875,7 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     c.mach = r.mach;
     if (comp)
     {
-        if (!(std::isfinite(c.mach) && c.mach > 0 && c.mach < 1))
+        if (!(finitePos(c.mach) && c.mach < 1))
             return bad(2, "--mach", "must be in (0,1) -- the flux is Kennedy-Gruber "
                                     "central with no shock capturing");
         if (r.given.contains("--tol"))
@@ -847,9 +884,10 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     }
     else
     {
-        for (const char* f : {"--mach", "--kick"})
-            if (r.given.contains(f))
-                return bad(2, f, std::string(f) + " is compressible-only");
+        if (auto e = rejectGiven(r, {"--mach", "--kick"},
+                                 "is compressible-only");
+            e)
+            return std::unexpected(*e);
     }
 
     c.nu = c.uInf * c.placement.D / c.re;
@@ -866,17 +904,18 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     c.bodyIsothermal = r.given.contains("--wall") && r.wallIso == 1;
     c.nscbcThermalInflow = r.nscbcTinflow;
     if (!comp)
-        for (const char* f : {"--tinf", "--prandtl", "--visc", "--wall",
-                              "--twall", "--nscbc-tinflow"})
-            if (r.given.contains(f))
-                return bad(2, f, std::string(f) + " is compressible-only "
-                                 "(the incompressible solver carries no energy "
-                                 "equation)");
-    if (!(std::isfinite(c.tinfK) && c.tinfK > 0))
+        if (auto e = rejectGiven(r,
+                                 {"--tinf", "--prandtl", "--visc", "--wall",
+                                  "--twall", "--nscbc-tinflow"},
+                                 "is compressible-only (the incompressible "
+                                 "solver carries no energy equation)");
+            e)
+            return std::unexpected(*e);
+    if (!finitePos(c.tinfK))
         return bad(2, "--tinf", "must be finite and > 0 (kelvin)");
-    if (!(std::isfinite(c.prandtl) && c.prandtl > 0))
+    if (!finitePos(c.prandtl))
         return bad(2, "--prandtl", "must be finite and > 0");
-    if (!(std::isfinite(c.twallRatio) && c.twallRatio > 0))
+    if (!finitePos(c.twallRatio))
         return bad(2, "--twall", "must be finite and > 0 (a ratio to Tinf)");
     if (r.given.contains("--twall") && !c.bodyIsothermal)
         return bad(2, "--twall", "sets the temperature of an ISOTHERMAL wall; "
@@ -925,11 +964,9 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     c.lesLabel = c.cs > 0;
     if (blCells < 3.0 && !c.lesLabel && c.bodyKind != BodyKind::None)
     {
-        char w[192];
-        std::snprintf(w, sizeof w,
-                      "boundary layer is %.1f cells (D/sqrt(Re)/h); this is "
-                      "under-resolved for DNS", blCells);
-        c.warnings.emplace_back(w);
+        c.warnings.push_back(
+            std::format("boundary layer is {:.1f} cells (D/sqrt(Re)/h); this "
+                        "is under-resolved for DNS", blCells));
     }
 
     // Far-field parameters.
@@ -938,7 +975,7 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     c.nscbcStrip = r.nscbcStrip;
     if (c.far == FarField::Nscbc)
     {
-        if (!(std::isfinite(c.nscbcEtaIn) && c.nscbcEtaIn > 0))
+        if (!finitePos(c.nscbcEtaIn))
             return bad(2, "--nscbc-etain", "must be > 0");
         // Empirically bracketed stability window (masterplan §6.3): 0 pumps a
         // growing global mode, 1.0 diverges at t = 35.
@@ -1131,7 +1168,7 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
                                            "cell-size ratio; the fine spacing "
                                            "sets the acoustic dt)");
         const double blendFrac = r.focalBlend;
-        if (!(std::isfinite(blendFrac) && blendFrac > 0 && blendFrac <= 2))
+        if (!(finitePos(blendFrac) && blendFrac <= 2))
             return bad(2, "--focal-blend", "must be in (0,2] (blend width per "
                                            "side as a fraction of the plateau)");
 
@@ -1332,10 +1369,12 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     }
     else
     {
-        for (const char* f : {"--focal-ratio", "--focal-blend", "--focal-wake",
-                              "--focal-pad"})
-            if (r.given.contains(f))
-                return bad(2, f, std::string(f) + " requires --focal");
+        if (auto e = rejectGiven(r,
+                                 {"--focal-ratio", "--focal-blend",
+                                  "--focal-wake", "--focal-pad"},
+                                 "requires --focal");
+            e)
+            return std::unexpected(*e);
     }
 
     // --- rotor: the body spins ------------------------------------------------
@@ -1345,14 +1384,15 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     // arithmetic it always took -- that is what keeps the measured cd/cl
     // anchors valid.
     {
-        static constexpr const char* rotorFlags[] = {
-            "--rotor-axis", "--rotor-bins", "--rotor-span", "--blade-thicken"};
         if (r.rotorMach == 0)
         {
-            for (const char* f : rotorFlags)
-                if (r.given.contains(f))
-                    return bad(2, f, std::string(f) + " configures a spinning "
-                                   "body; give --rotor-mach to have one");
+            if (auto e = rejectGiven(r,
+                                     {"--rotor-axis", "--rotor-bins",
+                                      "--rotor-span", "--blade-thicken"},
+                                     "configures a spinning body; give "
+                                     "--rotor-mach to have one");
+                e)
+                return std::unexpected(*e);
         }
         else
         {
@@ -1381,7 +1421,7 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
                 return bad(2, "--rotor-mach", "a spinning body has no steady "
                                "state and no per-level restart; drop --seq / "
                                "--steady");
-            if (!(std::isfinite(r.rotorMach) && r.rotorMach > 0))
+            if (!finitePos(r.rotorMach))
                 return bad(2, "--rotor-mach", "must be finite and > 0 (the TIP "
                                               "Mach number)");
             // The KG central flux carries no shock capturing, so the FASTEST
@@ -1392,8 +1432,7 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
                                "stay under 1: the advancing tip is the fastest "
                                "point in the flow and the flux has no shock "
                                "capturing");
-            if (!(std::isfinite(r.rotorSpan) && r.rotorSpan > 0
-                  && r.rotorSpan <= 0.5))
+            if (!(finitePos(r.rotorSpan) && r.rotorSpan <= 0.5))
                 return bad(2, "--rotor-span", "blade half-extent along the "
                                "shaft in diameters, in (0, 0.5]: beyond 0.5 the "
                                "swept volume leaves the placement cube that "
@@ -1406,12 +1445,13 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
             // tilt the model out of the axis it spins about, so the two
             // deprecated angles are rejected outright rather than silently
             // producing a wobbling body.
-            for (const char* f : {"--pitch", "--yaw"})
-                if (r.given.contains(f))
-                    return bad(2, f, std::string(f) + " tilts the body out of "
-                                   "the shaft it spins about; a rotor's mesh is "
-                                   "placed about its own origin. Bake attitude "
-                                   "into the mesh, or drop --rotor-mach");
+            if (auto e = rejectGiven(
+                    r, {"--pitch", "--yaw"},
+                    "tilts the body out of the shaft it spins about; a rotor's "
+                    "mesh is placed about its own origin. Bake attitude into "
+                    "the mesh, or drop --rotor-mach");
+                e)
+                return std::unexpected(*e);
             if (c.grid.nz == 1 && r.rotorAxis != 2)
                 return bad(2, "--rotor-axis", "nz == 1 is the exact 2D "
                                "restriction: only a z shaft keeps the motion in "
@@ -1526,7 +1566,7 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
 
     // Solver.
     c.tol = r.tol;
-    if (!(std::isfinite(c.tol) && c.tol > 0)) return bad(2, "--tol", "must be > 0");
+    if (!finitePos(c.tol)) return bad(2, "--tol", "must be > 0");
     c.maxIters = r.maxIters;
     if (c.maxIters < 1) return bad(2, "--max-iters", "must be >= 1");
     // Default per current app: 16 for the compressible cylinder (a validated
@@ -1576,9 +1616,10 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     c.yaw = r.yaw;
     c.robust = r.robust;
     if (c.bodyKind != BodyKind::Mesh)
-        for (const char* f : {"--scale", "--pitch", "--yaw", "--robust"})
-            if (r.given.contains(f))
-                return bad(2, f, std::string(f) + " applies to mesh bodies only");
+        if (auto e = rejectGiven(r, {"--scale", "--pitch", "--yaw", "--robust"},
+                                 "applies to mesh bodies only");
+            e)
+            return std::unexpected(*e);
 
     // Run length + output cadences.
     c.ft = r.ft;
@@ -1619,20 +1660,7 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
                                    "(needs n/2^(levels-1) >= max(16, 4*dr)); "
                                    "use fewer levels or a larger --n");
     }
-    c.fdt = r.fdt;
-    c.pdt = r.pdt > 0 ? r.pdt : c.fdt;
-    c.wdt = r.wdt > 0 ? r.wdt : c.fdt;
-    for (auto [v, f] : {std::pair{c.fdt, "--fdt"}, {c.pdt, "--pdt"}, {c.wdt, "--wdt"}})
-        if (!finitePos(v)) return bad(2, f, "must be finite and > 0");
-    c.planes = r.planes;
-    if (c.planes != 1 && c.planes != 3)
-        return bad(2, "--planes", "must be 1 (centre only) or 3 (centre +/- n/16)");
-    c.pngDown = r.pngDown;
-    if (c.pngDown < 1)
-        return bad(2, "--png-down", "must be >= 1 (1 = full-resolution PNGs)");
-    if (c.pngDown > 1 && (c.grid.nx % c.pngDown || c.grid.ny % c.pngDown))
-        return bad(2, "--png-down",
-                   "must divide both nx and ny evenly for box-averaging");
+    if (auto e = validateFrameOutputs(r, c); e) return std::unexpected(*e);
     c.vortMax = r.vortMax;
     if (!(std::isfinite(c.vortMax) && c.vortMax >= 0))
         return bad(2, "--vort-max", "must be finite and >= 0 (0 = auto scale)");
@@ -1653,9 +1681,8 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
                                        "signed z-vorticity; the flag selects "
                                        "it for 3D compressible runs");
 
-    if (c.emit.empty()) { c.emit.insert(Emit::Stats); c.emit.insert(Emit::Bin); }
-    if (c.emit.contains(Emit::None) && c.emit.size() > 1)
-        return bad(2, "--emit", "--emit none cannot be combined with other kinds");
+    if (auto e = resolveEmit(c, {Emit::Stats, Emit::Bin}); e)
+        return std::unexpected(*e);
     // PNG at nz > 1 renders the centre z-plane (same machinery the channel
     // already uses); the old flow-only nz == 1 restriction was conservative,
     // not load-bearing.
@@ -1675,6 +1702,41 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
               name(c.far), name(c.physics), comp ? c.kick : 0.0,
               c.lesLabel ? name(c.sgsModel) : ""};
     return c;
+}
+
+} // namespace
+
+std::expected<Case, ConfigError> validate(const RawConfig& r)
+{
+    Case c;
+    c.sub = r.sub;
+    c.backend = r.backend;
+    c.physics = r.physics;
+    c.far = r.far;
+    c.seed = r.seed;
+    c.quiet = r.quiet;
+    c.dryRun = r.dryRun;
+    c.outPrefix = r.out;
+    c.emit = r.emit;
+
+    if (c.outPrefix.empty())
+        return bad(2, "--out", "output prefix must not be empty");
+    // webframes.cpp concatenates the prefix into a JSON manifest unescaped.
+    if (c.outPrefix.find_first_of("\"\\\n\r\t") != std::string::npos)
+        return bad(2, "--out", "output prefix must not contain quotes, backslashes "
+                               "or control characters (it is embedded in JSON)");
+
+    if (r.n < 1) return bad(2, "--n", "must be >= 1");
+    if (!finitePos(r.re)) return bad(2, "--re", "must be finite and > 0");
+    c.re = r.re;
+    c.n = r.n;
+
+    if (r.sub == Subcommand::Bench) return validateBench(r, std::move(c));
+    if (r.sub == Subcommand::Tgv || r.sub == Subcommand::Hit)
+        return validatePeriodic(r, std::move(c));
+    if (r.sub == Subcommand::Channel) return validateChannel(r, std::move(c));
+    if (r.sub == Subcommand::Conv) return validateConv(r, std::move(c));
+    return validateFlow(r, std::move(c));
 }
 
 // ---------------------------------------------------------------------------
@@ -1701,64 +1763,61 @@ std::string Case::describe() const
                                        : "x and z");
     if (sub == Subcommand::Conv && physics == Physics::Incompressible)
     {
-        char buf[2048];
-        std::snprintf(buf, sizeof buf,
+        return std::format(
             "case:\n"
             "  mode       Rayleigh-Benard convection, BOUSSINESQ "
             "(incompressible)\n"
-            "  grid       %d x %d x %d (%d fluid rows + 2 ghost)  "
-            "box %.6g x %.6g x %.6g%s\n"
-            "  walls      no-slip isothermal plates at T = %+.3g / %+.3g "
+            "  grid       {} x {} x {} ({} fluid rows + 2 ghost)  "
+            "box {:.6g} x {:.6g} x {:.6g}{}\n"
+            "  walls      no-slip isothermal plates at T = {:+.3g} / {:+.3g} "
             "(drop 1 over H=1)\n"
-            "  sides      %s\n"
-            "  floor      %s\n"
-            "  driving    Ra=%.6g  Pr=%.4g   (free-fall scaling: "
+            "  sides      {}\n"
+            "  floor      {}\n"
+            "  driving    Ra={:.6g}  Pr={:.4g}   (free-fall scaling: "
             "H = dT = g*alpha = 1)\n"
-            "  derived    nu=%.6g  kappa=%.6g  Uff=1  Re_ff=%.6g  t_ff=1  "
-            "cfl=%.3g\n"
+            "  derived    nu={:.6g}  kappa={:.6g}  Uff=1  Re_ff={:.6g}  t_ff=1  "
+            "cfl={:.3g}\n"
             "  limit      no sound speed, no acoustic dt, no adiabatic "
             "gradient: Ra and Nu share the full drop\n"
-            "  run        tt=%.6g free-fall times (tEnd=%.6g)  kick=%.3g  "
-            "profile-dt=%.3g\n"
-            "  label      DNS%s\n"
-            "  out        %s\n",
+            "  run        tt={:.6g} free-fall times (tEnd={:.6g})  kick={:.3g}  "
+            "profile-dt={:.3g}\n"
+            "  label      DNS{}\n"
+            "  out        {}\n",
             grid.nx, grid.ny, grid.nz, grid.ny - 2,
             lxBox, convH, lzBox, grid.nz == 1 ? "  [native 2D]" : "",
-            tBot, tTop, sidesLabel.c_str(), patchLabel.c_str(),
+            tBot, tTop, sidesLabel, patchLabel,
             rayleigh, prandtl, nu, kappaDiff, re, cfl,
             ft, tEnd, kick, profileDt,
             grid.nz == 1 ? " (2D: qualitative only, no vortex stretching)"
                          : "",
-            outPrefix.c_str());
-        return buf;
+            outPrefix);
     }
     if (sub == Subcommand::Conv)
     {
-        char buf[2048];
-        std::snprintf(buf, sizeof buf,
+        return std::format(
             "case:\n"
             "  mode       Rayleigh-Benard convection (no-slip isothermal y "
             "walls)\n"
-            "  grid       %d x %d x %d (%d fluid rows + 2 ghost)  "
-            "box %.6g x %.6g x %.6g%s\n"
-            "  walls      floor T=%.6g, lid T=%.6g (imposed drop %.6g over "
-            "H=%.6g)\n"
-            "  sides      %s\n"
-            "  floor      %s\n"
-            "  gravity    g=%.6g in -y; adiabatic drop (g/cp)H=%.6g "
-            "(%.1f%% of the imposed)\n"
-            "  driving    Ra=%.6g on the superadiabatic drop %.6g  Pr=%.4g  "
-            "Mach=%.3g\n"
-            "  derived    nu=%.6g  kappa=%.6g  Uff=%.6g  Re_ff=%.6g  "
-            "t_ff=%.6g  cfl=%.3g\n"
-            "  transport  %s\n"
-            "  run        tt=%.6g free-fall times (tEnd=%.6g)  kick=%.3g  "
-            "profile-dt=%.3g\n"
-            "  label      DNS%s\n"
-            "  out        %s\n",
+            "  grid       {} x {} x {} ({} fluid rows + 2 ghost)  "
+            "box {:.6g} x {:.6g} x {:.6g}{}\n"
+            "  walls      floor T={:.6g}, lid T={:.6g} (imposed drop {:.6g} over "
+            "H={:.6g})\n"
+            "  sides      {}\n"
+            "  floor      {}\n"
+            "  gravity    g={:.6g} in -y; adiabatic drop (g/cp)H={:.6g} "
+            "({:.1f}% of the imposed)\n"
+            "  driving    Ra={:.6g} on the superadiabatic drop {:.6g}  Pr={:.4g}  "
+            "Mach={:.3g}\n"
+            "  derived    nu={:.6g}  kappa={:.6g}  Uff={:.6g}  Re_ff={:.6g}  "
+            "t_ff={:.6g}  cfl={:.3g}\n"
+            "  transport  {}\n"
+            "  run        tt={:.6g} free-fall times (tEnd={:.6g})  kick={:.3g}  "
+            "profile-dt={:.3g}\n"
+            "  label      DNS{}\n"
+            "  out        {}\n",
             grid.nx, grid.ny, grid.nz, grid.ny - 2,
             lxBox, convH, lzBox, grid.nz == 1 ? "  [native 2D]" : "",
-            tBot, tTop, dtemp, convH, sidesLabel.c_str(), patchLabel.c_str(),
+            tBot, tTop, dtemp, convH, sidesLabel, patchLabel,
             gravity, dtemp - dtempSuper,
             dtemp > 0 ? 100.0 * (dtemp - dtempSuper) / dtemp : 0.0,
             rayleigh, dtempSuper, prandtl, mach,
@@ -1770,28 +1829,26 @@ std::string Case::describe() const
             ft, tEnd, kick, profileDt,
             grid.nz == 1 ? " (2D: qualitative only, no vortex stretching)"
                          : "",
-            outPrefix.c_str());
-        return buf;
+            outPrefix);
     }
     if (sub == Subcommand::Channel)
     {
-        char buf[2048];
-        std::snprintf(buf, sizeof buf,
+        return std::format(
             "case:\n"
             "  mode       compressible turbulent channel (periodic x/z, "
             "no-slip y walls)\n"
-            "  grid       %d x %d x %d (%d fluid rows + 2 ghost)  "
-            "box %.6g x %.6g x %.6g%s\n"
-            "  mesh       y tanh-stretch beta=%.4g: first cell %.3e "
-            "(y+ = %.3g), growth <= %.4f\n"
-            "  physics    Re_tau=%.6g  nu=%.6g  Mach_bulk=%.3g  "
-            "(u_bulk est %.3g, p=%.6g)  cfl=%.3g\n"
-            "  walls      %s no-slip mirrors; force f=1 (constant), "
+            "  grid       {} x {} x {} ({} fluid rows + 2 ghost)  "
+            "box {:.6g} x {:.6g} x {:.6g}{}\n"
+            "  mesh       y tanh-stretch beta={:.4g}: first cell {:.3e} "
+            "(y+ = {:.3g}), growth <= {:.4f}\n"
+            "  physics    Re_tau={:.6g}  nu={:.6g}  Mach_bulk={:.3g}  "
+            "(u_bulk est {:.3g}, p={:.6g})  cfl={:.3g}\n"
+            "  walls      {} no-slip mirrors; force f=1 (constant), "
             "u_tau target 1\n"
-            "  run        tt=%.6g eddy turnovers (tEnd=%.6g)  kick=%.3g  "
-            "profile-dt=%.3g\n"
-            "  label      DNS%s\n"
-            "  out        %s\n",
+            "  run        tt={:.6g} eddy turnovers (tEnd={:.6g})  kick={:.3g}  "
+            "profile-dt={:.3g}\n"
+            "  label      DNS{}\n"
+            "  out        {}\n",
             grid.nx, grid.ny, grid.nz, grid.ny - 2,
             lxBox, 2.0, lzBox, grid.nz == 1 ? "  [native 2D]" : "",
             stretchBeta, chanH1, chanH1 * reTau, stretchGrowth,
@@ -1801,25 +1858,26 @@ std::string Case::describe() const
             ft, tEnd, kick, profileDt,
             grid.nz == 1 ? " (2D: qualitative only, no vortex stretching)"
                          : "",
-            outPrefix.c_str());
-        return buf;
+            outPrefix);
     }
-    char buf[2048];
-    std::snprintf(buf, sizeof buf,
+    // A mesh or scene path can be any length, which is why this is std::format
+    // and not a fixed buffer: snprintf TRUNCATED the report of exactly the runs
+    // whose body most needed naming.
+    const std::string bodyPath = bodyKind == BodyKind::Scene ? " " + scenePath
+                                 : meshPath.empty()          ? std::string()
+                                                             : " " + meshPath;
+    std::string s = std::format(
         "case:\n"
-        "  physics    %s\n"
-        "  body       %s%s%s\n"
-        "  far field  %s%s\n"
-        "  grid       %d x %d x %d  h=%.6g  L=%.6g%s\n"
-        "  placement  cx=%.6g cy=%.6g cz=%.6g D=%.6g (%.1f cells)\n"
-        "  Re=%.6g  nu=%.6g  Mach=%.6g  cfl=%.6g  Cs=%.6g (%s)\n"
-        "  ft=%.6g  tEnd=%.6g  fdt=%.6g\n"
-        "  mode       %s\n"
-        "  out        %s\n",
-        name(physics), name(bodyKind),
-        bodyKind == BodyKind::Scene
-            ? (" " + scenePath).c_str()
-            : meshPath.empty() ? "" : (" " + meshPath).c_str(),
+        "  physics    {}\n"
+        "  body       {}{}{}\n"
+        "  far field  {}{}\n"
+        "  grid       {} x {} x {}  h={:.6g}  L={:.6g}{}\n"
+        "  placement  cx={:.6g} cy={:.6g} cz={:.6g} D={:.6g} ({:.1f} cells)\n"
+        "  Re={:.6g}  nu={:.6g}  Mach={:.6g}  cfl={:.6g}  Cs={:.6g} ({})\n"
+        "  ft={:.6g}  tEnd={:.6g}  fdt={:.6g}\n"
+        "  mode       {}\n"
+        "  out        {}\n",
+        name(physics), name(bodyKind), bodyPath,
         cutFlux ? " [cut-flux]" : "",
         name(far),
         open ? (farPot ? " (lateral open, potential-corrected)"
@@ -1834,8 +1892,7 @@ std::string Case::describe() const
         ft, tEnd, fdt,
         steadyTol > 0 ? "stationary (stop at steady residual, tEnd = give-up cap)"
                       : "time-march to tEnd",
-        outPrefix.c_str());
-    std::string s = buf;
+        outPrefix);
     // Derived outflow coefficient: printed only when asked for, so a default
     // case's --dry-run reads exactly as it always did. It CHANGES the boundary
     // arithmetic, so like the DNS/LES label it must be visible.
@@ -1850,65 +1907,53 @@ std::string Case::describe() const
         (sutherland || bodyIsothermal || nscbcThermalInflow))
     {
         const double Tinf = mach > 0 ? 1.0 / (1.4 * mach * mach) : 0.0;
-        char t[512];
-        std::snprintf(t, sizeof t,
-            "  thermal    visc=%s  Pr=%.6g  Tinf=%.6g box (%.6g K)\n"
-            "             body wall %s%s  nscbc inflow holds %s\n",
+        s += std::format(
+            "  thermal    visc={}  Pr={:.6g}  Tinf={:.6g} box ({:.6g} K)\n"
+            "             body wall {}{}  nscbc inflow holds {}\n",
             sutherland ? "sutherland" : "constant", prandtl, Tinf, tinfK,
             bodyIsothermal ? "isothermal" : "adiabatic",
-            bodyIsothermal
-                ? (" Twall/Tinf=" + std::to_string(twallRatio)).c_str()
-                : "",
+            bodyIsothermal ? " Twall/Tinf=" + std::to_string(twallRatio)
+                           : std::string(),
             nscbcThermalInflow ? "T" : "rho");
-        s += t;
     }
     if (ogrid)
     {
-        char t[512];
-        std::snprintf(t, sizeof t,
-            "  o-grid     BODY-FITTED: %d angular x %d radial (2 ghost rows)"
-            " x %d spanwise\n"
-            "             rFar=%.6g (%.6g D)  beta=%.6g  span=%.6g\n"
+        s += std::format(
+            "  o-grid     BODY-FITTED: {} angular x {} radial (2 ghost rows)"
+            " x {} spanwise\n"
+            "             rFar={:.6g} ({:.6g} D)  beta={:.6g}  span={:.6g}\n"
             "             the wall is a MESH FACE -- no cut cells, no immersed"
             " body,\n"
             "             forces are an exact surface integral\n",
             grid.nx, grid.ny, grid.nz, ogridRFar,
             placement.D > 0 ? ogridRFar / placement.D : 0.0, ogridBeta,
             ogridSpan);
-        s += t;
     }
     if (stretchBeta > 0)
     {
-        char m[256];
-        std::snprintf(m, sizeof m,
-                      "  mesh       y tanh-stretch beta=%.4g: first interior cell "
-                      "%.3e (hy/%.1f), growth <= %.4f\n"
-                      "             (acoustic dt shrinks with the wall cell)\n",
-                      stretchBeta, stretchH1,
-                      stretchH1 > 0 ? grid.hy / stretchH1 : 0.0, stretchGrowth);
-        s += m;
+        s += std::format(
+            "  mesh       y tanh-stretch beta={:.4g}: first interior cell "
+            "{:.3e} (hy/{:.1f}), growth <= {:.4f}\n"
+            "             (acoustic dt shrinks with the wall cell)\n",
+            stretchBeta, stretchH1,
+            stretchH1 > 0 ? grid.hy / stretchH1 : 0.0, stretchGrowth);
     }
     if (focalActive)
     {
-        char m[512];
         const char* ax[3] = {"x", "y", "z"};
         std::string per;
         for (int a = 0; a < 3; ++a)
         {
             if (focalHi[a] <= focalLo[a]) continue;
-            char l[192];
-            std::snprintf(l, sizeof l,
-                          "             %s [%.4g,%.4g] blend %.4g: fine %.3e "
-                          "coarse %.3e\n",
-                          ax[a], focalLo[a], focalHi[a], focalW[a],
-                          focalHFine[a], focalHCoarse[a]);
-            per += l;
+            per += std::format(
+                "             {} [{:.4g},{:.4g}] blend {:.4g}: fine {:.3e} "
+                "coarse {:.3e}\n",
+                ax[a], focalLo[a], focalHi[a], focalW[a], focalHFine[a],
+                focalHCoarse[a]);
         }
-        std::snprintf(m, sizeof m,
-                      "  mesh       focal clustering ratio %.4g, growth <= "
-                      "%.4f, dt factor %.3f\n",
-                      focalRatio, focalGrowth, focalDtFactor);
-        s += m;
+        s += std::format("  mesh       focal clustering ratio {:.4g}, growth "
+                         "<= {:.4f}, dt factor {:.3f}\n",
+                         focalRatio, focalGrowth, focalDtFactor);
         s += per;
     }
     if (rotor.active())

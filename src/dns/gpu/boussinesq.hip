@@ -1,40 +1,26 @@
 #include "dns/gpu/boussinesq.hpp"
 
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/hotpatch.hpp"
+#include "dns/gpu/internal/plane_sums.hpp"
+#include "dns/gpu/internal/wall_ghost.hpp"
 
 namespace dns::gpu {
 
 namespace {
 
 // Cell (i,j,k) owns the y-faces j (below) and j+1 (above); the two wall faces
-// are therefore j = 1 and j = ny-1, and rows 0 and ny-1 are ghosts.
-// Centred hot patch: the floor column (i,k) is heated iff it lies within the
-// patch in BOTH lateral directions. Written as a fraction of the FLUID index
-// range so it is independent of the box extents and of whether that axis
-// carries a ghost column, and vacuous at nz == 1 (one z cell, always inside),
-// which makes the 2D case the middle strip in x.
-__host__ __device__ inline bool inHotPatch(const GpuGrid& g, int i, int k,
-                                           Real patch, int ox, int oz)
-{
-    const Real fx = (Real(i - ox) + Real(0.5)) / Real(g.nx - 2 * ox)
-                  - Real(0.5);
-    if (fabsf(fx) > Real(0.5) * patch) return false;
-    if (g.nz == 1) return true;
-    const Real fz = (Real(k - oz) + Real(0.5)) / Real(g.nz - 2 * oz)
-                  - Real(0.5);
-    return fabsf(fz) <= Real(0.5) * patch;
-}
+// are therefore j = 1 and j = ny-1, and rows 0 and ny-1 are ghosts. The hot
+// patch predicate is shared with the compressible branch (gpu/hotpatch.hpp).
 
 __global__ void kRbWall(GpuGrid g, Real Tbot, Real Ttop, Real patch, int ox,
                         int oz, Real* u, Real* v, Real* w, Real* T)
 {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t nxz = std::size_t(g.nx) * g.nz;
-    if (t >= 2 * nxz) return;
-    const bool hi = t >= nxz;
-    const int i = int(t % g.nx), k = int((t / g.nx) % g.nz);
-    const std::size_t c = gidx(g, i, hi ? g.ny - 1 : 0, k);
-    const std::size_t s = gidx(g, i, hi ? g.ny - 2 : 1, k);
+    int i, k;
+    bool hi;
+    std::size_t c, s;
+    if (!internal::yGhostPair(g, t, i, k, hi, c, s)) return;
 
     // Dirichlet plate: the linear image puts T = Twall on the wall face. The
     // floor carries Tbot only inside the patch; outside it, and on the whole
@@ -237,16 +223,6 @@ void applyRbWall(const GpuGrid& g, Real Tbot, Real Ttop, Real patch, bool closed
     checkLastKernel("kRbWallZ");
 }
 
-double rbPatchAreaFraction(const GpuGrid& g, double patch, bool closed)
-{
-    const int ox = sideGhostX(closed), oz = sideGhostZ(g, closed);
-    std::size_t inside = 0;
-    for (int k = oz; k < g.nz - oz; ++k)
-        for (int i = ox; i < g.nx - ox; ++i)
-            if (inHotPatch(g, i, k, Real(patch), ox, oz)) ++inside;
-    return double(inside) / (double(g.nx - 2 * ox) * (g.nz - 2 * oz));
-}
-
 void mirrorPressureWalls(const GpuGrid& g, bool closed, DeviceScalar& p)
 {
     kMirrorPressure<<<launchBlocks(g.size()), blockSize>>>(
@@ -284,19 +260,13 @@ hipError_t rbPlaneStats(const GpuGrid& g, bool closed, const DeviceField& U,
                         std::vector<double>& host)
 {
     const std::size_t n = std::size_t(g.ny) * 4;
-    if (scratch.size() < n)
-    {
-        auto b = DeviceBuffer<double>::make(n);
-        if (!b) return b.error();
-        scratch = std::move(*b);
-    }
+    if (auto e = internal::ensurePlaneScratch(scratch, n); e != hipSuccess)
+        return e;
     kRbPlaneStats<<<launchBlocks(std::size_t(g.ny)), blockSize>>>(
         g, sideGhostX(closed), sideGhostZ(g, closed), U.u.data(), U.v.data(),
         U.w.data(), T.data(), scratch.data());
     checkLastKernel("kRbPlaneStats");
-    host.resize(n);
-    return hipMemcpy(host.data(), scratch.data(), n * sizeof(double),
-                     hipMemcpyDeviceToHost);
+    return internal::fetchPlaneScratch(scratch, n, host);
 }
 
 } // namespace dns::gpu

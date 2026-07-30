@@ -43,7 +43,7 @@ struct Comp
     // distorted regular mesh (curvmesh.hpp).
     std::shared_ptr<const CurvMetrics> curv;
 
-    // gamma > 1, mu >= 0. Constant viscosity, Pr = 0.72, R = 1.
+    // gamma > 1, mu >= 0. The pre-thermal gas, Transport::constant.
     static Comp make(const Grid& g, double gamma, double mu);
 
     // Curvilinear variant; mesh defects (inverted cells, bad sizes) are

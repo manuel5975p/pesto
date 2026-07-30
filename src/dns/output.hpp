@@ -106,6 +106,10 @@ public:
     // The live shared-memory bridge (--emit shm). Same cadence as the web
     // frames; separate predicate because a run can want one without the other.
     bool wantsShm(double t) const;
+    // True when ANY kind is due -- the guard a runner puts in front of the
+    // derived-field kernels, so a frame's GPU work is skipped when nothing
+    // would consume it. frame() re-tests each kind itself.
+    bool wantsAnyFrame(double t) const;
 
     // Writes whichever kinds are enabled and due at time t. Advances the
     // cadences it consumed.

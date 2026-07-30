@@ -73,6 +73,27 @@ int die(int code, const std::string& msg)
     return code;
 }
 
+// The three centre-plane indices every frame geometry cuts on, plus the body
+// scale the web plane offsets are quoted in. nz/2 is already 0 at nz == 1, so
+// the 2D case needs no special value.
+void centrePlanes(FrameGeometry& fg, const Grid& g, double D)
+{
+    fg.ic = g.nx / 2;
+    fg.jc = g.ny / 2;
+    fg.kc = g.nz / 2;
+    fg.D = D;
+}
+
+// The line every run ends with. Returns the process exit code, so a runner's
+// tail is `return reportDone(...)`.
+template <class Stats>
+int reportDone(const Stats& st, const RunOutput& out)
+{
+    std::printf("done: %ld steps, %d frames, %.2f ms/step\n", st.steps,
+                out.frames(), st.msPerStep);
+    return 0;
+}
+
 // Case -> sink config. Genuinely app-layer wiring (it maps the validated
 // config onto the artefact sink's own config), but it was written out five
 // times; the cadences and the PNG coarsening are identical every time and only
@@ -161,10 +182,7 @@ int runFlowIncompressible(const Case& c, CaseGeometry& geo,
     FrameGeometry fg;
     fg.mask.assign(g.size(), 1.0f);
     for (std::size_t q = 0; q < g.size(); ++q) fg.mask[q] = float(geo.cut.lambda[q]);
-    fg.ic = g.nx / 2;
-    fg.jc = g.ny / 2;
-    fg.kc = g.nz == 1 ? 0 : g.nz / 2;
-    fg.D = geo.D;
+    centrePlanes(fg, g, geo.D);
     fg.i0 = 1;
     fg.j0 = 1;
     fg.k0 = g.nz == 1 ? 0 : 1;
@@ -259,9 +277,7 @@ int runFlowIncompressible(const Case& c, CaseGeometry& geo,
 
     auto res = gpu::runIncompressible(g, geo.cut, geo.sdf, U, rr, *out, finalOut);
     if (!res) return die(res.error().code, res.error().message);
-    std::printf("done: %ld steps, %d frames, %.2f ms/step\n", res->steps,
-                out->frames(), res->msPerStep);
-    return 0;
+    return reportDone(*res, *out);
 }
 
 // --- flow: compressible ----------------------------------------------------
@@ -301,10 +317,7 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
     // cell is fluid.
     FrameGeometry fg;
     fg.mask.assign(g.size(), 1.0f);
-    fg.ic = g.nx / 2;
-    fg.jc = g.ny / 2;
-    fg.kc = g.nz / 2;
-    fg.D = geo.D;
+    centrePlanes(fg, g, geo.D);
 
     const auto oc = outputConfig(
         c, std::format("{{\"app\":\"dns\",\"re\":{},\"mach\":{}", c.re,
@@ -406,10 +419,7 @@ int runFlowCompressible(const Case& c, CaseGeometry& geo)
 
     FrameGeometry fg;
     fg.mask = raster.apply(mask);
-    fg.ic = rg.nx / 2;
-    fg.jc = rg.ny / 2;
-    fg.kc = rg.nz / 2;
-    fg.D = geo.D;
+    centrePlanes(fg, rg, geo.D);
 
     RunMeta rmeta = c.meta;
     if (raster.active())
@@ -490,9 +500,7 @@ int runFlowCompressible(const Case& c, CaseGeometry& geo)
     auto res = gpu::runCompressible(g, host, geo.sdf,
                                     geo.hasBbox ? &geo.bbox : nullptr, rr, *out);
     if (!res) return die(res.error().code, res.error().message);
-    std::printf("done: %ld steps, %d frames, %.2f ms/step\n", res->steps,
-                out->frames(), res->msPerStep);
-    return 0;
+    return reportDone(*res, *out);
 }
 
 #endif // DNS_WITH_GPU
@@ -593,10 +601,7 @@ int runChannel(const Case& c)
 
     FrameGeometry fg;
     fg.mask = std::move(mask);
-    fg.ic = g.nx / 2;
-    fg.jc = g.ny / 2;
-    fg.kc = g.nz / 2;
-    fg.D = 2 * delta;
+    centrePlanes(fg, g, 2 * delta);
 
     const auto oc = outputConfig(
         c, std::format("{{\"app\":\"dns\",\"retau\":{},\"mach\":{}",
@@ -620,9 +625,7 @@ int runChannel(const Case& c)
 
     auto res = gpu::runChannel(g, host, rr, *out);
     if (!res) return die(res.error().code, res.error().message);
-    std::printf("done: %ld steps, %d frames, %.2f ms/step\n", res->steps,
-                out->frames(), res->msPerStep);
-    return 0;
+    return reportDone(*res, *out);
 #else
     return exitNoGpu;
 #endif
@@ -630,6 +633,24 @@ int runChannel(const Case& c)
 
 
 // --- conv ------------------------------------------------------------------
+
+// The artefact sink of a convection run. The two branches are two MODELS and
+// share no physics code, but they write the same artefacts with the same
+// metadata and the same centre planes -- so the sink is built once and the
+// only thing either branch supplies is its own ghost mask.
+std::expected<RunOutput, std::string> convOutput(const Case& c,
+                                                 std::vector<float> mask)
+{
+    FrameGeometry fg;
+    fg.mask = std::move(mask);
+    centrePlanes(fg, c.grid, c.convH);
+    return RunOutput::make(
+        outputConfig(c,
+                     std::format("{{\"app\":\"dns\",\"rayleigh\":{},"
+                                 "\"prandtl\":{}",
+                                 c.rayleigh, c.prandtl)),
+        c.meta, c.grid, std::move(fg));
+}
 
 int runConv(const Case& c)
 {
@@ -646,30 +667,10 @@ int runConv(const Case& c)
     {
         auto U = VectorField::zeros(g);
         auto T = zeros(g);
-        rbIC(c, U, T);
+        std::vector<float> mask(g.size(), 1.0f);
+        rbIC(c, U, T, mask);
 
-        // Ghost cells are not fluid and must not be drawn: the two wall rows
-        // always, and the lateral columns once those faces are walls. (The
-        // compressible twin gets the same mask from convIC.)
-        FrameGeometry fg;
-        fg.mask.assign(g.size(), 1.0f);
-        const int ox = c.closedSides ? 1 : 0;
-        const int oz = c.closedSides && g.nz > 1 ? 1 : 0;
-        for (int k = 0; k < g.nz; ++k)
-            for (int j = 0; j < g.ny; ++j)
-                for (int i = 0; i < g.nx; ++i)
-                    if (j < 1 || j > g.ny - 2 || i < ox || i >= g.nx - ox
-                        || k < oz || k >= g.nz - oz)
-                        fg.mask[g.idx(i, j, k)] = 0.0f;
-        fg.ic = g.nx / 2;
-        fg.jc = g.ny / 2;
-        fg.kc = g.nz / 2;
-        fg.D = c.convH;
-
-        const auto oc = outputConfig(
-            c, std::format("{{\"app\":\"dns\",\"rayleigh\":{},\"prandtl\":{}",
-                           c.rayleigh, c.prandtl));
-        auto out = RunOutput::make(oc, c.meta, g, std::move(fg));
+        auto out = convOutput(c, std::move(mask));
         if (!out) return die(exitOutput, out.error());
 
         gpu::RbRun rr;
@@ -690,26 +691,14 @@ int runConv(const Case& c)
 
         auto res = gpu::runRb(g, U, T, rr, *out);
         if (!res) return die(res.error().code, res.error().message);
-        std::printf("done: %ld steps, %d frames, %.2f ms/step\n", res->steps,
-                    out->frames(), res->msPerStep);
-        return 0;
+        return reportDone(*res, *out);
     }
 
     auto host = CompState::zeros(g);
     std::vector<float> mask(g.size(), 1.0f);
     convIC(c, gamma, host, mask);
 
-    FrameGeometry fg;
-    fg.mask = std::move(mask);
-    fg.ic = g.nx / 2;
-    fg.jc = g.ny / 2;
-    fg.kc = g.nz / 2;
-    fg.D = c.convH;
-
-    const auto oc = outputConfig(
-        c, std::format("{{\"app\":\"dns\",\"rayleigh\":{},\"prandtl\":{}",
-                       c.rayleigh, c.prandtl));
-    auto out = RunOutput::make(oc, c.meta, g, std::move(fg));
+    auto out = convOutput(c, std::move(mask));
     if (!out) return die(exitOutput, out.error());
 
     gpu::ConvRun rr;
@@ -733,9 +722,7 @@ int runConv(const Case& c)
 
     auto res = gpu::runConv(g, host, rr, *out);
     if (!res) return die(res.error().code, res.error().message);
-    std::printf("done: %ld steps, %d frames, %.2f ms/step\n", res->steps,
-                out->frames(), res->msPerStep);
-    return 0;
+    return reportDone(*res, *out);
 #else
     return exitNoGpu;
 #endif

@@ -2,50 +2,26 @@
 
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/index.hpp"
+#include "dns/gpu/internal/plane_sums.hpp"
+#include "dns/gpu/internal/wall_ghost.hpp"
 
 namespace dns::gpu {
 
 namespace {
 
-// Ghost rows {0, ny-1} mirror rows {1, ny-2}; writes and reads are disjoint.
-// Adiabatic (isothermal == 0): rho/E copied, ALL momentum antimirrored --
-// the same arithmetic as comp_far's kFarWallY no-slip branch. Isothermal:
-// the ghost thermodynamic state is built so the wall face holds T = Twall
-// and dp/dn = 0, with the mirrored velocity: T0 = 2 Twall - T1 (floored at
-// Twall/20 so a transient cannot construct a negative-temperature ghost),
-// p0 = p1, rho0 = p0/(R T0), m0 = -rho0 u1, E0 from (p0, rho0, |u1|).
+// The two plates. Both ghost states are the shared no-slip wall
+// (internal/wall_ghost.hpp); this kernel only picks which one.
 __global__ void kChannelWallY(GpuGrid g, int isothermal, Real gam, Real Rgas,
                               Real Twall, Real* rho, Real* mx, Real* my,
                               Real* mz, Real* E)
 {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t nxz = std::size_t(g.nx) * g.nz;
-    if (t >= 2 * nxz) return;
-    const bool hi = t >= nxz;
-    const int i = int(t % g.nx), k = int((t / g.nx) % g.nz);
-    const std::size_t c = gidx(g, i, hi ? g.ny - 1 : 0, k);
-    const std::size_t s = gidx(g, i, hi ? g.ny - 2 : 1, k);
-    if (!isothermal)
-    {
-        rho[c] = rho[s];
-        mx[c] = -mx[s];
-        my[c] = -my[s];
-        mz[c] = -mz[s];
-        E[c] = E[s];
-        return;
-    }
-    const Real r1 = rho[s];
-    const Real u1 = mx[s] / r1, v1 = my[s] / r1, w1 = mz[s] / r1;
-    const Real ke1 = Real(0.5) * (u1 * u1 + v1 * v1 + w1 * w1);
-    const Real p1 = (gam - Real(1)) * (E[s] - r1 * ke1);
-    const Real T1 = p1 / (Rgas * r1);
-    const Real T0 = fmaxf(Real(2) * Twall - T1, Real(0.05) * Twall);
-    const Real r0 = p1 / (Rgas * T0);
-    rho[c] = r0;
-    mx[c] = -r0 * u1;
-    my[c] = -r0 * v1;
-    mz[c] = -r0 * w1;
-    E[c] = p1 / (gam - Real(1)) + r0 * ke1;
+    int i, k;
+    bool hi;
+    std::size_t c, s;
+    if (!internal::yGhostPair(g, t, i, k, hi, c, s)) return;
+    if (!isothermal) internal::adiabaticGhost(c, s, rho, mx, my, mz, E);
+    else internal::isothermalGhost(c, s, gam, Rgas, Twall, rho, mx, my, mz, E);
 }
 
 // Additive rhs contribution: the stage kernel already wrote the interior
@@ -124,18 +100,12 @@ hipError_t channelPlaneStats(const GpuGrid& g, const DeviceScalar& rho,
                              std::vector<double>& host)
 {
     const std::size_t n = std::size_t(g.ny) * 8;
-    if (scratch.size() < n)
-    {
-        auto b = DeviceBuffer<double>::make(n);
-        if (!b) return b.error();
-        scratch = std::move(*b);
-    }
+    if (auto e = internal::ensurePlaneScratch(scratch, n); e != hipSuccess)
+        return e;
     kPlaneStats<<<launchBlocks(std::size_t(g.ny)), blockSize>>>(
         g, rho.data(), u.data(), v.data(), w.data(), T.data(), scratch.data());
     checkLastKernel("kPlaneStats");
-    host.resize(n);
-    return hipMemcpy(host.data(), scratch.data(), n * sizeof(double),
-                     hipMemcpyDeviceToHost);
+    return internal::fetchPlaneScratch(scratch, n, host);
 }
 
 } // namespace dns::gpu

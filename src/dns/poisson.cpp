@@ -2,8 +2,9 @@
 // available, the exact spectral inversion of the 2nd-order FD Laplacian.
 // One TU: the two are alternative implementations of one interface, and
 // makeDefaultSolver picks between them at compile time.
-#include "dns/poisson_internal.hpp"
+#include "dns/poisson.hpp"
 
+#include "dns/poisson_internal.hpp"
 
 #include <algorithm>
 #include <cmath>

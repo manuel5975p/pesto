@@ -20,6 +20,8 @@
 
 #include <array>
 #include <expected>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -28,7 +30,12 @@ namespace dns {
 
 enum class SceneObjectKind { Cylinder, Sphere, Cube, Lens, Mesh };
 
+// The ONE spelling of the kinds, indexed BY the enum value: the TOML parser,
+// the writer, the `unknown kind` message and the editor's picker all read it.
+std::span<const char* const> sceneObjectKindNames();
 const char* name(SceneObjectKind);
+// The inverse; nullopt when `s` is not a kind keyword.
+std::optional<SceneObjectKind> sceneObjectKindFromName(std::string_view s);
 
 struct SceneObject
 {

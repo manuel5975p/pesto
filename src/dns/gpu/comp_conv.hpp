@@ -78,10 +78,6 @@ private:
 void addGravityY(const GpuGrid& g, double gy, Real cr, bool closed,
                  const DeviceCompState& s, DeviceCompState& out);
 
-// Area fraction of the floor the patch covers, counted in CELLS (the discrete
-// value the Nusselt normalisation needs, not the nominal patch^2).
-double convPatchAreaFraction(const GpuGrid& g, double patch, bool closed);
-
 // Deterministic FP64 per-y-plane moment sums: for every row j,
 //   out[j*6 + 0..5] = sum over (i,k) of
 //                     {rho, T, v, v T, rho (u^2+v^2+w^2), rho v T}.

@@ -86,8 +86,8 @@ public:
     make(const Grid& g, const Transport& tr, double csLes = 0.0,
          SgsModel sgs = SgsModel::Smagorinsky);
 
-    // Constant-viscosity shorthand (gamma, mu, Pr = 0.72, R = 1): the gas the
-    // solver had before transport was temperature-dependent, bit-for-bit.
+    // Constant-viscosity shorthand: Transport::constant(gamma, mu), the gas
+    // the solver had before transport was temperature-dependent, bit-for-bit.
     static std::expected<DeviceComp, hipError_t>
     make(const Grid& g, double gamma, double mu, double csLes = 0.0,
          SgsModel sgs = SgsModel::Smagorinsky);
@@ -146,9 +146,6 @@ public:
     // needs mu or kappa goes through this, so a temperature-dependent law
     // reaches the surface tallies and the boundary kernels for free.
     const Transport& transport() const { return tr_; }
-
-    // Heat conductivity at the reference temperature, mu cp / Pr.
-    Real kappaCond() const { return Real(tr_.muRef * tr_.cp() / tr_.Pr); }
 
     // Called on every RK stage input before its rhs (boundary conditions and
     // embedded-boundary fill); the hook may mutate the state in place.

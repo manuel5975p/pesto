@@ -101,6 +101,10 @@ void convIC(const Case& c, double gamma, CompState& state,
 // The trip is the analytic curl of a streamfunction sampled at the MAC face
 // positions, so it is solenoidal to truncation rather than exactly; the first
 // projection removes the remainder, exactly as it does for channelIC.
-void rbIC(const Case& c, VectorField& U, Scalar& T);
+//
+// `mask` is marked 0 on the ghost cells, on convIC's contract: the two wall
+// rows always, and the lateral ghost columns once those sides are walls. Pre:
+// mask sized c.grid.size() and pre-filled with 1.
+void rbIC(const Case& c, VectorField& U, Scalar& T, std::vector<float>& mask);
 
 } // namespace dns

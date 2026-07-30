@@ -69,7 +69,6 @@ public:
     VkRenderPass renderPass() const { return renderPass_; }
     int frameIndex() const { return frame_; }
     VkDevice dev() const { return dev_; }
-    VkFormat depthFormat() const { return depthFormat_; }
     // MSAA sample count actually in use (1 = off). The 3D grid is nothing but
     // thin lines, so this is the difference between a readable mesh and a
     // shimmering moire.

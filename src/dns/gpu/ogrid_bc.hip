@@ -3,6 +3,7 @@
 #include "dns/gpu/internal/comp_flux.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/index.hpp"
+#include "dns/gpu/internal/wall_ghost.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -23,12 +24,9 @@ namespace {
 // is. (A FREE-SLIP wall would not be: it needs m - 2 (m.n) n and the local
 // normal, so it is deliberately not offered here.)
 //
-// Adiabatic (isothermal == 0): rho/E copied, momentum antimirrored -- the same
-// arithmetic as the channel's adiabatic branch, so the wall face carries
-// T0 == T1 and the Fourier flux through it is identically zero.
-// Isothermal: T0 = 2 Twall - T1 floored at Twall/20 (a transient must not be
-// able to construct a negative-temperature ghost), p0 = p1, rho0 = p0/(R T0),
-// E0 rebuilt on the antimirrored velocity.
+// Both ghost states are the shared no-slip wall (internal/wall_ghost.hpp) --
+// the same one the channel and convection plates get. Only the row differs:
+// there are two plates on a box and one wall here, at j = 0.
 __global__ void kOGridWall(GpuGrid g, int isothermal, Real gam, Real Rgas,
                            Real Twall, Real* rho, Real* mx, Real* my, Real* mz,
                            Real* E)
@@ -39,27 +37,8 @@ __global__ void kOGridWall(GpuGrid g, int isothermal, Real gam, Real Rgas,
     const int i = int(t % g.nx), k = int(t / g.nx);
     const std::size_t c = gidx(g, i, 0, k);
     const std::size_t s = gidx(g, i, 1, k);
-    if (!isothermal)
-    {
-        rho[c] = rho[s];
-        mx[c] = -mx[s];
-        my[c] = -my[s];
-        mz[c] = -mz[s];
-        E[c] = E[s];
-        return;
-    }
-    const Real r1 = rho[s];
-    const Real u1 = mx[s] / r1, v1 = my[s] / r1, w1 = mz[s] / r1;
-    const Real ke1 = Real(0.5) * (u1 * u1 + v1 * v1 + w1 * w1);
-    const Real p1 = (gam - Real(1)) * (E[s] - r1 * ke1);
-    const Real T1 = p1 / (Rgas * r1);
-    const Real T0 = fmaxf(Real(2) * Twall - T1, Real(0.05) * Twall);
-    const Real r0 = p1 / (Rgas * T0);
-    rho[c] = r0;
-    mx[c] = -r0 * u1;
-    my[c] = -r0 * v1;
-    mz[c] = -r0 * w1;
-    E[c] = p1 / (gam - Real(1)) + r0 * ke1;
+    if (!isothermal) internal::adiabaticGhost(c, s, rho, mx, my, mz, E);
+    else internal::isothermalGhost(c, s, gam, Rgas, Twall, rho, mx, my, mz, E);
 }
 
 // --- outer far-field row (j = ny-1) ------------------------------------------

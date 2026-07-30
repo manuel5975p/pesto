@@ -9,8 +9,11 @@
 #include "dns/sgs.hpp"
 
 #include <expected>
+#include <optional>
 #include <set>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace dns {
@@ -25,6 +28,19 @@ enum class BodyKind { None, Cylinder, Sphere, Cube, Lens, Fence, Floor, Mesh, Sc
 // theta = 0 value of the exact coefficient); the other two derive it from the
 // data, per face cell or per transverse DCT mode. See docs/nscbc.md.
 enum class NscbcAbc { YooIm, Adaptive, Modal };
+
+// The ONE spelling of each of these enums, indexed BY the enum value. The CLI
+// parser, the resolved-case printer, the --body error text and the editor's
+// pickers all read these rather than restating them -- a body kind added to
+// the enum and the table is then complete everywhere, which four hand-kept
+// copies (one of them a hardcoded count) were not.
+std::span<const char* const> bodyKindNames();
+std::span<const char* const> farFieldNames();
+const char* name(BodyKind);
+const char* name(FarField);
+// The inverse of name(BodyKind); nullopt when `s` is not a body keyword (a
+// mesh path, say, which the caller recognises by suffix instead).
+std::optional<BodyKind> bodyKindFromName(std::string_view s);
 
 // One field per CLI flag. `given` records which flags the user actually typed,
 // so the validator can distinguish "left at the default" from "set to the

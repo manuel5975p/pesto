@@ -146,7 +146,7 @@ CompState CompState::zeros(const Grid& g)
 Comp Comp::make(const Grid& g, double gamma, double mu)
 {
     assert(gamma > 1.0 && mu >= 0.0);
-    return {g, Transport::air(mu, 1.0, 0.0, 0.72, gamma, 1.0, false), nullptr};
+    return {g, Transport::constant(gamma, mu), nullptr};
 }
 
 std::expected<Comp, std::string> Comp::make(const CurvMesh& mesh, double gamma,

@@ -2,11 +2,11 @@
 // from the Mach number, the superadiabatic drop, nu from Ra), the ghost-row
 // grid, the hydrostatic initial condition, and the rejections -- above all the
 // subadiabatic layer, which is a configuration error and not a result.
-#include "dns/cli.hpp"
 #include "dns/comp.hpp"
 #include "dns/config.hpp"
 #include "dns/flow_ic.hpp"
 #include "check.hpp"
+#include "cli_test_util.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -17,24 +17,9 @@ namespace {
 
 using dnstest::check;
 
-std::expected<dns::Case, dns::ConfigError> run(std::vector<std::string> args)
-{
-    std::vector<char*> argv;
-    argv.push_back(const_cast<char*>("dns"));
-    for (auto& a : args) argv.push_back(a.data());
-    auto raw = dns::cli::parse(int(argv.size()), argv.data());
-    if (!raw)
-        return std::unexpected(dns::ConfigError{1, "cli", raw.error().message});
-    return dns::validate(*raw);
-}
+using dnstest::runCli;
+using dnstest::rejected;
 
-bool rejected(std::vector<std::string> args, int code, const std::string& what)
-{
-    auto c = run(std::move(args));
-    const bool ok = !c && c.error().code == code;
-    check(ok, what);
-    return ok;
-}
 
 bool near(double a, double b, double tol) { return std::abs(a - b) <= tol; }
 
@@ -46,7 +31,7 @@ int main()
 
     // The derivation chain, checked term by term against its own definitions.
     {
-        auto c = run({"conv"});
+        auto c = runCli({"conv"});
         check(c.has_value(), "defaults validate");
         if (c)
         {
@@ -86,8 +71,8 @@ int main()
 
     // Ra enters only through nu, and as an inverse square root.
     {
-        auto a = run({"conv", "--rayleigh", "1e6"});
-        auto b = run({"conv", "--rayleigh", "4e6"});
+        auto a = runCli({"conv", "--rayleigh", "1e6"});
+        auto b = runCli({"conv", "--rayleigh", "4e6"});
         check(a && b && near(a->nu / b->nu, 2.0, 1e-9),
               "nu scales as 1/sqrt(Ra)");
         check(a && b && near(a->gravity, b->gravity, 1e-15),
@@ -97,8 +82,8 @@ int main()
     // The adiabatic fraction is M^2 (gamma-1) / dtemp^2, so it vanishes
     // quadratically with the Mach number.
     {
-        auto lo = run({"conv", "--mach", "0.02"});
-        auto hi = run({"conv", "--mach", "0.08"});
+        auto lo = runCli({"conv", "--mach", "0.02"});
+        auto hi = runCli({"conv", "--mach", "0.08"});
         check(lo && hi, "both Mach numbers validate");
         if (lo && hi)
         {
@@ -116,7 +101,7 @@ int main()
     rejected({"conv", "--mach", "0.6", "--dtemp", "0.1"}, 2,
              "subadiabatic layer rejected");
     {
-        auto c = run({"conv", "--mach", "0.6", "--dtemp", "0.1"});
+        auto c = runCli({"conv", "--mach", "0.6", "--dtemp", "0.1"});
         check(!c && c.error().field == "--mach"
                   && c.error().message.find("subadiabatic") != std::string::npos,
               "the rejection names --mach and says subadiabatic");
@@ -124,12 +109,12 @@ int main()
 
     // Onset and 2D are advisories, not errors: both are legitimate runs.
     {
-        auto c = run({"conv", "--rayleigh", "1000"});
+        auto c = runCli({"conv", "--rayleigh", "1000"});
         check(c.has_value(), "subcritical Ra validates");
         check(c && c->warnings.size() == 1
                   && c->warnings[0].find("1708") != std::string::npos,
               "subcritical Ra warns about onset");
-        auto d = run({"conv", "--nz", "1"});
+        auto d = runCli({"conv", "--nz", "1"});
         check(d && d->warnings.size() == 1
                   && d->warnings[0].find("vortex stretching") != std::string::npos,
               "nz == 1 warns that 2D Nu is qualitative");
@@ -139,8 +124,8 @@ int main()
     // the PLATES' idiom: a ghost column per walled axis, so the GRID grows and
     // the fluid extent does not move.
     {
-        auto p = run({"conv", "--n", "32", "--ny", "16", "--nz", "8"});
-        auto c = run({"conv", "--n", "32", "--ny", "16", "--nz", "8", "--sides",
+        auto p = runCli({"conv", "--n", "32", "--ny", "16", "--nz", "8"});
+        auto c = runCli({"conv", "--n", "32", "--ny", "16", "--nz", "8", "--sides",
                       "closed"});
         check(p.has_value() && c.has_value(), "both --sides values validate");
         if (p && c)
@@ -167,12 +152,12 @@ int main()
         }
         // 2D closes x only: z at nz == 1 is exact periodic wrap, not a
         // degenerate wall, and a z ghost there would invent a third dimension.
-        auto d = run({"conv", "--n", "32", "--ny", "16", "--nz", "1", "--sides",
+        auto d = runCli({"conv", "--n", "32", "--ny", "16", "--nz", "1", "--sides",
                       "closed"});
         check(d && d->grid.nx == 34 && d->grid.nz == 1,
               "at nz == 1 only x closes");
-        auto e = run({"conv", "--sides", "periodic"});
-        auto f = run({"conv"});
+        auto e = runCli({"conv", "--sides", "periodic"});
+        auto f = runCli({"conv"});
         check(e && f && !e->closedSides && e->grid.nx == f->grid.nx,
               "--sides periodic is the default, spelled out");
     }
@@ -197,17 +182,17 @@ int main()
     rejected({"flow", "--body", "cylinder", "--temp"}, 2,
              "--temp rejected on the incompressible solver");
     {
-        auto c = run({"flow", "--body", "cylinder", "--physics", "compressible",
+        auto c = runCli({"flow", "--body", "cylinder", "--physics", "compressible",
                       "--temp"});
         check(c && c->tempFrames, "--temp accepted on the compressible solver");
-        auto d = run({"flow", "--body", "cylinder", "--physics", "compressible"});
+        auto d = runCli({"flow", "--body", "cylinder", "--physics", "compressible"});
         check(d && !d->tempFrames, "temp frames are off by default");
     }
 
     // The initial condition is a genuine hydrostatic equilibrium: dp/dy must
     // balance -rho g to the discretisation, not merely be "close to uniform".
     {
-        auto c = run({"conv", "--n", "8", "--ny", "32", "--nz", "1",
+        auto c = runCli({"conv", "--n", "8", "--ny", "32", "--nz", "1",
                       "--kick", "0"});
         check(c.has_value(), "IC case validates");
         if (c)
@@ -254,7 +239,7 @@ int main()
     // weak.
     {
         auto firstRowFraction = [&](int nyFluid) {
-            auto c = run({"conv", "--n", "16", "--ny", std::to_string(nyFluid),
+            auto c = runCli({"conv", "--n", "16", "--ny", std::to_string(nyFluid),
                           "--nz", "1", "--kick", "0.05"});
             check(c.has_value(), "kicked case validates (ny "
                                      + std::to_string(nyFluid) + ")");
@@ -289,7 +274,7 @@ int main()
     // face sits half a cell outside the first fluid column.
     {
         auto firstColFraction = [&](int nxFluid) {
-            auto c = run({"conv", "--n", std::to_string(nxFluid), "--ny", "16",
+            auto c = runCli({"conv", "--n", std::to_string(nxFluid), "--ny", "16",
                           "--nz", "1", "--kick", "0.05", "--sides", "closed"});
             check(c.has_value(), "closed kicked case validates (n "
                                      + std::to_string(nxFluid) + ")");
@@ -327,7 +312,7 @@ int main()
     // depend on x -- an adiabatic side wall is only consistent with a
     // temperature field that has no lateral gradient to conduct.
     {
-        auto c = run({"conv", "--physics", "incompressible", "--n", "32",
+        auto c = runCli({"conv", "--physics", "incompressible", "--n", "32",
                       "--ny", "16", "--nz", "1", "--kick", "0.05", "--sides",
                       "closed"});
         check(c.has_value(), "closed Boussinesq case validates");
@@ -336,7 +321,8 @@ int main()
             const auto& g = c->grid;
             auto U = dns::VectorField::zeros(g);
             auto T = dns::zeros(g);
-            dns::rbIC(*c, U, T);
+            std::vector<float> mask(c->grid.size(), 1.0f);
+            dns::rbIC(*c, U, T, mask);
             double wallLo = 0, wallHi = 0, any = 0, dTdx = 0;
             for (int j = 1; j <= g.ny - 2; ++j)
             {

@@ -140,9 +140,6 @@ public:
                DeviceCompState& out, const StageCombine& cmb,
                const AxisRemap3& remap) const;
 
-    // Device bytes the modal closure owns; 0 when it is off.
-    std::size_t abcBytes() const { return abc_ ? abc_->bytes() : 0; }
-
     // Inflow target u (quiet-start ramp tracking); must stay subsonic.
     void setFreestream(double u) { u_ = u; }
     double freestream() const { return u_; }

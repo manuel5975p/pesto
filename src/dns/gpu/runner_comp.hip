@@ -1,15 +1,17 @@
-#include "dns/interrupt.hpp"
 #include "dns/gpu/runner_comp.hpp"
+
+#include "dns/interrupt.hpp"
 
 #include "dns/curvmesh.hpp"
 #include "dns/gpu/comp.hpp"
-#include "dns/gpu/internal/derived_remap.hpp"
-#include "dns/gpu/internal/run_loop.hpp"
 #include "dns/gpu/comp_far.hpp"
 #include "dns/gpu/comp_ghost.hpp"
 #include "dns/gpu/comp_nscbc.hpp"
 #include "dns/gpu/derived.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/internal/derived_remap.hpp"
+#include "dns/gpu/internal/frame_scratch.hpp"
+#include "dns/gpu/internal/run_loop.hpp"
 #include "dns/gpu/reductions.hpp"
 #include "dns/gpu/rotortable.hpp"
 
@@ -287,14 +289,6 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     if (nsc) nsc->setFreestream(u0);
     applyBc(*ds);
 
-    auto du = DeviceScalar::make(g.size());
-    auto dv = DeviceScalar::make(g.size());
-    auto dw = DeviceScalar::make(g.size());
-    auto dVort = DeviceScalar::make(g.size());
-    auto dSpeed = DeviceScalar::make(g.size());
-    if (!du || !dv || !dw || !dVort || !dSpeed)
-        return fail(6, "GPU allocation failed");
-
     // qw is the wall heat flux (an energy RATE into the body, comp_ghost.hpp);
     // it is identically zero on the default adiabatic wall.
     // A rotor adds thrust and shaft torque, and their coefficients on the
@@ -321,20 +315,13 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                             : (r.signedVorticity ? 8.0 : 15.0) * r.uInf / r.D);
     const float speedMax = float(1.6 * r.uInf);
     const char* vortName = r.signedVorticity ? "vort" : "curl";
-    std::vector<Real> hVort(g.size()), hSpeed(g.size());
-    std::vector<float> vortF(g.size()), speedF(g.size());
     // --temp: T - Tinf on the diverging map, so the freestream is the neutral
-    // background exactly as --speed-map delta does for velocity. The clip is
-    // whichever thermal excursion the case can actually produce -- an
-    // isothermal wall's own offset, or the stagnation rise (gamma-1)/2 M^2
-    // Tinf that an adiabatic body still generates.
+    // background exactly as --speed-map delta does for velocity; the clip is
+    // shared with the O-grid runner (internal/frame_scratch.hpp).
     const double TInf = r.pInf / (r.rhoInf * r.tr.Rgas);
     const double machSq = r.uInf * r.uInf * r.rhoInf / (r.tr.gamma * r.pInf);
-    const float tempScale = float(std::max(
-        r.wallIsothermal ? std::abs(r.Twall - TInf) : 0.0,
-        0.5 * (r.tr.gamma - 1.0) * machSq * TInf));
-    std::vector<Real> hTemp(r.tempFrames ? g.size() : 0);
-    std::vector<float> tempF(r.tempFrames ? g.size() : 0);
+    const float tempScale = internal::thermalFrameScale(
+        TInf, machSq, r.tr.gamma, r.wallIsothermal, r.Twall);
     // Display raster: on a clustered mesh the frame arrays are resampled onto
     // the uniform physical grid RunOutput was built with (dns/framemap.hpp).
     const bool resample = r.raster && r.raster->active();
@@ -342,43 +329,35 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     std::vector<float> vortR(rn), speedR(rn);
     std::vector<float> tempR(r.tempFrames ? rn : 0);
     std::vector<float> rotorMaskR(r.rotor.active() ? rn : 0);
+    internal::FrameScratch fs;
     auto writeFrame = [&](double t) {
+        if (!fs.ensure(g.size(), r.tempFrames ? 3 : 2, true)) return;
         if (r.tempFrames) dev->primitives(*ds);
-        primitiveVelocity(gg, ds->rho, ds->mx, ds->my, ds->mz, *du, *dv, *dw);
+        primitiveVelocity(gg, ds->rho, ds->mx, ds->my, ds->mz, fs.u(), fs.v(),
+                          fs.w());
         if (r.signedVorticity && stretched)
-            vorticityZRemap(gg, remap, *du, *dv, *dVort);
+            vorticityZRemap(gg, remap, fs.u(), fs.v(), fs.vort());
         else if (r.signedVorticity && focal)
-            vorticityZRemap(gg, fremap, *du, *dv, *dVort);
-        else if (r.signedVorticity) vorticityZCentred(gg, *du, *dv, *dVort);
-        else curlMagCentred(gg, *du, *dv, *dw, *dVort);
-        speedCentred(gg, *du, *dv, *dw, *dSpeed);
-        (void)dVort->download(hVort.data());
-        (void)dSpeed->download(hSpeed.data());
-        const float uOff = r.speedDelta ? float(r.uInf) : 0.0f;
-        for (std::size_t c = 0; c < g.size(); ++c)
-        {
-            vortF[c] = float(hVort[c]);
-            speedF[c] = float(hSpeed[c]) - uOff;
-        }
-        const float* vortOut = vortF.data();
-        const float* speedOut = speedF.data();
-        const float* tempOut = nullptr;
-        if (r.tempFrames)
-        {
-            (void)dev->T().download(hTemp.data());
-            for (std::size_t c = 0; c < g.size(); ++c)
-                tempF[c] = float(double(hTemp[c]) - TInf);
-            tempOut = tempF.data();
-        }
+            vorticityZRemap(gg, fremap, fs.u(), fs.v(), fs.vort());
+        else if (r.signedVorticity)
+            vorticityZCentred(gg, fs.u(), fs.v(), fs.vort());
+        else curlMagCentred(gg, fs.u(), fs.v(), fs.w(), fs.vort());
+        speedCentred(gg, fs.u(), fs.v(), fs.w(), fs.speed());
+        fs.take(0, fs.vort());
+        fs.take(1, fs.speed(), r.speedDelta ? r.uInf : 0.0);
+        if (r.tempFrames) fs.take(2, dev->T(), TInf);
+        const float* vortOut = fs.channel(0);
+        const float* speedOut = fs.channel(1);
+        const float* tempOut = r.tempFrames ? fs.channel(2) : nullptr;
         if (resample)
         {
-            r.raster->apply(vortF.data(), vortR.data());
-            r.raster->apply(speedF.data(), speedR.data());
+            r.raster->apply(fs.channel(0), vortR.data());
+            r.raster->apply(fs.channel(1), speedR.data());
             vortOut = vortR.data();
             speedOut = speedR.data();
             if (r.tempFrames)
             {
-                r.raster->apply(tempF.data(), tempR.data());
+                r.raster->apply(fs.channel(2), tempR.data());
                 tempOut = tempR.data();
             }
         }
@@ -389,9 +368,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                 ? FrameField{"dspeed", speedOut, 0, float(0.6 * r.uInf), true}
                 : FrameField{"speed", speedOut, 0, speedMax, false},
             {"temp", tempOut, -tempScale, tempScale, true}};
-        const std::span<const FrameField> fv(ff, r.tempFrames ? 3u : 2u);
-        if (auto e = out.frame(t, FrameViews{fv}); !e)
-            std::fprintf(stderr, "frame write failed: %s\n", e.error().c_str());
+        internal::FrameScratch::emit(out, t, {ff, r.tempFrames ? 3u : 2u});
     };
 
     RunStats st;
@@ -518,8 +495,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         // that used to suppress them hid the first `ramp` time units of every
         // run for no numerical reason -- the sinks pace themselves via
         // fdt/pdt/wdt either way.
-        if (out.wantsFrame(t) || out.wantsPng(t) || out.wantsWeb(t)
-            || out.wantsShm(t))
+        if (out.wantsAnyFrame(t))
         {
             if (rotorTable && rotorMaskBin != rotorBinLoaded)
             {

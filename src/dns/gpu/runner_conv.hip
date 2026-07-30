@@ -1,10 +1,13 @@
-#include "dns/interrupt.hpp"
 #include "dns/gpu/runner_conv.hpp"
+
+#include "dns/interrupt.hpp"
 
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_conv.hpp"
 #include "dns/gpu/derived.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/hotpatch.hpp"
+#include "dns/gpu/internal/frame_scratch.hpp"
 #include "dns/gpu/internal/run_loop.hpp"
 #include "dns/gpu/reductions.hpp"
 #include "dns/transport.hpp"
@@ -65,16 +68,8 @@ runConv(const Grid& g, const CompState& ic, const ConvRun& r, RunOutput& out)
     // Area-mean floor temperature: the wall-gradient Nusselt number is built
     // from plane averages, so the pinned value must be the mean of the
     // per-column wall temperatures (see the Boussinesq twin).
-    const double patchFrac = convPatchAreaFraction(gg, r.patch, r.closedSides);
+    const double patchFrac = hotPatchAreaFraction(gg, r.patch, r.closedSides);
     const double TwallBot = patchFrac * r.Tbot + (1.0 - patchFrac) * r.Ttop;
-
-    auto du = DeviceScalar::make(g.size());
-    auto dv = DeviceScalar::make(g.size());
-    auto dw = DeviceScalar::make(g.size());
-    auto dVort = DeviceScalar::make(g.size());
-    auto dSpeed = DeviceScalar::make(g.size());
-    if (!du || !dv || !dw || !dVort || !dSpeed)
-        return fail(6, "GPU allocation failed");
 
     const std::string cols[] = {"t",      "dt",   "nuBot", "nuTop",
                                 "nuFlux", "urms", "KE"};
@@ -95,30 +90,24 @@ runConv(const Grid& g, const CompState& ic, const ConvRun& r, RunOutput& out)
                                            std::abs(r.Ttop - tCentre)));
     const float speedMax = float(1.6 * r.uFf);
     const float vortScale = float(r.uFf > 0 ? 8.0 * r.uFf / r.H : 8.0);
-    std::vector<Real> hVort(g.size()), hSpeed(g.size()), hTemp(g.size());
-    std::vector<float> vortF(g.size()), speedF(g.size()), tempF(g.size());
+    internal::FrameScratch fs;
     auto writeFrame = [&](double t) {
+        if (!fs.ensure(g.size(), 3, true)) return;
         dev->primitives(*ds);
-        primitiveVelocity(gg, ds->rho, ds->mx, ds->my, ds->mz, *du, *dv, *dw);
-        if (g.nz == 1) vorticityZCentred(gg, *du, *dv, *dVort);
-        else curlMagCentred(gg, *du, *dv, *dw, *dVort);
-        speedCentred(gg, *du, *dv, *dw, *dSpeed);
-        (void)dVort->download(hVort.data());
-        (void)dSpeed->download(hSpeed.data());
-        (void)dev->T().download(hTemp.data());
-        for (std::size_t c = 0; c < g.size(); ++c)
-        {
-            vortF[c] = float(hVort[c]);
-            speedF[c] = float(hSpeed[c]);
-            tempF[c] = float(double(hTemp[c]) - tempRef);
-        }
+        primitiveVelocity(gg, ds->rho, ds->mx, ds->my, ds->mz, fs.u(), fs.v(),
+                          fs.w());
+        if (g.nz == 1) vorticityZCentred(gg, fs.u(), fs.v(), fs.vort());
+        else curlMagCentred(gg, fs.u(), fs.v(), fs.w(), fs.vort());
+        speedCentred(gg, fs.u(), fs.v(), fs.w(), fs.speed());
+        fs.take(0, fs.vort());
+        fs.take(1, fs.speed());
+        fs.take(2, dev->T(), tempRef);
         const FrameField ff[3]{
-            {g.nz == 1 ? "vort" : "curl", vortF.data(), 0, vortScale,
+            {g.nz == 1 ? "vort" : "curl", fs.channel(0), 0, vortScale,
              g.nz == 1},
-            {"speed", speedF.data(), 0, speedMax, false},
-            {"temp", tempF.data(), -tempScale, tempScale, true}};
-        if (auto e = out.frame(t, FrameViews{ff}); !e)
-            std::fprintf(stderr, "frame write failed: %s\n", e.error().c_str());
+            {"speed", fs.channel(1), 0, speedMax, false},
+            {"temp", fs.channel(2), -tempScale, tempScale, true}};
+        internal::FrameScratch::emit(out, t, ff);
     };
 
     DeviceBuffer<double> planeScratch;
@@ -250,9 +239,7 @@ runConv(const Grid& g, const CompState& ic, const ConvRun& r, RunOutput& out)
                 while (nextProf <= t) nextProf += r.profileDt;
             }
         }
-        if (out.wantsFrame(t) || out.wantsPng(t) || out.wantsWeb(t)
-            || out.wantsShm(t))
-            writeFrame(t);
+        if (out.wantsAnyFrame(t)) writeFrame(t);
     }
     (void)hipDeviceSynchronize();
     finishTiming(st, wall0, out);

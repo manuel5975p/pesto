@@ -24,6 +24,27 @@
 
 namespace dns {
 
+// A map that moves y ALONE is fully described by its mapY/dmapY: x and z pass
+// through and the Jacobian is the identity with one diagonal entry replaced.
+// Both wall-normal stretches are of that shape and each used to spell the two
+// functions out. Free functions rather than a CRTP base so the maps stay
+// aggregates (they are kernel arguments, passed by value).
+template <class Map>
+DNS_HD void yOnlyMap(const Map& m, const double X[3], double x[3])
+{
+    x[0] = X[0];
+    x[1] = m.mapY(X[1]);
+    x[2] = X[2];
+}
+
+template <class Map>
+DNS_HD void yOnlyJacobian(const Map& m, const double X[3], double J[3][3])
+{
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) J[i][j] = i == j ? 1.0 : 0.0;
+    J[1][1] = m.dmapY(X[1]);
+}
+
 // x = X. The beta -> 0 / amp -> 0 limit of everything below.
 struct IdentityRemap
 {
@@ -110,15 +131,11 @@ struct TanhStretchY
 
     DNS_HD void map(const double X[3], double x[3]) const
     {
-        x[0] = X[0];
-        x[1] = mapY(X[1]);
-        x[2] = X[2];
+        yOnlyMap(*this, X, x);
     }
     DNS_HD void jacobian(const double X[3], double J[3][3]) const
     {
-        for (int i = 0; i < 3; ++i)
-            for (int j = 0; j < 3; ++j) J[i][j] = i == j ? 1.0 : 0.0;
-        J[1][1] = dmapY(X[1]);
+        yOnlyJacobian(*this, X, J);
     }
 };
 
@@ -185,15 +202,11 @@ struct ChannelStretchY
 
     DNS_HD void map(const double X[3], double x[3]) const
     {
-        x[0] = X[0];
-        x[1] = mapY(X[1]);
-        x[2] = X[2];
+        yOnlyMap(*this, X, x);
     }
     DNS_HD void jacobian(const double X[3], double J[3][3]) const
     {
-        for (int i = 0; i < 3; ++i)
-            for (int j = 0; j < 3; ++j) J[i][j] = i == j ? 1.0 : 0.0;
-        J[1][1] = dmapY(X[1]);
+        yOnlyJacobian(*this, X, J);
     }
 };
 

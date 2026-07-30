@@ -192,10 +192,6 @@ public:
     // True iff make() was given a wall velocity: the surface moves.
     bool moving() const { return moving_; }
 
-    // Table sizes: mirrored ghost cells, and fluid/ghost interface faces.
-    int ghostCount() const { return nGhost_; }
-    int faceCount() const { return nFace_; }
-
     // Cells with sdf < 0 (mask/diagnostics).
     const std::vector<int>& solidCells() const { return solid_; }
     // Solid cells held quiescent instead of mirrored. The mirror band

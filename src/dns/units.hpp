@@ -18,7 +18,6 @@ struct BoxUnits
     double nuToBox(double nuSI) const { return nuSI / (lRef * uRef); }
     double epsToBox(double epsSI) const { return epsSI * lRef / (uRef * uRef * uRef); }
     double epsToSI(double eps) const { return eps * uRef * uRef * uRef / lRef; }
-    double lengthToSI(double l) const { return l * lRef; }
     double velocityToSI(double u) const { return u * uRef; }
     double timeToSI(double t) const { return t * tRef(); }
 };

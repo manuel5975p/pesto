@@ -1,9 +1,9 @@
 // dns channel parse + validate: wall-unit derivations, the ghost-row grid,
 // the channel-only flag surface, and the rejections.
-#include "dns/cli.hpp"
 #include "dns/config.hpp"
 #include "dns/remap.hpp"
 #include "check.hpp"
+#include "cli_test_util.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -16,24 +16,9 @@ using dnstest::check;
 
 
 
-std::expected<dns::Case, dns::ConfigError> run(std::vector<std::string> args)
-{
-    std::vector<char*> argv;
-    argv.push_back(const_cast<char*>("dns"));
-    for (auto& a : args) argv.push_back(a.data());
-    auto raw = dns::cli::parse(int(argv.size()), argv.data());
-    if (!raw)
-        return std::unexpected(dns::ConfigError{1, "cli", raw.error().message});
-    return dns::validate(*raw);
-}
+using dnstest::runCli;
+using dnstest::rejected;
 
-bool rejected(std::vector<std::string> args, int code, const std::string& what)
-{
-    auto c = run(std::move(args));
-    const bool ok = !c && c.error().code == code;
-    check(ok, what);
-    return ok;
-}
 
 } // namespace
 
@@ -41,7 +26,7 @@ int main()
 {
     // Defaults resolve to the KMM box with two ghost rows.
     {
-        auto c = run({"channel"});
+        auto c = runCli({"channel"});
         check(c.has_value(), "defaults validate");
         if (c)
         {
@@ -77,12 +62,12 @@ int main()
 
     // 2D channel is allowed (native 2D restriction).
     {
-        auto c = run({"channel", "--nz", "1"});
+        auto c = runCli({"channel", "--nz", "1"});
         check(c.has_value() && c->grid.nz == 1, "nz 1 accepted");
     }
     // Uniform mesh (beta 0) still builds a consistent box.
     {
-        auto c = run({"channel", "--stretch", "0", "--ny", "16"});
+        auto c = runCli({"channel", "--stretch", "0", "--ny", "16"});
         check(c.has_value(), "beta 0 validates");
         if (c)
             check(std::abs(c->chanH1 - 2.0 / 16.0) < 1e-12,
@@ -90,7 +75,7 @@ int main()
     }
     // Adiabatic wall selection.
     {
-        auto c = run({"channel", "--wall", "adiabatic"});
+        auto c = runCli({"channel", "--wall", "adiabatic"});
         check(c.has_value() && !c->wallIso, "--wall adiabatic");
     }
 
@@ -109,7 +94,7 @@ int main()
     rejected({"channel", "--tt", "0"}, 2, "tt must be positive");
     rejected({"channel", "--profile-dt", "-1"}, 2, "negative profile-dt");
     {
-        auto c = run({"channel", "--emit", "png"});
+        auto c = runCli({"channel", "--emit", "png"});
         check(c.has_value(), "png allowed in 3D (centre z-plane)");
     }
     rejected({"channel", "--wall", "slippery"}, 1, "unknown wall kind");

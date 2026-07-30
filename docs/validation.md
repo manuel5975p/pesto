@@ -19,9 +19,9 @@ class(es), and `SKIP_RETURN_CODE 77`:
 
 - **Tier A** (default `ctest`): the tier the table below describes. In the
   default build only **two** of its rows are actually registered —
-  `val_spindown` (the green canary) and `val_comp_cyl_re60` (which itself exits
-  77, every check being anchor-gated). The other Tier-A rows are quarantined;
-  see below.
+  `val_spindown` (the green canary) and `val_comp_cyl_re60`, which RUNS since
+  its two anchors were regenerated on 2026-07-29 (it used to exit 77, every
+  check being anchor-gated). The other Tier-A rows are quarantined; see below.
 - **Tier B** (`cmake -B build -DDNS_HEAVY_VALIDATION=ON`): heavy runs,
   `RUN_SERIAL`, ~23 min GPU total. Most Tier-B rows are quarantined too.
 - **Tier C**: manual anchor regeneration + optional studies, documented below;
@@ -29,7 +29,9 @@ class(es), and `SKIP_RETURN_CODE 77`:
 
 Anchor-gated checks print `[DEFER] anchor '<key>' missing` while the anchor row
 in `anchors.csv` is commented out; a test whose checks are ALL anchor-gated
-skips (rc 77). Anchors are currently deferred by decision (2026-07-17).
+skips (rc 77). Deferred by decision on 2026-07-17; `cyl_re60_n256_cd` and
+`comp_re60_n256_cd` were regenerated on 2026-07-29 (Tier C below), the
+remaining three rows are still deferred.
 
 ### The `DNS_VALIDATION_BASELINE` quarantine
 
@@ -82,7 +84,7 @@ Measured on gfx1100, 2026-07-17. "runtime" = full ctest wall time.
 | `val_cyl_re60` | Williamson (1988) St(60) = 0.1358; Tritton/Henderson cd floor 1.42 | St 0.1521, cd 1.818 | St in [0.130, 0.156]; cd in [1.42, 1.90]; cl_rms > 0.01; >= 5 periods | ceiling +15% per the confinement table above (measured +12%); floor -4% discretization; run-to-run repeat was bit-identical | 87 s |
 | `val_cyl_re100` | Williamson (1988) St = 0.164; Henderson cd 1.33-1.35 | St 0.1963, cd 1.730 | St in [0.157, 0.205]; cd in [1.33, 1.82] | ceilings +25%/+35% per the confinement table (measured +20%/+29%, excess grows with Re); floors = unbounded values | 69 s |
 | `val_tgv3d_64` | anchor: repo curve `ours_tgv64.csv`; literature: 512^3 spectral reference `spectral_Re1600_512.gdiag` (dissipation peak 0.01286 at t = 8.97) | K/eps curves; peak 0.01182 at t = 8.34 (-8.1%) | curves within 2e-3 / 2e-2; peak time [8.0, 10.0]; value [-40%, +5%] | same binary => near-bitwise vs own curve (measured 6.6e-6 / 1.0e-5; slack for compiler/ROCm drift); 64^3 under-resolves the peak => trend band only, tight claim at 128^3 | 0.3 s |
-| `val_comp_cyl_re60` | anchor only (comp cd has no clean unbounded literature value at this confinement) | cd ~1.82; cd_comp - cd_incomp in [0.005, 0.06] (M^2 sign) | anchor +-1% | SKIPS rc 77 until anchors regenerated | skip |
+| `val_comp_cyl_re60` | anchor only (comp cd has no clean unbounded literature value at this confinement) | cd 1.9441 (dead steady: flat to 1.5e-5 in the window, repeat run bit-identical); cd_comp - cd_incomp = +0.1255 | cd vs `comp_re60_n256_cd` +-1%; cd_comp - cd_incomp in [0.06, 0.20] | anchors regenerated 2026-07-29, so the test runs; the offset band is the measured value +-50% and is a CROSS-BRANCH check, not an M^2 correction (adjustment 6 below) | 21 s |
 
 ### Tier B (`-DDNS_HEAVY_VALIDATION=ON`; total 1362 s GPU)
 
@@ -148,6 +150,30 @@ Recorded per the rule "widen only with written justification":
    k*eta = 0.65, and Pope's model spectrum predicts a band mean of 0.78 at
    this resolution. Recentred on the model prediction ([0.9x, 2x]); a
    factor-2 normalization error still fails.
+6. `val_comp_cyl_re60` cd_comp - cd_incomp band [0.005, 0.06] -> [0.06, 0.20],
+   and the claim it carries changed. The old band asserted a Mach-squared
+   correction: "small, strictly positive". Both halves are refuted by the
+   2026-07-29 regeneration (all `--far sponge --n 256 --re 60 --ft 20`,
+   trapezoid cd; the incompressible reference is the `--far tunnel` cut-cell
+   run of `val_cyl_re60`, cd 1.8187):
+
+   | M    | cd     |
+   |------|--------|
+   | 0.20 | 1.9441 |
+   | 0.10 | 1.9666 |
+   | 0.05 | 2.0016 |
+
+   cd FALLS with Mach, so the compressible branch's own M -> 0 limit sits
+   FURTHER above the incompressible 1.8187, not closer — a Mach correction
+   cannot be what separates them. Nor is it an unresolved wall converging
+   away: at n 512 (D = 64 cells) the compressible run gives 1.9659 while the
+   incompressible branch drops ~1% from 256^2 to 512^2, so the gap widens.
+   What is left is what the two branches do NOT share — the ghost-mirror wall
+   vs the cut-cell wall, and sponge vs free-slip-tunnel laterals. That
+   attribution is NOT isolated (no run holds one of the two fixed), so the
+   check makes no causal claim: the band pins the two branches to each other,
+   which is the one thing neither single-branch anchor can catch, at the
+   measured value +-50%.
 
 ## Tier C — manual procedures
 
@@ -191,6 +217,19 @@ same estimators the tests use (`tests/validation_util.hpp`): trapezoidal
 for St (compressible: St = f * pi/4). Uncomment the row with value + date.
 Run-to-run repeatability measured 2026-07-17 was bit-identical at 256^2, so
 tol_rel 0.01 is safe; widen to 0.015 only if drift is observed and note it here.
+
+#### Regenerated 2026-07-29 (gfx1201)
+
+| anchor | value | tol_rel | notes |
+|---|---|---|---|
+| `cyl_re60_n256_cd` | 1.818652 | 0.01 | 4.5 min; shedding; reproduces the 2026-07-17 value 1.818 — the recomposition did not move it |
+| `comp_re60_n256_cd` | 1.944129 | 0.01 | 21 s; steady, cd flat to 1.5e-5 over [30, 62.8] and the same value to 6 digits over [95, 127.6] |
+
+Both repeat runs were byte-for-byte identical in `_stats.csv`, so tol_rel 0.01
+stands. `comp_re800_n512_{cd,st}` and `sphere_re300_n160_cd` are still deferred;
+their owning tests keep skipping. Regenerating the Re60 pair was a measurement,
+not a physics change, so nothing else moved — but note it retired a claim, see
+tolerance adjustment 6.
 
 ### Convergence / blockage sweeps (optional, not automated)
 

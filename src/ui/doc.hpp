@@ -161,10 +161,6 @@ struct DocState
     std::vector<SceneItem> items;   // used when bodyKind selects "scene"
 
     bool isConv() const { return sub == Conv; }
-    // The physics selector the active subcommand uses. flow keeps `physics`;
-    // conv has its own so switching subcommand does not silently re-model the
-    // other one.
-    int activePhysics() const { return isConv() ? convPhysics : physics; }
     // dtemp as the solver takes it: the drop as a fraction of the mean.
     double convDtemp() const
     {
@@ -197,7 +193,9 @@ struct BodyOpts
 };
 BodyOpts bodyOptions(int bodyKind);
 
-const char* const* bodyNames();   // nullptr-terminated
+// The solver's own enum spellings (dns/config.hpp), indexed by the enum
+// value. Contiguous, NOT nullptr-terminated -- always take the count.
+const char* const* bodyNames();
 int bodyNameCount();
 const char* const* farNames();
 int farNameCount();
@@ -331,7 +329,6 @@ public:
     // A transient message for the status strip. NOT part of the document, so
     // it never lands in the undo stack.
     const std::string& notice() const { return notice_; }
-    void clearNotice() { notice_.clear(); }
 
     // --- undo ---------------------------------------------------------------
     // An interaction transaction: beginEdit captures the pre-state, endEdit

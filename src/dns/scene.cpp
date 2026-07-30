@@ -54,14 +54,19 @@ std::expected<SceneObject, std::string> parseObject(const toml::table& o,
 
     SceneObject ob;
     const std::string_view ks = kind->value_or(std::string_view{});
-    if (ks == "cylinder") ob.kind = SceneObjectKind::Cylinder;
-    else if (ks == "sphere") ob.kind = SceneObjectKind::Sphere;
-    else if (ks == "cube") ob.kind = SceneObjectKind::Cube;
-    else if (ks == "lens") ob.kind = SceneObjectKind::Lens;
-    else if (ks == "mesh") ob.kind = SceneObjectKind::Mesh;
-    else
+    const auto kk = sceneObjectKindFromName(ks);
+    if (!kk)
+    {
+        std::string known;
+        for (const char* n : sceneObjectKindNames())
+        {
+            if (!known.empty()) known += ", ";
+            known += n;
+        }
         return std::unexpected(bad(where, "unknown kind '" + std::string(ks)
-                                   + "' (cylinder, sphere, cube, lens, mesh)"));
+                                   + "' (" + known + ")"));
+    }
+    ob.kind = *kk;
 
     const bool mesh = ob.kind == SceneObjectKind::Mesh;
     for (const auto& [key, v] : o)
@@ -180,17 +185,26 @@ std::array<double, 6> merge(const std::array<double, 6>& a,
 
 } // namespace
 
+std::span<const char* const> sceneObjectKindNames()
+{
+    static constexpr const char* kNames[] = {"cylinder", "sphere", "cube",
+                                             "lens", "mesh"};
+    return kNames;
+}
+
 const char* name(SceneObjectKind k)
 {
-    switch (k)
-    {
-    case SceneObjectKind::Cylinder: return "cylinder";
-    case SceneObjectKind::Sphere: return "sphere";
-    case SceneObjectKind::Cube: return "cube";
-    case SceneObjectKind::Lens: return "lens";
-    case SceneObjectKind::Mesh: return "mesh";
-    }
-    return "?";
+    const auto n = sceneObjectKindNames();
+    const auto i = std::size_t(k);
+    return i < n.size() ? n[i] : "?";
+}
+
+std::optional<SceneObjectKind> sceneObjectKindFromName(std::string_view s)
+{
+    const auto n = sceneObjectKindNames();
+    const auto it = std::ranges::find(n, s);
+    if (it == n.end()) return std::nullopt;
+    return SceneObjectKind(it - n.begin());
 }
 
 RotatedCube sceneCube(const Grid& g, double cx, double cy, double cz, double r)

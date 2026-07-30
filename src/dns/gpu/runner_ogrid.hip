@@ -1,11 +1,13 @@
-#include "dns/interrupt.hpp"
 #include "dns/gpu/runner_ogrid.hpp"
+
+#include "dns/interrupt.hpp"
 
 #include "dns/curvmesh.hpp"
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/derived.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/internal/comp_flux.hpp"
+#include "dns/gpu/internal/frame_scratch.hpp"
 #include "dns/gpu/internal/run_loop.hpp"
 #include "dns/gpu/reductions.hpp"
 
@@ -107,14 +109,6 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
     wall->setFreestream(u0);
     wall->apply(*ds);
 
-    auto du = DeviceScalar::make(g.size());
-    auto dv = DeviceScalar::make(g.size());
-    auto dw = DeviceScalar::make(g.size());
-    auto dVort = DeviceScalar::make(g.size());
-    auto dSpeed = DeviceScalar::make(g.size());
-    if (!du || !dv || !dw || !dVort || !dSpeed)
-        return fail(6, "GPU allocation failed");
-
     // heat: the wall energy flux INTO the body, raw (not a coefficient) --
     // a Nusselt number needs the caller's own kappa and temperature scale.
     // wmax: the acoustic wave speed the dt bound actually saw, put back on a
@@ -130,51 +124,36 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
     const float speedMax = float(1.6 * r.uInf);
     const char* vortName = r.signedVorticity ? "vort" : "curl";
     const bool signedWz = r.signedVorticity && g.nz == 1;
-    std::vector<Real> hVort(g.size()), hSpeed(g.size());
-    std::vector<float> vortF(g.size()), speedF(g.size());
-    // --temp: T - Tinf, clipped at whichever thermal excursion the case can
-    // produce -- the isothermal wall's own offset, or the stagnation rise an
-    // adiabatic body still generates. Same convention as runner_comp.
+    // --temp: T - Tinf on the diverging map. Same convention as runner_comp,
+    // and the same clip (internal/frame_scratch.hpp).
     const double TInf = r.pInf / (r.rhoInf * r.tr.Rgas);
     const double machSq = r.uInf * r.uInf * r.rhoInf / (r.tr.gamma * r.pInf);
-    const float tempScale = float(std::max(
-        r.thermal == OGridThermal::Isothermal ? std::abs(r.Twall - TInf) : 0.0,
-        0.5 * (r.tr.gamma - 1.0) * machSq * TInf));
-    std::vector<Real> hTemp(r.tempFrames ? g.size() : 0);
-    std::vector<float> tempF(r.tempFrames ? g.size() : 0);
+    const float tempScale = internal::thermalFrameScale(
+        TInf, machSq, r.tr.gamma, r.thermal == OGridThermal::Isothermal,
+        r.Twall);
+    internal::FrameScratch fs;
     auto writeFrame = [&](double t) {
+        if (!fs.ensure(g.size(), r.tempFrames ? 3 : 2, true)) return;
         if (r.tempFrames) dev->primitives(*ds);
-        primitiveVelocity(gg, ds->rho, ds->mx, ds->my, ds->mz, *du, *dv, *dw);
+        primitiveVelocity(gg, ds->rho, ds->mx, ds->my, ds->mz, fs.u(), fs.v(),
+                          fs.w());
         kOGridCurl<<<launchBlocks(g.size()), blockSize>>>(
-            gg, dev->curvTables()->view(), signedWz ? 1 : 0, du->data(),
-            dv->data(), dw->data(), dVort->data());
+            gg, dev->curvTables()->view(), signedWz ? 1 : 0, fs.u().data(),
+            fs.v().data(), fs.w().data(), fs.vort().data());
         checkLastKernel("kOGridCurl");
-        speedCentred(gg, *du, *dv, *dw, *dSpeed);
-        (void)dVort->download(hVort.data());
-        (void)dSpeed->download(hSpeed.data());
-        const float uOff = r.speedDelta ? float(r.uInf) : 0.0f;
-        for (std::size_t c = 0; c < g.size(); ++c)
-        {
-            vortF[c] = float(hVort[c]);
-            speedF[c] = float(hSpeed[c]) - uOff;
-        }
-        if (r.tempFrames)
-        {
-            (void)dev->T().download(hTemp.data());
-            for (std::size_t c = 0; c < g.size(); ++c)
-                tempF[c] = float(double(hTemp[c]) - TInf);
-        }
+        speedCentred(gg, fs.u(), fs.v(), fs.w(), fs.speed());
+        fs.take(0, fs.vort());
+        fs.take(1, fs.speed(), r.speedDelta ? r.uInf : 0.0);
+        if (r.tempFrames) fs.take(2, dev->T(), TInf);
         const FrameField ff[3]{
-            {vortName, vortF.data(), 0, vortScale, signedWz,
+            {vortName, fs.channel(0), 0, vortScale, signedWz,
              r.vortAsinh && signedWz ? vortScale / 32.0f : 0.0f},
             r.speedDelta
-                ? FrameField{"dspeed", speedF.data(), 0, float(0.6 * r.uInf),
+                ? FrameField{"dspeed", fs.channel(1), 0, float(0.6 * r.uInf),
                              true}
-                : FrameField{"speed", speedF.data(), 0, speedMax, false},
-            {"temp", tempF.data(), -tempScale, tempScale, true}};
-        const std::span<const FrameField> fv(ff, r.tempFrames ? 3u : 2u);
-        if (auto e = out.frame(t, FrameViews{fv}); !e)
-            std::fprintf(stderr, "frame write failed: %s\n", e.error().c_str());
+                : FrameField{"speed", fs.channel(1), 0, speedMax, false},
+            {"temp", fs.channel(2), -tempScale, tempScale, true}};
+        internal::FrameScratch::emit(out, t, {ff, r.tempFrames ? 3u : 2u});
     };
 
     RunStats st;
@@ -236,9 +215,7 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
             }
             lastLog = st.steps;
         }
-        if (out.wantsFrame(t) || out.wantsPng(t) || out.wantsWeb(t)
-            || out.wantsShm(t))
-            writeFrame(t);
+        if (out.wantsAnyFrame(t)) writeFrame(t);
     }
     (void)hipDeviceSynchronize();
     st.tStop = t;

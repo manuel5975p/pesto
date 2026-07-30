@@ -2,6 +2,7 @@
 
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/index.hpp"
+#include "dns/gpu/internal/wall_ghost.hpp"
 
 namespace dns::gpu {
 
@@ -66,12 +67,10 @@ __global__ void kFarWallY(GpuGrid g, int noslip, Real* rho, Real* mx, Real* my,
                           Real* mz, Real* E)
 {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t nxz = std::size_t(g.nx) * g.nz;
-    if (t >= 2 * nxz) return;
-    const bool hi = t >= nxz;
-    const int i = int(t % g.nx), k = int((t / g.nx) % g.nz);
-    const std::size_t c = gidx(g, i, hi ? g.ny - 1 : 0, k);
-    const std::size_t s = gidx(g, i, hi ? g.ny - 2 : 1, k);
+    int i, k;
+    bool hi;
+    std::size_t c, s;
+    if (!internal::yGhostPair(g, t, i, k, hi, c, s)) return;
     rho[c] = rho[s];
     mx[c] = noslip ? -mx[s] : mx[s];
     my[c] = -my[s];
