@@ -99,11 +99,15 @@ public:
         bool potCorrect = false;
         double xc = 0, yc = 0, zc = 0; // body centre (world coords)
         double aBody = 0;              // displacement radius (D/2)
-        // Lateral entropy/shear relax rate where flow enters the domain. Keep
-        // it gentle: a stiff lateral velocity clamp is a wall in disguise
-        // (measured with the sponge far field: lateral u-relax cd 1.98 ~=
-        // walls 1.96, rho/p-only 1.91).
-        double etaLat = 0.25;
+        // Lateral entropy/shear relax rate where flow enters the domain.
+        // GENTLE ON MEASUREMENT, twice over: a stiff lateral velocity clamp
+        // is a wall in disguise (sponge-era: lateral u-relax cd 1.98 ~= walls
+        // 1.96, rho/p-only 1.91), and the relax itself writes vorticity onto
+        // the face in proportion to this rate under acoustic load
+        // (0.20/0.80/2.16 of incident scale at 0.05/0.25/1.0 -- the 45-deg
+        // ridge, gpu_nscbc_order 2026-07-30). 0.05 is the scan's optimum and
+        // free on the transparency and cd rigs.
+        double etaLat = 0.05;
         // Inflow lambda = u family rate (entropy L2, shear L3/L4). etaIn is
         // sized against freestream sag -- an L5 argument -- and clamping the
         // OTHER amplitudes at 100 makes the inflow a mirror for vorticity

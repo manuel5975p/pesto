@@ -93,8 +93,11 @@ int main()
            "--nscbc-beta 1.0 --dry-run", 2,
            "--nscbc-beta 1.0 is rejected (measured divergence)");
     expect("flow --physics compressible --body cylinder --far nscbc "
-           "--re 2000 --dry-run", 2,
-           "pure NSCBC above Re 800 is rejected");
+           "--re 2000 --dry-run", 0,
+           "above Re 800 the DEFAULT sink band satisfies the strip rule");
+    expect("flow --physics compressible --body cylinder --far nscbc "
+           "--re 2000 --nscbc-sink 0 --dry-run", 2,
+           "bare NSCBC above Re 800 (sink explicitly off) is rejected");
     expect("flow --physics compressible --body cylinder --far nscbc "
            "--nscbc-abc modal --dry-run", 0,
            "--nscbc-abc modal validates on the shipped walled-lateral case");

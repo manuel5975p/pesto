@@ -153,7 +153,9 @@ replace the positional. Explicit CLI flags override the file.
 * **Far field** `--far tunnel|fringe|sponge|nscbc|periodic` + `--open` for the
   lateral faces (§7). Tuning: `--sponge-cells N` (0 = 10% of n),
   `--fringe-axes 2|3` (0 = auto: 2 when `--nz 1`), `--nscbc-beta` (0.5),
-  `--nscbc-strip` (0), `--nscbc-etain` (100),
+  `--nscbc-strip` (0), `--nscbc-etain` (100), `--nscbc-etain-shear`
+  (follow etain), `--nscbc-etalat` (0.25, needs `--open`),
+  `--nscbc-sink N` (0) + `--nscbc-sink-amp` (1.0),
   `--nscbc-abc yooim|adaptive|modal` (yooim), `--pot`.
 * **Solver** `--tol` (1e-4, CG per-cell RMS residual), `--max-iters` (500),
   `--dt-recompute` (16, comp). The pressure solve is NOT selectable: it follows
@@ -679,8 +681,34 @@ wall for transverse sloshing). At 1024² it survives but is contaminated
 inside the NSCBC rows. 1024² triplet [50, 96]: pure 1.846±0.582 / clAmp 4.8,
 strip12 1.902±0.341 / 2.4 (calmest), sponge 2.087±0.370 / 2.8; the cd ordering is
 the confinement ordering. 2048² strip32 ran clean to t ≈ 25 (user-stopped, not
-validated long). Rule: `--far nscbc` alone ≤ Re800; add `--nscbc-strip ~ny/64`
-beyond (the validator enforces this). `N = 0` is byte-identical to pure six-face.
+validated long). Rule: `--far nscbc` alone ≤ Re800; beyond, the validator wants
+`--nscbc-sink` (on by default, preferred: 1024² sink16 measured 1.919±0.300 /
+clAmp 2.3 over [50, 65] — strip12's calm without the freestream reference) or
+`--nscbc-strip ~ny/64`. `N = 0` is byte-identical to pure six-face.
+
+### `--nscbc-sink N` — the scale-selective band (absorb what never arrives)
+`gpu/comp_sink.*`, measured in `gpu_comp_sink` + `gpu_nscbc_absorb`,
+writeup `docs/nscbc.md` "Small scales and the strip hand-off".
+
+The central flux transports nothing at the mesh scale (group velocity
+`c·cos(kh)`, ≤ 0 from 4 cells per wavelength down): measured, a wavepacket
+released against the outflow strands 2%/23%/69%/98% of its energy over
+kh = π/4…π, and a 4Δ vortical patch simply parks. No face-local closure can
+absorb what does not arrive; the sink is the explicit remedy — the compounded
+Laplacian D4 (symbol sin⁴(kh/2)) in conservative flux form, ramped over N
+cells inside each open face, an ADDITIVE rhs under the NSCBC overwrite.
+Exactly zero on constant and linear fields (no freestream reference: nothing
+sags, nothing reflects, all five fields conserved to roundoff). Measured at
+N = 16, amp 1: 2Δ decays on the analytic profile to 3%; 16Δ crosses losing
+< 2‰; a resolved vortex reaches mid-band with 0.9999 of its vorticity where
+`--nscbc-strip 16` keeps 0.6813 — the strip eats the near field, the sink
+does not. It deliberately does NOT fix the resolved-scale inflow mirror
+(0.810 → 0.802); that is `--nscbc-etain`'s or the strip's. Amp ≤ 2 is the
+SSP-RK3 bound. **ON BY DEFAULT for `--far nscbc`** wherever defined (uniform
+mesh, whole faces, fits twice per open axis; measured free: Re60 cd +0.003%);
+`--nscbc-sink 0` = the bare boundary bit-for-bit; an EXPLICIT sink is
+rejected with `--stretch/--focal/--ogrid/--body floor` while the default
+just stays off there.
 
 ### `--nscbc-etain` — the inflow was an acoustic mirror
 `docs/nscbc.md`, measured in `gpu_nscbc_absorb`.

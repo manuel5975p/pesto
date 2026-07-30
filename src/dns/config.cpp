@@ -977,6 +977,22 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
     c.nscbcEtaLat = r.nscbcEtaLat;
     c.nscbcSink = r.nscbcSink;
     c.nscbcSinkAmp = r.nscbcSinkAmp;
+    // The sink is ON by default for --far nscbc wherever it is defined
+    // (uniform mesh, whole faces, band fits twice on every open axis) --
+    // measured free where it does not absorb: cd moved +0.003% on the Re60
+    // nscbc cylinder, and it is what carries a run past Re 800 without the
+    // strip's near-field cost. An explicit --nscbc-sink (any value, 0 = off)
+    // always wins; incompatible cases fall back to 0 rather than rejecting,
+    // because a DEFAULT that does not apply is absence, not an error.
+    if (!r.given.contains("--nscbc-sink") && c.far == FarField::Nscbc)
+    {
+        const bool uniform = !(r.stretch > 0) && r.focal.empty() && !r.ogrid;
+        const bool fits = 32 < c.grid.nx &&
+                          (!c.open || (32 < c.grid.ny &&
+                                       (c.grid.nz == 1 || 32 < c.grid.nz)));
+        c.nscbcSink =
+            uniform && fits && c.bodyKind != BodyKind::Floor ? 16 : 0;
+    }
     if (c.far == FarField::Nscbc)
     {
         if (!finitePos(c.nscbcEtaIn))
@@ -989,11 +1005,12 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
                                           "is ill-posed at low Mach)");
         if (c.nscbcStrip < 0 || c.nscbcStrip >= c.grid.nx / 4)
             return bad(2, "--nscbc-strip", "must be >= 0 and < nx/4");
-        if (c.re > 800 && c.nscbcStrip == 0)
+        if (c.re > 800 && c.nscbcStrip == 0 && c.nscbcSink == 0)
             return bad(2, "--nscbc-strip", "pure NSCBC is validated only up to "
                                            "Re 800 (it diverges at Re 2000, 2048^2); "
-                                           "pass --nscbc-strip ~ny/64 (or see "
-                                           "--nscbc-sink, docs/nscbc.md)");
+                                           "pass --nscbc-sink 16 (scale-selective, "
+                                           "preferred) or --nscbc-strip ~ny/64 "
+                                           "(freestream sponge; docs/nscbc.md)");
         if (c.nscbcSink < 0 || 2 * c.nscbcSink >= c.grid.nx ||
             (c.open && c.nscbcSink > 0 && 2 * c.nscbcSink >= c.grid.ny))
             return bad(2, "--nscbc-sink", "band must be >= 0 and fit twice on "

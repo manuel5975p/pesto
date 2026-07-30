@@ -112,8 +112,10 @@ struct RawConfig
     // velocity onto the face under acoustic load, a vorticity source that
     // SCALES with this rate (0.20/0.80/2.16 of the incident scale at
     // 0.05/0.25/1.0) -- soft is transparent, stiff is a wall in disguise.
-    // 0.25 is the shipped default, bit-identical.
-    double nscbcEtaLat = 0.25;
+    // Default 0.05, the scan's optimum; measured free everywhere else (the
+    // vortex-on-face transparency rig is rate-insensitive, and the open Re60
+    // cylinder cd moved -0.003% from the old 0.25).
+    double nscbcEtaLat = 0.05;
     int nscbcStrip = 0;
     // Scale-selective absorbing band inside the open faces (gpu/comp_sink):
     // an explicit sink for the sub-6dx content the central flux cannot

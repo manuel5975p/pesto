@@ -648,7 +648,7 @@ FAR FIELD (--far, exactly one)
                      inflow a mirror for turbulence too. Soften this
                      one to make the inflow vortically transparent
                      while the freestream stays pinned.
-  --nscbc-etalat E   lateral (open-face) incoming relax rate, > 0     [0.25]
+  --nscbc-etalat E   lateral (open-face) incoming relax rate, > 0     [0.05]
                      The relax writes tangential velocity onto the face
                      under acoustic load -- a vorticity source that
                      SCALES with E (measured 0.20/0.80/2.16 of the

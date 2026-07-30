@@ -110,8 +110,17 @@ int main()
             "--nscbc-sink 16 --n 512");
     rejects("flow --physics compressible --body cylinder --far nscbc "
             "--nscbc-sink 16 --nscbc-sink-amp 2.5 --n 512");
+    accepts("flow --physics compressible --body cylinder --far nscbc "
+            "--nscbc-sink-amp 1.5 --n 512"); // amp tunes the DEFAULT band
     rejects("flow --physics compressible --body cylinder --far nscbc "
-            "--nscbc-sink-amp 1 --n 512"); // amp without a width
+            "--nscbc-sink 0 --nscbc-sink-amp 1 --n 512"); // amp with band off
+    // The default band: on wherever it is defined, absent (never an error)
+    // where it is not.
+    accepts("flow --physics compressible --body none --far nscbc --stretch 2 "
+            "--n 128 --ny 128");           // auto-off on a remapped mesh
+    accepts("flow --physics compressible --body floor --far nscbc --n 512");
+    accepts("flow --physics compressible --body cylinder --far nscbc "
+            "--nscbc-sink 0 --n 512");     // explicit off always wins
     rejects("flow --physics compressible --body cylinder --far nscbc "
             "--nscbc-sink 300 --n 512");   // band does not fit twice
     rejects("flow --physics compressible --body none --far nscbc --stretch 2 "
@@ -154,7 +163,12 @@ int main()
     rejects("flow --body cylinder --mach 0.2");        // incompressible + --mach
     rejects("flow --physics compressible --body cylinder --far nscbc "
             "--nscbc-beta 1.0");                       // measured to diverge
-    rejects("flow --physics compressible --body cylinder --far nscbc --re 2000");
+    // Above Re 800 the default sink satisfies the rule; stripping the band
+    // off EXPLICITLY exposes the bare-NSCBC rejection again.
+    accepts("flow --physics compressible --body cylinder --far nscbc --re 2000 "
+            "--n 1024");
+    rejects("flow --physics compressible --body cylinder --far nscbc --re 2000 "
+            "--n 1024 --nscbc-sink 0");
     rejects("flow --body cylinder --far fringe --n 16"); // clamp() UB guard
     rejects("flow --body cylinder --nz 2");            // nz == 1 or >= 4
     // png at nz > 1 renders the centre z-plane (channel precedent) -- allowed.

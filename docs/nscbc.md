@@ -164,6 +164,23 @@ eaten a third of the wake before it left the box. The strip remains the
 inflow-mirror fix while etaIn has no per-family split; the sink is the
 small-scale one.
 
+**High Re and the default (2026-07-30).** Re 2000 cylinder, 1024², `--far
+nscbc --nscbc-sink 16` and NO strip: clean to t = 64.8 (198k steps), cd[50,
+64.8] = 1.919 ± 0.300, cl range ±2.3 — the strip-12 hybrid's calm statistics
+(1.902 ± 0.341, clAmp 2.4, window [50, 96]) without a freestream reference
+anywhere, where pure NSCBC is contaminated (1.846 ± 0.582, clAmp 4.8). The
+validator's > Re 800 rule accepts either and suggests the sink first. The
+sink is ON BY DEFAULT (16-cell band, amp 1) for `--far nscbc` wherever it is
+defined — uniform mesh, whole faces, band fits twice per open axis — measured
+free where it has nothing to absorb: the Re60 nscbc cylinder cd moved +0.003%
+(1.786575 → 1.786622), and the resolved-pulse reflection tables above are
+unchanged-to-improved. An explicit `--nscbc-sink 0` is the bare boundary,
+bit-for-bit; incompatible cases (--stretch/--focal/--ogrid/--body floor)
+default to 0 silently — a default that does not apply is absence, not an
+error, while an EXPLICIT sink on those meshes stays rejected. `--nscbc-etalat`
+likewise defaults to the measured 0.05 (was 0.25): free on the transparency
+and cd rigs, 4× less face-written vorticity on the ridge.
+
 ## Absorption, measured 2026-07-28 (test `gpu_nscbc_absorb`)
 
 How absorbing the faces actually are, as reflection coefficients: a plane

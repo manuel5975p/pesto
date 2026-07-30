@@ -231,6 +231,17 @@ their owning tests keep skipping. Regenerating the Re60 pair was a measurement,
 not a physics change, so nothing else moved — but note it retired a claim, see
 tolerance adjustment 6.
 
+2026-07-30, the absorption-boundary defaults flip (`--nscbc-sink` 16 on for
+`--far nscbc` where defined; `--nscbc-etalat` 0.25 → 0.05; docs/nscbc.md):
+verified against this suite with NO adjustment needed. `comp_re60_n256_cd` is
+measured under `--far sponge`, which the sink never touches — the anchor test
+passed unmodified after the flip. The nscbc-side effect of default-on was
+measured directly before flipping: Re60 nscbc cylinder mean cd 1.786575 →
+1.786622 (+0.003%), open Re60 cylinder 1.803413 → 1.803361 (−0.003%) — an
+order below tol_rel. Both are trajectory changes, not new physics; a run
+wanting the old bare boundary bit-for-bit passes `--nscbc-sink 0`
+(`--nscbc-etalat 0.25` restores the old lateral rate).
+
 ### Convergence / blockage sweeps (optional, not automated)
 
 - Cylinder cd/St grid triple:
