@@ -376,7 +376,7 @@ if(BUILD_TESTING)
                   gpu_comp_ghost gpu_comp_ghost_focal gpu_comp_les
                   gpu_comp_ghost3d gpu_comp_mesh
                   gpu_comp_far gpu_comp_nscbc gpu_nscbc_absorb gpu_nscbc_order
-                  gpu_acoustics
+                  gpu_acoustics gpu_comp_sink
                   gpu_les_smag gpu_derived
                   gpu_poisson_wally gpu_rotor_wall gpu_rotor_table
                   gpu_channel gpu_cutflux gpu_ogrid)

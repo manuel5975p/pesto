@@ -1,37 +1,24 @@
-// What an open face LEAVES BEHIND at oblique incidence, and why it is mostly
-// vorticity.
+// What an open face reflects at oblique incidence, and which coefficient
+// closes it: the reflected acoustic energy of a tilted ridge over the full
+// angle sweep, fixed beta vs the adaptive per-cell and modal per-mode forms.
 //
-// gpu_nscbc_absorb measures the reflected ACOUSTIC energy and finds the face
-// also leaves spurious vorticity, larger than the acoustics, at every angle off
-// normal. This test isolates the source of it and the fix.
+// Two theories this file KILLED, kept here so nobody re-derives them:
 //
-// The mechanism. On a boundary row the LODI form replaces the normal-axis rhs
-// by the characteristic amplitudes. The tangential-momentum and transverse
-// terms it keeps are EXACT (L3 = un dv/dn is the true -u dv/dx, and the
-// transverse flux divergence is the interior scheme), so the only error the
-// face makes enters du_n/dt:
+// 1. "The face lays down a vortex sheet" -- retracted 2026-07-29
+//    (docs/nscbc.md). The claim came from a wrapped central difference that
+//    subtracted the outflow row from the inflow row across the non-periodic
+//    x extremes. Measured with the non-wrapping scan below, the spurious
+//    vorticity is an order below the retracted figure and its peak sits in
+//    the x-INTERIOR against the free-slip y wall -- the outflow row is clean,
+//    and this test pins BOTH facts.
 //
-//     d(du_n/dt) = -(dL5 - dL1) / (2 rho c)
-//
-// with no companion tangential velocity. A perturbation in the NORMAL velocity
-// alone, varying along the face, is a vortex sheet:
-//
-//     d(omega)/dt = -d/dy (d(du/dt)) = d/dy (dL5 - dL1) / (2 rho c)
-//
-// and in an inviscid barotropic interior vorticity is conserved, so what the
-// row lays down at lambda = u stays there for good in a quiescent box.
-//
-// Which error dominates is the point. dL1 is the modeled incoming amplitude --
-// the term --nscbc-beta corrects, and the Yoo-Im choice beta = 0.5 already
-// cancels its leading angle error. dL5 is the OUTGOING amplitude, built from a
-// one-sided normal difference, and at 30 deg incidence |L5| is ~14x |L1|, so
-// its O(h) truncation is the larger of the two by an order of magnitude. It
-// never shows up in the reflected acoustic energy -- it is injected with
-// OUTGOING polarization (p' = +rho c u'), so its acoustic part leaves -- but
-// its transverse gradient is vorticity, and that does not.
-//
-// So: --nscbc-order 2 (Config::normalOrder), a three-point one-sided normal
-// difference. The columns below are the before/after.
+// 2. "The one-sided dn() truncation dominates, --nscbc-order 2 is the fix" --
+//    measured dead 2026-07-30. A three-point second-order one-sided normal
+//    difference was prototyped in kNscbcCells and this whole sweep re-run:
+//    every reflected-energy figure moved in the FOURTH decimal (45 deg best
+//    fixed 0.0594 -> 0.0594; radial etaIn 100 slightly worse, 0.1156 ->
+//    0.1162). The closure -- beta, adaptive, modal -- owns the oblique error;
+//    the stencil order of the outgoing amplitude does not.
 #include "dns/comp.hpp"
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_far.hpp"

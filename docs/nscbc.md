@@ -116,6 +116,38 @@ the scheme are molecular ν and the explicit SGS model, which is why the
 flux will ever remove that energy, so the cure is to stop generating it (resolve
 the source) rather than to damp it.
 
+## Small scales and the strip hand-off, measured 2026-07-30 (test `gpu_comp_sink`)
+
+What the interior facts above mean for a BOUNDARY. A wavepacket at wavenumber
+kh (amp 1e-3, envelope σ = 0.32, quiescent 256-cell box) released mid-domain
+against the characteristic outflow; the fraction of its acoustic energy still
+inside after 1.3 crossing times is the fraction the face never received:
+
+| kh    | ppw  | E_left/E_0 | why |
+|-------|------|-----------|-----|
+| π/4   | 8    | 0.0215    | resolved: leaves, face absorbs |
+| π/2   | 4    | 0.2319    | group velocity c·cos(kh) ≈ 0 |
+| 3π/4  | 2.67 | 0.6869    | group velocity negative |
+| π     | 2    | 0.9783    | stationary and undamped |
+
+Same question for the vortical family (compact solenoidal patch, \|u'\| = 5% c,
+σ = 16h, advected at M 0.2 through the outflow, non-wrapping scan, sampled at
+one and two exit windows): the 8Δ patch drains through a slow face tail
+(residual 0.55 → 0.17, peak at the face rows), the 4Δ patch is simply PARKED —
+residual 0.55 → 0.40 with its peak still at the release point after two full
+windows, because the advective group speed u·cos(kh) is ~0 there.
+
+**None of this is the face's to absorb.** No face-local closure — LODI,
+Yoo-Im, adaptive, modal — can act on content that does not arrive, and the
+interior flux will never damp it. The cure is an EXPLICIT sink confined to a
+boundary band (`DeviceCompSink`, `--nscbc-sink`): scale-selective, so the
+resolved content above the 6Δ knee still reaches the characteristic rows
+unchanged and every reflection coefficient on this page stays valid. Contract
+between the two layers: the face owns the extreme rows' RHS; the sink is an
+additive term in the band inside; the face's one-sided `Lout` reads row nx−2,
+so the sink's field IS the face's upstream sample — the combined system is
+measured together, never inferred from the parts.
+
 ## Absorption, measured 2026-07-28 (test `gpu_nscbc_absorb`)
 
 How absorbing the faces actually are, as reflection coefficients: a plane
@@ -209,6 +241,12 @@ of incident acoustic energy reflected off the OUTFLOW, quiescent:
 β = 0 lands on the Engquist–Majda first-order coefficient
 R₁ = (1−cosθ)/(1+cosθ) within a factor of 2 at 60–75°, which is the check that
 the rig measures a reflection and not a leftover.
+
+A second-order (3-point) one-sided normal difference for the outgoing
+amplitudes was prototyped and this whole sweep re-run 2026-07-30: every figure
+in the table moved in the fourth decimal, the radial etaIn-100 case slightly
+worse (0.1156 → 0.1162). The closure owns the oblique error, not the dn()
+stencil; `--nscbc-order` is dropped, not deferred.
 
 **The measured optimum tracks β_opt(θ) = cosθ/(1+cosθ), not the constant 0.5.**
 0.5 is only its normal-incidence limit; the best fixed β falls from ~0.5 at 30°

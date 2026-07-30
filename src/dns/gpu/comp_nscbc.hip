@@ -211,6 +211,11 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
             hnrm = Real(fabs(coordD(i + (hi ? -ox : ox), j + (hi ? -oy : oy),
                                     k + (hi ? -oz : oz), a) -
                              coordD(i, j, k, a)));
+        // First-order one-sided ON PURPOSE: a 3-point second-order dn() was
+        // prototyped and measured 2026-07-30 on the full gpu_nscbc_order angle
+        // sweep -- every reflected-energy figure moved in the 4th decimal,
+        // some slightly worse. The closure (beta/abc), not this stencil, owns
+        // the boundary error; do not re-derive the upgrade.
         auto dn = [&](const Real* f) {
             return (hi ? f[c] - f[cn] : f[cn] - f[c]) / hnrm;
         };
