@@ -48,6 +48,131 @@ struct PrimView
     const Real *rho, *u, *v, *w, *e, *p, *T;
 };
 
+// Rotating-reference-frame zone (--rotor-frame mrf): the frozen-rotor
+// approximation solved on the STATIC azimuth-0 geometry. Inside the zone the
+// equations are the rotating-frame ones in absolute-velocity form: convective
+// transport by u - w with w = f * omega x (p - c), a Coriolis source
+// -f omega x m on the momentum, pressure work in the energy flux left on the
+// ABSOLUTE velocity, viscous terms untouched (a rigid rotation carries no
+// strain). f is a C1 blend that is 1 on a shaft-aligned cylinder holding the
+// blade and 0 outside a slightly larger one, so the far field, the NSCBC rows
+// and the sink never see the frame.
+//
+// The blend is built from the cylindrical radius r about the shaft and the
+// axial offset s alone, and w is purely azimuthal, so grad f is perpendicular
+// to w and div(f w) == 0 continuously. Continuity is NOT enough: sampled
+// pointwise at faces, the blend's DISCRETE divergence is O((h/W)^2 omega r)
+// -- measured 3e-2 on a 6-cell blend at tip speed 2, a coherent ring source.
+// The face transport correction is therefore built from a corner STREAM
+// potential instead (mrfFaceVel): psi = -omega fa(s) G(r) with G' = r fr(r),
+// so w_n at a face is a difference of two corner psi values and the discrete
+// divergence TELESCOPES to zero by construction, on the uniform and the
+// separable focal mesh alike. A uniform axial freestream then passes the zone
+// to FP roundoff (pinned in gpu_mrf). The pointwise form (mrfFrameVel) stays
+// for the Coriolis source and the dt bound, where no telescoping is at stake.
+// active == 0 keeps every caller bit-for-bit the static solver.
+struct MrfView
+{
+    int active = 0;
+    int axis = 0;                       // shaft axis 0/1/2
+    Real omega = Real(0);               // signed rate, rad per unit time
+    Real cx = Real(0), cy = Real(0), cz = Real(0); // shaft point (world)
+    Real r1 = Real(0), r2 = Real(0);    // radial blend: f=1 inside r1, 0 past r2
+    Real a1 = Real(0), a2 = Real(0);    // axial |s| blend, same convention
+    // Physical coordinates per axis (device, length nx/ny/nz): cell centres and
+    // +faces. Carried as tables because on a focal mesh the position is the
+    // REMAP of the reference coordinate, which no kernel view holds.
+    const Real* cc[3] = {nullptr, nullptr, nullptr};
+    const Real* fc[3] = {nullptr, nullptr, nullptr};
+};
+
+// 1 -> 0 smoothstep between q1 and q2 (C1; q2 > q1).
+__host__ __device__ inline Real mrfRamp(Real q, Real q1, Real q2)
+{
+    if (q <= q1) return Real(1);
+    if (q >= q2) return Real(0);
+    const Real s = (q - q1) / (q2 - q1);
+    return Real(1) - s * s * (Real(3) - Real(2) * s);
+}
+
+// Frame factor f at a world point, and w = f * omega x (p - c) into `w`.
+// Returns f; f == 0 leaves w zeroed.
+__host__ __device__ inline Real mrfFrameVel(const MrfView& z, Real px, Real py,
+                                            Real pz, Real w[3])
+{
+    w[0] = w[1] = w[2] = Real(0);
+    const Real d[3] = {px - z.cx, py - z.cy, pz - z.cz};
+    const int b = (z.axis + 1) % 3, c = (z.axis + 2) % 3;
+    const Real r = sqrt(d[b] * d[b] + d[c] * d[c]);
+    const Real f = mrfRamp(r, z.r1, z.r2) *
+                   mrfRamp(fabs(d[z.axis]), z.a1, z.a2);
+    if (f == Real(0)) return f;
+    // omega x d with omega = omega * unit(axis): (axis, b, c) cyclic.
+    const Real fo = f * z.omega;
+    w[b] = -fo * d[c];
+    w[c] = fo * d[b];
+    return f;
+}
+
+// G(r) = int_0^r s fr(s) ds for the radial blend fr (1 below r1, smoothstep
+// down to 0 at r2): the stream potential's radial profile. Closed form of the
+// cubic-smoothstep integral; G is constant past r2, which is what makes w
+// vanish identically outside the zone.
+__host__ __device__ inline Real mrfPsiRad(const MrfView& z, Real r)
+{
+    if (r <= z.r1) return Real(0.5) * r * r;
+    const Real d = z.r2 - z.r1;
+    const Real u = r >= z.r2 ? Real(1) : (r - z.r1) / d;
+    const Real u2 = u * u, u3 = u2 * u, u4 = u2 * u2;
+    return Real(0.5) * z.r1 * z.r1 +
+           d * (z.r1 * (u - u3 + Real(0.5) * u4) +
+                d * (Real(0.5) * u2 - Real(0.75) * u4 + Real(0.4) * u4 * u));
+}
+
+// Transport correction at the +`axis` face of cell (i, j, k), written into
+// w[3] with ONLY the face-normal component nonzero. w_n comes from the corner
+// potential psi = -omega fa(s_axis) G(r): the in-plane curl of psi x_shaft,
+// discretized as the difference of psi at the face's two corner nodes over
+// their physical distance. Every cell's face sum of these then telescopes
+// over the same four corner values -- discrete solenoidality by construction.
+// Both cells sharing a face see identical corner values, so conservation is
+// exact. Faces normal to the shaft carry no correction (w has no axial
+// component).
+__device__ inline void mrfFaceVel(const MrfView& z, int i, int j, int k,
+                                  int axis, Real w[3])
+{
+    w[0] = w[1] = w[2] = Real(0);
+    if (axis == z.axis) return;
+    const int b = (z.axis + 1) % 3, c2 = (z.axis + 2) % 3;
+    const int e = axis == b ? c2 : b; // the in-plane axis ALONG the face
+    const int idx[3] = {i, j, k};
+    const Real cen[3] = {z.cx, z.cy, z.cz};
+    // Axial blend factor at the shared cell-centre axial coordinate; 1e30
+    // bounds (the degenerate 2D zone) pass through mrfRamp as f = 1.
+    const Real s = fabs(z.cc[z.axis][idx[z.axis]] - cen[z.axis]);
+    const Real fa = mrfRamp(s, z.a1, z.a2);
+    if (fa == Real(0)) return;
+    // Face-normal coordinate (the face's own), and the two corner nodes along
+    // e: the +e face coordinates of cells idx[e]-1 and idx[e]. At idx[e] == 0
+    // the true lo corner is the periodic wrap node; the zone's boundary
+    // clearance (runner-enforced) puts every corner of such a face outside
+    // r2, where psi is CONSTANT, so the difference is zero whatever
+    // coordinate stands in -- the unit synthetic offset below only keeps the
+    // division defined and the stand-in point outside the zone.
+    const Real dn = z.fc[axis][idx[axis]] - cen[axis];
+    const Real nHiCoord = z.fc[e][idx[e]];
+    const Real nLoCoord =
+        idx[e] > 0 ? z.fc[e][idx[e] - 1] : nHiCoord - Real(1);
+    const Real nHi = nHiCoord - cen[e];
+    const Real nLo = nLoCoord - cen[e];
+    const Real he = nHiCoord - nLoCoord;
+    const Real gHi = mrfPsiRad(z, sqrt(dn * dn + nHi * nHi));
+    const Real gLo = mrfPsiRad(z, sqrt(dn * dn + nLo * nLo));
+    // psi = -omega fa G; w_b = +d psi/d c2, w_c2 = -d psi/d b.
+    const Real dpsi = -z.omega * fa * (gHi - gLo);
+    w[axis] = (axis == b ? dpsi : -dpsi) / he;
+}
+
 // Total Kennedy-Gruber convective minus viscous flux through the face between
 // cells a and b (b = a + one step along `axis`); identical expression from
 // both sides of a face keeps the scheme exactly conservative.
@@ -63,10 +188,16 @@ struct PrimView
 // kappa. nut==nullptr reproduces the molecular DNS flux bit-for-bit, so the
 // solver rhs (LES off) and the ghost-wall force tally (molecular stress only)
 // are unchanged.
+// wf (optional): frame velocity at this face (--rotor-frame mrf, MrfView).
+// Non-null switches the ADVECTING normal velocity to un - wf[axis] in every
+// transport term while the pressure work in the energy flux stays on the
+// absolute un -- the rotating-frame flux in absolute-velocity form. nullptr is
+// the inertial flux bit-for-bit.
 __device__ inline Flux faceFlux(const GpuGrid& g, ViscView vv, PrimView q,
                                 const Offsets& o, std::size_t a, std::size_t b,
                                 int axis, const Real* nut = nullptr,
-                                Real kapScale = Real(0))
+                                Real kapScale = Real(0),
+                                const Real* wf = nullptr)
 {
     const Real h = axis == 0 ? g.hx : axis == 1 ? g.hy : g.hz;
 
@@ -77,8 +208,9 @@ __device__ inline Flux faceFlux(const GpuGrid& g, ViscView vv, PrimView q,
     const Real em = Real(0.5) * (q.e[a] + q.e[b]);
     const Real pm = Real(0.5) * (q.p[a] + q.p[b]);
     const Real un = um[axis];
-    Flux f{rm * un, rm * un * um[0], rm * un * um[1], rm * un * um[2],
-           rm * un * em + pm * un};
+    const Real ua = wf ? un - wf[axis] : un; // advecting normal velocity
+    Flux f{rm * ua, rm * ua * um[0], rm * ua * um[1], rm * ua * um[2],
+           rm * ua * em + pm * un};
     (axis == 0 ? f.mx : axis == 1 ? f.my : f.mz) += pm;
     // Sutherland is evaluated ONCE per face, on the face-average temperature
     // the Fourier flux already uses -- not per cell -- so mu and kappa stay a
@@ -131,11 +263,18 @@ __device__ inline Flux faceFlux(const GpuGrid& g, ViscView vv, PrimView q,
 __device__ inline Flux faceFlux(const GpuGrid& g, ViscView vv, PrimView q,
                                 int i, int j, int k, int axis,
                                 const Real* nut = nullptr,
-                                Real kapScale = Real(0))
+                                Real kapScale = Real(0),
+                                const MrfView* mz = nullptr)
 {
     const Offsets o = offsetsAt(g, i, j, k);
     const std::size_t a = gidx(g, i, j, k);
-    return faceFlux(g, vv, q, o, a, a + o.p[axis], axis, nut, kapScale);
+    Real w[3];
+    const Real* wf = nullptr;
+    if (mz && mz->active) {
+        mrfFaceVel(*mz, i, j, k, axis, w);
+        wf = w;
+    }
+    return faceFlux(g, vv, q, o, a, a + o.p[axis], axis, nut, kapScale, wf);
 }
 
 // Device pointer table of the curvilinear metrics (dns/curvmesh.hpp), one
@@ -198,11 +337,14 @@ __host__ __device__ inline Real curvDelta2(const GpuGrid& g, Real invVol)
 // nut (optional, per-cell dynamic eddy viscosity for LES) enters exactly as in
 // faceFlux: face-averaged into mu, and scaled by kapScale = cp/Pr_t into
 // kappa. nut == nullptr reproduces the molecular curvilinear flux bit-for-bit.
+// wf: as in faceFlux -- advecting normal area flux Un - wf.S, pressure work on
+// the absolute Un. nullptr is the inertial flux bit-for-bit.
 __device__ inline Flux faceFluxCurv(ViscView vv, PrimView q, CurvView m,
                                     const Offsets& o, std::size_t a,
                                     std::size_t b, int axis,
                                     const Real* nut = nullptr,
-                                    Real kapScale = Real(0))
+                                    Real kapScale = Real(0),
+                                    const Real* wf = nullptr)
 {
     const Real Sv[3] = {m.S[axis][0][a], m.S[axis][1][a], m.S[axis][2][a]};
 
@@ -213,8 +355,10 @@ __device__ inline Flux faceFluxCurv(ViscView vv, PrimView q, CurvView m,
     const Real em = Real(0.5) * (q.e[a] + q.e[b]);
     const Real pm = Real(0.5) * (q.p[a] + q.p[b]);
     const Real Un = um[0] * Sv[0] + um[1] * Sv[1] + um[2] * Sv[2];
-    Flux f{rm * Un, rm * Un * um[0] + pm * Sv[0], rm * Un * um[1] + pm * Sv[1],
-           rm * Un * um[2] + pm * Sv[2], rm * Un * em + pm * Un};
+    const Real Ua =
+        wf ? Un - (wf[0] * Sv[0] + wf[1] * Sv[1] + wf[2] * Sv[2]) : Un;
+    Flux f{rm * Ua, rm * Ua * um[0] + pm * Sv[0], rm * Ua * um[1] + pm * Sv[1],
+           rm * Ua * um[2] + pm * Sv[2], rm * Ua * em + pm * Un};
     Real muf = vv.mu, kapf = vv.kappa;
     if (vv.sutherland) {
         const Real r = vv.ratio(Real(0.5) * (q.T[a] + q.T[b]));
@@ -266,11 +410,18 @@ __device__ inline Flux faceFluxCurv(ViscView vv, PrimView q, CurvView m,
 __device__ inline Flux faceFluxCurv(const GpuGrid& g, ViscView vv, PrimView q,
                                     CurvView m, int i, int j, int k, int axis,
                                     const Real* nut = nullptr,
-                                    Real kapScale = Real(0))
+                                    Real kapScale = Real(0),
+                                    const MrfView* mz = nullptr)
 {
     const Offsets o = offsetsAt(g, i, j, k);
     const std::size_t a = gidx(g, i, j, k);
-    return faceFluxCurv(vv, q, m, o, a, a + o.p[axis], axis, nut, kapScale);
+    Real w[3];
+    const Real* wf = nullptr;
+    if (mz && mz->active) {
+        mrfFaceVel(*mz, i, j, k, axis, w);
+        wf = w;
+    }
+    return faceFluxCurv(vv, q, m, o, a, a + o.p[axis], axis, nut, kapScale, wf);
 }
 
 } // namespace dns::gpu

@@ -17,11 +17,28 @@
 
 namespace dns {
 struct CurvMetrics;
+struct AxisRemap3;
 }
 
 namespace dns::gpu {
 
 struct CurvView; // dns/gpu/internal/comp_flux.hpp (HIP TUs only)
+struct MrfView;  // dns/gpu/internal/comp_flux.hpp (HIP TUs only)
+
+// Rotating-frame zone of --rotor-frame mrf, in world units: the frozen-rotor
+// approximation on static geometry. f = 1 on the shaft-aligned cylinder
+// (radius r1, axial half-extent a1 about `center`), 0 outside (r2, a2), C1
+// blend between; the kernels see it through MrfView. See comp_flux.hpp for
+// the formulation and why the blended transport field stays solenoidal.
+// Pre: 0 < r1 < r2, 0 < a1 < a2, omega != 0.
+struct MrfZone
+{
+    int axis = 0;               // shaft axis 0/1/2
+    double omega = 0;           // signed rate, rad per unit time
+    double center[3] = {};      // shaft point
+    double r1 = 0, r2 = 0;      // radial blend bounds
+    double a1 = 0, a2 = 0;      // axial |s| blend bounds
+};
 
 // Conservative state on device; each buffer has g.size() cells.
 struct DeviceCompState
@@ -147,6 +164,16 @@ public:
     // reaches the surface tallies and the boundary kernels for free.
     const Transport& transport() const { return tr_; }
 
+    // Install the rotating-frame zone (--rotor-frame mrf). Uploads the
+    // physical per-axis coordinate tables (through `remap`, the identity on a
+    // uniform mesh) that the kernels evaluate the frame velocity from. Never
+    // calling this keeps every path bit-for-bit the inertial solver.
+    // Pre: z as documented on MrfZone.
+    hipError_t setMrf(const MrfZone& z, const AxisRemap3& remap);
+    bool mrfActive() const { return mrf_.has_value(); }
+    // The zone as a by-value kernel view (HIP TUs only); pre: mrfActive().
+    MrfView mrfView() const;
+
     // Called on every RK stage input before its rhs (boundary conditions and
     // embedded-boundary fill); the hook may mutate the state in place.
     void setStageHook(std::function<void(DeviceCompState&)> h) { hook_ = std::move(h); }
@@ -184,6 +211,10 @@ private:
     // stage output at a time once the rhs is not materialized separately.
     DeviceCompState q1_, q2_;
     std::optional<DeviceCurv> curv_; // engaged = curvilinear rhs/stableDt
+    // Rotating-frame zone (engaged by setMrf): parameters plus the uploaded
+    // per-axis physical coordinate tables (cell centres and +faces).
+    std::optional<MrfZone> mrf_;
+    DeviceScalar mrfCc_[3], mrfFc_[3];
     DeviceScalar u_, v_, w_, e_, p_, T_;
     DeviceScalar nut_;      // per-cell dynamic eddy viscosity (LES only)
     std::function<void(DeviceCompState&)> hook_;

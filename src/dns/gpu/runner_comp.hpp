@@ -130,6 +130,12 @@ struct CompRun
     // `sdf` still describes the body at azimuth 0; the surface MOTION is what
     // this adds.
     Rotor rotor;
+    // --rotor-frame mrf: frozen-rotor rotating-frame zone instead of the
+    // azimuth table (gpu/comp.hpp MrfZone; read only when rotor.active()).
+    // hFine is the validator's fine spacing (plateau under --focal), used to
+    // size the zone's blend margins in cells.
+    bool rotorMrf = false;
+    double hFine = 0;
 };
 
 // `ic` is the initial conservative state; `sdf` is the body, used to build the

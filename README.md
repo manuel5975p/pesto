@@ -1254,6 +1254,54 @@ along the shaft in diameters, capped at 0.5 — with the tip radius it bounds th
 SWEPT volume from flags alone, which is what lets `--focal auto` place a plateau
 around a rotor whose mesh the validator may not read.
 
+### `--rotor-frame mrf` — the frozen rotor (an approximation)
+
+`--rotor-frame` picks how the rotation reaches the solver. `moving` (default)
+is everything above: azimuth table, bin replay, time-accurate blade passage.
+`mrf` is the MULTIPLE REFERENCE FRAME idiom: the geometry is built ONCE at
+azimuth 0 and never moves; the wall keeps the moving-wall image about
+`u = ω × r` (absolute velocity is what the state stores in both frames); and
+inside a blended shaft-aligned cylinder around the swept volume the equations
+become the rotating-frame ones in absolute-velocity form — convective
+transport by `u − w` with `w = f·ω × r`, a Coriolis source `−f ρ ω × u` on
+the momentum, pressure work left on the absolute velocity, viscous terms
+untouched (rigid rotation carries no strain). No azimuth table exists
+(`--rotor-bins` is rejected), no bin ever swaps, and the thrust/torque columns
+are unchanged.
+
+Three things carry the implementation:
+
+- **The blend field is solenoidal DISCRETELY, not just continuously.** The
+  face transport correction comes from a corner stream potential
+  (`ψ = −ω f_a(s) G(r)`, `G' = r f_r`), so each cell's transport divergence
+  telescopes to exactly zero. Sampling the analytic `f·ω×r` pointwise instead
+  measured a 3e-2 velocity ring at the blend (a coherent mass source);
+  the potential form measures 1e-5 — FP32 roundoff (`gpu_mrf`).
+- **The zone must vanish before the boundary rows.** `f = 0` is reached a
+  measured margin inside every face (strip/sink band + 4 cells,
+  runner-enforced), so NSCBC and the sink never see the frame.
+- **The tally uses the same modified flux the rhs uses**, so MRF thrust and
+  torque are the discrete budget of the same equations that were solved.
+
+What it is worth: MRF is EXACT when the outer conditions are axisymmetric
+about the shaft (pinned in `gpu_mrf`: a spinning cylinder in a quiescent box
+agrees with the direct moving-wall run to 1e-4 in torque) and an
+APPROXIMATION otherwise — it co-rotates whatever the far field imposes, which
+is precisely the frozen-rotor error. An axial-flow propeller in a uniform
+freestream is the good case. Measured 2026-07-31 on the single-blade prop of
+the section below (Re 500, tip Mach 0.41, J = 0.63, 384x256x256 focal, same
+flags, `--ft 1.5`):
+
+    moving  ct +0.1228 +- 0.0074   cq -0.0302 +- 0.0030   (12-rev mean)
+    mrf     ct +0.1310 +- 0.0009   cq -0.0299 +- 0.0001   (plateau read)
+
+Torque agrees to 1.0%; thrust reads 6.6% HIGH under MRF — the frozen wake
+never gets chopped by its own blade, the usual frozen-rotor bias, and the
+number to quote when someone asks what the approximation costs here. The MRF
+signal is a plateau (sd 20x smaller, still settling −0.5% per box time at the
+end), and the run skips the table build (90 s, 350 MB host) and every bin
+swap at a ~7% higher per-step cost.
+
 ### A propeller to test with — `tools/propeller.py`
 
     python3 tools/propeller.py prop.stl --blades 3 --pitch 0.8

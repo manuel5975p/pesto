@@ -246,6 +246,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                          &abcSel});
         enums.push_back({"--rotor-axis",
                          {{"x", 0}, {"y", 1}, {"z", 2}}, &c.rotorAxis});
+        enums.push_back({"--rotor-frame",
+                         {{"moving", 0}, {"mrf", 1}}, &c.rotorFrame});
         enums.push_back({"--vort-map",
                          {{"linear", 0}, {"asinh", 1}}, &c.vortMap});
         enums.push_back({"--speed-map",
@@ -738,6 +740,23 @@ ROTOR (compressible; the body SPINS about a fixed shaft)
   --rotor-axis A     shaft axis, x|y|z. The blade sweeps the plane normal
                      to it and thrust acts along it; x is the freestream
                      direction, i.e. an axial-flow rotor.               [x]
+  --rotor-frame F    how the rotation reaches the solver.          [moving]
+                       moving  the geometry itself turns: azimuth table,
+                               bin replay, time-accurate blade passage.
+                       mrf     MULTIPLE REFERENCE FRAME, the frozen-rotor
+                               APPROXIMATION: geometry static at azimuth
+                               0, wall velocity omega x r, and inside a
+                               blended cylinder around the swept volume
+                               the equations become the rotating-frame
+                               ones (relative transport + Coriolis
+                               source, absolute-velocity form). No
+                               azimuth table (rejects --rotor-bins), no
+                               bin swaps, and the blade never moves in
+                               the frames -- the flow it reports is the
+                               steady-in-the-blade-frame one, EXACT for
+                               an axisymmetric body (pinned in gpu_mrf)
+                               and an approximation for a real blade.
+                               Thrust/torque columns are unchanged.
   --rotor-bins N     azimuth bins. Geometry is precomputed at N evenly
                      spaced angles and replayed, so the time loop never
                      rebuilds it. 0 = the NATURAL count 2 pi R / h_fine:

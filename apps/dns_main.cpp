@@ -500,6 +500,13 @@ int runFlowCompressible(const Case& c, CaseGeometry& geo)
     // The resolved rotor, verbatim: the validator owns the shaft, rate, bins
     // and dilation, and `active()` is false unless --rotor-mach was given.
     rr.rotor = c.rotor;
+    rr.rotorMrf = c.rotorMrf;
+    rr.hFine = c.focalActive
+        ? (g.nz == 1 ? std::min(c.focalHFine[0], c.focalHFine[1])
+                     : std::min({c.focalHFine[0], c.focalHFine[1],
+                                 c.focalHFine[2]}))
+        : (g.nz == 1 ? std::min(g.hx, g.hy)
+                     : std::min({g.hx, g.hy, g.hz}));
 
     auto res = gpu::runCompressible(g, host, geo.sdf,
                                     geo.hasBbox ? &geo.bbox : nullptr, rr, *out);

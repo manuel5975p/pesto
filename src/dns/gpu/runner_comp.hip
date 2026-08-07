@@ -193,7 +193,125 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     std::optional<RotorTable> rotorTable;
     std::optional<DeviceCompGhost> ghostOwned;
     DeviceCompGhost* ghost = nullptr;
-    if (r.rotor.active())
+    if (r.rotor.active() && r.rotorMrf)
+    {
+        // --rotor-frame mrf: the frozen-rotor approximation. ONE classification
+        // (azimuth 0, exactly the static path plus the wall velocity), no
+        // azimuth table, and the rotation reaches the fluid as the rotating-
+        // frame equations inside a blended cylinder around the swept volume
+        // (gpu/comp.hpp MrfZone; formulation in internal/comp_flux.hpp).
+        const int a = rotorAxisIndex(r.rotor.axis);
+        const int b = (a + 1) % 3, c2 = (a + 2) % 3;
+        const double* cs = r.rotor.shaft.data();
+        // ONE host classification up front, and the zone is sized from its
+        // interface faces -- the SAME measurement the table path makes
+        // (rotortable.hip). The body AABB's in-plane corner (rotorSweepBounds)
+        // is exact for the swept BOX but overestimates a tip radius by up to
+        // sqrt(2): a 4-blade cross has a square AABB whose corner is empty
+        // space, and the zone sized from it reached past the focal plateau
+        // into the mesh blend (measured 2026-07-31: 4-blade prop, reported
+        // tip 0.5608 vs real 0.3927, r2 0.718 against a plateau half-width
+        // 0.589, diverged at t = 3.07).
+        GhostWallVelocity uw = [rot = r.rotor](double x, double y, double z2) {
+            return rotorWallVelocity(rot, {x, y, z2});
+        };
+        const CompGhostTables tbls = classifyCompGhost(
+            g, sdf, bbox ? bbox->data() : nullptr, fremap, &uw);
+        if (tbls.nGhost() == 0 || tbls.nFace() == 0)
+            return fail(3, "rotor: the body has no mirrored ghost cells -- it "
+                           "is not resolved by this grid at all");
+        double tipR = 0.0, aHalfMeas = 0.0;
+        for (std::size_t f = 0; f + 2 < tbls.fpos.size(); f += 3)
+        {
+            const double db = double(tbls.fpos[f + b]) - cs[b];
+            const double dc = double(tbls.fpos[f + c2]) - cs[c2];
+            tipR = std::max(tipR, std::hypot(db, dc));
+            aHalfMeas = std::max(
+                aHalfMeas, std::abs(double(tbls.fpos[f + a]) - cs[a]));
+        }
+        // The tip-Mach guard is the same hard stop the table path applies --
+        // the KG flux has no shock capturing either way.
+        const double cInf = std::sqrt(r.gamma * r.pInf / r.rhoInf);
+        const double machTip = std::abs(r.rotor.omega) * tipR / cInf;
+        const double machInf = r.uInf / cInf;
+        std::printf("rotor: measured tip radius %.4g (nominal %.4g) -> tip "
+                    "Mach %.3f, +freestream %.3f\n",
+                    tipR, r.rotor.radius, machTip, machTip + machInf);
+        if (machTip + machInf >= 1.0)
+            return fail(2, std::format(
+                "the body reaches {:.4g} from the shaft, not the nominal "
+                "{:.4g}, so its real tip Mach is {:.3f} and with the "
+                "freestream {:.3f} >= 1. Lower --rotor-mach below {:.3f}",
+                tipR, r.rotor.radius, machTip, machTip + machInf,
+                r.rotor.radius / tipR * (1.0 - machInf) * 0.95));
+
+        // Zone: f = 1 must cover the blade plus the ghost wall's mirror band,
+        // f = 0 must be reached well before any domain face so the NSCBC rows
+        // and the sink never see the frame. Margins in fine cells and in D.
+        const double hF = r.hFine > 0
+            ? r.hFine
+            : (g.nz == 1 ? std::min(g.hx, g.hy)
+                         : std::min({g.hx, g.hy, g.hz}));
+        const double aHalf = aHalfMeas;
+        MrfZone z;
+        z.axis = a;
+        z.omega = r.rotor.omega;
+        for (int d = 0; d < 3; ++d) z.center[d] = cs[d];
+        z.r1 = tipR + std::max(0.05 * r.D, 4.0 * hF);
+        z.r2 = z.r1 + std::max(0.15 * r.D, 8.0 * hF);
+        z.a1 = aHalf + std::max(0.05 * r.D, 4.0 * hF);
+        z.a2 = z.a1 + std::max(0.15 * r.D, 8.0 * hF);
+        // A z shaft at nz == 1 is the exact 2D restriction: the zone is
+        // z-invariant, so the axial blend never engages.
+        const bool axialDegenerate = a == 2 && g.nz == 1;
+        if (axialDegenerate)
+        {
+            z.a1 = 1e30;
+            z.a2 = 2e30;
+        }
+        // Clearance: the support must end at least (boundary bands + 4) cells
+        // inside every face. Reference axis lengths equal the physical ones
+        // (the focal map is endpoint-preserving); the margin uses the COARSE
+        // spacing, the largest a cell near a face can be.
+        const double L[3] = {g.nx * g.hx, g.ny * g.hy, g.nz * g.hz};
+        const double hC[3] = {g.hx * (focal ? r.focalRatio : 1.0),
+                              g.hy * (focal ? r.focalRatio : 1.0),
+                              g.hz * (focal ? r.focalRatio : 1.0)};
+        const int bandCells = std::max(r.nscbcStrip, r.nscbcSink) + 4;
+        auto clear = [&](int d) { return std::min(cs[d], L[d] - cs[d]) -
+                                         bandCells * hC[d]; };
+        double lat = clear(b);
+        if (g.nz > 1 || c2 != 2) lat = std::min(lat, clear(c2));
+        if (z.r2 >= lat || (!axialDegenerate && z.a2 >= clear(a)))
+            return fail(2, std::format(
+                "MRF zone (r2 {:.3g}, a2 {:.3g}) reaches within {} cells of a "
+                "domain face (lateral clearance {:.3g}, axial {:.3g}): the "
+                "rotating frame must vanish before the boundary rows. Enlarge "
+                "--dr or the box",
+                z.r2, z.a2, bandCells, lat, clear(a)));
+        std::printf("rotor: MRF zone about the shaft: f=1 to r %.4g, 0 past "
+                    "%.4g; axial %.4g/%.4g (frozen rotor -- an "
+                    "APPROXIMATION; blade fixed at azimuth 0)\n",
+                    z.r1, z.r2, z.a1, z.a2);
+        std::fflush(stdout);
+        if (dev->setMrf(z, fremap) != hipSuccess)
+            return fail(6, "MRF zone init failed");
+
+        CompGhostCapacity cap;
+        cap.cover(tbls);
+        auto gh = DeviceCompGhost::fromTables(g, tbls, cap, r.gamma, r.rhoInf,
+                                              r.pInf, focal, wallBc);
+        if (!gh) return fail(6, "ghost wall init failed");
+        // The deep-solid verdict the table path reports per bin, measured on
+        // the one frozen azimuth.
+        if (gh->deepCells().empty())
+            std::printf("rotor: WARNING no deep-solid cells -- the body is "
+                        "nowhere thicker than the mirror band. Thicken it "
+                        "(--blade-thicken) or refine.\n");
+        ghostOwned = std::move(*gh);
+        ghost = &*ghostOwned;
+    }
+    else if (r.rotor.active())
     {
         // The turn alone: `sdf` is the body AT AZIMUTH 0 and already carries
         // --blade-thicken (casegeom applied it), so re-applying the dilation

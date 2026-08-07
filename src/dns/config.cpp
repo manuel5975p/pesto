@@ -1461,7 +1461,8 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
         {
             if (auto e = rejectGiven(r,
                                      {"--rotor-axis", "--rotor-bins",
-                                      "--rotor-span", "--blade-thicken"},
+                                      "--rotor-span", "--blade-thicken",
+                                      "--rotor-frame"},
                                      "configures a spinning body; give "
                                      "--rotor-mach to have one");
                 e)
@@ -1556,8 +1557,21 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
                                                   c.rotor.radius);
             c.rotor.thicken = r.bladeThicken * hFine;
 
+            // --rotor-frame mrf: static geometry, rotating-frame zone. The
+            // azimuth table does not exist, so sizing it is a contradiction
+            // and is rejected by name rather than ignored.
+            c.rotorMrf = r.rotorFrame == 1;
+            if (c.rotorMrf && r.given.contains("--rotor-bins"))
+                return bad(2, "--rotor-bins", "--rotor-frame mrf freezes the "
+                               "geometry at azimuth 0; there is no azimuth "
+                               "table to size");
+
             const int natural = rotorNaturalBins(c.rotor, hFine);
-            if (r.given.contains("--rotor-bins"))
+            if (c.rotorMrf)
+                // active() needs bins > 0; one frozen azimuth is exactly what
+                // MRF is.
+                c.rotor.bins = 1;
+            else if (r.given.contains("--rotor-bins"))
             {
                 if (r.rotorBins < 8)
                     return bad(2, "--rotor-bins", "under 8 bins the body jumps "
@@ -2054,11 +2068,28 @@ std::string Case::describe() const
             "centre\n"
             "             tip Mach {:.4g} (freestream {:.4g}, sum {:.4g} < 1)  "
             "omega={:.6g}  R={:.6g}\n"
-            "             t_rev={:.6g} -> {:.2f} revolutions in tEnd={:.6g}\n"
-            "             azimuth {} bins (natural {} = 2 pi R / h_fine); "
-            "geometry is\n"
-            "             precomputed per bin and replayed -- the time loop "
-            "never rebuilds it\n"
+            "             t_rev={:.6g} -> {:.2f} revolutions in tEnd={:.6g}\n",
+            shaft, rotorTipMach, mach, rotorTipMach + mach, rotor.omega,
+            rotor.radius, tRev, tRev > 0 ? tEnd / tRev : 0.0, tEnd);
+        if (rotorMrf)
+            s += std::format(
+                "             frame: MRF (frozen rotor, an APPROXIMATION): "
+                "geometry static at\n"
+                "             azimuth 0, wall moves at omega x r, rotating-"
+                "frame equations in a\n"
+                "             blended cylinder around the swept volume (zone "
+                "printed at run time).\n"
+                "             Exact for an axisymmetric body; time-accurate "
+                "blade passage needs\n"
+                "             --rotor-frame moving\n");
+        else
+            s += std::format(
+                "             azimuth {} bins (natural {} = 2 pi R / h_fine); "
+                "geometry is\n"
+                "             precomputed per bin and replayed -- the time "
+                "loop never rebuilds it\n",
+                rotor.bins, rotorNaturalBins(rotor, hFine));
+        s += std::format(
             "             wall is MOVING no-slip (omega x r, tip speed "
             "{:.6g}); run reports\n"
             "             thrust and shaft torque about {}\n"
@@ -2066,9 +2097,6 @@ std::string Case::describe() const
             "D/h_fine={:.1f}):\n"
             "             >= {:.4g} in world units, or the two surfaces' "
             "mirror bands overlap\n",
-            shaft, rotorTipMach, mach, rotorTipMach + mach, rotor.omega,
-            rotor.radius, tRev, tRev > 0 ? tEnd / tRev : 0.0, tEnd, rotor.bins,
-            rotorNaturalBins(rotor, hFine),
             std::abs(rotor.omega) * rotor.radius, shaft, hFine,
             hFine > 0 ? placement.D / hFine : 0.0, 4.0 * hFine);
         if (rotor.thicken > 0)

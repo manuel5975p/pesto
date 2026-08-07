@@ -156,6 +156,7 @@ struct RawConfig
     int rotorBins = 0;        // 0 = the natural count, 2 pi R / h_fine
     double rotorSpan = 0.25;  // half-extent along the shaft, in diameters
     double bladeThicken = 0;  // sdf dilation, in fine cells
+    int rotorFrame = 0;       // 0 moving geometry, 1 MRF (frozen rotor)
 
     // Body-fitted O-grid (compressible): the mesh's inner boundary IS the
     // body surface, so there is no immersed body and no cut cell. --n is the
@@ -281,6 +282,12 @@ public:
     double rotorTipMach = 0;
     double rotorSpanD = 0;     // blade half-extent along the shaft, in D
     double bladeThickenCells = 0;
+    // --rotor-frame mrf: solve the FROZEN-ROTOR approximation in a rotating
+    // reference frame instead of moving the geometry -- static azimuth-0 body,
+    // wall velocity omega x r, relative transport + Coriolis source inside a
+    // blended zone (gpu/comp.hpp MrfZone). rotor.active() stays the one test
+    // for "this run spins"; this picks which of the two formulations it takes.
+    bool rotorMrf = false;
 
     // Body-fitted O-grid (dns/ogrid.hpp). ogridRFar is resolved to WORLD
     // units; the grid is (n angular) x (ny radial, incl. 2 ghost rows) x nz,

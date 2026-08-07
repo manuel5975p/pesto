@@ -3,6 +3,7 @@
 #include "dns/curvmesh.hpp"
 #include "dns/gpu/internal/comp_flux.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "dns/remap.hpp"
 
 #include <rocprim/device/device_reduce.hpp>
 #include <rocprim/iterator/counting_iterator.hpp>
@@ -60,11 +61,49 @@ __global__ void kCompSmagNut(GpuGrid g, Real smagCd, int sigma, const Real* rho,
     nut[c] = rho[c] * smagCd * sgsRate(sigma, gd);
 }
 
+// Frame velocity at both faces of cell (i,j,k) along `a` (mz.active only):
+// the hi face is the cell's own +face, the lo face the back neighbour's, with
+// the same wrap contract as offsetsAt so the two sides of any face agree.
+__device__ inline void mrfCellFaces(const MrfView& mz, const GpuGrid& g, int i,
+                                    int j, int k, int a, Real whi[3],
+                                    Real wlo[3])
+{
+    mrfFaceVel(mz, i, j, k, a, whi);
+    int il = i, jl = j, kl = k;
+    if (a == 0) il = i ? i - 1 : g.nx - 1;
+    else if (a == 1) jl = j ? j - 1 : g.ny - 1;
+    else kl = k ? k - 1 : g.nz - 1;
+    mrfFaceVel(mz, il, jl, kl, a, wlo);
+}
+
+// Coriolis source of the rotating-frame zone, added to the momentum rhs of
+// cell c: -f omega x m in absolute-velocity form ((axis, b, c2) cyclic:
+// S_b = +f omega m_c2, S_c2 = -f omega m_b). Energy carries no source -- the
+// term is perpendicular to u, so its work is identically zero. Zero on any
+// swirl-free field, which is what keeps a uniform axial freestream exact.
+__device__ inline void mrfSource(const MrfView& mz, PrimView q, std::size_t c,
+                                 int i, int j, int k, Real& dmx, Real& dmy,
+                                 Real& dmz)
+{
+    Real wc[3];
+    const Real f =
+        mrfFrameVel(mz, mz.cc[0][i], mz.cc[1][j], mz.cc[2][k], wc);
+    if (f == Real(0)) return;
+    const Real fo = f * mz.omega;
+    const int b = (mz.axis + 1) % 3, c2 = (mz.axis + 2) % 3;
+    const Real mom[3] = {q.rho[c] * q.u[c], q.rho[c] * q.v[c],
+                         q.rho[c] * q.w[c]};
+    Real* dm[3] = {&dmx, &dmy, &dmz};
+    *dm[b] += fo * mom[c2];
+    *dm[c2] -= fo * mom[b];
+}
+
 // out = cmb.ca a + cmb.cb b + cmb.cr * (-div F): the rhs and the RK
 // combination in one pass (see StageCombine in comp.hpp).
 __global__ void kCompStage(GpuGrid g, ViscView vv, PrimView q,
                            StageCombine cmb, Real* orho, Real* omx, Real* omy,
-                           Real* omz, Real* oE, const Real* nut, Real kapScale)
+                           Real* omz, Real* oE, const Real* nut, Real kapScale,
+                           MrfView mz)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
@@ -74,16 +113,24 @@ __global__ void kCompStage(GpuGrid g, ViscView vv, PrimView q,
     Real drho = 0, dmx = 0, dmy = 0, dmz = 0, dE = 0;
     for (int a = 0; a < 3; ++a) {
         const Real h = a == 0 ? g.hx : a == 1 ? g.hy : g.hz;
+        Real whi[3], wlo[3];
+        const Real *pwhi = nullptr, *pwlo = nullptr;
+        if (mz.active) {
+            mrfCellFaces(mz, g, i, j, k, a, whi, wlo);
+            pwhi = whi;
+            pwlo = wlo;
+        }
         const Flux hi =
-            faceFlux(g, vv, q, o, c, c + o.p[a], a, nut, kapScale);
+            faceFlux(g, vv, q, o, c, c + o.p[a], a, nut, kapScale, pwhi);
         const Flux lo =
-            faceFlux(g, vv, q, o, c + o.m[a], c, a, nut, kapScale);
+            faceFlux(g, vv, q, o, c + o.m[a], c, a, nut, kapScale, pwlo);
         drho -= (hi.rho - lo.rho) / h;
         dmx -= (hi.mx - lo.mx) / h;
         dmy -= (hi.my - lo.my) / h;
         dmz -= (hi.mz - lo.mz) / h;
         dE -= (hi.E - lo.E) / h;
     }
+    if (mz.active) mrfSource(mz, q, c, i, j, k, dmx, dmy, dmz);
     const Real rhs[5] = {drho, dmx, dmy, dmz, dE};
     Real* out[5] = {orho, omx, omy, omz, oE};
     for (int v = 0; v < 5; ++v)
@@ -118,7 +165,7 @@ __global__ void kCompSmagNutCurv(GpuGrid g, Real cs2, int sigma, CurvView m,
 __global__ void kCompStageCurv(GpuGrid g, ViscView vv, PrimView q,
                                CurvView m, StageCombine cmb, Real* orho,
                                Real* omx, Real* omy, Real* omz, Real* oE,
-                               const Real* nut, Real kapScale)
+                               const Real* nut, Real kapScale, MrfView mz)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
@@ -127,10 +174,17 @@ __global__ void kCompStageCurv(GpuGrid g, ViscView vv, PrimView q,
     const Offsets o = offsetsAt(g, i, j, k);
     Real drho = 0, dmx = 0, dmy = 0, dmz = 0, dE = 0;
     for (int a = 0; a < 3; ++a) {
+        Real whi[3], wlo[3];
+        const Real *pwhi = nullptr, *pwlo = nullptr;
+        if (mz.active) {
+            mrfCellFaces(mz, g, i, j, k, a, whi, wlo);
+            pwhi = whi;
+            pwlo = wlo;
+        }
         const Flux hi =
-            faceFluxCurv(vv, q, m, o, c, c + o.p[a], a, nut, kapScale);
+            faceFluxCurv(vv, q, m, o, c, c + o.p[a], a, nut, kapScale, pwhi);
         const Flux lo =
-            faceFluxCurv(vv, q, m, o, c + o.m[a], c, a, nut, kapScale);
+            faceFluxCurv(vv, q, m, o, c + o.m[a], c, a, nut, kapScale, pwlo);
         drho -= hi.rho - lo.rho;
         dmx -= hi.mx - lo.mx;
         dmy -= hi.my - lo.my;
@@ -138,7 +192,10 @@ __global__ void kCompStageCurv(GpuGrid g, ViscView vv, PrimView q,
         dE -= hi.E - lo.E;
     }
     const Real iv = m.invVol[c];
-    const Real rhs[5] = {drho * iv, dmx * iv, dmy * iv, dmz * iv, dE * iv};
+    Real rhs[5] = {drho * iv, dmx * iv, dmy * iv, dmz * iv, dE * iv};
+    // The source is a volume term: added AFTER the 1/vol of the flux
+    // divergence, in the same per-volume units.
+    if (mz.active) mrfSource(mz, q, c, i, j, k, rhs[1], rhs[2], rhs[3]);
     Real* out[5] = {orho, omx, omy, omz, oE};
     for (int v = 0; v < 5; ++v)
         out[v][c] = cmb.ca * cmb.a[v][c] + cmb.cb * cmb.b[v][c] +
@@ -167,17 +224,39 @@ __host__ __device__ inline CellPrim cellPrim(const Real* rho, const Real* mx,
     return {u, v, w, p, r};
 }
 
+// Frame velocity at cell c's centre (device path of the dt reductions); the
+// inactive view returns without touching w. In the rotating-frame zone the
+// convective eigenvalues are u_rel +- c, so the acoustic bound must see the
+// RELATIVE velocity -- the absolute one under-counts by the frame speed
+// (~ tip Mach) exactly where the mesh is finest.
+__host__ __device__ inline void mrfCellVel(const MrfView& mz, const GpuGrid& g,
+                                           int c, double w[3])
+{
+    if (!mz.active) return;
+    int i, j, k;
+    decompose(g, std::size_t(c), i, j, k);
+    Real wr[3];
+    (void)mrfFrameVel(mz, mz.cc[0][i], mz.cc[1][j], mz.cc[2][k], wr);
+    w[0] -= double(wr[0]);
+    w[1] -= double(wr[1]);
+    w[2] -= double(wr[2]);
+}
+
 // Curvilinear acoustic bound: (|u| + c) / width, width = 1/aov per axis;
 // |u| >= |u . n| makes the bound conservative on skewed cells.
 struct WavePerDtCurv
 {
+    GpuGrid g;
+    MrfView mrf;
     const Real *rho, *mx, *my, *mz, *E;
     const Real *ax, *ay, *az; // az == nullptr when nz == 1
     double gamma;
     __host__ __device__ double operator()(int c) const
     {
         const auto q = cellPrim(rho, mx, my, mz, E, gamma, c);
-        const double sp = sqrt(q.u * q.u + q.v * q.v + q.w * q.w)
+        double ur[3] = {q.u, q.v, q.w};
+        mrfCellVel(mrf, g, c, ur);
+        const double sp = sqrt(ur[0] * ur[0] + ur[1] * ur[1] + ur[2] * ur[2])
                         + sqrt(gamma * q.p / q.rho);
         double m = sp * double(ax[c] > ay[c] ? ax[c] : ay[c]);
         if (az && sp * az[c] > m) m = sp * az[c];
@@ -187,15 +266,19 @@ struct WavePerDtCurv
 
 struct WavePerDt
 {
+    GpuGrid g;
+    MrfView mrf;
     const Real *rho, *mx, *my, *mz, *E;
     double gamma, ihx, ihy, ihz; // degenerate axes pass 0
     __host__ __device__ double operator()(int c) const
     {
         const auto q = cellPrim(rho, mx, my, mz, E, gamma, c);
+        double ur[3] = {q.u, q.v, q.w};
+        mrfCellVel(mrf, g, c, ur);
         const double cs = sqrt(gamma * q.p / q.rho);
-        double m = (fabs(q.u) + cs) * ihx;
-        const double wy = (fabs(q.v) + cs) * ihy;
-        const double wz = (fabs(q.w) + cs) * ihz;
+        double m = (fabs(ur[0]) + cs) * ihx;
+        const double wy = (fabs(ur[1]) + cs) * ihy;
+        const double wz = (fabs(ur[2]) + cs) * ihz;
         if (wy > m) m = wy;
         if (wz > m) m = wz;
         return m;
@@ -449,6 +532,56 @@ CurvView DeviceCurv::view() const
 
 CurvView DeviceComp::curvView() const { return curv_->view(); }
 
+hipError_t DeviceComp::setMrf(const MrfZone& z, const AxisRemap3& remap)
+{
+    assert(z.omega != 0.0 && z.axis >= 0 && z.axis < 3 &&
+           0.0 < z.r1 && z.r1 < z.r2 && 0.0 < z.a1 && z.a1 < z.a2);
+    // Physical coordinate tables per axis: cell centres at the remap of
+    // (i + 0.5) h, +faces at the remap of (i + 1) h. One table each -- the
+    // remap is separable, so face positions never depend on the other axes.
+    const int n[3] = {g_.nx, g_.ny, g_.nz};
+    const double h[3] = {g_.hx, g_.hy, g_.hz};
+    const Focal1D* f[3] = {&remap.fx, &remap.fy, &remap.fz};
+    for (int a = 0; a < 3; ++a) {
+        std::vector<Real> cc(static_cast<std::size_t>(n[a]));
+        std::vector<Real> fc(static_cast<std::size_t>(n[a]));
+        for (int i = 0; i < n[a]; ++i) {
+            cc[std::size_t(i)] = Real(f[a]->map((i + 0.5) * h[a]));
+            fc[std::size_t(i)] = Real(f[a]->map((i + 1.0) * h[a]));
+        }
+        for (auto [buf, src] : {std::pair{&mrfCc_[a], &cc},
+                                std::pair{&mrfFc_[a], &fc}}) {
+            auto b = DeviceScalar::make(std::size_t(n[a]));
+            if (!b) return b.error();
+            if (auto e = b->upload(src->data()); e != hipSuccess) return e;
+            *buf = std::move(*b);
+        }
+    }
+    mrf_ = z;
+    return hipSuccess;
+}
+
+MrfView DeviceComp::mrfView() const
+{
+    const MrfZone& z = *mrf_;
+    MrfView v;
+    v.active = 1;
+    v.axis = z.axis;
+    v.omega = Real(z.omega);
+    v.cx = Real(z.center[0]);
+    v.cy = Real(z.center[1]);
+    v.cz = Real(z.center[2]);
+    v.r1 = Real(z.r1);
+    v.r2 = Real(z.r2);
+    v.a1 = Real(z.a1);
+    v.a2 = Real(z.a2);
+    for (int a = 0; a < 3; ++a) {
+        v.cc[a] = mrfCc_[a].data();
+        v.fc[a] = mrfFc_[a].data();
+    }
+    return v;
+}
+
 DeviceComp::DeviceComp(const GpuGrid& g, const Transport& tr, Real csLes,
                        SgsModel sgs)
     : g_(g), tr_(tr), csLes_(csLes), sgs_(sgs)
@@ -481,6 +614,7 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
     const Real kapLes = Real(tr_.cp() / prt_); // eddy conductivity scale
     const Real* nutp = nullptr;
     Real kapScale = Real(0);
+    const MrfView mz = mrf_ ? mrfView() : MrfView{};
     if (curv_) {
         const CurvView cv = curvView();
         if (csLes_ > Real(0)) {
@@ -493,7 +627,7 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
         }
         kCompStageCurv<<<launchBlocks(n), blockSize>>>(
             g_, vv, q, cv, cmb, out.rho.data(), out.mx.data(),
-            out.my.data(), out.mz.data(), out.E.data(), nutp, kapScale);
+            out.my.data(), out.mz.data(), out.E.data(), nutp, kapScale, mz);
         checkLastKernel("kCompStageCurv");
         if (rhsHook_) rhsHook_(s, out, cmb);
         return;
@@ -508,7 +642,7 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
     }
     kCompStage<<<launchBlocks(n), blockSize>>>(
         g_, vv, q, cmb, out.rho.data(), out.mx.data(), out.my.data(),
-        out.mz.data(), out.E.data(), nutp, kapScale);
+        out.mz.data(), out.E.data(), nutp, kapScale, mz);
     checkLastKernel("kCompStage");
     if (rhsHook_) rhsHook_(s, out, cmb);
 }
@@ -570,17 +704,19 @@ void DeviceComp::step(DeviceCompState& s, Real dt)
 double DeviceComp::stableDt(const DeviceCompState& s, ReduceScratch& r,
                             double cfl) const
 {
+    const MrfView mz = mrf_ ? mrfView() : MrfView{};
     const double wmax = curv_
         ? reduce(r, g_.size(),
-                 WavePerDtCurv{s.rho.data(), s.mx.data(), s.my.data(),
+                 WavePerDtCurv{g_, mz, s.rho.data(), s.mx.data(), s.my.data(),
                                s.mz.data(), s.E.data(), curv_->aov[0].data(),
                                curv_->aov[1].data(),
                                g_.nz > 1 ? curv_->aov[2].data() : nullptr,
                                double(tr_.gamma)},
                  rocprim::maximum<double>(), 0.0)
         : reduce(r, g_.size(),
-                 WavePerDt{s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
-                           s.E.data(), double(tr_.gamma), 1.0 / g_.hx, 1.0 / g_.hy,
+                 WavePerDt{g_, mz, s.rho.data(), s.mx.data(), s.my.data(),
+                           s.mz.data(), s.E.data(), double(tr_.gamma),
+                           1.0 / g_.hx, 1.0 / g_.hy,
                            g_.nz > 1 ? 1.0 / g_.hz : 0.0},
                  rocprim::maximum<double>(), 0.0);
     double dt = cfl / wmax;

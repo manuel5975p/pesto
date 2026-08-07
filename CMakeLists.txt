@@ -379,7 +379,7 @@ if(BUILD_TESTING)
                   gpu_comp_far gpu_comp_nscbc gpu_nscbc_absorb gpu_nscbc_order
                   gpu_acoustics gpu_comp_sink
                   gpu_les_smag gpu_derived
-                  gpu_poisson_wally gpu_rotor_wall gpu_rotor_table
+                  gpu_poisson_wally gpu_rotor_wall gpu_rotor_table gpu_mrf
                   gpu_channel gpu_cutflux gpu_ogrid)
             add_executable(test_${t} tests/test_${t}.cpp)
             target_link_libraries(test_${t} PRIVATE dns_gpu)

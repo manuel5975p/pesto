@@ -329,9 +329,42 @@ void testCase()
         }
     }
 
+    // --rotor-frame mrf: static geometry, one frozen azimuth, declared as an
+    // approximation in the dry-run. moving stays the default and the flag
+    // without a rotor is rejected below with the other orphan rotor flags.
+    {
+        auto c = parseCase(base);
+        check(c && !c->rotorMrf, "case: no flag means no MRF");
+        auto args = base;
+        args.insert(args.end(), {"--rotor-mach", "0.6", "--rotor-axis", "z",
+                                 "--rotor-frame", "mrf"});
+        c = parseCase(args);
+        check(c.has_value(), "case: --rotor-frame mrf validates");
+        if (c)
+        {
+            check(c->rotorMrf && c->rotor.active(),
+                  "case: MRF is active rotor + frozen geometry");
+            check(c->rotor.bins == 1, "case: MRF holds one azimuth bin");
+            check(c->describe().find("MRF") != std::string::npos &&
+                      c->describe().find("APPROXIMATION") != std::string::npos,
+                  "case: the dry-run declares MRF an approximation");
+        }
+        args = base;
+        args.insert(args.end(), {"--rotor-mach", "0.6", "--rotor-axis", "z",
+                                 "--rotor-frame", "moving"});
+        c = parseCase(args);
+        check(c && !c->rotorMrf && c->rotor.bins > 1,
+              "case: --rotor-frame moving is the azimuth-table path");
+    }
+
     // Rejections that protect a real invariant, one each.
     struct Bad { std::vector<const char*> extra; const char* what; };
     const Bad bad[] = {
+        {{"--rotor-frame", "mrf"},
+         "--rotor-frame without --rotor-mach has nothing to freeze"},
+        {{"--rotor-mach", "0.6", "--rotor-axis", "z", "--rotor-frame", "mrf",
+          "--rotor-bins", "16"},
+         "MRF has no azimuth table to size"},
         {{"--rotor-mach", "0.6"},
          "an x shaft at nz == 1 sweeps out of the plane"},
         {{"--rotor-mach", "0.9", "--rotor-axis", "z"},

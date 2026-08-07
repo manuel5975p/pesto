@@ -171,8 +171,13 @@ __device__ inline Real faceConductionCurv(const GpuGrid& g, ViscView vv,
 // roughly the half-percent level, which is this tally's accuracy -- far inside
 // the staircase wall's own error, and the price of keeping the reported column
 // readable: nonzero means flux, never offset.
+// mz (--rotor-frame mrf): the SAME zone view the rhs used, so the tallied
+// momentum flux is exactly the solver's -- the interface faces sit deep in
+// the f = 1 core, where the advecting normal velocity is the wall-relative
+// one and vanishes on the resolved surface.
 __global__ void kBodyFlux(GpuGrid g, ViscView vv, int iso, PrimView q,
-                          const int* fcell, const int* fdir, int m, double* acc)
+                          const int* fcell, const int* fdir, int m, double* acc,
+                          MrfView mz)
 {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= m) return;
@@ -186,7 +191,8 @@ __global__ void kBodyFlux(GpuGrid g, ViscView vv, int iso, PrimView q,
     const int fi = i - (minus ? (axis == 0) : 0),
               fj = j - (minus ? (axis == 1) : 0),
               fk = k - (minus ? (axis == 2) : 0);
-    const Flux f = faceFlux(g, vv, q, fi, fj, fk, axis);
+    const Flux f = faceFlux(g, vv, q, fi, fj, fk, axis, nullptr, Real(0),
+                            mz.active ? &mz : nullptr);
     const Real area = axis == 0 ? g.hy * g.hz
                     : axis == 1 ? g.hx * g.hz
                                 : g.hx * g.hy;
@@ -205,7 +211,7 @@ __global__ void kBodyFlux(GpuGrid g, ViscView vv, int iso, PrimView q,
 // face area vector S, so there is no separate area multiply here.
 __global__ void kBodyFluxCurv(GpuGrid g, ViscView vv, int iso, PrimView q,
                               CurvView m, const int* fcell, const int* fdir,
-                              int n, double* acc)
+                              int n, double* acc, MrfView mz)
 {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n) return;
@@ -217,7 +223,8 @@ __global__ void kBodyFluxCurv(GpuGrid g, ViscView vv, int iso, PrimView q,
     const int fi = i - (minus ? (axis == 0) : 0),
               fj = j - (minus ? (axis == 1) : 0),
               fk = k - (minus ? (axis == 2) : 0);
-    const Flux f = faceFluxCurv(g, vv, q, m, fi, fj, fk, axis);
+    const Flux f = faceFluxCurv(g, vv, q, m, fi, fj, fk, axis, nullptr,
+                                Real(0), mz.active ? &mz : nullptr);
     const Real sgn = minus ? Real(-1) : Real(1);
     acc[t] = double(sgn * f.mx);
     acc[n + t] = double(sgn * f.my);
@@ -625,6 +632,7 @@ DeviceCompGhost::Force DeviceCompGhost::force(DeviceComp& solver,
     const PrimView q{s.rho.data(),      solver.u().data(), solver.v().data(),
                      solver.w().data(), solver.e().data(), solver.p().data(),
                      solver.T().data()};
+    const MrfView mz = solver.mrfActive() ? solver.mrfView() : MrfView{};
     if (curv_) {
         const DeviceCurv* t = solver.curvTables();
         assert(t && "focal ghost force needs the curvilinear DeviceComp");
@@ -632,12 +640,12 @@ DeviceCompGhost::Force DeviceCompGhost::force(DeviceComp& solver,
         const CurvView cv = t->view();
         kBodyFluxCurv<<<launchBlocks(nFace_), blockSize>>>(
             g_, viscView(solver.transport()), iso_, q, cv, fcell_.data(),
-            fdir_.data(), nFace_, facc_.data());
+            fdir_.data(), nFace_, facc_.data(), mz);
         checkLastKernel("kBodyFluxCurv");
     } else {
         kBodyFlux<<<launchBlocks(nFace_), blockSize>>>(
             g_, viscView(solver.transport()), iso_, q, fcell_.data(),
-            fdir_.data(), nFace_, facc_.data());
+            fdir_.data(), nFace_, facc_.data(), mz);
         checkLastKernel("kBodyFlux");
     }
     kBodyMoment<<<launchBlocks(nFace_), blockSize>>>(
