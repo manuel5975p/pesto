@@ -86,8 +86,12 @@ __device__ inline void mrfSource(const MrfView& mz, PrimView q, std::size_t c,
                                  Real& dmz)
 {
     Real wc[3];
-    const Real f =
-        mrfFrameVel(mz, mz.cc[0][i], mz.cc[1][j], mz.cc[2][k], wc);
+    // Cell-centre position: the per-cell table on a general mesh
+    // (setMrfCurv), the separable per-axis tables otherwise.
+    const Real px = mz.pc[0] ? mz.pc[0][c] : mz.cc[0][i];
+    const Real py = mz.pc[1] ? mz.pc[1][c] : mz.cc[1][j];
+    const Real pz = mz.pc[2] ? mz.pc[2][c] : mz.cc[2][k];
+    const Real f = mrfFrameVel(mz, px, py, pz, wc);
     if (f == Real(0)) return;
     const Real fo = f * mz.omega;
     const int b = (mz.axis + 1) % 3, c2 = (mz.axis + 2) % 3;
@@ -176,15 +180,25 @@ __global__ void kCompStageCurv(GpuGrid g, ViscView vv, PrimView q,
     for (int a = 0; a < 3; ++a) {
         Real whi[3], wlo[3];
         const Real *pwhi = nullptr, *pwlo = nullptr;
+        Real qhi = 0, qlo = 0;
         if (mz.active) {
-            mrfCellFaces(mz, g, i, j, k, a, whi, wlo);
-            pwhi = whi;
-            pwlo = wlo;
+            if (mz.psi) {
+                // Node-psi transport correction (general mesh): the lo face is
+                // the back neighbour's +a face, same wrap as offsetsAt.
+                qhi = mrfFaceQNode(mz, g, i, j, a);
+                const int il = a == 0 ? (i ? i - 1 : g.nx - 1) : i;
+                const int jl = a == 1 ? (j ? j - 1 : g.ny - 1) : j;
+                qlo = mrfFaceQNode(mz, g, il, jl, a);
+            } else {
+                mrfCellFaces(mz, g, i, j, k, a, whi, wlo);
+                pwhi = whi;
+                pwlo = wlo;
+            }
         }
-        const Flux hi =
-            faceFluxCurv(vv, q, m, o, c, c + o.p[a], a, nut, kapScale, pwhi);
-        const Flux lo =
-            faceFluxCurv(vv, q, m, o, c + o.m[a], c, a, nut, kapScale, pwlo);
+        const Flux hi = faceFluxCurv(vv, q, m, o, c, c + o.p[a], a, nut,
+                                     kapScale, pwhi, qhi);
+        const Flux lo = faceFluxCurv(vv, q, m, o, c + o.m[a], c, a, nut,
+                                     kapScale, pwlo, qlo);
         drho -= hi.rho - lo.rho;
         dmx -= hi.mx - lo.mx;
         dmy -= hi.my - lo.my;
@@ -236,7 +250,10 @@ __host__ __device__ inline void mrfCellVel(const MrfView& mz, const GpuGrid& g,
     int i, j, k;
     decompose(g, std::size_t(c), i, j, k);
     Real wr[3];
-    (void)mrfFrameVel(mz, mz.cc[0][i], mz.cc[1][j], mz.cc[2][k], wr);
+    const Real px = mz.pc[0] ? mz.pc[0][c] : mz.cc[0][i];
+    const Real py = mz.pc[1] ? mz.pc[1][c] : mz.cc[1][j];
+    const Real pz = mz.pc[2] ? mz.pc[2][c] : mz.cc[2][k];
+    (void)mrfFrameVel(mz, px, py, pz, wr);
     w[0] -= double(wr[0]);
     w[1] -= double(wr[1]);
     w[2] -= double(wr[2]);
@@ -561,6 +578,89 @@ hipError_t DeviceComp::setMrf(const MrfZone& z, const AxisRemap3& remap)
     return hipSuccess;
 }
 
+namespace {
+
+// Host double twin of mrfPsiRad's closed form (same cubic-smoothstep
+// integral, kept in lockstep with it): G(r) = int_0^r s fr(s) ds. The table
+// is built once in double so the only FP32 rounding is the stored psi itself;
+// the kernel's telescoping then cancels those stored values exactly.
+double mrfPsiRadHost(double r1, double r2, double r)
+{
+    if (r <= r1) return 0.5 * r * r;
+    const double d = r2 - r1;
+    const double u = r >= r2 ? 1.0 : (r - r1) / d;
+    const double u2 = u * u, u3 = u2 * u, u4 = u2 * u2;
+    return 0.5 * r1 * r1 +
+           d * (r1 * (u - u3 + 0.5 * u4) +
+                d * (0.5 * u2 - 0.75 * u4 + 0.4 * u4 * u));
+}
+
+} // namespace
+
+hipError_t DeviceComp::setMrfCurv(const MrfZone& z, const CurvMesh& mesh)
+{
+    // z shaft only, and the axial blend must be degenerate (fa == 1
+    // everywhere): the node-psi table carries no axial factor, because a
+    // z-extruded mesh has no axial boundary for the blend to shield. The
+    // runner sets a1/a2 to the same 1e30 sentinel the 2D Cartesian zone uses.
+    assert(z.omega != 0.0 && z.axis == 2 && 0.0 < z.r1 && z.r1 < z.r2 &&
+           z.a1 >= 1e29 && z.a2 > z.a1);
+    assert(mesh.g.nx == g_.nx && mesh.g.ny == g_.ny && mesh.g.nz == g_.nz);
+
+    // Per-node stream potential psi = -omega * hz * G(r), (ny+1) rows of nx:
+    // row ny is the +j face's top corner row of the last cell row, well
+    // defined for every AxisWrap by CurvMesh::node. hz is baked in (the z
+    // edges of every in-plane face have exactly that length on a z-extruded
+    // mesh; 1 at nz == 1, the unit depth).
+    const std::size_t nn = std::size_t(g_.ny + 1) * g_.nx;
+    std::vector<Real> psi(nn);
+    for (int j = 0; j <= g_.ny; ++j)
+        for (int i = 0; i < g_.nx; ++i) {
+            const auto p = mesh.node(i, j, 0);
+            const double r = std::hypot(p[0] - z.center[0],
+                                        p[1] - z.center[1]);
+            psi[std::size_t(j) * g_.nx + i] =
+                Real(-z.omega * g_.hz * mrfPsiRadHost(z.r1, z.r2, r));
+        }
+
+    // Per-cell centres (mean of the 8 corner nodes) for the Coriolis source
+    // and the dt bound -- pointwise consumers, no telescoping at stake.
+    std::vector<Real> cx(g_.size()), cy(g_.size()), cz(g_.size());
+    for (int k = 0; k < g_.nz; ++k)
+        for (int j = 0; j < g_.ny; ++j)
+            for (int i = 0; i < g_.nx; ++i) {
+                double s[3] = {0, 0, 0};
+                for (int dk = 0; dk < 2; ++dk)
+                    for (int dj = 0; dj < 2; ++dj)
+                        for (int di = 0; di < 2; ++di) {
+                            const auto p =
+                                mesh.node(i + di, j + dj, k + dk);
+                            s[0] += p[0];
+                            s[1] += p[1];
+                            s[2] += p[2];
+                        }
+                const std::size_t c = gidx(g_, i, j, k);
+                cx[c] = Real(0.125 * s[0]);
+                cy[c] = Real(0.125 * s[1]);
+                cz[c] = Real(0.125 * s[2]);
+            }
+
+    auto up = [](DeviceScalar* dst, const std::vector<Real>& src)
+        -> hipError_t {
+        auto b = DeviceScalar::make(src.size());
+        if (!b) return b.error();
+        if (auto e = b->upload(src.data()); e != hipSuccess) return e;
+        *dst = std::move(*b);
+        return hipSuccess;
+    };
+    if (auto e = up(&mrfPsi_, psi); e != hipSuccess) return e;
+    if (auto e = up(&mrfPc_[0], cx); e != hipSuccess) return e;
+    if (auto e = up(&mrfPc_[1], cy); e != hipSuccess) return e;
+    if (auto e = up(&mrfPc_[2], cz); e != hipSuccess) return e;
+    mrf_ = z;
+    return hipSuccess;
+}
+
 MrfView DeviceComp::mrfView() const
 {
     const MrfZone& z = *mrf_;
@@ -578,7 +678,11 @@ MrfView DeviceComp::mrfView() const
     for (int a = 0; a < 3; ++a) {
         v.cc[a] = mrfCc_[a].data();
         v.fc[a] = mrfFc_[a].data();
+        v.pc[a] = mrfPc_[a].data();
     }
+    // Exactly one family is engaged: setMrf leaves psi/pc null, setMrfCurv
+    // leaves cc/fc null, and psi is the kernel-side switch.
+    v.psi = mrfPsi_.data();
     return v;
 }
 

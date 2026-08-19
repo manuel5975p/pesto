@@ -17,6 +17,7 @@
 
 namespace dns {
 struct CurvMetrics;
+struct CurvMesh;
 struct AxisRemap3;
 }
 
@@ -170,6 +171,14 @@ public:
     // calling this keeps every path bit-for-bit the inertial solver.
     // Pre: z as documented on MrfZone.
     hipError_t setMrf(const MrfZone& z, const AxisRemap3& remap);
+    // The same zone on a GENERAL z-extruded curvilinear mesh (the O-grid):
+    // uploads a per-node stream potential and per-cell centres built from the
+    // mesh's own nodes, so the transport correction telescopes exactly where
+    // no separable coordinate table exists. Pre: z as on MrfZone with
+    // z.axis == 2, and `mesh` is the mesh this solver's metrics were built
+    // from, z-invariant in the extrusion sense (the O-grid builder enforces
+    // it).
+    hipError_t setMrfCurv(const MrfZone& z, const CurvMesh& mesh);
     bool mrfActive() const { return mrf_.has_value(); }
     // The zone as a by-value kernel view (HIP TUs only); pre: mrfActive().
     MrfView mrfView() const;
@@ -213,8 +222,10 @@ private:
     std::optional<DeviceCurv> curv_; // engaged = curvilinear rhs/stableDt
     // Rotating-frame zone (engaged by setMrf): parameters plus the uploaded
     // per-axis physical coordinate tables (cell centres and +faces).
+    // setMrfCurv fills the node-psi and per-cell-centre tables instead.
     std::optional<MrfZone> mrf_;
     DeviceScalar mrfCc_[3], mrfFc_[3];
+    DeviceScalar mrfPsi_, mrfPc_[3];
     DeviceScalar u_, v_, w_, e_, p_, T_;
     DeviceScalar nut_;      // per-cell dynamic eddy viscosity (LES only)
     std::function<void(DeviceCompState&)> hook_;

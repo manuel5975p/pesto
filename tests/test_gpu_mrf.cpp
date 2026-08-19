@@ -17,8 +17,12 @@
 //      MRF co-rotates the far field, which is precisely its approximation --
 //      so the quiescent rig is the one that isolates the machinery.
 #include "dns/comp.hpp"
+#include "dns/curvmesh.hpp"
+#include "dns/ogrid.hpp"
+#include "dns/transport.hpp"
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_ghost.hpp"
+#include "dns/gpu/ogrid_bc.hpp"
 #include "dns/remap.hpp"
 #include "dns/rotor.hpp"
 
@@ -194,10 +198,9 @@ SpinResult spinUp(bool mrf, double tEnd)
     return out;
 }
 
-void testFrameParity()
+void testFrameParity(const SpinResult& direct)
 {
     const double tEnd = 3.0;
-    const auto direct = spinUp(false, tEnd);
     const auto mrf = spinUp(true, tEnd);
     std::printf("parity: direct torque %.6e uTheta %.6e | mrf torque %.6e "
                 "uTheta %.6e\n",
@@ -216,12 +219,196 @@ void testFrameParity()
           "driven swirl agrees between the frames");
 }
 
+// --- 3. the node-psi zone on the body-fitted O-grid (setMrfCurv) ------------
+//
+// Same two claims, general-mesh path. Transparency has no separable table to
+// lean on here: the correction is the per-node stream potential, whose face
+// differences must telescope on the annulus exactly as the corner form does
+// on the box. Parity reuses the SAME physical rig as the Cartesian one --
+// spinning cylinder, quiescent far field, identical R, mu, omega, t -- so the
+// O-grid MRF torque is pinned against the Cartesian DIRECT (moving-wall) run:
+// two wall discretizations, two frames, one flow.
+
+Transport rigGas(double gamma_, double mu)
+{
+    return Transport::air(mu, 1.0, 300.0, 0.72, gamma_, 1.0, false);
+}
+
+// Uniform quiescent state on a circular-cylinder O-grid with the zone active:
+// one step, no boundary hook, and the rows a polluted ghost row cannot have
+// reached yet must be unmoved to FP32-telescoping roundoff. Rows 0..2 and
+// ny-3..ny-1 are excluded: the ghost rows have no valid lo face, so their own
+// rhs is garbage by contract and it spreads one row per RK stage.
+void testOGridTransparency()
+{
+    const double R = 0.5, rFar = 5.0;
+    const int nx = 128, ny = 64;
+    const double gamma_ = 1.4, rhoInf = 1.0;
+    const double pInf = 1.0 / (gamma_ * 0.04); // c = 5
+    const auto g = ogridGrid(nx, ny, 1, R, rFar, 1.0);
+    const Sdf sdf = [R](double x, double y, double) {
+        return std::hypot(x, y) - R;
+    };
+    auto og = buildOGrid(g, sdf, {.cx = 0, .cy = 0, .cz = 0, .rFar = rFar,
+                                  .beta = 0, .span = 1.0});
+    if (!og) { check(false, "ogrid transparency build: " + og.error()); return; }
+    auto mtr = CurvMetrics::build(og->mesh);
+    if (!mtr) { check(false, "metrics: " + mtr.error()); return; }
+    auto dev = gpu::DeviceComp::make(*mtr, rigGas(gamma_, 1e-3), 0.0,
+                                     SgsModel::Smagorinsky);
+    auto ds = gpu::DeviceCompState::make(g.size());
+    auto red = gpu::ReduceScratch::make();
+    if (!dev || !ds || !red) { check(false, "ogrid transparency alloc"); return; }
+
+    gpu::MrfZone z;
+    z.axis = 2;
+    z.omega = 2.0;
+    z.center[0] = z.center[1] = z.center[2] = 0.0;
+    z.r1 = 1.5; z.r2 = 2.5;   // blend strictly inside the annulus
+    z.a1 = 1e30; z.a2 = 2e30; // z-extruded: degenerate axial blend
+    check(dev->setMrfCurv(z, og->mesh) == hipSuccess, "setMrfCurv");
+
+    auto host = CompState::zeros(g);
+    for (std::size_t c = 0; c < g.size(); ++c) {
+        host.rho[c] = rhoInf;
+        host.E[c] = pInf / (gamma_ - 1.0);
+    }
+    (void)ds->upload(host);
+    const double dt = dev->stableDt(*ds, *red);
+    dev->step(*ds, gpu::Real(dt));
+    (void)ds->download(host);
+
+    double dv = 0.0;
+    for (int j = 3; j <= g.ny - 4; ++j)
+        for (int i = 0; i < g.nx; ++i) {
+            const std::size_t c = g.idx(i, j, 0);
+            dv = std::max({dv, std::abs(host.mx[c] / host.rho[c]),
+                           std::abs(host.my[c] / host.rho[c]),
+                           std::abs(host.mz[c] / host.rho[c]),
+                           std::abs(double(host.rho[c]) - rhoInf)});
+        }
+    std::printf("ogrid transparency: dt %.3e, interior deviation %.3e\n", dt,
+                dv);
+    check(dv < 1e-4, "a quiescent state passes the node-psi zone (annulus)");
+}
+
+// Spin-up of the SAME cylinder on its own body-fitted annulus, MRF frame:
+// wall row mirrored about omega x r, node-psi zone over the wall, torque off
+// the wall-face tally. Same R, mu, omega and end time as spinUp().
+SpinResult spinUpOGrid(double tEnd)
+{
+    const double L = 2 * pi, R = L / 16, rFar = pi;
+    const int nx = 128, ny = 96;
+    const double gamma_ = 1.4, rhoInf = 1.0;
+    const double pInf = 1.0 / (gamma_ * 0.04);
+    const double mu = rhoInf * 2 * R / 20.0;
+    const auto g = ogridGrid(nx, ny, 1, R, rFar, 1.0);
+    const Sdf sdf = [R](double x, double y, double) {
+        return std::hypot(x, y) - R;
+    };
+    auto og = buildOGrid(g, sdf, {.cx = 0, .cy = 0, .cz = 0, .rFar = rFar,
+                                  .beta = 2.0, .span = 1.0});
+    if (!og) { check(false, "ogrid spinUp build: " + og.error()); return {}; }
+    auto mtr = CurvMetrics::build(og->mesh);
+    if (!mtr) { check(false, "ogrid spinUp metrics"); return {}; }
+    auto dev = gpu::DeviceComp::make(*mtr, rigGas(gamma_, mu), 0.0,
+                                     SgsModel::Smagorinsky);
+    auto ds = gpu::DeviceCompState::make(g.size());
+    auto red = gpu::ReduceScratch::make();
+    if (!dev || !ds || !red) { check(false, "ogrid spinUp alloc"); return {}; }
+
+    gpu::MrfZone z;
+    z.axis = 2;
+    z.omega = 1.0;
+    z.center[0] = z.center[1] = z.center[2] = 0.0;
+    z.r1 = 2.0 * R; z.r2 = 3.5 * R; // the Cartesian rig's own fractions
+    z.a1 = 1e30; z.a2 = 2e30;
+    if (dev->setMrfCurv(z, og->mesh) != hipSuccess) {
+        check(false, "ogrid spinUp setMrfCurv");
+        return {};
+    }
+
+    gpu::DeviceOGridBc::Config bc;
+    bc.gamma = gamma_;
+    bc.Rgas = 1.0;
+    bc.rhoInf = rhoInf;
+    bc.uInf = 0.0;
+    bc.pInf = pInf;
+    bc.omega = z.omega;
+    bc.cx = 0.0;
+    bc.cy = 0.0;
+    bc.wallPos = ogridWallMidpoints(*og);
+    auto wall = gpu::DeviceOGridBc::make(g, bc);
+    if (!wall) { check(false, "ogrid spinUp bc"); return {}; }
+    dev->setStageHook([&](gpu::DeviceCompState& s) { wall->apply(s); });
+
+    auto host = CompState::zeros(g);
+    for (std::size_t c = 0; c < g.size(); ++c) {
+        host.rho[c] = rhoInf;
+        host.E[c] = pInf / (gamma_ - 1.0);
+    }
+    (void)ds->upload(host);
+    wall->apply(*ds);
+    double t = 0.0;
+    while (t < tEnd) {
+        const double dt = dev->stableDt(*ds, *red);
+        dev->step(*ds, gpu::Real(dt));
+        t += dt;
+    }
+    wall->apply(*ds);
+    const auto F = wall->surface(*dev, *ds);
+    (void)ds->download(host);
+
+    // Tangential average over the SAME wall-distance band the Cartesian rig
+    // samples (its own grid spacing), cell centres off the mesh nodes.
+    const double h = L / 192;
+    SpinResult out{.torque = F.tz};
+    int m = 0;
+    for (int j = 1; j < ny - 1; ++j)
+        for (int i = 0; i < nx; ++i) {
+            const auto a = og->mesh.node(i, j, 0);
+            const auto b = og->mesh.node(i + 1, j, 0);
+            const auto c2 = og->mesh.node(i, j + 1, 0);
+            const auto d2 = og->mesh.node(i + 1, j + 1, 0);
+            const double x = 0.25 * (a[0] + b[0] + c2[0] + d2[0]);
+            const double y = 0.25 * (a[1] + b[1] + c2[1] + d2[1]);
+            const double r = std::hypot(x, y);
+            if (r - R < h || r - R > 2.0 * h) continue;
+            const std::size_t c = g.idx(i, j, 0);
+            const double tx = -y / r, ty = x / r;
+            out.uTheta += (host.mx[c] / host.rho[c]) * tx +
+                          (host.my[c] / host.rho[c]) * ty;
+            ++m;
+        }
+    if (m > 0) out.uTheta /= m;
+    return out;
+}
+
+void testOGridFrameParity(const SpinResult& direct)
+{
+    const auto og = spinUpOGrid(3.0);
+    std::printf("ogrid parity: direct torque %.6e uTheta %.6e | ogrid mrf "
+                "torque %.6e uTheta %.6e\n",
+                direct.torque, direct.uTheta, og.torque, og.uTheta);
+    check(og.torque < 0.0,
+          "the O-grid MRF torque opposes the spin");
+    // Two wall discretizations (mesh-face row vs ghost staircase), two
+    // frames, one flow: agreement is truncation-level, not roundoff.
+    check(std::abs(og.torque - direct.torque) < 0.10 * std::abs(direct.torque),
+          "O-grid MRF torque matches the Cartesian direct run");
+    check(std::abs(og.uTheta - direct.uTheta) < 0.10 * std::abs(direct.uTheta),
+          "O-grid MRF driven swirl matches the Cartesian direct run");
+}
+
 } // namespace
 
 int main()
 {
     test::requireDeviceOrSkip();
     testTransparency();
-    testFrameParity();
+    const auto direct = spinUp(false, 3.0);
+    testFrameParity(direct);
+    testOGridTransparency();
+    testOGridFrameParity(direct);
     return dnstest::finish();
 }

@@ -108,4 +108,10 @@ Grid ogridGrid(int nx, int ny, int nz, double rWall, double rFar, double span);
 std::expected<OGrid, std::string> buildOGrid(const Grid& g, const Sdf& sdf,
                                              const OGridSpec& spec);
 
+// In-plane midpoints of the nx wall faces (the +j face of cell (i, 0):
+// nodes (i, 1) and (i+1, 1) averaged, angular wrap included) -- the lever
+// arms and mirror points of a rigidly rotating wall (gpu/ogrid_bc).
+// Pre: og from buildOGrid.
+std::vector<std::array<double, 2>> ogridWallMidpoints(const OGrid& og);
+
 } // namespace dns

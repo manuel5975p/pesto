@@ -333,6 +333,11 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
     rr.thermal = c.bodyIsothermal ? gpu::OGridThermal::Isothermal
                                   : gpu::OGridThermal::Adiabatic;
     rr.Twall = c.twallRatio * Tinf;
+    // The resolved rotor, verbatim (validator-owned); on the O-grid only
+    // --rotor-frame mrf reaches here, and active() is false without
+    // --rotor-mach.
+    rr.rotor = c.rotor;
+    rr.rotorMrf = c.rotorMrf;
     rr.D = geo.D;
     rr.qRef = 0.5 * rhoInf * c.uInf * c.uInf * geo.D;
     rr.les = c.cs;

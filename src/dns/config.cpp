@@ -1477,10 +1477,29 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
                 return bad(2, "--rotor-mach", "the moving wall is the "
                                "compressible ghost wall; --rotor-mach needs "
                                "--physics compressible");
-            if (c.ogrid)
+            // The O-grid takes the frozen-rotor frame only: the wall is a
+            // mesh face row, so MOVING geometry would spin the mesh itself.
+            // --rotor-frame mrf keeps the mesh static (rotating-frame
+            // equations + a wall moving in its own plane) and is exact for a
+            // circular section.
+            if (c.ogrid && r.rotorFrame != 1)
                 return bad(2, "--rotor-mach", "an O-grid IS the body surface: "
-                               "spinning the body would spin the mesh, which "
-                               "is a different solver. Immerse it in the box");
+                               "spinning the body would spin the mesh. "
+                               "--rotor-frame mrf solves the rotating frame "
+                               "on the static O-grid instead; the moving-"
+                               "geometry rotor needs the immersed box");
+            if (c.ogrid && r.rotorAxis != 2)
+                return bad(2, "--rotor-axis", "the O-grid is z-extruded, so "
+                               "only the z shaft keeps the wall motion in the "
+                               "mesh plane");
+            if (c.ogrid && r.given.contains("--blade-thicken"))
+                return bad(2, "--blade-thicken", "exists for the immersed "
+                               "ghost wall's mirror band; the O-grid wall is "
+                               "a mesh face row and needs no dilation");
+            if (c.ogrid && r.given.contains("--rotor-span"))
+                return bad(2, "--rotor-span", "sizes the swept box of an "
+                               "immersed rotor; the O-grid's extent is the "
+                               "mesh itself");
             if (c.bodyKind == BodyKind::None)
                 return bad(2, "--rotor-mach", "there is no body to spin");
             if (c.bodyKind == BodyKind::Fence || c.bodyKind == BodyKind::Floor)
@@ -1614,7 +1633,9 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
             // The blade has to be thick enough for the ghost wall's mirror
             // band on BOTH sides. We cannot measure the mesh here (validation
             // touches no filesystem), so this is the advisory; the run reports
-            // the measured deep-solid count, which is the real check.
+            // the measured deep-solid count, which is the real check. The
+            // O-grid wall is a mesh face row -- no mirror band exists there.
+            if (!c.ogrid)
             c.warnings.push_back(std::format(
                 "rotor: the ghost wall needs a mirror band >= 2 cells thick "
                 "per side, so the blade must be >= 4 fine cells thick "
@@ -2092,13 +2113,18 @@ std::string Case::describe() const
         s += std::format(
             "             wall is MOVING no-slip (omega x r, tip speed "
             "{:.6g}); run reports\n"
-            "             thrust and shaft torque about {}\n"
-            "             blade must be >= 4 fine cells thick (h_fine={:.3e}, "
-            "D/h_fine={:.1f}):\n"
-            "             >= {:.4g} in world units, or the two surfaces' "
-            "mirror bands overlap\n",
-            std::abs(rotor.omega) * rotor.radius, shaft, hFine,
-            hFine > 0 ? placement.D / hFine : 0.0, 4.0 * hFine);
+            "             thrust and shaft torque about {}\n",
+            std::abs(rotor.omega) * rotor.radius, shaft);
+        if (!ogrid)
+            s += std::format(
+                "             blade must be >= 4 fine cells thick "
+                "(h_fine={:.3e}, D/h_fine={:.1f}):\n"
+                "             >= {:.4g} in world units, or the two surfaces' "
+                "mirror bands overlap\n",
+                hFine, hFine > 0 ? placement.D / hFine : 0.0, 4.0 * hFine);
+        else
+            s += "             wall is a mesh face row: no mirror band, no "
+                 "thickness gate\n";
         if (rotor.thicken > 0)
             s += std::format(
                 "  blade      THICKENED: surface dilated outward by {:.4g} "

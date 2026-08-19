@@ -17,6 +17,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <format>
+#include <numbers>
+#include <string>
 #include <vector>
 
 namespace dns::gpu {
@@ -87,6 +90,68 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
     auto red = ReduceScratch::make();
     if (!dev || !ds || !red) return fail(6, "GPU allocation failed");
 
+    if (r.rotor.active() && !r.rotorMrf)
+        return fail(2, "the O-grid has no moving-geometry rotor: spinning the "
+                       "body would spin the mesh. --rotor-frame mrf is the "
+                       "supported form (the validator enforces this)");
+    if (r.rotor.active())
+    {
+        // --rotor-frame mrf on the body-fitted mesh. The real tip radius is
+        // EXACT here -- the wall is a node row -- so the tip-Mach guard uses
+        // it directly; omega stays quoted on the nominal D/2 like the
+        // Cartesian path (one definition, config.cpp).
+        const double* cs = r.rotor.shaft.data();
+        const double tipR = og.rWallMax;
+        const double cInf = std::sqrt(r.tr.gamma * r.pInf / r.rhoInf);
+        const double machTip = std::abs(r.rotor.omega) * tipR / cInf;
+        const double machInf = std::abs(r.uInf) / cInf;
+        std::printf("rotor: wall tip radius %.4g (nominal %.4g) -> tip Mach "
+                    "%.3f, +freestream %.3f\n",
+                    tipR, r.rotor.radius, machTip, machTip + machInf);
+        if (machTip + machInf >= 1.0)
+            return fail(2, std::format(
+                "the wall reaches {:.4g} from the shaft, not the nominal "
+                "{:.4g}, so its real tip Mach is {:.3f} and with the "
+                "freestream {:.3f} >= 1. Lower --rotor-mach below {:.3f}",
+                tipR, r.rotor.radius, machTip, machTip + machInf,
+                r.rotor.radius / tipR * (1.0 - machInf) * 0.95));
+
+        // Zone: f = 1 over the whole wall (that is what cancels the moving
+        // wall's normal flux against the transport correction exactly), the
+        // blend inside the annulus, and psi CONSTANT before the far rows so
+        // the characteristic far field never sees the frame. rFar and the
+        // nominal fluid radial spacing come off the mesh itself.
+        const auto pf = og.mesh.node(0, g.ny - 1, 0);
+        const double rFar = std::hypot(pf[0] - cs[0], pf[1] - cs[1]);
+        const double hr = (rFar - og.rWallMax) / std::max(1, g.ny - 3);
+        MrfZone z;
+        z.axis = 2;
+        z.omega = r.rotor.omega;
+        for (int d = 0; d < 3; ++d) z.center[d] = cs[d];
+        z.r1 = tipR + std::max(0.05 * r.D, 2.0 * hr);
+        z.r2 = z.r1 + std::max(0.15 * r.D, 4.0 * hr);
+        // The O-grid is z-extruded with a periodic span: no axial boundary
+        // exists, so the axial blend is degenerate exactly as the 2D
+        // Cartesian zone's (setMrfCurv requires it).
+        z.a1 = 1e30;
+        z.a2 = 2e30;
+        // Margin 4 nominal cells: with radial clustering the OUTER cells are
+        // the widest, so the nominal spacing under-counts there.
+        if (z.r2 >= rFar - 4.0 * hr)
+            return fail(2, std::format(
+                "MRF blend (r2 {:.3g}) reaches the far rows (rFar {:.3g}): "
+                "the rotating frame must vanish before the characteristic "
+                "boundary. Increase --ogrid-far",
+                z.r2, rFar));
+        std::printf("rotor: MRF zone about the shaft: f=1 to r %.4g, 0 past "
+                    "%.4g (frozen rotor -- exact for a circular section, an "
+                    "APPROXIMATION otherwise)\n",
+                    z.r1, z.r2);
+        std::fflush(stdout);
+        if (dev->setMrfCurv(z, og.mesh) != hipSuccess)
+            return fail(6, "MRF zone init failed");
+    }
+
     DeviceOGridBc::Config bc;
     bc.gamma = r.tr.gamma;
     bc.Rgas = r.tr.Rgas;
@@ -97,6 +162,13 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
     bc.pInf = r.pInf;
     bc.sigma = r.farSigma;
     bc.band = r.farBand;
+    if (r.rotor.active())
+    {
+        bc.omega = r.rotor.omega;
+        bc.cx = r.rotor.shaft[0];
+        bc.cy = r.rotor.shaft[1];
+        bc.wallPos = ogridWallMidpoints(og);
+    }
     auto wall = DeviceOGridBc::make(g, bc);
     if (!wall) return fail(6, "O-grid boundary init failed");
 
@@ -114,9 +186,20 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
     // wmax: the acoustic wave speed the dt bound actually saw, put back on a
     // physical length (the mesh's narrowest cell width); the index spacings of
     // a curvilinear grid are not lengths.
-    const std::string cols[] = {"t",  "dt", "cd",   "cl",
-                                "cs", "heat", "wmax"};
+    // A rotor adds thrust, shaft torque and their propeller coefficients
+    // (rho n^2 D^4 / D^5, n = rev per unit time), exactly runner_comp's
+    // columns; a static run keeps the columns it has always had.
+    const std::vector<std::string> cols =
+        r.rotor.active()
+            ? std::vector<std::string>{"t",    "dt",   "cd",     "cl",
+                                       "cs",   "heat", "wmax",   "thrust",
+                                       "torque", "ct", "cq"}
+            : std::vector<std::string>{"t",  "dt",   "cd",  "cl",
+                                       "cs", "heat", "wmax"};
     out.declareSeries("stats", cols);
+    const double rotorN = std::abs(r.rotor.omega) / (2.0 * std::numbers::pi);
+    const double ctDen = r.rhoInf * rotorN * rotorN * std::pow(r.D, 4);
+    const double cqDen = ctDen * r.D;
 
     const float vortScale =
         float(r.curlMax > 0 ? r.curlMax
@@ -204,13 +287,32 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
             st.cs = F.fz / (r.qRef * span);
             heat = F.heat;
             const double wmax = r.cfl / dtStab * mtr->hmin;
-            const double row[] = {t, dt, st.cd, st.cl, st.cs, heat, wmax};
-            (void)out.row("stats", row);
+            if (r.rotor.active())
+            {
+                // z shaft: thrust is the force along it, torque the moment
+                // about it, both signed like runner_comp's.
+                const double row[] = {t,     dt,   st.cd, st.cl,  st.cs,
+                                      heat,  wmax, F.fz,  F.tz,
+                                      ctDen > 0 ? F.fz / ctDen : 0.0,
+                                      cqDen > 0 ? F.tz / cqDen : 0.0};
+                (void)out.row("stats", row);
+            }
+            else
+            {
+                const double row[] = {t, dt, st.cd, st.cl, st.cs, heat, wmax};
+                (void)out.row("stats", row);
+            }
             if (st.steps - lastLog >= 10 * r.statsEvery || t >= r.tEnd)
             {
-                std::printf("t=%.2f/%.2f cd=%.3f cl=%+.3f cs=%+.3f q=%+.3e "
-                            "wmax=%.2f dt=%.2e\n",
-                            t, r.tEnd, st.cd, st.cl, st.cs, heat, wmax, dt);
+                if (r.rotor.active())
+                    std::printf("t=%.2f/%.2f torque=%+.4e cd=%.3f cl=%+.3f "
+                                "wmax=%.2f dt=%.2e\n",
+                                t, r.tEnd, F.tz, st.cd, st.cl, wmax, dt);
+                else
+                    std::printf("t=%.2f/%.2f cd=%.3f cl=%+.3f cs=%+.3f "
+                                "q=%+.3e wmax=%.2f dt=%.2e\n",
+                                t, r.tEnd, st.cd, st.cl, st.cs, heat, wmax,
+                                dt);
                 std::fflush(stdout);
             }
             lastLog = st.steps;

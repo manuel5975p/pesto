@@ -30,7 +30,9 @@
 
 #include "dns/gpu/comp.hpp"
 
+#include <array>
 #include <expected>
+#include <vector>
 
 namespace dns::gpu {
 
@@ -80,10 +82,23 @@ public:
         // freestream, so the fixed point is exact for any blend weight -- the
         // same argument comp_nscbc's lateral blend makes.
         double band = 0.01;
+        // Rigid rotation of the WALL about the z shaft through (cx, cy) at
+        // rate omega (--rotor-frame mrf on the O-grid): the ghost row mirrors
+        // about u_wall = omega x (p - c) instead of rest, the SAME image the
+        // moving Cartesian ghost wall takes, with reflection factor exactly 1
+        // because the mesh puts the ghost at the geometric reflection. 0 is
+        // the resting wall bit-for-bit (the resting branch is kept verbatim,
+        // not folded into the general form). When omega != 0, wallPos must
+        // hold the nx wall-face midpoints as (x, y) pairs (ogridWallMidpoints)
+        // -- they set both the mirror velocity and the torque lever arms.
+        double omega = 0;
+        double cx = 0, cy = 0;
+        std::vector<std::array<double, 2>> wallPos;
     };
 
     // ny >= 4, gamma > 1, Rgas > 0, rhoInf > 0, pInf > 0, |uInf| subsonic,
-    // sigma in (0, 1], band > 0, and Twall > 0 when isothermal.
+    // sigma in (0, 1], band > 0, Twall > 0 when isothermal, and
+    // wallPos.size() == nx when omega != 0.
     static std::expected<DeviceOGridBc, hipError_t> make(const Grid& g,
                                                          Config c);
 
@@ -119,11 +134,17 @@ public:
         double fx, fy, fz; // force ON the body (fluid -> body)
         // Energy flux from the fluid INTO the body through the wall face, same
         // orientation as the force: positive = the body gains energy (a wall
-        // colder than the fluid). At a no-slip wall the face velocity is
-        // exactly zero, so the convective and viscous-work terms vanish
+        // colder than the fluid). At a RESTING no-slip wall the face velocity
+        // is exactly zero, so the convective and viscous-work terms vanish
         // identically and this is the Fourier term alone -- a caller divides by
-        // kappa * dT * area to get a Nusselt number.
+        // kappa * dT * area to get a Nusselt number. A MOVING wall (omega
+        // != 0) adds the viscous work of the wall's own motion, which is the
+        // shaft power -- the Fourier reading needs the resting wall.
         double heat;
+        // Moment about the z shaft through (cx, cy), same faces and same FP64
+        // reduction as the force so the two cannot disagree about which faces
+        // are the body. Exactly 0.0 when omega == 0 (no lever-arm tables).
+        double tz;
     };
 
     // Exact discrete surface integral over the wall face row: the wall face is
@@ -153,7 +174,10 @@ private:
     double u_ = 0;      // live (ramped) freestream speed
     double cInf_ = 0;   // freestream sound speed
     DeviceScalar cosT_, sinT_; // nx entries: the cell-centre radial normal
-    DeviceBuffer<double> acc_; // 4 * nx * nz staging for the surface tally
+    // Moving wall only (omega != 0), nx entries each: wall-face midpoints and
+    // the wall velocity omega x (p - c) there. Null = resting wall.
+    DeviceScalar wpx_, wpy_, uwx_, uwy_;
+    DeviceBuffer<double> acc_; // 5 * nx * nz staging for the surface tally
     ReduceScratch red_;
 };
 

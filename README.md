@@ -1302,6 +1302,27 @@ signal is a plateau (sd 20x smaller, still settling −0.5% per box time at the
 end), and the run skips the table build (90 s, 350 MB host) and every bin
 swap at a ~7% higher per-step cost.
 
+**MRF on the body-fitted O-grid** — `--rotor-mach M --rotor-frame mrf --ogrid`
+(z shaft only; the moving-geometry rotor stays rejected there, since spinning
+the body would spin the mesh). The wall row mirrors about `u = ω × r` at the
+wall-face midpoints (reflection factor exactly 1, the resting branch kept
+verbatim at ω = 0), and the transport correction generalizes to the
+curvilinear mesh through a per-NODE stream potential (`DeviceComp::
+setMrfCurv`): the face's advected area flux is the difference of ψ at its two
+in-plane corner nodes — exactly `∮ ψẑ·dl` around the face, so the discrete
+divergence telescopes over shared node values on ANY mesh, and at `f = 1`
+over the wall the correction cancels the moving wall's own normal flux
+exactly (the face is watertight by construction). The zone is radial-only —
+the O-grid span is periodic, so there is no axial boundary to blend toward —
+and the runner rejects a blend that reaches the far rows (`--ogrid-far` too
+small). The surface tally passes the same view and adds the shaft moment on
+the same wall faces, so the stats gain `thrust,torque,ct,cq` exactly as the
+immersed rotor's. Measured (`gpu_mrf`, spinning cylinder, quiescent, Re 20 on
+the tip): O-grid MRF torque agrees with the Cartesian DIRECT moving-wall run
+to 0.07% and the driven swirl to 0.5% — two wall discretizations, two frames,
+one flow; the node-psi transparency residual is 6e-8 against the corner
+form's 1e-5.
+
 ### A propeller to test with — `tools/propeller.py`
 
     python3 tools/propeller.py prop.stl --blades 3 --pitch 0.8

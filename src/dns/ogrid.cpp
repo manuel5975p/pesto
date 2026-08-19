@@ -284,4 +284,16 @@ std::expected<OGrid, std::string> buildOGrid(const Grid& g, const Sdf& sdf,
     return out;
 }
 
+std::vector<std::array<double, 2>> ogridWallMidpoints(const OGrid& og)
+{
+    const int nx = og.mesh.g.nx;
+    std::vector<std::array<double, 2>> mid(static_cast<std::size_t>(nx));
+    for (int i = 0; i < nx; ++i) {
+        const auto a = og.mesh.node(i, 1, 0);
+        const auto b = og.mesh.node(i + 1, 1, 0);
+        mid[std::size_t(i)] = {0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])};
+    }
+    return mid;
+}
+
 } // namespace dns

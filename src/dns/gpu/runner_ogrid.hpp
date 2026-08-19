@@ -15,6 +15,7 @@
 #include "dns/comp.hpp"
 #include "dns/ogrid.hpp"
 #include "dns/output.hpp"
+#include "dns/rotor.hpp"
 #include "dns/sgs.hpp"
 #include "dns/transport.hpp"
 #include "dns/gpu/ogrid_bc.hpp"
@@ -39,6 +40,18 @@ struct OGridRun
     // Inner wall thermal condition.
     OGridThermal thermal = OGridThermal::Adiabatic;
     double Twall = 1.0;          // isothermal only
+
+    // --rotor-mach with --rotor-frame mrf: the body spins about the z shaft
+    // through the O-grid centre, solved in the rotating frame on the static
+    // body-fitted mesh (the frozen-rotor approximation; exact when the
+    // section is a circle). The wall row mirrors about u = omega x r, the
+    // rhs carries the node-psi MRF zone (DeviceComp::setMrfCurv), and the
+    // stats gain thrust/torque/ct/cq exactly as runner_comp's rotor does.
+    // The MOVING-geometry rotor has no O-grid counterpart: spinning the body
+    // would spin the mesh, so the runner rejects rotor.active() && !rotorMrf.
+    // Inactive rotor = bit-for-bit the static runner.
+    Rotor rotor{};
+    bool rotorMrf = false;
 
     // Far-field row: Rudy-Strikwerda pressure anchor and the outflow/inflow
     // blend dead band (gpu/ogrid_bc.hpp). There is deliberately no sponge
