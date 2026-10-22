@@ -5,7 +5,7 @@
 #include "dns/field.hpp"
 #include "dns/gpu/device_buffer.hpp"
 
-#include <hip/hip_runtime.h>
+#include "dns/gpu/hip_runtime.hpp"
 
 #include <cassert>
 #include <cstdio>

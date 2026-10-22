@@ -4,7 +4,7 @@
 
 #include "dns/grid.hpp"
 
-#include <hip/hip_runtime.h>
+#include "dns/gpu/hip_runtime.hpp"
 
 #include <cstddef>
 
