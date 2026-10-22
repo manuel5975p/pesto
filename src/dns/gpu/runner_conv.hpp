@@ -20,8 +20,9 @@
 
 #include "dns/comp.hpp"
 #include "dns/config.hpp"
-#include "dns/gpu/runner_incomp.hpp" // RunStats, RunError
+#include "dns/gpu/run_result.hpp" // RunStats, RunError
 #include "dns/output.hpp"
+#include "dns/transport.hpp"
 
 #include <expected>
 
@@ -29,7 +30,7 @@ namespace dns::gpu {
 
 struct ConvRun
 {
-    double gamma = 1.4, Rgas = 1.0;
+    double gamma = kGammaAir, Rgas = kRgasBox;
     double mu = 0;              // dynamic viscosity at Tref (rho_ref = 1)
     double Pr = 0.72;
     double tinfK = 288.15;      // Sutherland anchor; read only when sutherland

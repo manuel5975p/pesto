@@ -96,7 +96,13 @@ bool writeMapped(const std::string& path, int w, int h, const float* field,
             }
             const std::array<float, 3> col = map(field[c]);
             for (int q = 0; q < 3; ++q)
-                px[q] = static_cast<unsigned char>(col[q] * 255.0f + 0.5f);
+            {
+                // An out-of-range float -> unsigned char cast is UB; a colour
+                // that is not in [0, 1] (only a non-finite one can be) is 0.
+                const float x = col[q] * 255.0f + 0.5f;
+                px[q] = x >= 0.0f && x < 256.0f ? static_cast<unsigned char>(x)
+                                                : 0;
+            }
         }
     }
     return writePngRgb(path, w, h, rgb);
@@ -129,7 +135,8 @@ bool writeDivergingPng(const std::string& path, int w, int h,
     };
     return writeMapped(path, w, h, field, mask, [&](float v) {
         float t = v / scale;
-        t = t < -1.0f ? -1.0f : (t > 1.0f ? 1.0f : t);
+        // NaN-safe clamp: a non-finite value lands on an end, never in glow().
+        t = !(t > -1.0f) ? -1.0f : (t < 1.0f ? t : 1.0f);
         return t < 0.0f ? glow(bSat, bTop, -t) : glow(rSat, rTop, t);
     });
 }
@@ -145,7 +152,8 @@ bool writeSequentialPng(const std::string& path, int w, int h,
         {180, 222, 44}, {253, 231, 37}};
     return writeMapped(path, w, h, field, mask, [&](float v) {
         float t = (v - lo) / (hi - lo);
-        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        // NaN-safe clamp: int(s) and vir[a + 1] below stay in range.
+        t = !(t > 0.0f) ? 0.0f : (t < 1.0f ? t : 1.0f);
         const float s = t * 9.0f;
         const int a = s >= 9.0f ? 8 : int(s);
         const float f = s - a;

@@ -1,9 +1,11 @@
 #include "dns/config.hpp"
+#include "dns/numparse.hpp"
 
 #include "dns/ogrid.hpp"
 
 #include "dns/remap.hpp"
 #include "dns/scene.hpp"
+#include "dns/transport.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -26,19 +28,36 @@ bool hasSuffix(std::string_view s, std::string_view suf)
     return s.size() > suf.size() && s.substr(s.size() - suf.size()) == suf;
 }
 
-const char* name(Physics p)
+// Table lookups behind every name()/FromName(): index == the enum value.
+const char* nameAt(std::span<const char* const> n, std::size_t i)
 {
-    return p == Physics::Compressible ? "compressible" : "incompressible";
+    return i < n.size() ? n[i] : "?";
 }
 
-const char* name(SgsModel m)
+template <class E>
+std::optional<E> fromName(std::span<const char* const> n, std::string_view s)
 {
-    return m == SgsModel::Sigma ? "sigma" : "smag";
+    const auto it = std::ranges::find(n, s);
+    if (it == n.end()) return std::nullopt;
+    return E(it - n.begin());
 }
 
 std::unexpected<ConfigError> bad(int code, const char* field, std::string msg)
 {
     return std::unexpected(ConfigError{code, field, std::move(msg)});
+}
+
+// The run asks for a remapped (curvilinear) Cartesian mesh: the ONE spelling
+// of "not the uniform mesh" that the sink default, the explicit-sink rejection
+// and the modal closure all test. The default and the rejections stay separate
+// decisions (a default that does not apply is absence; an explicit flag that
+// does not apply is an error) -- only the predicate is shared.
+bool remapsMesh(const RawConfig& r) { return r.stretch > 0 || !r.focal.empty(); }
+
+// The same error as a validator stage's result (std::optional<ConfigError>).
+ConfigError err(int code, const char* field, std::string msg)
+{
+    return ConfigError{code, field, std::move(msg)};
 }
 
 // The --body keywords, in one comma-separated string built from the shared
@@ -104,6 +123,78 @@ std::optional<ConfigError> validateFrameOutputs(const RawConfig& r, Case& c)
     return std::nullopt;
 }
 
+// --- validator idioms ---------------------------------------------------------
+// Each rule below was spelled out per subcommand; one definition each now, with
+// the message text unchanged. Every helper returns the error rather than
+// throwing it, so the caller's check ORDER -- first error wins -- is untouched.
+
+// The compressible Mach range.
+std::optional<ConfigError> checkMach(double mach)
+{
+    if (!(finitePos(mach) && mach < 1))
+        return ConfigError{2, "--mach", "must be in (0,1) -- the flux is "
+                                        "Kennedy-Gruber central with no shock "
+                                        "capturing"};
+    return std::nullopt;
+}
+
+// The z cell count: 1 is the exact 2D restriction, otherwise >= 4.
+// `belowOne` is the subcommand's own wording for nz < 1.
+std::optional<ConfigError> checkNz(int nz, const char* belowOne)
+{
+    if (nz < 1) return ConfigError{2, "--nz", belowOne};
+    if (nz != 1 && nz < 4)
+        return ConfigError{2, "--nz", "must be 1 (native 2D) or >= 4"};
+    return std::nullopt;
+}
+
+// The int indexing the whole tree assumes.
+std::optional<ConfigError> checkCells(std::size_t cells)
+{
+    if (cells > std::size_t(2147483647))
+        return ConfigError{2, "--n", "grid exceeds INT_MAX cells"};
+    return std::nullopt;
+}
+
+// The one constructor of a validated box: rejects a grid over INT_MAX cells and
+// is the ONE enforcement point of `nz == 1 => hz == 1` (lz is pinned to 1).
+std::expected<Grid, ConfigError> makeBox(int nx, int ny, int nz, double lx,
+                                         double ly, double lz)
+{
+    if (auto e = checkCells(std::size_t(nx) * ny * nz); e)
+        return std::unexpected(*e);
+    return Grid::make(nx, ny, nz, lx, ly, nz == 1 ? 1.0 : lz);
+}
+
+// --cfl, or the subcommand's own default when it was not given.
+std::optional<ConfigError> resolveCfl(const RawConfig& r, Case& c,
+                                      double fallback)
+{
+    c.cfl = r.given.contains("--cfl") ? r.cfl : fallback;
+    if (!(c.cfl > 0 && c.cfl <= 1))
+        return ConfigError{2, "--cfl", "must be in (0,1]"};
+    return std::nullopt;
+}
+
+// --dt-recompute, or the subcommand's own default when it was not given.
+std::optional<ConfigError> resolveDtRecompute(const RawConfig& r, Case& c,
+                                              int fallback)
+{
+    c.dtRecompute = r.given.contains("--dt-recompute") ? r.dtRecompute : fallback;
+    if (c.dtRecompute < 1)
+        return ConfigError{2, "--dt-recompute", "must be >= 1"};
+    return std::nullopt;
+}
+
+// --profile-dt: a dump interval, 0 = off.
+std::optional<ConfigError> checkProfileDt(const RawConfig& r, Case& c)
+{
+    c.profileDt = r.profileDt;
+    if (!(std::isfinite(c.profileDt) && c.profileDt >= 0))
+        return ConfigError{2, "--profile-dt", "must be finite and >= 0 (0 = off)"};
+    return std::nullopt;
+}
+
 // An empty --emit set takes the subcommand's own default; `none` is exclusive.
 std::optional<ConfigError> resolveEmit(Case& c,
                                        std::initializer_list<Emit> fallback)
@@ -115,11 +206,51 @@ std::optional<ConfigError> resolveEmit(Case& c,
     return std::nullopt;
 }
 
+// The wall-bounded boxes (channel, conv) share their grid-count prologue and
+// their run epilogue rule for rule and word for word; the physics between the
+// two is theirs alone.
+//
+// Prologue: the lateral, wall-normal and spanwise FLUID cell counts.
+std::optional<ConfigError> checkWallGrid(const RawConfig& r)
+{
+    if (r.n < 4) return ConfigError{2, "--n", "must be >= 4"};
+    if (r.ny < 8)
+        return ConfigError{2, "--ny", "must be >= 8 fluid cells (wall-normal "
+                                      "resolution; two ghost rows are added)"};
+    return checkNz(r.nz, "must be >= 1 (interior cells; 1 = native 2D)");
+}
+
+// Epilogue: --cfl, --kick, --tt (c.ft; the caller sets c.tEnd from it),
+// --profile-dt, --dt-recompute (default 16), the frame cadences and --emit
+// (default stats). Pre: c.grid is resolved.
+std::optional<ConfigError> validateWallRun(const RawConfig& r, Case& c,
+                                           double cflFallback)
+{
+    if (auto e = resolveCfl(r, c, cflFallback); e) return e;
+    c.kick = r.kick;
+    if (!(std::isfinite(c.kick) && c.kick >= 0))
+        return ConfigError{2, "--kick", "must be finite and >= 0"};
+    if (!finitePos(r.tt)) return ConfigError{2, "--tt", "must be finite and > 0"};
+    c.ft = r.tt;
+    if (auto e = checkProfileDt(r, c); e) return e;
+    if (auto e = resolveDtRecompute(r, c, 16); e) return e;
+    if (auto e = validateFrameOutputs(r, c); e) return e;
+    return resolveEmit(c, {Emit::Stats});
+}
+
+// The inverse of name(BodyKind); nullopt when `s` is not a body keyword (a
+// mesh path, say, which the caller recognises by suffix instead).
+std::optional<BodyKind> bodyKindFromName(std::string_view s)
+{
+    return fromName<BodyKind>(bodyKindNames(), s);
+}
+
 } // namespace
 
 // Index == the enum value; a static_assert on the size would not catch a
 // TRANSPOSED pair, so the tables are written in enum order and read only
-// through name()/bodyKindFromName().
+// through name()/*FromName(). The order is also the order every "one of:"
+// message lists them in.
 std::span<const char* const> bodyKindNames()
 {
     static constexpr const char* kNames[] = {"none",  "cylinder", "sphere",
@@ -135,26 +266,82 @@ std::span<const char* const> farFieldNames()
     return kNames;
 }
 
-const char* name(BodyKind b)
+std::span<const char* const> physicsNames()
 {
-    const auto n = bodyKindNames();
-    const auto i = std::size_t(b);
-    return i < n.size() ? n[i] : "?";
+    static constexpr const char* kNames[] = {"incompressible", "compressible"};
+    return kNames;
 }
 
-const char* name(FarField f)
+std::span<const char* const> sgsModelNames()
 {
-    const auto n = farFieldNames();
-    const auto i = std::size_t(f);
-    return i < n.size() ? n[i] : "?";
+    static constexpr const char* kNames[] = {"smag", "sigma"};
+    return kNames;
 }
 
-std::optional<BodyKind> bodyKindFromName(std::string_view s)
+std::span<const char* const> nscbcAbcNames()
 {
-    const auto n = bodyKindNames();
-    const auto it = std::ranges::find(n, s);
-    if (it == n.end()) return std::nullopt;
-    return BodyKind(it - n.begin());
+    static constexpr const char* kNames[] = {"yooim", "adaptive", "modal"};
+    return kNames;
+}
+
+std::span<const char* const> subcommandNames()
+{
+    static constexpr const char* kNames[] = {"flow",  "tgv",     "hit",
+                                             "bench", "channel", "conv"};
+    return kNames;
+}
+
+const char* name(BodyKind b) { return nameAt(bodyKindNames(), std::size_t(b)); }
+const char* name(FarField f) { return nameAt(farFieldNames(), std::size_t(f)); }
+const char* name(Physics p) { return nameAt(physicsNames(), std::size_t(p)); }
+const char* name(SgsModel m) { return nameAt(sgsModelNames(), std::size_t(m)); }
+const char* name(NscbcAbc a) { return nameAt(nscbcAbcNames(), std::size_t(a)); }
+const char* name(Subcommand s)
+{
+    return nameAt(subcommandNames(), std::size_t(s));
+}
+
+std::optional<Subcommand> subcommandFromName(std::string_view s)
+{
+    return fromName<Subcommand>(subcommandNames(), s);
+}
+
+std::optional<SgsModel> sgsModelFromName(std::string_view s)
+{
+    return fromName<SgsModel>(sgsModelNames(), s);
+}
+
+FarField defaultFar(Physics p)
+{
+    return p == Physics::Compressible ? FarField::Nscbc : FarField::Tunnel;
+}
+
+std::span<const FarField> farChoices(Physics p)
+{
+    static constexpr FarField kComp[] = {FarField::Nscbc, FarField::Sponge,
+                                         FarField::Periodic};
+    static constexpr FarField kIncomp[] = {FarField::Tunnel, FarField::Fringe,
+                                           FarField::Periodic};
+    return p == Physics::Compressible ? std::span<const FarField>(kComp)
+                                      : std::span<const FarField>(kIncomp);
+}
+
+bool farAllowed(Physics p, FarField f)
+{
+    return std::ranges::find(farChoices(p), f) != farChoices(p).end();
+}
+
+BodyOptions bodyOptions(BodyKind b)
+{
+    switch (b)
+    {
+    case BodyKind::Cylinder: return {.dimples = true};   // 2D disks
+    case BodyKind::Sphere: return {.dimples = true};     // 3D caps
+    case BodyKind::Lens: return {.aspect = true};
+    case BodyKind::Floor: return {.bumps = true};        // trip spikes
+    case BodyKind::Mesh: return {.mesh = true};          // scale, robust
+    default: return {};                                  // none/cube/fence/scene
+    }
 }
 
 std::string format(const ConfigError& e)
@@ -180,8 +367,7 @@ std::expected<void, ConfigError> applySceneModel(const Scene& s, RawConfig& r)
         if (r.given.contains("--sgs") && r.sgs != s.sgs)
             return std::unexpected(ConfigError{
                 2, "--sgs",
-                std::string("the scene selects sgs = ")
-                    + (s.sgs == SgsModel::Sigma ? "sigma" : "smag")
+                std::string("the scene selects sgs = ") + name(s.sgs)
                     + "; a conflicting --sgs was given (drop it or change the "
                       "scene)"});
         r.les = s.cs;
@@ -213,10 +399,9 @@ std::expected<Case, ConfigError> validateBench(const RawConfig& r, Case c)
     // n >= 4 forecloses both the degenerate-z case (bench has no 2D mode:
     // the box is always n^3) and any n too small to time meaningfully.
     if (r.n < 4) return bad(2, "--n", "must be >= 4 (bench is an n^3 box)");
-    const std::size_t benchCells = std::size_t(r.n) * r.n * r.n;
-    if (benchCells > std::size_t(2147483647))
-        return bad(2, "--n", "grid exceeds INT_MAX cells");
-    c.grid = Grid::make(r.n, r.n, r.n, 2 * pi, 2 * pi, 2 * pi);
+    auto box = makeBox(r.n, r.n, r.n, 2 * pi, 2 * pi, 2 * pi);
+    if (!box) return std::unexpected(box.error());
+    c.grid = *box;
     c.nzInterior = r.n;
     // bench times the SOLVER the user names, so it needs the physics
     // parameters the solver reads: viscosity, Mach (compressible pressure
@@ -227,10 +412,7 @@ std::expected<Case, ConfigError> validateBench(const RawConfig& r, Case c)
         return bad(2, "--nu", "must be finite and >= 0");
     c.mach = r.mach;
     if (r.physics == Physics::Compressible) {
-        if (!(finitePos(c.mach) && c.mach < 1))
-            return bad(2, "--mach", "must be in (0,1) -- the flux is "
-                                    "Kennedy-Gruber central with no shock "
-                                    "capturing");
+        if (auto e = checkMach(c.mach); e) return std::unexpected(*e);
     } else if (r.given.contains("--mach")) {
         return bad(2, "--mach", "--mach is compressible-only");
     }
@@ -247,9 +429,11 @@ std::expected<Case, ConfigError> validateBench(const RawConfig& r, Case c)
         return bad(2, "--sgs", "selects the SGS model for --les; give --les CS "
                                "(> 0) or drop --sgs");
     c.lesLabel = c.cs > 0;
-    c.meta = {r.n, r.n, r.n, c.grid.hx, c.grid.hy, c.grid.hz,
-              0, 0, 0, 0, 0, false, "none", "periodic", name(c.physics), 0,
-              ""};
+    c.meta = {.body = "none",
+              .farField = "periodic",
+              .physics = name(c.physics),
+              .sgs = ""};
+    c.meta.setGrid(c.grid);
     return c;
 }
 
@@ -257,18 +441,14 @@ std::expected<Case, ConfigError> validateBench(const RawConfig& r, Case c)
 std::expected<Case, ConfigError> validatePeriodic(const RawConfig& r, Case c)
 {
     const int nz = r.given.contains("--nz") ? r.nz : r.n;
-    if (nz < 1) return bad(2, "--nz", "must be >= 1");
-    if (nz != 1 && nz < 4) return bad(2, "--nz", "must be 1 (native 2D) or >= 4");
+    if (auto e = checkNz(nz, "must be >= 1"); e) return std::unexpected(*e);
     if (r.sub == Subcommand::Hit && nz < 4)
         return bad(2, "--nz", "hit needs nz >= 4 (spectral initial condition)");
-    const std::size_t cells = std::size_t(r.n) * r.n * nz;
-    if (cells > std::size_t(2147483647))
-        return bad(2, "--n", "grid exceeds INT_MAX cells");
-    const double lz = nz == 1 ? 1.0 : 2 * pi;
-    c.grid = Grid::make(r.n, r.n, nz, 2 * pi, 2 * pi, lz);
+    auto box = makeBox(r.n, r.n, nz, 2 * pi, 2 * pi, 2 * pi);
+    if (!box) return std::unexpected(box.error());
+    c.grid = *box;
     c.nzInterior = nz;
-    c.cfl = r.given.contains("--cfl") ? r.cfl : 0.9;
-    if (!(c.cfl > 0 && c.cfl <= 1)) return bad(2, "--cfl", "must be in (0,1]");
+    if (auto e = resolveCfl(r, c, 0.9); e) return std::unexpected(*e);
     c.ft = r.ft;
     if (r.sub == Subcommand::Tgv && !finitePos(c.ft))
         return bad(2, "--ft", "must be finite and > 0");
@@ -291,9 +471,13 @@ std::expected<Case, ConfigError> validatePeriodic(const RawConfig& r, Case c)
                                 "Taylor-Green solution and requires --nz 1");
     if (c.emit.empty()) c.emit.insert(Emit::Stats);
     c.fdt = r.fdt;
-    c.meta = {r.n, r.n, nz, c.grid.hx, c.grid.hy, c.grid.hz,
-              0, r.re, 0, c.fdt, 0, false, "none", "periodic",
-              name(c.physics), 0, ""};
+    c.meta = {.re = r.re,
+              .frameDt = c.fdt,
+              .body = "none",
+              .farField = "periodic",
+              .physics = name(c.physics),
+              .sgs = ""};
+    c.meta.setGrid(c.grid);
     return c;
 }
 
@@ -309,26 +493,16 @@ std::expected<Case, ConfigError> validateChannel(const RawConfig& r, Case c)
     if (r.given.contains("--ft"))
         return bad(2, "--ft", "channel run length is --tt (eddy turnovers "
                               "of delta/u_tau = 1)");
-    if (r.n < 4) return bad(2, "--n", "must be >= 4");
+    if (auto e = checkWallGrid(r); e) return std::unexpected(*e);
     const int nyI = r.ny;
-    if (nyI < 8)
-        return bad(2, "--ny", "must be >= 8 fluid cells (wall-normal "
-                              "resolution; two ghost rows are added)");
     const int nz = r.nz;
-    if (nz < 1) return bad(2, "--nz", "must be >= 1 (interior cells; 1 = "
-                                      "native 2D)");
-    if (nz != 1 && nz < 4)
-        return bad(2, "--nz", "must be 1 (native 2D) or >= 4");
     if (!finitePos(r.reTau))
         return bad(2, "--re-tau", "must be finite and > 0");
     c.reTau = r.reTau;
     c.re = r.reTau;
     c.nu = 1.0 / r.reTau;
     c.mach = r.mach;
-    if (!(finitePos(c.mach) && c.mach < 1))
-        return bad(2, "--mach", "must be in (0,1) -- the flux is "
-                                "Kennedy-Gruber central with no shock "
-                                "capturing");
+    if (auto e = checkMach(c.mach); e) return std::unexpected(*e);
     c.stretchBeta = r.stretch;
     if (!(std::isfinite(c.stretchBeta) && c.stretchBeta >= 0
           && c.stretchBeta <= 4))
@@ -346,54 +520,44 @@ std::expected<Case, ConfigError> validateChannel(const RawConfig& r, Case c)
         return bad(2, "--lz", "must be finite and > 0 (0/omitted = 4 pi/3)");
     c.lxBox = r.lx > 0 ? r.lx : 4 * pi;
     c.lzBox = nz == 1 ? 1.0 : (r.lzBox > 0 ? r.lzBox : 4 * pi / 3);
-    const std::size_t cells = std::size_t(r.n) * nyT * nz;
-    if (cells > std::size_t(2147483647))
-        return bad(2, "--n", "grid exceeds INT_MAX cells");
-    c.grid = Grid::make(r.n, nyT, nz, c.lxBox, ly, c.lzBox);
+    auto box = makeBox(r.n, nyT, nz, c.lxBox, ly, c.lzBox);
+    if (!box) return std::unexpected(box.error());
+    c.grid = *box;
     c.nzInterior = nz;
     c.h = c.grid.hy;
     c.L = c.lxBox;
     c.chanH1 = h1;
     c.stretchH1 = h1;
     const ChannelStretchY R{ly, nyT, c.stretchBeta, delta};
-    double prev = h1;
-    for (int j = 2; j < nyT - 1; ++j)
-    {
-        const double dy = R.mapY((j + 1) * c.grid.hy) - R.mapY(j * c.grid.hy);
-        c.stretchGrowth = std::max(c.stretchGrowth,
-                                   std::max(dy / prev, prev / dy));
-        prev = dy;
-    }
+    c.stretchGrowth = std::max(
+        c.stretchGrowth,
+        maxAdjacentGrowth([&](double y) { return R.mapY(y); }, c.grid.hy, 2,
+                          nyT - 1, h1));
 
     // Bulk-velocity estimate (log law) fixes the sound speed for the
     // requested BULK Mach: c_s = ubEst/Mach, p = rho c_s^2/gamma,
     // Twall = p (rho = R = 1). The IC and the isothermal wall share it.
     c.ubEst = 2.5 * std::log(std::max(c.reTau, 3.0)) + 2.6;
-    c.pRef = (c.ubEst / c.mach) * (c.ubEst / c.mach) / 1.4;
+    c.pRef = (c.ubEst / c.mach) * (c.ubEst / c.mach) / kGammaAir;
 
-    c.cfl = r.cfl;
-    if (!(c.cfl > 0 && c.cfl <= 1)) return bad(2, "--cfl", "must be in (0,1]");
-    c.kick = r.kick;
-    if (!(std::isfinite(c.kick) && c.kick >= 0))
-        return bad(2, "--kick", "must be finite and >= 0");
-    if (!finitePos(r.tt)) return bad(2, "--tt", "must be finite and > 0");
-    c.ft = r.tt;
+    // --cfl has no channel-specific default: the parser's 0.4 stands.
+    if (auto e = validateWallRun(r, c, r.cfl); e) return std::unexpected(*e);
     c.tEnd = r.tt;
-    c.profileDt = r.profileDt;
-    if (!(std::isfinite(c.profileDt) && c.profileDt >= 0))
-        return bad(2, "--profile-dt", "must be finite and >= 0 (0 = off)");
-    c.dtRecompute = r.given.contains("--dt-recompute") ? r.dtRecompute : 16;
-    if (c.dtRecompute < 1) return bad(2, "--dt-recompute", "must be >= 1");
-    if (auto e = validateFrameOutputs(r, c); e) return std::unexpected(*e);
-    if (auto e = resolveEmit(c, {Emit::Stats}); e) return std::unexpected(*e);
     // PNG is allowed at nz > 1 here: it renders the centre z-plane,
     // which for a channel is exactly the picture you want.
     c.physics = Physics::Compressible;
     c.far = FarField::Periodic;
     c.bodyKind = BodyKind::None;
-    c.meta = {c.grid.nx, c.grid.ny, c.grid.nz, c.grid.hx, c.grid.hy,
-              c.grid.hz, 2 * delta, c.reTau, c.mach, c.fdt, 0, false,
-              "channel", "periodic", "compressible", c.kick, ""};
+    c.meta = {.D = 2 * delta,
+              .re = c.reTau,
+              .mach = c.mach,
+              .frameDt = c.fdt,
+              .body = "channel",
+              .farField = "periodic",
+              .physics = "compressible",
+              .kick = c.kick,
+              .sgs = ""};
+    c.meta.setGrid(c.grid);
     return c;
 }
 
@@ -426,16 +590,9 @@ std::expected<Case, ConfigError> validateConv(const RawConfig& r, Case c)
     if (r.given.contains("--ft"))
         return bad(2, "--ft", "convection run length is --tt (free-fall "
                               "times H/Uf)");
-    if (r.n < 4) return bad(2, "--n", "must be >= 4");
+    if (auto e = checkWallGrid(r); e) return std::unexpected(*e);
     const int nyI = r.ny;
-    if (nyI < 8)
-        return bad(2, "--ny", "must be >= 8 fluid cells (wall-normal "
-                              "resolution; two ghost rows are added)");
     const int nz = r.nz;
-    if (nz < 1) return bad(2, "--nz", "must be >= 1 (interior cells; 1 = "
-                                      "native 2D)");
-    if (nz != 1 && nz < 4)
-        return bad(2, "--nz", "must be 1 (native 2D) or >= 4");
 
     if (!finitePos(r.rayleigh))
         return bad(2, "--rayleigh", "must be finite and > 0");
@@ -446,10 +603,7 @@ std::expected<Case, ConfigError> validateConv(const RawConfig& r, Case c)
                                  "so the lid sits at 1 - dtemp/2 > 0");
     c.dtemp = r.dtemp;
     c.mach = r.mach;
-    if (!(finitePos(c.mach) && c.mach < 1))
-        return bad(2, "--mach", "must be in (0,1) -- the flux is "
-                                "Kennedy-Gruber central with no shock "
-                                "capturing");
+    if (auto e = checkMach(c.mach); e) return std::unexpected(*e);
     c.prandtl = r.prandtl;
     if (!finitePos(c.prandtl))
         return bad(2, "--prandtl", "must be finite and > 0");
@@ -502,7 +656,7 @@ std::expected<Case, ConfigError> validateConv(const RawConfig& r, Case c)
     // z ghost ring there would be a third dimension the case does not have.
     c.closedSides = r.sides == 1;
 
-    const double gamma = 1.4, Rgas = 1.0, H = 1.0, Tref = 1.0;
+    const double gamma = kGammaAir, Rgas = kRgasBox, H = 1.0, Tref = 1.0;
     c.convH = H;
     if (c.physics == Physics::Incompressible)
     {
@@ -567,10 +721,9 @@ std::expected<Case, ConfigError> validateConv(const RawConfig& r, Case c)
     const double hx = c.lxBox / r.n, hz = c.lzBox / nz;
     const double lx = c.closedSides ? c.lxBox + 2 * hx : c.lxBox;
     const double lz = c.closedSides && nz > 1 ? c.lzBox + 2 * hz : c.lzBox;
-    const std::size_t cells = std::size_t(nxT) * nyT * nzT;
-    if (cells > std::size_t(2147483647))
-        return bad(2, "--n", "grid exceeds INT_MAX cells");
-    c.grid = Grid::make(nxT, nyT, nzT, lx, ly, lz);
+    auto box = makeBox(nxT, nyT, nzT, lx, ly, lz);
+    if (!box) return std::unexpected(box.error());
+    c.grid = *box;
     c.nxInterior = r.n;
     c.nzInterior = nz;
     c.h = c.grid.hy;
@@ -579,23 +732,11 @@ std::expected<Case, ConfigError> validateConv(const RawConfig& r, Case c)
 
     // The compressible branch is acoustically limited, the Boussinesq one
     // advectively; 0.4 and 0.8 are those two solvers' own defaults.
-    c.cfl = r.given.contains("--cfl")
-                ? r.cfl
-                : (c.physics == Physics::Incompressible ? 0.8 : 0.4);
-    if (!(c.cfl > 0 && c.cfl <= 1)) return bad(2, "--cfl", "must be in (0,1]");
-    c.kick = r.kick;
-    if (!(std::isfinite(c.kick) && c.kick >= 0))
-        return bad(2, "--kick", "must be finite and >= 0");
-    if (!finitePos(r.tt)) return bad(2, "--tt", "must be finite and > 0");
-    c.ft = r.tt;
+    if (auto e = validateWallRun(
+            r, c, c.physics == Physics::Incompressible ? 0.8 : 0.4);
+        e)
+        return std::unexpected(*e);
     c.tEnd = r.tt * H / c.uFreeFall;   // free-fall times -> box time
-    c.profileDt = r.profileDt;
-    if (!(std::isfinite(c.profileDt) && c.profileDt >= 0))
-        return bad(2, "--profile-dt", "must be finite and >= 0 (0 = off)");
-    c.dtRecompute = r.given.contains("--dt-recompute") ? r.dtRecompute : 16;
-    if (c.dtRecompute < 1) return bad(2, "--dt-recompute", "must be >= 1");
-    if (auto e = validateFrameOutputs(r, c); e) return std::unexpected(*e);
-    if (auto e = resolveEmit(c, {Emit::Stats}); e) return std::unexpected(*e);
     // Below onset the layer just conducts; that is a legitimate run (the
     // subcritical control), but it is not what the user usually wants, so
     // it is an advisory and not an error.
@@ -629,15 +770,26 @@ std::expected<Case, ConfigError> validateConv(const RawConfig& r, Case c)
             c.convAspect));
     c.far = FarField::Periodic;
     c.bodyKind = BodyKind::None;
-    c.meta = {c.grid.nx, c.grid.ny, c.grid.nz, c.grid.hx, c.grid.hy,
-              c.grid.hz, H, c.re, c.mach, c.fdt, 0, false,
-              "convection", c.closedSides ? "closed-sides" : "periodic",
-              name(c.physics), c.kick, ""};
+    c.meta = {.D = H,
+              .re = c.re,
+              .mach = c.mach,
+              .frameDt = c.fdt,
+              .body = "convection",
+              .farField = c.closedSides ? "closed-sides" : "periodic",
+              .physics = name(c.physics),
+              .kick = c.kick,
+              .sgs = ""};
+    c.meta.setGrid(c.grid);
     return c;
 }
 
 // --- flow -------------------------------------------------------------------
-std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
+// validateFlow() below runs these stages in order; each one returns the first
+// error of its own checks.
+
+// Stage: the body (--body/--scene), the far field it may have, and the
+// wall-mounted bodies' rules.
+std::optional<ConfigError> flowBody(const RawConfig& r, Case& c)
 {
     // A scene file replaces --body: main loads it (phase 1.5) and hands the
     // parsed Scene to the geometry build; the validator only records the path
@@ -645,13 +797,13 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
     if (!r.scene.empty())
     {
         if (!r.body.empty())
-            return bad(2, "--scene", "--scene and --body are mutually exclusive "
+            return err(2, "--scene", "--scene and --body are mutually exclusive "
                                      "(the scene lists its own objects)");
         c.bodyKind = BodyKind::Scene;
         c.scenePath = r.scene;
     }
     else if (r.body.empty())
-        return bad(2, "--body", "required: one of " + bodyKeywords()
+        return err(2, "--body", "required: one of " + bodyKeywords()
                                 + ", a .stl/.gltf/.glb file, or "
                                   "--scene FILE.toml");
     // Mesh and Scene are kinds the validator ASSIGNS, never keywords the user
@@ -667,38 +819,34 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
         c.meshPath = r.body;
     }
     else
-        return bad(2, "--body", "unrecognised body '" + r.body + "'; expected "
+        return err(2, "--body", "unrecognised body '" + r.body + "'; expected "
                                 + bodyKeywords()
                                 + ", or a path ending in .stl/.gltf/.glb");
 
     // Body-free box (wall boundary layers, channel-like cases): the
     // incompressible runner requires solid cells, so this is compressible-only.
     if (c.bodyKind == BodyKind::None && c.physics != Physics::Compressible)
-        return bad(2, "--body", "--body none is compressible-only (the "
+        return err(2, "--body", "--body none is compressible-only (the "
                                 "incompressible tunnel needs a body)");
 
     // Far field defaults follow the physics when the user did not choose one.
     // Sponge is NEVER a default (any physics, any mode): it is an escape hatch that
     // eats the near field in a relaxation band. The compressible default is
     // the physical characteristic boundary; --far sponge must be asked for.
-    if (!r.given.contains("--far"))
-        c.far = c.physics == Physics::Compressible ? FarField::Nscbc
-                                                   : FarField::Tunnel;
+    if (!r.given.contains("--far")) c.far = defaultFar(c.physics);
 
     const bool comp = c.physics == Physics::Compressible;
-    if (comp && (c.far == FarField::Tunnel || c.far == FarField::Fringe))
-        return bad(2, "--far", std::string("--far ") + name(c.far)
-                   + " is an incompressible far field; compressible runs use "
-                     "sponge, nscbc or periodic");
-    if (!comp && (c.far == FarField::Sponge || c.far == FarField::Nscbc))
-        return bad(2, "--far", std::string("--far ") + name(c.far)
-                   + " is a compressible far field; incompressible runs use "
-                     "tunnel, fringe or periodic");
+    if (!farAllowed(c.physics, c.far))
+        return err(2, "--far", std::string("--far ") + name(c.far)
+                   + (comp ? " is an incompressible far field; compressible "
+                             "runs use sponge, nscbc or periodic"
+                           : " is a compressible far field; incompressible "
+                             "runs use tunnel, fringe or periodic"));
 
     c.open = r.open;
     if (c.open && c.far != FarField::Sponge && c.far != FarField::Nscbc
         && c.far != FarField::Tunnel)
-        return bad(2, "--open", std::string("--open has no meaning with --far ")
+        return err(2, "--open", std::string("--open has no meaning with --far ")
                    + name(c.far)
                    + " (tunnel, sponge and nscbc have lateral faces)");
 
@@ -711,39 +859,44 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
     {
         const char* b = c.bodyKind == BodyKind::Fence ? "fence" : "floor";
         if (comp && c.bodyKind == BodyKind::Fence)
-            return bad(2, "--body", "fence is incompressible-only for now (a "
+            return err(2, "--body", "fence is incompressible-only for now (a "
                                     "mid-plate blocker on the compressible "
                                     "mirror wall rows is unvalidated)");
         // Compressible floor: NSCBC/sponge x planes skip the fully-solid
         // rows (the ghost wall owns them); periodic has no walls at all.
         if (comp && c.far == FarField::Periodic)
-            return bad(2, "--far", "floor needs closed y walls; use --far "
+            return err(2, "--far", "floor needs closed y walls; use --far "
                                    "nscbc (default) or an explicit sponge");
         if (!comp && c.far != FarField::Tunnel)
-            return bad(2, "--far", std::string(b) +
+            return err(2, "--far", std::string(b) +
                                    " sits on the tunnel floor; incompressible "
                                    "runs need --far tunnel (periodic/fringe "
                                    "have no wall for it to stand on)");
         if (c.open)
-            return bad(2, "--open", std::string("--open removes the lateral "
+            return err(2, "--open", std::string("--open removes the lateral "
                                     "walls; the ") + b + " needs the floor wall");
     }
+    return std::nullopt;
+}
 
+// Stage: the grid: the two physics' box conventions and the body's minimum resolution.
+std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
+{
+    const bool comp = c.physics == Physics::Compressible;
     // Grid: two separately validated conventions, dispatched on --physics.
     const int ny = r.given.contains("--ny") ? r.ny : r.n;
-    if (ny < 1) return bad(2, "--ny", "must be >= 1");
+    if (ny < 1) return err(2, "--ny", "must be >= 1");
     // --nz defaults to 1 (native 2D) for the z-invariant bodies and to --n for
     // the genuinely 3D ones: a sphere or a mesh in a one-cell-thick box has no
     // solid cells at all, which used to surface as a silent no-body run.
     const bool body3d = c.bodyKind == BodyKind::Sphere || c.bodyKind == BodyKind::Mesh;
     const int nzI = r.given.contains("--nz") ? r.nz : (body3d ? r.n : 1);
-    if (nzI < 1) return bad(2, "--nz", "must be >= 1 (interior cells; 1 = native 2D)");
-    if (nzI != 1 && nzI < 4)
-        return bad(2, "--nz", "must be 1 (native 2D) or >= 4");
+    if (auto e = checkNz(nzI, "must be >= 1 (interior cells; 1 = native 2D)"); e)
+        return e;
     if (body3d && nzI == 1)
-        return bad(2, "--nz", std::string("--body ") + name(c.bodyKind)
+        return err(2, "--nz", std::string("--body ") + name(c.bodyKind)
                    + " is a 3D body; --nz 1 leaves it with no solid cells");
-    if (!finitePos(r.dr)) return bad(2, "--dr", "must be finite and > 0");
+    if (!finitePos(r.dr)) return err(2, "--dr", "must be finite and > 0");
     c.dr = r.dr;
     c.nzInterior = nzI;
 
@@ -756,21 +909,21 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
         // name rather than silently ignored. --n is the angular cell count,
         // --ny the radial one INCLUDING the two ghost rows.
         if (!comp)
-            return bad(2, "--ogrid", "the body-fitted O-grid is compressible-"
+            return err(2, "--ogrid", "the body-fitted O-grid is compressible-"
                                      "only (the curvilinear path is)");
         if (c.bodyKind == BodyKind::None)
-            return bad(2, "--ogrid", "wraps a body; there is none");
+            return err(2, "--ogrid", "wraps a body; there is none");
         // A 3D O-grid around a closed surface has polar singularities (cells
         // collapse on the axis, det -> 0), which is a different mesh topology,
         // not a parameter. Only bodies with a z-invariant cross-section wrap.
         if (c.bodyKind == BodyKind::Sphere)
-            return bad(2, "--ogrid", "a sphere needs a 3D O-grid, whose polar "
+            return err(2, "--ogrid", "a sphere needs a 3D O-grid, whose polar "
                                      "axis is a mesh singularity (collapsed "
                                      "cells, det = 0). Bodies with a "
                                      "z-invariant cross-section only: cylinder, "
                                      "lens, cube, or a z-invariant mesh");
         if (c.bodyKind == BodyKind::Fence || c.bodyKind == BodyKind::Floor)
-            return bad(2, "--ogrid", "wall-mounted bodies are not star-shaped "
+            return err(2, "--ogrid", "wall-mounted bodies are not star-shaped "
                                      "about a centre and have no annulus "
                                      "around them");
         if (auto e = rejectGiven(
@@ -780,18 +933,18 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
                 "replaces both (the wall IS a mesh face, and the far field is "
                 "the outer circle)");
             e)
-            return std::unexpected(*e);
+            return e;
         if (r.n < 16)
-            return bad(2, "--n", "is the ANGULAR cell count on an O-grid; "
+            return err(2, "--n", "is the ANGULAR cell count on an O-grid; "
                                  "below 16 the contour is not resolved");
         if (ny < 6)
-            return bad(2, "--ny", "is the RADIAL cell count on an O-grid, two "
+            return err(2, "--ny", "is the RADIAL cell count on an O-grid, two "
                                   "of which are ghost rows; >= 6 needed");
         if (!(std::isfinite(r.ogridFar) && r.ogridFar > 1.0))
-            return bad(2, "--ogrid-far", "far-boundary radius in DIAMETERS; "
+            return err(2, "--ogrid-far", "far-boundary radius in DIAMETERS; "
                                          "must be finite and > 1");
         if (!(std::isfinite(r.ogridBeta) && r.ogridBeta >= 0))
-            return bad(2, "--ogrid-beta", "radial clustering; must be finite "
+            return err(2, "--ogrid-beta", "radial clustering; must be finite "
                                           "and >= 0 (0 = uniform)");
         const double D = pi / 4.0;
         c.ogrid = true;
@@ -801,6 +954,7 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
         // the unit depth the 2D convention requires.
         c.ogridSpan = nzI > 1 ? pi * D : 1.0;
         c.grid = ogridGrid(r.n, ny, nzI, 0.5 * D, c.ogridRFar, c.ogridSpan);
+        if (auto e = checkCells(c.grid.size()); e) return e;
         c.L = 2.0 * c.ogridRFar;
         c.h = c.grid.hy; // nominal radial spacing; the mesh reports the real h1
         // The body sits at the origin: the mesh is built about its centre.
@@ -814,13 +968,15 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
         // exact *1.0 and the 2.1107 placement literal is preserved). No ghost
         // ring: the compressible far fields act on interior rows.
         if (c.dr < 4)
-            return bad(2, "--dr", "compressible box is dr*D wide; below 4 the "
+            return err(2, "--dr", "compressible box is dr*D wide; below 4 the "
                                   "body sits under 1D from the inflow row");
         const double D = pi / 4.0;
         c.h = D / 64.0 * (512.0 / double(ny)) * (c.dr / 8.0);
         const double lx = r.n * c.h, ly = ny * c.h;
         const double lz = nzI > 1 ? nzI * c.h : 1.0;
-        c.grid = Grid::make(r.n, ny, nzI, lx, ly, lz);
+        auto box = makeBox(r.n, ny, nzI, lx, ly, lz);
+        if (!box) return box.error();
+        c.grid = *box;
         c.L = lx;
         // The floor is pinned to the box bottom (no ghost ring here): the
         // slab spans [0, D], cy = centre of the blocked strip.
@@ -837,7 +993,9 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
         const int nxT = r.n + 2, nyT = ny + 2;
         const int nzT = nzI <= 1 ? 1 : nzI + 2;
         const double lz = nzT == 1 ? 1.0 : nzT * c.h;
-        c.grid = Grid::make(nxT, nyT, nzT, nxT * c.h, nyT * c.h, lz);
+        auto box = makeBox(nxT, nyT, nzT, nxT * c.h, nyT * c.h, lz);
+        if (!box) return box.error();
+        c.grid = *box;
         const double D = c.L / c.dr;
         // Per-body placement offsets: each deliberately puts the body off-node
         // so the shedding instability trips. Carried verbatim (masterplan §6).
@@ -856,30 +1014,31 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
         c.placement = {cx, cy, cz, D};
     }
 
-    const std::size_t cells = std::size_t(c.grid.nx) * c.grid.ny * c.grid.nz;
-    if (cells > std::size_t(2147483647))
-        return bad(2, "--n", "grid exceeds INT_MAX cells");
     if (c.placement.D < 4 * c.h)
-        return bad(2, "--dr", "body diameter is under 4 cells; refine --n or lower "
+        return err(2, "--dr", "body diameter is under 4 cells; refine --n or lower "
                               "--dr");
     // The fence is D/8 thick; below 32 cells of D the blocker itself is under
     // 4 cells and the sampled cut degenerates.
     if (c.bodyKind == BodyKind::Fence && c.placement.D < 32 * c.h)
-        return bad(2, "--dr", "fence thickness is D/8; D under 32 cells makes it "
+        return err(2, "--dr", "fence thickness is D/8; D under 32 cells makes it "
                               "thinner than 4 cells -- refine --n or lower --dr");
     if (c.bodyKind == BodyKind::Floor && c.dr < 2)
-        return bad(2, "--dr", "floor solidifies the bottom 1/dr of the channel; "
+        return err(2, "--dr", "floor solidifies the bottom 1/dr of the channel; "
                               "--dr under 2 blocks more than half of it");
+    return std::nullopt;
+}
 
+// Stage: Mach, viscosity, CFL.
+std::optional<ConfigError> flowPhysics(const RawConfig& r, Case& c)
+{
+    const bool comp = c.physics == Physics::Compressible;
     // Physics.
     c.mach = r.mach;
     if (comp)
     {
-        if (!(finitePos(c.mach) && c.mach < 1))
-            return bad(2, "--mach", "must be in (0,1) -- the flux is Kennedy-Gruber "
-                                    "central with no shock capturing");
+        if (auto e = checkMach(c.mach); e) return e;
         if (r.given.contains("--tol"))
-            return bad(2, "--tol", "compressible runs are fully explicit; there is "
+            return err(2, "--tol", "compressible runs are fully explicit; there is "
                                    "no pressure solve to converge");
     }
     else
@@ -887,13 +1046,18 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
         if (auto e = rejectGiven(r, {"--mach", "--kick"},
                                  "is compressible-only");
             e)
-            return std::unexpected(*e);
+            return e;
     }
 
     c.nu = c.uInf * c.placement.D / c.re;
-    c.cfl = r.given.contains("--cfl") ? r.cfl : (comp ? 0.4 : 0.8);
-    if (!(c.cfl > 0 && c.cfl <= 1)) return bad(2, "--cfl", "must be in (0,1]");
+    if (auto e = resolveCfl(r, c, comp ? 0.4 : 0.8); e) return e;
+    return std::nullopt;
+}
 
+// Stage: the compressible thermal knobs.
+std::optional<ConfigError> flowThermal(const RawConfig& r, Case& c)
+{
+    const bool comp = c.physics == Physics::Compressible;
     // Thermal model. Every knob here is compressible-only and OFF by default:
     // a constant-viscosity adiabatic-wall run is bit-for-bit what it was, so
     // no measured anchor in the repo moves until a run asks for temperature.
@@ -910,53 +1074,59 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
                                  "is compressible-only (the incompressible "
                                  "solver carries no energy equation)");
             e)
-            return std::unexpected(*e);
+            return e;
     if (!finitePos(c.tinfK))
-        return bad(2, "--tinf", "must be finite and > 0 (kelvin)");
+        return err(2, "--tinf", "must be finite and > 0 (kelvin)");
     if (!finitePos(c.prandtl))
-        return bad(2, "--prandtl", "must be finite and > 0");
+        return err(2, "--prandtl", "must be finite and > 0");
     if (!finitePos(c.twallRatio))
-        return bad(2, "--twall", "must be finite and > 0 (a ratio to Tinf)");
+        return err(2, "--twall", "must be finite and > 0 (a ratio to Tinf)");
     if (r.given.contains("--twall") && !c.bodyIsothermal)
-        return bad(2, "--twall", "sets the temperature of an ISOTHERMAL wall; "
+        return err(2, "--twall", "sets the temperature of an ISOTHERMAL wall; "
                                  "add --wall isothermal (the default body wall "
                                  "is adiabatic)");
     if (c.bodyIsothermal && c.bodyKind == BodyKind::None)
-        return bad(2, "--wall", "an isothermal wall needs a body; there is none");
+        return err(2, "--wall", "an isothermal wall needs a body; there is none");
     if (c.nscbcThermalInflow && c.far != FarField::Nscbc)
-        return bad(2, "--nscbc-tinflow", "is the NSCBC entropy inflow target; "
+        return err(2, "--nscbc-tinflow", "is the NSCBC entropy inflow target; "
                                          "use --far nscbc");
+    return std::nullopt;
+}
 
+// Stage: SGS model, the aperture/Brinkman options, the DNS/LES label.
+std::optional<ConfigError> flowLes(const RawConfig& r, Case& c)
+{
+    const bool comp = c.physics == Physics::Compressible;
     c.cs = r.les;
     if (!(std::isfinite(c.cs) && c.cs >= 0))
-        return bad(2, "--les", "must be finite and >= 0");
+        return err(2, "--les", "must be finite and >= 0");
     c.sgsModel = r.sgs;
     if (r.given.contains("--sgs") && c.cs == 0)
-        return bad(2, "--sgs", "selects the SGS model for --les; give --les CS "
+        return err(2, "--sgs", "selects the SGS model for --les; give --les CS "
                                "(> 0) or drop --sgs");
     c.cutFlux = r.cutFlux;
     if (c.cutFlux && c.bodyKind == BodyKind::None)
-        return bad(2, "--cut-flux", "apertures the body's momentum fluxes; "
+        return err(2, "--cut-flux", "apertures the body's momentum fluxes; "
                                     "there is no body");
     if (c.cutFlux && r.given.contains("--stretch"))
-        return bad(2, "--cut-flux", "apertures are uniform-mesh geometry; the "
+        return err(2, "--cut-flux", "apertures are uniform-mesh geometry; the "
                                     "curvilinear path has none. Drop --stretch");
     if (c.cutFlux && comp)
-        return bad(2, "--cut-flux", "compressible cut-flux DIVERGES near the "
+        return err(2, "--cut-flux", "compressible cut-flux DIVERGES near the "
                                     "body (measured twice, 2026-07-23: the KG "
                                     "split flux loses its KE property under "
                                     "per-face area weighting). Incompressible "
                                     "only until redesigned");
     c.penalize = r.penalize;
     if (!(std::isfinite(c.penalize) && c.penalize >= 0))
-        return bad(2, "--penalize", "must be finite and >= 0");
+        return err(2, "--penalize", "must be finite and >= 0");
     if (c.penalize > 0 && c.bodyKind == BodyKind::None)
-        return bad(2, "--penalize", "decays the near-body band; there is no body");
+        return err(2, "--penalize", "decays the near-body band; there is no body");
     if (c.penalize > 0 && r.given.contains("--stretch"))
-        return bad(2, "--penalize", "needs the uniform-mesh fluid fractions; "
+        return err(2, "--penalize", "needs the uniform-mesh fluid fractions; "
                                     "drop --stretch");
     if (c.sgsModel == SgsModel::Sigma && c.cs > 0 && c.grid.nz == 1)
-        return bad(2, "--sgs", "sigma: D_sigma is identically ZERO for any 2D "
+        return err(2, "--sgs", "sigma: D_sigma is identically ZERO for any 2D "
                                "flow (that is the model's design); at nz == 1 "
                                "it is a silent no-op. Use nz > 1 or smag");
     // Honest labelling: the boundary layer scales as D/sqrt(Re).
@@ -968,7 +1138,12 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
             std::format("boundary layer is {:.1f} cells (D/sqrt(Re)/h); this "
                         "is under-resolved for DNS", blCells));
     }
+    return std::nullopt;
+}
 
+// Stage: the far-field parameters: NSCBC closure, sink, strip, --pot.
+std::optional<ConfigError> flowNscbc(const RawConfig& r, Case& c)
+{
     // Far-field parameters.
     c.nscbcBeta = r.nscbcBeta;
     c.nscbcEtaIn = r.given.contains("--nscbc-etain") ? r.nscbcEtaIn : 100.0;
@@ -986,7 +1161,7 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
     // because a DEFAULT that does not apply is absence, not an error.
     if (!r.given.contains("--nscbc-sink") && c.far == FarField::Nscbc)
     {
-        const bool uniform = !(r.stretch > 0) && r.focal.empty() && !r.ogrid;
+        const bool uniform = !remapsMesh(r) && !r.ogrid;
         const bool fits = 32 < c.grid.nx &&
                           (!c.open || (32 < c.grid.ny &&
                                        (c.grid.nz == 1 || 32 < c.grid.nz)));
@@ -996,71 +1171,71 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
     if (c.far == FarField::Nscbc)
     {
         if (!finitePos(c.nscbcEtaIn))
-            return bad(2, "--nscbc-etain", "must be > 0");
+            return err(2, "--nscbc-etain", "must be > 0");
         // Empirically bracketed stability window (masterplan §6.3): 0 pumps a
         // growing global mode, 1.0 diverges at t = 35.
         if (!(std::isfinite(c.nscbcBeta) && c.nscbcBeta >= 0 && c.nscbcBeta < 1))
-            return bad(2, "--nscbc-beta", "must be in [0,1); 1.0 is measured to diverge "
+            return err(2, "--nscbc-beta", "must be in [0,1); 1.0 is measured to diverge "
                                           "at t = 35 (full transverse cancellation "
                                           "is ill-posed at low Mach)");
         if (c.nscbcStrip < 0 || c.nscbcStrip >= c.grid.nx / 4)
-            return bad(2, "--nscbc-strip", "must be >= 0 and < nx/4");
+            return err(2, "--nscbc-strip", "must be >= 0 and < nx/4");
         if (c.re > 800 && c.nscbcStrip == 0 && c.nscbcSink == 0)
-            return bad(2, "--nscbc-strip", "pure NSCBC is validated only up to "
+            return err(2, "--nscbc-strip", "pure NSCBC is validated only up to "
                                            "Re 800 (it diverges at Re 2000, 2048^2); "
                                            "pass --nscbc-sink 16 (scale-selective, "
                                            "preferred) or --nscbc-strip ~ny/64 "
                                            "(freestream sponge; docs/nscbc.md)");
         if (c.nscbcSink < 0 || 2 * c.nscbcSink >= c.grid.nx ||
             (c.open && c.nscbcSink > 0 && 2 * c.nscbcSink >= c.grid.ny))
-            return bad(2, "--nscbc-sink", "band must be >= 0 and fit twice on "
+            return err(2, "--nscbc-sink", "band must be >= 0 and fit twice on "
                                           "every open axis");
         if (!(std::isfinite(c.nscbcSinkAmp) && c.nscbcSinkAmp > 0 &&
               c.nscbcSinkAmp <= 2.0))
-            return bad(2, "--nscbc-sink-amp",
+            return err(2, "--nscbc-sink-amp",
                        "must be in (0, 2]; sigma dt <= 2 * cfl * axes is the "
                        "SSP-RK3 real-axis bound at cfl 0.4");
         // The sink's cutoff is quoted in CELLS on a uniform mesh; under a
         // remap the physical cutoff varies across the band, which needs its
         // own measurement before it is allowed. Rejected, never ignored.
-        if (c.nscbcSink > 0 && (r.stretch > 0 || !r.focal.empty()))
-            return bad(2, "--nscbc-sink", "is measured on the uniform mesh; "
+        if (c.nscbcSink > 0 && remapsMesh(r))
+            return err(2, "--nscbc-sink", "is measured on the uniform mesh; "
                                           "--stretch/--focal remap the band "
                                           "(unmeasured -- not yet allowed)");
         if (c.nscbcSink > 0 && c.bodyKind == BodyKind::Floor)
-            return bad(2, "--nscbc-sink", "band rows overlap the solid floor "
+            return err(2, "--nscbc-sink", "band rows overlap the solid floor "
                                           "rows the ghost wall owns "
                                           "(--body floor)");
         if (c.nscbcSink > 0 && r.ogrid)
-            return bad(2, "--nscbc-sink", "is a Cartesian face band; the "
+            return err(2, "--nscbc-sink", "is a Cartesian face band; the "
                                           "body-fitted O-grid has no such "
                                           "faces");
     }
     else if (r.given.contains("--nscbc-strip") && c.nscbcStrip > 0)
-        return bad(2, "--nscbc-strip", "requires --far nscbc");
+        return err(2, "--nscbc-strip", "requires --far nscbc");
     if (c.far != FarField::Nscbc && r.given.contains("--nscbc-sink") &&
         c.nscbcSink > 0)
-        return bad(2, "--nscbc-sink", "requires --far nscbc");
+        return err(2, "--nscbc-sink", "requires --far nscbc");
     if (r.given.contains("--nscbc-sink-amp") && c.nscbcSink == 0)
-        return bad(2, "--nscbc-sink-amp", "sets the strength of the "
+        return err(2, "--nscbc-sink-amp", "sets the strength of the "
                                           "--nscbc-sink band; pass a width");
     if (c.far != FarField::Nscbc && r.given.contains("--nscbc-etain"))
-        return bad(2, "--nscbc-etain", "requires --far nscbc");
+        return err(2, "--nscbc-etain", "requires --far nscbc");
     if (r.given.contains("--nscbc-etain-shear"))
     {
         if (c.far != FarField::Nscbc)
-            return bad(2, "--nscbc-etain-shear", "requires --far nscbc");
+            return err(2, "--nscbc-etain-shear", "requires --far nscbc");
         if (!finitePos(c.nscbcEtaInShear))
-            return bad(2, "--nscbc-etain-shear", "must be > 0");
+            return err(2, "--nscbc-etain-shear", "must be > 0");
     }
     if (r.given.contains("--nscbc-etalat"))
     {
         if (c.far != FarField::Nscbc || !c.open)
-            return bad(2, "--nscbc-etalat", "is the OPEN lateral faces' relax "
+            return err(2, "--nscbc-etalat", "is the OPEN lateral faces' relax "
                                             "rate; needs --far nscbc --open "
                                             "(walled laterals never read it)");
         if (!finitePos(c.nscbcEtaLat))
-            return bad(2, "--nscbc-etalat", "must be > 0");
+            return err(2, "--nscbc-etalat", "must be > 0");
         if (c.nscbcEtaLat > 0.5)
             c.warnings.emplace_back(
                 "--nscbc-etalat > 0.5: the lateral relax writes vorticity onto "
@@ -1075,26 +1250,26 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
     // silently ignored.
     c.nscbcAbc = r.nscbcAbc;
     if (c.nscbcAbc != NscbcAbc::YooIm && c.far != FarField::Nscbc)
-        return bad(2, "--nscbc-abc", "is the NSCBC outflow's transverse "
+        return err(2, "--nscbc-abc", "is the NSCBC outflow's transverse "
                                      "coefficient; use --far nscbc");
     if (c.nscbcAbc == NscbcAbc::Modal)
     {
         if (c.open)
-            return bad(2, "--nscbc-abc modal",
+            return err(2, "--nscbc-abc modal",
                        "needs walled lateral faces: with --open the far-field "
                        "problem is not separable in the transverse directions, "
                        "so the modal basis it transforms in does not exist "
                        "(--nscbc-abc adaptive works there)");
-        if (r.stretch > 0 || !r.focal.empty())
-            return bad(2, "--nscbc-abc modal",
+        if (remapsMesh(r))
+            return err(2, "--nscbc-abc modal",
                        "is derived on the UNIFORM outflow plane; --stretch and "
                        "--focal remap it (--nscbc-abc adaptive works there)");
         if (r.ogrid)
-            return bad(2, "--nscbc-abc modal",
+            return err(2, "--nscbc-abc modal",
                        "is a Cartesian x-face closure; the body-fitted O-grid "
                        "has no such face");
         if (c.bodyKind == BodyKind::Floor)
-            return bad(2, "--nscbc-abc modal",
+            return err(2, "--nscbc-abc modal",
                        "needs a whole outflow plane; --body floor makes its "
                        "lower rows solid");
         if (c.grid.nz > 1)
@@ -1105,14 +1280,19 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
     }
     c.farPot = r.farPot;
     if (c.farPot && c.bodyKind == BodyKind::None)
-        return bad(2, "--pot", "models the body's wake source and displacement "
+        return err(2, "--pot", "models the body's wake source and displacement "
                                "doublet; meaningless with --body none");
     if (c.farPot && c.far != FarField::Nscbc
         && !(c.far == FarField::Tunnel && c.open))
-        return bad(2, "--pot", "requires --far nscbc (compressible) or "
+        return err(2, "--pot", "requires --far nscbc (compressible) or "
                                "--far tunnel --open (incompressible) -- the "
                                "correction retargets an open far field");
+    return std::nullopt;
+}
 
+// Stage: sponge/fringe band widths.
+std::optional<ConfigError> flowBands(const RawConfig& r, Case& c)
+{
     // Sponge / fringe band width. clamp(0.1n, 8, n/2-1) is UB when n < 18.
     // Band width is measured along x for BOTH physics. (This was once a
     // `comp ? nx : nx` ternary -- a physics distinction someone intended and
@@ -1121,23 +1301,29 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
     if ((c.far == FarField::Fringe || c.far == FarField::Sponge
          || c.far == FarField::Nscbc)
         && bandBase < 18)
-        return bad(2, "--n", "sponge/fringe far fields need at least 18 cells along x");
+        return err(2, "--n", "sponge/fringe far fields need at least 18 cells along x");
     c.spongeCells = r.spongeCells > 0
                         ? r.spongeCells
                         : std::clamp(int(0.1 * bandBase), 8, bandBase / 2 - 1);
     if (c.spongeCells < 1 || c.spongeCells >= bandBase / 2)
-        return bad(2, "--sponge-cells", "must be >= 1 and < nx/2");
+        return err(2, "--sponge-cells", "must be >= 1 and < nx/2");
 
     // Auto: band z only when the box is thick enough to hold the band. A thin
     // quasi-2D run gets x,y only -- a z band there would sponge the whole wake.
     const bool zBandFits = c.grid.nz >= 2 * c.spongeCells + 2;
     c.fringeAxes = r.fringeAxes != 0 ? r.fringeAxes : (zBandFits ? 3 : 2);
     if (c.fringeAxes != 2 && c.fringeAxes != 3)
-        return bad(2, "--fringe-axes", "must be 2 or 3");
+        return err(2, "--fringe-axes", "must be 2 or 3");
     if (c.far == FarField::Fringe && c.fringeAxes == 3 && !zBandFits)
-        return bad(2, "--fringe-axes", "a z fringe band needs nz >= 2*cells + 2; "
+        return err(2, "--fringe-axes", "a z fringe band needs nz >= 2*cells + 2; "
                                        "pass --fringe-axes 2 for a z-invariant run");
+    return std::nullopt;
+}
 
+// Stage: the tanh y-stretch.
+std::optional<ConfigError> flowStretch(const RawConfig& r, Case& c)
+{
+    const bool comp = c.physics == Physics::Compressible;
     // Curvilinear y-stretch + wall type. Scope is deliberate: the interior
     // scheme (curv finite-volume path) is general and NSCBC evaluates the
     // PointRemap on device (physical distances in its one-sided and
@@ -1148,23 +1334,23 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
     c.stretchBeta = r.stretch;
     c.noslipY = r.noslip;
     if (!(std::isfinite(c.stretchBeta) && c.stretchBeta >= 0 && c.stretchBeta <= 4))
-        return bad(2, "--stretch", "must be in [0,4] (tanh clustering strength; "
+        return err(2, "--stretch", "must be in [0,4] (tanh clustering strength; "
                                    "4 already compresses the wall cell ~190x)");
     if (c.stretchBeta > 0)
     {
         if (!comp)
-            return bad(2, "--stretch", "the curvilinear solver is compressible-"
+            return err(2, "--stretch", "the curvilinear solver is compressible-"
                                        "only; --stretch needs --physics "
                                        "compressible");
         if (c.bodyKind != BodyKind::None)
-            return bad(2, "--stretch", "the ghost wall samples the body SDF at "
+            return err(2, "--stretch", "the ghost wall samples the body SDF at "
                                        "uniform cell positions; stretched runs "
                                        "need --body none for now");
         if (c.open)
-            return bad(2, "--open", "--stretch clusters cells toward the closed "
+            return err(2, "--open", "--stretch clusters cells toward the closed "
                                     "y walls; open lateral faces defeat it");
         if (c.far != FarField::Nscbc && c.far != FarField::Sponge)
-            return bad(2, "--far", "stretched-y runs need --far nscbc (the "
+            return err(2, "--far", "stretched-y runs need --far nscbc (the "
                                    "characteristic terms evaluate the PointRemap) "
                                    "or an explicit --far sponge");
         // Resolved wall resolution: first INTERIOR cell (row 1; rows 0 and
@@ -1173,15 +1359,18 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
         const TanhStretchY R{double(c.grid.ny) * c.grid.hy, c.stretchBeta};
         const double hy = c.grid.hy;
         c.stretchH1 = R.mapY(2 * hy) - R.mapY(hy);
-        double prev = R.mapY(hy) - R.mapY(0.0);
-        for (int j = 1; j < c.grid.ny; ++j)
-        {
-            const double dy = R.mapY((j + 1) * hy) - R.mapY(j * hy);
-            c.stretchGrowth = std::max(c.stretchGrowth,
-                                       std::max(dy / prev, prev / dy));
-            prev = dy;
-        }
+        c.stretchGrowth = std::max(
+            c.stretchGrowth,
+            maxAdjacentGrowth([&](double y) { return R.mapY(y); }, hy, 1,
+                              c.grid.ny, R.mapY(hy) - R.mapY(0.0)));
     }
+    return std::nullopt;
+}
+
+// Stage: the --focal plateau.
+std::optional<ConfigError> flowFocal(const RawConfig& r, Case& c)
+{
+    const bool comp = c.physics == Physics::Compressible;
     // Focal clustering: a fine plateau box (typically the body plus its wake)
     // with a coarse far field, one independent Focal1D per axis. Same scope
     // as --stretch (compressible curvilinear, NSCBC or explicit sponge; LES is
@@ -1193,11 +1382,11 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
     if (r.given.contains("--focal"))
     {
         if (!comp)
-            return bad(2, "--focal", "the curvilinear solver is compressible-"
+            return err(2, "--focal", "the curvilinear solver is compressible-"
                                      "only; --focal needs --physics "
                                      "compressible");
         if (c.stretchBeta > 0)
-            return bad(2, "--focal", "--stretch and --focal are different "
+            return err(2, "--focal", "--stretch and --focal are different "
                                      "curvilinear meshes; pick one");
         // Bodies ARE supported (the ghost wall classifies against the mapped
         // cell centres), but only the analytic ones: their AABB follows from
@@ -1212,37 +1401,37 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
         const bool sweptBox = r.rotorMach != 0;
         if ((c.bodyKind == BodyKind::Mesh || c.bodyKind == BodyKind::Scene)
             && !sweptBox)
-            return bad(2, "--focal", "a mesh/scene body's bounding box is only "
+            return err(2, "--focal", "a mesh/scene body's bounding box is only "
                                      "known after the file is loaded, and "
                                      "validation touches no filesystem; give "
                                      "the plateau explicitly for now (a rotor "
                                      "is exempt: its swept extent follows from "
                                      "--dr and --rotor-span)");
         if (c.bodyKind == BodyKind::Fence || c.bodyKind == BodyKind::Floor)
-            return bad(2, "--focal", "the wall-mounted bodies span the full "
+            return err(2, "--focal", "the wall-mounted bodies span the full "
                                      "domain width; there is no compact "
                                      "plateau to cluster on");
         if (c.cutFlux || c.penalize > 0)
-            return bad(2, "--focal", "apertures and the Brinkman band are "
+            return err(2, "--focal", "apertures and the Brinkman band are "
                                      "uniform-mesh geometry; the curvilinear "
                                      "path has none");
         if (c.open)
-            return bad(2, "--open", "--focal needs the closed lateral faces "
+            return err(2, "--open", "--focal needs the closed lateral faces "
                                     "its blend margin is measured against");
         if (c.far != FarField::Nscbc && c.far != FarField::Sponge)
-            return bad(2, "--far", "focal runs need --far nscbc (the "
+            return err(2, "--far", "focal runs need --far nscbc (the "
                                    "characteristic terms evaluate the "
                                    "PointRemap) or an explicit --far sponge");
 
         c.focalRatio = r.focalRatio;
         if (!(std::isfinite(c.focalRatio) && c.focalRatio > 1
               && c.focalRatio <= 16))
-            return bad(2, "--focal-ratio", "must be in (1,16] (coarse/fine "
+            return err(2, "--focal-ratio", "must be in (1,16] (coarse/fine "
                                            "cell-size ratio; the fine spacing "
                                            "sets the acoustic dt)");
         const double blendFrac = r.focalBlend;
         if (!(finitePos(blendFrac) && blendFrac <= 2))
-            return bad(2, "--focal-blend", "must be in (0,2] (blend width per "
+            return err(2, "--focal-blend", "must be in (0,2] (blend width per "
                                            "side as a fraction of the plateau)");
 
         // The body's axis-aligned bounds, when there is a body: the
@@ -1264,12 +1453,12 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
         if (r.focal == "auto")
         {
             if (!hasBody)
-                return bad(2, "--focal", "auto needs a body; --body none has "
+                return err(2, "--focal", "auto needs a body; --body none has "
                                          "no AABB to focus on");
             if (!(std::isfinite(r.focalWake) && r.focalWake >= 0))
-                return bad(2, "--focal-wake", "must be finite and >= 0");
+                return err(2, "--focal-wake", "must be finite and >= 0");
             if (!(std::isfinite(r.focalPad) && r.focalPad >= 0))
-                return bad(2, "--focal-pad", "must be finite and >= 0");
+                return err(2, "--focal-pad", "must be finite and >= 0");
             const double D = c.placement.D, pad = r.focalPad * D;
             const int nA[3] = {c.grid.nx, c.grid.ny, c.grid.nz};
             const double hA[3] = {c.grid.hx, c.grid.hy, c.grid.hz};
@@ -1300,7 +1489,7 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
                 if (!fits(std::min(need[0], want[0]),
                           std::max(need[1], want[1])) &&
                     !fits(need[0], need[1]))
-                    return bad(2, "--focal", std::string(axName[a])
+                    return err(2, "--focal", std::string(axName[a])
                                    + " has no plateau that both contains the "
                                      "body and clears the domain faces; the "
                                      "box is too small for --focal-blend");
@@ -1327,18 +1516,14 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
             for (int q = 0; q < 6; ++q)
             {
                 const std::size_t comma = s.find(',');
-                const std::string tok(s.substr(0, comma));
-                char* end = nullptr;
-                box[q] = std::strtod(tok.c_str(), &end);
-                if (tok.empty() || end != tok.c_str() + tok.size()
-                    || !std::isfinite(box[q]))
-                    return bad(2, "--focal", "expects six numbers "
+                if (!parseDouble(s.substr(0, comma), box[q]))
+                    return err(2, "--focal", "expects six numbers "
                                              "x0,x1,y0,y1,z0,z1 (world units) "
                                              "or 'auto'");
                 if (comma == std::string_view::npos)
                 {
                     if (q != 5)
-                        return bad(2, "--focal", "expects six comma-separated "
+                        return err(2, "--focal", "expects six comma-separated "
                                                  "numbers x0,x1,y0,y1,z0,z1");
                     s = {};
                 }
@@ -1346,7 +1531,7 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
                     s = s.substr(comma + 1);
             }
             if (!s.empty())
-                return bad(2, "--focal", "expects exactly six numbers "
+                return err(2, "--focal", "expects exactly six numbers "
                                          "x0,x1,y0,y1,z0,z1");
         }
 
@@ -1360,13 +1545,13 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
             {
                 // Degenerate pair = leave this axis uniform.
                 if (hi < lo)
-                    return bad(2, "--focal", std::string(axName[a])
+                    return err(2, "--focal", std::string(axName[a])
                                                  + " plateau has hi < lo");
                 c.focalHFine[a] = c.focalHCoarse[a] = hAx[a];
                 continue;
             }
             if (a == 2 && c.grid.nz == 1)
-                return bad(2, "--focal", "nz == 1 IS the exact 2D restriction; "
+                return err(2, "--focal", "nz == 1 IS the exact 2D restriction; "
                                          "a z plateau there is meaningless -- "
                                          "pass z0,z1 equal");
             const double w = blendFrac * (hi - lo);
@@ -1377,7 +1562,7 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
             const int mCells = a == 0 ? std::max(4, c.nscbcStrip + 2) : 4;
             const double margin = mCells * hAx[a];
             if (!(lo - w >= margin && hi + w <= L - margin))
-                return bad(2, "--focal",
+                return err(2, "--focal",
                            std::string(axName[a]) + " plateau plus its blend "
                            "must clear both domain faces by " +
                            std::to_string(mCells) + " cells (the map must be "
@@ -1385,7 +1570,7 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
                            "--focal-blend");
             const double fine = hAx[a] / c.focalRatio;
             if (hi - lo < 4 * fine)
-                return bad(2, "--focal", std::string(axName[a])
+                return err(2, "--focal", std::string(axName[a])
                                              + " plateau spans under 4 fine "
                                                "cells; widen it");
             // Containment: the body plus the ghost wall's 3-cell mirror
@@ -1396,7 +1581,7 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
             {
                 const double guard = 3.0 * fine;
                 if (!(lo <= bLo[a] - guard && hi >= bHi[a] + guard))
-                    return bad(2, "--focal",
+                    return err(2, "--focal",
                                std::string(axName[a]) + " plateau must contain "
                                "the body plus a 3-fine-cell guard band "
                                "([" + std::to_string(bLo[a] - guard) + "," +
@@ -1413,32 +1598,21 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
             c.focalHCoarse[a] = f.c * hAx[a];
             // Discrete adjacent growth: the KG flux carries no dissipation,
             // so a fast coarse->fine transition is a dispersive reflector.
-            double prev = f.map(hAx[a]) - f.map(0.0);
-            for (int i = 1; i < nAx[a]; ++i)
-            {
-                const double d = f.map((i + 1) * hAx[a]) - f.map(i * hAx[a]);
-                c.focalGrowth =
-                    std::max(c.focalGrowth, std::max(d / prev, prev / d));
-                prev = d;
-            }
+            c.focalGrowth = std::max(
+                c.focalGrowth,
+                maxAdjacentGrowth([&](double X) { return f.map(X); }, hAx[a], 1,
+                                  nAx[a], f.map(hAx[a]) - f.map(0.0)));
         }
         if (!c.focalActive)
-            return bad(2, "--focal", "every axis pair is degenerate; the mesh "
+            return err(2, "--focal", "every axis pair is degenerate; the mesh "
                                      "would be uniform -- drop --focal");
         if (c.focalGrowth > 1.25)
-            return bad(2, "--focal-blend", "max adjacent cell growth " +
+            return err(2, "--focal-blend", "max adjacent cell growth " +
                        std::to_string(c.focalGrowth) + " exceeds 1.25; the "
                        "central flux has no dissipation and reflects off a "
                        "sharp transition. Widen --focal-blend or lower "
                        "--focal-ratio");
-        const double hUni = c.grid.nz == 1
-                                ? std::min(c.grid.hx, c.grid.hy)
-                                : std::min({c.grid.hx, c.grid.hy, c.grid.hz});
-        const double hFoc = c.grid.nz == 1
-                                ? std::min(c.focalHFine[0], c.focalHFine[1])
-                                : std::min({c.focalHFine[0], c.focalHFine[1],
-                                            c.focalHFine[2]});
-        c.focalDtFactor = hFoc / hUni;
+        c.focalDtFactor = hFine(c) / hMin(c.grid);
     }
     else
     {
@@ -1447,9 +1621,15 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
                                   "--focal-wake", "--focal-pad"},
                                  "requires --focal");
             e)
-            return std::unexpected(*e);
+            return e;
     }
+    return std::nullopt;
+}
 
+// Stage: the spinning body.
+std::optional<ConfigError> flowRotor(const RawConfig& r, Case& c)
+{
+    const bool comp = c.physics == Physics::Compressible;
     // --- rotor: the body spins ------------------------------------------------
     //
     // rotorMach is the ONE switch. At 0 nothing below runs, c.rotor stays
@@ -1466,15 +1646,12 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
                                      "configures a spinning body; give "
                                      "--rotor-mach to have one");
                 e)
-                return std::unexpected(*e);
+                return e;
         }
         else
         {
-            if (c.sub != Subcommand::Flow)
-                return bad(2, "--rotor-mach", "only `dns flow` immerses a body "
-                                              "that could spin");
             if (!comp)
-                return bad(2, "--rotor-mach", "the moving wall is the "
+                return err(2, "--rotor-mach", "the moving wall is the "
                                "compressible ghost wall; --rotor-mach needs "
                                "--physics compressible");
             // The O-grid takes the frozen-rotor frame only: the wall is a
@@ -1483,55 +1660,55 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
             // equations + a wall moving in its own plane) and is exact for a
             // circular section.
             if (c.ogrid && r.rotorFrame != 1)
-                return bad(2, "--rotor-mach", "an O-grid IS the body surface: "
+                return err(2, "--rotor-mach", "an O-grid IS the body surface: "
                                "spinning the body would spin the mesh. "
                                "--rotor-frame mrf solves the rotating frame "
                                "on the static O-grid instead; the moving-"
                                "geometry rotor needs the immersed box");
             if (c.ogrid && r.rotorAxis != 2)
-                return bad(2, "--rotor-axis", "the O-grid is z-extruded, so "
+                return err(2, "--rotor-axis", "the O-grid is z-extruded, so "
                                "only the z shaft keeps the wall motion in the "
                                "mesh plane");
             if (c.ogrid && r.given.contains("--blade-thicken"))
-                return bad(2, "--blade-thicken", "exists for the immersed "
+                return err(2, "--blade-thicken", "exists for the immersed "
                                "ghost wall's mirror band; the O-grid wall is "
                                "a mesh face row and needs no dilation");
             if (c.ogrid && r.given.contains("--rotor-span"))
-                return bad(2, "--rotor-span", "sizes the swept box of an "
+                return err(2, "--rotor-span", "sizes the swept box of an "
                                "immersed rotor; the O-grid's extent is the "
                                "mesh itself");
             if (c.bodyKind == BodyKind::None)
-                return bad(2, "--rotor-mach", "there is no body to spin");
+                return err(2, "--rotor-mach", "there is no body to spin");
             if (c.bodyKind == BodyKind::Fence || c.bodyKind == BodyKind::Floor)
-                return bad(2, "--rotor-mach", "the wall-mounted bodies are "
+                return err(2, "--rotor-mach", "the wall-mounted bodies are "
                                "sealed through the domain floor; they have no "
                                "shaft and cannot turn");
             if (c.cutFlux || c.penalize > 0)
-                return bad(2, "--rotor-mach", "apertures and the Brinkman band "
+                return err(2, "--rotor-mach", "apertures and the Brinkman band "
                                "are built once from a static body; the moving "
                                "wall is the ghost wall alone");
             if (r.seq > 1 || r.steady > 0)
-                return bad(2, "--rotor-mach", "a spinning body has no steady "
+                return err(2, "--rotor-mach", "a spinning body has no steady "
                                "state and no per-level restart; drop --seq / "
                                "--steady");
             if (!finitePos(r.rotorMach))
-                return bad(2, "--rotor-mach", "must be finite and > 0 (the TIP "
+                return err(2, "--rotor-mach", "must be finite and > 0 (the TIP "
                                               "Mach number)");
             // The KG central flux carries no shock capturing, so the FASTEST
             // material point in the run has to stay subsonic -- that is the
             // advancing tip, not the freestream.
             if (r.rotorMach + c.mach >= 1.0)
-                return bad(2, "--rotor-mach", "tip Mach + freestream Mach must "
+                return err(2, "--rotor-mach", "tip Mach + freestream Mach must "
                                "stay under 1: the advancing tip is the fastest "
                                "point in the flow and the flux has no shock "
                                "capturing");
             if (!(finitePos(r.rotorSpan) && r.rotorSpan <= 0.5))
-                return bad(2, "--rotor-span", "blade half-extent along the "
+                return err(2, "--rotor-span", "blade half-extent along the "
                                "shaft in diameters, in (0, 0.5]: beyond 0.5 the "
                                "swept volume leaves the placement cube that "
                                "bounds every extent check");
             if (!(std::isfinite(r.bladeThicken) && r.bladeThicken >= 0))
-                return bad(2, "--blade-thicken", "must be finite and >= 0 "
+                return err(2, "--blade-thicken", "must be finite and >= 0 "
                                                  "(fine cells of dilation)");
             // A rotor's mesh is placed and sized about its SHAFT, and its own
             // origin IS that shaft (casegeom). Baking an attitude into it would
@@ -1544,9 +1721,9 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
                     "mesh is placed about its own origin. Bake attitude into "
                     "the mesh, or drop --rotor-mach");
                 e)
-                return std::unexpected(*e);
+                return e;
             if (c.grid.nz == 1 && r.rotorAxis != 2)
-                return bad(2, "--rotor-axis", "nz == 1 is the exact 2D "
+                return err(2, "--rotor-axis", "nz == 1 is the exact 2D "
                                "restriction: only a z shaft keeps the motion in "
                                "the plane. An x or y shaft sweeps the blade out "
                                "of it, which 2D cannot represent");
@@ -1554,15 +1731,7 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
             // Fine spacing: the plateau's under --focal, the grid's otherwise.
             // It sets both the natural bin count and what a "cell" of
             // --blade-thicken means, so the two always agree.
-            const double hFine =
-                c.focalActive
-                    ? (c.grid.nz == 1
-                           ? std::min(c.focalHFine[0], c.focalHFine[1])
-                           : std::min({c.focalHFine[0], c.focalHFine[1],
-                                       c.focalHFine[2]}))
-                    : (c.grid.nz == 1 ? std::min(c.grid.hx, c.grid.hy)
-                                      : std::min({c.grid.hx, c.grid.hy,
-                                                  c.grid.hz}));
+            const double hFine = dns::hFine(c);
 
             c.rotor.axis = r.rotorAxis == 0   ? RotorAxis::X
                            : r.rotorAxis == 1 ? RotorAxis::Y
@@ -1581,7 +1750,7 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
             // and is rejected by name rather than ignored.
             c.rotorMrf = r.rotorFrame == 1;
             if (c.rotorMrf && r.given.contains("--rotor-bins"))
-                return bad(2, "--rotor-bins", "--rotor-frame mrf freezes the "
+                return err(2, "--rotor-bins", "--rotor-frame mrf freezes the "
                                "geometry at azimuth 0; there is no azimuth "
                                "table to size");
 
@@ -1593,11 +1762,11 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
             else if (r.given.contains("--rotor-bins"))
             {
                 if (r.rotorBins < 8)
-                    return bad(2, "--rotor-bins", "under 8 bins the body jumps "
+                    return err(2, "--rotor-bins", "under 8 bins the body jumps "
                                    "by more than a blade width per step change; "
                                    "0 selects the natural count");
                 if (r.rotorBins > 1 << 16)
-                    return bad(2, "--rotor-bins", "over 65536 bins; the table "
+                    return err(2, "--rotor-bins", "over 65536 bins; the table "
                                    "grows linearly and buys nothing past the "
                                    "natural count");
                 c.rotor.bins = r.rotorBins;
@@ -1622,7 +1791,7 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
             // The dilated body must still be a body in this box: a dilation
             // comparable to the radius turns a blade into a disc.
             if (c.rotor.thicken > 0.25 * c.rotor.radius)
-                return bad(2, "--blade-thicken", "dilation exceeds a quarter of "
+                return err(2, "--blade-thicken", "dilation exceeds a quarter of "
                                "the tip radius; that is a different body, not a "
                                "resolvable one");
 
@@ -1645,93 +1814,124 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
                 hFine, c.placement.D / hFine));
         }
     }
+    return std::nullopt;
+}
 
+// Stage: the no-slip y walls.
+std::optional<ConfigError> flowWalls(const RawConfig&, Case& c)
+{
+    const bool comp = c.physics == Physics::Compressible;
     if (c.noslipY)
     {
         if (!comp)
-            return bad(2, "--noslip", "the y mirror walls belong to the "
+            return err(2, "--noslip", "the y mirror walls belong to the "
                                       "compressible far field; --noslip needs "
                                       "--physics compressible");
         if (c.open)
-            return bad(2, "--noslip", "--open removes the y walls; there is "
+            return err(2, "--noslip", "--open removes the y walls; there is "
                                       "nothing to make no-slip");
         if (c.far != FarField::Sponge && c.far != FarField::Nscbc)
-            return bad(2, "--noslip", "requires a far field with closed y walls "
+            return err(2, "--noslip", "requires a far field with closed y walls "
                                       "(--far sponge or --far nscbc)");
     }
+    return std::nullopt;
+}
 
+// Stage: quiet start and trip.
+std::optional<ConfigError> flowStartup(const RawConfig& r, Case& c)
+{
+    const bool comp = c.physics == Physics::Compressible;
     // Start-up. The raw default (2.0) is the COMPRESSIBLE default; the
     // incompressible ramp is opt-in so existing impulsive-start trajectories
     // and anchors do not silently move.
     c.ramp = comp ? r.ramp : (r.given.contains("--ramp") ? r.ramp : 0.0);
     if (!comp && c.ramp > 0 && (r.seq > 1 || r.steady > 0))
-        return bad(2, "--ramp", "the quiet start would re-ramp the developed "
+        return err(2, "--ramp", "the quiet start would re-ramp the developed "
                                 "field each --seq level / fight --steady; "
                                 "use an impulsive start there");
     c.kick = r.kick;
-    if (!(std::isfinite(c.ramp) && c.ramp >= 0)) return bad(2, "--ramp", "must be >= 0");
-    if (!std::isfinite(c.kick)) return bad(2, "--kick", "must be finite");
+    if (!(std::isfinite(c.ramp) && c.ramp >= 0)) return err(2, "--ramp", "must be >= 0");
+    if (!std::isfinite(c.kick)) return err(2, "--kick", "must be finite");
+    return std::nullopt;
+}
 
+// Stage: the pressure solve and the dt recompute.
+std::optional<ConfigError> flowSolver(const RawConfig& r, Case& c)
+{
+    const bool comp = c.physics == Physics::Compressible;
     // Solver.
     c.tol = r.tol;
-    if (!finitePos(c.tol)) return bad(2, "--tol", "must be > 0");
+    if (!finitePos(c.tol)) return err(2, "--tol", "must be > 0");
     c.maxIters = r.maxIters;
-    if (c.maxIters < 1) return bad(2, "--max-iters", "must be >= 1");
+    if (c.maxIters < 1) return err(2, "--max-iters", "must be >= 1");
     // Default per current app: 16 for the compressible cylinder (a validated
     // perf fix, masterplan §6.7), 1 everywhere else.
-    c.dtRecompute = r.given.contains("--dt-recompute")
-                        ? r.dtRecompute
-                        : (comp && c.bodyKind == BodyKind::Cylinder ? 16 : 1);
-    if (c.dtRecompute < 1) return bad(2, "--dt-recompute", "must be >= 1");
+    if (auto e = resolveDtRecompute(
+            r, c, comp && c.bodyKind == BodyKind::Cylinder ? 16 : 1);
+        e)
+        return e;
+    return std::nullopt;
+}
 
+// Stage: the per-body options.
+std::optional<ConfigError> flowGeometry(const RawConfig& r, Case& c)
+{
     // Geometry options.
+    // Which body takes which option is bodyOptions()'s, the table the editor
+    // reads too.
+    const BodyOptions bo = bodyOptions(c.bodyKind);
     c.aspect = r.aspect;
-    if (c.bodyKind == BodyKind::Lens && !(c.aspect > 1.0))
-        return bad(2, "--aspect", "must be > 1 (the lens needs w > hh)");
+    if (bo.aspect && !(c.aspect > 1.0))
+        return err(2, "--aspect", "must be > 1 (the lens needs w > hh)");
     c.dimples = r.dimples;
-    if (c.dimples < 0) return bad(2, "--dimples", "must be >= 0");
-    if (c.dimples > 0 && c.bodyKind != BodyKind::Cylinder
-        && c.bodyKind != BodyKind::Sphere)
-        return bad(2, "--dimples", "only cylinder and sphere carry dimples");
+    if (c.dimples < 0) return err(2, "--dimples", "must be >= 0");
+    if (c.dimples > 0 && !bo.dimples)
+        return err(2, "--dimples", "only cylinder and sphere carry dimples");
     if (c.dimples > 0 && c.placement.D < 16 * c.h)
-        return bad(2, "--dimples", "dimple pits are 5h wide; D must span at least 16 "
+        return err(2, "--dimples", "dimple pits are 5h wide; D must span at least 16 "
                                    "cells or they consume the body");
     c.bumps = r.bumps;
-    if (c.bumps < 0) return bad(2, "--bumps", "must be >= 0");
-    if (c.bumps > 0 && c.bodyKind != BodyKind::Floor)
-        return bad(2, "--bumps", "the surface ripple belongs to --body floor");
+    if (c.bumps < 0) return err(2, "--bumps", "must be >= 0");
+    if (c.bumps > 0 && !bo.bumps)
+        return err(2, "--bumps", "the surface ripple belongs to --body floor");
     c.bumpH = r.bumpH;
     if (c.bumps > 0)
     {
         if (!(std::isfinite(c.bumpH) && c.bumpH >= 4 && c.bumpH <= 48))
-            return bad(2, "--bump-h", "must be in [4,48] cells (base = height, "
+            return err(2, "--bump-h", "must be in [4,48] cells (base = height, "
                                       "63-degree flanks; under 4 the tip is "
                                       "sub-cell, over 48 it is a fence, not "
                                       "roughness)");
         if (c.bumps > int(0.65 * c.n / (2.0 * c.bumpH)))
-            return bad(2, "--bumps", "spike pitch is under twice the tooth "
+            return err(2, "--bumps", "spike pitch is under twice the tooth "
                                      "base; the teeth merge -- fewer bumps, "
                                      "shorter --bump-h, or more cells");
         if (c.placement.D < 4 * c.bumpH * c.h)
-            return bad(2, "--bump-h", "spikes taller than D/4 are a fence "
+            return err(2, "--bump-h", "spikes taller than D/4 are a fence "
                                       "field, not surface roughness -- lower "
                                       "--bump-h or --dr");
     }
     c.scale = r.scale;
     if (!(std::isfinite(c.scale) && c.scale >= 0))
-        return bad(2, "--scale", "must be finite and >= 0 (0 = fit D)");
+        return err(2, "--scale", "must be finite and >= 0 (0 = fit D)");
     c.pitch = r.pitch;
     c.yaw = r.yaw;
     c.robust = r.robust;
-    if (c.bodyKind != BodyKind::Mesh)
+    if (!bo.mesh)
         if (auto e = rejectGiven(r, {"--scale", "--pitch", "--yaw", "--robust"},
                                  "applies to mesh bodies only");
             e)
-            return std::unexpected(*e);
+            return e;
+    return std::nullopt;
+}
 
+// Stage: run length, stationary mode, sequencing, frames, metadata.
+std::optional<ConfigError> flowOutput(const RawConfig& r, Case& c)
+{
+    const bool comp = c.physics == Physics::Compressible;
     // Run length + output cadences.
     c.ft = r.ft;
-    if (!finitePos(c.ft)) return bad(2, "--ft", "must be finite and > 0");
+    if (!finitePos(c.ft)) return err(2, "--ft", "must be finite and > 0");
     // One flow-through is L/uInf in both physics (c.L already carries each
     // physics' own box convention). Formerly a `comp ? X : X` ternary.
     c.tEnd = c.ft * c.L / c.uInf;
@@ -1740,13 +1940,13 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
     // give-up cap: not converging by then is exit 8, never a silent answer.
     c.steadyTol = r.steady;
     if (c.steadyTol < 0 || !std::isfinite(c.steadyTol))
-        return bad(2, "--steady", "must be finite and >= 0 (0 = time-march)");
+        return err(2, "--steady", "must be finite and >= 0 (0 = time-march)");
     if (c.steadyTol > 0 && comp)
-        return bad(2, "--steady",
+        return err(2, "--steady",
                    "is incompressible-only; the compressible loop has acoustic "
                    "transients that a velocity residual cannot certify");
     if (c.steadyTol > 0 && c.cs > 0)
-        return bad(2, "--steady",
+        return err(2, "--steady",
                    "with --les is meaningless: a filtered field has no "
                    "stationary state to converge to");
 
@@ -1755,42 +1955,42 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
     // startup transient at full resolution.
     c.seqLevels = r.seq;
     if (c.seqLevels < 1 || c.seqLevels > 6)
-        return bad(2, "--seq", "must be in [1,6] (1 = off)");
+        return err(2, "--seq", "must be in [1,6] (1 = off)");
     if (c.seqLevels > 1)
     {
         if (c.steadyTol <= 0)
-            return bad(2, "--seq", "requires --steady: without a convergence "
+            return err(2, "--seq", "requires --steady: without a convergence "
                                    "test there is nothing to advance a level on");
         // The coarsest level still has to resolve the body: same D >= 4h rule.
         const int nCoarse = r.n >> (c.seqLevels - 1);
         if (nCoarse < 16 || double(nCoarse) < 4.0 * c.dr)
-            return bad(2, "--seq", "coarsest level would not resolve the body "
+            return err(2, "--seq", "coarsest level would not resolve the body "
                                    "(needs n/2^(levels-1) >= max(16, 4*dr)); "
                                    "use fewer levels or a larger --n");
     }
-    if (auto e = validateFrameOutputs(r, c); e) return std::unexpected(*e);
+    if (auto e = validateFrameOutputs(r, c); e) return e;
     c.vortMax = r.vortMax;
     if (!(std::isfinite(c.vortMax) && c.vortMax >= 0))
-        return bad(2, "--vort-max", "must be finite and >= 0 (0 = auto scale)");
+        return err(2, "--vort-max", "must be finite and >= 0 (0 = auto scale)");
     c.vortAsinh = r.vortMap == 1;
     if (c.vortAsinh && !(c.vortMax > 0))
-        return bad(2, "--vort-map", "asinh needs an explicit full-scale clip; "
+        return err(2, "--vort-map", "asinh needs an explicit full-scale clip; "
                                     "set --vort-max (~ the peak |vorticity| in "
                                     "uInf/D, e.g. sqrt(Re))");
     c.speedDelta = r.speedMap == 1;
     c.tempFrames = r.tempFrames;
     if (c.tempFrames && !comp)
-        return bad(2, "--temp", "the incompressible solver carries no energy "
+        return err(2, "--temp", "the incompressible solver carries no energy "
                                 "equation and no temperature field; use "
                                 "--physics compressible");
     c.vortSigned = r.vortSigned;
     if (c.vortSigned && !comp)
-        return bad(2, "--vort-signed", "incompressible frames are already "
+        return err(2, "--vort-signed", "incompressible frames are already "
                                        "signed z-vorticity; the flag selects "
                                        "it for 3D compressible runs");
 
     if (auto e = resolveEmit(c, {Emit::Stats, Emit::Bin}); e)
-        return std::unexpected(*e);
+        return e;
     // PNG at nz > 1 renders the centre z-plane (same machinery the channel
     // already uses); the old flow-only nz == 1 restriction was conservative,
     // not load-bearing.
@@ -1802,13 +2002,37 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
     // that --dry-run printed as if it were the number the run would divide by.
     // The real value comes from dns/geometry.hpp's referenceQ*(), once.
 
-    c.meta = {c.grid.nx, c.grid.ny, c.grid.nz, c.grid.hx, c.grid.hy, c.grid.hz,
-              c.placement.D, c.re, comp ? c.mach : 0.0, c.fdt, c.cs, c.lesLabel,
-              c.bodyKind == BodyKind::Mesh    ? c.meshPath
-              : c.bodyKind == BodyKind::Scene ? "scene:" + c.scenePath
-                                              : name(c.bodyKind),
-              name(c.far), name(c.physics), comp ? c.kick : 0.0,
-              c.lesLabel ? name(c.sgsModel) : ""};
+    c.meta = {.D = c.placement.D,
+              .re = c.re,
+              .mach = comp ? c.mach : 0.0,
+              .frameDt = c.fdt,
+              .cs = c.cs,
+              .les = c.lesLabel,
+              .body = c.bodyKind == BodyKind::Mesh    ? c.meshPath
+                      : c.bodyKind == BodyKind::Scene ? "scene:" + c.scenePath
+                                                      : name(c.bodyKind),
+              .farField = name(c.far),
+              .physics = name(c.physics),
+              .kick = comp ? c.kick : 0.0,
+              .sgs = c.lesLabel ? name(c.sgsModel) : ""};
+    c.meta.setGrid(c.grid);
+    return std::nullopt;
+}
+
+// The `dns flow` validator, as ordered stages over one Case. ORDER IS
+// LOAD-BEARING: the first error wins, so a stage may only move together with
+// every check before it. Each stage reads what the earlier ones resolved.
+std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
+{
+    using Stage = std::optional<ConfigError> (*)(const RawConfig&, Case&);
+    static constexpr Stage kStages[] = {
+        flowBody, flowGrid, flowPhysics, flowThermal,
+        flowLes, flowNscbc, flowBands, flowStretch,
+        flowFocal, flowRotor, flowWalls, flowStartup,
+        flowSolver, flowGeometry, flowOutput
+    };
+    for (const Stage s : kStages)
+        if (auto e = s(r, c); e) return std::unexpected(*e);
     return c;
 }
 
@@ -1845,6 +2069,13 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     if (r.sub == Subcommand::Channel) return validateChannel(r, std::move(c));
     if (r.sub == Subcommand::Conv) return validateConv(r, std::move(c));
     return validateFlow(r, std::move(c));
+}
+
+double hFine(const Case& c)
+{
+    return c.focalActive ? hMin(c.grid.nz, c.focalHFine[0], c.focalHFine[1],
+                                c.focalHFine[2])
+                         : hMin(c.grid);
 }
 
 // ---------------------------------------------------------------------------
@@ -2021,7 +2252,7 @@ std::string Case::describe() const
     if (physics == Physics::Compressible &&
         (sutherland || bodyIsothermal || nscbcThermalInflow))
     {
-        const double Tinf = mach > 0 ? 1.0 / (1.4 * mach * mach) : 0.0;
+        const double Tinf = mach > 0 ? 1.0 / (kGammaAir * mach * mach) : 0.0;
         s += std::format(
             "  thermal    visc={}  Pr={:.6g}  Tinf={:.6g} box ({:.6g} K)\n"
             "             body wall {}{}  nscbc inflow holds {}\n",
@@ -2074,14 +2305,7 @@ std::string Case::describe() const
     if (rotor.active())
     {
         const char* ax[3] = {"x", "y", "z"};
-        const double hFine = focalActive
-                                 ? (grid.nz == 1
-                                        ? std::min(focalHFine[0], focalHFine[1])
-                                        : std::min({focalHFine[0], focalHFine[1],
-                                                    focalHFine[2]}))
-                                 : (grid.nz == 1 ? std::min(grid.hx, grid.hy)
-                                                 : std::min({grid.hx, grid.hy,
-                                                             grid.hz}));
+        const double hFine = dns::hFine(*this);
         const double tRev = 2.0 * std::numbers::pi / std::abs(rotor.omega);
         const char* shaft = ax[rotorAxisIndex(rotor.axis)];
         s += std::format(

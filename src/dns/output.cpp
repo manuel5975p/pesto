@@ -16,6 +16,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 
 namespace dns {
 
@@ -76,6 +77,30 @@ struct RunOutput::Impl
     double msPerStep = 0;
     bool moved = false;
 
+    // The first write failure of the run, reported once on stderr when it
+    // happens and returned by finish(). The run itself continues: a full disk
+    // must not lose a run that is otherwise healthy, but it must not exit 0.
+    std::optional<std::string> firstError;
+    std::optional<std::expected<void, std::string>> finished;
+
+    void record(const std::string& e)
+    {
+        if (firstError) return;
+        firstError = e;
+        std::fprintf(stderr, "dns: output error: %s (the run continues; it "
+                             "will exit 4)\n", e.c_str());
+    }
+
+    // Writes one binary record to a frame stream and records a failure.
+    void writeBin(const std::string& name, const std::vector<float>& data)
+    {
+        auto& out = binFor(name);
+        out.write(reinterpret_cast<const char*>(data.data()),
+                  std::streamsize(data.size() * sizeof(float)));
+        if (!out)
+            record(std::format("write failed on '{}_{}.bin'", cfg.prefix, name));
+    }
+
     std::vector<float> buf;   // scratch plane / volume buffer
 
     std::string json() const
@@ -94,6 +119,14 @@ struct RunOutput::Impl
     {
         std::ofstream f(cfg.prefix + ".json");
         f << json();
+    }
+
+    std::expected<void, std::string> writeJsonChecked() const
+    {
+        const std::string path = cfg.prefix + ".json";
+        std::ofstream f(path);
+        f << json();
+        return closeChecked(f, path);
     }
 
     // Frame streams open on first use -- their names come from the runner's
@@ -141,14 +174,15 @@ struct RunOutput::Impl
     // Lazily built: the field list, and so the plane manifest, is only known
     // at the first frame. Its own method rather than an immediately-invoked
     // lambda inside frame(), which is what it was.
-    std::expected<void, std::string> buildWebPlanes(const FrameViews& fv,
-                                                    int nx, int ny, int nz)
+    std::expected<void, std::string>
+    buildWebPlanes(std::span<const FrameField> fields, int nx, int ny, int nz)
     {
         Impl& p = *this;
         const int per = std::clamp(p.cfg.planesPerAxis, 1, 3);
         const int dI = std::max(1, nx / 16), dJ = std::max(1, ny / 16),
                   dK = std::max(1, nz / 16);
         std::string idx;
+        bool failed = false;   // a static mask that did not write
         auto add = [&](const std::string& suf, const std::string& axis,
                        double offD, int a, int b, auto sel) {
             WebPlane wp;
@@ -158,7 +192,7 @@ struct RunOutput::Impl
                 tagPrefix("web_", p.cfg.prefix) + suf, a, b,
                 p.cfg.simJson + ",\"plane\":\"" + axis + "\",\"off\":\"" +
                     (offD == 0.0 ? "mid" : offs) + "\"}");
-            for (const auto& f : fv.fields)
+            for (const auto& f : fields)
                 wp.wf->addField(f.name,
                                 f.diverging ? "diverging" : "sequential",
                                 f.diverging ? -f.hi : f.lo, f.hi);
@@ -169,7 +203,8 @@ struct RunOutput::Impl
             {
                 std::vector<float> m;
                 p.gather(p.geo.mask.data(), a, b, wp.sel, m);
-                wp.wf->writeStatic("mask", m.data(), 0.0, 1.0);
+                if (!wp.wf->writeStatic("mask", m.data(), 0.0, 1.0))
+                    failed = true;
             }
             char e[160];
             std::snprintf(e, sizeof e,
@@ -182,8 +217,13 @@ struct RunOutput::Impl
         const double D = p.geo.D > 0 ? p.geo.D : 1.0;
         auto cellsD = [&](int c) { return c * p.g.hx / D; };
         const int ic = p.geo.ic, jc = p.geo.jc, kc = p.geo.kc;
+        const std::string maskErr = std::format(
+            "web static mask write failed under '{}'",
+            tagPrefix("web_", p.cfg.prefix));
         add("", "xy", 0.0, nx, ny, xySel(kc));
-        if (nz == 1) return {};             // native 2D: one plane only
+        if (nz == 1)                        // native 2D: one plane only
+            return failed ? std::unexpected(maskErr)
+                          : std::expected<void, std::string>{};
         if (per == 3 && nz >= 16)
         {
             add("_xy_m", "xy", -cellsD(dK), nx, ny, xySel(kc - dK));
@@ -201,6 +241,7 @@ struct RunOutput::Impl
             add("_yz_m", "yz", -cellsD(dI), ny, nz, yzSel(ic - dI));
             add("_yz_p", "yz", +cellsD(dI), ny, nz, yzSel(ic + dI));
         }
+        if (failed) return std::unexpected(maskErr);
         const std::string path =
             tagPrefix("web_", p.cfg.prefix) + "/planes.json";
         std::ofstream pf(path);
@@ -230,7 +271,7 @@ RunOutput& RunOutput::operator=(RunOutput&&) noexcept = default;
 
 RunOutput::~RunOutput()
 {
-    if (!p_) return;                      // moved from
+    if (!p_ || p_->finished) return;      // moved from, or already finished
     for (auto& [n, f] : p_->bins) f.close();
     for (auto& [n, f] : p_->series) f.close();
     p_->writeJson();                      // final frame count + ms/step
@@ -346,34 +387,54 @@ RunOutput::auxBinary(std::string_view kind, int index, std::string_view ext,
     return closeChecked(f, path);
 }
 
-void RunOutput::declareSeries(std::string_view name,
-                              std::span<const std::string> cols)
+std::expected<void, std::string>
+RunOutput::declareSeries(std::string_view name, std::span<const std::string> cols)
 {
-    if (!has(p_->cfg.kinds, Emit::Stats)) return;
+    if (!has(p_->cfg.kinds, Emit::Stats)) return {};
     const std::string key(name);
+    const std::string path = p_->cfg.prefix + "_" + key + ".csv";
     auto& f = p_->series[key];
     // Re-declaring a series reopens it: opening an already-open stream would
     // set failbit and silently swallow every subsequent row.
     if (f.is_open()) f.close();
     f.clear();
-    f.open(p_->cfg.prefix + "_" + key + ".csv");
+    f.open(path);
+    if (!f) return std::unexpected(std::format("cannot write '{}'", path));
     for (std::size_t i = 0; i < cols.size(); ++i)
         f << (i ? "," : "") << cols[i];
     f << '\n';
+    return {};
 }
 
-std::expected<void, std::string> RunOutput::row(std::string_view name,
-                                                std::span<const double> v)
+bool RunOutput::row(std::string_view name, std::span<const double> v)
 {
     auto it = p_->series.find(std::string(name));
-    if (it == p_->series.end()) return {};      // series not enabled
+    if (it == p_->series.end()) return true;    // series not enabled
     auto& f = it->second;
     for (std::size_t i = 0; i < v.size(); ++i)
         f << (i ? "," : "") << v[i];
     f << '\n';
     f.flush();
-    if (!f) return std::unexpected(std::format("write failed on series '{}'", name));
-    return {};
+    if (f) return true;
+    p_->record(std::format("write failed on series '{}'", name));
+    return false;
+}
+
+std::expected<void, std::string> RunOutput::finish()
+{
+    auto& p = *p_;
+    if (p.finished) return *p.finished;
+    std::optional<std::string> err = p.firstError;
+    for (auto& [n, f] : p.bins)
+        if (auto r = closeChecked(f, p.cfg.prefix + "_" + n + ".bin"); !r && !err)
+            err = r.error();
+    for (auto& [n, f] : p.series)
+        if (auto r = closeChecked(f, p.cfg.prefix + "_" + n + ".csv"); !r && !err)
+            err = r.error();
+    if (auto r = p.writeJsonChecked(); !r && !err) err = r.error();
+    p.finished = err ? std::expected<void, std::string>(std::unexpected(*err))
+                     : std::expected<void, std::string>{};
+    return *p.finished;
 }
 
 bool RunOutput::wantsFrame(double t) const
@@ -400,7 +461,16 @@ bool RunOutput::wantsAnyFrame(double t) const
     return wantsFrame(t) || wantsPng(t) || wantsWeb(t) || wantsShm(t);
 }
 
-std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv)
+std::expected<void, std::string>
+RunOutput::frame(double t, std::span<const FrameField> fields)
+{
+    auto r = frameKinds(t, fields);
+    if (!r) p_->record(r.error());
+    return r;
+}
+
+std::expected<void, std::string>
+RunOutput::frameKinds(double t, std::span<const FrameField> fields)
 {
     auto& p = *p_;
     const auto& k = p.cfg.kinds;
@@ -413,39 +483,33 @@ std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv
 
     // Lazily build the web planes: the field list is only known here.
     if (doWeb && p.webs.empty())
-        if (auto r = p.buildWebPlanes(fv, nx, ny, nz); !r) return r;
+        if (auto r = p.buildWebPlanes(fields, nx, ny, nz); !r) return r;
 
     if (doBin)
     {
-        for (const auto& f : fv.fields)
+        for (const auto& f : fields)
         {
             if (has(k, Emit::Volume))
             {
-                auto& out = p.binFor(f.name);
                 p.buf.resize(std::size_t(nx) * ny * nz);
                 std::size_t q = 0;
                 for (int kk = 0; kk < nz; ++kk)
                     for (int j = 0; j < ny; ++j)
                         for (int i = 0; i < nx; ++i, ++q)
                             p.buf[q] = f.data[p.g.idx(i0 + i, j0 + j, k0 + kk)];
-                out.write(reinterpret_cast<const char*>(p.buf.data()),
-                          std::streamsize(p.buf.size() * sizeof(float)));
+                p.writeBin(f.name, p.buf);
             }
             if (has(k, Emit::Bin))
             {
-                auto& out = p.binFor(f.name);
                 p.gather(f.data, nx, ny, p.xySel(p.geo.kc), p.buf);
-                out.write(reinterpret_cast<const char*>(p.buf.data()),
-                          std::streamsize(p.buf.size() * sizeof(float)));
+                p.writeBin(f.name, p.buf);
             }
             if (has(k, Emit::Slices))
             {
                 const int ic = p.geo.ic, jc = p.geo.jc, kc = p.geo.kc;
                 auto plane = [&](const char* suf, int a, int b, auto sel) {
                     p.gather(f.data, a, b, sel, p.buf);
-                    auto& out = p.binFor(std::string(suf) + "_" + f.name);
-                    out.write(reinterpret_cast<const char*>(p.buf.data()),
-                              std::streamsize(p.buf.size() * sizeof(float)));
+                    p.writeBin(std::string(suf) + "_" + f.name, p.buf);
                 };
                 plane("xy", nx, ny, p.xySel(kc));
                 plane("xz", nx, nz, p.xzSel(jc));
@@ -458,7 +522,7 @@ std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv
 
     if (doPng)
     {
-        for (const auto& f : fv.fields)
+        for (const auto& f : fields)
         {
             p.gather(f.data, nx, ny, p.xySel(p.geo.kc), p.buf);
             const auto path = std::format("{}/{}_{:05d}.png", p.pngDir, f.name,
@@ -522,13 +586,13 @@ std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv
 
     if (doWeb)
     {
-        std::vector<std::vector<float>> planes(fv.fields.size());
+        std::vector<std::vector<float>> planes(fields.size());
         for (auto& wp : p.webs)
         {
             std::vector<const float*> ptr;
-            for (std::size_t i = 0; i < fv.fields.size(); ++i)
+            for (std::size_t i = 0; i < fields.size(); ++i)
             {
-                p.gather(fv.fields[i].data, wp.a, wp.b, wp.sel, planes[i]);
+                p.gather(fields[i].data, wp.a, wp.b, wp.sel, planes[i]);
                 ptr.push_back(planes[i].data());
             }
             if (!wp.wf->writeFrame(t, ptr))
@@ -553,7 +617,7 @@ std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv
         if (!p.shmReady)
         {
             std::vector<ShmField> fs;
-            for (const auto& f : fv.fields)
+            for (const auto& f : fields)
             {
                 ShmField sf;
                 std::snprintf(sf.name, sizeof sf.name, "%s", f.name.c_str());
@@ -590,11 +654,11 @@ std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv
                                  : std::array{ic, j0 + a, k0 + b};
             };
         };
-        store.reserve(specs.size() * (fv.fields.size() + 1));
+        store.reserve(specs.size() * (fields.size() + 1));
         for (const auto& sp : specs)
         {
             std::vector<const float*> ptr;
-            for (const auto& f : fv.fields)
+            for (const auto& f : fields)
             {
                 store.emplace_back();
                 p.gather(f.data, sp.w, sp.h, sel2(sp.axis), store.back());
@@ -620,8 +684,8 @@ std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv
         if (nz > 1 && p.shm.hasVolume())
         {
             const std::size_t n = std::size_t(nx) * ny * nz;
-            vols.resize(fv.fields.size());
-            for (std::size_t f = 0; f < fv.fields.size(); ++f)
+            vols.resize(fields.size());
+            for (std::size_t f = 0; f < fields.size(); ++f)
             {
                 vols[f].resize(n);
                 std::size_t q = 0;
@@ -629,7 +693,7 @@ std::expected<void, std::string> RunOutput::frame(double t, const FrameViews& fv
                     for (int j = 0; j < ny; ++j)
                         for (int i = 0; i < nx; ++i, ++q)
                             vols[f][q] =
-                                fv.fields[f].data[p.g.idx(i0 + i, j0 + j, k0 + kk)];
+                                fields[f].data[p.g.idx(i0 + i, j0 + j, k0 + kk)];
                 volPtr.push_back(vols[f].data());
             }
         }

@@ -15,7 +15,10 @@
 
 #include <SDL3/SDL.h>
 
+#include <charconv>
+#include <cmath>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -23,6 +26,31 @@
 #include <vector>
 
 namespace ui {
+
+// The editor's ONE text -> number rule: a finite number spelled by ALL of `s`
+// (from_chars: no whitespace, no trailing junk, nan/inf rejected); nullopt
+// otherwise. A typed field that does not parse leaves its value untouched.
+inline std::optional<double> parseNumber(std::string_view s)
+{
+    double v{};
+    const auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (s.empty() || ec != std::errc{} || p != s.data() + s.size()
+        || !std::isfinite(v))
+        return std::nullopt;
+    return v;
+}
+
+// The number at the START of `s` (one optional '+', as printf's %+ writes),
+// ending at the first character that cannot continue it -- a run-log field
+// such as "12.00/40.00 cd=..." reads 12. nullopt when no finite number leads.
+inline std::optional<double> leadingNumber(std::string_view s)
+{
+    if (s.starts_with('+')) s.remove_prefix(1);
+    double v{};
+    const auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (ec != std::errc{} || !std::isfinite(v)) return std::nullopt;
+    return v;
+}
 
 // One frame of input, assembled by app.cpp from the SDL event queue.
 struct Input

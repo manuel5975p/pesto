@@ -37,7 +37,4 @@ struct ConfigTokens
 };
 std::expected<ConfigTokens, std::string> configTokens(std::string_view toml);
 
-std::string help(Subcommand);
-std::string helpTop();
-
 } // namespace dns::cli

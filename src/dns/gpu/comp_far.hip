@@ -22,11 +22,7 @@ __global__ void kFarSponge(GpuGrid g, int ns, Real sigMax, Real gam, int openY,
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
-    auto depth = [ns](int q, int n) {
-        if (q < ns) return Real(ns - q) / Real(ns);
-        if (q >= n - ns) return Real(q - (n - ns) + 1) / Real(ns);
-        return Real(0);
-    };
+    auto depth = [ns](int q, int n) { return bandDepth(q, n, ns); };
     auto sig = [sigMax](Real r) {
         return r > Real(0) ? sigMax * Real(0.5) * (Real(1) - cosf(Real(M_PI) * r))
                            : Real(0);
@@ -83,12 +79,9 @@ __global__ void kFarWallZ(GpuGrid g, Real* rho, Real* mx, Real* my, Real* mz,
                           Real* E)
 {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t nxy = std::size_t(g.nx) * g.ny;
-    if (t >= 2 * nxy) return;
-    const bool hi = t >= nxy;
-    const int i = int(t % g.nx), j = int((t / g.nx) % g.ny);
-    const std::size_t c = gidx(g, i, j, hi ? g.nz - 1 : 0);
-    const std::size_t s = gidx(g, i, j, hi ? g.nz - 2 : 1);
+    bool hi;
+    std::size_t c, s;
+    if (!internal::sideGhostPair(g, 2, t, hi, c, s)) return;
     rho[c] = rho[s];
     mx[c] = mx[s];
     my[c] = my[s];

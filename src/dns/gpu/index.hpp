@@ -52,6 +52,25 @@ __host__ __device__ inline int sideGhostZ(const GpuGrid& g, bool closed)
     return closed && g.nz > 1 ? 1 : 0;
 }
 
+// A FLUID cell of the wall-bounded box: off the y ghost rows {0, ny-1} and off
+// the lateral ghost ring the offsets above describe (ox/oz = 0: none there).
+__host__ __device__ inline bool inFluid(const GpuGrid& g, int i, int j, int k,
+                                        int ox, int oz)
+{
+    return i >= ox && i < g.nx - ox && j >= 1 && j < g.ny - 1 && k >= oz
+        && k < g.nz - oz;
+}
+
+// Depth of row q into a boundary band of nb rows on an axis of n: 1 at either
+// extreme row, falling by 1/nb per row inward, 0 outside both bands. Only the
+// depth is shared; each band keeps its own ramp of it.
+__host__ __device__ inline Real bandDepth(int q, int n, int nb)
+{
+    if (q < nb) return Real(nb - q) / Real(nb);
+    if (q >= n - nb) return Real(q - (n - nb) + 1) / Real(nb);
+    return Real(0);
+}
+
 // Periodic wrap for stencil offsets; |i - [0,n)| <= 1.
 __host__ __device__ inline int wrap(int i, int n)
 {

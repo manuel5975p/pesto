@@ -42,53 +42,31 @@ __global__ void kRbWall(GpuGrid g, Real Tbot, Real Ttop, Real patch, int ox,
     }
 }
 
-// Lateral no-slip ADIABATIC wall on x: the plates' treatment one axis over.
-// The wall faces are the u-faces i = 1 and i = nx-1, the tangential v and w are
+// Lateral no-slip ADIABATIC wall on x (axis 0) or z (axis 2): the plates'
+// treatment one axis over. The wall faces are the normal-velocity faces at
+// index 1 and n-1 of that axis, the two tangential components are
 // antimirrored into the ghost column, and T is MIRRORED rather than imaged --
-// dT/dn = 0, an insulating side wall. Runs over EVERY j and k, including the y
-// ghost rows, so a corner ghost is the x-mirror of a cell the y pass already
-// mirrored: the diagonal reflection.
-__global__ void kRbWallX(GpuGrid g, Real* u, Real* v, Real* w, Real* T)
-{
-    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t nyz = std::size_t(g.ny) * g.nz;
-    if (t >= 2 * nyz) return;
-    const bool hi = t >= nyz;
-    const int j = int(t % g.ny), k = int((t / g.ny) % g.nz);
-    const std::size_t c = gidx(g, hi ? g.nx - 1 : 0, j, k);
-    const std::size_t s = gidx(g, hi ? g.nx - 2 : 1, j, k);
-
-    T[c] = T[s];
-    v[c] = -v[s];
-    w[c] = -w[s];
-    if (hi) u[c] = Real(0);
-    else
-    {
-        u[gidx(g, 1, j, k)] = Real(0);
-        u[c] = Real(0);
-    }
-}
-
-// The z twin, and it exists only at nz > 1: at nz == 1 the z stencil cancels by
+// dT/dn = 0, an insulating side wall. The index pair is the shared one
+// (internal::sideGhostPair), so a corner ghost is the diagonal reflection. The
+// z wall is launched only at nz > 1: at nz == 1 the z stencil cancels by
 // periodic wrap and there is no third dimension to wall off.
-__global__ void kRbWallZ(GpuGrid g, Real* u, Real* v, Real* w, Real* T)
+// `n` is the wall-normal velocity, `t1`/`t2` the tangential ones.
+__global__ void kRbWallSide(GpuGrid g, int axis, Real* n, Real* t1, Real* t2,
+                            Real* T)
 {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t nxy = std::size_t(g.nx) * g.ny;
-    if (t >= 2 * nxy) return;
-    const bool hi = t >= nxy;
-    const int i = int(t % g.nx), j = int((t / g.nx) % g.ny);
-    const std::size_t c = gidx(g, i, j, hi ? g.nz - 1 : 0);
-    const std::size_t s = gidx(g, i, j, hi ? g.nz - 2 : 1);
+    bool hi;
+    std::size_t c, s;
+    if (!internal::sideGhostPair(g, axis, t, hi, c, s)) return;
 
     T[c] = T[s];
-    u[c] = -u[s];
-    v[c] = -v[s];
-    if (hi) w[c] = Real(0);
+    t1[c] = -t1[s];
+    t2[c] = -t2[s];
+    if (hi) n[c] = Real(0);
     else
     {
-        w[gidx(g, i, j, 1)] = Real(0);
-        w[c] = Real(0);
+        n[s] = Real(0);   // s is the low wall face, index 1 on this axis
+        n[c] = Real(0);
     }
 }
 
@@ -171,9 +149,7 @@ __global__ void kZeroGhostCells(GpuGrid g, int ox, int oz, Real* q)
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
-    const bool in = i >= ox && i < g.nx - ox && j >= 1 && j < g.ny - 1
-        && k >= oz && k < g.nz - oz;
-    if (!in) q[c] = Real(0);
+    if (!inFluid(g, i, j, k, ox, oz)) q[c] = Real(0);
 }
 
 __global__ void kRbPlaneStats(GpuGrid g, int ox, int oz, const Real* u,
@@ -214,13 +190,13 @@ void applyRbWall(const GpuGrid& g, Real Tbot, Real Ttop, Real patch, bool closed
         T.data());
     checkLastKernel("kRbWall");
     if (ox == 0) return;
-    kRbWallX<<<launchBlocks(2 * std::size_t(g.ny) * g.nz), blockSize>>>(
-        g, U.u.data(), U.v.data(), U.w.data(), T.data());
-    checkLastKernel("kRbWallX");
+    kRbWallSide<<<launchBlocks(2 * std::size_t(g.ny) * g.nz), blockSize>>>(
+        g, 0, U.u.data(), U.v.data(), U.w.data(), T.data());
+    checkLastKernel("kRbWallSide x");
     if (oz == 0) return;
-    kRbWallZ<<<launchBlocks(2 * std::size_t(g.nx) * g.ny), blockSize>>>(
-        g, U.u.data(), U.v.data(), U.w.data(), T.data());
-    checkLastKernel("kRbWallZ");
+    kRbWallSide<<<launchBlocks(2 * std::size_t(g.nx) * g.ny), blockSize>>>(
+        g, 2, U.w.data(), U.u.data(), U.v.data(), T.data());
+    checkLastKernel("kRbWallSide z");
 }
 
 void mirrorPressureWalls(const GpuGrid& g, bool closed, DeviceScalar& p)

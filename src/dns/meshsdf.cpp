@@ -87,28 +87,48 @@ std::uint64_t edgeKey(int a, int b)
          | std::uint32_t(std::max(a, b));
 }
 
-} // namespace
-
-MeshSdf::MeshSdf(TriMesh mesh, bool robust)
-    : verts_(std::move(mesh.verts)), robust_(robust)
+// Squared diagonal of the vertex bounding box.
+double diag2Of(const std::vector<A3>& verts)
 {
-    assert(!verts_.empty() && !mesh.tris.empty());
     A3 lo{1e300, 1e300, 1e300}, hi{-1e300, -1e300, -1e300};
-    for (const auto& v : verts_)
+    for (const auto& v : verts)
         for (int a = 0; a < 3; ++a)
         {
             lo[a] = std::min(lo[a], v[a]);
             hi[a] = std::max(hi[a], v[a]);
         }
-    const double diag2 = dot(sub(hi, lo), sub(hi, lo));
+    return dot(sub(hi, lo), sub(hi, lo));
+}
 
-    // Keep only triangles with area (degenerates break normals, add nothing).
+// The one sliver rule: degenerates break normals and add nothing.
+bool hasArea(const std::vector<A3>& verts, const std::array<int, 3>& t,
+             double diag2)
+{
+    const A3 cr = cross(sub(verts[t[1]], verts[t[0]]),
+                        sub(verts[t[2]], verts[t[0]]));
+    return norm(cr) > 1e-14 * diag2;
+}
+
+} // namespace
+
+bool meshHasArea(const TriMesh& mesh)
+{
+    if (mesh.verts.empty()) return false;
+    const double diag2 = diag2Of(mesh.verts);
+    return std::ranges::any_of(mesh.tris, [&](const std::array<int, 3>& t) {
+        return hasArea(mesh.verts, t, diag2);
+    });
+}
+
+MeshSdf::MeshSdf(TriMesh mesh, bool robust)
+    : verts_(std::move(mesh.verts)), robust_(robust)
+{
+    assert(!verts_.empty() && !mesh.tris.empty());
+    const double diag2 = diag2Of(verts_);
+
+    // Keep only triangles with area.
     for (const auto& t : mesh.tris)
-    {
-        const A3 cr = cross(sub(verts_[t[1]], verts_[t[0]]),
-                            sub(verts_[t[2]], verts_[t[0]]));
-        if (norm(cr) > 1e-14 * diag2) tris_.push_back(t);
-    }
+        if (hasArea(verts_, t, diag2)) tris_.push_back(t);
     assert(!tris_.empty());
 
     // Watertight: each directed edge once, its opposite present.

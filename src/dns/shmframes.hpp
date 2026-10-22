@@ -103,6 +103,15 @@ struct ShmHeader
     // ShmVolume[volumeCount], then the float data at the recorded offsets.
 };
 
+// Reader-side bounds on a header: no writer publishes more than this many
+// fields or planes, so a larger count is a corrupt or foreign segment.
+inline constexpr std::int32_t kShmMaxFields = 64;
+inline constexpr std::int32_t kShmMaxPlanes = 16;
+
+// The header's table counts are in range and the field/plane/volume tables
+// fit a mapping of `bytes`: what a reader checks before trusting an offset.
+bool shmTablesFit(const ShmHeader& h, std::size_t bytes);
+
 // The writer side. Owned by RunOutput; one per run.
 class ShmFrames
 {
@@ -150,6 +159,12 @@ public:
     // The name the viewer should open, without the slash.
     static std::string nameFor(const std::string& outPrefix);
 
+    // True when `name` (no slash) is junk to clean up: unreadable, not a dns
+    // frame stream of this version, or published by a process that no longer
+    // exists. A live run's segment is never stale. The ONE rule; the editor
+    // calls it rather than restating it.
+    static bool isStale(const std::string& name);
+
 private:
     void unmapAll();
 
@@ -157,6 +172,7 @@ private:
     unsigned char* base_ = nullptr;
     std::size_t bytes_ = 0;
     int fd_ = -1;
+    std::uint64_t dev_ = 0, ino_ = 0;   // the object create() made
     std::vector<ShmField> fields_;
     std::vector<ShmPlane> planes_;
     ShmVolume volume_{};

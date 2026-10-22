@@ -30,11 +30,14 @@ inline int finish()
     return gFailures ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
-// ctest SKIP_RETURN_CODE convention (no device, missing anchor, ...).
+// ctest SKIP_RETURN_CODE convention (no device, missing anchor, ...): the ONE
+// place the code is spelled.
+inline constexpr int kSkipExitCode = 77;
+
 [[noreturn]] inline void skip(const std::string& why)
 {
     std::printf("SKIP: %s\n", why.c_str());
-    std::exit(77);
+    std::exit(kSkipExitCode);
 }
 
 } // namespace dnstest

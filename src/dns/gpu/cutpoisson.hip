@@ -214,8 +214,8 @@ void DeviceCutPoissonSolver::precondition(const DeviceScalar& r, DeviceScalar& z
 void DeviceCutPoissonSolver::projectMean(DeviceScalar& x)
 {
     double* sum = sc_.data() + 4; // reuse the [sum] slot; result stays on device
-    reduceInto(red_.tmp, g_.size(), FluidSum{cut_->lambda.data(), x.data()},
-               rocprim::plus<double>(), 0.0, sum);
+    record(reduceInto(red_.tmp, g_.size(), FluidSum{cut_->lambda.data(), x.data()},
+                      rocprim::plus<double>(), 0.0, sum));
     kFluidMean<<<1, 1>>>(sum, double(cut_->nFluid), ab_.data() + 2);
     checkLastKernel("fluidMean");
     kSubtractFluidMean<<<launchBlocks(g_.size()), blockSize>>>(
@@ -226,12 +226,23 @@ void DeviceCutPoissonSolver::projectMean(DeviceScalar& x)
 void DeviceCutPoissonSolver::fluidDotInto(const DeviceScalar& a, const DeviceScalar& b,
                                           double* dst)
 {
-    reduceInto(red_.tmp, g_.size(), FluidDot{cut_->lambda.data(), a.data(), b.data()},
-               rocprim::plus<double>(), 0.0, dst);
+    record(reduceInto(red_.tmp, g_.size(),
+                      FluidDot{cut_->lambda.data(), a.data(), b.data()},
+                      rocprim::plus<double>(), 0.0, dst));
 }
 
-int DeviceCutPoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p,
-                                  bool warmStart)
+void DeviceCutPoissonSolver::record(hipError_t e)
+{
+    if (e != hipSuccess && red_.err == hipSuccess) red_.err = e;
+}
+
+hipError_t DeviceCutPoissonSolver::status() const
+{
+    return red_.err != hipSuccess ? red_.err : fft_.status();
+}
+
+PcgResult DeviceCutPoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p,
+                                        bool warmStart)
 {
     assert(rhs.size() == g_.size() && p.size() == g_.size());
     const std::size_t n = g_.size();
@@ -251,11 +262,14 @@ int DeviceCutPoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p,
     checkLastKernel("negate");
     projectMean(t_);
     fluidDotInto(t_, t_, BB);
-    double bb = 0.0;
-    (void)hipMemcpy(&bb, BB, sizeof(double), hipMemcpyDeviceToHost); // once/solve
+    // Every host read starts as NaN: a copy that fails leaves it NaN, and the
+    // finiteness tests below then report a failed solve instead of a value.
+    constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+    double bb = kNaN;
+    record(hipMemcpy(&bb, BB, sizeof(double), hipMemcpyDeviceToHost)); // once/solve
     const double target = tol_ * tol_ * bb;
 
-    if (!warmStart) (void)hipMemset(p.data(), 0, n * sizeof(Real));
+    if (!warmStart) record(hipMemset(p.data(), 0, n * sizeof(Real)));
     else
     {
         projectMean(p);
@@ -268,12 +282,13 @@ int DeviceCutPoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p,
     fluidDotInto(r_, r_, RR);
 
     precondition(r_, z_);
-    (void)hipMemcpy(d_.data(), z_.data(), n * sizeof(Real), hipMemcpyDeviceToDevice);
+    record(hipMemcpy(d_.data(), z_.data(), n * sizeof(Real),
+                     hipMemcpyDeviceToDevice));
     fluidDotInto(r_, z_, RZ);
 
-    double rr = 0.0;
-    (void)hipMemcpy(&rr, RR, sizeof(double), hipMemcpyDeviceToHost); // initial guard
-    double chk[2]{}; // [rr, dq] pulled together each iteration (one sync)
+    double rr = kNaN;
+    record(hipMemcpy(&rr, RR, sizeof(double), hipMemcpyDeviceToHost)); // initial guard
+    double chk[2]{kNaN, kNaN}; // [rr, dq] pulled together each iteration (one sync)
 
     // NaN compares false against everything, so `rr > target` alone would exit
     // the loop at iteration 0 and report a perfect solve on a field that has
@@ -293,7 +308,7 @@ int DeviceCutPoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p,
     // 128^3: 52 -> 56 pcg/step, 58.0 -> 60.6 ms/step). Do not re-try it without
     // first making a CG iteration cheap.
     int it = 0;
-    if (!std::isfinite(rr)) return maxIters_;
+    if (!std::isfinite(rr)) return {maxIters_, false, false};
     for (; it < maxIters_ && std::isfinite(rr) && rr > target; ++it)
     {
         // projectMean(q_) is load-bearing in FP32: M(d) telescopes to a zero
@@ -310,10 +325,14 @@ int DeviceCutPoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p,
         checkLastKernel("cgUpdate");
         fluidDotInto(r_, r_, RR);
         // Single host round-trip: RR and DQ are the contiguous slots [0],[1].
-        (void)hipMemcpy(chk, RR, 2 * sizeof(double), hipMemcpyDeviceToHost);
+        chk[0] = chk[1] = kNaN;
+        record(hipMemcpy(chk, RR, 2 * sizeof(double), hipMemcpyDeviceToHost));
         rr = chk[0];
-        if (!std::isfinite(rr)) return maxIters_;              // diverged
-        if (rr <= target || chk[1] <= 0.0) { ++it; break; } // converged / breakdown
+        if (!std::isfinite(rr)) return {maxIters_, false, false}; // diverged
+        // Converged, or a breakdown (dq <= 0): the loop stops either way, and
+        // the verdict below says which -- a breakdown above target is NOT a
+        // converged solve.
+        if (rr <= target || chk[1] <= 0.0) { ++it; break; }
         precondition(r_, z_);
         fluidDotInto(r_, z_, RZN);
         kBeta<<<1, 1>>>(RZ, RZN, ab_.data() + 1);    // beta=rzNew/rz, then rz<-rzNew
@@ -323,7 +342,7 @@ int DeviceCutPoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p,
         checkLastKernel("cgDirection");
     }
     projectMean(p);
-    return it;
+    return {it, rr <= target, true};
 }
 
 int projectCut(const GpuGrid& g, const DeviceCutGeometry& cut,
@@ -332,7 +351,7 @@ int projectCut(const GpuGrid& g, const DeviceCutGeometry& cut,
 {
     assert(dt > 0);
     divergenceCut(g, cut, U, s.div, Real(1) / dt);
-    const int it = poisson.solve(s.div, s.phi, true);
+    const int it = poisson.solve(s.div, s.phi, true).iters;
     subtractGradientCut(g, cut, s.phi, dt, U);
     maskSolidFaces(g, cut, U);
     return it;

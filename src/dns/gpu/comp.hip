@@ -275,6 +275,9 @@ struct WavePerDtCurv
         mrfCellVel(mrf, g, c, ur);
         const double sp = sqrt(ur[0] * ur[0] + ur[1] * ur[1] + ur[2] * ur[2])
                         + sqrt(gamma * q.p / q.rho);
+        // A non-finite cell is +inf to the max-reduction, never dropped: a
+        // comparison against NaN is false, and the bound would read finite.
+        if (!isfinite(sp)) return HUGE_VAL;
         double m = sp * double(ax[c] > ay[c] ? ax[c] : ay[c]);
         if (az && sp * az[c] > m) m = sp * az[c];
         return m;
@@ -296,6 +299,8 @@ struct WavePerDt
         double m = (fabs(ur[0]) + cs) * ihx;
         const double wy = (fabs(ur[1]) + cs) * ihy;
         const double wz = (fabs(ur[2]) + cs) * ihz;
+        // Every term is tested, not the max: `wy > m` is false for a NaN wy.
+        if (!isfinite(m + wy + wz)) return HUGE_VAL;
         if (wy > m) m = wy;
         if (wz > m) m = wz;
         return m;
@@ -318,7 +323,8 @@ struct MaxT
     __host__ __device__ double operator()(int c) const
     {
         const auto q = cellPrim(rho, mx, my, mz, E, gamma, c);
-        return q.p / (q.rho * Rgas);
+        const double T = q.p / (q.rho * Rgas);
+        return isfinite(T) ? T : HUGE_VAL;   // never dropped by the max
     }
 };
 
@@ -347,7 +353,8 @@ struct SmagMax
             for (int d = 0; d < 3; ++d)
                 gd[cc][d] = (vel(int(c + o.p[d]), cc) -
                              vel(int(c + o.m[d]), cc)) * inv[d];
-        return double(rho[c]) * smagCd * sgsRate(sigma, gd);
+        const double nut = double(rho[c]) * smagCd * sgsRate(sigma, gd);
+        return isfinite(nut) ? nut : HUGE_VAL;   // never dropped by the max
     }
 };
 
@@ -377,24 +384,10 @@ struct SmagMaxCurv
                           },
                           gd);
         const double cd = cs2 * double(curvDelta2(g, m.invVol[c]));
-        return double(rho[c]) * cd * sgsRate(sigma, gd);
+        const double nut = double(rho[c]) * cd * sgsRate(sigma, gd);
+        return isfinite(nut) ? nut : HUGE_VAL;   // never dropped by the max
     }
 };
-
-// Local copy of the reduction driver (reductions.hip keeps its own private).
-
-hipError_t copyOne(DeviceScalar& dst, const std::vector<double>& src, bool up,
-                   std::vector<double>* down)
-{
-    std::vector<Real> tmp(dst.size());
-    if (up) {
-        for (std::size_t i = 0; i < tmp.size(); ++i) tmp[i] = Real(src[i]);
-        return dst.upload(tmp.data());
-    }
-    if (auto e = dst.download(tmp.data()); e != hipSuccess) return e;
-    for (std::size_t i = 0; i < tmp.size(); ++i) (*down)[i] = tmp[i];
-    return hipSuccess;
-}
 
 // Galilean x-boost by du: (rho, m, E) -> (rho, mx + rho du, E + mx du +
 // rho du^2 / 2). Exact frame change -- creates no divergence, no vorticity,
@@ -422,13 +415,9 @@ void boostX(const GpuGrid& g, DeviceCompState& s, double du)
 std::expected<DeviceCurv, hipError_t> DeviceCurv::make(const CurvMetrics& m)
 {
     const std::size_t n = m.vol.size();
-    std::vector<Real> tmp(n);
-    auto up = [&](DeviceScalar& dst,
-                  const std::vector<double>& src) -> hipError_t {
-        auto b = DeviceScalar::make(n);
+    auto up = [](DeviceScalar& dst, const std::vector<double>& src) -> hipError_t {
+        auto b = makeNarrow(src);
         if (!b) return b.error();
-        for (std::size_t i = 0; i < n; ++i) tmp[i] = Real(src[i]);
-        if (auto e = b->upload(tmp.data()); e != hipSuccess) return e;
         dst = std::move(*b);
         return hipSuccess;
     };
@@ -463,21 +452,20 @@ std::expected<DeviceCompState, hipError_t> DeviceCompState::make(std::size_t n)
 
 hipError_t DeviceCompState::upload(const CompState& h)
 {
-    if (auto e = copyOne(rho, h.rho, true, nullptr); e != hipSuccess) return e;
-    if (auto e = copyOne(mx, h.mx, true, nullptr); e != hipSuccess) return e;
-    if (auto e = copyOne(my, h.my, true, nullptr); e != hipSuccess) return e;
-    if (auto e = copyOne(mz, h.mz, true, nullptr); e != hipSuccess) return e;
-    return copyOne(E, h.E, true, nullptr);
+    if (auto e = uploadNarrow(h.rho, rho); e != hipSuccess) return e;
+    if (auto e = uploadNarrow(h.mx, mx); e != hipSuccess) return e;
+    if (auto e = uploadNarrow(h.my, my); e != hipSuccess) return e;
+    if (auto e = uploadNarrow(h.mz, mz); e != hipSuccess) return e;
+    return uploadNarrow(h.E, E);
 }
 
 hipError_t DeviceCompState::download(CompState& h) const
 {
-    auto& self = const_cast<DeviceCompState&>(*this);
-    if (auto e = copyOne(self.rho, {}, false, &h.rho); e != hipSuccess) return e;
-    if (auto e = copyOne(self.mx, {}, false, &h.mx); e != hipSuccess) return e;
-    if (auto e = copyOne(self.my, {}, false, &h.my); e != hipSuccess) return e;
-    if (auto e = copyOne(self.mz, {}, false, &h.mz); e != hipSuccess) return e;
-    return copyOne(self.E, {}, false, &h.E);
+    if (auto e = downloadWiden(rho, h.rho); e != hipSuccess) return e;
+    if (auto e = downloadWiden(mx, h.mx); e != hipSuccess) return e;
+    if (auto e = downloadWiden(my, h.my); e != hipSuccess) return e;
+    if (auto e = downloadWiden(mz, h.mz); e != hipSuccess) return e;
+    return downloadWiden(E, h.E);
 }
 
 std::expected<DeviceComp, hipError_t> DeviceComp::make(const Grid& g,

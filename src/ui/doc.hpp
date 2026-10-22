@@ -184,13 +184,7 @@ std::string sceneTomlOf(const DocState&);
 // panel (what to show) and toRaw/commandLine (what to emit) -- so a dimple
 // count left over from a cylinder cannot ride along to a cube, and the panel
 // cannot offer a knob the solver would reject.
-struct BodyOpts
-{
-    bool aspect = false;   // --aspect
-    bool dimples = false;  // --dimples
-    bool bumps = false;    // --bumps, --bump-h
-    bool mesh = false;     // --scale, --robust
-};
+using BodyOpts = dns::BodyOptions;   // the validator's table (dns/config.hpp)
 BodyOpts bodyOptions(int bodyKind);
 
 // The solver's own enum spellings (dns/config.hpp), indexed by the enum
@@ -208,7 +202,7 @@ int farNameCount();
 // tunnel, floor needs closed y walls) are NOT encoded here -- those stay the
 // validator's to report, because duplicating them is how a second, drifting
 // opinion gets born.
-std::span<const int> farForPhysics(int physics);
+std::vector<int> farForPhysics(int physics);
 // A valid far index for `physics`, preferring `current` when it is already
 // legal. Compressible falls back to nscbc, never sponge (CLAUDE.md: sponge is
 // never a default, anywhere).

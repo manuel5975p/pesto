@@ -313,13 +313,7 @@ std::expected<double, std::string> Comp::stableDt(const CompState& s,
     }
     double dt = cfl / wmax;
     if (tr.muRef > 0.0) {
-        double h;
-        if (curv) {
-            h = curv->hmin;
-        } else {
-            h = std::min(g.hx, g.hy);
-            if (g.nz > 1) h = std::min(h, g.hz);
-        }
+        const double h = curv ? curv->hmin : hMin(g);
         // Thermal diffusivity gamma nu / Pr binds before the momentum one for
         // air; mu(T) is monotone, so its field max is mu(Tmax). Both mirror
         // gpu/comp.hip exactly -- test_gpu_comp pins the parity.

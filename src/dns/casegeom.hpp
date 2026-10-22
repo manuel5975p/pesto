@@ -35,9 +35,10 @@ struct CaseGeometry
     std::array<double, 6> bbox{};
     bool hasBbox = false;
 
-    // Scenes only: per-object world boxes for the per-object force tallies,
-    // and whether every object spans the full z extent (z-invariant scene).
+    // Scenes only: per-object world boxes for the per-object force tallies.
     std::vector<std::pair<std::string, std::array<double, 6>>> objectBoxes;
+    // The body spans the full z extent: the z-invariant kinds (cylinder,
+    // lens, fence, floor) and a scene whose every object does.
     bool zSpans = false;
 };
 

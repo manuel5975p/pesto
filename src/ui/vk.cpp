@@ -421,8 +421,16 @@ void Vk::destroySwapchain()
 
 bool Vk::beginFrame(const float clear[4])
 {
+    if (deviceLost_) return false;
     Frame& f = frames_[frame_];
-    vkWaitForFences(dev_, 1, &f.done, VK_TRUE, UINT64_MAX);
+    // Bounded: a fence that never signals is a hung or lost device, and an
+    // infinite wait would freeze the window instead of letting the app quit.
+    const VkResult w = vkWaitForFences(dev_, 1, &f.done, VK_TRUE, kFenceTimeoutNs);
+    if (w == VK_TIMEOUT) return false;   // skip this frame, try again
+    if (w != VK_SUCCESS) {
+        deviceLost_ = true;
+        return false;
+    }
 
     if (swapchainDirty_ || !swapchain_) {
         vkDeviceWaitIdle(dev_);
@@ -439,15 +447,26 @@ bool Vk::beginFrame(const float clear[4])
         swapchainDirty_ = true;
         return false;
     }
+    if (acq == VK_ERROR_DEVICE_LOST) {
+        deviceLost_ = true;
+        return false;
+    }
     if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) return false;
 
-    vkResetFences(dev_, 1, &f.done);
+    // The fence is NOT reset here: a frame abandoned between here and the
+    // submit would leave it unsignaled forever, and the next wait on it would
+    // never return. endFrame() resets it immediately before the submit.
     vkResetCommandBuffer(f.cmd, 0);
 
     VkCommandBufferBeginInfo bi{};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(f.cmd, &bi);
+    if (vkBeginCommandBuffer(f.cmd, &bi) != VK_SUCCESS) {
+        // The acquired image's semaphore is now signaled with no submit to
+        // consume it; there is no safe way to continue on this device.
+        deviceLost_ = true;
+        return false;
+    }
 
     VkClearValue cv[3]{};
     cv[0].color = {{clear[0], clear[1], clear[2], clear[3]}};
@@ -478,7 +497,10 @@ void Vk::endFrame()
     frameOpen_ = false;
     Frame& f = frames_[frame_];
     vkCmdEndRenderPass(f.cmd);
-    vkEndCommandBuffer(f.cmd);
+    if (vkEndCommandBuffer(f.cmd) != VK_SUCCESS) {
+        deviceLost_ = true;
+        return;
+    }
 
     const VkPipelineStageFlags wait = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo si{};
@@ -490,7 +512,13 @@ void Vk::endFrame()
     si.pCommandBuffers = &f.cmd;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &renderDone_[imageIndex_];
-    vkQueueSubmit(queue_, 1, &si, f.done);
+    // Reset only now, with the submit that will signal it next: no path can
+    // leave the fence unsignaled any more (see beginFrame).
+    vkResetFences(dev_, 1, &f.done);
+    if (vkQueueSubmit(queue_, 1, &si, f.done) != VK_SUCCESS) {
+        deviceLost_ = true;
+        return;
+    }
 
     VkPresentInfoKHR pi{};
     pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -502,6 +530,8 @@ void Vk::endFrame()
     const VkResult pr = vkQueuePresentKHR(queue_, &pi);
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR)
         swapchainDirty_ = true;
+    else if (pr == VK_ERROR_DEVICE_LOST)
+        deviceLost_ = true;
 
     frame_ = (frame_ + 1) % framesInFlight;
 }
@@ -633,7 +663,11 @@ std::expected<void, std::string> Vk::uploadCoverage(Texture& t, const uint8_t* p
     VkCommandBufferBeginInfo bi{};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cb, &bi);
+    if (vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) {
+        vkFreeCommandBuffers(dev_, uploadPool_, 1, &cb);
+        destroy(*stage);
+        return std::unexpected("vkBeginCommandBuffer (texture upload) failed");
+    }
 
     auto barrier = [&](VkImageLayout from, VkImageLayout to, VkAccessFlags srcA,
                        VkAccessFlags dstA, VkPipelineStageFlags srcS,
@@ -662,17 +696,21 @@ std::expected<void, std::string> Vk::uploadCoverage(Texture& t, const uint8_t* p
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
             VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-    vkEndCommandBuffer(cb);
+    VkResult r = vkEndCommandBuffer(cb);
 
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cb;
-    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue_);
+    if (r == VK_SUCCESS) r = vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+    if (r == VK_SUCCESS) r = vkQueueWaitIdle(queue_);
 
     vkFreeCommandBuffers(dev_, uploadPool_, 1, &cb);
     destroy(*stage);
+    if (r == VK_ERROR_DEVICE_LOST) deviceLost_ = true;
+    if (r != VK_SUCCESS)
+        return std::unexpected("texture upload failed (VkResult "
+                               + std::to_string(int(r)) + ")");
     return {};
 }
 

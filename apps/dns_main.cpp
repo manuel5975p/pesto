@@ -25,6 +25,7 @@
 #include "dns/scene.hpp"
 #include "dns/taylor_green.hpp"
 #include "dns/timestepper.hpp"
+#include "dns/transport.hpp"
 #include "dns/trimesh.hpp"
 #include "dns/units.hpp"
 #include "dns/vtk_writer.hpp"
@@ -65,7 +66,8 @@ using std::numbers::pi;
 
 // Exit codes: 0 ok, 1 CLI, 2 config, 3 input, 4 output, 5 no GPU, 6 resource,
 // 7 numerical failure, 8 solver non-convergence.
-constexpr int exitInput = 3, exitOutput = 4, exitNoGpu = 5, exitResource = 6;
+constexpr int exitInput = 3, exitOutput = 4, exitNoGpu = 5, exitResource = 6,
+              exitNumerical = 7;
 
 int die(int code, const std::string& msg)
 {
@@ -73,22 +75,13 @@ int die(int code, const std::string& msg)
     return code;
 }
 
-// The three centre-plane indices every frame geometry cuts on, plus the body
-// scale the web plane offsets are quoted in. nz/2 is already 0 at nz == 1, so
-// the 2D case needs no special value.
-void centrePlanes(FrameGeometry& fg, const Grid& g, double D)
-{
-    fg.ic = g.nx / 2;
-    fg.jc = g.ny / 2;
-    fg.kc = g.nz / 2;
-    fg.D = D;
-}
-
-// The line every run ends with. Returns the process exit code, so a runner's
-// tail is `return reportDone(...)`.
+// The end of every run: the sink's checked close (a write failure anywhere in
+// the run is exit 4 here, never a silent 0), then the line every run ends with.
+// Returns the process exit code, so a runner's tail is `return reportDone(...)`.
 template <class Stats>
-int reportDone(const Stats& st, const RunOutput& out)
+int reportDone(const Stats& st, RunOutput& out)
 {
+    if (auto e = out.finish(); !e) return die(exitOutput, e.error());
     std::printf("done: %ld steps, %d frames, %.2f ms/step\n", st.steps,
                 out.frames(), st.msPerStep);
     return 0;
@@ -124,6 +117,33 @@ bool haveGpu(const Case&) { return false; }
 #endif
 
 #if DNS_WITH_GPU
+
+// --- flow: compressible freestream -----------------------------------------
+
+// Box units of both compressible body runs (Cartesian and O-grid): rho = u =
+// R = 1 and p from the Mach number.
+constexpr double kRhoInf = 1.0;
+
+struct Freestream
+{
+    double pInf, mu, Tinf;
+    Transport gas;
+};
+
+// The freestream state and gas of a compressible body run on diameter D. Tinf
+// is the box-unit temperature T = p / (rho R) = 1 / (gamma M^2): the reference
+// the viscosity law and the wall ratio are measured against, and the
+// dimensional anchor --tinf maps onto (dns/transport.hpp).
+Freestream compFreestream(const Case& c, double D)
+{
+    const double gamma = kGammaAir, rhoInf = kRhoInf, Rgas = kRgasBox;
+    const double pInf = rhoInf * c.uInf * c.uInf / (gamma * c.mach * c.mach);
+    const double mu = rhoInf * c.uInf * D / c.re;
+    const double Tinf = pInf / (rhoInf * Rgas);
+    return {pInf, mu, Tinf,
+            Transport::air(mu, Tinf, c.tinfK, c.prandtl, gamma, Rgas,
+                           c.sutherland)};
+}
 
 // --- flow: incompressible --------------------------------------------------
 
@@ -179,16 +199,17 @@ int runFlowIncompressible(const Case& c, CaseGeometry& geo,
     else incompressibleBodyIC(c, geo, U);
 
     // Phase 3c: everything the run will write is created and checked now.
-    FrameGeometry fg;
+    // The written window is the interior: the ghost ring never reaches a frame.
+    const auto gg = gpu::GpuGrid::from(g);
+    FrameGeometry fg = FrameGeometry::centred(g, geo.D);
     fg.mask.assign(g.size(), 1.0f);
     for (std::size_t q = 0; q < g.size(); ++q) fg.mask[q] = float(geo.cut.lambda[q]);
-    centrePlanes(fg, g, geo.D);
     fg.i0 = 1;
     fg.j0 = 1;
-    fg.k0 = g.nz == 1 ? 0 : 1;
+    fg.k0 = gg.kInLo();
     fg.w = g.nx - 2;
     fg.h = g.ny - 2;
-    fg.d = g.nz == 1 ? 1 : g.nz - 2;
+    fg.d = gg.kInCount();
 
     const auto oc = outputConfig(
         c, std::format("{{\"app\":\"dns\",\"re\":{}", c.re), suppressOutput);
@@ -228,14 +249,11 @@ int runFlowIncompressible(const Case& c, CaseGeometry& geo,
     rr.floorRows = floorRows;
     rr.floorFrac = floorFrac;
 
-    const auto gg = gpu::GpuGrid::from(g);
     rr.box = c.bodyKind == BodyKind::Scene
                  ? gpu::bodyBox(gg, geo.bbox)
                  : gpu::bodyBox(gg, c.placement.cx, c.placement.cy,
                                 c.placement.cz, 0.5 * geo.D);
-    if (g.nz == 1 || c.bodyKind == BodyKind::Cylinder || c.bodyKind == BodyKind::Lens
-        || c.bodyKind == BodyKind::Fence || c.bodyKind == BodyKind::Floor
-        || (c.bodyKind == BodyKind::Scene && geo.zSpans))
+    if (g.nz == 1 || geo.zSpans)
     {   // z-invariant bodies span the whole interior in z.
         rr.box.k0 = gg.kInLo();
         rr.box.k1 = gg.kInHi();
@@ -291,12 +309,10 @@ int runFlowIncompressible(const Case& c, CaseGeometry& geo,
 int runFlowOGrid(const Case& c, CaseGeometry& geo)
 {
     const auto& g = c.grid;
-    const double gamma = 1.4, rhoInf = 1.0, Rgas = 1.0;
-    const double pInf = rhoInf * c.uInf * c.uInf / (gamma * c.mach * c.mach);
-    const double mu = rhoInf * c.uInf * geo.D / c.re;
-    const double Tinf = pInf / (rhoInf * Rgas);
-    const Transport gas = Transport::air(mu, Tinf, c.tinfK, c.prandtl, gamma,
-                                         Rgas, c.sutherland);
+    const double gamma = kGammaAir, rhoInf = kRhoInf;
+    const Freestream fs = compFreestream(c, geo.D);
+    const double pInf = fs.pInf, Tinf = fs.Tinf;
+    const Transport& gas = fs.gas;
 
     const OGridSpec spec{.cx = c.placement.cx,
                          .cy = c.placement.cy,
@@ -315,9 +331,8 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
     // Frames are the index-space raster of the annulus (runner_ogrid.hpp says
     // why), so the render grid IS the logical grid and there is no mask: every
     // cell is fluid.
-    FrameGeometry fg;
+    FrameGeometry fg = FrameGeometry::centred(g, geo.D);
     fg.mask.assign(g.size(), 1.0f);
-    centrePlanes(fg, g, geo.D);
 
     const auto oc = outputConfig(
         c, std::format("{{\"app\":\"dns\",\"re\":{},\"mach\":{}", c.re,
@@ -365,7 +380,7 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
 
     const auto res = gpu::runOGrid(g, *og, ic, rr, *out);
     if (!res) return die(res.error().code, res.error().message);
-    (void)out->setMsPerStep(res->msPerStep);
+    if (auto e = out->finish(); !e) return die(exitOutput, e.error());
     std::printf("done: %ld steps, cd=%.4f cl=%.4f\n", res->steps, res->cd,
                 res->cl);
     return 0;
@@ -374,31 +389,17 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
 int runFlowCompressible(const Case& c, CaseGeometry& geo)
 {
     const auto& g = c.grid;
-    const double gamma = 1.4, rhoInf = 1.0, Rgas = 1.0;
-    const double pInf = rhoInf * c.uInf * c.uInf / (gamma * c.mach * c.mach);
-    const double mu = rhoInf * c.uInf * geo.D / c.re;
-    // Box-unit freestream temperature: T = p / (rho R) = 1 / (gamma M^2). It
-    // is the reference the viscosity law and the wall ratio are measured
-    // against, and the dimensional anchor --tinf maps onto (dns/transport.hpp).
-    const double Tinf = pInf / (rhoInf * Rgas);
-    const Transport gas = Transport::air(mu, Tinf, c.tinfK, c.prandtl, gamma,
-                                         Rgas, c.sutherland);
+    const double gamma = kGammaAir, rhoInf = kRhoInf;
+    const Freestream fs = compFreestream(c, geo.D);
+    const double pInf = fs.pInf, Tinf = fs.Tinf;
+    const Transport& gas = fs.gas;
 
     // Frontal area / reference dynamic pressure (used for qRef ONLY, never for
     // the solve -- the compressible body is the sharp ghost wall). One
     // definition, in the geometry layer; see geometry.hpp for why REFERENCE
     // spacings are the correct weights even under --focal (measured).
-    const double axisL[3] = {double(g.nx) * g.hx, double(g.ny) * g.hy,
-                             double(g.nz) * g.hz};
-    AxisRemap3 fRemap;
-    {
-        Focal1D* f[3] = {&fRemap.fx, &fRemap.fy, &fRemap.fz};
-        for (int a = 0; a < 3; ++a)
-            *f[a] = c.focalActive && c.focalHi[a] > c.focalLo[a]
-                        ? Focal1D::make(axisL[a], c.focalLo[a], c.focalHi[a],
-                                        c.focalW[a], c.focalRatio)
-                        : Focal1D::identity(axisL[a]);
-    }
+    const AxisRemap3 fRemap = focalRemap(g, c.focalActive, c.focalLo,
+                                         c.focalHi, c.focalW, c.focalRatio);
     ReferenceQ rq;
     if (c.bodyKind != BodyKind::None)
     {
@@ -422,20 +423,11 @@ int runFlowCompressible(const Case& c, CaseGeometry& geo)
     const PhysicalRaster raster = rasterFor(g, fRemap, yRemap);
     const Grid& rg = raster.renderGrid();
 
-    FrameGeometry fg;
+    FrameGeometry fg = FrameGeometry::centred(rg, geo.D);
     fg.mask = raster.apply(mask);
-    centrePlanes(fg, rg, geo.D);
 
     RunMeta rmeta = c.meta;
-    if (raster.active())
-    {
-        rmeta.nx = rg.nx;
-        rmeta.ny = rg.ny;
-        rmeta.nz = rg.nz;
-        rmeta.hx = rg.hx;
-        rmeta.hy = rg.hy;
-        rmeta.hz = rg.hz;
-    }
+    if (raster.active()) rmeta.setGrid(rg);
 
     const auto oc = outputConfig(
         c, std::format("{{\"app\":\"dns\",\"re\":{},\"mach\":{}", c.re, c.mach));
@@ -444,8 +436,6 @@ int runFlowCompressible(const Case& c, CaseGeometry& geo)
 
     gpu::CompRun rr;
     rr.raster = &raster;
-    rr.gamma = gamma;
-    rr.mu = mu;
     rr.tr = gas;
     rr.wallIsothermal = c.bodyIsothermal;
     rr.Twall = c.twallRatio * Tinf;
@@ -506,12 +496,7 @@ int runFlowCompressible(const Case& c, CaseGeometry& geo)
     // and dilation, and `active()` is false unless --rotor-mach was given.
     rr.rotor = c.rotor;
     rr.rotorMrf = c.rotorMrf;
-    rr.hFine = c.focalActive
-        ? (g.nz == 1 ? std::min(c.focalHFine[0], c.focalHFine[1])
-                     : std::min({c.focalHFine[0], c.focalHFine[1],
-                                 c.focalHFine[2]}))
-        : (g.nz == 1 ? std::min(g.hx, g.hy)
-                     : std::min({g.hx, g.hy, g.hz}));
+    rr.hFine = hFine(c);
 
     auto res = gpu::runCompressible(g, host, geo.sdf,
                                     geo.hasBbox ? &geo.bbox : nullptr, rr, *out);
@@ -606,7 +591,7 @@ int runChannel(const Case& c)
         return die(exitNoGpu, "no GPU device (dns channel is GPU-only)");
 #if DNS_WITH_GPU
     const auto& g = c.grid;
-    const double gamma = 1.4, delta = 1.0, rho0 = 1.0;
+    const double gamma = kGammaAir, delta = 1.0, rho0 = 1.0;
     const ChannelStretchY remap{double(g.ny) * g.hy, g.ny, c.stretchBeta,
                                 delta};
 
@@ -615,9 +600,8 @@ int runChannel(const Case& c)
     std::vector<float> mask(g.size(), 1.0f);
     channelIC(c, remap, delta, rho0, gamma, host, mask);
 
-    FrameGeometry fg;
+    FrameGeometry fg = FrameGeometry::centred(g, 2 * delta);
     fg.mask = std::move(mask);
-    centrePlanes(fg, g, 2 * delta);
 
     const auto oc = outputConfig(
         c, std::format("{{\"app\":\"dns\",\"retau\":{},\"mach\":{}",
@@ -657,9 +641,8 @@ int runChannel(const Case& c)
 std::expected<RunOutput, std::string> convOutput(const Case& c,
                                                  std::vector<float> mask)
 {
-    FrameGeometry fg;
+    FrameGeometry fg = FrameGeometry::centred(c.grid, c.convH);
     fg.mask = std::move(mask);
-    centrePlanes(fg, c.grid, c.convH);
     return RunOutput::make(
         outputConfig(c,
                      std::format("{{\"app\":\"dns\",\"rayleigh\":{},"
@@ -674,7 +657,7 @@ int runConv(const Case& c)
         return die(exitNoGpu, "no GPU device (dns conv is GPU-only)");
 #if DNS_WITH_GPU
     const auto& g = c.grid;
-    const double gamma = 1.4;
+    const double gamma = kGammaAir;
 
     // Boussinesq branch: a different model, not a cheaper solver for the same
     // one (gpu/boussinesq.hpp). It shares the case derivation and the artefact
@@ -764,7 +747,11 @@ int runTgv(const Case& c)
         long steps = 0;
         while (t < c.tEnd)
         {
+            if (stopRequested()) break;
             const double dt = ts.suggestDt(U, c.tEnd - t);
+            if (!(dt > 0) || !std::isfinite(dt))
+                return die(exitNumerical, "stable dt is not finite and positive "
+                              "(the state diverged)");
             ts.step(U, dt);
             t += dt;
             ++steps;
@@ -793,13 +780,6 @@ int runTgv(const Case& c)
     auto U = VectorField::zeros(g);
     taylorGreen3D(g, U);
 
-    double kPrev = 0.0, tPrev = 0.0;
-    auto emit = [&](double t, double k, double eps) {
-        const double dkdt = t > tPrev ? -(k - kPrev) / (t - tPrev) : 0.0;
-        std::printf("%.6f,%.10e,%.10e,%.10e\n", t, k, dkdt, eps);
-        kPrev = k;
-        tPrev = t;
-    };
     const double outEvery = 0.1;
 
 #if DNS_WITH_GPU
@@ -812,7 +792,7 @@ int runTgv(const Case& c)
             auto oc = outputConfig(c, "");
             oc.kinds = {Emit::Slices};
             auto o = RunOutput::make(oc, c.meta, g,
-                                     gpu::periodicFrameGeometry(g));
+                                     FrameGeometry::centred(g, 2 * pi));
             if (!o) return die(exitOutput, o.error());
             slices = std::move(*o);
             auto f = gpu::PeriodicFrames::make(g, *slices);
@@ -829,22 +809,29 @@ int runTgv(const Case& c)
         tr.volume = vol;
         auto st = gpu::runTgv3d(g, U, tr, frames ? &*frames : nullptr);
         if (!st) return die(st.error().code, st.error().message);
+        if (slices)
+            if (auto e = slices->finish(); !e) return die(exitOutput, e.error());
         std::fprintf(stderr, "done: %ld steps (%s)\n", st->steps, gpu::backendName);
         return 0;
     }
 #endif
     TimeStepper ts(g, sp);
     std::printf("# 3D TGV n=%d Re=%g cfl=%g backend=cpu\n", g.nx, c.re, c.cfl);
-    std::printf("t,K,dKdt,epsVisc\n");
+    TgvSeries::header();
+    TgvSeries series;
     double t = 0.0, nextOut = 0.0;
     long steps = 0;
     auto probe = [&] {
-        emit(t, kineticEnergy(g, U) / vol, nu * velocityGradientSq(g, U));
+        series.row(t, kineticEnergy(g, U) / vol, nu * velocityGradientSq(g, U));
     };
     while (t < c.tEnd)
     {
+        if (stopRequested()) break;
         if (t >= nextOut) { probe(); nextOut += outEvery; }
         const double dt = ts.suggestDt(U, c.tEnd - t);
+        if (!(dt > 0) || !std::isfinite(dt))
+            return die(exitNumerical, "stable dt is not finite and positive "
+                          "(the state diverged)");
         ts.step(U, dt);
         t += dt;
         ++steps;
@@ -881,13 +868,14 @@ int runHit(const Case& c)
     // a full destination surfaced hours into a run instead of in the first
     // second.
     const auto oc = outputConfig(c, "");
-    auto outOr = RunOutput::make(oc, c.meta, g, gpu::periodicFrameGeometry(g));
+    auto outOr = RunOutput::make(oc, c.meta, g, FrameGeometry::centred(g, 2 * pi));
     if (!outOr) return die(exitOutput, outOr.error());
     RunOutput out = std::move(*outOr);
     const std::string statsCols[] = {"t",   "dt",       "A",        "kPrime",
                                      "uPrime", "epsVisc", "epsInj",  "eta",
                                      "reLambda", "hOverEta", "cfl", "maxDiv"};
-    out.declareSeries("stats", statsCols);
+    if (auto e = out.declareSeries("stats", statsCols); !e)
+        return die(exitOutput, e.error());
 
     std::optional<gpu::PeriodicFrames> frames;
     if (c.emit.contains(Emit::Slices))
@@ -911,6 +899,7 @@ int runHit(const Case& c)
     gpu::RunStats st;
     auto avg = gpu::runHit(g, U, hr, out, frames ? &*frames : nullptr, st);
     if (!avg) return die(avg.error().code, avg.error().message);
+    if (auto e = out.finish(); !e) return die(exitOutput, e.error());
     const long steps = st.steps;
 
     const double uPrime = std::sqrt(2.0 * avg->kPrime / 3.0);
@@ -955,11 +944,33 @@ CompState benchCompState(const Grid& g, const VectorField& U, double gamma,
 // allocation. hipMemGetInfo's absolute "in use" also counts the display server
 // and every other process on the card, which made the reported figure both
 // wrong and machine-dependent.
-double benchVramGiB(std::size_t freeBefore)
+std::optional<double> benchVramGiB(std::size_t freeBefore)
 {
     std::size_t freeB = 0, totalB = 0;
-    (void)hipMemGetInfo(&freeB, &totalB);
+    if (hipMemGetInfo(&freeB, &totalB) != hipSuccess) return std::nullopt;
     return freeBefore > freeB ? double(freeBefore - freeB) / (1 << 30) : 0.0;
+}
+
+// ms per call of `step`, timed over `steps` calls after 3 warm-up calls, each
+// phase closed by a checked synchronization; or the device failure that
+// invalidated the measurement.
+template <class Step>
+std::expected<double, std::string> benchTime(int steps, Step&& step)
+{
+    for (int s = 0; s < 3; ++s) step();   // warm-up (incl. FFT tuning)
+    if (auto e = hipDeviceSynchronize(); e != hipSuccess)
+        return std::unexpected(std::string("warm-up: ") + hipGetErrorString(e));
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int s = 0; s < steps; ++s) step();
+    if (auto e = hipDeviceSynchronize(); e != hipSuccess)
+        return std::unexpected(std::string("timed steps: ") + hipGetErrorString(e));
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count()
+                      / steps;
+    if (auto e = hipGetLastError(); e != hipSuccess)
+        return std::unexpected(std::string("launch: ") + hipGetErrorString(e));
+    return ms;
 }
 
 void benchReport(const Grid& g, const char* what, double ms, double vramGiB)
@@ -979,48 +990,38 @@ int runBench(const Case& c)
     taylorGreen3D(g, U);
     const double dt = 0.2 * (2 * pi / g.nx); // fixed benchmark dt, CFL-ish
     std::size_t freeBefore = 0, totalB = 0;
-    (void)hipMemGetInfo(&freeBefore, &totalB);
+    if (hipMemGetInfo(&freeBefore, &totalB) != hipSuccess)
+        return die(exitResource, "GPU memory query failed");
 
     if (c.physics == Physics::Compressible)
     {
-        constexpr double gamma = 1.4;
+        constexpr double gamma = kGammaAir;
         auto D = gpu::DeviceComp::make(g, gamma, c.nu, c.cs, c.sgsModel);
         auto S = gpu::DeviceCompState::make(g.size());
         if (!D || !S) return die(exitResource, "GPU init failed");
         if (S->upload(benchCompState(g, U, gamma, c.mach)) != hipSuccess)
             return die(exitResource, "GPU upload failed");
-        const double vram = benchVramGiB(freeBefore);
-        for (int s = 0; s < 3; ++s) D->step(*S, gpu::Real(dt)); // warm-up
-        (void)hipDeviceSynchronize();
-
-        const auto t0 = std::chrono::steady_clock::now();
-        for (int s = 0; s < c.steps; ++s) D->step(*S, gpu::Real(dt));
-        (void)hipDeviceSynchronize();
-        const double ms = std::chrono::duration<double, std::milli>(
-                              std::chrono::steady_clock::now() - t0).count()
-                          / c.steps;
-        benchReport(g, c.cs > 0 ? "compressible LES" : "compressible", ms, vram);
+        const auto vram = benchVramGiB(freeBefore);
+        if (!vram) return die(exitResource, "GPU memory query failed");
+        const auto ms =
+            benchTime(c.steps, [&] { D->step(*S, gpu::Real(dt)); });
+        if (!ms) return die(exitResource, "GPU failure in bench " + ms.error());
+        benchReport(g, c.cs > 0 ? "compressible LES" : "compressible", *ms,
+                    *vram);
         return 0;
     }
 
     auto ts = gpu::TimeStepper::make(g, {c.nu, 0.9});
     auto D = gpu::DeviceField::make(g.size());
     if (!ts || !D) return die(exitResource, "GPU init failed");
-    (void)gpu::uploadField(U, *D);
+    if (gpu::uploadField(U, *D) != hipSuccess)
+        return die(exitResource, "GPU upload failed");
     ts->setForcing({0.1, {0, 0, 0}}); // exercise the forcing path too
-    const double vram = benchVramGiB(freeBefore);
-
-    for (int s = 0; s < 3; ++s) ts->step(*D, dt); // warm-up (incl. FFT tuning)
-    (void)hipDeviceSynchronize();
-
-    const auto t0 = std::chrono::steady_clock::now();
-    for (int s = 0; s < c.steps; ++s) ts->step(*D, dt);
-    (void)hipDeviceSynchronize();
-    const double ms = std::chrono::duration<double, std::milli>(
-                          std::chrono::steady_clock::now() - t0)
-                          .count()
-                      / c.steps;
-    benchReport(g, "incompressible", ms, vram);
+    const auto vram = benchVramGiB(freeBefore);
+    if (!vram) return die(exitResource, "GPU memory query failed");
+    const auto ms = benchTime(c.steps, [&] { ts->step(*D, dt); });
+    if (!ms) return die(exitResource, "GPU failure in bench " + ms.error());
+    benchReport(g, "incompressible", *ms, *vram);
     return 0;
 #else
     return exitNoGpu;

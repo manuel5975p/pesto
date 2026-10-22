@@ -14,6 +14,10 @@ struct ReduceScratch
 {
     DeviceBuffer<unsigned char> tmp;
     DeviceBuffer<double> out; // single accumulator
+    // The first failure of any reduction through this scratch since it was
+    // last cleared; a failed reduction itself returns NaN. Read (and cleared)
+    // by the runners' health check, internal/run_loop.hpp deviceHealthy().
+    hipError_t err = hipSuccess;
 
     static std::expected<ReduceScratch, hipError_t> make();
 };

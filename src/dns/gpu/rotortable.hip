@@ -30,37 +30,37 @@ buildRotorTable(const Grid& g, const Rotor& rot,
 
     RotorTable out;
     out.bins.resize(std::size_t(rot.bins));
-    const int nw =
-        threads > 0 ? threads
-                    : std::max(1u, std::thread::hardware_concurrency());
+    // No more workers than bins: an idle worker still builds its own sdf.
+    const int hw = int(std::max(1u, std::thread::hardware_concurrency()));
+    const int nw = std::min(rot.bins, threads > 0 ? threads : hw);
 
     // Bins are handed out atomically rather than sliced, because their cost is
     // not uniform: a blade edge-on to the grid touches far fewer cells than one
     // at 45 degrees, and a static slice would leave workers idle at the end.
     std::atomic<int> next{0};
-    std::vector<std::thread> pool;
-    pool.reserve(std::size_t(nw));
-    for (int w = 0; w < nw; ++w)
-        pool.emplace_back([&] {
-            // One sdf object per worker: the classification is read-only, but
-            // the sdf it reads need not be, so no worker shares one.
-            const GhostSdf sdf = sdfFactory();
-            for (int m = next++; m < rot.bins; m = next++)
-            {
-                const double theta = rotorBinAngle(rot, m);
-                const GhostSdf turned = rotorSdf(rot, sdf, theta);
-                // The wall velocity is a property of the SHAFT, not of the
-                // azimuth: omega x r at a world point is the same whatever
-                // angle the blade has reached, so this closure is bin-free.
-                const GhostWallVelocity uw = [&rot](double x, double y,
-                                                    double z) {
-                    return rotorWallVelocity(rot, {x, y, z});
-                };
-                out.bins[std::size_t(m)] =
-                    classifyCompGhost(g, turned, bbox, remap, &uw);
-            }
-        });
-    for (auto& t : pool) t.join();
+    auto work = [&] {
+        // One sdf object per worker: the classification is read-only, but
+        // the sdf it reads need not be, so no worker shares one.
+        const GhostSdf sdf = sdfFactory();
+        for (int m = next++; m < rot.bins; m = next++)
+        {
+            const double theta = rotorBinAngle(rot, m);
+            const GhostSdf turned = rotorSdf(rot, sdf, theta);
+            // The wall velocity is a property of the SHAFT, not of the
+            // azimuth: omega x r at a world point is the same whatever
+            // angle the blade has reached, so this closure is bin-free.
+            const GhostWallVelocity uw = [&rot](double x, double y, double z) {
+                return rotorWallVelocity(rot, {x, y, z});
+            };
+            out.bins[std::size_t(m)] =
+                classifyCompGhost(g, turned, bbox, remap, &uw);
+        }
+    };
+    {   // jthread joins at scope exit, before `out` is read below.
+        std::vector<std::jthread> pool;
+        pool.reserve(std::size_t(nw));
+        for (int w = 0; w < nw; ++w) pool.emplace_back(work);
+    }
 
     const int s = rotorAxisIndex(rot.axis);
     const int pb = (s + 1) % 3, pc = (s + 2) % 3;

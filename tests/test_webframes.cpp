@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -91,6 +92,32 @@ int main()
 
     auto q1 = loadU16(dir + "/speed_00001.bin", n);
     check(!q1.empty(), "second frame second field present");
+
+    // Non-finite cells: quantized to 0, left out of minmax, and a manifest
+    // value that is not finite is JSON null (there is no NaN literal).
+    {
+        const std::string d2 = "webframes_test_nan";
+        std::filesystem::remove_all(d2);
+        dns::WebFrames nf(d2, w, h, "{}");
+        nf.addField("vort", "diverging", -4.0, 4.0);
+        std::vector<float> v(n, 1.0f);
+        v[0] = std::numeric_limits<float>::quiet_NaN();
+        v[7] = std::numeric_limits<float>::infinity();
+        v[9] = -2.0f;
+        check(nf.writeFrame(std::numeric_limits<double>::quiet_NaN(), {v.data()}),
+              "NaN frame written");
+        const auto qn = loadU16(d2 + "/vort_00000.bin", n);
+        check(!qn.empty() && qn[0] == 0 && qn[7] == 0,
+              "non-finite cells quantize to 0");
+        const std::string mn = slurp(d2 + "/manifest.json");
+        check(mn.find("\"t\":null") != std::string::npos, "NaN time is null");
+        check(mn.find("\"vort\":[-2,1]") != std::string::npos,
+              "minmax over the finite cells only");
+        check(mn.find("nan") == std::string::npos
+                  && mn.find("inf") == std::string::npos,
+              "no NaN/inf token in the manifest");
+        std::filesystem::remove_all(d2);
+    }
 
     std::filesystem::remove_all(dir);
     return dnstest::gFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

@@ -18,8 +18,10 @@
 //   void jacobian(const double X[3], double J[3][3]) const; // J[i][j] = dx_i/dX_j
 #pragma once
 
+#include "dns/grid.hpp"
 #include "dns/hd.hpp"
 
+#include <algorithm>
 #include <math.h>
 
 namespace dns {
@@ -359,6 +361,41 @@ struct AxisRemap3
         J[2][2] = fz.deriv(X[2]);
     }
 };
+
+// The --focal mesh map of grid g, built ONCE here for every caller (the app,
+// the compressible runner, the editor): axis a clusters on [lo, hi] with
+// blend w when active and hi > lo, and is the exact identity otherwise.
+// Host only.
+inline AxisRemap3 focalRemap(const Grid& g, bool active, const double lo[3],
+                             const double hi[3], const double w[3], double ratio)
+{
+    const double axisL[3] = {double(g.nx) * g.hx, double(g.ny) * g.hy,
+                             double(g.nz) * g.hz};
+    AxisRemap3 m;
+    Focal1D* f[3] = {&m.fx, &m.fy, &m.fz};
+    for (int a = 0; a < 3; ++a)
+        *f[a] = active && hi[a] > lo[a]
+                    ? Focal1D::make(axisL[a], lo[a], hi[a], w[a], ratio)
+                    : Focal1D::identity(axisL[a]);
+    return m;
+}
+
+// Largest adjacent-cell growth ratio max(d/prev, prev/d) of the 1D map `map`
+// over the reference cells j0 .. j1-1 of spacing h, seeded with the spacing
+// `prev0` of the cell before j0. One loop for every mesh diagnostic that
+// --dry-run prints. Host only.
+template <class Map>
+double maxAdjacentGrowth(const Map& map, double h, int j0, int j1, double prev0)
+{
+    double growth = 1.0, prev = prev0;
+    for (int j = j0; j < j1; ++j)
+    {
+        const double d = map((j + 1) * h) - map(j * h);
+        growth = std::max(growth, std::max(d / prev, prev / d));
+        prev = d;
+    }
+    return growth;
+}
 
 // --- derived quantities (valid for any PointRemap) ---------------------------
 

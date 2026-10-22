@@ -88,7 +88,7 @@ bool checkOne(const char* title, ui::DocState st, bool wantSurface)
     }
     // A convection cell has no body, so "no cut cells" is the correct state
     // there and only a body case is required to produce them.
-    if (b.nCut == 0 && st.bodyKind != 0 && !st.isConv()) {
+    if (b.nCut == 0 && st.bodyKind != int(dns::BodyKind::None) && !st.isConv()) {
         std::printf("   FAILED: body has no cut cells\n");
         ok = false;
     }
@@ -182,13 +182,24 @@ bool checkCommandRoundTrip(const char* title, const ui::DocState& st)
                 && near(cas->hotPatch, b.cas().hotPatch)
                 && cas->closedSides == b.cas().closedSides
                 && near(cas->tEnd, b.cas().tEnd);
-    else
+    else {
         ok = ok && near(cas->re, b.cas().re)
                 && cas->sutherland == b.cas().sutherland
                 && cas->bodyIsothermal == b.cas().bodyIsothermal
                 && near(cas->twallRatio, b.cas().twallRatio)
                 && cas->nscbcThermalInflow == b.cas().nscbcThermalInflow
-                && cas->tempFrames == b.cas().tempFrames;
+                && cas->tempFrames == b.cas().tempFrames
+                && cas->far == b.cas().far
+                && near(cas->nscbcBeta, b.cas().nscbcBeta)
+                && near(cas->nscbcEtaIn, b.cas().nscbcEtaIn)
+                && cas->nscbcSink == b.cas().nscbcSink
+                && cas->focalActive == b.cas().focalActive;
+        // The resolved --focal plateau: a flag the editor uses but does not
+        // export (wake, pad) moves these by whole diameters.
+        for (int ax = 0; ax < 3; ++ax)
+            ok = ok && near(cas->focalLo[ax], b.cas().focalLo[ax])
+                    && near(cas->focalHi[ax], b.cas().focalHi[ax]);
+    }
     if (!ok)
         std::printf("FAILED: grid %dx%dx%d vs %dx%dx%d  phys %d/%d  re %.6g/%.6g "
                     "Ra %.6g/%.6g patch %.6g/%.6g closed %d/%d "
@@ -366,6 +377,22 @@ bool checkConvCommands()
     thermal.nscbcTinflow = true;
     thermal.tempFrames = true;
     bad += !checkCommandRoundTrip("flow, full thermal", thermal);
+
+    // --focal auto with a NON-default wake and pad: the inspected case uses
+    // both, so the exported command must carry both, or the run's plateau
+    // sits somewhere the picture does not show.
+    ui::DocState focal;
+    focal.physics = 1;
+    focal.n = 256;
+    focal.nz = 1;
+    focal.far = 3;
+    focal.phys.dBody = 1e-4;
+    focal.phys.uInf = 68.6;
+    focal.focalAuto = true;
+    focal.focalBlend = 0.8;
+    focal.focalWake = 3.0;
+    focal.focalPad = 0.5;
+    bad += !checkCommandRoundTrip("flow, --focal auto, wake 3 pad 0.5", focal);
 
     return bad == 0;
 }
@@ -774,6 +801,25 @@ bool checkRunner()
         const std::string err = r.start({"/bin/sh", "-c", "true"}, ".");
         ok(!err.empty(), "a second concurrent run is refused");
         r.stop();
+    }
+
+    {   // Start immediately followed by stop, fifty times: the stop must find
+        // the child's process group even when it lands before the child has
+        // run a single instruction (the parent sets the group too), and
+        // nothing may hang.
+        const auto t0 = std::chrono::steady_clock::now();
+        bool all = true;
+        for (int i = 0; i < 50 && all; ++i) {
+            ui::Runner r;
+            all = r.start({"/bin/sh", "-c", "while true; do sleep 1; done"}, ".")
+                      .empty();
+            r.stop();
+            all = all && !r.running();
+        }
+        const double secs = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - t0).count();
+        ok(all, "start/stop x50 always stops the child");
+        ok(secs < 60.0, "start/stop x50 does not hang");
     }
 
     return bad == 0;
@@ -1570,6 +1616,32 @@ bool checkRunStop()
                     }
                     close(fd);
                 }
+            }
+        }
+    }
+
+    // A segment with a valid magic but a garbage header must be REFUSED at
+    // attach: its counts size every table read that follows.
+    {
+        dns::ShmFrames junk;
+        std::vector<dns::ShmField> f1(1);
+        std::snprintf(f1[0].name, sizeof f1[0].name, "v");
+        if (junk.create("dns_uicorpse", f1, {{2, 0.0f, 4, 4}}, 0, 0, 0)) {
+            const int fd = shm_open("/dns_uicorpse", O_RDWR, 0);
+            if (fd >= 0) {
+                auto* h = static_cast<dns::ShmHeader*>(
+                    mmap(nullptr, sizeof(dns::ShmHeader), PROT_READ | PROT_WRITE,
+                         MAP_SHARED, fd, 0));
+                if (h != MAP_FAILED) {
+                    h->fieldCount = 100000;   // tables far past the mapping
+                    munmap(h, sizeof(dns::ShmHeader));
+                    ui::LiveField lj;
+                    ok(!lj.attach("dns_uicorpse").empty(),
+                       "a garbage segment header fails attach");
+                    ok(ui::LiveField::isStale("dns_uicorpse"),
+                       "a garbage segment header is stale");
+                }
+                close(fd);
             }
         }
     }

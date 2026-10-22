@@ -6,7 +6,7 @@
 // mapping; every time loop is in gpu/runner_*.
 #pragma once
 
-#include "dns/gpu/runner_incomp.hpp"   // RunError, RunStats
+#include "dns/gpu/run_result.hpp"   // RunStats, RunError
 #include "dns/hit_ic.hpp"
 #include "dns/output.hpp"
 

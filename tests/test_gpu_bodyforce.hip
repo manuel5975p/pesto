@@ -17,6 +17,7 @@
 #include "dns/geometry.hpp"
 #include "dns/gpu/bodyforce.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "gpu_test_util.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -29,12 +30,7 @@ using gpu::Real;
 
 namespace {
 
-int failures = 0;
-
-void check(bool ok, const char* what)
-{
-    if (!ok) { std::printf("FAIL: %s\n", what); ++failures; }
-}
+using dnstest::check;
 
 // The pre-recomposition x/y-only friction tally (cylinder:196, eye), verbatim,
 // as the oracle.
@@ -156,7 +152,7 @@ double unifiedCdf(const Grid& g, const gpu::DeviceCutGeometry& cut,
 
 int main()
 {
-    if (!gpu::deviceAvailable()) { std::printf("no HIP device\n"); return 77; }
+    dns::test::requireDeviceOrSkip();
     using std::numbers::pi;
 
     auto red = gpu::ReduceScratch::make();
@@ -239,6 +235,6 @@ int main()
               "accepts a valid box");
     }
 
-    if (failures == 0) std::printf("gpu_bodyforce: ok\n");
-    return failures == 0 ? 0 : 1;
+    if (dnstest::gFailures == 0) std::printf("gpu_bodyforce: ok\n");
+    return dnstest::finish();
 }

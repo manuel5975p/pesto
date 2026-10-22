@@ -4,6 +4,7 @@
 #include "dns/field.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/grid.hpp"
+#include "check.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -13,16 +14,12 @@
 
 namespace dns::test {
 
-inline constexpr int skipExitCode = 77; // ctest SKIP_RETURN_CODE
+inline constexpr int skipExitCode = dnstest::kSkipExitCode;
 
 // Call first in every GPU test's main().
 inline void requireDeviceOrSkip()
 {
-    if (!gpu::deviceAvailable())
-    {
-        std::printf("no HIP device, skipping\n");
-        std::exit(skipExitCode);
-    }
+    if (!gpu::deviceAvailable()) dnstest::skip("no HIP device");
 }
 
 inline VectorField randomField(const Grid& g, unsigned seed)

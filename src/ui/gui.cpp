@@ -573,10 +573,9 @@ bool Gui::dragImpl(std::string_view lbl, double& v, double step, double lo,
         o.maxLen = 32;
         const bool clickAway = in_.lPressed && !hit(box);
         if (editKeys(o) || clickAway) {
-            try {
-                v = std::clamp(std::stod(edit_.buf), lo, hi);
+            if (const auto x = parseNumber(edit_.buf)) {
+                v = std::clamp(*x, lo, hi);
                 changed = true;
-            } catch (...) {
             }
             edit_ = {};
         }

@@ -26,16 +26,9 @@ namespace dns::gpu {
 
 using internal::fail;
 using internal::finishTiming;
+using internal::rampFrac;
 
 namespace {
-
-// Quiet-start freestream schedule: smoothstep 0 -> 1 over [0, ramp].
-double rampFrac(double t, double ramp)
-{
-    if (ramp <= 0 || t >= ramp) return 1.0;
-    const double s = t / ramp;
-    return s * s * (3 - 2 * s);
-}
 
 // Curl of the cell-centred velocity through the O-grid's own metrics: index
 // space central differences contracted with the cell-centre inverse Jacobian
@@ -103,18 +96,11 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
         const double* cs = r.rotor.shaft.data();
         const double tipR = og.rWallMax;
         const double cInf = std::sqrt(r.tr.gamma * r.pInf / r.rhoInf);
-        const double machTip = std::abs(r.rotor.omega) * tipR / cInf;
-        const double machInf = std::abs(r.uInf) / cInf;
-        std::printf("rotor: wall tip radius %.4g (nominal %.4g) -> tip Mach "
-                    "%.3f, +freestream %.3f\n",
-                    tipR, r.rotor.radius, machTip, machTip + machInf);
-        if (machTip + machInf >= 1.0)
-            return fail(2, std::format(
-                "the wall reaches {:.4g} from the shaft, not the nominal "
-                "{:.4g}, so its real tip Mach is {:.3f} and with the "
-                "freestream {:.3f} >= 1. Lower --rotor-mach below {:.3f}",
-                tipR, r.rotor.radius, machTip, machTip + machInf,
-                r.rotor.radius / tipR * (1.0 - machInf) * 0.95));
+        if (auto e = internal::checkTipMach(r.rotor.omega, tipR, r.rotor.radius,
+                                            cInf, std::abs(r.uInf) / cInf,
+                                            "wall tip radius", "wall", "", "");
+            !e)
+            return std::unexpected(e.error());
 
         // Zone: f = 1 over the whole wall (that is what cancels the moving
         // wall's normal flux against the transport correction exactly), the
@@ -176,7 +162,10 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
     // rhs computed on them is discarded and re-derived every stage.
     dev->setStageHook([&](DeviceCompState& s) { wall->apply(s); });
 
-    (void)ds->upload(ic);
+    if (ds->upload(ic) != hipSuccess)
+        return fail(6, "initial condition upload failed");
+    if (auto h = internal::checkDevice("the initial condition"); !h)
+        return std::unexpected(h.error());
     const double u0 = r.ramp > 0 ? 0.0 : r.uInf;
     wall->setFreestream(u0);
     wall->apply(*ds);
@@ -196,10 +185,9 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
                                        "torque", "ct", "cq"}
             : std::vector<std::string>{"t",  "dt",   "cd",  "cl",
                                        "cs", "heat", "wmax"};
-    out.declareSeries("stats", cols);
-    const double rotorN = std::abs(r.rotor.omega) / (2.0 * std::numbers::pi);
-    const double ctDen = r.rhoInf * rotorN * rotorN * std::pow(r.D, 4);
-    const double cqDen = ctDen * r.D;
+    if (auto e = out.declareSeries("stats", cols); !e)
+        return fail(4, e.error());
+    const auto [ctDen, cqDen] = internal::propellerDen(r.rhoInf, r.rotor.omega, r.D);
 
     const float vortScale =
         float(r.curlMax > 0 ? r.curlMax
@@ -218,8 +206,7 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
     auto writeFrame = [&](double t) {
         if (!fs.ensure(g.size(), r.tempFrames ? 3 : 2, true)) return;
         if (r.tempFrames) dev->primitives(*ds);
-        primitiveVelocity(gg, ds->rho, ds->mx, ds->my, ds->mz, fs.u(), fs.v(),
-                          fs.w());
+        fs.centreFromConserved(gg, *ds);
         kOGridCurl<<<launchBlocks(g.size()), blockSize>>>(
             gg, dev->curvTables()->view(), signedWz ? 1 : 0, fs.u().data(),
             fs.v().data(), fs.w().data(), fs.vort().data());
@@ -231,18 +218,15 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
         const FrameField ff[3]{
             {vortName, fs.channel(0), 0, vortScale, signedWz,
              r.vortAsinh && signedWz ? vortScale / 32.0f : 0.0f},
-            r.speedDelta
-                ? FrameField{"dspeed", fs.channel(1), 0, float(0.6 * r.uInf),
-                             true}
-                : FrameField{"speed", fs.channel(1), 0, speedMax, false},
+            internal::speedField(fs.channel(1), r.speedDelta, r.uInf, speedMax),
             {"temp", fs.channel(2), -tempScale, tempScale, true}};
-        internal::FrameScratch::emit(out, t, {ff, r.tempFrames ? 3u : 2u});
+        fs.emit(out, t, {ff, r.tempFrames ? 3u : 2u});
     };
 
     RunStats st;
     double heat = 0.0;
     double t = 0.0;
-    long lastLog = 0;
+    internal::StatsCadence cad{r.statsEvery};
     double dtStab = 0.0;
     int sinceDt = 1 << 30;
     const double span = g.nz > 1 ? g.nz * g.hz : 1.0;
@@ -279,9 +263,11 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
         t += dt;
         ++st.steps;
 
-        if (st.steps - lastLog >= r.statsEvery || t >= r.tEnd)
+        if (cad.due(st.steps, t, r.tEnd))
         {
             const auto F = wall->surface(*dev, *ds);
+            if (auto h = internal::checkDevice("a stats row", &*red); !h)
+                return std::unexpected(h.error());
             st.cd = F.fx / (r.qRef * span);
             st.cl = F.fy / (r.qRef * span);
             st.cs = F.fz / (r.qRef * span);
@@ -295,14 +281,14 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
                                       heat,  wmax, F.fz,  F.tz,
                                       ctDen > 0 ? F.fz / ctDen : 0.0,
                                       cqDen > 0 ? F.tz / cqDen : 0.0};
-                (void)out.row("stats", row);
+                out.row("stats", row);
             }
             else
             {
                 const double row[] = {t, dt, st.cd, st.cl, st.cs, heat, wmax};
-                (void)out.row("stats", row);
+                out.row("stats", row);
             }
-            if (st.steps - lastLog >= 10 * r.statsEvery || t >= r.tEnd)
+            if (cad.printDue(st.steps, t, r.tEnd))
             {
                 if (r.rotor.active())
                     std::printf("t=%.2f/%.2f torque=%+.4e cd=%.3f cl=%+.3f "
@@ -314,12 +300,14 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
                                 t, r.tEnd, st.cd, st.cl, st.cs, heat, wmax,
                                 dt);
                 std::fflush(stdout);
+                cad.printed(st.steps);
             }
-            lastLog = st.steps;
+            cad.logged(st.steps);
         }
         if (out.wantsAnyFrame(t)) writeFrame(t);
     }
-    (void)hipDeviceSynchronize();
+    if (auto h = internal::checkDevice("the end of the run", &*red); !h)
+        return std::unexpected(h.error());
     st.tStop = t;
     finishTiming(st, wall0, out);
     return st;

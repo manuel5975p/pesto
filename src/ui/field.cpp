@@ -117,6 +117,14 @@ std::string LiveField::attach(const std::string& name)
         detach();
         return "live segment is not a dns frame stream (or a different version)";
     }
+    // The magic is written last (after a release), so the header and tables
+    // are complete here; their counts still have to be believed before any
+    // offset is followed.
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (!dns::shmTablesFit(*h, bytes_)) {
+        detach();
+        return "live segment has an out-of-range header";
+    }
     fields_.assign(reinterpret_cast<const dns::ShmField*>(base_ + sizeof(dns::ShmHeader)),
                    reinterpret_cast<const dns::ShmField*>(base_ + sizeof(dns::ShmHeader))
                        + h->fieldCount);
@@ -159,11 +167,7 @@ int LiveField::publisherPid() const { return base_ ? header()->pid : 0; }
 
 bool LiveField::isStale(const std::string& name)
 {
-    LiveField probe;
-    if (!probe.attach(name).empty()) return true;   // unreadable: treat as junk
-    const int pid = probe.publisherPid();
-    if (pid <= 0) return false;
-    return ::kill(pid_t(pid), 0) != 0 && errno == ESRCH;
+    return dns::ShmFrames::isStale(name);
 }
 
 bool LiveField::hasVolume() const
@@ -185,8 +189,8 @@ bool LiveField::poll()
 {
     if (!base_) return false;
     const dns::ShmHeader* h = header();
+    if (!dns::shmTablesFit(*h, bytes_)) return false;   // corrupt: refuse
     const int nf = h->fieldCount;
-    if (nf <= 0) return false;
     const int sel = std::clamp(want_, 0, nf - 1);
     // Frame 0 means the publisher has not written anything yet: the segment
     // exists (it is created before the first step) but holds only zeros.

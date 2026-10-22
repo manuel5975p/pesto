@@ -38,6 +38,30 @@ __host__ __device__ inline bool yGhostPair(const GpuGrid& g, std::size_t t,
     return true;
 }
 
+// The same pair on a wall normal to x (axis 0) or z (axis 2): thread t of a
+// 2 * (face) launch, the face sweeping EVERY index of the other two axes (ghost
+// rows included) -- (j, k) beside a walled i, (i, j) beside a walled k. So a
+// corner ghost is this axis's mirror of a cell an earlier pass already
+// mirrored: the diagonal reflection. Index pair only; the state edit is the
+// caller's physics. Returns false when t is past the end of the launch.
+// Pre: axis is 0 or 2.
+__host__ __device__ inline bool sideGhostPair(const GpuGrid& g, int axis,
+                                              std::size_t t, bool& hi,
+                                              std::size_t& c, std::size_t& s)
+{
+    const int nA = axis == 0 ? g.nx : g.nz;
+    const int nB = axis == 0 ? g.ny : g.nx;   // the two swept axes, B then C
+    const int nC = axis == 0 ? g.nz : g.ny;
+    const std::size_t face = std::size_t(nB) * nC;
+    if (t >= 2 * face) return false;
+    hi = t >= face;
+    const int b = int(t % nB), cc = int((t / nB) % nC);
+    const int a0 = hi ? nA - 1 : 0, a1 = hi ? nA - 2 : 1;
+    c = axis == 0 ? gidx(g, a0, b, cc) : gidx(g, b, cc, a0);
+    s = axis == 0 ? gidx(g, a1, b, cc) : gidx(g, b, cc, a1);
+    return true;
+}
+
 // Adiabatic no-slip: rho and E copied, ALL momentum antimirrored, so every
 // velocity component vanishes at the wall face by symmetry. |m| is unchanged,
 // so the copied E keeps p mirrored -- T0 == T1 and the Fourier flux through

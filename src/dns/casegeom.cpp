@@ -46,6 +46,7 @@ buildCaseGeometry(const Case& c, const Scene* scene)
             out.sdf = sdfOf(cyl);
             out.cut = CutGeometry::make(g, cyl);
         }
+        out.zSpans = true;
         break;
     }
     case BodyKind::Sphere:
@@ -88,6 +89,7 @@ buildCaseGeometry(const Case& c, const Scene* scene)
         if (!r) return std::unexpected(r.error());
         out.cut = std::move(*r);
         out.D = 2.0 * hh;
+        out.zSpans = true;
         break;
     }
     case BodyKind::Fence:
@@ -100,6 +102,7 @@ buildCaseGeometry(const Case& c, const Scene* scene)
         auto r = sampleCut(g, out.sdf, {8, 8, true});
         if (!r) return std::unexpected(r.error());
         out.cut = std::move(*r);
+        out.zSpans = true;
         break;
     }
     case BodyKind::Floor:
@@ -133,6 +136,7 @@ buildCaseGeometry(const Case& c, const Scene* scene)
         auto r = sampleCut(g, out.sdf, {8, 8, true});
         if (!r) return std::unexpected(r.error());
         out.cut = std::move(*r);
+        out.zSpans = true;
         break;
     }
     case BodyKind::Mesh:
@@ -176,6 +180,8 @@ buildCaseGeometry(const Case& c, const Scene* scene)
         out.bbox = {bb.lo[0], bb.lo[1], bb.lo[2], bb.hi[0], bb.hi[1], bb.hi[2]};
         out.hasBbox = true;
 
+        if (!meshHasArea(mesh))
+            return std::unexpected("mesh has no triangle with nonzero area");
         auto sdfp = std::make_shared<MeshSdf>(std::move(mesh), c.robust);
         if (!sdfp->watertight() && !c.robust)
             std::fprintf(stderr, "dns: warning: mesh is not watertight; "

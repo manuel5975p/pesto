@@ -84,8 +84,14 @@ int main()
 
         std::vector<gpu::Real> tmp(rhs.begin(), rhs.end());
         (void)dDiv->upload(tmp.data());
-        const int it = poisson->solve(*dDiv, scr->phi);
-        std::printf("pcg iterations: %d\n", it);
+        const auto pr = poisson->solve(*dDiv, scr->phi);
+        const int it = pr.iters;
+        std::printf("pcg iterations: %d (converged %d)\n", it, int(pr.converged));
+        if (!pr.converged || !pr.finite)
+        {
+            std::printf("FAIL: a healthy solve did not report convergence\n");
+            ok = false;
+        }
         std::vector<gpu::Real> pTmp(g.size());
         (void)scr->phi.download(pTmp.data());
         Scalar p(pTmp.begin(), pTmp.end());
@@ -103,6 +109,35 @@ int main()
         {
             std::printf("FAIL: preconditioner ineffective (%d iterations)\n", it);
             ok = false;
+        }
+    }
+
+    // --- 2b) running out of iterations is NOT convergence ---
+    // A one-iteration cap on a 1e-7 target cannot converge; it used to be
+    // indistinguishable from a solve that did (both just returned the count).
+    {
+        auto capped = gpu::DeviceCutPoissonSolver::make(gg, *dCut, 1, 1e-7);
+        if (!capped)
+        {
+            std::printf("FAIL: capped solver make\n");
+            ok = false;
+        }
+        else
+        {
+            gpu::DeviceScalar p1 = std::move(*gpu::DeviceScalar::make(g.size()));
+            const auto pr = capped->solve(*dDiv, p1);
+            std::printf("maxIters 1: iters %d converged %d finite %d\n", pr.iters,
+                        int(pr.converged), int(pr.finite));
+            if (pr.converged || !pr.finite || pr.iters != 1)
+            {
+                std::printf("FAIL: a capped solve reported convergence\n");
+                ok = false;
+            }
+            if (capped->status() != hipSuccess)
+            {
+                std::printf("FAIL: capped solve recorded a device error\n");
+                ok = false;
+            }
         }
     }
 

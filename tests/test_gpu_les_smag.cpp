@@ -24,6 +24,7 @@
 
 #include "dns/cutcell.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "gpu_test_util.hpp"
 #include "dns/gpu/les.hpp"
 #include "check.hpp"
 
@@ -36,7 +37,6 @@ namespace {
 
 using dnstest::check;
 
-constexpr int skipExitCode = 77;
 
 
 } // namespace
@@ -46,11 +46,7 @@ int main()
     using namespace dns;
     using gpu::Real;
 
-    if (!gpu::deviceAvailable())
-    {
-        std::printf("no HIP device, skipping\n");
-        return skipExitCode;
-    }
+    dns::test::requireDeviceOrSkip();
 
     const int n = 32;
     const auto g = Grid::make(n, n, 1, 1.0, 1.0, 1.0);

@@ -22,14 +22,19 @@
 
 namespace dns {
 
+// The gas constants every compressible path quotes: air's fixed ratio of
+// specific heats, and the box-unit gas constant (R = 1).
+inline constexpr double kGammaAir = 1.4;
+inline constexpr double kRgasBox = 1.0;
+
 struct Transport
 {
     double muRef = 0.0;  // dynamic viscosity at Tref
     double Tref = 1.0;   // reference temperature (box units) == T_inf
     double S = 0.0;      // Sutherland constant, box units; 0 with the law off
     double Pr = 0.72;    // molecular Prandtl number (air)
-    double gamma = 1.4;  // ratio of specific heats
-    double Rgas = 1.0;   // specific gas constant, p = rho R T
+    double gamma = kGammaAir;  // ratio of specific heats
+    double Rgas = kRgasBox;    // specific gas constant, p = rho R T
     bool sutherland = false;
 
     // Sutherland's constant for air, in kelvin.

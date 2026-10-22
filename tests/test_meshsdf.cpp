@@ -10,6 +10,7 @@
 #include "dns/meshsdf.hpp"
 
 #include "mesh_test_util.hpp"
+#include "check.hpp"
 
 #include "dns/cutcell.hpp"
 #include "dns/trimesh.hpp"
@@ -22,8 +23,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <numbers>
+#include <string>
+#include <vector>
 
 using namespace dns;
 
@@ -31,26 +35,14 @@ namespace {
 
 using A3 = std::array<double, 3>;
 
-bool g_ok = true;
-
+// A measured error against its tolerance; NaN fails. Counted by check.hpp.
 void check(const char* what, double err, double tol)
 {
     std::printf("%-34s %.3e (tol %.1e)\n", what, err, tol);
-    if (!(err < tol))
-    {
-        std::printf("FAIL: %s\n", what);
-        g_ok = false;
-    }
+    dnstest::check(err < tol, what);
 }
 
-void require(const char* what, bool cond)
-{
-    if (!cond)
-    {
-        std::printf("FAIL: %s\n", what);
-        g_ok = false;
-    }
-}
+void require(const char* what, bool cond) { dnstest::check(cond, what); }
 
 // Axis-aligned cube [lo,hi]^3 as 12 outward-CCW triangles.
 TriMesh cubeMesh(double lo, double hi)
@@ -242,7 +234,8 @@ int main()
             st.minLambda >= lambdaMin && st.minAperture >= apertureMin);
     {
         const double tol = CutGeometry::openTol;
-        for (int k = 0; k < n && g_ok; ++k)
+        bool cellsOk = true;   // stop scanning at the first broken cell
+        for (int k = 0; k < n && cellsOk; ++k)
             for (int j = 0; j < n; ++j)
                 for (int i = 0; i < n; ++i)
                 {
@@ -253,7 +246,7 @@ int main()
                      || (cut.az[cc] > tol && (solidC || cut.lambda[g.idx(i, j, k - 1)] <= 0.0)))
                     {
                         std::printf("FAIL: open face on solid cell at %d %d %d\n", i, j, k);
-                        g_ok = false;
+                        cellsOk = false;
                     }
                     if (!solidC
                         && !(cut.ax[cc] > tol || cut.ax[g.idx(i + 1, j, k)] > tol
@@ -261,9 +254,11 @@ int main()
                           || cut.az[cc] > tol || cut.az[g.idx(i, j, k + 1)] > tol))
                     {
                         std::printf("FAIL: isolated fluid cell at %d %d %d\n", i, j, k);
-                        g_ok = false;
+                        cellsOk = false;
                     }
                 }
+        require("sanitized cut: no open face on a solid cell, no isolated "
+                "fluid cell", cellsOk);
     }
 
     // --- 5) STL round-trip: binary and ASCII ---
@@ -312,5 +307,66 @@ int main()
         require("loadMesh rejects .obj", !bad.has_value());
     }
 
-    return g_ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    // --- 6) input the MeshSdf preconditions must never meet ---
+    {
+        // All-sliver mesh: MeshSdf would assert; meshHasArea says no first.
+        TriMesh sl;
+        sl.verts = {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}, {3, 1e-30, 0}};
+        sl.tris = {{0, 1, 2}, {1, 2, 3}};
+        require("sliver-only mesh has no area", !meshHasArea(sl));
+        require("cube mesh has area", meshHasArea(cubeMesh(2.0, 4.0)));
+        require("empty mesh has no area", !meshHasArea(TriMesh{}));
+
+        const auto dir = std::filesystem::temp_directory_path();
+        // Binary STL with a NaN vertex: the parser rejects it.
+        const auto nanPath = dir / "dns_meshsdf_nan.stl";
+        {
+            TriMesh m = cubeMesh(2.0, 4.0);
+            m.verts[3][1] = std::numeric_limits<double>::quiet_NaN();
+            writeBinaryStl(nanPath, m);
+        }
+        auto ln = loadMesh(nanPath.string());
+        require("binary STL with a NaN vertex is rejected", !ln.has_value());
+        std::filesystem::remove(nanPath);
+
+        // glTF whose index equals the POSITION count: out of range, rejected
+        // instead of read past id[]. Buffer: 3 float3 positions + 3 u16
+        // indices {0, 1, 3}, embedded as a base64 data URI.
+        std::vector<unsigned char> buf(42, 0);
+        const float pos[9] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+        std::memcpy(buf.data(), pos, sizeof pos);
+        const std::uint16_t idx[3] = {0, 1, 3};
+        std::memcpy(buf.data() + 36, idx, sizeof idx);
+        static const char b64[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string enc;
+        for (std::size_t i = 0; i < buf.size(); i += 3)
+        {
+            const unsigned v = unsigned(buf[i]) << 16
+                             | unsigned(i + 1 < buf.size() ? buf[i + 1] : 0) << 8
+                             | unsigned(i + 2 < buf.size() ? buf[i + 2] : 0);
+            enc += b64[(v >> 18) & 63];
+            enc += b64[(v >> 12) & 63];
+            enc += i + 1 < buf.size() ? b64[(v >> 6) & 63] : '=';
+            enc += i + 2 < buf.size() ? b64[v & 63] : '=';
+        }
+        const auto gltfPath = dir / "dns_meshsdf_badidx.gltf";
+        std::ofstream(gltfPath)
+            << R"({"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],)"
+               R"("nodes":[{"mesh":0}],"meshes":[{"primitives":[{"attributes":)"
+               R"({"POSITION":0},"indices":1}]}],"buffers":[{"byteLength":42,)"
+               R"("uri":"data:application/octet-stream;base64,)" << enc << R"("}],)"
+               R"("bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36},)"
+               R"({"buffer":0,"byteOffset":36,"byteLength":6}],)"
+               R"("accessors":[{"bufferView":0,"componentType":5126,"count":3,)"
+               R"("type":"VEC3"},{"bufferView":1,"componentType":5123,"count":3,)"
+               R"("type":"SCALAR"}]})";
+        auto lg = loadMesh(gltfPath.string());
+        if (!lg) std::printf("gltf bad index: %s\n", lg.error().c_str());
+        require("glTF index == vertex count is rejected",
+                !lg && lg.error() == "gltf: index out of range");
+        std::filesystem::remove(gltfPath);
+    }
+
+    return dnstest::finish();
 }

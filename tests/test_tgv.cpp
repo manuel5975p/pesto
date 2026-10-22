@@ -45,5 +45,24 @@ int main()
     int fails = 0;
     if (e64 > 2e-3) { std::puts("FAIL: error too large"); ++fails; }
     if (order < 1.7) { std::puts("FAIL: not 2nd order"); ++fails; }
+
+    // A diverged (NaN-seeded) field must NOT get a usable dt: std::max(NaN,
+    // diff) used to drop the NaN and hand back dtMax, so `dns tgv` marched a
+    // NaN field to tEnd and exited 0. The caller's `dt > 0` check (exit 7)
+    // relies on this.
+    {
+        const auto g = Grid::make(16, 16, 1, 2 * pi, 2 * pi, 2 * pi / 16);
+        auto U = VectorField::zeros(g);
+        taylorGreen(g, nu, 0.0, U);
+        U.v[g.idx(5, 7, 0)] = std::nan("");
+        TimeStepper ts(g, {.nu = nu, .cfl = 0.4});
+        const double dt = ts.suggestDt(U, 1.0);
+        std::printf("NaN-seeded suggestDt: %g\n", dt);
+        if (dt > 0 && std::isfinite(dt))
+        {
+            std::puts("FAIL: a NaN field got a finite positive dt");
+            ++fails;
+        }
+    }
     return fails == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

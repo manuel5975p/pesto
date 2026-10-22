@@ -8,8 +8,9 @@
 #include "dns/comp.hpp"
 #include "dns/transport.hpp"
 #include "dns/config.hpp"
+#include "dns/cutcell.hpp"
 #include "dns/framemap.hpp"
-#include "dns/gpu/runner_incomp.hpp"   // RunStats, RunError
+#include "dns/gpu/run_result.hpp"   // RunStats, RunError
 #include "dns/output.hpp"
 #include "dns/rotor.hpp"
 #include "dns/sdf.hpp"
@@ -20,12 +21,10 @@ namespace dns::gpu {
 
 struct CompRun
 {
-    double gamma = 1.4;
-    double mu = 0;
-    // The gas. Carries the viscosity law, Pr, R and gamma; `gamma`/`mu` above
-    // stay as the reference values the boundary configs quote. Default-
-    // constructed (constant viscosity) reproduces the pre-thermal solver
-    // bit-for-bit -- dns_main fills it from the validated Case.
+    // The gas. Carries the viscosity law, Pr, R and gamma; `tr.gamma` is the
+    // value the boundary configs quote. Default-constructed (constant
+    // viscosity) reproduces the pre-thermal solver bit-for-bit -- dns_main
+    // fills it from the validated Case.
     Transport tr;
     // Body surface thermal condition. Adiabatic is the historical wall.
     bool wallIsothermal = false;
@@ -73,9 +72,8 @@ struct CompRun
     // interior rows j <= floorRows are fully solid there (the ghost wall
     // owns them; NSCBC must not overwrite their rhs). -1 = no floor.
     int floorRows = -1;
-    int spongeCells = 0;         // 0 = clamp(0.1 nx, 8, nx/2 - 1)
+    int spongeCells = 0;         // resolved by validate(); > 0
     double nscbcBeta = 0.5;      // Yoo-Im transverse correction, in [0,1)
-    bool nscbcBetaAuto = false;  // scale it by the per-cell incidence angle
     double nscbcEtaIn = 100.0;   // inflow relaxation stiffness (> 0)
     double nscbcEtaInShear = -1; // inflow lambda=u rate; < 0 = follow etaIn
     double nscbcEtaLat = 0.05;   // open-lateral incoming relax rate (> 0)

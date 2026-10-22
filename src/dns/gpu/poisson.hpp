@@ -46,6 +46,10 @@ public:
     // NeumannBox mode). rhs/p distinct device buffers of full grid size.
     void solve(const DeviceScalar& rhs, DeviceScalar& p);
 
+    // The first failure (FFT execution or staging copy) of any solve so far;
+    // sticky. hipSuccess = every solve ran.
+    hipError_t status() const;
+
 private:
     struct Impl;
     explicit DevicePoissonSolver(std::unique_ptr<Impl> impl);

@@ -30,7 +30,6 @@ namespace {
 
 using dnstest::check;
 
-constexpr int skipExitCode = 77;
 
 int runDns(const std::string& args)
 {
@@ -145,10 +144,7 @@ int main()
     // would exit 5 and the checks would be meaningless.
     if (runDns("flow --body cylinder --n 32 --nz 1 --ft 0.001 --emit none "
                "--out runner_probe") == 5)
-    {
-        std::printf("no HIP device, skipping\n");
-        return skipExitCode;
-    }
+    dnstest::skip("no HIP device");
     cleanup("runner_probe");
 
     testIncompTunnel();

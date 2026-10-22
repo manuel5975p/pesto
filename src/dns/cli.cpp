@@ -1,10 +1,9 @@
 #include "dns/cli.hpp"
+#include "dns/numparse.hpp"
 
-#define TOML_EXCEPTIONS 0
 #include <tomlplusplus/toml.hpp>
 
 #include <algorithm>
-#include <charconv>
 #include <cstring>
 #include <format>
 #include <initializer_list>
@@ -19,14 +18,9 @@ using std::string;
 using std::string_view;
 
 // --- scalar parsing ---------------------------------------------------------
-// Full-consumption from_chars: "3x" and "" are errors, never a silent default.
-// (The old apps used parseOr/atof, which returned the default on garbage.)
-bool toDouble(string_view s, double& v)
-{
-    if (s.empty()) return false;
-    auto [q, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-    return ec == std::errc{} && q == s.data() + s.size();
-}
+// dns/numparse.hpp: full consumption, finite only. (The old apps used
+// parseOr/atof, which returned the default on garbage.)
+bool toDouble(string_view s, double& v) { return parseDouble(s, v); }
 
 bool toInt(string_view s, int& v)
 {
@@ -51,6 +45,16 @@ struct EnumOpt
     std::vector<std::pair<const char*, int>> values;
     int* target;
 };
+
+// An enum's EnumOpt values straight from its name table (index == value), so
+// the CLI accepts exactly the spellings config.hpp defines, in its order.
+std::vector<std::pair<const char*, int>>
+enumValues(std::span<const char* const> names)
+{
+    std::vector<std::pair<const char*, int>> v;
+    for (std::size_t i = 0; i < names.size(); ++i) v.emplace_back(names[i], int(i));
+    return v;
+}
 
 string joinNames(const std::vector<string>& v)
 {
@@ -92,6 +96,10 @@ Emit emitOf(string_view s, bool& ok)
     return Emit::None;
 }
 
+// The --help texts; defined at the end of this file.
+std::string help(Subcommand);
+std::string helpTop();
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -110,33 +118,30 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     if (sub == "--help" || sub == "-h" || sub == "help")
         return std::unexpected(CliError{helpTop(), true});
 
-    if (sub == "flow") c.sub = Subcommand::Flow;
-    else if (sub == "tgv") c.sub = Subcommand::Tgv;
-    else if (sub == "hit") c.sub = Subcommand::Hit;
-    else if (sub == "bench") c.sub = Subcommand::Bench;
-    else if (sub == "channel") c.sub = Subcommand::Channel;
-    else if (sub == "conv") c.sub = Subcommand::Conv;
-    else
+    const auto sc = subcommandFromName(sub);
+    if (!sc)
         return std::unexpected(CliError{
             "dns: unknown subcommand '" + string(sub) + "'\n"
             "dns: try 'dns --help'\n"});
+    c.sub = *sc;
 
     // Per-subcommand defaults that differ from RawConfig's.
+    // The --out default is the subcommand name, set after the flag loop.
     switch (c.sub)
     {
-    case Subcommand::Flow: c.out = "flow"; c.ft = 20.0; break;
-    case Subcommand::Tgv:  c.out = "tgv";  c.ft = 20.0; c.n = 64; c.nz = 0;
+    case Subcommand::Flow: c.ft = 20.0; break;
+    case Subcommand::Tgv:  c.ft = 20.0; c.n = 64; c.nz = 0;
                            c.re = 1600.0; c.cfl = 0.9; break;
-    case Subcommand::Hit:  c.out = "hit";  c.n = 256; c.nz = 0; break;
-    case Subcommand::Bench: c.out = "bench"; c.n = 256; c.nz = 0; break;
+    case Subcommand::Hit:  c.n = 256; c.nz = 0; break;
+    case Subcommand::Bench: c.n = 256; c.nz = 0; break;
     // KMM Re_tau 180 grid; interior wall-normal cells, spanwise 160.
-    case Subcommand::Channel: c.out = "channel"; c.n = 192; c.ny = 128;
+    case Subcommand::Channel: c.n = 192; c.ny = 128;
                               c.nz = 160; c.physics = Physics::Compressible;
                               c.stretch = 2.0; c.kick = 0.2; c.cfl = 0.4;
                               break;
     // A cube of cells over a layer twice as wide as it is tall, and a trip
     // small enough to leave the conduction state visible before it grows.
-    case Subcommand::Conv: c.out = "conv"; c.n = 128; c.ny = 64; c.nz = 128;
+    case Subcommand::Conv: c.n = 128; c.ny = 64; c.nz = 128;
                            c.physics = Physics::Compressible; c.kick = 0.02;
                            c.cfl = 0.4; c.mach = 0.05; c.tt = 30;
                            c.profileDt = 0.0; break;
@@ -221,29 +226,13 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     };
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench
         || c.sub == Subcommand::Conv)
-        enums.push_back({"--physics",
-                         {{"incompressible", int(Physics::Incompressible)},
-                          {"compressible", int(Physics::Compressible)}},
-                         &physicsSel});
+        enums.push_back({"--physics", enumValues(physicsNames()), &physicsSel});
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench)
-        enums.push_back({"--sgs",
-                         {{"smag", int(SgsModel::Smagorinsky)},
-                          {"sigma", int(SgsModel::Sigma)}},
-                         &sgsSel});
+        enums.push_back({"--sgs", enumValues(sgsModelNames()), &sgsSel});
     if (c.sub == Subcommand::Flow)
     {
-        enums.push_back({"--far",
-                         {{"tunnel", int(FarField::Tunnel)},
-                          {"fringe", int(FarField::Fringe)},
-                          {"sponge", int(FarField::Sponge)},
-                          {"nscbc", int(FarField::Nscbc)},
-                          {"periodic", int(FarField::Periodic)}},
-                         &farSel});
-        enums.push_back({"--nscbc-abc",
-                         {{"yooim", int(NscbcAbc::YooIm)},
-                          {"adaptive", int(NscbcAbc::Adaptive)},
-                          {"modal", int(NscbcAbc::Modal)}},
-                         &abcSel});
+        enums.push_back({"--far", enumValues(farFieldNames()), &farSel});
+        enums.push_back({"--nscbc-abc", enumValues(nscbcAbcNames()), &abcSel});
         enums.push_back({"--rotor-axis",
                          {{"x", 0}, {"y", 1}, {"z", 2}}, &c.rotorAxis});
         enums.push_back({"--rotor-frame",
@@ -444,6 +433,8 @@ std::expected<ConfigTokens, std::string> configTokens(std::string_view toml)
 }
 
 // ---------------------------------------------------------------------------
+
+namespace {
 
 std::string helpTop()
 {
@@ -1137,5 +1128,7 @@ R"(dns bench — step-time and throughput benchmark
     }
     return {};
 }
+
+} // namespace
 
 } // namespace dns::cli

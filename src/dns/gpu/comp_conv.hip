@@ -38,30 +38,16 @@ __global__ void kConvWallY(GpuGrid g, Real gam, Real Rgas, Real Tbot,
 // the drop across THOSE is the experiment.
 //
 // `axis` is 0 for x and 2 for z; the two are one kernel because the state edit
-// is identical and only the pair of indices moves. Runs over every index of the
-// other two axes, so a corner ghost is this axis's mirror of a cell an earlier
-// pass already mirrored: the diagonal reflection.
+// is identical and only the pair of indices moves (internal::sideGhostPair).
+// The edit IS the shared adiabatic no-slip ghost.
 __global__ void kConvWallSide(GpuGrid g, int axis, Real* rho, Real* mx, Real* my,
                               Real* mz, Real* E)
 {
-    const int nA = axis == 0 ? g.nx : g.nz;
-    const int nB = axis == 0 ? g.ny : g.nx;   // the two swept axes, B then C
-    const int nC = axis == 0 ? g.nz : g.ny;
-    const std::size_t face = std::size_t(nB) * nC;
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (t >= 2 * face) return;
-    const bool hi = t >= face;
-    const int b = int(t % nB), cc = int((t / nB) % nC);
-    const int a0 = hi ? nA - 1 : 0, a1 = hi ? nA - 2 : 1;
-    // axis 0: (b, cc) = (j, k) beside the walled i. axis 2: (b, cc) = (i, j).
-    const std::size_t c = axis == 0 ? gidx(g, a0, b, cc) : gidx(g, b, cc, a0);
-    const std::size_t s = axis == 0 ? gidx(g, a1, b, cc) : gidx(g, b, cc, a1);
-
-    rho[c] = rho[s];
-    mx[c] = -mx[s];
-    my[c] = -my[s];
-    mz[c] = -mz[s];
-    E[c] = E[s];
+    bool hi;
+    std::size_t c, s;
+    if (!internal::sideGhostPair(g, axis, t, hi, c, s)) return;
+    internal::adiabaticGhost(c, s, rho, mx, my, mz, E);
 }
 
 // Additive rhs contribution: the stage kernel already wrote the interior
@@ -77,9 +63,7 @@ __global__ void kGravityY(GpuGrid g, int ox, int oz, Real gy, Real cr,
     decompose(g, c, i, j, k);
     // Ghost cells: the wall mirror owns them (the rows always, the lateral
     // columns once that side is a wall).
-    if (j < 1 || j > g.ny - 2) return;
-    if (i < ox || i >= g.nx - ox) return;
-    if (k < oz || k >= g.nz - oz) return;
+    if (!inFluid(g, i, j, k, ox, oz)) return;
     omy[c] -= cr * gy * rho[c];
     oE[c] -= cr * gy * my[c];
 }

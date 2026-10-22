@@ -9,8 +9,9 @@
 
 #include "dns/comp.hpp"
 #include "dns/config.hpp"
-#include "dns/gpu/runner_incomp.hpp" // RunStats, RunError
+#include "dns/gpu/run_result.hpp" // RunStats, RunError
 #include "dns/output.hpp"
+#include "dns/transport.hpp"
 
 #include <expected>
 
@@ -18,7 +19,7 @@ namespace dns::gpu {
 
 struct ChannelRun
 {
-    double gamma = 1.4, Rgas = 1.0;
+    double gamma = kGammaAir, Rgas = kRgasBox;
     double mu = 0;              // = rho nu = 1/reTau in wall units
     double reTau = 180;
     double ubEst = 0;           // log-law bulk-velocity estimate (validate())

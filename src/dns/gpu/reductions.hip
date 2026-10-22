@@ -57,7 +57,9 @@ struct PlainAbs
     const Real* x;
     __host__ __device__ double operator()(int c) const
     {
-        return std::abs(double(x[c]));
+        // Non-finite is +inf: a max-reduction would otherwise drop a NaN.
+        const double a = std::abs(double(x[c]));
+        return isfinite(a) ? a : HUGE_VAL;
     }
 };
 
@@ -97,8 +99,9 @@ struct CourantSum
     double ihx, ihy, ihz;
     __host__ __device__ double operator()(int c) const
     {
-        return fabs(double(u[c])) * ihx + fabs(double(v[c])) * ihy
-             + fabs(double(w[c])) * ihz;
+        const double s = fabs(double(u[c])) * ihx + fabs(double(v[c])) * ihy
+                       + fabs(double(w[c])) * ihz;
+        return isfinite(s) ? s : HUGE_VAL;   // never dropped by the max
     }
 };
 
@@ -119,9 +122,10 @@ struct CourantSumCut
         const double lu = fmax(0.5 * (double(lam[gidx(g, i - 1, j, k)]) + lam[c]), 0.5);
         const double lv = fmax(0.5 * (double(lam[gidx(g, i, j - 1, k)]) + lam[c]), 0.5);
         const double lw = fmax(0.5 * (double(lam[gidx(g, i, j, k - 1)]) + lam[c]), 0.5);
-        return fabs(double(u[c])) * ihx * fmax(1.0, double(ax[c]) / lu)
-             + fabs(double(v[c])) * ihy * fmax(1.0, double(ay[c]) / lv)
-             + fabs(double(w[c])) * ihz * fmax(1.0, double(az[c]) / lw);
+        const double s = fabs(double(u[c])) * ihx * fmax(1.0, double(ax[c]) / lu)
+                       + fabs(double(v[c])) * ihy * fmax(1.0, double(ay[c]) / lv)
+                       + fabs(double(w[c])) * ihz * fmax(1.0, double(az[c]) / lw);
+        return isfinite(s) ? s : HUGE_VAL;   // never dropped by the max
     }
 };
 
@@ -136,7 +140,7 @@ struct AbsDiv
         const double d = (double(u[gidx(g, i + 1, j, k)]) - double(u[c])) / g.hx
                        + (double(v[gidx(g, i, j + 1, k)]) - double(v[c])) / g.hy
                        + (double(w[gidx(g, i, j, k + 1)]) - double(w[c])) / g.hz;
-        return fabs(d);
+        return isfinite(d) ? fabs(d) : HUGE_VAL;   // never dropped by the max
     }
 };
 

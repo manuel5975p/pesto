@@ -1,6 +1,7 @@
 #include "dns/webframes.hpp"
 
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -10,8 +11,10 @@ namespace dns {
 
 namespace {
 
+// JSON has no NaN/Infinity literal; a non-finite value is written as null.
 std::string fmtDouble(double v)
 {
+    if (!std::isfinite(v)) return "null";
     char b[32];
     std::snprintf(b, sizeof b, "%.9g", v);
     return b;
@@ -40,13 +43,24 @@ bool WebFrames::writeQuantized(const std::string& path, const float* data,
     const std::size_t n = std::size_t(w_) * h_;
     std::vector<std::uint16_t> q(n);
     const double s = 65535.0 / (hi - lo);
-    mn = mx = data[0];
+    // A non-finite cell quantizes to 0 and is left out of the min/max, which
+    // are then over the finite cells only (0, 0 when there are none).
+    bool any = false;
+    mn = mx = 0.0f;
     for (std::size_t c = 0; c < n; ++c) {
         const float v = data[c];
+        if (!std::isfinite(v)) {
+            q[c] = 0;
+            continue;
+        }
+        if (!any) {
+            mn = mx = v;
+            any = true;
+        }
         mn = v < mn ? v : mn;
         mx = v > mx ? v : mx;
         double t = (double(v) - lo) * s;
-        t = t < 0.0 ? 0.0 : (t > 65535.0 ? 65535.0 : t);
+        t = !(t > 0.0) ? 0.0 : (t < 65535.0 ? t : 65535.0);
         q[c] = std::uint16_t(t + 0.5);
     }
     std::ofstream f(path, std::ios::binary);
@@ -121,6 +135,8 @@ bool WebFrames::writeManifest() const
         std::ofstream f(tmp, std::ios::binary);
         if (!f) return false;
         f.write(j.data(), std::streamsize(j.size()));
+        // Close first: a buffered ENOSPC only surfaces at close.
+        f.close();
         if (!f) return false;
     }
     std::error_code ec;

@@ -56,7 +56,7 @@ int main()
     std::vector<float> vort(g.size(), 0.5f), speed(g.size(), 1.0f);
     const FrameField ff[2]{{"vort", vort.data(), 0, 8, true},
                            {"speed", speed.data(), 0, 1.6f, false}};
-    const FrameViews fv{ff};
+    const std::span<const FrameField> fv{ff};
 
     // --- 2D: stats + bin + png ---------------------------------------------
     {
@@ -96,9 +96,9 @@ int main()
 
         const std::string cols[] = {"t", "dt", "K", "cd", "cl",
                                     "cdf", "cfl", "maxDiv", "pcgIters"};
-        o->declareSeries("stats", cols);
+        check(o->declareSeries("stats", cols).has_value(), "series declared");
         const double r[] = {0.0, 1e-3, 2.0, 1.5, 0.0, 0.5, 0.4, 1e-9, 7};
-        check(o->row("stats", r).has_value(), "row writes");
+        check(o->row("stats", r), "row writes");
 
         // t = 0, 1, 2, 3: bin every 1.0 => 4 frames; png every 2.0 => 2.
         for (double t = 0; t < 3.5; t += 1.0)
@@ -144,7 +144,7 @@ int main()
         auto o = RunOutput::make(cfg, meta(g3), g3, geo);
         check(o.has_value(), "volume RunOutput::make");
         if (o) {
-            check(o->frame(0.0, FrameViews{f3}).has_value(), "volume frame");
+            check(o->frame(0.0, f3).has_value(), "volume frame");
             check(o->flush().has_value(), "volume flush");
             check(fileSize("v_curl.bin") == g3.size() * 4, "volume is the full grid");
         }
@@ -153,12 +153,87 @@ int main()
         cfg.kinds = {Emit::Slices};
         auto o2 = RunOutput::make(cfg, meta(g3), g3, geo);
         if (o2) {
-            check(o2->frame(0.0, FrameViews{f3}).has_value(), "slice frame");
+            check(o2->frame(0.0, f3).has_value(), "slice frame");
             check(o2->flush().has_value(), "slice flush");
             check(fileSize("s_xy_curl.bin") == 8 * 8 * 4, "xy slice size");
             check(fileSize("s_xz_curl.bin") == 8 * 8 * 4, "xz slice size");
             check(fileSize("s_yz_speed.bin") == 8 * 8 * 4, "yz slice size");
         }
+    }
+
+    // --- finish(): the run's write failures reach the exit code -------------
+    {
+        RunOutput::Config cfg;
+        cfg.kinds = {Emit::Stats, Emit::Bin};
+        cfg.fdt = 1.0;
+        const std::string cols[] = {"t", "x"};
+        const double r[] = {0.0, 1.0};
+
+        // Healthy: finish() succeeds, rewrites the json, and is idempotent.
+        cfg.prefix = "ok";
+        {
+            auto o = RunOutput::make(cfg, meta(g), g, {});
+            check(o.has_value(), "healthy make");
+            if (o)
+            {
+                check(o->declareSeries("stats", cols).has_value(),
+                      "healthy declareSeries");
+                check(o->row("stats", r), "healthy row");
+                check(o->frame(0.0, fv).has_value(), "healthy frame");
+                o->setMsPerStep(2.5);
+                check(o->finish().has_value(), "healthy finish succeeds");
+                check(o->finish().has_value(), "finish is idempotent");
+            }
+            const std::string j = slurp("ok.json");
+            check(j.find("\"frames\":1") != std::string::npos
+                      && j.find("\"msPerStep\":2.5") != std::string::npos,
+                  "finish rewrites the json");
+        }
+
+        // A full device under the stats CSV: the stream opens, the row's
+        // flush fails and is recorded, and finish() returns it.
+        if (std::filesystem::exists("/dev/full"))
+        {
+            cfg.prefix = "full";
+            std::filesystem::create_symlink("/dev/full", "full_stats.csv");
+            auto o = RunOutput::make(cfg, meta(g), g, {});
+            check(o.has_value(), "make beside a /dev/full series");
+            if (o)
+            {
+                check(o->declareSeries("stats", cols).has_value(),
+                      "declareSeries opens /dev/full");
+                check(!o->row("stats", r),
+                      "the row's write failure is returned");
+                check(o->frame(0.0, fv).has_value(), "frames still write");
+                const auto f = o->finish();
+                check(!f.has_value(), "finish() reports the series failure");
+                if (!f)
+                    check(f.error().find("full_stats") != std::string::npos
+                              || f.error().find("series 'stats'")
+                                     != std::string::npos,
+                          "finish() names the failed series: " + f.error());
+            }
+
+            // The same for a frame stream: a buffered write that only fails
+            // at close, which nothing but finish() can see.
+            cfg.prefix = "fullbin";
+            std::filesystem::create_symlink("/dev/full", "fullbin_vort.bin");
+            auto o2 = RunOutput::make(cfg, meta(g), g, {});
+            if (o2)
+            {
+                check(o2->declareSeries("stats", cols).has_value(),
+                      "bin case: series declared");
+                check(o2->row("stats", r), "bin case: row writes");
+                (void)o2->frame(0.0, fv);
+                const auto f = o2->finish();
+                check(!f.has_value(), "finish() reports the bin-stream failure");
+                if (!f)
+                    check(f.error().find("fullbin_vort.bin") != std::string::npos,
+                          "finish() names the failed bin: " + f.error());
+            }
+        }
+        else
+            std::printf("  [SKIP] /dev/full not present\n");
     }
 
     // --- rejections ---------------------------------------------------------

@@ -9,6 +9,8 @@
 // full surface of `config` (the first).
 #pragma once
 
+#include "dns/grid.hpp"
+
 #include <string>
 
 namespace dns {
@@ -34,6 +36,17 @@ struct RunMeta
     std::string body, farField, physics;
     double kick = 0;
     std::string sgs;   // "smag" | "sigma" when les, "" for DNS
+
+    // The six grid fields from the grid the artefacts are written on.
+    void setGrid(const Grid& g)
+    {
+        nx = g.nx;
+        ny = g.ny;
+        nz = g.nz;
+        hx = g.hx;
+        hy = g.hy;
+        hz = g.hz;
+    }
 };
 
 // code: the process exit code this error maps to (1 CLI, 2 config, 3 input...).

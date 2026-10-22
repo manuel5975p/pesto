@@ -198,11 +198,7 @@ __global__ void kFringe(GpuGrid g, int ns, int axes, Real sigMax, Real uInf,
     if (c >= g.size()) return;
     int i, j, k;
     decompose(g, c, i, j, k);
-    auto depth = [ns](int q, int nq) {
-        if (q < ns) return Real(ns - q) / Real(ns);
-        if (q >= nq - ns) return Real(q - (nq - ns) + 1) / Real(ns);
-        return Real(0);
-    };
+    auto depth = [ns](int q, int nq) { return bandDepth(q, nq, ns); };
     Real r = max(depth(i, g.nx), depth(j, g.ny));
     if (axes == 3) r = max(r, depth(k, g.nz));
     if (r <= 0) return;

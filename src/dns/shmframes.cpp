@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -25,6 +26,18 @@ std::atomic_ref<std::uint64_t> seqOf(ShmHeader* h)
 }
 
 } // namespace
+
+bool shmTablesFit(const ShmHeader& h, std::size_t bytes)
+{
+    if (h.fieldCount < 1 || h.fieldCount > kShmMaxFields) return false;
+    if (h.planeCount < 0 || h.planeCount > kShmMaxPlanes) return false;
+    if (h.volumeCount < 0 || h.volumeCount > 1) return false;
+    const std::size_t tables = sizeof(ShmHeader)
+                             + sizeof(ShmField) * std::size_t(h.fieldCount)
+                             + sizeof(ShmPlane) * std::size_t(h.planeCount)
+                             + sizeof(ShmVolume);
+    return tables <= bytes;
+}
 
 std::string ShmFrames::nameFor(const std::string& outPrefix)
 {
@@ -51,13 +64,55 @@ void ShmFrames::unmapAll()
 {
     if (base_) munmap(base_, bytes_);
     base_ = nullptr;
-    if (fd_ >= 0) close(fd_);
-    fd_ = -1;
     // The segment is unlinked here, not at create: a viewer that is still
     // mapped keeps its mapping alive (POSIX unlink semantics), it just cannot
     // be opened afresh. That is the behaviour we want when a run ends.
-    if (!name_.empty()) shm_unlink(("/" + name_).c_str());
+    //
+    // Only if the name still means OUR object: a second run on the same name
+    // re-creates it (create() unlinks and reopens), and unlinking by name then
+    // would pull the live segment out from under that run's viewer.
+    if (!name_.empty() && ino_ != 0) {
+        const std::string path = "/" + name_;
+        const int cur = shm_open(path.c_str(), O_RDONLY, 0);
+        if (cur >= 0) {
+            struct stat now{};
+            const bool ours = fstat(cur, &now) == 0 && now.st_dev == dev_
+                              && now.st_ino == ino_;
+            close(cur);
+            if (ours) shm_unlink(path.c_str());
+        }
+    }
+    if (fd_ >= 0) close(fd_);
+    fd_ = -1;
     name_.clear();
+    dev_ = 0;
+    ino_ = 0;
+}
+
+bool ShmFrames::isStale(const std::string& name)
+{
+    const std::string path = "/" + name;
+    const int fd = shm_open(path.c_str(), O_RDONLY, 0);
+    if (fd < 0) return true;   // unreadable: treat as junk
+    struct stat st{};
+    bool stale = true;
+    if (fstat(fd, &st) == 0 && st.st_size >= off_t(sizeof(ShmHeader))) {
+        void* m = mmap(nullptr, sizeof(ShmHeader), PROT_READ, MAP_SHARED, fd, 0);
+        if (m != MAP_FAILED) {
+            const auto* h = static_cast<const ShmHeader*>(m);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const bool ours =
+                std::memcmp(h->magic, kShmMagic, sizeof kShmMagic) == 0
+                && h->version == kShmVersion
+                && shmTablesFit(*h, std::size_t(st.st_size));
+            const int pid = h->pid;
+            stale = !ours
+                    || (pid > 0 && ::kill(pid_t(pid), 0) != 0 && errno == ESRCH);
+            munmap(m, sizeof(ShmHeader));
+        }
+    }
+    close(fd);
+    return stale;
 }
 
 std::expected<void, std::string>
@@ -130,9 +185,15 @@ ShmFrames::create(const std::string& name, const std::vector<ShmField>& fields,
     base_ = static_cast<unsigned char*>(m);
     name_ = name;
     std::memset(base_, 0, bytes_);
+    // Which object THIS run created: the name can be re-created by a later run
+    // while this one still holds it, and unmapAll() must not unlink that one.
+    struct stat own{};
+    if (fstat(fd_, &own) == 0) {
+        dev_ = own.st_dev;
+        ino_ = own.st_ino;
+    }
 
     auto* h = reinterpret_cast<ShmHeader*>(base_);
-    std::memcpy(h->magic, kShmMagic, sizeof kShmMagic);
     h->version = kShmVersion;
     h->headerBytes = std::uint32_t(sizeof(ShmHeader));
     h->fieldCount = std::int32_t(fields_.size());
@@ -148,6 +209,11 @@ ShmFrames::create(const std::string& name, const std::vector<ShmField>& fields,
     for (std::size_t i = 0; i < planes_.size(); ++i) pArr[i] = planes_[i];
     auto* vArr = reinterpret_cast<ShmVolume*>(pArr + planes_.size());
     *vArr = volume_;
+    // The magic goes in LAST, after a release fence: a reader that sees it
+    // (with an acquire) sees a complete header and complete tables, never the
+    // zeros of a segment that is still being laid out.
+    std::atomic_thread_fence(std::memory_order_release);
+    std::memcpy(h->magic, kShmMagic, sizeof kShmMagic);
     return {};
 }
 

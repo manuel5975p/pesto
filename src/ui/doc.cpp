@@ -30,38 +30,41 @@ int bodyNameCount() { return int(dns::bodyKindNames().size()); }
 const char* const* farNames() { return dns::farFieldNames().data(); }
 int farNameCount() { return int(dns::farFieldNames().size()); }
 
-// Indices into farNames(): 0 tunnel, 1 fringe, 2 sponge, 3 nscbc, 4 periodic.
-// Measured against the validator, not guessed -- `dns flow --dry-run` over the
-// full body x far x physics matrix rejects the cross terms with "tunnel is an
-// incompressible far field" / "sponge is a compressible far field". Periodic is
-// the only one both accept.
-std::span<const int> farForPhysics(int physics)
+namespace {
+
+dns::Physics physicsOf(int physics)
 {
-    static constexpr int kIncomp[] = {0, 1, 4};
-    static constexpr int kComp[] = {3, 2, 4};   // nscbc first: it is the default
-    return physics == 1 ? std::span<const int>(kComp) : std::span<const int>(kIncomp);
+    return physics == 1 ? dns::Physics::Compressible : dns::Physics::Incompressible;
+}
+
+dns::SgsModel sgsOf(int sgs)
+{
+    return sgs == 1 ? dns::SgsModel::Sigma : dns::SgsModel::Smagorinsky;
+}
+
+} // namespace
+
+// The validator's own rule (dns::farChoices), as indices into farNames().
+std::vector<int> farForPhysics(int physics)
+{
+    std::vector<int> v;
+    for (dns::FarField f : dns::farChoices(physicsOf(physics))) v.push_back(int(f));
+    return v;
 }
 
 int remapFar(int current, int physics)
 {
-    for (int i : farForPhysics(physics))
-        if (i == current) return current;
-    // Compressible falls back to NSCBC, never sponge: CLAUDE.md is explicit
-    // that sponge is never a default anywhere, in any physics or mode -- it is
-    // an escape hatch the user asks for by name.
-    return physics == 1 ? 3 : 0;
+    const dns::Physics p = physicsOf(physics);
+    if (dns::farAllowed(p, dns::FarField(current))) return current;
+    // The physics' default: NSCBC for compressible, never sponge -- CLAUDE.md
+    // is explicit that sponge is never a default anywhere, in any physics or
+    // mode; it is an escape hatch the user asks for by name.
+    return int(dns::defaultFar(p));
 }
 
 BodyOpts bodyOptions(int bodyKind)
 {
-    switch (bodyKind) {
-    case 1: return {.dimples = true};                  // cylinder -> 2D disks
-    case 2: return {.dimples = true};                  // sphere -> 3D caps
-    case 4: return {.aspect = true};                   // lens
-    case 6: return {.bumps = true};                    // floor trip spikes
-    case 7: return {.mesh = true};                     // mesh: scale, robust
-    default: return {};                                // none/cube/fence/scene
-    }
+    return dns::bodyOptions(dns::BodyKind(bodyKind));
 }
 const char* const* objectKindNames()
 {
@@ -69,7 +72,7 @@ const char* const* objectKindNames()
 }
 int objectKindCount() { return int(dns::sceneObjectKindNames().size()); }
 
-bool Doc::sceneMode() const { return st.bodyKind == 8; }
+bool Doc::sceneMode() const { return st.bodyKind == int(dns::BodyKind::Scene); }
 
 Doc::Doc()
 {
@@ -191,11 +194,13 @@ static dns::RawConfig rawFrom(const DocState& s)
     if (s.physics == 1) r.given.insert("--mach");
     if (s.penalize > 0) r.given.insert("--penalize");
 
-    if (s.bodyKind == 8) {
+    if (s.bodyKind == int(dns::BodyKind::Scene)) {
         r.scene = "<editor>";   // recorded, never opened (phase 1.5 is ours)
         r.given.insert("--scene");
     } else {
-        r.body = s.bodyKind == 7 ? s.meshPath : dns::bodyKindNames()[s.bodyKind];
+        r.body = s.bodyKind == int(dns::BodyKind::Mesh)
+                     ? s.meshPath
+                     : dns::bodyKindNames()[s.bodyKind];
         r.given.insert("--body");
     }
 
@@ -228,7 +233,7 @@ static dns::RawConfig rawFrom(const DocState& s)
         }
     }
 
-    if (s.les > 0 && s.bodyKind != 8) {
+    if (s.les > 0 && s.bodyKind != int(dns::BodyKind::Scene)) {
         r.les = s.les;
         r.given.insert("--les");
         r.given.insert("--sgs");
@@ -272,6 +277,8 @@ static dns::RawConfig rawFrom(const DocState& s)
         r.given.insert("--focal");
         r.given.insert("--focal-ratio");
         r.given.insert("--focal-blend");
+        r.given.insert("--focal-wake");
+        r.given.insert("--focal-pad");
     }
     return r;
 }
@@ -282,7 +289,7 @@ void Doc::build(const DocState& s, uint64_t rev, Build& out)
     out.revision = rev;
 
     dns::RawConfig r = rawFrom(s);
-    const bool scene = s.bodyKind == 8;
+    const bool scene = s.bodyKind == int(dns::BodyKind::Scene);
     dns::Scene sc;
     if (scene) {
         // THE SERIALIZE-PARSE GATE. The editor's scene is DEFINED as
@@ -423,32 +430,22 @@ void Doc::build(const DocState& s, uint64_t rev, Build& out)
     out.minLambda = minL;
     out.minAperture = minA;
 
-    // Focal remap, built exactly as runner_comp does.
-    const double axisL[3] = {double(g.nx) * g.hx, double(g.ny) * g.hy,
-                             double(g.nz) * g.hz};
-    dns::Focal1D* f[3] = {&out.remap.fx, &out.remap.fy, &out.remap.fz};
-    for (int a = 0; a < 3; ++a)
-        *f[a] = out.cas().focalActive && out.cas().focalHi[a] > out.cas().focalLo[a]
-                    ? dns::Focal1D::make(axisL[a], out.cas().focalLo[a],
-                                         out.cas().focalHi[a], out.cas().focalW[a],
-                                         out.cas().focalRatio)
-                    : dns::Focal1D::identity(axisL[a]);
-    out.remapActive = out.cas().focalActive;
+    // Focal remap: the one builder runner_comp and the app use too.
+    const dns::Case& cs = out.cas();
+    out.remap = dns::focalRemap(g, cs.focalActive, cs.focalLo, cs.focalHi,
+                                cs.focalW, cs.focalRatio);
+    out.remapActive = cs.focalActive;
 
-    // Resolution verdict. h is the FINEST spacing present -- with --focal that
-    // is the plateau spacing, which is the one the body actually sits on.
-    double h = std::min(g.hx, g.hy);
-    if (g.nz > 1) h = std::min(h, g.hz);
-    if (out.cas().focalActive)
-        for (int a = 0; a < 3; ++a)
-            if (out.cas().focalHFine[a] > 0) h = std::min(h, out.cas().focalHFine[a]);
+    // Resolution verdict. h is the FINEST spacing the body sits on -- with
+    // --focal the plateau spacing -- by the solver's own rule (dns::hFine).
+    const double h = dns::hFine(cs);
     out.dOverH = out.geo.D > 0 ? out.geo.D / h : out.cas().placement.D / h;
     out.blCells = out.cas().re > 0 ? out.dOverH / std::sqrt(out.cas().re) : 0;
     out.bodyResolved = out.blCells >= 3.0;
 
     if (out.cas().lesLabel) {
         out.label = std::string("LES (") +
-                    (out.cas().sgsModel == dns::SgsModel::Sigma ? "sigma" : "smag") +
+                    dns::name(out.cas().sgsModel) +
                     ", Cs = " + num(out.cas().cs) + ")";
     } else {
         out.label = "DNS";
@@ -537,7 +534,7 @@ std::string sceneTomlOf(const DocState& st)
     if (st.les > 0) {
         s += "type = \"les\"\n";
         s += "cs = " + tomlNum(st.les) + "\n";
-        s += std::string("sgs = \"") + (st.sgs == 1 ? "sigma" : "smag") + "\"\n";
+        s += std::string("sgs = \"") + dns::name(sgsOf(st.sgs)) + "\"\n";
     } else {
         s += "type = \"dns\"\n";
     }
@@ -975,7 +972,7 @@ std::string Doc::openScene(const std::string& path)
     Edit tx(*this, "open scene");
     st.items.clear();
     for (const auto& o : sc->objects) st.items.push_back({o, nextId_++});
-    st.bodyKind = 8;
+    st.bodyKind = int(dns::BodyKind::Scene);
     if (sc->model == dns::SceneModel::Les) {
         st.les = sc->cs;
         st.sgs = sc->sgs == dns::SgsModel::Sigma ? 1 : 0;
@@ -1016,8 +1013,7 @@ std::vector<std::string> Doc::commandArgs(const std::string& exe,
     if (st.isConv()) {
         std::vector<std::string> c{exe, "conv"};
         auto addc = [&](const char* f, const std::string& v) { add2(c, f, v); };
-        addc("--physics", st.convPhysics == 1 ? "compressible"
-                                              : "incompressible");
+        addc("--physics", dns::name(physicsOf(st.convPhysics)));
         addc("--n", std::to_string(st.n));
         addc("--ny", std::to_string(st.ny > 0 ? st.ny : st.n));
         addc("--nz", std::to_string(st.nz));
@@ -1056,12 +1052,14 @@ std::vector<std::string> Doc::commandArgs(const std::string& exe,
     // left alone because the editor's runs write no frames to disk.
     add("--wdt", num(st.wdt));
     if (st.physics == 1) {
-        add("--physics", "compressible");
+        add("--physics", dns::name(dns::Physics::Compressible));
         add("--mach", num(st.mach()));
     }
     add("--far", dns::farFieldNames()[st.far]);
     if (sceneMode()) add("--scene", scenePath);
-    else add("--body", st.bodyKind == 7 ? st.meshPath : dns::bodyKindNames()[st.bodyKind]);
+    else add("--body", st.bodyKind == int(dns::BodyKind::Mesh)
+                            ? st.meshPath
+                            : dns::bodyKindNames()[st.bodyKind]);
 
     // Same capability gate as rawFrom(): the command that runs must be the
     // command that was inspected, so it cannot carry a flag the body does not
@@ -1079,7 +1077,7 @@ std::vector<std::string> Doc::commandArgs(const std::string& exe,
     }
     if (st.les > 0 && !sceneMode()) {
         add("--les", num(st.les));
-        add("--sgs", st.sgs == 1 ? "sigma" : "smag");
+        add("--sgs", dns::name(sgsOf(st.sgs)));
     }
     // Thermal, same gating as rawFrom(): only what is engaged is printed, so
     // the command reproduces the case that was inspected and nothing more.
@@ -1102,6 +1100,10 @@ std::vector<std::string> Doc::commandArgs(const std::string& exe,
         add("--focal", "auto");
         add("--focal-ratio", num(st.focalRatio));
         add("--focal-blend", num(st.focalBlend));
+        // The plateau's extent: the inspected case uses them (rawFrom), so a
+        // command without them ran the CLI defaults instead.
+        add("--focal-wake", num(st.focalWake));
+        add("--focal-pad", num(st.focalPad));
     }
     return a;
 }

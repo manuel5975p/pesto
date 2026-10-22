@@ -219,8 +219,8 @@ std::expected<std::unique_ptr<App>, std::string> App::create()
     // did not grow. DNS_UI_SCALE overrides it.
     float uiScale = 1.6f;
     if (const char* e = SDL_getenv("DNS_UI_SCALE")) {
-        const double v = std::atof(e);
-        if (v >= 0.5 && v <= 4.0) uiScale = float(v);
+        if (const auto v = parseNumber(e); v && *v >= 0.5 && *v <= 4.0)
+            uiScale = float(*v);
     }
     app->gui_->clipboard.get = [] {
         char* t = SDL_GetClipboardText();
@@ -317,7 +317,7 @@ void App::handleEvents(bool& quit)
                     status_ = "mesh: " + path;
                 } else {
                     doc_.st.meshPath = path;
-                    doc_.st.bodyKind = 7;
+                    doc_.st.bodyKind = int(dns::BodyKind::Mesh);
                     doc_.touch();
                     status_ = "mesh body: " + path;
                 }
@@ -955,7 +955,7 @@ void App::leftRegion()
             doc_.st.far = valid[size_t(sel)];
             doc_.touch();
         }
-        if (doc_.st.far == 2)
+        if (doc_.st.far == int(dns::FarField::Sponge))
             g.label("sponge eats the near field - explicit fallback only", th.warn);
     }
 
@@ -990,7 +990,7 @@ void App::leftRegion()
                 doc_.touch();
             // validate() rejects an isothermal wall with no body, so say it
             // here rather than letting the case go red.
-            if (doc_.st.bodyKind == 0)
+            if (doc_.st.bodyKind == int(dns::BodyKind::None))
                 g.label("an isothermal wall needs a body", th.bad);
             g.label("wall heat flux appears as the qw stats column",
                     th.textDim);
@@ -1699,12 +1699,11 @@ void App::parseSeries()
         auto num = [&](const char* key, float& out) {
             const std::size_t p = ln.find(key);
             if (p == std::string::npos) return false;
-            try {
-                out = std::stof(ln.substr(p + std::strlen(key)));
-                return true;
-            } catch (...) {
-                return false;
-            }
+            const auto v =
+                leadingNumber(std::string_view(ln).substr(p + std::strlen(key)));
+            if (!v) return false;
+            out = float(*v);
+            return true;
         };
         float t = 0, cd = 0, cl = 0, kk = 0, dv = 0;
         if (!num("t=", t)) continue;
@@ -1724,9 +1723,9 @@ void App::parseSeries()
         if (num("Nu=", nb)) {
             const std::size_t p = ln.find("Nu=");
             const std::size_t sl = ln.find('/', p);
-            if (sl != std::string::npos) {
-                try { nt = std::stof(ln.substr(sl + 1)); } catch (...) {}
-            }
+            if (sl != std::string::npos)
+                if (const auto v = leadingNumber(std::string_view(ln).substr(sl + 1)))
+                    nt = float(*v);
         }
         num("(flux ", nf);
         // The compressible runner prints urms as a ratio to the free-fall
@@ -2156,7 +2155,6 @@ void App::dockRegion()
 
 void App::drawScene()
 {
-    const Build& b = doc_.current();
     // The scene is projected into the VIEWPORT rect, not the window: aspect
     // and the Vulkan viewport must agree or the body comes out sheared.
     ren_->setViewport(lay_.vpX, lay_.vpY, lay_.vpW, lay_.vpH);
@@ -2183,7 +2181,6 @@ void App::drawScene()
     if (gizMesh_.count)
         ren_->drawTriangles(gizMesh_, mvp, light, Rgba{255, 255, 255, 255}, false,
                             false);
-    (void)b;
 }
 
 // The selection box is computed from the EDITED offsets, not from the last
@@ -2365,7 +2362,6 @@ int App::run()
                     want = snapOrigin(sn, gizDrag_.originAtGrab, want, axisFree);
 
                     const auto& p = b.cas().placement;
-                    const Vec3 d = want - gizDrag_.originAtGrab;
                     // Apply as a DELTA from the grab, so every selected object
                     // moves together and the maths stays absolute.
                     const SceneItem* it = doc_.find(doc_.primary());
@@ -2377,7 +2373,6 @@ int App::run()
                         const double dz = b.cas().grid.nz > 1 ? nz - it->obj.z : 0.0;
                         if (dx || dy || dz) doc_.nudgeSelection(dx, dy, dz);
                     }
-                    (void)d;
                     status_ = "moved " + num(double(length(want - gizDrag_.originAtGrab)) /
                                                  (p.D > 0 ? p.D : 1.0), 3) + " D" +
                               (sn.mode == SnapSettings::Mode::Free ? "" : "  (snapped)");
@@ -2444,6 +2439,11 @@ int App::run()
             drawScene();
             (void)ren_->drawUi(gui_->vertices(), gui_->batches());
             vk_->endFrame();
+        }
+        if (vk_->deviceLost()) {
+            std::fprintf(stderr, "dns-ui: the Vulkan device was lost; "
+                                 "quitting\n");
+            return 1;
         }
     }
     return 0;

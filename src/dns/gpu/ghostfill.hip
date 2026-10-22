@@ -35,22 +35,6 @@ __global__ void kGhostFill(std::size_t count, const int* __restrict__ face,
     q[face[t]] = acc;
 }
 
-// Whole-field copy of the three components in ONE launch. It replaces three
-// hipMemcpy D2D calls, each of which is a blocking host synchronization: at
-// three RK stages that was nine pipeline stalls per step, for a transfer the
-// solver never has to wait on.
-__global__ void kCopyField(std::size_t n, const Real* __restrict__ su,
-                           const Real* __restrict__ sv, const Real* __restrict__ sw,
-                           Real* __restrict__ du, Real* __restrict__ dv,
-                           Real* __restrict__ dw)
-{
-    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (c >= n) return;
-    du[c] = su[c];
-    dv[c] = sv[c];
-    dw[c] = sw[c];
-}
-
 int pmod(int i, int n) { return ((i % n) + n) % n; }
 
 // Host-side accumulator for one component's ghost entries.
@@ -182,11 +166,11 @@ DeviceGhostFill::make(const Grid& g, const CutGeometry& cut, const Sdf& sdf)
 
 void DeviceGhostFill::fillFrom(const DeviceField& in, DeviceField& diff) const
 {
-    const std::size_t n = in.u.size();
-    kCopyField<<<launchBlocks(n), blockSize>>>(n, in.u.data(), in.v.data(),
-                                               in.w.data(), diff.u.data(),
-                                               diff.v.data(), diff.w.data());
-    checkLastKernel("ghostCopy");
+    // One launch, not three blocking D2D copies: at three RK stages that was
+    // nine pipeline stalls per step. Same-size fields are the caller's
+    // invariant, so a failure here is a programmer error.
+    [[maybe_unused]] const hipError_t e = copyField(diff, in);
+    assert(e == hipSuccess && "ghostCopy failed");
     fill(in, diff);
 }
 

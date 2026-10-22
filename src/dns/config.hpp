@@ -36,11 +36,39 @@ enum class NscbcAbc { YooIm, Adaptive, Modal };
 // copies (one of them a hardcoded count) were not.
 std::span<const char* const> bodyKindNames();
 std::span<const char* const> farFieldNames();
+std::span<const char* const> physicsNames();
+std::span<const char* const> sgsModelNames();
+std::span<const char* const> nscbcAbcNames();
+std::span<const char* const> subcommandNames();
 const char* name(BodyKind);
 const char* name(FarField);
-// The inverse of name(BodyKind); nullopt when `s` is not a body keyword (a
-// mesh path, say, which the caller recognises by suffix instead).
-std::optional<BodyKind> bodyKindFromName(std::string_view s);
+const char* name(Physics);
+const char* name(SgsModel);
+const char* name(NscbcAbc);
+const char* name(Subcommand);
+// The inverses the parsers need; nullopt when `s` is not a keyword.
+std::optional<Subcommand> subcommandFromName(std::string_view s);
+std::optional<SgsModel> sgsModelFromName(std::string_view s);
+
+// The far-field rules of `dns flow`, the ONE definition the validator and the
+// editor both read. Sponge is never a default, in any physics (CLAUDE.md).
+// The physics' default far field: nscbc compressible, tunnel incompressible.
+FarField defaultFar(Physics);
+// The far fields `physics` accepts, default first. Periodic is the only one
+// both physics take; body-specific limits (fence, floor) are the validator's.
+std::span<const FarField> farChoices(Physics);
+bool farAllowed(Physics, FarField);
+
+// The per-body option flags a body kind accepts: --aspect (lens), --dimples
+// (cylinder, sphere), --bumps/--bump-h (floor), --scale/--robust (mesh).
+struct BodyOptions
+{
+    bool aspect = false;
+    bool dimples = false;
+    bool bumps = false;
+    bool mesh = false;
+};
+BodyOptions bodyOptions(BodyKind);
 
 // One field per CLI flag. `given` records which flags the user actually typed,
 // so the validator can distinguish "left at the default" from "set to the
@@ -378,6 +406,11 @@ private:
     Case() = default;
     friend std::expected<Case, ConfigError> validate(const RawConfig&);
 };
+
+// The finest cell spacing the run resolves: the focal plateau's when
+// focalActive, the grid's otherwise, both by the hMin rule (z excluded at
+// nz == 1). Computed, not stored, so no validator stage can read it stale.
+double hFine(const Case&);
 
 struct Scene;   // dns/scene.hpp
 

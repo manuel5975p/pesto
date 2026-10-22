@@ -1,11 +1,11 @@
 #include "dns/scene.hpp"
 
 #include "dns/bodies.hpp"
+#include "dns/config.hpp"
 #include "dns/geometry.hpp"
 #include "dns/meshsdf.hpp"
 #include "dns/trimesh.hpp"
 
-#define TOML_EXCEPTIONS 0
 #include <tomlplusplus/toml.hpp>
 
 #include <algorithm>
@@ -41,6 +41,15 @@ bool finiteNum(const toml::node& n, double& out)
         return true;
     }
     return false;
+}
+
+// The inverse of name(SceneObjectKind); nullopt when `s` is not a kind keyword.
+std::optional<SceneObjectKind> sceneObjectKindFromName(std::string_view s)
+{
+    const auto n = sceneObjectKindNames();
+    const auto it = std::ranges::find(n, s);
+    if (it == n.end()) return std::nullopt;
+    return SceneObjectKind(it - n.begin());
 }
 
 std::expected<SceneObject, std::string> parseObject(const toml::table& o,
@@ -162,11 +171,11 @@ std::expected<void, std::string> parseModel(const toml::table& m, Scene& sc)
             const std::string_view m =
                 v.is_string() ? v.value_or(std::string_view{})
                               : std::string_view{};
-            if (m == "smag") sc.sgs = SgsModel::Smagorinsky;
-            else if (m == "sigma") sc.sgs = SgsModel::Sigma;
-            else
+            const auto sg = sgsModelFromName(m);
+            if (!sg)
                 return std::unexpected(bad("model", "`sgs` must be \"smag\" or "
                                                     "\"sigma\""));
+            sc.sgs = *sg;
             continue;
         }
         return std::unexpected(bad("model", "unknown key `" + k + "`"));
@@ -199,14 +208,6 @@ const char* name(SceneObjectKind k)
     return i < n.size() ? n[i] : "?";
 }
 
-std::optional<SceneObjectKind> sceneObjectKindFromName(std::string_view s)
-{
-    const auto n = sceneObjectKindNames();
-    const auto it = std::ranges::find(n, s);
-    if (it == n.end()) return std::nullopt;
-    return SceneObjectKind(it - n.begin());
-}
-
 RotatedCube sceneCube(const Grid& g, double cx, double cy, double cz, double r)
 {
     // 2D: no third dimension to be a cube in, so the prism reading stands.
@@ -234,8 +235,7 @@ std::string Scene::describe() const
     std::ostringstream os;
     os << "scene:      model " << (model == SceneModel::Les ? "LES" : "DNS");
     if (model == SceneModel::Les)
-        os << " (" << (sgs == SgsModel::Sigma ? "sigma" : "smag")
-           << ", Cs=" << cs << ")";
+        os << " (" << name(sgs) << ", Cs=" << cs << ")";
     os << ", " << objects.size() << " object"
        << (objects.size() == 1 ? "" : "s") << "\n";
     for (std::size_t i = 0; i < objects.size(); ++i)
@@ -451,6 +451,10 @@ buildSceneGeometry(const Grid& g, const Placement& ref, const Scene& scene)
                       {cx, cy, cz});
             const Aabb b = bounds(mesh);
             bb = {b.lo[0], b.lo[1], b.lo[2], b.hi[0], b.hi[1], b.hi[2]};
+            if (!meshHasArea(mesh))
+                return std::unexpected("scene object '" + o.label
+                                       + "': mesh has no triangle with "
+                                         "nonzero area");
             auto sdfp = std::make_shared<MeshSdf>(std::move(mesh), o.robust);
             if (!sdfp->watertight() && !o.robust)
                 std::fprintf(stderr, "dns: warning: scene object '%s' is not "

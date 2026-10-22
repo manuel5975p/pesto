@@ -8,6 +8,7 @@
 #include "dns/gpu/comp_ghost.hpp"
 #include "dns/gpu/comp_nscbc.hpp"
 #include "dns/gpu/comp_sink.hpp"
+#include "dns/gpu/cutcell.hpp"
 #include "dns/gpu/derived.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/internal/derived_remap.hpp"
@@ -19,6 +20,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -32,19 +34,7 @@ namespace dns::gpu {
 
 using internal::fail;
 using internal::finishTiming;
-
-namespace {
-
-
-// Quiet-start freestream schedule: smoothstep 0 -> 1 over [0, ramp].
-double rampFrac(double t, double ramp)
-{
-    if (ramp <= 0 || t >= ramp) return 1.0;
-    const double s = t / ramp;
-    return s * s * (3 - 2 * s);
-}
-
-} // namespace
+using internal::rampFrac;
 
 std::expected<RunStats, RunError>
 runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
@@ -62,17 +52,8 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     // device (kernel template argument) so differences use physical, not
     // reference, distances.
     const TanhStretchY remap{double(g.ny) * g.hy, r.stretchBeta};
-    const double axisL[3] = {double(g.nx) * g.hx, double(g.ny) * g.hy,
-                             double(g.nz) * g.hz};
-    AxisRemap3 fremap;
-    {
-        Focal1D* f[3] = {&fremap.fx, &fremap.fy, &fremap.fz};
-        for (int a = 0; a < 3; ++a)
-            *f[a] = r.focalActive && r.focalHi[a] > r.focalLo[a]
-                        ? Focal1D::make(axisL[a], r.focalLo[a], r.focalHi[a],
-                                        r.focalW[a], r.focalRatio)
-                        : Focal1D::identity(axisL[a]);
-    }
+    const AxisRemap3 fremap = focalRemap(g, r.focalActive, r.focalLo,
+                                         r.focalHi, r.focalW, r.focalRatio);
 
     // Curvilinear mesh: nodes from the PointRemap, finite-volume tables
     // derived from the nodes (discrete face closure), solver on the
@@ -112,7 +93,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     fc.rhoInf = r.rhoInf;
     fc.uInf = r.uInf;
     fc.pInf = r.pInf;
-    fc.gamma = r.gamma;
+    fc.gamma = r.tr.gamma;
     // Resolved by validate(); not re-derived here (see runner_incomp).
     if (r.spongeCells <= 0)
         return fail(6, "far-field band width was not resolved");
@@ -137,7 +118,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         nc.rhoInf = r.rhoInf;
         nc.uInf = r.uInf;
         nc.pInf = r.pInf;
-        nc.gamma = r.gamma;
+        nc.gamma = r.tr.gamma;
         nc.betaTrans = r.nscbcBeta;
         nc.betaAuto = r.nscbcAbc == NscbcAbc::Adaptive;
         nc.betaModal = r.nscbcAbc == NscbcAbc::Modal;
@@ -169,7 +150,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         auto m = DeviceCompSink::make(
             g, {.nb = r.nscbcSink,
                 .alpha = r.nscbcSinkAmp,
-                .cInf = std::sqrt(r.gamma * r.pInf / r.rhoInf),
+                .cInf = std::sqrt(r.tr.gamma * r.pInf / r.rhoInf),
                 .openY = r.open,
                 .openZ = r.open && g.nz > 1});
         if (!m) return fail(6, "sink init failed");
@@ -231,27 +212,18 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         }
         // The tip-Mach guard is the same hard stop the table path applies --
         // the KG flux has no shock capturing either way.
-        const double cInf = std::sqrt(r.gamma * r.pInf / r.rhoInf);
-        const double machTip = std::abs(r.rotor.omega) * tipR / cInf;
-        const double machInf = r.uInf / cInf;
-        std::printf("rotor: measured tip radius %.4g (nominal %.4g) -> tip "
-                    "Mach %.3f, +freestream %.3f\n",
-                    tipR, r.rotor.radius, machTip, machTip + machInf);
-        if (machTip + machInf >= 1.0)
-            return fail(2, std::format(
-                "the body reaches {:.4g} from the shaft, not the nominal "
-                "{:.4g}, so its real tip Mach is {:.3f} and with the "
-                "freestream {:.3f} >= 1. Lower --rotor-mach below {:.3f}",
-                tipR, r.rotor.radius, machTip, machTip + machInf,
-                r.rotor.radius / tipR * (1.0 - machInf) * 0.95));
+        const double cInf = std::sqrt(r.tr.gamma * r.pInf / r.rhoInf);
+        if (auto e = internal::checkTipMach(r.rotor.omega, tipR, r.rotor.radius,
+                                            cInf, r.uInf / cInf,
+                                            "measured tip radius", "body", "", "");
+            !e)
+            return std::unexpected(e.error());
 
         // Zone: f = 1 must cover the blade plus the ghost wall's mirror band,
         // f = 0 must be reached well before any domain face so the NSCBC rows
         // and the sink never see the frame. Margins in fine cells and in D.
-        const double hF = r.hFine > 0
-            ? r.hFine
-            : (g.nz == 1 ? std::min(g.hx, g.hy)
-                         : std::min({g.hx, g.hy, g.hz}));
+        assert(r.hFine > 0);   // dns_main fills it from hFine(Case)
+        const double hF = r.hFine;
         const double aHalf = aHalfMeas;
         MrfZone z;
         z.axis = a;
@@ -299,7 +271,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
 
         CompGhostCapacity cap;
         cap.cover(tbls);
-        auto gh = DeviceCompGhost::fromTables(g, tbls, cap, r.gamma, r.rhoInf,
+        auto gh = DeviceCompGhost::fromTables(g, tbls, cap, r.tr.gamma, r.rhoInf,
                                               r.pInf, focal, wallBc);
         if (!gh) return fail(6, "ghost wall init failed");
         // The deep-solid verdict the table path reports per bin, measured on
@@ -344,21 +316,14 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         // says. The KG central flux has no shock capturing, so this is a hard
         // stop rather than a warning; it is checked HERE because the extent is
         // only measurable once the body has been voxelized.
-        const double cInf = std::sqrt(r.gamma * r.pInf / r.rhoInf);
-        const double machTip = std::abs(r.rotor.omega) * tbl->tipRadius / cInf;
-        const double machInf = r.uInf / cInf;
-        std::printf("rotor: measured tip radius %.4g (nominal %.4g) -> tip "
-                    "Mach %.3f, +freestream %.3f\n",
-                    tbl->tipRadius, r.rotor.radius, machTip, machTip + machInf);
-        if (machTip + machInf >= 1.0)
-            return fail(2, std::format(
-                "the body reaches {:.4g} from the shaft, not the nominal "
-                "{:.4g}, so its real tip Mach is {:.3f} and with the "
-                "freestream {:.3f} >= 1. The flux is Kennedy-Gruber central "
-                "with no shock capturing. Lower --rotor-mach below {:.3f}, or "
-                "use a body that fits inside its own diameter",
-                tbl->tipRadius, r.rotor.radius, machTip, machTip + machInf,
-                r.rotor.radius / tbl->tipRadius * (1.0 - machInf) * 0.95));
+        const double cInf = std::sqrt(r.tr.gamma * r.pInf / r.rhoInf);
+        if (auto e = internal::checkTipMach(
+                r.rotor.omega, tbl->tipRadius, r.rotor.radius, cInf,
+                r.uInf / cInf, "measured tip radius", "body",
+                "The flux is Kennedy-Gruber central with no shock capturing. ",
+                ", or use a body that fits inside its own diameter");
+            !e)
+            return std::unexpected(e.error());
         // The mirror band must be at least two cells thick per side, so a body
         // with NO deep-solid core anywhere is one whose two surfaces read
         // through each other. Reported, not rejected: it is a resolution
@@ -371,7 +336,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                         "(--blade-thicken) or refine.\n");
         std::fflush(stdout);
         auto gh = DeviceCompGhost::fromTables(g, tbl->bins[0], tbl->capacity,
-                                              r.gamma, r.rhoInf, r.pInf, focal,
+                                              r.tr.gamma, r.rhoInf, r.pInf, focal,
                                               wallBc);
         if (!gh) return fail(6, "ghost wall init failed");
         rotorTable = std::move(*tbl);
@@ -380,7 +345,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     }
     else
     {
-        auto gh = DeviceCompGhost::make(g, sdf, r.gamma, r.rhoInf, r.pInf,
+        auto gh = DeviceCompGhost::make(g, sdf, r.tr.gamma, r.rhoInf, r.pInf,
                                         bbox ? bbox->data() : nullptr, fremap,
                                         wallBc);
         if (!gh) return fail(6, "ghost wall init failed");
@@ -424,7 +389,10 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
             if (snk) snk->apply(s, out, cmb);
         });
 
-    (void)ds->upload(ic);
+    if (ds->upload(ic) != hipSuccess)
+        return fail(6, "initial condition upload failed");
+    if (auto h = internal::checkDevice("the initial condition"); !h)
+        return std::unexpected(h.error());
     const double u0 = r.ramp > 0 ? 0.0 : r.uInf;
     far->setFreestream(u0);
     if (nsc) nsc->setFreestream(u0);
@@ -443,13 +411,10 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                                        "ct", "cq"}
             : std::vector<std::string>{"t", "dt", "cd", "cl", "cs", "wmax",
                                        "qw"};
-    out.declareSeries("stats", cols);
+    if (auto e = out.declareSeries("stats", cols); !e)
+        return fail(4, e.error());
     const int shaftAxis = rotorAxisIndex(r.rotor.axis);
-    // n = omega / 2 pi, revolutions per unit time; the propeller coefficients
-    // are rho n^2 D^4 and rho n^2 D^5, so they are undefined at omega = 0.
-    const double rotorN = std::abs(r.rotor.omega) / (2.0 * std::numbers::pi);
-    const double ctDen = r.rhoInf * rotorN * rotorN * std::pow(r.D, 4);
-    const double cqDen = ctDen * r.D;
+    const auto [ctDen, cqDen] = internal::propellerDen(r.rhoInf, r.rotor.omega, r.D);
 
     const float vortScale =
         float(r.curlMax > 0 ? r.curlMax
@@ -474,8 +439,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     auto writeFrame = [&](double t) {
         if (!fs.ensure(g.size(), r.tempFrames ? 3 : 2, true)) return;
         if (r.tempFrames) dev->primitives(*ds);
-        primitiveVelocity(gg, ds->rho, ds->mx, ds->my, ds->mz, fs.u(), fs.v(),
-                          fs.w());
+        fs.centreFromConserved(gg, *ds);
         if (r.signedVorticity && stretched)
             vorticityZRemap(gg, remap, fs.u(), fs.v(), fs.vort());
         else if (r.signedVorticity && focal)
@@ -505,23 +469,19 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         const FrameField ff[3]{
             {vortName, vortOut, 0, vortScale, r.signedVorticity,
              r.vortAsinh && r.signedVorticity ? vortScale / 32.0f : 0.0f},
-            r.speedDelta
-                ? FrameField{"dspeed", speedOut, 0, float(0.6 * r.uInf), true}
-                : FrameField{"speed", speedOut, 0, speedMax, false},
+            internal::speedField(speedOut, r.speedDelta, r.uInf, speedMax),
             {"temp", tempOut, -tempScale, tempScale, true}};
-        internal::FrameScratch::emit(out, t, {ff, r.tempFrames ? 3u : 2u});
+        fs.emit(out, t, {ff, r.tempFrames ? 3u : 2u});
     };
 
     RunStats st;
     double t = 0.0;
-    long lastLog = 0;
+    internal::StatsCadence cad{r.statsEvery};
     double dtStab = 0.0;
     int sinceDt = 1 << 30;
-    // Potential-correction wake source: EMA of F_drag/(rhoInf uInf) over
-    // ~2 D/uInf so the shedding oscillation does not feed back into the
-    // far-field target. Fed only past the quiet-start ramp (the ramp's
-    // inertial force is not drag).
-    double qEma = 0.0, tQ = r.ramp;
+    // Potential-correction wake source: EMA of F_drag/(rhoInf uInf), fed only
+    // past the quiet-start ramp (the ramp's inertial force is not drag).
+    internal::WakeEma wake{.tLast = r.ramp};
     const auto wall0 = std::chrono::steady_clock::now();
 
     while (t < r.tEnd)
@@ -579,9 +539,11 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         t += dt;
         ++st.steps;
 
-        if (st.steps - lastLog >= r.statsEvery || t >= r.tEnd)
+        if (cad.due(st.steps, t, r.tEnd))
         {
             const auto F = ghost->force(*dev, *ds, r.rotor.shaft);
+            if (auto h = internal::checkDevice("a stats row", &*red); !h)
+                return std::unexpected(h.error());
             const double span = g.nz > 1 ? g.nz * g.hz : 1.0;
             st.cd = F.fx / (r.qRef * span);
             st.cl = F.fy / (r.qRef * span);
@@ -590,11 +552,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
             {
                 const double Qinst = std::clamp(F.fx / (r.rhoInf * r.uInf),
                                                 0.0, 2.0 * r.D * r.uInf * span);
-                const double alpha =
-                    std::min(1.0, (t - tQ) / (2.0 * r.D / r.uInf));
-                qEma += alpha * (Qinst - qEma);
-                tQ = t;
-                nsc->setWakeSource(qEma);
+                nsc->setWakeSource(wake.update(t, Qinst, r.D, r.uInf));
             }
             const double wmax =
                 r.cfl / dtStab * std::min({g.hx, g.hy, g.hz});
@@ -610,14 +568,14 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                                       st.cs,  wmax,   F.heat, thrust,
                                       torque, ctDen > 0 ? thrust / ctDen : 0.0,
                                       cqDen > 0 ? torque / cqDen : 0.0};
-                (void)out.row("stats", row);
+                out.row("stats", row);
             }
             else
             {
                 const double row[] = {t, dt, st.cd, st.cl, st.cs, wmax, F.heat};
-                (void)out.row("stats", row);
+                out.row("stats", row);
             }
-            if (st.steps - lastLog >= 10 * r.statsEvery || t >= r.tEnd)
+            if (cad.printDue(st.steps, t, r.tEnd))
             {
                 if (r.rotor.active())
                     std::printf("t=%.2f/%.2f T=%+.4g Q=%+.4g cd=%.3f "
@@ -628,8 +586,9 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                                 "wmax=%.2f dt=%.2e\n",
                                 t, r.tEnd, st.cd, st.cl, st.cs, wmax, dt);
                 std::fflush(stdout);
+                cad.printed(st.steps);
             }
-            lastLog = st.steps;
+            cad.logged(st.steps);
         }
         // The output schedule is independent of the quiet-start ramp: frames
         // during spin-up show the (physical, ramped) transient. The ramp gate
@@ -661,7 +620,8 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
             writeFrame(t);
         }
     }
-    (void)hipDeviceSynchronize();
+    if (auto h = internal::checkDevice("the end of the run", &*red); !h)
+        return std::unexpected(h.error());
     // Swaps per step is the diagnostic that says whether the bin count matched
     // the time step: far below 1 means most steps saw a body that had not
     // moved (correct, and free), while 1 means every step crossed a bin and the

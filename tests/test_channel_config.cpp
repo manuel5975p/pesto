@@ -86,7 +86,7 @@ int main()
     rejected({"channel", "--far", "nscbc"}, 1, "--far is not a channel flag");
     rejected({"channel", "--les", "0.1"}, 1, "--les is not a channel flag");
     rejected({"channel", "--re-tau", "0"}, 2, "re-tau must be positive");
-    rejected({"channel", "--re-tau", "nan"}, 2, "re-tau nan caught by validate");
+    rejected({"channel", "--re-tau", "nan"}, 1, "re-tau nan rejected by the parser");
     rejected({"channel", "--mach", "1.5"}, 2, "mach must be under 1");
     rejected({"channel", "--ny", "4"}, 2, "ny under 8 rejected");
     rejected({"channel", "--nz", "2"}, 2, "nz 2 rejected (1 or >= 4)");

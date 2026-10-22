@@ -15,59 +15,58 @@
 #include <cassert>
 #include <climits>
 #include <cstddef>
+#include <limits>
 
 namespace dns::gpu::internal {
 
-// op-reduce f(0..n-1) into a host double. Scratch grows on demand and is
-// reused across calls.
+// op-reduce f(0..n-1) into the device double `dst` -- NO host copy, so it
+// never synchronizes. Used inside the CG loop to keep alpha/beta and the mean
+// on device across iterations. Scratch grows on demand and is reused.
 //
-// On a scratch-allocation failure the reduction is left to run on whatever
-// scratch already exists and rocPRIM reports the shortfall -- it does not
-// corrupt memory. `init` is returned in that case. The obvious alternative
-// (dereferencing the valueless expected) is UB in Release, where assert() is a
-// comment; that is the bug this shape exists to avoid.
+// Any failure (the size query, the scratch growth, the reduction itself)
+// writes a quiet NaN to `dst` and returns the error: a failed reduction must
+// never read as a plausible number -- every consumer of these values (dt, a
+// convergence test, a reported coefficient) then fails loudly on the NaN.
+template <class F, class Op>
+hipError_t reduceInto(DeviceBuffer<unsigned char>& tmp, std::size_t n, F f, Op op,
+                      double init, double* dst)
+{
+    assert(n <= std::size_t(INT_MAX));
+    const auto in =
+        rocprim::make_transform_iterator(rocprim::counting_iterator<int>(0), f);
+    std::size_t bytes = 0;
+    hipError_t e = rocprim::reduce(nullptr, bytes, in, dst, init, n, op);
+    if (e == hipSuccess && tmp.size() < bytes)
+    {
+        auto grown = DeviceBuffer<unsigned char>::make(bytes);
+        if (grown) tmp = std::move(*grown);
+        else e = grown.error();
+    }
+    if (e == hipSuccess)
+    {
+        bytes = tmp.size();
+        e = rocprim::reduce(tmp.data(), bytes, in, dst, init, n, op);
+    }
+    if (e != hipSuccess)
+    {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        (void)hipMemcpy(dst, &nan, sizeof(double), hipMemcpyHostToDevice);
+    }
+    return e;
+}
+
+// The same reduction into a host double: reduceInto plus one copy. Returns a
+// quiet NaN on any failure and records the first error in s.err.
 template <class F, class Op>
 double reduce(ReduceScratch& s, std::size_t n, F f, Op op, double init)
 {
-    assert(n <= std::size_t(INT_MAX));
-    const auto in =
-        rocprim::make_transform_iterator(rocprim::counting_iterator<int>(0), f);
-
-    std::size_t bytes = 0;
-    (void)rocprim::reduce(nullptr, bytes, in, s.out.data(), init, n, op);
-    if (s.tmp.size() < bytes)
-    {
-        auto grown = DeviceBuffer<unsigned char>::make(bytes);
-        if (!grown) return init;
-        s.tmp = std::move(*grown);
-    }
-    bytes = s.tmp.size();
-    (void)rocprim::reduce(s.tmp.data(), bytes, in, s.out.data(), init, n, op);
+    hipError_t e = reduceInto(s.tmp, n, f, op, init, s.out.data());
     double h = 0.0;
-    (void)hipMemcpy(&h, s.out.data(), sizeof(double), hipMemcpyDeviceToHost);
-    return h;
-}
-
-// Same reduction, but the result is left in the device buffer `dst` -- NO host
-// copy, so it never synchronizes. Used inside the CG loop to keep alpha/beta
-// and the mean on device across iterations.
-template <class F, class Op>
-void reduceInto(DeviceBuffer<unsigned char>& tmp, std::size_t n, F f, Op op,
-                double init, double* dst)
-{
-    assert(n <= std::size_t(INT_MAX));
-    const auto in =
-        rocprim::make_transform_iterator(rocprim::counting_iterator<int>(0), f);
-    std::size_t bytes = 0;
-    (void)rocprim::reduce(nullptr, bytes, in, dst, init, n, op);
-    if (tmp.size() < bytes)
-    {
-        auto grown = DeviceBuffer<unsigned char>::make(bytes);
-        if (!grown) return;
-        tmp = std::move(*grown);
-    }
-    bytes = tmp.size();
-    (void)rocprim::reduce(tmp.data(), bytes, in, dst, init, n, op);
+    if (e == hipSuccess)
+        e = hipMemcpy(&h, s.out.data(), sizeof(double), hipMemcpyDeviceToHost);
+    if (e == hipSuccess) return h;
+    if (s.err == hipSuccess) s.err = e;
+    return std::numeric_limits<double>::quiet_NaN();
 }
 
 } // namespace dns::gpu::internal

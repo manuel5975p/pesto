@@ -17,9 +17,14 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 
+#include <csignal>
+
+#include <fcntl.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #ifndef DNS_BIN
 #error "DNS_BIN must be defined (path to the dns binary)"
@@ -62,6 +67,9 @@ int main()
     expect("flow --body cylinder --n banana --dry-run", 1, "unparseable number");
     expect("flow --body cylinder --n 64x --dry-run", 1,
            "trailing garbage after a number");
+    expect("flow --body cylinder --re nan --dry-run", 1, "a NaN number");
+    expect("flow --body cylinder --physics compressible --mach inf --dry-run", 1,
+           "an infinite number");
 
     // --- 2: config ----------------------------------------------------------
     expect("flow --dry-run", 2, "--body is required");
@@ -171,6 +179,35 @@ int main()
                "a file that is not a mesh");
         std::filesystem::remove(tmp);
     }
+    {
+        // Every triangle a sliver: MeshSdf's precondition, checked on input.
+        const auto tmp = std::filesystem::temp_directory_path() / "dns_sliver.stl";
+        std::ofstream(tmp) << "solid s\n facet normal 0 0 0\n  outer loop\n"
+                              "   vertex 0 0 0\n   vertex 1 0 0\n   vertex 2 0 0\n"
+                              "  endloop\n endfacet\nendsolid s\n";
+        expect("flow --body " + tmp.string() + " --n 32 --nz 32", 3,
+               "a mesh with no triangle of nonzero area");
+        std::filesystem::remove(tmp);
+    }
+    {
+        // A NaN vertex in a binary STL: rejected by the parser itself.
+        const auto tmp = std::filesystem::temp_directory_path() / "dns_nan.stl";
+        {
+            std::ofstream f(tmp, std::ios::binary);
+            const char hdr[80] = {};
+            f.write(hdr, 80);
+            const unsigned n = 1;
+            f.write(reinterpret_cast<const char*>(&n), 4);
+            const float nan = std::numeric_limits<float>::quiet_NaN();
+            const float rec[12] = {0, 0, 1, 0, 0, 0, 1, 0, 0, 0, nan, 0};
+            f.write(reinterpret_cast<const char*>(rec), sizeof rec);
+            const char attr[2] = {};
+            f.write(attr, 2);
+        }
+        expect("flow --body " + tmp.string() + " --n 32 --nz 32", 3,
+               "a binary STL with a NaN vertex");
+        std::filesystem::remove(tmp);
+    }
 
     // --- 4: output ----------------------------------------------------------
     // Phase 3c creates and truncates EVERY output before the first hipMalloc,
@@ -191,6 +228,79 @@ int main()
         }
         else
             std::printf("ok    exit 4 (unwritable --out)\n");
+    }
+    // A write that fails MID-RUN (a full disk) must not end in exit 0: the
+    // run continues, and finish() turns the recorded failure into exit 4.
+    if (std::filesystem::exists("/dev/full"))
+    {
+        const auto dir = std::filesystem::temp_directory_path() / "dns_full_run";
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+        std::filesystem::create_symlink("/dev/full", dir / "x_stats.csv");
+        const int rc = run("conv --n 16 --ny 8 --nz 1 --tt 0.05 --emit stats "
+                           "--out " + (dir / "x").string());
+        if (rc == 5)
+            std::printf("SKIP  exit 4 (full disk mid-run): no GPU\n");
+        else if (rc != 4)
+        {
+            std::printf("FAIL  exit 4 (full disk mid-run): got %d\n", rc);
+            ++dnstest::gFailures;
+        }
+        else
+            std::printf("ok    exit 4 (full disk mid-run)\n");
+        std::filesystem::remove_all(dir);
+    }
+
+    // A stop signal ends a periodic run like reaching tEnd does (exit 0). The
+    // tgv/hit loops used to ignore it, so this `hit` -- far too long to finish
+    // -- ran until killed.
+    {
+        const std::string prefix =
+            (std::filesystem::temp_directory_path() / "dns_hit_sigint").string();
+        const pid_t pid = fork();
+        if (pid == 0)
+        {
+            const int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0)
+            {
+                dup2(devnull, 1);
+                dup2(devnull, 2);
+            }
+            execl(DNS_BIN, DNS_BIN, "hit", "--n", "32", "--spin", "1e4",
+                  "--stats", "1e4", "--emit", "none", "--out", prefix.c_str(),
+                  static_cast<char*>(nullptr));
+            _exit(127);
+        }
+        // Let it reach its time loop, then ask it to stop; give it a bounded
+        // time to unwind before calling it a hang.
+        usleep(3000000);
+        kill(pid, SIGINT);
+        int status = 0, waited = 0;
+        while (waitpid(pid, &status, WNOHANG) == 0 && waited < 600)
+        {
+            usleep(100000);
+            ++waited;
+        }
+        if (waited >= 600)
+        {
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            std::printf("FAIL  SIGINT stops dns hit: still running after 60 s\n");
+            ++dnstest::gFailures;
+        }
+        else
+        {
+            const int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            if (rc == 5)
+                std::printf("SKIP  SIGINT stops dns hit: no GPU\n");
+            else if (rc != 0)
+            {
+                std::printf("FAIL  SIGINT stops dns hit: exit %d\n", rc);
+                ++dnstest::gFailures;
+            }
+            else
+                std::printf("ok    SIGINT stops dns hit (exit 0)\n");
+        }
     }
 
     std::printf("%s\n", dnstest::gFailures == 0 ? "ALL OK" : "FAILURES");

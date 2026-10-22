@@ -19,12 +19,14 @@ namespace {
 
 // hipfftExec* statuses used to be [[maybe_unused]] + assert, i.e. DISCARDED in
 // the Release build this project ships. solve() is void-returning (it sits
-// under the PoissonSolver interface), so the status cannot be propagated
-// without changing that interface; report it loudly instead of dropping it.
-void checkFft(hipfftResult r, const char* what)
+// under the PoissonSolver interface), so a failure is reported loudly AND
+// recorded in the solver's sticky status(), which the runners' health check
+// consults.
+void checkFft(hipfftResult r, const char* what, hipError_t& status)
 {
-    if (r != HIPFFT_SUCCESS)
-        std::fprintf(stderr, "dns: hipfft %s failed (status %d)\n", what, int(r));
+    if (r == HIPFFT_SUCCESS) return;
+    std::fprintf(stderr, "dns: hipfft %s failed (status %d)\n", what, int(r));
+    if (status == hipSuccess) status = hipErrorUnknown;
 }
 
 
@@ -241,6 +243,7 @@ struct DevicePoissonSolver::Impl
 {
     GpuGrid g;
     PoissonBc bc = PoissonBc::Periodic;
+    hipError_t status = hipSuccess;   // first failure of any solve; sticky
 
     // Periodic mode.
     int nxh = 0;
@@ -405,6 +408,8 @@ DevicePoissonSolver& DevicePoissonSolver::operator=(DevicePoissonSolver&&) noexc
     = default;
 DevicePoissonSolver::~DevicePoissonSolver() = default;
 
+hipError_t DevicePoissonSolver::status() const { return impl_->status; }
+
 void DevicePoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p)
 {
     Impl& s = *impl_;
@@ -413,10 +418,13 @@ void DevicePoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p)
     if (s.bc == PoissonBc::Periodic)
     {
         // R2C may clobber its input: stage rhs into the work buffer.
-        (void)hipMemcpy(s.work.data(), rhs.data(), s.g.size() * sizeof(Real),
-                        hipMemcpyDeviceToDevice);
+        if (const auto e = hipMemcpy(s.work.data(), rhs.data(),
+                                     s.g.size() * sizeof(Real),
+                                     hipMemcpyDeviceToDevice);
+            e != hipSuccess && s.status == hipSuccess)
+            s.status = e;
         auto rf = hipfftExecR2C(s.fwd, s.work.data(), s.spec.data());
-        checkFft(rf, "ExecR2C");
+        checkFft(rf, "ExecR2C", s.status);
 
         const std::size_t nc = std::size_t(s.nxh) * s.g.ny * s.g.nz;
         const Real norm = Real(1.0 / double(s.g.size()));
@@ -427,7 +435,7 @@ void DevicePoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p)
         checkLastKernel("poissonScale");
 
         auto rb = hipfftExecC2R(s.bwd, s.spec.data(), p.data());
-        checkFft(rb, "ExecC2R");
+        checkFft(rb, "ExecC2R", s.status);
         return;
     }
 
@@ -439,10 +447,10 @@ void DevicePoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p)
         checkLastKernel("packYInterior");
 
         checkFft(hipfftExecC2C(s.planX, s.cbuf.data(), s.cbuf.data(),
-                               HIPFFT_FORWARD), "ExecC2C x forward");
+                               HIPFFT_FORWARD), "ExecC2C x forward", s.status);
         if (s.g.nz > 1)
             checkFft(hipfftExecC2C(s.planZ, s.cbuf.data(), s.cbuf.data(),
-                                   HIPFFT_FORWARD), "ExecC2C z forward");
+                                   HIPFFT_FORWARD), "ExecC2C z forward", s.status);
 
         const Real ihy2 = Real(1.0 / (s.g.hy * s.g.hy));
         kTridiagY<<<launchBlocks(std::size_t(s.g.nx) * s.g.nz), blockSize>>>(
@@ -452,9 +460,9 @@ void DevicePoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p)
 
         if (s.g.nz > 1)
             checkFft(hipfftExecC2C(s.planZ, s.cbuf.data(), s.cbuf.data(),
-                                   HIPFFT_BACKWARD), "ExecC2C z backward");
+                                   HIPFFT_BACKWARD), "ExecC2C z backward", s.status);
         checkFft(hipfftExecC2C(s.planX, s.cbuf.data(), s.cbuf.data(),
-                               HIPFFT_BACKWARD), "ExecC2C x backward");
+                               HIPFFT_BACKWARD), "ExecC2C x backward", s.status);
 
         // hipFFT's inverse is unnormalised on both transformed axes.
         const Real norm = Real(1.0 / (double(s.g.nx) * s.g.nz));
@@ -484,7 +492,7 @@ void DevicePoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p)
         checkLastKernel("dctPermute");
         auto r =
             hipfftExecC2C(s.plan[a], s.cbuf.data(), s.cbuf.data(), HIPFFT_FORWARD);
-        checkFft(r, "ExecC2C forward");
+        checkFft(r, "ExecC2C forward", s.status);
         kDctTwiddleRot<<<rotGrid(n0, n1, n2), rotBlock>>>(n0, n1, n2,
                                                           s.cbuf.data(), nxt);
         checkLastKernel("dctTwiddleRot");
@@ -507,7 +515,7 @@ void DevicePoissonSolver::solve(const DeviceScalar& rhs, DeviceScalar& p)
         checkLastKernel("dctInvTwiddle");
         auto r =
             hipfftExecC2C(s.plan[a], s.cbuf.data(), s.cbuf.data(), HIPFFT_BACKWARD);
-        checkFft(r, "ExecC2C backward");
+        checkFft(r, "ExecC2C backward", s.status);
         kDctInvPermuteRot<<<rotGrid(n0, n1, n2), rotBlock>>>(n0, n1, n2,
                                                              s.cbuf.data(), nxt);
         checkLastKernel("dctInvPermuteRot");

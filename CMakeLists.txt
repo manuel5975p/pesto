@@ -62,6 +62,9 @@ add_library(dns_core
 target_include_directories(dns_core PUBLIC src)
 # cgltf (trimesh.cpp) + toml++ (scene.cpp); SYSTEM mutes third-party warnings.
 target_include_directories(dns_core SYSTEM PRIVATE third_party)
+# toml++ is built without exceptions in every TU that includes it (house rule:
+# std::expected, no throw). PRIVATE: third_party is not on consumers' path.
+target_compile_definitions(dns_core PRIVATE TOML_EXCEPTIONS=0)
 target_link_libraries(dns_core PRIVATE ZLIB::ZLIB)
 
 if(DNS_WITH_FFTW)
@@ -153,7 +156,8 @@ if(DNS_WITH_HIP)
     target_link_libraries(dns_gpu
         PUBLIC dns_core hip::host
         PRIVATE hip::hipfft roc::rocprim)
-    target_compile_definitions(dns_gpu PUBLIC DNS_WITH_GPU=1 DNS_WITH_HIP=1)
+    target_compile_definitions(dns_gpu PUBLIC DNS_WITH_GPU=1 DNS_WITH_HIP=1
+                                              DNS_GPU_BACKEND_NAME="hip")
     target_compile_options(dns_gpu PRIVATE
         $<$<COMPILE_LANGUAGE:HIP>:-Wall$<SEMICOLON>-Wextra>)
 
@@ -232,7 +236,8 @@ if(DNS_WITH_CUDA)
     target_link_libraries(dns_gpu
         PUBLIC dns_core CUDA::cudart
         PRIVATE CUDA::cufft)
-    target_compile_definitions(dns_gpu PUBLIC DNS_WITH_GPU=1 DNS_WITH_CUDA=1)
+    target_compile_definitions(dns_gpu PUBLIC DNS_WITH_GPU=1 DNS_WITH_CUDA=1
+                                              DNS_GPU_BACKEND_NAME="cuda")
     # Same warnings as the HIP branch; nvcc needs them handed to the host
     # compiler explicitly.
     target_compile_options(dns_gpu PRIVATE
@@ -401,57 +406,33 @@ if(BUILD_TESTING)
             set_tests_properties(${t} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
         endforeach()
 
+        # A GPU test that drives the BUILT `dns` binary (handed in as DNS_BIN)
+        # and skips (77) without a device.
+        function(dns_gpu_bin_test name timeout)
+            add_executable(test_${name} tests/test_${name}.cpp)
+            target_link_libraries(test_${name} PRIVATE dns_gpu)
+            target_compile_definitions(test_${name} PRIVATE
+                DNS_BIN="$<TARGET_FILE:dns>")
+            add_dependencies(test_${name} dns)
+            add_test(NAME ${name} COMMAND test_${name})
+            set_tests_properties(${name} PROPERTIES TIMEOUT ${timeout}
+                SKIP_RETURN_CODE 77)
+        endfunction()
+
         # dns conv is an app composition (IC + sink + runner), so it is driven
         # through the binary and read back from its stats CSV.
-        add_executable(test_gpu_conv tests/test_gpu_conv.cpp)
-        target_link_libraries(test_gpu_conv PRIVATE dns_gpu)
-        target_compile_definitions(test_gpu_conv PRIVATE
-            DNS_BIN="$<TARGET_FILE:dns>")
-        add_dependencies(test_gpu_conv dns)
-        add_test(NAME gpu_conv COMMAND test_gpu_conv)
-        set_tests_properties(gpu_conv PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
-
+        dns_gpu_bin_test(gpu_conv 300)
         # The Boussinesq branch, including the cross-validation against the
         # compressible one -- also driven through the binary.
-        add_executable(test_gpu_rb tests/test_gpu_rb.cpp)
-        target_link_libraries(test_gpu_rb PRIVATE dns_gpu)
-        target_compile_definitions(test_gpu_rb PRIVATE
-            DNS_BIN="$<TARGET_FILE:dns>")
-        add_dependencies(test_gpu_rb dns)
-        add_test(NAME gpu_rb COMMAND test_gpu_rb)
-        set_tests_properties(gpu_rb PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
-
+        dns_gpu_bin_test(gpu_rb 300)
         # Open far-field path is app-local; drive the built binary.
-        add_executable(test_gpu_open_incomp tests/test_gpu_open_incomp.cpp)
-        target_link_libraries(test_gpu_open_incomp PRIVATE dns_gpu)
-        target_compile_definitions(test_gpu_open_incomp PRIVATE
-            DNS_BIN="$<TARGET_FILE:dns>")
-        add_dependencies(test_gpu_open_incomp dns)
-        add_test(NAME gpu_open_incomp COMMAND test_gpu_open_incomp)
-        set_tests_properties(gpu_open_incomp PROPERTIES TIMEOUT 600
-            SKIP_RETURN_CODE 77)
-
+        dns_gpu_bin_test(gpu_open_incomp 600)
         # Smoke coverage for the three runners, incl. --far tunnel WITH walls
         # (the incompressible default) and runner_comp, which had none.
-        add_executable(test_gpu_runners tests/test_gpu_runners.cpp)
-        target_link_libraries(test_gpu_runners PRIVATE dns_gpu)
-        target_compile_definitions(test_gpu_runners PRIVATE
-            DNS_BIN="$<TARGET_FILE:dns>")
-        add_dependencies(test_gpu_runners dns)
-        add_test(NAME gpu_runners COMMAND test_gpu_runners)
-        set_tests_properties(gpu_runners PROPERTIES TIMEOUT 600
-            SKIP_RETURN_CODE 77)
-
+        dns_gpu_bin_test(gpu_runners 600)
         # Sponge-free open tunnel: library-level freestream cycles + a short
         # end-to-end run of the built binary.
-        add_executable(test_gpu_tunnel_open tests/test_gpu_tunnel_open.cpp)
-        target_link_libraries(test_gpu_tunnel_open PRIVATE dns_gpu)
-        target_compile_definitions(test_gpu_tunnel_open PRIVATE
-            DNS_BIN="$<TARGET_FILE:dns>")
-        add_dependencies(test_gpu_tunnel_open dns)
-        add_test(NAME gpu_tunnel_open COMMAND test_gpu_tunnel_open)
-        set_tests_properties(gpu_tunnel_open PROPERTIES TIMEOUT 600
-            SKIP_RETURN_CODE 77)
+        dns_gpu_bin_test(gpu_tunnel_open 600)
 
 
         # --- Physical validation suite (docs/validation.md) -----------------

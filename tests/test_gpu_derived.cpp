@@ -7,6 +7,7 @@
 
 #include "dns/gpu/derived.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "gpu_test_util.hpp"
 #include "check.hpp"
 
 #include <cmath>
@@ -18,7 +19,6 @@ namespace {
 
 using dnstest::check;
 
-constexpr int skipExitCode = 77;
 
 
 double maxDiff(const std::vector<dns::gpu::Real>& a, const std::vector<double>& b)
@@ -37,11 +37,7 @@ int main()
     using gpu::Real;
     using std::numbers::pi;
 
-    if (!gpu::deviceAvailable())
-    {
-        std::printf("no HIP device, skipping\n");
-        return skipExitCode;
-    }
+    dns::test::requireDeviceOrSkip();
 
     for (int nz : {1, 8})
     {

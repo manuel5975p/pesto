@@ -3,6 +3,7 @@
 //  (b) 2D Taylor-Green on the GPU converges at order > 1.7 vs the analytic field.
 #include "gpu_test_util.hpp"
 
+#include "dns/gpu/runner_periodic.hpp"
 #include "dns/gpu/timestepper.hpp"
 #include "dns/operators.hpp"
 #include "dns/taylor_green.hpp"
@@ -79,6 +80,29 @@ int main()
     {
         std::fprintf(stderr, "FAIL: 2D TGV e64=%.3e order=%.2f\n", e64, order);
         ok = false;
+    }
+
+    // A NaN-seeded IC is a numerical failure (exit 7) of the 3D runner, not a
+    // NaN marched to tEnd: the Courant max-reduction reads the NaN as +inf, so
+    // dt is 0 and the runner's dt check stops it.
+    {
+        const auto g = Grid::make(16, 16, 16, 2 * pi, 2 * pi, 2 * pi);
+        auto U = VectorField::zeros(g);
+        taylorGreen3D(g, U);
+        U.w[g.idx(3, 9, 11)] = std::nan("");
+        gpu::TgvRun tr;
+        tr.nu = 1.0 / 400.0;
+        tr.tEnd = 0.2;
+        tr.volume = std::pow(2 * pi, 3);
+        const auto st = gpu::runTgv3d(g, U, tr, nullptr);
+        std::printf("NaN-seeded runTgv3d: %s (code %d)\n",
+                    st ? "ran to tEnd" : st.error().message.c_str(),
+                    st ? 0 : st.error().code);
+        if (st || st.error().code != 7)
+        {
+            std::fprintf(stderr, "FAIL: NaN IC did not stop with exit 7\n");
+            ok = false;
+        }
     }
     return ok ? 0 : 1;
 }

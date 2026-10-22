@@ -1,50 +1,14 @@
 #include "dns/diagnostics.hpp"
 
-#include "dns/operators.hpp"
-
 #if DNS_WITH_FFTW
 #include <fftw3.h>
 #endif
 
 #include <algorithm>
 #include <cmath>
-#include <filesystem>
-#include <fstream>
 #include <numbers>
 
 namespace dns {
-
-FlowStats computeStats(const Grid& g, const VectorField& U, double nu)
-{
-    FlowStats s{};
-    s.kPrime = fluctuationEnergy(g, U);
-    s.uPrime = std::sqrt(2.0 * s.kPrime / 3.0);
-    s.epsVisc = nu * velocityGradientSq(g, U);
-    if (s.epsVisc > 0 && nu > 0)
-    {
-        s.eta = std::pow(nu * nu * nu / s.epsVisc, 0.25);
-        s.reLambda = s.uPrime * s.uPrime * std::sqrt(15.0 / (nu * s.epsVisc));
-        s.hOverEta = std::max({g.hx, g.hy, g.hz}) / s.eta;
-    }
-    s.courantPerDt = maxCourantPerDt(g, U);
-    s.maxDiv = maxAbsDivergence(g, U);
-    return s;
-}
-
-bool appendStatsCsv(const std::string& path, double t, double dt, double forcingA,
-                    const FlowStats& s)
-{
-    const bool fresh = !std::filesystem::exists(path);
-    std::ofstream f(path, std::ios::app);
-    if (!f) return false;
-    if (fresh)
-        f << "t,dt,A,kPrime,uPrime,epsVisc,epsInj,eta,reLambda,hOverEta,cfl,maxDiv\n";
-    f << t << ',' << dt << ',' << forcingA << ',' << s.kPrime << ',' << s.uPrime
-      << ',' << s.epsVisc << ',' << 2.0 * forcingA * s.kPrime << ',' << s.eta << ','
-      << s.reLambda << ',' << s.hOverEta << ',' << s.courantPerDt * dt << ','
-      << s.maxDiv << '\n';
-    return bool(f);
-}
 
 #if DNS_WITH_FFTW
 

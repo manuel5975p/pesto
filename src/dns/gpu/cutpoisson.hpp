@@ -18,6 +18,17 @@ namespace dns::gpu {
 // Laplacian: the apertured operator differs from the constant-coefficient one
 // only at the body, so the FFT solve clusters the spectrum and CG converges in
 // tens of iterations. FP32 fields, FP64 dot products.
+// One PCG solve's outcome. iters is what the solve cost; converged is true
+// only when the residual reached the target -- running out of iterations and
+// a CG breakdown above target are both NOT converged; finite is false when the
+// residual went NaN/inf (the field diverged; iters is then the cap).
+struct PcgResult
+{
+    int iters = 0;
+    bool converged = false;
+    bool finite = true;
+};
+
 class DeviceCutPoissonSolver
 {
 public:
@@ -35,10 +46,15 @@ public:
 
     // Solve M(p) = rhs; p has zero mean over fluid cells (zero in solid) on
     // return. warmStart reuses the incoming p as initial guess. Returns the
-    // iterations taken.
-    int solve(const DeviceScalar& rhs, DeviceScalar& p, bool warmStart = false);
+    // iterations taken and the verdict (see PcgResult).
+    PcgResult solve(const DeviceScalar& rhs, DeviceScalar& p, bool warmStart = false);
+
+    // The first device failure (reduction, copy, preconditioner FFT) of any
+    // solve so far; sticky. hipSuccess = every solve ran.
+    hipError_t status() const;
 
 private:
+    void record(hipError_t e);   // keeps the first failure for status()
     DeviceCutPoissonSolver(const GpuGrid& g, const DeviceCutGeometry& cut,
                            int maxIters, double tol, DevicePoissonSolver fft,
                            DeviceScalar r, DeviceScalar z, DeviceScalar d,

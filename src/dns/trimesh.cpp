@@ -12,6 +12,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <sstream>
 
 namespace dns {
@@ -24,8 +25,13 @@ struct MeshBuilder
     TriMesh m;
     std::map<std::array<double, 3>, int> ids;
 
-    int vert(std::array<double, 3> v)
+    // nullopt for a non-finite coordinate: a NaN key breaks the map's strict
+    // weak ordering, and NaN/inf survive every parser only to surface much
+    // later as a degenerate BVH and an sdf that is NaN everywhere.
+    std::optional<int> vert(std::array<double, 3> v)
     {
+        if (!std::ranges::all_of(v, [](double x) { return std::isfinite(x); }))
+            return std::nullopt;
         const auto [it, fresh] = ids.try_emplace(v, int(m.verts.size()));
         if (fresh) m.verts.push_back(v);
         return it->second;
@@ -42,6 +48,7 @@ std::expected<std::vector<char>, std::string> slurp(const std::string& path)
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return std::unexpected("cannot open " + path);
     const auto n = f.tellg();
+    if (n < 0) return std::unexpected("cannot determine size of " + path);
     std::vector<char> buf(static_cast<std::size_t>(n), '\0');
     f.seekg(0);
     f.read(buf.data(), n);
@@ -49,7 +56,10 @@ std::expected<std::vector<char>, std::string> slurp(const std::string& path)
     return buf;
 }
 
-TriMesh parseStlBinary(const std::vector<char>& buf, std::uint32_t n)
+constexpr const char* kNonFinite = "non-finite vertex coordinate";
+
+std::expected<TriMesh, std::string> parseStlBinary(const std::vector<char>& buf,
+                                                   std::uint32_t n)
 {
     MeshBuilder b;
     const char* p = buf.data() + 84;
@@ -61,7 +71,9 @@ TriMesh parseStlBinary(const std::vector<char>& buf, std::uint32_t n)
         {
             float f[3];
             std::memcpy(f, p, sizeof f);
-            id[v] = b.vert({double(f[0]), double(f[1]), double(f[2])});
+            const auto k = b.vert({double(f[0]), double(f[1]), double(f[2])});
+            if (!k) return std::unexpected(std::string("stl: ") + kNonFinite);
+            id[v] = *k;
         }
         p += 2; // attribute byte count
         b.tri(id[0], id[1], id[2]);
@@ -82,7 +94,9 @@ std::expected<TriMesh, std::string> parseStlAscii(const std::vector<char>& buf)
         double x, y, z;
         if (!(ss >> x >> y >> z))
             return std::unexpected("stl: malformed ASCII vertex");
-        id[nv++] = b.vert({x, y, z});
+        const auto k = b.vert({x, y, z});
+        if (!k) return std::unexpected(std::string("stl: ") + kNonFinite);
+        id[nv++] = *k;
         if (nv == 3)
         {
             b.tri(id[0], id[1], id[2]);
@@ -130,7 +144,7 @@ std::expected<TriMesh, std::string> loadStl(const std::string& path)
         if (n > 0 && buf->size() == 84 + 50ull * n)
         {
             auto m = parseStlBinary(*buf, n);
-            if (m.tris.empty()) return std::unexpected("stl: no triangles");
+            if (m && m->tris.empty()) return std::unexpected("stl: no triangles");
             return m;
         }
     }
@@ -170,16 +184,27 @@ std::expected<TriMesh, std::string> loadGltf(const std::string& path)
                 cgltf_float f[3]{};
                 if (!cgltf_accessor_read_float(pos, v, f, 3))
                     return std::unexpected("gltf: POSITION read failed");
-                id[v] = b.vert(
+                const auto k = b.vert(
                     {double(wm[0]) * f[0] + double(wm[4]) * f[1] + double(wm[8]) * f[2] + double(wm[12]),
                      double(wm[1]) * f[0] + double(wm[5]) * f[1] + double(wm[9]) * f[2] + double(wm[13]),
                      double(wm[2]) * f[0] + double(wm[6]) * f[1] + double(wm[10]) * f[2] + double(wm[14])});
+                if (!k) return std::unexpected(std::string("gltf: ") + kNonFinite);
+                id[v] = *k;
             }
             if (prim.indices)
                 for (cgltf_size t = 0; t + 2 < prim.indices->count; t += 3)
-                    b.tri(id[cgltf_accessor_read_index(prim.indices, t)],
-                          id[cgltf_accessor_read_index(prim.indices, t + 1)],
-                          id[cgltf_accessor_read_index(prim.indices, t + 2)]);
+                {
+                    // An index past the POSITION accessor is a file error,
+                    // and reading id[] with it an out-of-bounds read.
+                    cgltf_size ix[3];
+                    for (int q = 0; q < 3; ++q)
+                    {
+                        ix[q] = cgltf_accessor_read_index(prim.indices, t + q);
+                        if (ix[q] >= id.size())
+                            return std::unexpected("gltf: index out of range");
+                    }
+                    b.tri(id[ix[0]], id[ix[1]], id[ix[2]]);
+                }
             else
                 for (cgltf_size t = 0; t + 2 < pos->count; t += 3)
                     b.tri(id[t], id[t + 1], id[t + 2]);
@@ -191,15 +216,13 @@ std::expected<TriMesh, std::string> loadGltf(const std::string& path)
 
 namespace {
 
-// A NaN or inf coordinate survives every parser and only surfaces much later as
-// a degenerate BVH and an sdf that is NaN everywhere.
-bool allFinite(const TriMesh& m)
+// Indices must address the vertex table: a stale index is a silent OOB read
+// inside the BVH build. Non-finite vertices never get here: MeshBuilder
+// rejects them in every parser, so that half is an invariant.
+bool meshConsistent(const TriMesh& m)
 {
-    for (const auto& v : m.verts)
-        for (double x : v)
-            if (!std::isfinite(x)) return false;
-    // Indices must address the vertex table: a stale index is a silent OOB read
-    // inside the BVH build.
+    for ([[maybe_unused]] const auto& v : m.verts)
+        assert(std::ranges::all_of(v, [](double x) { return std::isfinite(x); }));
     const int nv = int(m.verts.size());
     for (const auto& t : m.tris)
         for (int i : t)
@@ -217,7 +240,7 @@ std::expected<TriMesh, std::string> loadMesh(const std::string& path)
            : std::expected<TriMesh, std::string>(
                  std::unexpected("unsupported mesh extension: " + path));
     if (!m) return m;
-    if (!allFinite(*m))
+    if (!meshConsistent(*m))
         return std::unexpected("mesh has non-finite vertex coordinates or "
                                "out-of-range triangle indices: " + path);
     return m;

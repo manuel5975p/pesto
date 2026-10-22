@@ -27,12 +27,7 @@ using gpu::Real;
 
 namespace {
 
-int failures = 0;
-
-void check(bool ok, const char* what)
-{
-    if (!ok) { std::printf("FAIL: %s\n", what); ++failures; }
-}
+using dnstest::check;
 
 // The pre-recomposition native-2D variant (Class A: cylinder:75, eye:62),
 // verbatim, as the bit-identity oracle at nz == 1.
@@ -97,7 +92,7 @@ std::vector<Real> download(const gpu::DeviceScalar& q, std::size_t n)
 
 int main()
 {
-    if (!gpu::deviceAvailable()) { std::printf("no HIP device\n"); return 77; }
+    dns::test::requireDeviceOrSkip();
 
     // --- 1) nz == 1: unified kernel is bit-identical to Class A -------------
     {
@@ -502,6 +497,6 @@ int main()
         }
     }
 
-    if (failures == 0) std::printf("gpu_tunnel_bc: ok\n");
-    return failures == 0 ? 0 : 1;
+    if (dnstest::gFailures == 0) std::printf("gpu_tunnel_bc: ok\n");
+    return dnstest::finish();
 }

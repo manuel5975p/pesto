@@ -25,6 +25,9 @@ TimeStepper::TimeStepper(const Grid& g, StepParams p)
 double TimeStepper::suggestDt(const VectorField& U, double dtMax) const
 {
     const double conv = maxCourantPerDt(g_, U);
+    // A NaN Courant number is a diverged field: max(NaN, diff) would drop it
+    // and return dtMax. NaN out instead, so the caller's dt check fails.
+    if (!(conv >= 0)) return std::numeric_limits<double>::quiet_NaN();
     const double hmin2 = std::pow(std::min({g_.hx, g_.hy, g_.hz}), 2);
     const double diff = p_.nu > 0 ? 6.0 * p_.nu / hmin2 : 0.0;
     const double lim = std::max(conv, diff);

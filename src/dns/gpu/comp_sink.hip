@@ -11,13 +11,8 @@ namespace {
 // Same shape family as the kFarSponge strength, so the two bands compare.
 __device__ Real bandRamp(int q, int n, int nb)
 {
-    Real d;
-    if (q < nb)
-        d = Real(nb - q) / Real(nb);
-    else if (q >= n - nb)
-        d = Real(q - (n - nb) + 1) / Real(nb);
-    else
-        return Real(0);
+    const Real d = bandDepth(q, n, nb);   // > 0 exactly inside the band
+    if (!(d > Real(0))) return Real(0);
     return Real(0.5) * (Real(1) - cosf(Real(M_PI) * d));
 }
 

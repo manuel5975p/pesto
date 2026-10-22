@@ -84,7 +84,7 @@ int main()
 
         std::vector<gpu::Real> tmp(rhs.begin(), rhs.end());
         (void)dDiv->upload(tmp.data());
-        const int it = poisson->solve(*dDiv, scr->phi);
+        const int it = poisson->solve(*dDiv, scr->phi).iters;
         std::printf("pcg iterations: %d\n", it);
         std::vector<gpu::Real> pTmp(g.size());
         (void)scr->phi.download(pTmp.data());

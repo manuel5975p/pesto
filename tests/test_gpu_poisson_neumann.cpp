@@ -111,7 +111,7 @@ int main()
         return 1;
     }
     // The PCG operator is the apertured mirror Laplacian == the rhs built above.
-    const int it = pcg->solve(dRhs, dP);
+    const int it = pcg->solve(dRhs, dP).iters;
     (void)dP.download(tmp.data());
     double errPcg = 0.0;
     for (int k = 1; k <= mz; ++k)

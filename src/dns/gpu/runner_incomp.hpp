@@ -10,6 +10,7 @@
 #include "dns/cutcell.hpp"
 #include "dns/gpu/bodyforce.hpp"
 #include "dns/gpu/index.hpp"
+#include "dns/gpu/run_result.hpp"
 #include "dns/output.hpp"
 #include "dns/sdf.hpp"
 
@@ -72,8 +73,8 @@ struct IncompRun
     // -1 = no floor (bit-identical historical tunnel).
     int floorRows = -1;
     double floorFrac = 1.0;
-    int fringeCells = 0;      // 0 = clamp(0.1 nx, 8, nx/2 - 1)
-    int fringeAxes = 0;       // 0 = nz == 1 ? 2 : 3
+    int fringeCells = 0;      // resolved by validate(); > 0
+    int fringeAxes = 0;       // resolved by validate(); 2 or 3
 
     BodyBox box{};            // force-tally index box (the whole scene/body)
 
@@ -99,27 +100,9 @@ struct IncompRun
     double steadyTol = 0;
 };
 
-struct RunStats
-{
-    long steps = 0;
-    double msPerStep = 0;
-    double cd = 0, cl = 0, cs = 0, cdf = 0;   // last measured
-    double resid = 0;         // last steady residual, uInf^2/D units
-    double tStop = 0;         // time actually reached
-    bool converged = false;   // steady mode only: resid fell below steadyTol
-};
-
 // Runs to completion, writing through `out`. `cut` must already be sanitized
 // (and, for the tunnel far field, closed on the box boundary); `sdf` is the
 // body's signed distance, used once to build the ghost-fill sharp wall.
-// Errors carry the process exit code the masterplan assigns (6 resource,
-// 7 numerical, 8 solver).
-struct RunError
-{
-    int code;
-    std::string message;
-};
-
 // `finalField`, when non-null, receives the converged/final velocity field --
 // grid sequencing prolongs it onto the next level as that level's initial
 // guess. Must be sized for this grid.

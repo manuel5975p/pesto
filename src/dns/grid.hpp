@@ -3,6 +3,7 @@
 // the 3D operators ARE the 2D ones (w stays 0; solvers skip the z transform).
 #pragma once
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 
@@ -42,5 +43,14 @@ struct Grid
         return std::size_t(i) + std::size_t(nx) * (std::size_t(j) + std::size_t(ny) * k);
     }
 };
+
+// The smallest cell spacing, the ONE rule every "the" cell size uses: z is
+// excluded at nz == 1, where hz is the unit depth of the 2D restriction and
+// not a spacing. Pre: spacings > 0.
+inline double hMin(int nz, double hx, double hy, double hz)
+{
+    return nz == 1 ? std::min(hx, hy) : std::min({hx, hy, hz});
+}
+inline double hMin(const Grid& g) { return hMin(g.nz, g.hx, g.hy, g.hz); }
 
 } // namespace dns

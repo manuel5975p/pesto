@@ -40,6 +40,9 @@ TimeStepper::TimeStepper(GpuGrid g, StepParams p, DevicePoissonSolver poisson,
 double TimeStepper::suggestDt(const DeviceField& U, double dtMax)
 {
     const double conv = maxCourantPerDt(g_, U, red_);
+    // A NaN Courant number is a diverged field: max(NaN, diff) would drop it
+    // and return dtMax. NaN out instead, so the caller's dt check fails.
+    if (!(conv >= 0)) return std::numeric_limits<double>::quiet_NaN();
     const double hmin = std::min({double(g_.hx), double(g_.hy), double(g_.hz)});
     const double diff = p_.nu > 0 ? 6.0 * p_.nu / (hmin * hmin) : 0.0;
     const double lim = std::max(conv, diff);

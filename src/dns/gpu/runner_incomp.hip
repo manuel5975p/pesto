@@ -27,20 +27,7 @@ namespace dns::gpu {
 
 using internal::fail;
 using internal::finishTiming;
-
-namespace {
-
-
-// Quiet-start freestream schedule: smoothstep 0 -> 1 over [0, ramp]
-// (the runner_comp schedule, verbatim).
-double rampFrac(double t, double ramp)
-{
-    if (ramp <= 0 || t >= ramp) return 1.0;
-    const double s = t / ramp;
-    return s * s * (3.0 - 2.0 * s);
-}
-
-} // namespace
+using internal::rampFrac;
 
 std::expected<RunStats, RunError>
 runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
@@ -145,16 +132,23 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
         fringe->setFreestream(0.0);
     }
 
-    (void)uploadField(ic, *dU);
+    if (uploadField(ic, *dU) != hipSuccess)
+        return fail(6, "initial condition upload failed");
     maskSolidFaces(gg, *dCut, *dU);
     (void)hipMemset(scr->phi.data(), 0, g.size() * sizeof(Real)); // warm start
     if (!r.fringe) tunnel->apply(*dU, *dU, 0.0); // seed ghosts/prescribed faces
+    if (auto h = internal::checkDevice("the initial condition"); !h)
+        return std::unexpected(h.error());
 
     // One SSP-RK3 stage. The order below carries physics -- see the masterplan
     // keep-list; in particular the ghost view feeds ONLY the viscous term, and
     // the outlet flux correction must precede the divergence so the projection
     // RHS is compatible.
     int pcgIters = 0;
+    // Solves that missed the target since the last stats row (warned there),
+    // and a residual that went non-finite (the field diverged: exit 7).
+    int pcgUnconverged = 0, pcgSolves = 0;
+    bool pcgDiverged = false;
     auto stage = [&](const DeviceField& in, DeviceField& outF, double a, double dt) {
         dGhost->fillFrom(in, *dG);
         // The solid-face mask rides in the stage kernel's tail instead of
@@ -195,7 +189,11 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
         }
         divergenceCut(gg, *dCut, outF, scr->div, Real(1.0 / dt));
         if (!r.fringe) tunnel->addFluxRhs(outF, 1.0 / dt, scr->div);
-        pcgIters += poisson->solve(scr->div, scr->phi, true);
+        const PcgResult pr = poisson->solve(scr->div, scr->phi, true);
+        pcgIters += pr.iters;
+        pcgUnconverged += pr.converged ? 0 : 1;
+        ++pcgSolves;
+        pcgDiverged = pcgDiverged || !pr.finite;
         subtractGradientCut(gg, *dCut, scr->phi, Real(dt), outF);
         if (!r.fringe) // refresh the mirrors; keep the projected lateral fluxes
             tunnel->apply(outF, outF, 0.0, /*refreshOnly=*/true);
@@ -203,14 +201,16 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
 
     const std::string cols[] = {"t",   "dt",  "K",   "cd",      "cl",
                                 "cdf", "cfl", "maxDiv", "pcgIters", "resid"};
-    out.declareSeries("stats", cols);
+    if (auto e = out.declareSeries("stats", cols); !e)
+        return fail(4, e.error());
     if (!objForce.empty())
     {
         std::vector<std::string> fcols{"t"};
         for (const auto& tb : r.tallies)
             for (const char* q : {"cd_", "cl_", "cdf_"})
                 fcols.push_back(q + tb.name);
-        out.declareSeries("forces", fcols);
+        if (auto e = out.declareSeries("forces", fcols); !e)
+            return fail(4, e.error());
     }
 
     const float vortScale =
@@ -228,19 +228,15 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
         fs.take(1, fs.speed(), r.speedDelta ? r.uInf : 0.0);
         const FrameField ff[2]{
             {"vort", fs.channel(0), 0, vortScale, true, vortToe},
-            r.speedDelta
-                ? FrameField{"dspeed", fs.channel(1), 0, float(0.6 * r.uInf),
-                             true}
-                : FrameField{"speed", fs.channel(1), 0, speedMax, false}};
-        internal::FrameScratch::emit(out, t, ff);
+            internal::speedField(fs.channel(1), r.speedDelta, r.uInf, speedMax)};
+        fs.emit(out, t, ff);
     };
 
     RunStats st;
     double t = 0.0, dt = 1e-3;
-    // Potential-corrected inlet wake source: EMA of F_drag / uInf over
-    // ~2 D/uInf (the shedding oscillation must not feed the far-field
-    // target), fed only after the impulsive-start transient.
-    double qEma = 0.0, tQ = r.ramp + 2.0 * r.D / r.uInf;
+    // Potential-corrected inlet wake source: EMA of F_drag / uInf, fed only
+    // after the impulsive-start transient.
+    internal::WakeEma wake{.tLast = r.ramp + 2.0 * r.D / r.uInf};
     // Steady-residual snapshot interval, in PHYSICAL time -- not in steps. The
     // metric differences two FP32 fields, so its noise floor is ~eps*u/interval;
     // a fixed step count shrinks the interval with dt and pushes the floor UP on
@@ -329,21 +325,19 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
                                               les ? &les->nut() : nullptr, *red);
                     frow.insert(frow.end(), {oc.cd, oc.cl, oc.cdf});
                 }
-                (void)out.row("forces", frow);
+                out.row("forces", frow);
             }
-            if (r.pot && t > tQ)
+            if (r.pot && t > wake.tLast)
             {
                 const double Qinst = std::clamp(st.cd * r.qRef / r.uInf, 0.0,
                                                 2.0 * r.D * r.uInf);
-                const double alpha =
-                    std::min(1.0, (t - tQ) / (2.0 * r.D / r.uInf));
-                qEma += alpha * (Qinst - qEma);
-                tQ = t;
-                tunnel->setWakeSource(qEma);
+                tunnel->setWakeSource(wake.update(t, Qinst, r.D, r.uInf));
             }
         }
         stage(*dU, *dS, 0.75, dt);
         stage(*dS, *dU, 1.0 / 3.0, dt);
+        if (pcgDiverged)
+            return fail(7, "the pressure solve diverged (non-finite residual)");
 
         if (out.wantsAnyFrame(t)) writeFrame(t);
 
@@ -363,13 +357,8 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
                                * r.D / (r.uInf * r.uInf);
                     residValid = true;
                 }
-                const std::size_t nb = g.size() * sizeof(Real);
-                (void)hipMemcpy(dSnap->u.data(), dU->u.data(), nb,
-                                hipMemcpyDeviceToDevice);
-                (void)hipMemcpy(dSnap->v.data(), dU->v.data(), nb,
-                                hipMemcpyDeviceToDevice);
-                (void)hipMemcpy(dSnap->w.data(), dU->w.data(), nb,
-                                hipMemcpyDeviceToDevice);
+                if (copyField(*dSnap, *dU) != hipSuccess)
+                    return fail(6, "steady snapshot copy failed");
                 tSnap = t + dt;
             }
             const double K = kineticEnergy(gg, *dU, *red);
@@ -378,10 +367,20 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
             divergenceCut(gg, *dCut, *dU, scr->div, Real(1));
             if (!r.fringe) tunnel->addFluxRhs(*dU, 1.0, scr->div);
             const double maxDiv = maxAbsScalar(scr->div, *red);
+            if (auto h = internal::checkDevice("a stats row", &*red,
+                                               poisson->status());
+                !h)
+                return std::unexpected(h.error());
+            if (pcgUnconverged > 0)
+                std::fprintf(stderr,
+                             "dns: warning t=%.4g: %d of %d pressure solves "
+                             "stopped short of --tol since the last row\n",
+                             t, pcgUnconverged, pcgSolves);
+            pcgUnconverged = pcgSolves = 0;
             const double row[] = {t,       dt,     K,      st.cd,
                                   st.cl,   st.cdf, dt * conv, maxDiv,
                                   double(pcgIters), st.resid};
-            (void)out.row("stats", row);
+            out.row("stats", row);
             if (st.steps % (10 * r.statsEvery) == 0)
             {
                 std::printf("t=%.2f/%.2f cd=%.3f (cdf=%.3f) cl=%+.3f K=%.1f "
@@ -409,7 +408,10 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
                        + std::to_string(st.resid) + " > "
                        + std::to_string(r.steadyTol)
                        + "); raise --ft or relax --steady");
-    (void)hipDeviceSynchronize();
+    if (auto h = internal::checkDevice("the end of the run", &*red,
+                                       poisson->status());
+        !h)
+        return std::unexpected(h.error());
     finishTiming(st, wall0, out);
     return st;
 }

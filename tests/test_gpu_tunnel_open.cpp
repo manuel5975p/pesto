@@ -16,18 +16,15 @@
 #include "dns/cutcell.hpp"
 #include "dns/gpu/cutpoisson.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "gpu_test_util.hpp"
 #include "dns/gpu/tunnel.hpp"
 #include "validation_util.hpp"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <fstream>
-#include <sstream>
 #include <string>
 #include <vector>
-
-#include <sys/wait.h>
 
 #ifndef DNS_BIN
 #error "DNS_BIN must be defined (path to the dns binary)"
@@ -37,7 +34,6 @@ namespace {
 
 using dnstest::check;
 
-constexpr int skipExitCode = 77;
 
 
 // All-fluid cut geometry with the box boundary closed (the tunnel far field).
@@ -85,7 +81,7 @@ double freestreamDrift(const dns::Grid& g, int cycles, int& cgIters)
         bc->correctOutletFlux(*dU, *red, *tmp);
         gpu::divergenceCut(gg, *dCut, *dU, scr->div, gpu::Real(1.0 / dt));
         bc->addFluxRhs(*dU, 1.0 / dt, scr->div);
-        cgIters += poisson->solve(scr->div, scr->phi, true);
+        cgIters += poisson->solve(scr->div, scr->phi, true).iters;
         gpu::subtractGradientCut(gg, *dCut, scr->phi, gpu::Real(dt), *dU);
         bc->apply(*dU, *dU, 0.0);
     }
@@ -103,39 +99,7 @@ double freestreamDrift(const dns::Grid& g, int cycles, int& cgIters)
 
 int runApp(const std::string& args)
 {
-    const std::string cmd = "\"" DNS_BIN "\" flow --body cylinder " + args
-                          + " > /dev/null 2>&1";
-    const int rc = std::system(cmd.c_str());
-    if (rc == -1 || !WIFEXITED(rc)) return -1;
-    return WEXITSTATUS(rc);
-}
-
-struct Row
-{
-    double t, cd, maxDiv;
-};
-
-std::vector<Row> readStats(const std::string& prefix)
-{
-    std::vector<Row> rows;
-    std::ifstream f(prefix + "_stats.csv");
-    std::string line;
-    std::getline(f, line); // header
-    while (std::getline(f, line))
-    {
-        if (line.empty()) continue;
-        std::stringstream ls(line);
-        std::string cell;
-        double col[8]{};
-        bool ok = true;
-        for (int q = 0; q < 8 && ok; ++q)
-        {
-            ok = bool(std::getline(ls, cell, ','));
-            if (ok) col[q] = std::strtod(cell.c_str(), nullptr);
-        }
-        if (ok) rows.push_back({col[0], col[3], col[7]});
-    }
-    return rows;
+    return valtest::runBinary("\"" DNS_BIN "\" flow --body cylinder " + args);
 }
 
 void cleanup(const std::string& prefix)
@@ -151,11 +115,7 @@ int main()
 {
     using namespace dns;
 
-    if (!gpu::deviceAvailable())
-    {
-        std::printf("no HIP device, skipping\n");
-        return skipExitCode;
-    }
+    dns::test::requireDeviceOrSkip();
 
     // --- 1) freestream preservation, 2D ------------------------------------
     {
@@ -183,23 +143,26 @@ int main()
         const int rc = runApp("--far tunnel --open --n 256 --nz 1 --re 60 "
                               "--dr 8 --ft 2 --fdt 1e9 --out " + prefix);
         check(rc == 0, "--far tunnel --open run exits 0");
-        const auto rows = readStats(prefix);
-        check(rows.size() > 5, "stats CSV has data rows");
-        if (!rows.empty())
+        // By column NAME, never by index (the schema is documented that way).
+        const auto tab = valtest::loadCsv(prefix + "_stats.csv");
+        check(tab && tab->rows() > 5, "stats CSV has data rows");
+        if (tab && tab->rows() > 0)
         {
+            const auto& t = tab->col("t");
+            const auto& cd = tab->col("cd");
+            const auto& div = tab->col("maxDiv");
             double maxDiv = 0;
             bool finite = true;
-            for (const auto& r : rows)
+            for (std::size_t q = 0; q < tab->rows(); ++q)
             {
-                if (r.t > 1.0) maxDiv = std::max(maxDiv, r.maxDiv);
-                finite = finite && std::isfinite(r.cd);
+                if (t[q] > 1.0) maxDiv = std::max(maxDiv, div[q]);
+                finite = finite && std::isfinite(cd[q]);
             }
             std::printf("cd(t=%.2f) = %.4f, max maxDiv(t>1) = %.3e\n",
-                        rows.back().t, rows.back().cd, maxDiv);
+                        t.back(), cd.back(), maxDiv);
             check(finite, "cd finite throughout");
             check(maxDiv < 1e-3, "projection healthy (maxDiv < 1e-3 past start)");
-            check(rows.back().cd > 0.5 && rows.back().cd < 4.0,
-                  "cd in a sane startup band");
+            check(cd.back() > 0.5 && cd.back() < 4.0, "cd in a sane startup band");
         }
         cleanup(prefix);
     }

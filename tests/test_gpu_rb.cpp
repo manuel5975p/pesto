@@ -29,12 +29,15 @@
 
 #include "dns/gpu/boussinesq.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "gpu_test_util.hpp"
 #include "dns/gpu/hotpatch.hpp"
+#include "dns/gpu/runner_rb.hpp"
 #include "validation_util.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -48,7 +51,6 @@ namespace {
 
 using dnstest::check;
 
-constexpr int skipExitCode = 77;
 
 struct Tail
 {
@@ -131,11 +133,7 @@ bool sameFile(const std::string& a, const std::string& b)
 
 int main()
 {
-    if (!dns::gpu::deviceAvailable())
-    {
-        std::printf("no GPU device -- skipping\n");
-        return skipExitCode;
-    }
+    dns::test::requireDeviceOrSkip();
 
     // 0. The one thing a stats file cannot show: that the hot patch is counted
     //    over the FLUID cells. Its predicate is a fraction of the index range,
@@ -387,6 +385,32 @@ int main()
                         "(%.1f%%)\n", cl.nuBot, clc.nuBot, 100 * rel);
             check(rel < 0.15,
                   "closed sides: Boussinesq and compressible Nu agree to 15%");
+        }
+    }
+
+    // A NaN in the state is a diverged run (exit 7), not "a layer at rest":
+    // the dt rule read `cpd > 0 ? cfl/cpd : 1e30`, and a NaN Courant number
+    // fails `> 0` exactly like a quiescent one does.
+    {
+        const auto g = dns::Grid::make(16, 10, 1, 2.0, 1.25, 1.0);
+        auto U = dns::VectorField::zeros(g);
+        dns::Scalar T(g.size(), 0.0);
+        U.u[g.idx(5, 4, 0)] = std::nan("");
+        dns::gpu::RbRun rr;
+        rr.nu = std::sqrt(0.72 / 1e4);
+        rr.kappa = 1.0 / std::sqrt(1e4 * 0.72);
+        rr.tEnd = 1.0;
+        dns::RunOutput::Config oc;
+        oc.prefix = (std::filesystem::temp_directory_path() / "dns_rbnan").string();
+        oc.kinds = {dns::Emit::None};
+        auto out = dns::RunOutput::make(oc, {}, g, {});
+        check(out.has_value(), "NaN case: sink created");
+        if (out)
+        {
+            const auto st = dns::gpu::runRb(g, U, T, rr, *out);
+            std::printf("  NaN-seeded runRb: %s\n",
+                        st ? "ran to tEnd" : st.error().message.c_str());
+            check(!st && st.error().code == 7, "a NaN-seeded state exits 7");
         }
     }
 

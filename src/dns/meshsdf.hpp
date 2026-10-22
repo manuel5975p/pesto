@@ -9,12 +9,17 @@
 
 namespace dns {
 
+// True iff some triangle has area above the sliver threshold MeshSdf drops
+// (1e-14 of the squared bounding diagonal): the precondition of its ctor,
+// checkable on user input before construction. Pre: indices in range.
+bool meshHasArea(const TriMesh& mesh);
+
 class MeshSdf
 {
 public:
     // Builds the BVH and feature pseudonormals; robust switches the sign test
     // to the winding number (O(tris) per call, orientation/leak tolerant).
-    // Pre: mesh non-empty with outward CCW winding; degenerate tris dropped.
+    // Pre: meshHasArea(mesh), outward CCW winding; degenerate tris dropped.
     explicit MeshSdf(TriMesh mesh, bool robust = false);
 
     // Signed distance to the mesh surface, < 0 inside the solid.

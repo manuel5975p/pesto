@@ -153,11 +153,16 @@ double maxCourantPerDt(const Grid& g, const VectorField& U)
 {
     // Pointwise sum: SSP-RK3 + 2nd-order central is stable for
     // dt * max(|u|/hx + |v|/hy + |w|/hz) <= sqrt(3).
+    // A non-finite cell is +inf, never dropped: std::max(m, NaN) keeps m, which
+    // would let a diverged field pass for a finite Courant number.
     double m = 0.0;
     for (std::size_t c = 0; c < g.size(); ++c)
-        m = std::max(m, std::abs(U.u[c]) / g.hx
-                      + std::abs(U.v[c]) / g.hy
-                      + std::abs(U.w[c]) / g.hz);
+    {
+        const double s = std::abs(U.u[c]) / g.hx + std::abs(U.v[c]) / g.hy
+                       + std::abs(U.w[c]) / g.hz;
+        if (!std::isfinite(s)) return std::numeric_limits<double>::infinity();
+        m = std::max(m, s);
+    }
     return m;
 }
 

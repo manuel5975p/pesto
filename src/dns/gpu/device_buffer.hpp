@@ -46,11 +46,11 @@ public:
     std::size_t size() const { return n_; }
 
     // Full-buffer synchronous transfers; host must hold size() elements.
-    hipError_t upload(const T* host)
+    [[nodiscard]] hipError_t upload(const T* host)
     {
         return hipMemcpy(p_, host, n_ * sizeof(T), hipMemcpyHostToDevice);
     }
-    hipError_t download(T* host) const
+    [[nodiscard]] hipError_t download(T* host) const
     {
         return hipMemcpy(host, p_, n_ * sizeof(T), hipMemcpyDeviceToHost);
     }

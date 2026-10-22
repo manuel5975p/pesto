@@ -20,7 +20,7 @@
 #pragma once
 
 #include "dns/field.hpp"
-#include "dns/gpu/runner_incomp.hpp" // RunStats, RunError
+#include "dns/gpu/run_result.hpp" // RunStats, RunError
 #include "dns/output.hpp"
 
 #include <expected>

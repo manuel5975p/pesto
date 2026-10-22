@@ -55,7 +55,10 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
         addBodyForceX(gg, r.fBody, cmb.cr, dev->u(), out);
     });
 
-    (void)ds->upload(ic);
+    if (ds->upload(ic) != hipSuccess)
+        return fail(6, "initial condition upload failed");
+    if (auto h = internal::checkDevice("the initial condition"); !h)
+        return std::unexpected(h.error());
     wall->apply(*ds);
 
     // Host-side row geometry: physical cell-centre y and row heights.
@@ -70,10 +73,12 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
 
     const std::string cols[] = {"t",       "dt",      "ubulk", "utauBot",
                                 "utauTop", "retau",   "KE"};
-    out.declareSeries("stats", cols);
+    if (auto e = out.declareSeries("stats", cols); !e)
+        return fail(4, e.error());
     const std::string pcols[] = {"t",    "y",    "yplus", "uplus", "urms",
                                  "vrms", "wrms", "uv",    "rho",   "T"};
-    out.declareSeries("profiles", pcols);
+    if (auto e = out.declareSeries("profiles", pcols); !e)
+        return fail(4, e.error());
 
     // Log-law bulk-velocity estimate, resolved once in validate() (it also
     // sets pRef from the bulk Mach there); re-deriving it here would let the
@@ -84,8 +89,7 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     internal::FrameScratch fs;
     auto writeFrame = [&](double t) {
         if (!fs.ensure(g.size(), 2, true)) return;
-        primitiveVelocity(gg, ds->rho, ds->mx, ds->my, ds->mz, fs.u(), fs.v(),
-                          fs.w());
+        fs.centreFromConserved(gg, *ds);
         if (g.nz == 1) vorticityZRemap(gg, remap, fs.u(), fs.v(), fs.vort());
         else curlMagCentred(gg, fs.u(), fs.v(), fs.w(), fs.vort());
         speedCentred(gg, fs.u(), fs.v(), fs.w(), fs.speed());
@@ -95,7 +99,7 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
             {g.nz == 1 ? "vort" : "curl", fs.channel(0), 0, vortScale,
              g.nz == 1},
             {"speed", fs.channel(1), 0, speedMax, false}};
-        internal::FrameScratch::emit(out, t, ff);
+        fs.emit(out, t, ff);
     };
 
     DeviceBuffer<double> planeScratch;
@@ -105,12 +109,12 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     {
         double ubulk = 0, utauBot = 0, utauTop = 0, ke = 0;
     };
-    auto measure = [&]() -> std::expected<WallState, std::string> {
+    auto measure = [&]() -> std::expected<WallState, RunError> {
         dev->primitives(*ds);
         if (auto e = channelPlaneStats(gg, ds->rho, dev->u(), dev->v(),
                                        dev->w(), dev->T(), planeScratch, ps);
             e != hipSuccess)
-            return std::unexpected("plane stats download failed");
+            return fail(6, "plane stats download failed");
         WallState w;
         double mass = 0, mom = 0, ke = 0;
         for (int j = jLo; j <= jHi; ++j)
@@ -156,22 +160,16 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
                                   uv / (ut * ut),
                                   rhoM,
                                   TM};
-            (void)out.row("profiles", row);
+            out.row("profiles", row);
         }
     };
 
     RunStats st;
     double t = 0.0;
-    long lastLog = 0;
-    // The PRINT cadence needs its own counter. Sharing lastLog with the CSV
-    // cadence made the progress line unreachable: lastLog is reset every
-    // statsEvery steps, so `steps - lastLog >= 10 * statsEvery` was never true
-    // and the line appeared only at tEnd -- which left dns-ui's live plots
-    // empty for the whole run.
-    long lastPrint = 0;
+    internal::StatsCadence cad{r.statsEvery};
     double dtStab = 0.0;
     int sinceDt = 1 << 30;
-    double nextProf = r.profileDt > 0 ? r.profileDt : -1;
+    internal::ProfileSchedule prof(r.profileDt);
     const auto wall0 = std::chrono::steady_clock::now();
 
     while (t < r.tEnd)
@@ -195,12 +193,14 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
         t += dt;
         ++st.steps;
 
-        const bool statsDue = st.steps - lastLog >= r.statsEvery || t >= r.tEnd;
-        const bool profDue = nextProf >= 0 && (t >= nextProf || t >= r.tEnd);
+        const bool statsDue = cad.due(st.steps, t, r.tEnd);
+        const bool profDue = prof.due(t, r.tEnd);
         if (statsDue || profDue)
         {
             auto w = measure();
-            if (!w) return fail(7, w.error());
+            if (!w) return std::unexpected(w.error());
+            if (auto h = internal::checkDevice("a stats row", &*red); !h)
+                return std::unexpected(h.error());
             if (statsDue)
             {
                 const double retau =
@@ -208,27 +208,28 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
                 const double row[] = {t,          dt,         w->ubulk,
                                       w->utauBot, w->utauTop, retau,
                                       w->ke};
-                (void)out.row("stats", row);
-                if (st.steps - lastPrint >= 10 * r.statsEvery || t >= r.tEnd)
+                out.row("stats", row);
+                if (cad.printDue(st.steps, t, r.tEnd))
                 {
                     std::printf("t=%.2f/%.2f ub=%.2f Re_tau=%.1f "
                                 "(bot %.3f top %.3f) dt=%.2e\n",
                                 t, r.tEnd, w->ubulk, retau, w->utauBot,
                                 w->utauTop, dt);
                     std::fflush(stdout);
-                    lastPrint = st.steps;
+                    cad.printed(st.steps);
                 }
-                lastLog = st.steps;
+                cad.logged(st.steps);
             }
             if (profDue)
             {
                 emitProfiles(t, *w);
-                while (nextProf <= t) nextProf += r.profileDt;
+                prof.done(t);
             }
         }
         if (out.wantsAnyFrame(t)) writeFrame(t);
     }
-    (void)hipDeviceSynchronize();
+    if (auto h = internal::checkDevice("the end of the run", &*red); !h)
+        return std::unexpected(h.error());
     finishTiming(st, wall0, out);
     return st;
 }

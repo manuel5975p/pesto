@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -124,6 +125,35 @@ int main()
     // No mask pointer: whole image mapped.
     check(dns::writeSequentialPng(sPath, w, h, sf.data(), 0.0f, 2.0f, nullptr),
           "null mask accepted");
+
+    // Non-finite cells (a diverged field) must still give a valid image: the
+    // clamp and the colour cast used to be UB on NaN and read vir[a + 1] at
+    // an arbitrary a. NaN lands on the low end of either map; +-inf clips.
+    {
+        std::vector<float> bad(w * h, 0.5f);
+        bad[1 * w + 2] = std::numeric_limits<float>::quiet_NaN();
+        bad[1 * w + 3] = std::numeric_limits<float>::infinity();
+        bad[2 * w + 3] = -std::numeric_limits<float>::infinity();
+        check(dns::writeDivergingPng(dPath, w, h, bad.data(), 1.0f, nullptr),
+              "diverging write with NaN/inf succeeds");
+        auto dn = decode(dPath, w, h);
+        check(!dn.empty(), "diverging NaN/inf PNG structurally valid");
+        if (!dn.empty()) {
+            check(px(dn, w, h, 2, 1, 225, 240, 255), "NaN clips to the -scale end");
+            check(px(dn, w, h, 3, 1, 255, 240, 225), "+inf clips to +scale");
+            check(px(dn, w, h, 3, 2, 225, 240, 255), "-inf clips to -scale");
+        }
+        check(dns::writeSequentialPng(sPath, w, h, bad.data(), 0.0f, 2.0f,
+                                      nullptr),
+              "sequential write with NaN/inf succeeds");
+        auto sn = decode(sPath, w, h);
+        check(!sn.empty(), "sequential NaN/inf PNG structurally valid");
+        if (!sn.empty()) {
+            check(px(sn, w, h, 2, 1, 68, 1, 84), "NaN maps to viridis lo");
+            check(px(sn, w, h, 3, 1, 253, 231, 37), "+inf maps to viridis hi");
+            check(px(sn, w, h, 3, 2, 68, 1, 84), "-inf maps to viridis lo");
+        }
+    }
 
     std::remove(dPath);
     std::remove(sPath);

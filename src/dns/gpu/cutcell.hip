@@ -111,26 +111,17 @@ struct AbsDivCut
     }
 };
 
-std::expected<DeviceScalar, hipError_t> uploadNarrow(const Scalar& src)
-{
-    auto buf = DeviceScalar::make(src.size());
-    if (!buf) return buf;
-    std::vector<Real> tmp(src.begin(), src.end());
-    if (auto e = buf->upload(tmp.data()); e != hipSuccess) return std::unexpected(e);
-    return buf;
-}
-
 } // namespace
 
 std::expected<DeviceCutGeometry, hipError_t> DeviceCutGeometry::make(const CutGeometry& cut)
 {
-    auto lam = uploadNarrow(cut.lambda);
+    auto lam = makeNarrow(cut.lambda);
     if (!lam) return std::unexpected(lam.error());
-    auto ax = uploadNarrow(cut.ax);
+    auto ax = makeNarrow(cut.ax);
     if (!ax) return std::unexpected(ax.error());
-    auto ay = uploadNarrow(cut.ay);
+    auto ay = makeNarrow(cut.ay);
     if (!ay) return std::unexpected(ay.error());
-    auto az = uploadNarrow(cut.az);
+    auto az = makeNarrow(cut.az);
     if (!az) return std::unexpected(az.error());
     std::size_t nFluid = 0;
     for (double l : cut.lambda)

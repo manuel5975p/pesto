@@ -95,6 +95,15 @@ int main()
     accepts("flow --body cylinder --far tunnel --open --pot --n 512 --nz 1");
     rejects("flow --physics compressible --body cylinder --far sponge --pot");
     rejects("flow --body cylinder --far tunnel --pot"); // pot needs --open
+    // A non-finite number is a CLI error (exit 1): from_chars parses "nan" and
+    // "inf", and a NaN then passes every `x < lo` range check downstream.
+    dnstest::rejected({"flow", "--body", "cylinder", "--re", "nan"}, 1,
+                      "--re nan is a CLI error");
+    dnstest::rejected({"flow", "--body", "cylinder", "--physics", "compressible",
+                       "--mach", "inf"},
+                      1, "--mach inf is a CLI error");
+    dnstest::rejected({"flow", "--body", "cylinder", "--n", "-inf"}, 1,
+                      "--n -inf is a CLI error");
     rejects("flow --physics compressible --body cylinder --dr 3"); // below dr floor 4
     accepts("flow --physics compressible --body cylinder --dr 4 --far nscbc "
             "--n 512"); // D = L/4, smallest allowed compressible box

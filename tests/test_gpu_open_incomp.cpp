@@ -17,6 +17,7 @@
 // No HIP device -> skip (exit 77), probed via the app's own predicate.
 
 #include "dns/gpu/device_util.hpp"
+#include "gpu_test_util.hpp"
 #include "validation_util.hpp"
 
 #include <algorithm>
@@ -38,7 +39,6 @@ namespace {
 
 using dnstest::check;
 
-constexpr int skipExitCode = 77;
 
 // Drives the real binary through validation_util::runBinary -- this used to
 // be a private copy of it.
@@ -81,11 +81,7 @@ void cleanup(const std::string& prefix)
 
 int main()
 {
-    if (!dns::gpu::deviceAvailable())
-    {
-        std::printf("no HIP device, skipping\n");
-        return skipExitCode;
-    }
+    dns::test::requireDeviceOrSkip();
 
     // 16D x 16D open domain, D = 32 cells; t_end ~ 38 = ~96 D-times, past the
     // ~55 D-times the confined anchor needed to settle. --fdt huge = no

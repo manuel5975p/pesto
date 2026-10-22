@@ -52,17 +52,10 @@ runRb(const Grid& g, const VectorField& icU, const Scalar& icT, const RbRun& r,
         gg, r.closedSides ? PoissonBc::NeumannBox : PoissonBc::PeriodicXZWallY);
     if (!poisson) return fail(6, "pressure solver init failed");
 
-    {
-        std::vector<Real> h(g.size());
-        auto up = [&](const Scalar& src, DeviceScalar& dst) {
-            for (std::size_t c = 0; c < g.size(); ++c) h[c] = Real(src[c]);
-            (void)dst.upload(h.data());
-        };
-        up(icU.u, dU->u);
-        up(icU.v, dU->v);
-        up(icU.w, dU->w);
-        up(icT, *dT);
-    }
+    if (uploadField(icU, *dU) != hipSuccess || uploadNarrow(icT, *dT) != hipSuccess)
+        return fail(6, "initial condition upload failed");
+    if (auto h = internal::checkDevice("the initial condition"); !h)
+        return std::unexpected(h.error());
     applyRbWall(gg, Real(r.Tbot), Real(r.Ttop), Real(r.patch), r.closedSides,
                 *dU, *dT);
 
@@ -109,9 +102,11 @@ runRb(const Grid& g, const VectorField& icU, const Scalar& icT, const RbRun& r,
 
     const std::string cols[] = {"t",      "dt",   "nuBot", "nuTop",
                                 "nuFlux", "urms", "KE",    "maxDiv"};
-    out.declareSeries("stats", cols);
+    if (auto e = out.declareSeries("stats", cols); !e)
+        return fail(4, e.error());
     const std::string pcols[] = {"t", "y", "T", "v", "vT", "nu"};
-    out.declareSeries("profiles", pcols);
+    if (auto e = out.declareSeries("profiles", pcols); !e)
+        return fail(4, e.error());
 
     // Temperature frames ride the diverging map, so they need a reference that
     // reads as the NEUTRAL background. On a uniformly heated plate that is the
@@ -142,7 +137,7 @@ runRb(const Grid& g, const VectorField& icU, const Scalar& icT, const RbRun& r,
              g.nz == 1},
             {"speed", fs.channel(1), 0, speedMax, false},
             {"temp", fs.channel(2), -tempScale, tempScale, true}};
-        internal::FrameScratch::emit(out, t, ff);
+        fs.emit(out, t, ff);
     };
 
     DeviceBuffer<double> planeScratch;
@@ -152,10 +147,10 @@ runRb(const Grid& g, const VectorField& icU, const Scalar& icT, const RbRun& r,
     {
         double nuBot = 0, nuTop = 0, nuFlux = 0, urms = 0, ke = 0, maxDiv = 0;
     };
-    auto measure = [&]() -> std::expected<RbState, std::string> {
+    auto measure = [&]() -> std::expected<RbState, RunError> {
         if (auto e = rbPlaneStats(gg, r.closedSides, *dU, *dT, planeScratch, ps);
             e != hipSuccess)
-            return std::unexpected("plane stats download failed");
+            return fail(6, "plane stats download failed");
         RbState s;
         auto Tm = [&](int j) { return ps[j * 4 + 0] / planeCells; };
         const double d1 = 0.5 * g.hy, d2 = 1.5 * g.hy;
@@ -183,15 +178,9 @@ runRb(const Grid& g, const VectorField& icU, const Scalar& icT, const RbRun& r,
 
     RunStats st;
     double t = 0.0;
-    long lastLog = 0;
-    // The PRINT cadence needs its own counter. Sharing lastLog with the CSV
-    // cadence made the progress line unreachable: lastLog is reset every
-    // statsEvery steps, so `steps - lastLog >= 10 * statsEvery` was never true
-    // and the line appeared only at tEnd -- which left dns-ui's live plots
-    // empty for the whole run.
-    long lastPrint = 0;
-    double nextProf = r.profileDt > 0 ? r.profileDt : -1;
-    const double hmin = std::min({g.hx, g.hy, g.nz == 1 ? 1e30 : g.hz});
+    internal::StatsCadence cad{r.statsEvery};
+    internal::ProfileSchedule prof(r.profileDt);
+    const double hmin = hMin(g);
     // Explicit diffusive bound on the LARGER of the two diffusivities, and the
     // free-fall bound sqrt(h / (g alpha dT)) -- the latter is what limits the
     // very first steps, when the layer is at rest and the advective bound is
@@ -205,20 +194,23 @@ runRb(const Grid& g, const VectorField& icU, const Scalar& icT, const RbRun& r,
     {
         if (stopRequested()) break;
         const double cpd = maxCourantPerDt(gg, *dU, *red);
+        // A NaN Courant number is a diverged field, not a layer at rest: the
+        // `cpd > 0` test below would read it as the 1e30 sentinel.
+        if (!(cpd >= 0))
+            return fail(7, "the Courant number is not finite (the state "
+                           "diverged)");
         const double dtAdv = cpd > 0 ? r.cfl / cpd : 1e30;
         double dt = std::min({dtAdv, dtDiff, dtBuoy, r.tEnd - t});
         if (!(dt > 0) || !std::isfinite(dt))
             return fail(7, "stable dt is not finite and positive (the state "
                            "diverged)");
 
-        (void)hipMemcpy(dU0->u.data(), dU->u.data(), g.size() * sizeof(Real),
-                        hipMemcpyDeviceToDevice);
-        (void)hipMemcpy(dU0->v.data(), dU->v.data(), g.size() * sizeof(Real),
-                        hipMemcpyDeviceToDevice);
-        (void)hipMemcpy(dU0->w.data(), dU->w.data(), g.size() * sizeof(Real),
-                        hipMemcpyDeviceToDevice);
-        (void)hipMemcpy(dT0->data(), dT->data(), g.size() * sizeof(Real),
-                        hipMemcpyDeviceToDevice);
+        // The step's start state moves into U0/T0 by SWAP, not by four D2D
+        // copies: stage 1 rewrites every cell of dU/dT from U0/T0 alone, so
+        // what the swapped-out buffers held never matters (the incompressible
+        // runner does the same). `stage` dereferences at call time.
+        std::swap(*dU0, *dU);
+        std::swap(*dT0, *dT);
 
         stage(*dU0, *dT0, *dU, *dT, 0.0, dt);
         stage(*dU, *dT, *dS, *dTs, 0.75, dt);
@@ -226,30 +218,34 @@ runRb(const Grid& g, const VectorField& icU, const Scalar& icT, const RbRun& r,
         t += dt;
         ++st.steps;
 
-        const bool statsDue = st.steps - lastLog >= r.statsEvery || t >= r.tEnd;
-        const bool profDue = nextProf >= 0 && (t >= nextProf || t >= r.tEnd);
+        const bool statsDue = cad.due(st.steps, t, r.tEnd);
+        const bool profDue = prof.due(t, r.tEnd);
         if (statsDue || profDue)
         {
             auto s = measure();
-            if (!s) return fail(7, s.error());
+            if (!s) return std::unexpected(s.error());
             if (statsDue)
             {
                 divergence(gg, *dU, *dDiv, Real(1));
                 zeroGhostCells(gg, r.closedSides, *dDiv);
                 s->maxDiv = maxAbsScalar(*dDiv, *red);
+                if (auto h = internal::checkDevice("a stats row", &*red,
+                                                   poisson->status());
+                    !h)
+                    return std::unexpected(h.error());
                 const double row[] = {t,        dt,      s->nuBot, s->nuTop,
                                       s->nuFlux, s->urms, s->ke,    s->maxDiv};
-                (void)out.row("stats", row);
-                if (st.steps - lastPrint >= 10 * r.statsEvery || t >= r.tEnd)
+                out.row("stats", row);
+                if (cad.printDue(st.steps, t, r.tEnd))
                 {
                     std::printf("t=%.2f/%.2f Nu=%.3f/%.3f (flux %.3f) "
                                 "urms=%.3f dt=%.2e\n",
                                 t, r.tEnd, s->nuBot, s->nuTop, s->nuFlux,
                                 s->urms, dt);
                     std::fflush(stdout);
-                    lastPrint = st.steps;
+                    cad.printed(st.steps);
                 }
-                lastLog = st.steps;
+                cad.logged(st.steps);
             }
             if (profDue)
             {
@@ -269,14 +265,17 @@ runRb(const Grid& g, const VectorField& icU, const Scalar& icT, const RbRun& r,
                     }
                     const double row[] = {t,  (j - jLo + 0.5) * g.hy, Tbar,
                                           vBar, vT,                  nuLocal};
-                    (void)out.row("profiles", row);
+                    out.row("profiles", row);
                 }
-                while (nextProf <= t) nextProf += r.profileDt;
+                prof.done(t);
             }
         }
         if (out.wantsAnyFrame(t)) writeFrame(t);
     }
-    (void)hipDeviceSynchronize();
+    if (auto h = internal::checkDevice("the end of the run", &*red,
+                                       poisson->status());
+        !h)
+        return std::unexpected(h.error());
     finishTiming(st, wall0, out);
     return st;
 }

@@ -34,8 +34,6 @@ enum class SceneObjectKind { Cylinder, Sphere, Cube, Lens, Mesh };
 // the writer, the `unknown kind` message and the editor's picker all read it.
 std::span<const char* const> sceneObjectKindNames();
 const char* name(SceneObjectKind);
-// The inverse; nullopt when `s` is not a kind keyword.
-std::optional<SceneObjectKind> sceneObjectKindFromName(std::string_view s);
 
 struct SceneObject
 {

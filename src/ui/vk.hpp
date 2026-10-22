@@ -61,6 +61,9 @@ public:
     // not draw and comes back next iteration.
     bool beginFrame(const float clear[4]);
     void endFrame();
+    // A Vulkan call failed in a way no frame can recover from (device lost, a
+    // command buffer that would not begin or submit). Sticky; the app quits.
+    bool deviceLost() const { return deviceLost_; }
     // Call on SDL_EVENT_WINDOW_RESIZED / PIXEL_SIZE_CHANGED.
     void invalidateSwapchain() { swapchainDirty_ = true; }
 
@@ -143,6 +146,9 @@ private:
     uint32_t imageIndex_ = 0;
     bool swapchainDirty_ = false;
     bool frameOpen_ = false;
+    bool deviceLost_ = false;
+    // Upper bound on a frame-fence wait; past it the frame is skipped.
+    static constexpr uint64_t kFenceTimeoutNs = 5'000'000'000ull;
 
     VkCommandPool uploadPool_ = VK_NULL_HANDLE;
 };

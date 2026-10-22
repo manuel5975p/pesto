@@ -33,6 +33,16 @@ std::string Runner::start(const std::vector<std::string>& argv,
     if (argv.empty()) return "empty command";
     if (reader_.joinable()) reader_.join();
 
+    // Everything the child needs is built BEFORE fork: between fork and exec
+    // only async-signal-safe calls are allowed, and a vector allocation (or a
+    // std::string copy) in a child forked from a threaded process can deadlock
+    // on an allocator lock another thread held at the fork.
+    std::vector<char*> cargv;
+    cargv.reserve(argv.size() + 1);
+    for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
+    cargv.push_back(nullptr);
+    const char* const cdir = dir.empty() ? nullptr : dir.c_str();
+
     int fds[2];
     if (pipe(fds) != 0) return std::string("pipe: ") + std::strerror(errno);
 
@@ -52,16 +62,18 @@ std::string Runner::start(const std::vector<std::string>& argv,
         // Its own process group, so stop() can signal the whole run and not
         // the editor.
         setpgid(0, 0);
-        if (!dir.empty() && chdir(dir.c_str()) != 0) _exit(127);
-        std::vector<char*> cargv;
-        cargv.reserve(argv.size() + 1);
-        for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
-        cargv.push_back(nullptr);
+        if (cdir && chdir(cdir) != 0) _exit(127);
         execv(cargv[0], cargv.data());
         execvp(cargv[0], cargv.data());
         _exit(127);   // exec failed; the parent sees 127
     }
 
+    // The parent sets the group too: whichever of the two runs first, the
+    // group exists before stop() can signal it -- a stop() racing the child's
+    // own setpgid would otherwise signal a group that does not exist yet and
+    // leave the child running. (EACCES after the child's exec is harmless: it
+    // had already done it.)
+    setpgid(pid, pid);
     close(fds[1]);
     {
         std::lock_guard lk(mu_);

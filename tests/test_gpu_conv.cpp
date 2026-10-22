@@ -25,6 +25,7 @@
 // No HIP device -> skip (exit 77).
 
 #include "dns/gpu/device_util.hpp"
+#include "gpu_test_util.hpp"
 #include "validation_util.hpp"
 
 #include <algorithm>
@@ -42,7 +43,6 @@ namespace {
 
 using dnstest::check;
 
-constexpr int skipExitCode = 77;
 
 struct Tail
 {
@@ -106,11 +106,7 @@ Tail runCase(const std::string& name, double ra, int nx, int ny, double tt,
 
 int main()
 {
-    if (!dns::gpu::deviceAvailable())
-    {
-        std::printf("no GPU device -- skipping\n");
-        return skipExitCode;
-    }
+    dns::test::requireDeviceOrSkip();
 
     const double uff = freeFall(0.05, 0.1);
 

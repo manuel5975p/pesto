@@ -16,25 +16,13 @@
 #include "dns/gpu/index.hpp"
 #include "dns/gpu/kernels.hpp"
 
+#include <cstdio>
 #include <expected>
-#include <numbers>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace dns::gpu {
-
-// Centre-plane geometry for a periodic box; the caller hands it to
-// RunOutput::make.
-inline FrameGeometry periodicFrameGeometry(const Grid& g)
-{
-    FrameGeometry fg;
-    fg.ic = g.nx / 2;
-    fg.jc = g.ny / 2;
-    fg.kc = g.nz / 2;
-    fg.D = 2 * std::numbers::pi;
-    return fg;
-}
 
 class PeriodicFrames
 {
@@ -61,21 +49,29 @@ public:
 
     bool wants(double t) const { return out_->wantsFrame(t); }
 
-    void write(const GpuGrid& gg, const DeviceField& U, double t,
-               std::size_t n)
+    // Derives and writes one frame. A failed download skips the frame and a
+    // failed write is recorded by the sink; both are reported and the run
+    // continues (a frame is never worth a healthy run).
+    void write(const GpuGrid& gg, const DeviceField& U, double t)
     {
         vorticityZ(gg, U, *vort_);
         speedMac(gg, U, *speed_);
-        (void)vort_->download(hv_.data());
-        (void)speed_->download(hs_.data());
-        for (std::size_t c = 0; c < n; ++c)
+        if (vort_->download(hv_.data()) != hipSuccess
+            || speed_->download(hs_.data()) != hipSuccess)
+        {
+            std::fprintf(stderr, "frame at t=%.6g skipped: device download "
+                                 "failed\n", t);
+            return;
+        }
+        for (std::size_t c = 0; c < hv_.size(); ++c)
         {
             fv_[c] = float(hv_[c]);
             fs_[c] = float(hs_[c]);
         }
         const FrameField ff[2]{{"vort", fv_.data(), 0, 8, true},
                                {"speed", fs_.data(), 0, 2, false}};
-        (void)out_->frame(t, FrameViews{ff});
+        if (auto e = out_->frame(t, ff); !e)
+            std::fprintf(stderr, "frame write failed: %s\n", e.error().c_str());
     }
 
 private:

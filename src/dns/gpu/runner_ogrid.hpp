@@ -19,7 +19,7 @@
 #include "dns/sgs.hpp"
 #include "dns/transport.hpp"
 #include "dns/gpu/ogrid_bc.hpp"
-#include "dns/gpu/runner_incomp.hpp" // RunStats, RunError
+#include "dns/gpu/run_result.hpp" // RunStats, RunError
 
 #include <expected>
 
