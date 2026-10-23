@@ -5,7 +5,7 @@ Specs: `docs/nscbc.md`, `docs/validation.md`, `docs/viewer-format.md`, `docs/cha
 
 ## Ground rules
 
-- ONE solver binary: `build/dns <flow|tgv|hit|channel|conv|bench>`. The old 15 apps are gone. `dns --help` / `dns <sub> --help` are authoritative — read them, don't guess flags.
+- ONE solver binary: `build/dns <flow|tgv|hit|channel|conv|bench|prop>`. The old 15 apps are gone. `dns --help` / `dns <sub> --help` are authoritative — read them, don't guess flags.
 - `dns-ui` is the second binary and the only exception: scene editor, run cockpit and live viewer. It links `dns_core` ONLY — never `dns_gpu`, never a solver. It RUNS a case by spawning `dns` as a child process, and WATCHES it by mapping the shared-memory segment that run publishes. Keep it that way: the moment it links the GPU it stops being a front end. `docs/ui.md`.
 - Live results are shared memory, not files: `--emit shm` (`src/dns/shmframes.hpp`) publishes planes, the mask and the 3D volumes under a SEQLOCK — writer bumps odd, copies, bumps even. The solver NEVER blocks on a viewer; a dead viewer cannot slow a run. A reader copies between two equal even reads and discards a torn one. Volumes are capped at 512 MB; over budget the run publishes planes only.
 - `--dry-run` validates + prints the resolved case (and the DNS/LES label) without touching GPU or filesystem. Use it before every real run.

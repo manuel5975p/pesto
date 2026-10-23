@@ -4,6 +4,7 @@
 #pragma once
 
 #include "dns/grid.hpp"
+#include "dns/prop/spec.hpp"
 #include "dns/rotor.hpp"
 #include "dns/runmeta.hpp"
 #include "dns/sgs.hpp"
@@ -18,7 +19,7 @@
 
 namespace dns {
 
-enum class Subcommand { Flow, Tgv, Hit, Bench, Channel, Conv };
+enum class Subcommand { Flow, Tgv, Hit, Bench, Channel, Conv, Prop };
 enum class Physics { Incompressible, Compressible };
 enum class FarField { Tunnel, Fringe, Sponge, Nscbc, Periodic };
 enum class Backend { Cpu, Gpu, Auto };
@@ -237,6 +238,24 @@ struct RawConfig
 
     // bench
     int steps = 20;
+
+    // prop (host-only thrust curve; tools/bemt.py, tools/liftline.py). The
+    // operating point reuses --nu (kinematic viscosity, defaulted to air by
+    // the parser); hubRR 0 = the planform's first r/R.
+    int propMethod = 0;          // prop::Method
+    std::string planform, polar; // input CSVs; --polar thin = built-in
+    double thinCd0 = 0.02, thinAlpha0 = 0.0;
+    int blades = 3;
+    double hubRR = 0.0;
+    double diameter = 0.254, rpm = 6000.0, rho = 1.225, sound = 340.0;
+    std::string advance;         // --j: "a,b,c" or "start:stop:step"
+    double dumpSpan = 0.0;       // read iff --dump-span was given
+    int stationsBemt = 40;
+    int panels = 30, alignIters = 3;
+    double wakeLength = 10.0, alignTol = 0.01, segDeg = 10.0, core = 0.0,
+           stallVisc = 2.0;
+    int liftHub = 0, wakePitch = 0;   // prop::HubModel, prop::WakePitch
+    bool selftest = false;
 };
 
 // Fully resolved case. Every derived quantity is computed here, so downstream
@@ -373,6 +392,10 @@ public:
     // and the free-fall time is exactly 1. There is no Mach number and no
     // stratification here, so dtempSuper == dtemp and gravity is not a knob.
     double kappaDiff = 0;  // thermal diffusivity
+
+    // prop: the resolved thrust-curve case (dns/prop/spec.hpp). Host-only --
+    // `dns prop` never acquires a GPU.
+    prop::Case prop;
 
     std::string outPrefix;
     std::set<Emit> emit;

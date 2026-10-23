@@ -1,0 +1,108 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      snappyHexMeshDict;
+}
+
+castellatedMesh true;
+snap            true;
+addLayers       $addLayers;
+
+geometry
+{
+    propeller.stl { type triSurfaceMesh; name propeller; }
+    rotor
+    {
+        type cylinder;
+        point1 ($zx0 0 0);
+        point2 ($zx1 0 0);
+        radius $zr;
+    }
+    wake
+    {
+        type cylinder;
+        point1 ($zx0 0 0);
+        point2 ($wx1 0 0);
+        radius $zr;
+    }
+}
+
+castellatedMeshControls
+{
+    maxLocalCells       2000000;
+    maxGlobalCells      $maxCells;
+    minRefinementCells  0;
+    maxLoadUnbalance    0.10;
+    nCellsBetweenLevels 3;
+    features ( { file "propeller.eMesh"; level $lmax; } );
+    refinementSurfaces
+    {
+        propeller
+        {
+            level ($lmin $lmax);
+            patchInfo { type wall; }
+        }
+        rotor
+        {
+            level ($lzone $lzone);
+            faceType       internal;
+            faceZone       rotor;
+            cellZone       rotor;
+            cellZoneInside inside;
+        }
+    }
+    resolveFeatureAngle 20;
+    refinementRegions
+    {
+        rotor { mode inside; levels ((1e15 $lzone)); }
+        wake  { mode inside; levels ((1e15 $lwake)); }
+    }
+    locationInMesh $loc;
+    allowFreeStandingZoneFaces false;
+}
+
+snapControls
+{
+    nSmoothPatch 3;
+    tolerance 2.0;
+    nSolveIter 100;
+    nRelaxIter 5;
+    nFeatureSnapIter 10;
+    implicitFeatureSnap true;
+    explicitFeatureSnap false;
+    multiRegionFeatureSnap false;
+}
+
+addLayersControls
+{
+    relativeSizes true;
+    layers { $layers }
+    expansionRatio 1.2;
+    finalLayerThickness 0.5;
+    minThickness 0.1;
+    nGrow 0;
+    featureAngle 130;
+    slipFeatureAngle 30;
+    nRelaxIter 3;
+    nSmoothSurfaceNormals 1;
+    nSmoothNormals 3;
+    nSmoothThickness 10;
+    maxFaceThicknessRatio 0.5;
+    maxThicknessToMedialRatio 0.3;
+    minMedialAxisAngle 90;
+    nBufferCellsNoExtrude 0;
+    nLayerIter 50;
+}
+
+meshQualityControls
+{
+    #includeEtc "caseDicts/meshQualityDict"
+    minFaceWeight 0.02;
+    nSmoothScale 4;
+    errorReduction 0.75;
+    relaxed { maxNonOrtho 75; }
+}
+
+mergeTolerance 1e-6;

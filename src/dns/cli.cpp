@@ -145,17 +145,19 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                            c.physics = Physics::Compressible; c.kick = 0.02;
                            c.cfl = 0.4; c.mach = 0.05; c.tt = 30;
                            c.profileDt = 0.0; break;
+    // Air at 15 C, as tools/bemt.py.
+    case Subcommand::Prop: c.nu = 1.5e-5; break;
     }
 
-    // Numeric / string options valid in this subcommand.
-    std::vector<Opt> opts{
-        {"--out", &c.out},
-        {"--n", &c.n},
-        {"--nz", &c.nz},
-        {"--re", &c.re},
-        {"--ft", &c.ft},
-        {"--seed", &c.seed},
-    };
+    // Numeric / string options valid in this subcommand. prop is host-only
+    // and has no grid, so it takes none of the grid/run-length/seed flags.
+    std::vector<Opt> opts{{"--out", &c.out}};
+    if (c.sub != Subcommand::Prop)
+        opts.insert(opts.end(), {{"--n", &c.n},
+                                 {"--nz", &c.nz},
+                                 {"--re", &c.re},
+                                 {"--ft", &c.ft},
+                                 {"--seed", &c.seed}});
     auto add = [&](std::initializer_list<Opt> l) { opts.insert(opts.end(), l); };
 
     if (c.sub == Subcommand::Flow)
@@ -216,14 +218,32 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--profile-dt", &c.profileDt},
              {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
              {"--planes", &c.planes}, {"--png-down", &c.pngDown}});
+    if (c.sub == Subcommand::Prop)
+        add({{"--planform", &c.planform}, {"--polar", &c.polar},
+             {"--thin-cd0", &c.thinCd0}, {"--thin-alpha0", &c.thinAlpha0},
+             {"--blades", &c.blades}, {"--hub-radius", &c.hubRR},
+             {"--diameter", &c.diameter}, {"--rpm", &c.rpm}, {"--rho", &c.rho},
+             {"--nu", &c.nu}, {"--sound", &c.sound}, {"--j", &c.advance},
+             {"--dump-span", &c.dumpSpan}, {"--stations-bemt", &c.stationsBemt},
+             {"--panels", &c.panels}, {"--wake-length", &c.wakeLength},
+             {"--align-iters", &c.alignIters}, {"--align-tol", &c.alignTol},
+             {"--seg-deg", &c.segDeg}, {"--core", &c.core},
+             {"--stall-visc", &c.stallVisc}});
 
     int physicsSel = int(c.physics), farSel = int(c.far), backendSel = int(c.backend),
         sgsSel = int(c.sgs);
     int abcSel = int(c.nscbcAbc);
-    std::vector<EnumOpt> enums{
-        {"--backend", {{"cpu", int(Backend::Cpu)}, {"gpu", int(Backend::Gpu)},
-                       {"auto", int(Backend::Auto)}}, &backendSel},
-    };
+    std::vector<EnumOpt> enums;
+    // prop never touches a GPU, so it has no backend to choose.
+    if (c.sub != Subcommand::Prop)
+        enums.push_back({"--backend", {{"cpu", int(Backend::Cpu)}, {"gpu", int(Backend::Gpu)},
+                                       {"auto", int(Backend::Auto)}}, &backendSel});
+    if (c.sub == Subcommand::Prop)
+    {
+        enums.push_back({"--method", enumValues(prop::methodNames()), &c.propMethod});
+        enums.push_back({"--hub", enumValues(prop::hubModelNames()), &c.liftHub});
+        enums.push_back({"--wake-pitch", enumValues(prop::wakePitchNames()), &c.wakePitch});
+    }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench
         || c.sub == Subcommand::Conv)
         enums.push_back({"--physics", enumValues(physicsNames()), &physicsSel});
@@ -267,12 +287,13 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         flags.push_back({"--ogrid", &c.ogrid});
         flags.push_back({"--temp", &c.tempFrames});
     }
+    if (c.sub == Subcommand::Prop) flags.push_back({"--selftest", &c.selftest});
 
     std::vector<string> known;
     for (const auto& o : opts) known.emplace_back(o.name);
     for (const auto& e : enums) known.emplace_back(e.name);
     for (const auto& f : flags) known.emplace_back(f.first);
-    known.emplace_back("--emit");
+    if (c.sub != Subcommand::Prop) known.emplace_back("--emit");
     known.emplace_back("--help");
 
     auto err = [&](const string& m) {
@@ -289,7 +310,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         auto fl = std::ranges::find_if(flags, [&](auto& p) { return s == p.first; });
         if (fl != flags.end()) { *fl->second = true; c.given.insert(string(s)); continue; }
 
-        if (s == "--emit")
+        if (s == "--emit" && c.sub != Subcommand::Prop)
         {
             if (a + 1 >= argc) return err("option '--emit' requires a value");
             bool ok = false;
@@ -359,7 +380,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     c.far = FarField(farSel);
     c.sgs = SgsModel(sgsSel);
     c.nscbcAbc = NscbcAbc(abcSel);
-    if (!c.given.contains("--out")) c.out = string(sub);
+    // prop's --out is an optional CSV path: absent = no file.
+    if (!c.given.contains("--out") && c.sub != Subcommand::Prop) c.out = string(sub);
     return c;
 }
 
@@ -456,8 +478,9 @@ subcommands:
   channel wall-resolved turbulent channel flow (compressible, forced)
   conv    Rayleigh-Bénard convection: heated floor, cooled lid, gravity
   bench   step-time and throughput benchmark
+  prop    propeller thrust curve by BEMT or lifting line (host-only, no GPU)
 
-common options (every subcommand):
+common options (every subcommand; prop takes no --backend/--seed):
   --backend cpu|gpu|auto   compute backend                        [auto]
   --out PREFIX             output file/dir prefix           [<subcommand>]
   --seed N                 RNG seed for any stochastic input          [1]
@@ -1124,6 +1147,103 @@ R"(dns bench — step-time and throughput benchmark
   --les CS         compressible only: time the SGS path too          [off]
   --sgs smag|sigma which nut(grad u) --les uses                    [smag]
   Reports ms/step, Mcell-updates/s and the VRAM this run allocates.
+)";
+    case Subcommand::Prop:
+        return
+R"(dns prop — propeller thrust curve (CT, CP, CQ, eta vs J), host-only
+
+The cheap references a resolved rotor run is checked against, on the SAME
+blade: blade-element momentum and a lifting line. Never acquires a
+GPU. Conventions: shaft +x, freestream +x, +omega about +x. PROPULSIVE signs:
+T > 0 pulls upstream, Q > 0 is the motor torque, P = 2 pi n Q;
+CT = T/(rho n^2 D^4), CP = P/(rho n^3 D^5), CQ = CP/(2 pi), eta = J CT/CP
+(nan where CP <= 0 or J = 0).
+
+usage: dns prop --planform FILE --polar FILE|thin [--method bemt|liftline]
+                [operating point] [method options] [--out FILE.csv]
+       dns prop --method liftline --selftest
+
+METHOD
+  --method bemt|liftline                                           [bemt]
+    bemt      blade-element momentum: axial + tangential induction, Prandtl
+              tip AND hub loss, Buhl's turbulent-wake branch; inflow angle by
+              Ning's (2014) bracketed residual, so a root is guaranteed
+              wherever a bracket changes sign. J = 0 is the same equation.
+              Section Re frozen per solve, refreshed from the solved W (3
+              passes; 1 for the Re-free thin polar).
+    liftline  lifting line: one horseshoe per panel, constant-pitch helical
+              trailing wake realigned from the solution, Kerwin image hub,
+              Vatistas cores, Biot-Savart over all B blades -- tip loss and
+              blade interference come out of the vortex system, so a
+              disagreement with BEMT is information. Gamma by Newton (MINPACK
+              hybrd and pseudo-transient continuation behind it), Chattot
+              stall viscosity + homotopy from the saturated linear polar.
+              A J that does not converge is FLAGGED (converged = 0), never
+              smoothed over, and reported on stderr; the exit code stays 0.
+
+INPUTS (strict CSV: exact header, every row all finite numbers)
+  --planform FILE    r_R,c_R,beta_deg rows hub -> tip: r/R (tip radii),
+                     chord / tip radius, geometric pitch angle in deg. Linear
+                     in r/R, held constant past either end.  >= 2 rows,
+                     0 < r_R <= 1 strictly increasing, c_R > 0, |beta| < 90.
+                     tools/propeller.py exports it from its blade law.
+  --polar FILE       re,alpha_deg,cl,cd rows grouped by re ascending, alpha
+                     ascending over exactly -180..180 deg in each group
+                     (XFOIL + Viterna, tools/polars.py exports it).
+                     Interpolated linearly in alpha and in log Re, Re clamped
+                     to the table (never extrapolated).
+  --polar thin       built-in thin-airfoil polar: 2 pi (alpha - alpha0),
+                     constant cd0 on alpha0 +- 10 deg, Viterna past it
+                     (flat-plate cd 1.11 + 0.018 AR from the planform).
+                     Re-independent.
+  --thin-cd0 CD      --polar thin: profile drag, (0,1)              [0.02]
+  --thin-alpha0 DEG  --polar thin: zero-lift angle, (-10,10) deg; NACA
+                     4412 is -4.154                                    [0]
+
+BLADE AND OPERATING POINT (SI)
+  --blades N         blade count                                       [3]
+  --hub-radius F     hub radius / tip radius; the blade is integrated from
+                     the hub SURFACE            [the planform's first r/R]
+  --diameter D       m                                             [0.254]
+  --rpm RPM                                                         [6000]
+  --rho RHO          kg/m^3                                        [1.225]
+  --nu NU            kinematic viscosity, m^2/s                   [1.5e-5]
+  --sound C          speed of sound, m/s (station/tip Mach, reported) [340]
+  --j LIST           advance ratios J = V/(n D): 'a,b,c' or
+                     'start:stop:step' (stop inclusive), sorted, >= 0
+                                          [bemt 0:1:0.05, liftline 0:1.0:0.1]
+
+BEMT
+  --stations-bemt N  radial elements, cosine-clustered to root and tip,
+                     >= 4                                             [40]
+
+LIFTING LINE
+  --panels N         panels per blade, >= 4                            [30]
+  --wake-length L    helix length in diameters                         [10]
+  --align-iters N    wake realignments after the seed wake              [3]
+  --align-tol T      converged when the wake pitch moves less than this,
+                     relative, at every node                         [0.01]
+  --seg-deg A        helix segment angle, (0,30]; half on the first turn,
+                     double past one diameter                          [10]
+  --core R           vortex core radius in tip radii; 0 = 5% of the
+                     smallest control-point/node gap                    [0]
+  --hub image|none   image: Kerwin hub images (the hub is a wall, the root
+                     keeps its load); none: a free root end         [image]
+  --wake-pitch mean|local
+                     helix pitch from the circumferential-mean disk
+                     velocity of the vortex system, or the blade-local
+                     velocity (collapses behind a stalled root)      [mean]
+  --stall-visc K     Chattot artificial viscosity past stall, in units of
+                     the sawtooth stability bound; 0 = off              [2]
+  --selftest         Biot-Savart vs closed forms, the actuator-disk
+                     cylinder, Betz/Prandtl limits; exit 0 iff all pass
+
+OUTPUT
+  --out FILE.csv     J,CT,CP,CQ,eta,T_N,Q_Nm,P_W,Re75 (liftline adds
+                     converged). Omitted: the table on stdout only.
+  --dump-span J      also print the spanwise solution at this J
+  --quiet            no table on stdout (warnings still on stderr)
+  --dry-run          validate, print the resolved case; reads no file
 )";
     }
     return {};

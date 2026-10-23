@@ -51,6 +51,7 @@ add_library(dns_core
     src/dns/meshsdf.cpp
     src/dns/ogrid.cpp
     src/dns/poisson.cpp
+    src/dns/prop/spec.cpp
     src/dns/rotor.cpp
     src/dns/scene.cpp
     src/dns/shmframes.cpp
@@ -76,10 +77,25 @@ if(DNS_WITH_FFTW)
     target_compile_definitions(dns_core PUBLIC DNS_WITH_FFTW=1)
 endif()
 
+# `dns prop`: the propeller thrust-curve codes (BEMT, lifting line). Host-only
+# physics on top of dns_core's config layer, so dns-ui (dns_core only) never
+# carries them, and they never link dns_gpu.
+find_package(Threads REQUIRED)
+add_library(dns_prop
+    src/dns/prop/bemt.cpp
+    src/dns/prop/blade.cpp
+    src/dns/prop/csv.cpp
+    src/dns/prop/curve.cpp
+    src/dns/prop/liftline.cpp
+    src/dns/prop/numeric.cpp
+    src/dns/prop/polar.cpp
+)
+target_link_libraries(dns_prop PUBLIC dns_core PRIVATE Threads::Threads)
+
 # The one executable. Everything else in apps/ was deleted by the
 # recomposition; `dns <subcommand>` covers the whole former 15-binary surface.
 add_executable(dns apps/dns_main.cpp)
-target_link_libraries(dns PRIVATE dns_core)
+target_link_libraries(dns PRIVATE dns_core dns_prop)
 
 # The one GPU source list, shared by both backends.
 set(DNS_GPU_SOURCES
@@ -370,6 +386,22 @@ if(BUILD_TESTING)
     add_dependencies(test_errors dns)
     add_test(NAME errors COMMAND test_errors)
     set_tests_properties(errors PROPERTIES TIMEOUT 120)
+
+    # dns prop: library level (closed forms, Python equivalence fixtures, CSV
+    # and CLI rejections) and through the binary (exit codes, CSV). Host-only:
+    # neither skips without a GPU.
+    set(DNS_PROP_DATA ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/prop)
+    add_executable(test_prop tests/test_prop.cpp)
+    target_link_libraries(test_prop PRIVATE dns_prop)
+    target_compile_definitions(test_prop PRIVATE DNS_PROP_DATA="${DNS_PROP_DATA}")
+    add_test(NAME prop COMMAND test_prop)
+    set_tests_properties(prop PROPERTIES TIMEOUT 300)
+    add_executable(test_prop_cli tests/test_prop_cli.cpp)
+    target_compile_definitions(test_prop_cli PRIVATE DNS_BIN="$<TARGET_FILE:dns>"
+                               DNS_PROP_DATA="${DNS_PROP_DATA}")
+    add_dependencies(test_prop_cli dns)
+    add_test(NAME prop_cli COMMAND test_prop_cli)
+    set_tests_properties(prop_cli PROPERTIES TIMEOUT 300)
     if(DNS_WITH_FFTW)
         set_tests_properties(hit_mini PROPERTIES TIMEOUT 900
             LABELS "slow;validation;literature")

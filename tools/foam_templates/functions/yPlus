@@ -1,0 +1,7 @@
+    yPlus
+    {
+        type            yPlus;
+        libs            (fieldFunctionObjects);
+        writeControl    writeTime;
+        writeFields     false;
+    }

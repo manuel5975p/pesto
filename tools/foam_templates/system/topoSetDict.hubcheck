@@ -1,0 +1,22 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      topoSetDict;
+}
+
+actions
+(
+    {
+        name hubCore; type cellSet; action new;
+        source cylinderToCell;
+        point1 ($mhx 0 0); point2 ($hx 0 0); radius $rin;
+    }
+    { name hubFaces; type faceSet; action new; source patchToFace; patch propeller; }
+    {
+        name hubFaces; type faceSet; action subset; source cylinderToFace;
+        point1 ($mho 0 0); point2 ($ho 0 0); radius $hr;
+    }
+    { name $zone; type faceZoneSet; action new; source setToFaceZone; faceSet hubFaces; }
+);

@@ -1,0 +1,42 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      createPatchDict;
+}
+
+pointSync false;
+patches
+(
+    {
+        name perLo;
+        patchInfo
+        {
+            type            cyclicAMI;
+            neighbourPatch  perHi;
+            transform       rotational;
+            rotationAxis    (1 0 0);
+            rotationCentre  (0 0 0);
+            rotationAngle   $angle;
+            matchTolerance  0.0001;
+        }
+        constructFrom patches;
+        patches (perLo0);
+    }
+    {
+        name perHi;
+        patchInfo
+        {
+            type            cyclicAMI;
+            neighbourPatch  perLo;
+            transform       rotational;
+            rotationAxis    (1 0 0);
+            rotationCentre  (0 0 0);
+            rotationAngle   $mangle;
+            matchTolerance  0.0001;
+        }
+        constructFrom patches;
+        patches (perHi0);
+    }
+);

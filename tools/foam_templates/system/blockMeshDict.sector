@@ -1,0 +1,29 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      blockMeshDict;
+}
+
+scale 1;
+vertices
+(
+$vertices
+);
+blocks
+(
+$hexes
+);
+edges
+(
+$edges
+);
+boundary
+(
+    inlet  { type patch; faces ($inlet); }
+    outlet { type patch; faces ($outlet); }
+    sides  { type patch; faces ($sides); }
+    perLo0 { type patch; faces ($perlo); }
+    perHi0 { type patch; faces ($perhi); }
+);

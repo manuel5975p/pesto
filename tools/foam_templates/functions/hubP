@@ -1,0 +1,22 @@
+    hubPx
+    {
+        type            exprField;
+        libs            (fieldFunctionObjects);
+        field           hubPx;
+        action          new;
+        autowrite       false;
+        expression      "p*vector(1,0,0)";
+    }
+    hubP
+    {
+        type            surfaceFieldValue;
+        libs            (fieldFunctionObjects);
+        regionType      faceZone;
+        name            $zone;
+        operation       areaNormalIntegrate;
+        fields          (hubPx);
+        writeFields     false;
+        writeControl    timeStep;
+        writeInterval   1;
+        log             false;
+    }

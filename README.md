@@ -105,9 +105,11 @@ outlines come from `hb-draw`), no widget toolkit. Full description: `docs/ui.md`
 | `channel` | wall-resolved turbulent channel flow (compressible, forced; spec: `docs/channel.md`) |
 | `conv` | Rayleigh-Bénard convection: heated floor, cooled lid, gravity |
 | `bench` | step-time and throughput benchmark |
+| `prop` | propeller thrust curve by BEMT or lifting line — host-only, never a GPU |
 
 Common to every subcommand: `--backend cpu|gpu|auto` (auto), `--out PREFIX`
 (= subcommand name), `--seed N` (1), `--quiet`, `--dry-run`, `--help`.
+`prop` takes no `--backend`/`--seed` and its `--out` is an optional CSV path.
 
 `--config FILE.toml` supplies any of the above from a TOML run config —
 `n = 512` is `--n 512`, `re_tau` is `--re-tau`, `emit = ["stats","png"]`
@@ -398,6 +400,29 @@ already carried.
   controller (Carroll-Blanquart): stationary ⟨ε_visc⟩ = ε_f.
 * `bench`: `--n` 256, `--steps` 20 (after 3 warm-up), `--physics`. Reports
   ms/step, Mcell-updates/s, VRAM in use.
+
+### `prop` — propeller thrust curve (host-only)
+
+    dns prop --method bemt|liftline --planform P.csv --polar Q.csv|thin \
+             --blades 2 --diameter 0.254 --rpm 6000 --j 0:0.95:0.05 --out curve.csv
+
+Two cheap thrust-curve methods: BEMT (Ning residual, Prandtl tip + hub
+loss, Buhl branch) and a lifting line (helical wake
+realigned from the solution, image hub, Vatistas cores, Newton → MINPACK
+hybrd → pseudo-transient continuation, stall viscosity + homotopy). Links
+`dns_prop` (host library on `dns_core`), never `dns_gpu`; never exit 5.
+Inputs are two strict CSVs exported by the Python tools: `--planform`
+(`r_R,c_R,beta_deg`, hub → tip, chord in TIP RADII) and `--polar`
+(`re,alpha_deg,cl,cd`, Re ascending, each group over exactly −180..180°,
+Viterna-extended); `--polar thin` is the built-in thin-airfoil polar
+(`--thin-cd0`, `--thin-alpha0` = the section's zero-lift angle, which the CSV
+does not carry). Output `J,CT,CP,CQ,eta,T_N,Q_Nm,P_W,Re75[,converged]`,
+propulsive signs. A lifting-line J that does not converge is flagged
+(`converged` 0, stderr), not an error. `--method liftline --selftest` runs the
+Biot-Savart / actuator-disk / Betz checks. Measured against the Python on the
+same inputs (2-blade NACA 4412 P/D 0.8 and the UIUC DA4002, XFOIL and thin
+polars): BEMT to ≤ 3e-15, lifting line to ≤ 3e-14 relative, at ~50× the speed
+(`test_prop` pins it). `dns prop --help` has every flag.
 
 ### Strictness, exit codes, `--dry-run`
 

@@ -1,0 +1,15 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       $cls;
+    location    "0";
+    object      $name;
+}
+
+dimensions $dim;
+internalField $internal;
+boundaryField
+{
+    #includeEtc "caseDicts/setConstraintTypes"
+$patches}
