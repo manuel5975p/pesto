@@ -507,14 +507,14 @@ int runFlowCompressible(const Case& c, CaseGeometry& geo)
     return reportDone(*res, *out);
 }
 
-#endif // DNS_WITH_GPU
-
 
 // Grid sequencing: converge on n/2^(L-1), prolong, repeat, finish on n. Each
 // level is a normally validated Case -- the ladder reuses validate() rather
 // than hand-editing a Case, so no level can skip a check. Only the finest
-// level writes output and only its result is reported.
-int runFlowSequenced(const Case& c, const RawConfig& raw, const Scene* scene)
+// level writes output and only its result is reported. `fine` is the finest
+// level's geometry, already built by runFlow; only the coarse ones are built here.
+int runFlowSequenced(const Case& c, const RawConfig& raw, const Scene* scene,
+                     CaseGeometry& fine)
 {
     const int L = c.seqLevels;
     VectorField carry = VectorField::zeros(c.grid);   // replaced at level 0
@@ -535,8 +535,15 @@ int runFlowSequenced(const Case& c, const RawConfig& raw, const Scene* scene)
         auto lc = validate(lr);
         if (!lc) { std::fputs(format(lc.error()).c_str(), stderr); return lc.error().code; }
 
-        auto geo = buildCaseGeometry(*lc, scene);
-        if (!geo) return die(exitInput, geo.error());
+        const bool last = l == L - 1;
+        std::optional<CaseGeometry> coarse;
+        if (!last)
+        {
+            auto g = buildCaseGeometry(*lc, scene);
+            if (!g) return die(exitInput, g.error());
+            coarse = std::move(*g);
+        }
+        CaseGeometry& geo = last ? fine : *coarse;
 
         VectorField prolonged = VectorField::zeros(lc->grid);
         if (l > 0)
@@ -545,14 +552,13 @@ int runFlowSequenced(const Case& c, const RawConfig& raw, const Scene* scene)
             ic = &prolonged;
         }
 
-        const bool last = l == L - 1;
         std::printf("# seq level %d/%d: n=%d h=%.6g (%.1f cells/D)%s\n", l + 1, L,
                     lc->n, lc->h, lc->placement.D / lc->h,
                     last ? "  [final]" : "");
         std::fflush(stdout);
 
         VectorField fin = VectorField::zeros(lc->grid);
-        const int rc = runFlowIncompressible(*lc, *geo, ic, last ? nullptr : &fin,
+        const int rc = runFlowIncompressible(*lc, geo, ic, last ? nullptr : &fin,
                                              !last);
         if (rc != 0) return rc;
         if (!last)
@@ -565,15 +571,18 @@ int runFlowSequenced(const Case& c, const RawConfig& raw, const Scene* scene)
     return 0;
 }
 
-int runFlow(const Case& c, const RawConfig& raw, const Scene* scene)
+#endif // DNS_WITH_GPU
+
+int runFlow(const Case& c, [[maybe_unused]] const RawConfig& raw, const Scene* scene)
 {
+    // Input before device: a bad mesh is exit 3 on every machine, GPU or not.
+    [[maybe_unused]] const auto t0 = std::chrono::steady_clock::now();
+    auto geo = buildCaseGeometry(c, scene);
+    if (!geo) return die(exitInput, geo.error());
     if (!haveGpu(c))
         return die(exitNoGpu, "no GPU device (dns flow is GPU-only)");
 #if DNS_WITH_GPU
-    if (c.seqLevels > 1) return runFlowSequenced(c, raw, scene);
-    const auto t0 = std::chrono::steady_clock::now();
-    auto geo = buildCaseGeometry(c, scene);
-    if (!geo) return die(exitInput, geo.error());
+    if (c.seqLevels > 1) return runFlowSequenced(c, raw, scene, *geo);
     std::printf("# geometry built in %.2f s (D = %.4f, %.1f cells)\n",
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
                     .count(),
@@ -641,8 +650,8 @@ int runChannel(const Case& c)
 // share no physics code, but they write the same artefacts with the same
 // metadata and the same centre planes -- so the sink is built once and the
 // only thing either branch supplies is its own ghost mask.
-std::expected<RunOutput, std::string> convOutput(const Case& c,
-                                                 std::vector<float> mask)
+[[maybe_unused]] std::expected<RunOutput, std::string> convOutput(const Case& c,
+                                                                  std::vector<float> mask)
 {
     FrameGeometry fg = FrameGeometry::centred(c.grid, c.convH);
     fg.mask = std::move(mask);

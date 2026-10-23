@@ -145,7 +145,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                            c.physics = Physics::Compressible; c.kick = 0.02;
                            c.cfl = 0.4; c.mach = 0.05; c.tt = 30;
                            c.profileDt = 0.0; break;
-    // Air at 15 C, as tools/bemt.py.
+    // Air at 15 C.
     case Subcommand::Prop: c.nu = 1.5e-5; break;
     }
 

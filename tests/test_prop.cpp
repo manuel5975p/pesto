@@ -1,7 +1,7 @@
 // dns prop, library level: the thin-airfoil polar and the planform against
 // their closed forms, BEMT's own consistency identities, the lifting-line
 // self-test, CSV and CLI rejections, and EQUIVALENCE with the Python codes it
-// ports (tools/bemt.py, tools/liftline.py) on pinned fixtures.
+// ports (the retired tools/bemt.py, tools/liftline.py) on pinned fixtures.
 //
 // The fixtures in tests/data/prop were produced by the Python tools on
 // exactly these planform/polar CSVs (reduced XFOIL tables, 2 Re each, 7

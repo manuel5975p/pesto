@@ -2046,7 +2046,7 @@ double round12(double x)
     return v;
 }
 
-// --j: "a,b,c" or "start:stop:step" (stop inclusive, bemt.py's rule) ->
+// --j: "a,b,c" or "start:stop:step" (stop inclusive) ->
 // sorted, de-duplicated, every J >= 0. Python's parse_j, made strict: an
 // empty list item is an error, not skipped.
 std::expected<std::vector<double>, ConfigError> parseAdvance(std::string_view s)

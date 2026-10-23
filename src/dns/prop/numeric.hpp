@@ -1,5 +1,5 @@
 // The numpy / scipy primitives the propeller codes are written in, with THEIR
-// semantics, so the C++ port reproduces tools/bemt.py and tools/liftline.py to
+// semantics, so the C++ port reproduces the retired Python bemt.py/liftline.py to
 // rounding: np.interp's clamping and exact-node rules, np.mod's sign, np.arange
 // and np.linspace's element formulas, numpy's pairwise sum, scipy's brentq and
 // MINPACK's hybrd (scipy.optimize.root(method="hybr")). Internal to dns/prop.

@@ -239,7 +239,7 @@ struct RawConfig
     // bench
     int steps = 20;
 
-    // prop (host-only thrust curve; tools/bemt.py, tools/liftline.py). The
+    // prop (host-only thrust curve: BEMT, lifting line). The
     // operating point reuses --nu (kinematic viscosity, defaulted to air by
     // the parser); hubRR 0 = the planform's first r/R.
     int propMethod = 0;          // prop::Method

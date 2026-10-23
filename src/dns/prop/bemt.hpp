@@ -1,4 +1,4 @@
-// Blade-element momentum theory, the port of tools/bemt.py: axial and
+// Blade-element momentum theory (ported from the retired tools/bemt.py): axial and
 // tangential induction, Prandtl tip x hub loss, Buhl's turbulent-wake branch,
 // and Ning's (2014) one-variable residual in phi solved by a bracketed brentq,
 // so a root is guaranteed wherever a bracket changes sign. J = 0 is the same
@@ -50,7 +50,7 @@ struct BemtResult
 BemtResult bemtSolve(double J, const BemtBlade& bl, const Operating& op,
                      const Polar& polar);
 
-// The whole curve over c.js, plus the advisories bemt.py prints.
+// The whole curve over c.js, plus the run advisories.
 struct BemtCurve
 {
     std::vector<CurvePoint> rows;
@@ -60,7 +60,7 @@ struct BemtCurve
 };
 BemtCurve bemtCurve(const Case& c, const BemtBlade& bl, const Polar& polar);
 
-// The --dump-span table at J (bemt.py's format).
+// The --dump-span table at J.
 std::string bemtSpanTable(double J, const BemtBlade& bl, const BemtResult& res);
 
 } // namespace dns::prop

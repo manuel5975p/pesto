@@ -1,4 +1,4 @@
-// Lifting-line propeller analysis, the port of tools/liftline.py: B blades,
+// Lifting-line propeller analysis (ported from the retired tools/liftline.py): B blades,
 // one horseshoe per panel on the radial quarter-chord line, a prescribed
 // constant-pitch helical wake per trailing vortex realigned from the solution,
 // Kerwin image hub, Vatistas (n = 2) cores, Biot-Savart over the whole vortex
@@ -58,7 +58,7 @@ struct LiftCurve
 };
 LiftCurve liftlineCurve(const Case& c, const LiftGeometry& geo, const Polar& polar);
 
-// The --dump-span table (liftline.py's format).
+// The --dump-span table.
 std::string liftlineSpanTable(double J, const LiftGeometry& geo, const LiftPoint& p);
 
 // Biot-Savart against closed forms, then the vortex system against the

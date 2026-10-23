@@ -345,7 +345,7 @@ public:
         return 0.0;
     }
 
-    // Hydrodynamic pitch at the nodes for the next wake (see liftline.py).
+    // Hydrodynamic pitch at the nodes for the next wake.
     Vec tanb(const State& s, const Vec& tanb, WakePitch mode) const
     {
         const Vec& nodes = geo_.nodes;
