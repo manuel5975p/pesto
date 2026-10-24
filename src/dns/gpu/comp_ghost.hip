@@ -353,6 +353,27 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                     (bbox && farFromBox(x, y, z)) ? outer : sdf(x, y, z);
             }
 
+    // The flux stencil of a fluid cell: its face neighbours and its EDGE
+    // neighbours (faceFlux reads the normal pair plus the tangential averages
+    // of both; no corner). Every solid cell in it is read by the fluid's own
+    // update, so it must carry the wall image -- a deep cell there is a
+    // resting wall at pInf the fluid feels and, on a face, a piece of the
+    // surface the tally never reads (an OPEN surface: measured on a 3-blade
+    // prop mesh, 16% of the wetted faces and a spurious CT of +0.025 from pInf
+    // alone). At nz == 1 the z steps wrap onto the cell itself and are skipped.
+    std::vector<std::array<int, 3>> reach;
+    for (int dk = (nz == 1 ? 0 : -1); dk <= (nz == 1 ? 0 : 1); ++dk)
+        for (int dj = -1; dj <= 1; ++dj)
+            for (int di = -1; di <= 1; ++di) {
+                const int nnz = (di != 0) + (dj != 0) + (dk != 0);
+                if (nnz == 1 || nnz == 2) reach.push_back({di, dj, dk});
+            }
+    auto inFluidReach = [&](int i, int j, int k) {
+        return std::ranges::any_of(reach, [&](const std::array<int, 3>& s) {
+            return phi[g.idx(i + s[0], j + s[1], k + s[2])] >= 0.0;
+        });
+    };
+
     CompGhostTables T;
     auto& gcell = T.gcell;
     auto& gnbr = T.gnbr;
@@ -366,6 +387,124 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
     auto& fpos = T.fpos;
     std::vector<char> isGhost(g.size(), 0);
 
+    // One ghost's image: up to 8 fluid source cells and their weights (wsum
+    // their sum, normalized at push), the extrapolation ratio a = dw/dsmp, and
+    // the wall point where the surface velocity is sampled.
+    struct Image
+    {
+        int nb[8];
+        double w[8];
+        double wsum, a;
+        double wall[3];
+    };
+
+    // The normal-sampled image: a sample point ds beyond the wall along the
+    // sdf normal, trilinear over the fluid cells around it. False when it is
+    // unusable -- deeper than the mirror band, a degenerate normal, or a
+    // sample landing among solid cells (thin bodies, concave junctions, an
+    // sdf that is not a distance).
+    auto normalImage = [&](std::size_t c, int i, int j, int k,
+                           const double dloc[3], Image& im) {
+        const double hl = minSpacing(dloc);
+        // The mirror band must be at least two cells deep along EVERY axis:
+        // the interior stencil reaches two cells, and a quiescent deep-solid
+        // cell inside its reach is a hard discontinuity against the fluid.
+        // The threshold therefore follows the WIDEST local spacing -- with
+        // the smallest, an anisotropic fine region leaves the band under two
+        // cells thick along the wide axis (measured on the Re100 cylinder at
+        // aspect 1.7: cd 1.49 -> -7.6, a spurious thrust). Isotropic cells
+        // make the two identical, so the Cartesian construction is untouched.
+        if (phi[c] < -2.0 * maxSpacing(dloc)) return false;
+        const double x = cx(i), y = cy(j), z = cz(k);
+        const double d = 1e-3 * hl;
+        double nv[3] = {(sdf(x + d, y, z) - sdf(x - d, y, z)) / (2 * d),
+                        (sdf(x, y + d, z) - sdf(x, y - d, z)) / (2 * d),
+                        (sdf(x, y, z + d) - sdf(x, y, z - d)) / (2 * d)};
+        if (nz == 1) nv[2] = 0.0;
+        const double nn =
+            std::sqrt(nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2]);
+        if (nn < 1e-12) return false;
+        for (double& v : nv) v /= nn;
+        // Sample at ds beyond the wall (>= 0.75 of the finest local spacing so
+        // the stencil always reaches fluid, even for cells barely inside).
+        const double dw = -phi[c];
+        const double dsmp = std::max(dw, 0.75 * hl);
+        // The sample point is a PHYSICAL offset along the physical normal; the
+        // per-axis inverse takes it back to reference space, where the
+        // cell-centre lattice is uniform and the trilinear weights are the
+        // Cartesian ones. The map is box-preserving, so the physical wrap is
+        // the reference wrap.
+        const double xi = R.fx.inverse(pmod(x + (dw + dsmp) * nv[0], Lx));
+        const double yi = R.fy.inverse(pmod(y + (dw + dsmp) * nv[1], Ly));
+        const double zi = R.fz.inverse(pmod(z + (dw + dsmp) * nv[2], Lz));
+        // Trilinear over cell centres, fluid cells only, renormalized.
+        const double fx = xi / hx - 0.5, fy = yi / hy - 0.5, fz = zi / hz - 0.5;
+        const int i0 = int(std::floor(fx)), j0 = int(std::floor(fy)),
+                  k0 = int(std::floor(fz));
+        const double ax = fx - i0, ay = fy - j0, az = fz - k0;
+        im.wsum = 0.0;
+        for (int s = 0; s < 8; ++s) {
+            const int sx = s & 1, sy = (s >> 1) & 1, sz = s >> 2;
+            const std::size_t cc =
+                g.idx((i0 + sx + nx) % nx, (j0 + sy + ny) % ny,
+                      ((k0 + sz) % nz + nz) % nz);
+            const double ww =
+                (sx ? ax : 1 - ax) * (sy ? ay : 1 - ay) * (sz ? az : 1 - az);
+            im.nb[s] = int(cc);
+            im.w[s] = phi[cc] > 0.0 ? ww : 0.0;
+            im.wsum += im.w[s];
+        }
+        if (im.wsum < 0.05) return false;
+        im.a = dw / dsmp;
+        // Wall velocity at the FOOT OF THE NORMAL, not at the ghost centre:
+        // that point is on the surface, so a rotor's omega x r there is the
+        // actual surface speed the fluid sees.
+        im.wall[0] = x + dw * nv[0];
+        im.wall[1] = y + dw * nv[1];
+        im.wall[2] = z + dw * nv[2];
+        return true;
+    };
+
+    // The neighbour image, for a cell the fluid's flux READS but whose normal
+    // sample is unusable: the cell's own fluid face neighbours (edge
+    // neighbours when it has none -- it has one of the two by construction),
+    // equally weighted, at most 8 in stencil order. The wall sits where the
+    // sdf, linear along the step from the ghost to the sample centroid,
+    // crosses zero, so a = dw/dsmp = -phi_g / phi_s -- the normal image's own
+    // ratio wherever the sdf is a distance -- capped at 1 like the normal
+    // image's (dsmp >= dw there). The cap also bounds it where the sdf is not
+    // a distance (the very cells that land here): a in [0, 1] is always a
+    // damped mirror. The velocity is sampled at that wall point.
+    auto neighbourImage = [&](std::size_t c, int i, int j, int k,
+                              const double dloc[3], Image& im) {
+        int m = 0;
+        double phiS = 0.0, disp[3] = {0.0, 0.0, 0.0};
+        for (int order = 1; order <= 2 && m == 0; ++order)
+            for (const auto& s : reach) {
+                if (m == 8) break;
+                if (std::abs(s[0]) + std::abs(s[1]) + std::abs(s[2]) != order)
+                    continue;
+                const std::size_t cc = g.idx(i + s[0], j + s[1], k + s[2]);
+                if (phi[cc] < 0.0) continue;
+                im.nb[m] = int(cc);
+                phiS += phi[cc];
+                for (int q = 0; q < 3; ++q) disp[q] += s[q] * dloc[q];
+                ++m;
+            }
+        assert(m > 0 && "neighbourImage: caller checked inFluidReach");
+        for (int s = 0; s < 8; ++s) {
+            im.w[s] = s < m ? 1.0 : 0.0;
+            if (s >= m) im.nb[s] = im.nb[0];
+        }
+        im.wsum = double(m);
+        phiS /= m;
+        const double dw = -phi[c];
+        im.a = phiS > 0.0 ? std::min(1.0, dw / phiS) : 1.0;
+        const double t = im.a / (1.0 + im.a);
+        const double p[3] = {cx(i), cy(j), cz(k)};
+        for (int q = 0; q < 3; ++q) im.wall[q] = p[q] + t * disp[q] / m;
+    };
+
     for (int k = 0; k < nz; ++k)
         for (int j = 0; j < ny; ++j)
             for (int i = 0; i < nx; ++i) {
@@ -376,84 +515,26 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                 // thresholds must follow the cells that are actually there.
                 double dloc[3];
                 localSpacing(i, j, k, dloc);
-                const double hl = minSpacing(dloc);
-                // The mirror band must be at least two cells deep along
-                // EVERY axis: the interior stencil reaches two cells, and a
-                // quiescent deep-solid cell inside its reach is a hard
-                // discontinuity against the fluid. The threshold therefore
-                // follows the WIDEST local spacing -- with the smallest, an
-                // anisotropic fine region leaves the band under two cells
-                // thick along the wide axis (measured on the Re100 cylinder
-                // at aspect 1.7: cd 1.49 -> -7.6, a spurious thrust).
-                // Isotropic cells make the two identical, so the Cartesian
-                // construction is untouched.
-                if (phi[c] < -2.0 * maxSpacing(dloc)) {
-                    deep.push_back(int(c));
-                    continue;
-                }
-                const double x = cx(i), y = cy(j), z = cz(k);
-                const double d = 1e-3 * hl;
-                double nv[3] = {(sdf(x + d, y, z) - sdf(x - d, y, z)) / (2 * d),
-                                (sdf(x, y + d, z) - sdf(x, y - d, z)) / (2 * d),
-                                (sdf(x, y, z + d) - sdf(x, y, z - d)) / (2 * d)};
-                if (nz == 1) nv[2] = 0.0;
-                const double nn =
-                    std::sqrt(nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2]);
-                if (nn < 1e-12) {
-                    deep.push_back(int(c));
-                    continue;
-                }
-                for (double& v : nv) v /= nn;
-                // Sample at ds beyond the wall (>= 0.75 of the finest local
-                // spacing so the stencil always reaches fluid, even for cells
-                // barely inside).
-                const double dw = -phi[c];
-                const double dsmp = std::max(dw, 0.75 * hl);
-                // The sample point is a PHYSICAL offset along the physical
-                // normal; the per-axis inverse takes it back to reference
-                // space, where the cell-centre lattice is uniform and the
-                // trilinear weights are the Cartesian ones. The map is
-                // box-preserving, so the physical wrap is the reference wrap.
-                const double xi = R.fx.inverse(pmod(x + (dw + dsmp) * nv[0], Lx));
-                const double yi = R.fy.inverse(pmod(y + (dw + dsmp) * nv[1], Ly));
-                const double zi = R.fz.inverse(pmod(z + (dw + dsmp) * nv[2], Lz));
-                // Trilinear over cell centres, fluid cells only, renormalized.
-                const double fx = xi / hx - 0.5, fy = yi / hy - 0.5,
-                             fz = zi / hz - 0.5;
-                const int i0 = int(std::floor(fx)), j0 = int(std::floor(fy)),
-                          k0 = int(std::floor(fz));
-                const double ax = fx - i0, ay = fy - j0, az = fz - k0;
-                int nb[8];
-                double w[8];
-                double wsum = 0.0;
-                for (int s = 0; s < 8; ++s) {
-                    const int sx = s & 1, sy = (s >> 1) & 1, sz = s >> 2;
-                    const std::size_t cc =
-                        g.idx((i0 + sx + nx) % nx, (j0 + sy + ny) % ny,
-                              ((k0 + sz) % nz + nz) % nz);
-                    const double ww = (sx ? ax : 1 - ax) * (sy ? ay : 1 - ay) *
-                                      (sz ? az : 1 - az);
-                    nb[s] = int(cc);
-                    w[s] = phi[cc] > 0.0 ? ww : 0.0;
-                    wsum += w[s];
-                }
-                if (wsum < 0.05) {
-                    deep.push_back(int(c));
-                    continue;
+                Image im;
+                if (!normalImage(c, i, j, k, dloc, im)) {
+                    // Deep only where no fluid flux reads it: then the cell is
+                    // inert and the fluid/solid interface stays closed.
+                    if (!inFluidReach(i, j, k)) {
+                        deep.push_back(int(c));
+                        continue;
+                    }
+                    neighbourImage(c, i, j, k, dloc, im);
+                    ++T.fallback;
                 }
                 gcell.push_back(int(c));
                 isGhost[c] = 1;
-                gscale.push_back(Real(dw / dsmp));
+                gscale.push_back(Real(im.a));
                 for (int s = 0; s < 8; ++s) {
-                    gnbr.push_back(nb[s]);
-                    gw.push_back(Real(w[s] / wsum));
+                    gnbr.push_back(im.nb[s]);
+                    gw.push_back(Real(im.w[s] / im.wsum));
                 }
-                // Wall velocity at the FOOT OF THE NORMAL, not at the ghost
-                // centre: that point is on the surface, so a rotor's omega x r
-                // there is the actual surface speed the fluid sees.
                 if (uwall) {
-                    const auto v = (*uwall)(x + dw * nv[0], y + dw * nv[1],
-                                            z + dw * nv[2]);
+                    const auto v = (*uwall)(im.wall[0], im.wall[1], im.wall[2]);
                     uw.push_back(Real(v[0]));
                     uw.push_back(Real(v[1]));
                     uw.push_back(Real(v[2]));
@@ -592,6 +673,7 @@ hipError_t DeviceCompGhost::load(const CompGhostTables& t)
     nGhost_ = t.nGhost();
     nDeep_ = t.nDeep();
     nFace_ = t.nFace();
+    fallback_ = t.fallback;
     solid_ = t.solid;
     deepHost_ = t.deep;
     return hipSuccess;

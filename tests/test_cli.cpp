@@ -264,6 +264,12 @@ int main()
     accepts("flow --physics compressible --body cylinder --focal auto "
             "--n 256 --nz 1");
     accepts("flow --physics compressible --body sphere --focal auto "
+            "--focal-blend 0.8 --n 128 --nz 128");
+    // A 4 D deep z at R 4: the PHYSICAL plateau costs ~4.6 D of reference
+    // cells, so the far cells coarsen past the face margin. Accepted while
+    // the plateau was (wrongly) built in reference space, nowhere near the
+    // body; test_focal pins the physical contract.
+    rejects("flow --physics compressible --body sphere --focal auto "
             "--focal-blend 0.8 --n 128 --nz 64");
     rejects("flow --body none --focal 2,4,2,4,0,0 --n 128");  // incompressible
     rejects("flow --physics compressible --body none --focal auto --n 128");

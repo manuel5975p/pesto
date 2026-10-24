@@ -1129,15 +1129,7 @@ std::optional<ConfigError> flowLes(const RawConfig& r, Case& c)
         return err(2, "--sgs", "sigma: D_sigma is identically ZERO for any 2D "
                                "flow (that is the model's design); at nz == 1 "
                                "it is a silent no-op. Use nz > 1 or smag");
-    // Honest labelling: the boundary layer scales as D/sqrt(Re).
-    const double blCells = c.placement.D / std::sqrt(c.re) / c.h;
     c.lesLabel = c.cs > 0;
-    if (blCells < 3.0 && !c.lesLabel && c.bodyKind != BodyKind::None)
-    {
-        c.warnings.push_back(
-            std::format("boundary layer is {:.1f} cells (D/sqrt(Re)/h); this "
-                        "is under-resolved for DNS", blCells));
-    }
     return std::nullopt;
 }
 
@@ -1449,6 +1441,35 @@ std::optional<ConfigError> flowFocal(const RawConfig& r, Case& c)
                                c.placement.cy + 0.5 * c.placement.D,
                                c.placement.cz + 0.5 * c.placement.D};
 
+        // Every per-axis rule below, auto and explicit alike, is evaluated on
+        // the map actually built from the PHYSICAL box (Focal1D::
+        // fromPhysical): the body is placed in physical coordinates, so the
+        // plateau, the guard and the containment test must be too. The face
+        // margin is a CELL count and is therefore tested in reference space,
+        // where cells are uniform.
+        const int nAx[3] = {c.grid.nx, c.grid.ny, c.grid.nz};
+        const double hAx[3] = {c.grid.hx, c.grid.hy, c.grid.hz};
+        auto axisMap = [&](int a, double lo, double hi) {
+            return Focal1D::fromPhysical(nAx[a] * hAx[a], lo, hi,
+                                         blendFrac * (hi - lo), c.focalRatio);
+        };
+        // Identity margin at both faces: the blend support must end at least
+        // 4 cells short of each domain face (x also clears the NSCBC rows and
+        // any absorbing strip), so the far grid is exactly uniform where the
+        // boundary treatment reads it.
+        auto marginCells = [&](int a) {
+            return a == 0 ? std::max(4, c.nscbcStrip + 2) : 4;
+        };
+        auto clearsFaces = [&](int a, const Focal1D& f) {
+            return f.active && f.clears(marginCells(a) * hAx[a]);
+        };
+        auto fineOf = [&](int a, const Focal1D& f) {
+            return f.c * f.r * hAx[a];
+        };
+        auto holdsBody = [&](int a, double lo, double hi, double guard) {
+            return lo <= bLo[a] - guard && hi >= bHi[a] + guard;
+        };
+
         double box[6];
         if (r.focal == "auto")
         {
@@ -1460,8 +1481,6 @@ std::optional<ConfigError> flowFocal(const RawConfig& r, Case& c)
             if (!(std::isfinite(r.focalPad) && r.focalPad >= 0))
                 return err(2, "--focal-pad", "must be finite and >= 0");
             const double D = c.placement.D, pad = r.focalPad * D;
-            const int nA[3] = {c.grid.nx, c.grid.ny, c.grid.nz};
-            const double hA[3] = {c.grid.hx, c.grid.hy, c.grid.hz};
             for (int a = 0; a < 3; ++a)
             {
                 // Axes the body does not localize stay uniform.
@@ -1470,29 +1489,42 @@ std::optional<ConfigError> flowFocal(const RawConfig& r, Case& c)
                     box[4] = box[5] = 0.0;
                     continue;
                 }
-                const double want[2] = {
-                    bLo[a] - pad,
-                    bHi[a] + pad + (a == 0 ? r.focalWake * D : 0.0)};
-                // Smallest plateau that still satisfies the containment rule
-                // below; the desired box shrinks toward it until its blend
-                // clears the domain faces. The resolved box is what
-                // --dry-run prints, so the shrink is never silent.
-                const double guard = 3.0 * hA[a] / c.focalRatio;
+                // Smallest plateau: the body plus FOUR fine cells of that
+                // plateau's own spacing -- one more than the containment rule
+                // below asks, so rounding cannot reject auto's own box. The
+                // fine spacing grows with the box (through c), hence the
+                // fixed point; it is monotone from the c = 1 lower bound and
+                // contracts by ~8 h/L per step.
+                double guard = 4.0 * hAx[a] / c.focalRatio;
+                for (int it = 0; it < 64; ++it)
+                {
+                    const double g2 = 4.0 * fineOf(a, axisMap(a, bLo[a] - guard,
+                                                              bHi[a] + guard));
+                    if (g2 == guard) break;
+                    guard = g2;
+                }
                 const double need[2] = {bLo[a] - guard, bHi[a] + guard};
-                const double Lax = nA[a] * hA[a];
-                const double m =
-                    (a == 0 ? std::max(4, c.nscbcStrip + 2) : 4) * hA[a];
+                // Desired plateau, never smaller than the smallest one. It
+                // shrinks toward `need` until it fits; the resolved box is what
+                // --dry-run prints, so the shrink is never silent.
+                const double want[2] = {
+                    std::min(need[0], bLo[a] - pad),
+                    std::max(need[1],
+                             bHi[a] + pad + (a == 0 ? r.focalWake * D : 0.0))};
                 auto fits = [&](double lo, double hi) {
-                    const double w = blendFrac * (hi - lo);
-                    return hi > lo && lo - w >= m && hi + w <= Lax - m;
+                    const Focal1D f = axisMap(a, lo, hi);
+                    return clearsFaces(a, f)
+                           && holdsBody(a, lo, hi, 3.0 * fineOf(a, f));
                 };
-                if (!fits(std::min(need[0], want[0]),
-                          std::max(need[1], want[1])) &&
-                    !fits(need[0], need[1]))
+                if (!fits(need[0], need[1]))
                     return err(2, "--focal", std::string(axName[a])
                                    + " has no plateau that both contains the "
-                                     "body and clears the domain faces; the "
-                                     "box is too small for --focal-blend");
+                                     "body and clears the domain faces: the "
+                                     "fine cells cost --focal-ratio x the "
+                                     "plateau width out of the grid, which "
+                                     "coarsens the far cells until the face "
+                                     "margin no longer fits. Raise --n, or "
+                                     "lower --focal-ratio or --focal-blend");
                 double t = 1.0;
                 if (!fits(want[0], want[1]))
                 {
@@ -1535,12 +1567,9 @@ std::optional<ConfigError> flowFocal(const RawConfig& r, Case& c)
                                          "x0,x1,y0,y1,z0,z1");
         }
 
-        const int nAx[3] = {c.grid.nx, c.grid.ny, c.grid.nz};
-        const double hAx[3] = {c.grid.hx, c.grid.hy, c.grid.hz};
         for (int a = 0; a < 3; ++a)
         {
             const double lo = box[2 * a], hi = box[2 * a + 1];
-            const double L = nAx[a] * hAx[a];
             if (hi <= lo)
             {
                 // Degenerate pair = leave this axis uniform.
@@ -1554,21 +1583,18 @@ std::optional<ConfigError> flowFocal(const RawConfig& r, Case& c)
                 return err(2, "--focal", "nz == 1 IS the exact 2D restriction; "
                                          "a z plateau there is meaningless -- "
                                          "pass z0,z1 equal");
-            const double w = blendFrac * (hi - lo);
-            // Identity margin at both faces: the blend support must end at
-            // least 4 cells short of each domain face (x also clears the
-            // NSCBC rows and any absorbing strip), so the far grid is
-            // exactly uniform where the boundary treatment reads it.
-            const int mCells = a == 0 ? std::max(4, c.nscbcStrip + 2) : 4;
-            const double margin = mCells * hAx[a];
-            if (!(lo - w >= margin && hi + w <= L - margin))
+            const Focal1D f = axisMap(a, lo, hi);
+            if (!clearsFaces(a, f))
                 return err(2, "--focal",
                            std::string(axName[a]) + " plateau plus its blend "
                            "must clear both domain faces by " +
-                           std::to_string(mCells) + " cells (the map must be "
-                           "the exact identity there); shrink the box or "
-                           "--focal-blend");
-            const double fine = hAx[a] / c.focalRatio;
+                           std::to_string(marginCells(a)) + " (coarse) cells "
+                           "(the map must be the exact identity there). The "
+                           "fine cells cost --focal-ratio x the plateau width "
+                           "out of the grid, which coarsens the far cells; "
+                           "shrink the box, --focal-blend or --focal-ratio, "
+                           "or raise --n");
+            const double fine = fineOf(a, f);
             if (hi - lo < 4 * fine)
                 return err(2, "--focal", std::string(axName[a])
                                              + " plateau spans under 4 fine "
@@ -1580,7 +1606,7 @@ std::optional<ConfigError> flowFocal(const RawConfig& r, Case& c)
             if (hasBody && !(a == 2 && zSpanning))
             {
                 const double guard = 3.0 * fine;
-                if (!(lo <= bLo[a] - guard && hi >= bHi[a] + guard))
+                if (!holdsBody(a, lo, hi, guard))
                     return err(2, "--focal",
                                std::string(axName[a]) + " plateau must contain "
                                "the body plus a 3-fine-cell guard band "
@@ -1589,12 +1615,13 @@ std::optional<ConfigError> flowFocal(const RawConfig& r, Case& c)
                                "wall's mirror stencil must not straddle the "
                                "coarse/fine blend");
             }
+            // The case carries the PHYSICAL plateau and blend; focalRemap()
+            // turns them into this same map for every consumer.
             c.focalActive = true;
             c.focalLo[a] = lo;
             c.focalHi[a] = hi;
-            c.focalW[a] = w;
-            const Focal1D f = Focal1D::make(L, lo, hi, w, c.focalRatio);
-            c.focalHFine[a] = f.c * f.r * hAx[a];
+            c.focalW[a] = blendFrac * (hi - lo);
+            c.focalHFine[a] = fine;
             c.focalHCoarse[a] = f.c * hAx[a];
             // Discrete adjacent growth: the KG flux carries no dissipation,
             // so a fast coarse->fine transition is a dispersive reflector.
@@ -1622,6 +1649,18 @@ std::optional<ConfigError> flowFocal(const RawConfig& r, Case& c)
                                  "requires --focal");
             e)
             return e;
+    }
+    // Honest labelling: the boundary layer scales as D/sqrt(Re), and it is
+    // resolved by the spacing AT the body -- the plateau's under --focal, which
+    // the containment rule above guarantees the body sits on. Hence here, once
+    // the mesh is known, and not with the LES label.
+    const double hBody = c.focalActive ? hFine(c) : c.h;
+    const double blCells = c.placement.D / std::sqrt(c.re) / hBody;
+    if (blCells < 3.0 && !c.lesLabel && c.bodyKind != BodyKind::None)
+    {
+        c.warnings.push_back(
+            std::format("boundary layer is {:.1f} cells (D/sqrt(Re)/h); this "
+                        "is under-resolved for DNS", blCells));
     }
     return std::nullopt;
 }
@@ -2507,8 +2546,8 @@ std::string Case::describe() const
         {
             if (focalHi[a] <= focalLo[a]) continue;
             per += std::format(
-                "             {} [{:.4g},{:.4g}] blend {:.4g}: fine {:.3e} "
-                "coarse {:.3e}\n",
+                "             {} physical [{:.4g},{:.4g}] blend {:.4g}: fine "
+                "{:.3e} coarse {:.3e}\n",
                 ax[a], focalLo[a], focalHi[a], focalW[a], focalHFine[a],
                 focalHCoarse[a]);
         }

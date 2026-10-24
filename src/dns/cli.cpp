@@ -706,7 +706,12 @@ MESH & WALLS (compressible)
   --focal BOX        focal clustering: a FINE plateau box, coarse far
                      field, one independent per-axis map (dns/remap.hpp
                      Focal1D / AxisRemap3). BOX = x0,x1,y0,y1,z0,z1 in
-                     world units; a degenerate pair (x0 == x1) leaves
+                     PHYSICAL (world) units, the frame the body is
+                     placed in: that region gets the fine spacing. The
+                     fine cells are paid for out of --n, so a plateau
+                     costs --focal-ratio x its width in cells and a box
+                     the grid cannot afford is rejected. A degenerate
+                     pair (x0 == x1) leaves
                      that axis uniform, so a tube around a body and its
                      wake is x = body..wake, y/z = body diameter. The
                      map is the EXACT identity within 4 cells of every
@@ -730,8 +735,9 @@ MESH & WALLS (compressible)
                      --dry-run prints the per-axis fine/coarse spacings,
                      the max adjacent growth ratio and the dt penalty.
   --focal-ratio R    coarse/fine cell-size ratio, (1,16].            [4]
-  --focal-blend F    blend width per side as a fraction of the plateau
-                     extent, (0,2]. Wider = gentler transition; the
+  --focal-blend F    physical blend width per side as a fraction of the
+                     physical plateau extent, (0,2]. Wider = gentler
+                     transition; the
                      validator rejects a max adjacent growth over 1.25
                      (the central flux has no dissipation and reflects
                      off a sharp coarse/fine step).                 [0.5]

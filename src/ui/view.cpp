@@ -371,14 +371,16 @@ void buildViewGeometry(const Build& b, const ViewOptions& o, ViewGeometry& out)
         }
         if (flat) ns[2] = 1;
 
+        // The lattice is uniform in REFERENCE space (lo/hi are the solid box
+        // in index units, so it is dense where the cells are), and each node
+        // is placed AND sampled at its physical position: the solver's body
+        // is the world sdf at mapped centres (comp_ghost), so that is the one
+        // that is drawn.
         auto pos = [&](int a, int i) {
             const double X = lo[a] + (hi[a] - lo[a]) * double(i) / double(ns[a]);
             if (!b.remapActive) return X;
             const dns::Focal1D* f[3] = {&b.remap.fx, &b.remap.fy, &b.remap.fz};
             return f[a]->map(X);
-        };
-        auto ref = [&](int a, int i) {
-            return lo[a] + (hi[a] - lo[a]) * double(i) / double(ns[a]);
         };
 
         if (flat) {
@@ -389,7 +391,7 @@ void buildViewGeometry(const Build& b, const ViewOptions& o, ViewGeometry& out)
             for (int j = 0; j <= ns[1]; ++j)
                 for (int i = 0; i <= ns[0]; ++i)
                     f0[size_t(j) * size_t(ns[0] + 1) + size_t(i)] =
-                        b.geo.sdf(ref(0, i), ref(1, j), zc);
+                        b.geo.sdf(pos(0, i), pos(1, j), zc);
             for (int j = 0; j < ns[1]; ++j)
                 for (int i = 0; i < ns[0]; ++i) {
                     const double v[4] = {
@@ -422,7 +424,7 @@ void buildViewGeometry(const Build& b, const ViewOptions& o, ViewGeometry& out)
                 for (int j = 0; j <= ns[1]; ++j)
                     for (int i = 0; i <= ns[0]; ++i)
                         fv[size_t(i) * sx + size_t(j) * sy + size_t(k) * sz] =
-                            b.geo.sdf(ref(0, i), ref(1, j), ref(2, k));
+                            b.geo.sdf(pos(0, i), pos(1, j), pos(2, k));
             Sample corner[8];
             for (int k = 0; k < ns[2]; ++k)
                 for (int j = 0; j < ns[1]; ++j)

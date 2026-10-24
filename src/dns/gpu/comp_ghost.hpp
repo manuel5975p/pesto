@@ -63,6 +63,9 @@ struct CompGhostTables
     std::vector<int> fdir;   // 0:+x 1:-x 2:+y 3:-y 4:+z 5:-z (ghost side)
     std::vector<Real> fpos;  // physical centre of each interface face, xyz
     std::vector<int> solid;  // every cell with sdf < 0 (mask / diagnostics)
+    // Ghosts imaged from their fluid neighbours because the normal sample was
+    // unusable (diagnostic: thin or concave geometry at the grid scale).
+    int fallback = 0;
 
     int nGhost() const { return int(gcell.size()); }
     int nDeep() const { return int(deep.size()); }
@@ -81,7 +84,10 @@ struct CompGhostCapacity
 // The classification make() runs, on its own. Pure host: no HIP call, no device
 // memory, and `sdf` is evaluated only where the bbox short-circuit lets it be.
 // Safe to run concurrently for different azimuths as long as sdf and uwall are.
-// Pre: bbox is null or 6 doubles [lo xyz, hi xyz].
+// Post: every solid cell a fluid cell's face flux reads (its face and edge
+// neighbours) is a ghost, never deep -- so the interface faces are EVERY
+// fluid/solid face (a closed surface, sum n A == 0) and the fluid never sees a
+// resting pInf cell. Pre: bbox is null or 6 doubles [lo xyz, hi xyz].
 CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                                   const double* bbox, const AxisRemap3& remap,
                                   const GhostWallVelocity* uwall);
@@ -197,8 +203,11 @@ public:
     // Solid cells held quiescent instead of mirrored. The mirror band
     // between these and the fluid must stay at least two cells thick along
     // every axis -- the interior stencil reaches two cells, and a quiescent
-    // cell inside its reach is a discontinuity against the fluid.
+    // cell inside its reach is a discontinuity against the fluid. None of
+    // them is ever inside a fluid cell's flux stencil (classifyCompGhost).
     const std::vector<int>& deepCells() const { return deepHost_; }
+    // Ghosts of the resident tables imaged from their fluid neighbours.
+    int nFallback() const { return fallback_; }
 
 private:
     DeviceCompGhost() = default;
@@ -209,7 +218,7 @@ private:
     // arithmetic untouched, which is what pins the published cd/cl anchors.
     int iso_ = 0;
     Real Twall_ = Real(0), Rgas_ = Real(1);
-    int nGhost_ = 0, nDeep_ = 0, nFace_ = 0;
+    int nGhost_ = 0, nDeep_ = 0, nFace_ = 0, fallback_ = 0;
     DeviceBuffer<int> gcell_;    // ghost cell index
     DeviceBuffer<int> gnbr_;     // 8 trilinear source cells per ghost
     DeviceBuffer<Real> gw_;      // 8 renormalized weights per ghost

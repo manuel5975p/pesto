@@ -391,9 +391,12 @@ is ever written.
 
 ## Caveat inherited from the solver
 
-Under `--focal`, `sampleCut()` evaluates the sdf at **reference** coordinates
-while the ghost wall classifies against **mapped** centres (see
-`dns/geometry.hpp`). The viewer draws the cut-consistent body: sdf evaluated in
-reference space, plotted at mapped positions. Surface, cut cells and apertures
-therefore agree with each other and with what the runner consumes. With
-`--focal` off the two coincide exactly.
+Under `--focal` the solver's body is the WORLD sdf at the MAPPED cell centres
+(the ghost wall). The viewer draws exactly that: the cut cells come from
+`dns::sampleCutMapped` (the world sdf at the mapped sub-samples, in index
+space) and the surface samples the sdf at physical positions. The world-lattice
+`sampleCut()` the runner keeps is the qRef frontal-area measurement only (see
+`dns/geometry.hpp`). It used to be the drawn one too -- sdf in reference space,
+plotted at mapped positions -- which showed the body shrunk by the plateau
+slope and sitting inside the drawn plateau, while the run had it on coarse
+cells beside it. With `--focal` off the two coincide exactly.

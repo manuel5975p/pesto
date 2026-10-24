@@ -366,7 +366,7 @@ include(CTest)
 if(BUILD_TESTING)
     set(DNS_TESTS cli geometry output poisson projection tgv tgv3d cutcell cutcell_sphere comp comp_curv meshsdf
         fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport
-        rotor)
+        rotor focal)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)
     endif()
@@ -412,7 +412,7 @@ if(BUILD_TESTING)
                   gpu_cutcell gpu_cutcell2d gpu_cutcell_sphere gpu_conservation
                   gpu_energy_stability gpu_ghostfill gpu_comp gpu_comp_curv
                   gpu_comp_ghost gpu_comp_ghost_focal gpu_comp_les
-                  gpu_comp_ghost3d gpu_comp_mesh
+                  gpu_comp_ghost3d gpu_comp_mesh gpu_comp_ghost_closure
                   gpu_comp_far gpu_comp_nscbc gpu_nscbc_absorb gpu_nscbc_order
                   gpu_acoustics gpu_comp_sink
                   gpu_les_smag gpu_derived

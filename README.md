@@ -1065,6 +1065,24 @@ the blend; `auto` derives the box from the body AABB (`--focal-pad`,
 Analytic bodies only — a mesh/scene AABB is not known until the file loads and
 validation touches no filesystem.
 
+**Coordinates (fixed 2026-10-23).** The box, `auto` or explicit, and the blend
+`W = F·(hi − lo)` are PHYSICAL: the region of the world, where the body is
+placed, that gets the fine spacing. `Focal1D`'s own `a, b, w` are REFERENCE
+(index-space) positions, so `Focal1D::fromPhysical` inverts the map in closed
+form (`cP = (hi−lo)/r`, `cw = 2W/(1+r)`, `c = 1 + (1−r)(cP+cw)/L`) and
+`focalRemap` is the one builder every consumer calls. The face margin is a cell
+count and is tested in reference space; containment, the guard and the
+4-fine-cell floor are tested on the physical plateau. Before the fix the world
+numbers went straight into `Focal1D::make`, so the physical fine region was
+`[map(lo), map(hi)]` — about `c·r` of the intended width and shifted toward
+the box centre — while `--dry-run` printed the fine spacing as if the body sat
+on it. Consequence: the fine cells now cost `R ×` the plateau width out of the
+grid, the far cells coarsen to pay for them, and configurations that only fit
+because the plateau was in the wrong place are now rejected (e.g. the prop
+sweep's `--n 384 --ny 256 --nz 256 --focal-ratio 16 --focal-blend 1`: growth
+1.33 > 1.25; `--focal-ratio 8` resolves h_fine 7.1e-3). Test: `focal`,
+`gpu_comp_ghost_focal` (world-placed body).
+
 Display raster (`dns/framemap.hpp`, `PhysicalRaster`): the solver's arrays are
 indexed in REFERENCE space, so a pixel-per-cell frame is a picture of the INDEX
 space — on a clustered mesh the plateau is blown up and the far field squashed,
@@ -1091,6 +1109,12 @@ weights stay the Cartesian index-space ones (a separable monotone map keeps
 the centre lattice a valid interpolation lattice). The force tally switches to
 `faceFluxCurv`, which carries the exact face area vector, so the `hy·hz`
 multiply is dropped.
+
+The two tables below predate the coordinate fix. At R = 2 the error is mild:
+the physical fine region was x [1.91, 4.25], y [2.82, 3.50] against the
+printed x [1.60, 4.61], y [2.57, 3.75], so the cylinder's front quarter and
+its y extremes sat on the blend with spacing up to 1.04 × h_fine. The focal
+rows are therefore NOT the configuration they name; regenerate before citing.
 
 Measured (Re100 cylinder, M0.2, NSCBC, 2D, mean over t > 60):
 
@@ -1260,6 +1284,19 @@ ball, so the field stays a true distance and convex edges round rather than
 distort. It CHANGES THE BODY: chord grows by `2C·h`, and the achieved dilation
 must be reported with every result, the same discipline as the DNS/LES label.
 
+**The tallied surface is closed by construction.** A solid cell inside a fluid
+cell's flux stencil (face and edge neighbours) is ALWAYS a mirrored ghost, never
+deep. When its wall-normal sample finds no fluid — overlapping mesh shells
+(hub and blades exported as separate parts: the nearest triangle is a buried
+face and the normal points into the body), thin or concave features — it is
+imaged from its own fluid neighbours instead, and the run prints the count
+(`ghost wall: N ghost cells imaged from their fluid neighbours`). Before this, such cells
+went deep: a resting `pInf` wall the fluid felt but the tally never read, so
+`Σ n A ≠ 0` and a uniform pressure produced a force (measured on a 3-blade prop
+mesh at 31-98 cells per D: 2-7% of the wetted faces open, `|Σ n A|/A` 0.5-2%;
+the audit's coarse case, 16% open, read a spurious CT +0.025 from `pInf` alone).
+Pinned in `gpu_comp_ghost_closure`.
+
 **The real tip may be faster than the flag says.** `--rotor-mach` is quoted on
 `D/2` because that is all `validate()` can know without opening the body file. A
 body that reaches further — a lens, a scene, an overhanging mesh — has a faster
@@ -1315,7 +1352,10 @@ APPROXIMATION otherwise — it co-rotates whatever the far field imposes, which
 is precisely the frozen-rotor error. An axial-flow propeller in a uniform
 freestream is the good case. Measured 2026-07-31 on the single-blade prop of
 the section below (Re 500, tip Mach 0.41, J = 0.63, 384x256x256 focal, same
-flags, `--ft 1.5`):
+flags, `--ft 1.5`). INVALID as absolute numbers: that focal mesh predates the
+coordinate fix (§12.1) and put the rotor on ~0.03 cells in x (25 per D, the
+blade 2 cells thick) instead of the printed 2.2e-3; only the moving-vs-MRF
+difference on one shared mesh survives, and that too needs a rerun:
 
     moving  ct +0.1228 +- 0.0074   cq -0.0302 +- 0.0030   (12-rev mean)
     mrf     ct +0.1310 +- 0.0009   cq -0.0299 +- 0.0001   (plateau read)

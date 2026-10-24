@@ -54,8 +54,9 @@ struct CompRun
     double stretchBeta = 0;
     // Focal clustering (dns/remap.hpp AxisRemap3): a fine plateau box with a
     // coarse far field, one independent map per axis. Mutually exclusive with
-    // stretchBeta; same guarantees from the validator (les == 0, no immersed
-    // body, and the map is the exact identity within the boundary margin).
+    // stretchBeta; the validator guarantees the map is the exact identity
+    // within the boundary margin and that the plateau holds the body.
+    // Lo/Hi/W are PHYSICAL (Case::focalLo, through focalRemap()).
     // focalActive == false leaves the mesh uniform bit-for-bit.
     bool focalActive = false;
     double focalLo[3] = {0, 0, 0}, focalHi[3] = {0, 0, 0}, focalW[3] = {0, 0, 0};

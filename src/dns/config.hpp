@@ -308,9 +308,10 @@ public:
     bool noslipY = false;
 
     // Focal clustering (compressible only, mutually exclusive with --stretch).
-    // focalActive: at least one axis clusters. The resolved plateau [lo,hi],
-    // blend width and ratio per axis are what runner_comp turns into the
-    // AxisRemap3; focalHFine/focalGrowth are the diagnostics --dry-run prints
+    // focalActive: at least one axis clusters. The resolved plateau [lo,hi]
+    // and blend width are PHYSICAL (the frame the body is placed in); with the
+    // ratio they are what focalRemap() turns into the AxisRemap3 for every
+    // consumer. focalHFine/focalGrowth are the diagnostics --dry-run prints
     // because the fine spacing sets the acoustic dt.
     bool focalActive = false;
     double focalLo[3] = {0, 0, 0}, focalHi[3] = {0, 0, 0}, focalW[3] = {0, 0, 0};

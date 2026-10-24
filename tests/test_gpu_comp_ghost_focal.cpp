@@ -1,7 +1,9 @@
 // Compressible ghost wall on a FOCAL (per-axis clustered) mesh: the inactive
 // remap must reproduce the Cartesian construction exactly, and with the body
 // inside the fine plateau the wall must keep a quiescent gas quiescent, report
-// no spurious force, and produce sane positive drag in a freestream.
+// no spurious force, and produce sane positive drag in a freestream. A body
+// placed off the box centre, with the plateau stated physically through
+// focalRemap, must sit on the fine cells (the --focal contract).
 #include "dns/comp.hpp"
 #include "dns/curvmesh.hpp"
 #include "dns/gpu/comp.hpp"
@@ -98,10 +100,10 @@ void degenerateMatchesCartesian(const Grid& g)
 // it has to follow the WIDEST local spacing -- setting it from the smallest
 // leaves the band under two cells thick along the wide axis, and the
 // measured Re100 cylinder drag flipped sign (cd 1.49 -> -7.6).
-void mirrorBandDepth(const Grid& g, double wx, double bf, const char* tag)
+void mirrorBandDepth(const Grid& g, const AxisRemap3& R,
+                     const gpu::DeviceCompGhost::Sdf& sdf, const char* tag)
 {
-    const AxisRemap3 R = focalAboutBody(4.0, wx, bf);
-    auto ghost = gpu::DeviceCompGhost::make(g, circle, gam, rhoInf, pInf,
+    auto ghost = gpu::DeviceCompGhost::make(g, sdf, gam, rhoInf, pInf,
                                             nullptr, R);
     if (!ghost) { check(false, "band ghost make"); return; }
     std::vector<char> solid(g.size(), 0), deep(g.size(), 0);
@@ -124,6 +126,108 @@ void mirrorBandDepth(const Grid& g, double wx, double bf, const char* tag)
     std::printf("%s: %d deep cells, %d fluid cells within 2 of a deep cell\n",
                 tag, int(ghost->deepCells().size()), thin);
     check(thin == 0, tag);
+}
+
+void mirrorBandDepth(const Grid& g, double wx, double bf, const char* tag)
+{
+    mirrorBandDepth(g, focalAboutBody(4.0, wx, bf), circle, tag);
+}
+
+// The --focal CONTRACT on the ghost wall: the plateau is stated PHYSICALLY
+// and built by focalRemap (the one builder every consumer uses), and the body
+// sits OFF the box centre, where map(X) != X -- the case the reference-space
+// construction got wrong (the fine region landed ~R times narrower and
+// shifted, the body on coarse cells). Every solid cell must then see the
+// fine spacing, and the solid/deep counts must be the FINE lattice's.
+void worldPlacedBody(const Grid& g)
+{
+    std::printf("--- world-placed body off the box centre ---\n");
+    const double ox = Lbox / 3, oy = Lbox / 2 + 0.013;
+    const gpu::DeviceCompGhost::Sdf off = [=](double x, double y, double) {
+        return std::hypot(x - ox, y - oy) - Rb;
+    };
+    const double lo[3] = {ox - 1.5 * Rb, oy - 1.5 * Rb, 0.0};
+    const double hi[3] = {ox + 1.5 * Rb, oy + 1.5 * Rb, 0.0};
+    const double w[3] = {1.5 * Rb, 1.5 * Rb, 0.0};
+    const AxisRemap3 R = focalRemap(g, true, lo, hi, w, 4.0);
+    const double hFx = R.fx.c * R.fx.r * g.hx, hFy = R.fy.c * R.fy.r * g.hy;
+    check(R.fx.clears(4 * g.hx) && R.fy.clears(4 * g.hy),
+          "world-placed plateau clears the faces");
+    check(std::abs(R.fx.map(R.fx.a) - lo[0]) < 1e-12
+              && std::abs(R.fy.map(R.fy.b) - hi[1]) < 1e-12,
+          "world-placed plateau is the physical box");
+
+    auto counts = [&](const AxisRemap3& M, double& worst) {
+        const auto T = gpu::classifyCompGhost(g, off, nullptr, M, nullptr);
+        const double fx = M.fx.c * M.fx.r * g.hx, fy = M.fy.c * M.fy.r * g.hy;
+        worst = 0.0;
+        for (int c : T.solid)
+        {
+            const int i = c % g.nx, j = (c / g.nx) % g.ny;
+            worst = std::max(
+                {worst, std::abs(M.fx.deriv((i + 0.5) * g.hx) * g.hx / fx - 1.0),
+                 std::abs(M.fy.deriv((j + 0.5) * g.hy) * g.hy / fy - 1.0)});
+        }
+        return T;
+    };
+    double worst = 0.0;
+    const auto T = counts(R, worst);
+    // Fine-lattice expectations: cells inside the disc, and inside the disc
+    // shrunk by the 2-cell mirror band (the deep threshold is 2 x the widest
+    // local spacing).
+    const double hMax = std::max(hFx, hFy);
+    const double solidExp = pi * Rb * Rb / (hFx * hFy);
+    const double deepExp = pi * (Rb - 2 * hMax) * (Rb - 2 * hMax) / (hFx * hFy);
+    std::printf("  h_fine %.4e x %.4e (ref %.4e): solid %d (fine lattice "
+                "%.0f), deep %d (%.0f), ghosts %d; worst spacing dev %.2e\n",
+                hFx, hFy, g.hx, int(T.solid.size()), solidExp, T.nDeep(),
+                deepExp, T.nGhost(), worst);
+    check(worst < 1e-12, "every solid cell of a world-placed body is h_fine");
+    check(std::abs(T.solid.size() / solidExp - 1.0) < 0.03,
+          "solid count is the fine lattice's");
+    check(std::abs(T.nDeep() / deepExp - 1.0) < 0.10,
+          "deep-solid count is the fine lattice's");
+
+    // The pre-fix construction (physical numbers read as reference ones):
+    // the body lands on blend/coarse cells. Measured here: solid 1063 vs
+    // 1148, but the solid cells span up to 4x h_fine -- the spacing, not the
+    // count, is what discriminates.
+    const AxisRemap3 B{Focal1D::make(Lbox, lo[0], hi[0], w[0], 4.0),
+                       Focal1D::make(Lbox, lo[1], hi[1], w[1], 4.0),
+                       Focal1D::identity(1.0)};
+    double worstB = 0.0;
+    const auto TB = counts(B, worstB);
+    std::printf("  reference-space construction: solid %d, deep %d, worst "
+                "spacing dev %.2f\n",
+                int(TB.solid.size()), TB.nDeep(), worstB);
+    check(worstB > 0.5,
+          "the reference-space construction puts the body off the fine "
+          "region (the check discriminates)");
+
+    // On the device: the mirror band stays two cells deep, and a uniform
+    // state carries no static force on the off-centre body.
+    mirrorBandDepth(g, R, off, "world-placed: mirror band is 2 cells deep");
+    const auto mesh = CurvMesh::fromRemap(g, R);
+    const auto cpu = Comp::make(mesh, gam, 0.0);
+    if (!cpu) { check(false, "world-placed CPU make"); return; }
+    auto dev = gpu::DeviceComp::make(*cpu->curv, gam, 0.0);
+    auto ghost = gpu::DeviceCompGhost::make(g, off, gam, rhoInf, pInf, nullptr, R);
+    auto ds = gpu::DeviceCompState::make(g.size());
+    if (!dev || !ghost || !ds) { check(false, "world-placed GPU alloc"); return; }
+    check(int(ghost->deepCells().size()) == T.nDeep(),
+          "device ghost wall reports the host deep count");
+    auto host = CompState::zeros(g);
+    for (std::size_t c = 0; c < g.size(); ++c) {
+        host.rho[c] = rhoInf;
+        host.E[c] = pInf / (gam - 1.0);
+    }
+    (void)ds->upload(host);
+    ghost->apply(*ds);
+    const auto F = ghost->force(*dev, *ds);
+    const double scale = 0.5 * rhoInf * 2 * Rb;
+    std::printf("  static force (%.3e, %.3e)\n", F.fx, F.fy);
+    check(std::abs(F.fx) < 1e-4 * scale && std::abs(F.fy) < 1e-4 * scale,
+          "world-placed body: no static force");
 }
 
 // The same freestream transient on the plain Cartesian mesh, computed once:
@@ -346,6 +450,7 @@ int main()
     test::requireDeviceOrSkip();
     const auto g = Grid::make(128, 128, 1, Lbox, Lbox, 1.0);
     degenerateMatchesCartesian(g);
+    worldPlacedBody(g);
     mirrorBandDepth(g, 3.0, 0.5, "isotropic: mirror band is 2 cells deep");
     mirrorBandDepth(g, 5.0, 0.25, "anisotropic: mirror band is 2 cells deep");
     staticForce(g, 3.0, 0.5, "isotropic fine cells: no static force");

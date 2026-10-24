@@ -124,6 +124,22 @@ sampleCut(const Grid& g, const Sdf& sdf, SampleOpts o)
 }
 
 std::expected<CutGeometry, std::string>
+sampleCutMapped(const Grid& g, const Sdf& sdf, const AxisRemap3& m, SampleOpts o)
+{
+    const Focal1D* ax[3] = {&m.fx, &m.fy, &m.fz};
+    if (std::ranges::none_of(ax, [](const Focal1D* f) { return f->active; }))
+        return sampleCut(g, sdf, o);
+    // Focal1D's slope is in [c r, c]: c bounds it.
+    double slope = 1.0;
+    for (const Focal1D* f : ax)
+        if (f->active) slope = std::max(slope, f->c);
+    const Sdf pulled = [&sdf, &m, slope](double X, double Y, double Z) {
+        return sdf(m.fx.map(X), m.fy.map(Y), m.fz.map(Z)) / slope;
+    };
+    return sampleCut(g, pulled, o);
+}
+
+std::expected<CutGeometry, std::string>
 exactLensCut(const Grid& g, const Lens& b, int ns)
 {
     if (!(b.w > b.hh)) return std::unexpected("exactLensCut: needs w > hh");

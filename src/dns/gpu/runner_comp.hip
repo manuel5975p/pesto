@@ -352,6 +352,19 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         ghostOwned = std::move(*gh);
         ghost = &*ghostOwned;
     }
+    // A resolution verdict like the deep-solid count: ghosts whose normal
+    // sample found no fluid are imaged from their fluid neighbours instead
+    // (classifyCompGhost) -- the wall stays closed, but is locally a staircase.
+    {
+        int fb = ghost->nFallback();
+        if (rotorTable)
+            for (const auto& t : rotorTable->bins) fb = std::max(fb, t.fallback);
+        if (fb > 0)
+            std::printf("ghost wall: %d ghost cells imaged from their fluid "
+                        "neighbours (no usable wall-normal sample: overlapping "
+                        "mesh shells, or a body thin or concave at the grid "
+                        "scale)\n", fb);
+    }
     // Bin currently resident on the device. Bin 0 is loaded above, and the
     // index is recomputed from the step's own time (never accumulated), so a
     // long run cannot drift off the table.

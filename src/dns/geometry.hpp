@@ -42,6 +42,18 @@ struct SampleOpts
 std::expected<CutGeometry, std::string>
 sampleCut(const Grid&, const Sdf&, SampleOpts = {});
 
+// The cut of the body the SOLVER sees on a --focal mesh, in index space: cell
+// (i,j,k) samples the WORLD sdf at the MAPPED positions of its reference
+// sub-samples -- the frame the ghost wall classifies in. For display and
+// diagnostics of a clustered mesh (dns-ui); qRef keeps the world-lattice
+// sampleCut (see ReferenceQ). The pulled-back field is divided by the map's
+// largest slope so it stays 1-Lipschitz in reference coordinates, which is
+// what sampleCut's prefilter and band assume (fractions are sign counts, so
+// the scale changes no value).
+// Pre: as sampleCut. Post: all-inactive remap = sampleCut, bit for bit.
+std::expected<CutGeometry, std::string>
+sampleCutMapped(const Grid&, const Sdf&, const AxisRemap3&, SampleOpts = {});
+
 // Exact chord apertures + supersampled lambda for the lens: its tips are
 // sub-cell and pure sampling loses them.
 // Pre: b.w > b.hh, lambdaSamples > 0.
@@ -54,27 +66,24 @@ exactLensCut(const Grid&, const Lens& b, int lambdaSamples = 64);
 // body's FRONTAL AREA, measured from the cut apertures: a (j,k) stream column
 // is blocked by 1 - min_i ax, exact for a convex body and honest for the rest.
 //
-// MEASURED 2026-07-25, --focal. sampleCut() evaluates the sdf at REFERENCE
-// coordinates, so the cut's body is a reference-space body, while the ghost
-// wall classifies against MAPPED centres, so the SOLVED body is a
-// physical-space body. That looks like it should scale A wrong under a
-// clustered mesh -- but the two effects cancel EXACTLY, and reference spacings
-// are the correct weights:
+// --focal: this measurement does not see the solver mesh at all, and that is
+// why it is right. sampleCut() evaluates the WORLD sdf on the uniform lattice
+// (i + 0.5) h -- a uniform grid of spacing h in world units -- so the cut is
+// an independent sampling of the body, at its true size D, and the reference
+// spacings h are that lattice's own weights. The SOLVED body (the ghost wall,
+// classified against MAPPED centres) is the same world body on the clustered
+// mesh; the two agree on A because both are the sdf's body, not because any
+// factor cancels. Weighting the reference cut's rows by the focal map's
+// PHYSICAL extents mixes the two lattices and makes A low by the plateau
+// slope c*r -- measured 2026-07-25, cylinder n = 256:
 //
 //   R    A with reference spacings   A with physical spacings   true D
 //   1    0.785228                    0.785228                   0.785398
 //   2    0.785228                    0.523485                   0.785398
 //   4    0.785228                    0.314091                   0.785398
 //
-// (cylinder, n = 256, plateau centred on the body). The reference body is
-// SMALLER in physical space than the solved body by the plateau slope c*r
-// (~1/R), and the reference spacings are LARGER than the physical ones there
-// by the same factor; the product is the solved body's true physical frontal
-// area. Weighting rows by their physical extent instead makes A low by that
-// slope -- 2/3 at R = 2, 2/5 at R = 4 in the table above.
-//
-// So: DO NOT "fix" this by mapping the spacings. If you change the weighting,
-// re-run that table first.
+// So: DO NOT "fix" this by mapping the spacings. The resolution of A is the
+// reference h (coarser than the plateau), which is ample for a frontal area.
 struct ReferenceQ
 {
     double q = 0.0;        // 0.5 rho uInf^2 A (with the physics normalisation)

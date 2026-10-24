@@ -394,13 +394,13 @@ int main()
     // The one number three definitions used to disagree about. Two properties
     // are pinned here:
     //   1. A == the body's physical frontal area D * span.
-    //   2. A is INDEPENDENT of --focal clustering. sampleCut() works in
-    //      reference coordinates while the ghost wall classifies against
-    //      mapped centres; the reference body is R times smaller in physical
-    //      space and the reference spacings are R times larger, and the two
-    //      cancel EXACTLY. Weighting rows by their physical extent instead
-    //      (which looks like the obvious "fix") makes A low by exactly R --
-    //      measured 2026-07-25, and the reason geometry.hpp says not to.
+    //   2. A is INDEPENDENT of --focal clustering. sampleCut() samples the
+    //      world sdf on the uniform world-unit lattice of spacing h, so it
+    //      measures the body at its true size whatever the solver mesh is.
+    //      Weighting its rows by the focal map's physical extents instead
+    //      (which looks like the obvious "fix") mixes the two lattices and
+    //      makes A low by the plateau slope -- measured 2026-07-25, and the
+    //      reason geometry.hpp says not to.
     {
         using namespace dns;
         const double L = 2 * std::numbers::pi;

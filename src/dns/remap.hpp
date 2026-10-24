@@ -224,11 +224,17 @@ struct ChannelStretchY
 // struct is pure baked coefficients (trivially copyable, kernel-by-value).
 // Inactive (R <= 1 or empty interval) is the EXACT identity by branch, the
 // TanhStretchY beta == 0 pattern.
+//
+// TWO coordinate systems, and the members are in the REFERENCE one: a, b and
+// w are index-space positions X (phi and PhiInt are evaluated at X), so the
+// PHYSICAL plateau is [map(a), map(b)], of width c r (b - a). The user-facing
+// --focal contract is physical; fromPhysical() is the only constructor that
+// takes it, and make() is the raw reference-space one.
 struct Focal1D
 {
     double L = 1.0;          // axis period
-    double a = 0.0, b = 0.0; // fine plateau [a, b] (world coords)
-    double w = 0.0;          // blend width each side
+    double a = 0.0, b = 0.0; // fine plateau [a, b] (REFERENCE coords)
+    double w = 0.0;          // blend width each side (REFERENCE)
     double r = 1.0;          // fine/coarse slope ratio = 1/R
     double c = 1.0;          // normalization L / (L - (1-r) ((b-a)+w))
     bool active = false;
@@ -253,6 +259,35 @@ struct Focal1D
         f.c = L / (L - (1.0 - f.r) * ((b - a) + w));
         f.active = true;
         return f;
+    }
+
+    // The map whose fine plateau is PHYSICALLY [lo, hi] with a PHYSICAL blend
+    // width W per side: what --focal means. Closed form, no solve: the plateau
+    // maps with slope c r and each blend has mean slope c (1+r)/2, so
+    // c P = (hi-lo)/r and c w = 2W/(1+r) are known, and c follows from the
+    // normalization c (L - (1-r)(P+w)) = L as c = 1 + (1-r)(cP + cw)/L.
+    // Pre: none (bad parameters give the inactive identity, as make()).
+    // Post: map(a) = lo, map(b) = hi, map(a-w) = lo-W, map(b+w) = hi+W to
+    // rounding. Whether the support [a-w, b+w] fits inside [0, L] is the
+    // CALLER's margin test -- outside it the map is not endpoint-preserving.
+    static Focal1D fromPhysical(double L, double lo, double hi, double W,
+                                double R)
+    {
+        if (!(R > 1.0) || !(hi > lo) || !(W > 0.0)) return identity(L);
+        const double r = 1.0 / R;
+        const double cP = (hi - lo) / r, cw = 2.0 * W / (1.0 + r);
+        const double c = 1.0 + (1.0 - r) * (cP + cw) / L;
+        const double w = cw / c;
+        const double a = lo / c + 0.5 * (1.0 - r) * w;
+        return make(L, a, a + cP / c, w, R);
+    }
+
+    // True when the blend support ends at least `margin` (REFERENCE length,
+    // i.e. cells * h) inside both ends of [0, L]; the inactive identity
+    // trivially clears.
+    bool clears(double margin) const
+    {
+        return !active || (a - w >= margin && b + w <= L - margin);
     }
 
     // Quintic smoothstep and its antiderivative on [0, 1].
@@ -363,8 +398,10 @@ struct AxisRemap3
 };
 
 // The --focal mesh map of grid g, built ONCE here for every caller (the app,
-// the compressible runner, the editor): axis a clusters on [lo, hi] with
-// blend w when active and hi > lo, and is the exact identity otherwise.
+// the compressible runner, the editor): axis a is fine on the PHYSICAL
+// plateau [lo, hi] with PHYSICAL blend w when active and hi > lo, and is the
+// exact identity otherwise. The body is placed in physical (world)
+// coordinates, so this is the frame the plateau must be stated in.
 // Host only.
 inline AxisRemap3 focalRemap(const Grid& g, bool active, const double lo[3],
                              const double hi[3], const double w[3], double ratio)
@@ -375,7 +412,7 @@ inline AxisRemap3 focalRemap(const Grid& g, bool active, const double lo[3],
     Focal1D* f[3] = {&m.fx, &m.fy, &m.fz};
     for (int a = 0; a < 3; ++a)
         *f[a] = active && hi[a] > lo[a]
-                    ? Focal1D::make(axisL[a], lo[a], hi[a], w[a], ratio)
+                    ? Focal1D::fromPhysical(axisL[a], lo[a], hi[a], w[a], ratio)
                     : Focal1D::identity(axisL[a]);
     return m;
 }

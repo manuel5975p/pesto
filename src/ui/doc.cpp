@@ -390,12 +390,32 @@ void Doc::build(const DocState& s, uint64_t rev, Build& out)
     }
     out.geo = std::move(*geo);
 
+    // Focal remap: the one builder runner_comp and the app use too.
+    const dns::Case& cs = out.cas();
+    const dns::Grid& g = cs.grid;
+    out.remap = dns::focalRemap(g, cs.focalActive, cs.focalLo, cs.focalHi,
+                                cs.focalW, cs.focalRatio);
+    out.remapActive = cs.focalActive;
+    // Under --focal the solver's body is the WORLD sdf at the MAPPED cell
+    // centres (the ghost wall), so the drawn cut is that body in index space
+    // -- the core's own sampling of it, not a restatement here. The
+    // world-lattice cut buildCaseGeometry made is the qRef measurement only.
+    if (out.remapActive) {
+        auto mapped = dns::sampleCutMapped(g, out.geo.sdf, out.remap, {8, 8});
+        if (!mapped) {
+            out.ok = false;
+            out.error = mapped.error();
+            out.errorCode = 3;
+            return;
+        }
+        out.geo.cut = std::move(*mapped);
+    }
+
     // The runners sanitize before solving (apps/dns_main.cpp), so the cut the
     // viewer draws is the sanitized one -- otherwise it would show slivers the
     // solver never sees.
-    out.sanitize = dns::sanitizeCut(out.cas().grid, out.geo.cut);
+    out.sanitize = dns::sanitizeCut(g, out.geo.cut);
 
-    const dns::Grid& g = out.cas().grid;
     out.nCells = g.size();
     double minL = 1.0, minA = 1.0;
     int bi0 = g.nx, bi1 = -1, bj0 = g.ny, bj1 = -1, bk0 = g.nz, bk1 = -1;
@@ -429,12 +449,6 @@ void Doc::build(const DocState& s, uint64_t rev, Build& out)
     }
     out.minLambda = minL;
     out.minAperture = minA;
-
-    // Focal remap: the one builder runner_comp and the app use too.
-    const dns::Case& cs = out.cas();
-    out.remap = dns::focalRemap(g, cs.focalActive, cs.focalLo, cs.focalHi,
-                                cs.focalW, cs.focalRatio);
-    out.remapActive = cs.focalActive;
 
     // Resolution verdict. h is the FINEST spacing the body sits on -- with
     // --focal the plateau spacing -- by the solver's own rule (dns::hFine).
