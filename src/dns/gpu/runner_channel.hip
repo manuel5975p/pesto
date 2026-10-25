@@ -2,6 +2,7 @@
 
 #include "dns/interrupt.hpp"
 
+#include "dns/channel_line.hpp"
 #include "dns/curvmesh.hpp"
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_channel.hpp"
@@ -11,16 +12,19 @@
 #include "dns/gpu/internal/frame_scratch.hpp"
 #include "dns/gpu/internal/run_loop.hpp"
 #include "dns/gpu/reductions.hpp"
+#include "dns/pseudo_time.hpp"
 #include "dns/remap.hpp"
 #include "dns/steady_stop.hpp"
 
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <format>
+#include <ranges>
 #include <span>
 #include <string>
 #include <vector>
@@ -42,14 +46,20 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     const bool rans = r.rans != RansModel::None;
     const bool sst = ransSst(r.rans);
     const bool steady = rans && r.steadyTol > 0;
+    const bool implicitSteady = steady && r.implicitSteady;
+    // The explicit steady march: compensated state, local time stepping.
+    const bool explicitSteady = steady && !implicitSteady;
 
     auto m = CurvMetrics::build(CurvMesh::channelY(g, r.stretchBeta, r.delta));
     if (!m) return fail(2, "channel mesh: " + m.error());
     auto dev = DeviceComp::make(*m, r.gamma, r.mu);
-    // Steady: the compensated state, so pseudo-time updates below ulp(q)/2
-    // still accumulate (docs/rans.md, "The FP32 update floor"). The channel
-    // wall is the only state-overwriting hook here, and it keeps the low words.
-    auto ds = DeviceCompState::make(g.size(), ransScalars(r.rans), steady);
+    // Explicit steady: the compensated state, so pseudo-time updates below
+    // ulp(q)/2 still accumulate (docs/rans.md, "The FP32 update floor"). The
+    // channel wall is the only state-overwriting hook here, and it keeps the
+    // low words. Implicit steady: plain -- the host holds the FP64 iterate and
+    // the device only its FP32 rounding, so low words would be dead weight.
+    auto ds = DeviceCompState::make(g.size(), ransScalars(r.rans),
+                                    explicitSteady);
     auto red = ReduceScratch::make();
     if (!dev || !ds || !red) return fail(6, "GPU allocation failed");
     // Both plates are walls: mu_t is mirrored odd on both ghost rows, so it
@@ -59,15 +69,15 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
                                   .mirrorYLo = true,
                                   .mirrorYHi = true}))
         return fail(6, "GPU allocation failed (RANS)");
-    if (steady && !dev->enableCompensation())
+    if (explicitSteady && !dev->enableCompensation())
         return fail(6, "GPU allocation failed (compensated state)");
 
     // SST's wall omega: TMR's 60 nu_w / (beta1 d1^2) with d1 the first cell
     // centre's distance (the same on both plates: the mesh is a reflection).
     const double d1 = sst ? r.wallDist[g.idx(0, 1, 0)] : 0.0;
+    const double omegaCoef = sst ? sst::omegaWallFactor * r.mu / (d1 * d1) : 0.0;
     auto wall = DeviceChannelWall::make(
-        g, {r.gamma, r.Rgas, r.Twall, r.isothermal,
-            sst ? sst::omegaWallFactor * r.mu / (d1 * d1) : 0.0});
+        g, {r.gamma, r.Rgas, r.Twall, r.isothermal, omegaCoef});
     if (!wall) return fail(6, "channel wall init failed");
 
     dev->setStageHook([&](DeviceCompState& s) { wall->apply(s); });
@@ -104,6 +114,7 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     if (steady)
         cols.insert(cols.end(), {"iter", "resid", "resU", "resE", "resT",
                                  "Tbulk", "remaining"});
+    if (implicitSteady) cols.insert(cols.end(), {"cfl", "alpha", "rejects"});
     if (auto e = out.declareSeries("stats", cols); !e)
         return fail(4, e.error());
     std::vector<std::string> pcols = {"t",    "y",    "yplus", "uplus", "urms",
@@ -239,6 +250,202 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     const auto wall0 = std::chrono::steady_clock::now();
     const std::string ransLabel = rans ? "RANS " + std::string(ransName(r.rans))
                                        : std::string();
+
+    if (implicitSteady)
+    {
+        // Steady RANS by implicit Newton pseudo-time (docs/rans.md, "Implicit
+        // pseudo-time"). The RANS mean is x/z-homogeneous by construction
+        // (homogeneous IC, --kick rejected), so the HOST holds ONE FP64
+        // column; the device holds its FP32 rounding in every column and
+        // evaluates the residual -- the update's only right-hand side:
+        //   (diag(1/dtau) - J_line) dq = R_gpu,
+        // J_line the host line operator's FD Jacobian (dns/channel_line),
+        // which only preconditions. Exact for this channel ONLY. Every
+        // accepted update is projected onto the IC's total mass (the steady
+        // equations are a one-parameter family in it). The stop listens only
+        // after an undamped step taken at the CFL cap (dns/pseudo_time).
+        // t accumulates the smallest dtau and is NOT a physical time.
+        const int F = 5 + ransScalars(r.rans), ny = g.ny, nS = sst ? 4 : 3;
+        const ChannelLine line = ChannelLine::make(
+            *m, g, r.wallDist,
+            {r.rans, r.gamma, r.Rgas, r.mu, r.Twall, ChannelRun::fBody,
+             omegaCoef});
+        std::vector<double> q(std::size_t(ny) * F, 0.0);
+        for (int j = 0; j < ny; ++j)
+        {
+            const std::size_t c = g.idx(0, j, 0);
+            double* x = q.data() + std::size_t(j) * F;
+            x[0] = ic.rho[c];
+            x[1] = ic.mx[c];
+            x[2] = ic.my[c];
+            x[3] = ic.mz[c];
+            x[4] = ic.E[c];
+            for (int i = 0; i < ds->nT; ++i) x[5 + i] = r.icTurb[i][c];
+        }
+        line.wall(q);
+        const double M0 = line.mass(q);
+
+        std::vector<Real> packed(std::size_t(F) * ny), Rf;
+        DeviceBuffer<Real> xfer;
+        // float(q) into every column's fluid rows, then the wall's ghosts.
+        auto upload = [&](const std::vector<double>& x) {
+            for (int j = 0; j < ny; ++j)
+                for (int v = 0; v < F; ++v)
+                    packed[std::size_t(v) * ny + j] = Real(x[std::size_t(j) * F + v]);
+            const hipError_t e = channelSetRows(gg, packed, xfer, *ds);
+            if (e == hipSuccess) wall->apply(*ds);
+            return e;
+        };
+        // The GPU residual of column 0 in the line's layout; false when not
+        // finite on a fluid row.
+        std::vector<double> R(q.size(), 0.0);
+        auto unpackResidual = [&] {
+            bool finite = true;
+            for (int j = jLo; j <= jHi; ++j)
+                for (int v = 0; v < F; ++v)
+                {
+                    const double x = Rf[std::size_t(v) * ny + j];
+                    R[std::size_t(j) * F + v] = x;
+                    finite = finite && std::isfinite(x);
+                }
+            return finite;
+        };
+
+        PseudoTime pt;
+        SteadyStop stop(nS);
+        std::vector<double> qPrev = q, dtau(ny);
+        long rejects = 0;
+        // Of the step that produced the current state; 0 before the first.
+        double alpha = 0, cflStep = 0, dtStep = 0;
+        double remaining = HUGE_VAL, hostSec = 0, gpuSec = 0;
+        bool converged = false;
+        internal::StatsCadence icad{1}; // a row every iteration
+        auto since = [](std::chrono::steady_clock::time_point a) {
+            return std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - a)
+                .count();
+        };
+        // A rejected step: back to the last accepted state, the history
+        // cleared, the CFL cut; exit 7 once it has collapsed.
+        auto reject = [&]() -> std::expected<void, RunError> {
+            stop = SteadyStop(nS);
+            ++rejects;
+            if (pt.rejected()) return {};
+            return fail(7, std::format("implicit pseudo-time collapsed: CFL < "
+                                       "{:g} after {} rejections",
+                                       kImplicitCflMin, rejects));
+        };
+        while (!converged && st.steps < r.steadySteps)
+        {
+            if (stopRequested()) break;
+            const auto g0 = std::chrono::steady_clock::now();
+            if (upload(q) != hipSuccess)
+                return fail(6, "implicit column upload failed");
+            const ResidualNorms n = dev->residual(*ds, jLo, jHi, *red);
+            if (channelGatherColumn(gg, dev->residualField(), xfer, Rf) !=
+                hipSuccess)
+                return fail(6, "implicit residual download failed");
+            ++st.steps;
+            const double resU = n.mom, resE = n.E / ubEst,
+                         resT = sst ? std::max(n.t[0], n.t[1]) : n.t[0];
+            const double resid = std::max({resU, resE, resT});
+            if (!unpackResidual() || !std::isfinite(resid))
+            {
+                if (st.steps == 1)
+                    return fail(7, "the residual of the initial state is not "
+                                   "finite");
+                q = qPrev;
+                if (auto e = reject(); !e) return std::unexpected(e.error());
+                gpuSec += since(g0);
+                continue;
+            }
+            auto w = measure();
+            if (!w) return std::unexpected(w.error());
+            if (auto h = internal::checkDevice("a stats row", &*red); !h)
+                return std::unexpected(h.error());
+            gpuSec += since(g0);
+
+            const double tBulk = r.Twall + w->tExcess;
+            if (pt.armed())
+            {
+                const double s[4] = {w->ubulk, tBulk, w->turb[0], w->turb[1]};
+                stop.push(std::span(s, nS));
+            }
+            else
+            {
+                stop = SteadyStop(nS);
+            }
+            remaining = stop.remaining(r.steadyTol);
+            converged = remaining < r.steadyTol;
+            const double retau = 0.5 * (w->utauBot + w->utauTop) * r.delta / nu;
+            std::vector<double> row = {t, dtStep, w->ubulk, w->utauBot,
+                                       w->utauTop, retau, w->ke, w->mutMax};
+            if (sst) row.push_back(double(dev->floorHits()));
+            row.insert(row.end(), {double(st.steps), resid, resU, resE, resT,
+                                   tBulk, remaining, cflStep, alpha,
+                                   double(rejects)});
+            out.row("stats", row);
+            const bool last = converged || st.steps >= r.steadySteps;
+            // ub to 7 decimals: the march lands within ~1e-7 of the oracle,
+            // below the stats CSV's 6 significant digits.
+            if (last || st.steps - icad.lastPrint >= 10 * icad.every)
+            {
+                std::printf("iter=%ld ub=%.7f Re_tau=%.2f mutMax=%.2f "
+                            "cfl=%.2e alpha=%.3f %s remaining=%.2e "
+                            "resid=%.3e (U %.2e E %.2e T %.2e)\n",
+                            st.steps, w->ubulk, retau, w->mutMax, cflStep,
+                            alpha, ransLabel.c_str(), remaining, resid, resU,
+                            resE, resT);
+                std::fflush(stdout);
+                icad.printed(st.steps);
+            }
+            if (last)
+            {
+                emitProfiles(t, *w);
+                break;
+            }
+
+            const auto h0 = std::chrono::steady_clock::now();
+            auto dq = pseudoUpdate(line, q, R, pt.cfl());
+            if (!dq) return fail(7, "implicit line solve: " + dq.error());
+            const double a = stepLength(q, *dq, line);
+            std::vector<double> qn = q;
+            line.advance(qn, *dq, a, M0);
+            // rho w stays exactly 0: R_mz decouples at w = 0 (channel_line).
+            assert(std::ranges::all_of(std::views::iota(0, ny), [&](int j) {
+                return qn[std::size_t(j) * F + 3] == 0.0;
+            }));
+            const bool ok = line.admissible(qn);
+            line.pseudoStep(q, pt.cfl(), dtau);
+            hostSec += since(h0);
+            if (!ok)
+            {
+                if (auto e = reject(); !e) return std::unexpected(e.error());
+                continue;
+            }
+            qPrev = std::move(q);
+            q = std::move(qn);
+            cflStep = pt.cfl();
+            alpha = a;
+            dtStep = *std::min_element(dtau.begin() + jLo, dtau.begin() + jHi + 1);
+            t += dtStep;
+            pt.accepted(a);
+        }
+        if (auto h = internal::checkDevice("the end of the run", &*red); !h)
+            return std::unexpected(h.error());
+        finishTiming(st, wall0, out);
+        std::printf("# implicit: %ld iterations, %ld rejections; host "
+                    "(Jacobian, solve, update) %.3f s, GPU (residual, "
+                    "transfers, stats) %.3f s\n",
+                    st.steps, rejects, hostSec, gpuSec);
+        if (!converged && !stopRequested())
+            return fail(8, std::format("steady state not reached in {} "
+                                       "implicit iterations (remaining "
+                                       "change {:.3e} > {:.3g})",
+                                       st.steps, remaining, r.steadyTol));
+        st.converged = converged;
+        return st;
+    }
 
     if (steady)
     {

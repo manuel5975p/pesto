@@ -11,11 +11,14 @@ Every artefact says which closure and which mode (`--dry-run` label, RunMeta
 | `RANS SST-Vm` | Menter 1994 SST with vorticity, ⅔ρk dropped |
 
 Mode suffix: `-- steady (local time stepping: pseudo-time, not time-accurate)`
-with `--steady`, `-- URANS (time-accurate)` without. A RANS 1D/2D run never
-carries the DNS label's "2D: qualitative only" suffix — the mean really is 1D.
+with `--steady` (explicit scheme), `-- steady (implicit Newton pseudo-time:
+not time-accurate)` with `--steady --steady-scheme implicit`, `-- URANS
+(time-accurate)` without. A RANS 1D/2D run never carries the DNS label's "2D:
+qualitative only" suffix — the mean really is 1D.
 
 Built (this round): `dns channel --rans none|sa-neg|sst-2003m|sst-vm`, plus
-`--steady TOL` / `--steady-steps N`. Not built: `dns flow` (O-grid, plate,
+`--steady TOL` / `--steady-steps N` / `--steady-scheme explicit|implicit`.
+Not built: `dns flow` (O-grid, plate,
 immersed bodies), wall models, the incompressible branch, MUSCL scalar
 convection. `--rans` is registered only on `dns channel`, only with the
 closures that exist.
@@ -99,6 +102,10 @@ pinned test requires zero hits.
 
 ## Pseudo-time (`--steady`)
 
+Two schemes (`--steady-scheme`): `explicit` (the default; this section and
+the two after it) and `implicit` (the Newton line march, "Implicit
+pseudo-time" below; ~27 iterations instead of ~3e5).
+
 - **LTS** (D8, D9): `StageCombine::lts` is a per-cell RATIO dt_c/dtRef ≥ 1 on
   top of `cr`; `crAt(c)` is the ONLY way any kernel reads `cr` (stage
   kernels, body force, gravity, sink, NSCBC, the scalar kernels). Additive
@@ -117,7 +124,7 @@ pinned test requires zero hits.
   resU = rms(|R_m|/ρ), resE = rms(R_E/ρ)/Ue, resT = SA rms(R_ν̃/ρ), SST
   max(rms(R_k/ρ), rms(R_ω/(ρω))) (ω spans six decades: its rate of ln ω).
   `resid = max(resU, resE, resT)`, reported in the stats, NOT the stop
-  (below). `--steady-steps` (1000000) is exit 8.
+  (below). `--steady-steps` (1000000 explicit, 500 implicit) is exit 8.
 
 ### The FP32 update floor — what the residual can and cannot certify
 
@@ -161,9 +168,23 @@ Measured (gfx1100):
 The plain march's ub never stops creeping (it crossed the oracle and kept
 going); the compensated one decays onto a fixed point. What it does NOT do is
 reach the static floor (0.042): the plateau is ~10× above it, so the
-residual still certifies nothing. Unexplained, recorded: the cold starts
-settle +0.03% above the oracle on all three closures while the oracle-start
-drift is 3e-8.
+residual still certifies nothing.
+
+**The cold starts' +0.03% above the oracle is MASS DRIFT** (explained
+2026-10-25; it used to be recorded as unexplained). Local time stepping
+conserves Σ V ρ / lts, not Σ V ρ, while v ≠ 0 in the transient, and the
+steady equations are a one-parameter family in total mass (Σ V R_ρ ≡ 0: the
+wall faces carry no mass flux), so the march lands on the member of the
+family whose mass it drifted to. Measured on the device (TPRI analyses a1,
+a2, reproduced 2026-10-25 from the final profile; `--n 4 --nz 1 --ny 64
+--rans sa-neg --steady 1e-4`, 305800 iterations): final fluid mass 1.998440,
+−7.80e-4 against the IC's 2; the oracle solved AT that mass gives ub
+15.83529 against the march's 15.8338 (−9e-5, inside TOL), while against mass
+2 the march is +2.4e-4. Sensitivity dub/ub per dM/M = −0.430. The oracle-start
+drift is 3e-8 because a start at the fixed point has no transient v. The
+implicit scheme pins the mass (below); the explicit march is unchanged — a
+projection there (offline replica: 298,000 vs 305,800 iterations, ub
+−9.8e-5 instead of +2.4e-4) is a pending decision, not built.
 
 ### Stopping on the integrals (built 2026-10-25)
 
@@ -205,7 +226,139 @@ Every stop is exit 0, ~0.16–0.18 ms/iteration (49 s at TOL 1e-4 SA). The
 slow mode's e-fold is ~5.6e4 iterations at Re_τ 180 and ~1.1–1.5e5 at Re_τ
 395 (ny 96), where bulk T is the slowest series: TOL 1e-4 needs ~5e5
 iterations and 1e-5 is past 6e5. The stop certifies the MARCH's fixed point;
-its +0.03% offset from the oracle is a separate, open question.
+its +0.03% offset from the oracle is the mass drift above, not the stop.
+
+## Implicit pseudo-time (`--steady-scheme implicit`, built 2026-10-25)
+
+`dns/channel_line`, `dns/blockband`, `dns/pseudo_time`, and the implicit
+branch of `gpu/runner_channel.hip`. Backward-Euler pseudo-time with defect
+correction:
+
+    (diag(1/Δτ_j) − J) Δq = R_gpu(q),   q ← P_M0(q + α Δq)
+
+- **The right-hand side is always the GPU's**: the existing residual-mode
+  stage (`DeviceComp::residual`, hooks in), gathered from column (0, ·, 0)
+  (`channelGatherColumn`). J only preconditions: a drift between the line
+  operator and the GPU costs iterations, never the answer. `gpu_rans_implicit`
+  I1/I2 pin the drift.
+- **One column, on the host, broadcast.** The RANS mean is x/z-homogeneous
+  by construction (homogeneous IC, `--kick` rejected), so the host holds ONE
+  FP64 column and the device holds its FP32 rounding in every column
+  (`channelSetRows`, then the wall). The device state is column-uniform bit
+  for bit at every iteration (I4), the y-line Jacobian is exact for it, and
+  the iterate on nx 6 × nz 2 equals nx 4 × nz 1 bit for bit (I6, same cells).
+  Exact ONLY for this channel: a non-homogeneous RANS case needs a new design
+  (line-Jacobi plus off-line coupling).
+- **Unknowns** B = 4 + nT per row: (ρ, ρu, ρv, E, ρν̃ | ρk, ρω). At w = 0,
+  R_mz is linear in w and every other row even in it, so ρw decouples
+  exactly and stays exactly 0 (I4: gathered R_mz ≡ 0 and w ≡ 0 at every
+  iteration).
+- **Jacobian**: (2K+1)-colour CENTRAL FD in FP64 of the host line operator,
+  step 1e-7 × max(|q|, floor) (ρ and E their own magnitude, the rest
+  max(|q|, 1e-3 ρ)), the wall reapplied after each perturbation so the ghost
+  chain rule is in. `dns/channel_line` restates the GPU's y-line in conserved
+  variables — KG + face-viscous flux with μt, scalar upwind on the verbatim
+  mass flux, face diffusion with face-formed coefficients, cell terms,
+  isothermal and scalar ghosts, μt odd / F1 even, the body force — and CALLS
+  the closure algebra of `dns/rans.hpp` / `dns/sgs.hpp`. K = 1 for SA (its
+  operator is genuinely tridiagonal), K = 2 for SST (μt and F1 carry
+  cell-centre gradients); the band is pinned EXACT (`channel_line` (b)).
+  The line's residual vanishes at the oracle's solution to 2e-13 (momentum),
+  5e-10 / 1e-9 (energy, SA / SST; at Re_τ 1e4 its FP64 rounding floor, 1.2e-6,
+  is above that) and 1.7e-15 relative (SST ω).
+- **Solve**: block LU without inter-block pivoting, partial pivoting inside
+  each diagonal block (`dns/blockband`), FP64 on the host. Host cost per
+  Jacobian + solve: SA 0.26 / 0.52 / 1.04 ms, SST 0.35 / 0.70 / 1.40 ms at
+  ny 128 / 256 / 512 — no threading needed.
+- **Mass**: every accepted update is scaled to the IC's total mass M0 =
+  Σ ρ vol/S (= 2, the oracle's `totalMass`); specific quantities move by 2
+  ulp. This selects the oracle's member of the mass family.
+- **Ramp, limiter, rejection** (`dns/pseudo_time.hpp`, the one home of the
+  constants): Δτ_j = CFL / ((|u| + c) max_a aov_a) — a continuation scale,
+  not a stability bound; CFL 100, ×2 per accepted undamped step, cap 1e8; the
+  step LENGTH α (whole update scaled, never clipped per cell) keeps ρ and E
+  within 20%, SST ρω above −50% and ρk above −90%; α < 1 holds the CFL. A
+  non-finite residual or an inadmissible state restores the last accepted
+  state and cuts the CFL ×0.1; below 1 it is exit 7. A singular block pivot
+  is exit 7.
+- **Stop**: `SteadyStop` unchanged, one sample per iteration, but ARMED:
+  samples enter the history only after an undamped step taken AT the cap;
+  any damped step, rejection or sub-cap step clears it. Unarmed, a damped
+  march certifies (host test (e): α forced to 0.5 at the cap certified at
+  iteration 15 with ub +6.8e-5; armed, never).
+- **Surface**: `--steady-steps` defaults to 500 (explicit keeps 1000000);
+  `--cfl` and `--dt-recompute` are rejected. Stats: the explicit columns plus
+  `cfl, alpha, rejects` (of the step that produced the row's state; 0 on the
+  first row), one row per iteration; `t`/`dt` are pseudo-time (the smallest
+  Δτ). RunMeta json gains `"steady":"implicit"`. The device state is plain
+  (no Kahan words: the host holds the iterate). The progress line prints ub
+  to 7 decimals (the stats CSV carries 6 significant digits) and the run ends
+  with the host / GPU time split.
+
+| constant | value | bracket |
+|---|---|---|
+| CFL₀ | 100 | prototype (forward-FD J, FP32 residual), Re_τ 1e4 ny 256 SA/SST: 29/29 it from 10, 25/26 from 100, 22/23 from 1000; from 1e8 SST stalled. Host line with the central J: 27–29 from 100, 7–11 from 1e8 (36 cases) |
+| growth | ×2 | ×1.5 needed 23–28 iterations to 1e-4 vs 15–18 at ×2 |
+| cap | 1e8 | a 1e5 cap leaves a slow tail (SA Re_τ 1e4 +5.9e-5 / +7.7e-5) |
+| CFL min | 1 | rejection never fired in any measured case |
+| step bounds | ρ, E 20%; ρω −50%; ρk −90% | fired only at iteration 0 on SST |
+| cap (iterations) | 500 | measured 27–28 |
+| FD step | 1e-7, central | see below |
+
+**First measurement** (before any gate; 30 iterations from the uploaded
+oracle, Re_τ 180 ny 64): the stop's integrals jitter (max − min)/mean
+≤ 1.42e-7 over all samples (SA 1.36e-7, SST-2003m 1.42e-7) and ≤ 7.0e-8 over
+the armed ones — below 2^-21 = 4.8e-7, so the flat branch (2^-20) certifies;
+resid 0.008–0.048 (the static floor).
+
+**Measured** (gfx1100, M 0.2, TOL 1e-4, `--n 4 --nz 1`; oracle
+`solveChannel1d` tol 1e-8 in process; wall = process start to exit, of which
+~0.05 s is start-up; host = Jacobian, solve, update; GPU = upload, wall,
+residual, gather, stats):
+
+| case | iterations | ub | oracle | error | wall | host / GPU |
+|---|---|---|---|---|---|---|
+| Re_τ 180, ny 64, β 2, RANS SA-neg | 27 | 15.8299691 | 15.8299695 | −2.7e-8 | 0.10 s | 3 / 37 ms |
+| — RANS SST-2003m | 28 | 15.6677693 | 15.6677686 | +4.5e-8 | 0.10 s | 6 / 40 ms |
+| — RANS SST-Vm | 28 | 15.6330125 | 15.6330113 | +7.9e-8 | 0.10 s | 5 / 40 ms |
+| Re_τ 1e4, ny 128, β 4, RANS SA-neg | 27 | 25.3453147 | 25.3453151 | −1.6e-8 | 0.10 s | 8 / 38 ms |
+| — RANS SST-2003m | 27 | 25.9915408 | 25.9915400 | +3.1e-8 | 0.11 s | 11 / 44 ms |
+| Re_τ 1e4, ny 256, β 4, RANS SA-neg | 27 | 25.4021882 | 25.4021884 | −7.7e-9 | 0.11 s | 14 / 44 ms |
+| — RANS SST-2003m | 28 | 25.6762395 | 25.6762386 | +3.7e-8 | 0.13 s | 23 / 48 ms |
+| — RANS SST-Vm | 28 | 25.5959025 | 25.5959014 | +4.3e-8 | 0.13 s | 20 / 47 ms |
+
+All exit 0, mode `steady (implicit Newton pseudo-time: not time-accurate)`,
+0 rejections, 0 SST guard hits, α = 1 after iteration 0. TOL 1e-6 (Re_τ 180
+SA) certifies in the same 27. The residual at the stop is the FP32 floor
+(0.02–0.03 at Re_τ 180, 0.9–8.7 at Re_τ 1e4): the stop is on the integrals,
+as for the explicit march. For comparison the explicit march needs ~3.1e5
+iterations / ~50 s for Re_τ 180 TOL 1e-4, and its default cap (1e6) cannot
+reach TOL 1e-4 at Re_τ 1e4 (it needs ~1.3e6).
+
+**Why the Jacobian is CENTRAL FD** (a deviation from the masterplan, which
+specified forward): a forward step's per-entry error reached 1.6e-5 near the
+centreline (Ω = |du/dy| → 0 is a curvature spike in the SA source and the
+SST rate) and it is one-sided across the upwind kink max(ṁ, 0), on which
+every face sits at v = 0 (the cold start and the fixed point). J·δ against a
+central FD of the line was 8e-5 (SA) / 2.2e-4 (SST) per equation with the
+forward form, 1.5e-7 with the central one. With the forward form pure Newton
+(CFL₀ 1e8) stalled damped on SST Re_τ 1e4 ny 256 (ub +19.9% after 100
+iterations — the masterplan's R-a stall); with the central form it certifies
+there in 9 iterations, and in 7–11 across SA/2003m/Vm × Re_τ 180/2000/1e4 ×
+ny 64–512 (host line, FP64 residual). The CFL ramp is kept as the plan's
+guard; the doubled line evaluations cost < 1.4 ms per iteration.
+
+Rejected alternatives (masterplan, reviewer reruns of the prototype):
+
+- **J by FP32 FD of the GPU residual**: the working step is a non-monotone,
+  case-dependent window — 2^-10 never certifies SST Re_τ 1e4 ny 128 (period-2
+  ub oscillation ±0.4%), 2^-12 fails ny 256, 2^-14 passes.
+- **K = 1 for SST** (frozen R, F2, F1): converges with a LINEAR tail, 0.70
+  per iteration at the cap, and stops at −4.4e-5 (Re_τ 180); a truncated
+  exact K = 1 diverges at CFL ≥ 300.
+- **A 1e5 cap**: a slow tail (SA Re_τ 1e4 stopped +5.9e-5 / +7.7e-5).
+- **An unarmed stop**: certified ub 1.1% off after rejections (a1 F5), and a
+  damped stall (a3).
 
 ## dt with RANS (D12)
 
@@ -257,9 +410,13 @@ Laminar limit: 2nd order to the exact compressible Poiseuille (u and T).
 | `rans` | SA/SST closed forms: fv1, fw, cw1, r cap, S̃ limiter, the log-layer identity (cw1; γ1 derived vs 5/9: 0 vs 0.43%), SA-neg branch continuity, J ≥ 0, positive branch == standard SA, point-implicit fixed point (and its increment form, exactly 0 there), float/double, F1/F2 limits, limiters, μt branches, wall distance |
 | `rans_channel1d` | the oracle: laminar order, MKM band (5% provisional ceiling, values pinned to 1e-6), log slope, ub order (SA 2nd, SST 1st), Newton < 2 s |
 | `gpu_rans` | G1 lts = 1.0f bitwise; G2 ν̃ ≡ 0 (and SST k ≡ 0) bitwise to RANS off; G3 uniform scalar exact; G4 wall face μt == 0, ghost algebra (SST: ω_w on the face); G5 residual at the oracle at the FP32 floor; G6/G7 oracle fixed point (uniform / random lts); G8 SA-neg ν̃ < 0 patch; G9 (SA, SST-2003m) march onto the oracle; G10 compensated state (TwoSum exact, pair upload/download, plateau ≤ ½ plain, oracle fixed point, perturbed march); SST rough-field positivity, 0 guard hits |
-| `channel_config` | every `--rans`/`--steady` rule (TOL ∈ [1e-6, 1)), labels, describe lines, RANS-off describe unchanged |
+| `channel_config` | every `--rans`/`--steady`/`--steady-scheme` rule (TOL ∈ [1e-6, 1); implicit rejects `--cfl`/`--dt-recompute`, cap 500, a given `--steady-steps` honoured), labels and describe lines of both schemes, explicit given == defaulted byte for byte, json `"steady"` only on implicit, RANS-off describe unchanged |
 | `steady_stop` | the stop rule: geometric tail exact, never early; growth / drift / short / zero-scale never certified; undamped oscillation never, damped only once flat; 3e-8 noise certified; a single series fooled at a turning point, a companion holds it off |
-| `gpu_runners` | `--steady 1e-3` SA-neg end to end: exit 0, > 1e5 iterations (not at ub's dip), ub within 1.5e-3 of the oracle |
+| `blockband` | block LU vs a dense partial-pivot LU: random B 5/6 × K 1/2 × n 8/64/254 and the line matrix at CFL 100 (backward error ≤ 1e-12, agreement ≤ 1e-10); at CFL 1e8 backward errors only (the matrix is singular to ~1e-8 by Σ V R_ρ ≡ 0, so ANY two solvers differ by ~cond eps); singular / NaN / Inf → error |
+| `channel_line` | (a) R at the oracle (tol 1e-11) ≤ 1e-10 momentum/k, ω 1e-13 relative, E ≤ max(1e-7, its 1-ulp floor); (b) band EXACTLY K, ghosts included; (c) J δ vs central FD ≤ 1e-6 (measured 1.5e-7); (d) host Newton from Reichardt: SA/2003m/Vm Re_τ 180 ny 64, SA/2003m Re_τ 1e4 ny 128 in 27–28 iterations, ub ≤ 7e-10 off, mass 1e-12; (e) a damped march never certified (an unarmed stop does); (f) projection: 2 ulp, mass 1e-15; host timings |
+| `pseudo_time` | CFL 100·2^n to the cap at n = 20; α < 1 holds and disarms; rejection ×0.1, false below 1; armed only after an undamped step at the cap; R-b ramp/reject/regrow never arms below the cap; each step bound binds alone, SA has none |
+| `gpu_rans_implicit` | I1 GPU vs line residual per equation (10× measured: ρ 2e-6, mx 3e-4, my 1e-3, E 2e-4, t 5e-4 / 7e-5); I2 line J vs GPU FP32 central FD ≤ 2e-2 (measured ≤ 1.8e-2); I3 one iteration at the oracle: dub ≤ 1.2e-10, mass exact, resid 0.016–0.031; I4 Re_τ 180 cold starts via the binary (27–28 it, ub ≤ 8e-8 off, 0 rejects / hits) + R_mz, w ≡ 0 and bitwise column-uniform state every iteration; I5 Re_τ 1e4 ny 128 (27 it, ≤ 3e-8, 0.1 s); I6 IC residual column-uniform, nx 6 nz 2 iterate == nx 4 nz 1 bitwise; I7 TOL 1e-6 |
+| `gpu_runners` | `--steady 1e-3 --steady-scheme explicit` SA-neg end to end: exit 0, > 1e5 iterations (not at ub's dip), ub within 1.5e-3 of the oracle (TOL + the mass-drift offset); `--steady 1e-4 --steady-scheme implicit`: exit 0, ≤ 60 iterations (27), ub within 1e-5 of the oracle, < 2 s |
 
 Manual cold starts, `dns channel --n 4 --nz 1 --ny 64 --rans <m> --steady
 1e-6 --steady-steps N`, Re_τ 180, measured 2026-10-24 (gfx1100), BEFORE the

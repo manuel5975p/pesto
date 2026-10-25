@@ -266,7 +266,11 @@ public:
     // [jLo, jHi]. Not state differencing. Pre: rans(), s stage-hook
     // consistent, between steps only (it reuses the stage scratch).
     ResidualNorms residual(const DeviceCompState& s, int jLo, int jHi,
-                           ReduceScratch& r);    // Per-cell local dt_c = min(cfl/wave_c, diffusive_c) into the lts ratios
+                           ReduceScratch& r);
+    // The pure rhs the last residual() wrote, every equation and cell; ghost
+    // rows meaningless. Valid until the next step() or residual().
+    const DeviceCompState& residualField() const { return q2_; }
+    // Per-cell local dt_c = min(cfl/wave_c, diffusive_c) into the lts ratios
     // dt_c/dtRef; returns dtRef = min_c dt_c (FP64). Pre: rans().
     double localDt(const DeviceCompState& s, ReduceScratch& r, double cfl);
     // step() passes the lts ratios in every StageCombine when on.

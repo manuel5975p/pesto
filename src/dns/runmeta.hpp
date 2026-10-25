@@ -37,6 +37,7 @@ struct RunMeta
     double kick = 0;
     std::string sgs;   // "smag" | "sigma" when les, "" for DNS
     std::string rans;  // "SA-neg" | "SST-2003m" | "SST-Vm" when RANS, "" otherwise
+    std::string steady; // "implicit" on --steady-scheme implicit runs, "" otherwise
 
     // The six grid fields from the grid the artefacts are written on.
     void setGrid(const Grid& g)

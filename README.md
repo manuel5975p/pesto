@@ -202,12 +202,17 @@ RANS (spec `docs/rans.md`): `--rans none|sa-neg|sst-2003m|sst-vm` (TMR SA-neg
 with ft2; Menter SST 2003 / 1994-with-vorticity, both with ⅔ρk dropped).
 Labelled `RANS <variant> -- steady|URANS` everywhere. The mean is 1D, so
 `--n 4 --nz 1` is the case; no trip (`--kick` > 0 rejected). `--steady TOL`
-runs local-time-stepping PSEUDO-time on a compensated (Kahan) state until
-ub, bulk T and the turbulence integrals are within TOL (relative, [1e-6, 1))
-of their extrapolated fixed point; `--steady-steps N` (1000000) is exit 8;
-it needs isothermal walls and rejects `--tt`, `--profile-dt` and frame
-output. The residual is reported, never the stop: its FP32 floor hides the
-slow mode. Re_τ 180, ny 64: TOL 1e-4 in ~3.1–3.3e5 iterations (~50–60 s).
+runs PSEUDO-time until ub, bulk T and the turbulence integrals are within
+TOL (relative, [1e-6, 1)) of their extrapolated fixed point; `--steady-steps
+N` is exit 8; it needs isothermal walls and rejects `--tt`, `--profile-dt`
+and frame output. The residual is reported, never the stop: its FP32 floor
+hides the slow mode. `--steady-scheme explicit|implicit` (default explicit):
+`explicit` = local time stepping on a compensated (Kahan) state, cap 1000000,
+Re_τ 180 ny 64 TOL 1e-4 in ~3.1–3.3e5 iterations (~50–60 s); `implicit` =
+Newton line solve on one FP64 host column (the GPU supplies the residual),
+CFL 100 ×2 → 1e8, total mass pinned, cap 500, rejects `--cfl` and
+`--dt-recompute`: 27–28 iterations and 0.10–0.13 s from Re_τ 180 to 1e4,
+within 8e-8 of the FP64 oracle.
 Measured: ub⁺ vs MKM 15.679 at Re_τ 178 — SA-neg +0.82%, SST-2003m −0.29%
 (ny 64; SST is first order in ny, limit −3.5%). `docs/rans.md`.
 
@@ -1018,8 +1023,8 @@ KE < DNS in 3D).
 **RANS** (`dns channel --rans`, `docs/rans.md`) is a third label and a third
 kind of result: an ensemble-mean MODEL output (`RANS SA-neg`, `RANS
 SST-2003m`, `RANS SST-Vm`, plus `-- steady (local time stepping:
-pseudo-time, not time-accurate)` or `-- URANS (time-accurate)`), never a
-grounder. Its μt rides the same eddy-viscosity slot as LES; ν̃ ≡ 0 / k ≡ 0 is
+pseudo-time, not time-accurate)`, `-- steady (implicit Newton pseudo-time:
+not time-accurate)` or `-- URANS (time-accurate)`), never a grounder. Its μt rides the same eddy-viscosity slot as LES; ν̃ ≡ 0 / k ≡ 0 is
 the DNS bit for bit.
 
 ## 12. Curvilinear (distorted regular) meshes — compressible
@@ -1586,3 +1591,7 @@ conditions before citing any of them.
 | sphere STL 96³ Re100 M0.2 dr6 | cd 1.226, Afront 0.856 ≈ πR² |
 | sphere STL vs analytic, Re300, D=12 cells | cd 0.710 vs 0.685 |
 | TGV Re1600 peak dissipation vs spectral | 64³ −8.1%, 128³ +5.6%, 256³ −4.3%, 512³ +1.2% |
+| channel RANS SA-neg Re_τ 1e4 ny 128 β4, steady implicit TOL 1e-4 | 27 it, ub 25.3453147 (oracle −1.6e-8), 0.10 s |
+| channel RANS SST-2003m Re_τ 1e4 ny 128 β4, steady implicit TOL 1e-4 | 27 it, ub 25.9915408 (+3.1e-8), 0.11 s |
+| channel RANS SA-neg Re_τ 1e4 ny 256 β4, steady implicit TOL 1e-4 | 27 it, ub 25.4021882 (−7.7e-9), 0.11 s |
+| channel RANS SST-2003m Re_τ 1e4 ny 256 β4, steady implicit TOL 1e-4 | 28 it, ub 25.6762395 (+3.7e-8), 0.13 s |

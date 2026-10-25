@@ -17,6 +17,7 @@
 // A band belongs in the val_* tier, behind the regeneration procedure.
 #include "validation_util.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -136,19 +137,23 @@ void testChannel()
     cleanup(prefix);
 }
 
-// runner_channel's steady RANS march and its stop rule (dns/steady_stop):
-// exit 0 at TOL 1e-3, with ub where the rule claims. Measured 2026-10-25:
-// stops at 177800 iterations (~28 s), ub 15.8196. ub ALONE would certify at
-// 3400 iterations, 2.8% low (its dip); the companion integrals are what hold
-// the stop off, so the iteration count is checked as well as ub. The FP64
-// oracle (rans_channel1d, Re_tau 180, ny 64) is 15.8300; the march's own
-// fixed point sits +3.3e-4 above it (docs/rans.md), so the band is TOL plus
-// that offset, rounded up.
+// runner_channel's EXPLICIT steady RANS march and its stop rule
+// (dns/steady_stop): exit 0 at TOL 1e-3, with ub where the rule claims.
+// Measured 2026-10-25: stops at 177800 iterations (~28 s), ub 15.8196. ub
+// ALONE would certify at 3400 iterations, 2.8% low (its dip); the companion
+// integrals are what hold the stop off, so the iteration count is checked as
+// well as ub. The FP64 oracle (rans_channel1d, Re_tau 180, ny 64) is 15.8300;
+// the march's own fixed point sits +3.3e-4 above it -- MASS DRIFT: local time
+// stepping conserves sum V rho / lts, not sum V rho, while v != 0, and the
+// steady equations are a one-parameter family in mass (docs/rans.md) -- so
+// the band is TOL plus that offset, rounded up. The scheme is spelled out so
+// a future default flip cannot silently retarget this test.
 void testChannelSteady()
 {
     const std::string prefix = "runner_channel_steady";
     const int rc = runDns("channel --n 4 --nz 1 --ny 64 --rans sa-neg "
-                          "--steady 1e-3 --out " + prefix);
+                          "--steady 1e-3 --steady-scheme explicit --out " +
+                          prefix);
     check(rc == 0, "runner_channel --steady 1e-3: converges, exits 0");
     if (rc == 0)
     {
@@ -172,6 +177,42 @@ void testChannelSteady()
     cleanup(prefix);
 }
 
+// The IMPLICIT steady march (--steady-scheme implicit, docs/rans.md): the
+// Newton line solve, mass pinned, so it lands ON the oracle (15.8299695),
+// not on the explicit march's drifted fixed point. Measured 2026-10-25: 27
+// iterations, ub 15.8299691, 0.1 s.
+void testChannelSteadyImplicit()
+{
+    const std::string prefix = "runner_channel_steady_implicit";
+    const auto t0 = std::chrono::steady_clock::now();
+    const int rc = runDns("channel --n 4 --nz 1 --ny 64 --rans sa-neg "
+                          "--steady 1e-4 --steady-scheme implicit --out " +
+                          prefix);
+    const double secs = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - t0).count();
+    check(rc == 0, "runner_channel --steady-scheme implicit: converges, exits 0");
+    if (rc == 0)
+    {
+        const auto tbl = valtest::loadCsv(prefix + "_stats.csv");
+        check(tbl.has_value(), "runner_channel implicit: stats readable");
+        if (tbl)
+        {
+            const double it = tbl->col("iter").back(),
+                         ub = tbl->col("ubulk").back(),
+                         rem = tbl->col("remaining").back();
+            std::printf("  channel steady implicit: iter %.0f ub %.6g remaining "
+                        "%.3g, %.2f s\n",
+                        it, ub, rem, secs);
+            check(rem < 1e-4, "runner_channel implicit: last row certifies");
+            check(it <= 60, "runner_channel implicit: <= 60 iterations");
+            check(std::abs(ub / 15.82997 - 1) < 1e-5,
+                  "runner_channel implicit: ub within 1e-5 of the oracle");
+            check(secs < 2.0, "runner_channel implicit: < 2 s");
+        }
+    }
+    cleanup(prefix);
+}
+
 } // namespace
 
 int main()
@@ -187,5 +228,6 @@ int main()
     testCompNscbc();
     testChannel();
     testChannelSteady();
+    testChannelSteadyImplicit();
     return dnstest::finish();
 }

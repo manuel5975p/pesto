@@ -1,12 +1,16 @@
 // dns channel parse + validate: wall-unit derivations, the ghost-row grid,
 // the channel-only flag surface, and the rejections.
 #include "dns/config.hpp"
+#include "dns/output.hpp"
 #include "dns/remap.hpp"
 #include "check.hpp"
 #include "cli_test_util.hpp"
 
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -203,6 +207,109 @@ int main()
                       std::string::npos,
               std::string("--rans ") + cli + ": label, RunMeta and wall line");
     }
+    // --- --steady-scheme (docs/rans.md, "Implicit pseudo-time") -------------
+    check(fieldIs(with({"--rans", "sa-neg", "--steady-scheme", "implicit"}),
+                  "--steady-scheme"),
+          "--steady-scheme implicit without --steady rejected");
+    check(fieldIs(with({"--rans", "sa-neg", "--steady-scheme", "explicit"}),
+                  "--steady-scheme"),
+          "--steady-scheme explicit without --steady rejected (given = typed)");
+    check(fieldIs(with({"--rans", "sa-neg", "--steady", "1e-4",
+                        "--steady-scheme", "implicit", "--cfl", "0.3"}),
+                  "--cfl"),
+          "implicit + --cfl rejected");
+    check(fieldIs(with({"--rans", "sa-neg", "--steady", "1e-4",
+                        "--steady-scheme", "implicit", "--dt-recompute", "8"}),
+                  "--dt-recompute"),
+          "implicit + --dt-recompute rejected");
+    rejected(with({"--rans", "sa-neg", "--steady", "1e-4", "--steady-scheme",
+                   "newton"}),
+             1, "unknown --steady-scheme value");
+    {
+        auto c = runCli(with({"--rans", "sa-neg", "--steady", "1e-4",
+                              "--steady-scheme", "explicit", "--cfl", "0.3"}));
+        check(c.has_value() && c->cfl == 0.3, "explicit + --cfl accepted");
+    }
+    {
+        auto imp = runCli(with({"--rans", "sa-neg", "--steady", "1e-4",
+                                "--steady-scheme", "implicit"}));
+        auto exp = runCli(with({"--rans", "sa-neg", "--steady", "1e-4"}));
+        auto expGiven = runCli(with({"--rans", "sa-neg", "--steady", "1e-4",
+                                     "--steady-scheme", "explicit"}));
+        check(imp.has_value() && exp.has_value() && expGiven.has_value(),
+              "implicit / explicit / explicit-given validate");
+        if (imp && exp && expGiven)
+        {
+            check(imp->steadyScheme == dns::SteadyScheme::Implicit &&
+                      imp->steadySteps == 500,
+                  "implicit: --steady-steps defaults to 500");
+            check(exp->steadyScheme == dns::SteadyScheme::Explicit &&
+                      exp->steadySteps == 1000000,
+                  "explicit: --steady-steps stays 1000000");
+            const std::string d = imp->describe();
+            check(d.find("  label      RANS SA-neg -- steady (implicit Newton "
+                         "pseudo-time: not time-accurate)\n") != std::string::npos,
+                  "describe: implicit label");
+            check(d.find("  run        steady TOL=0.0001 cap 500 iterations, "
+                         "implicit Newton (CFL 100 x2 -> 1e8, total mass "
+                         "pinned)\n") != std::string::npos,
+                  "describe: implicit run line with the cap 500");
+            check(exp->describe() == expGiven->describe(),
+                  "explicit given or defaulted: describe byte-identical");
+            check(exp->describe().find("implicit") == std::string::npos,
+                  "explicit describe never mentions implicit");
+            check(imp->meta.steady == "implicit" && exp->meta.steady.empty() &&
+                      expGiven->meta.steady.empty(),
+                  "RunMeta.steady is \"implicit\" only for implicit");
+        }
+    }
+    for (const char* given : {"implicit", "explicit"})
+    {
+        auto c = runCli(with({"--rans", "sst-vm", "--steady", "1e-4",
+                              "--steady-scheme", given, "--steady-steps", "77"}));
+        check(c.has_value() && c->steadySteps == 77,
+              std::string("--steady-steps 77 honoured under ") + given);
+    }
+    {
+        auto c = runCli(with({"--rans", "sst-2003m", "--steady", "1e-4",
+                              "--steady-scheme", "implicit"}));
+        check(c.has_value() &&
+                  c->describe().find("  label      RANS SST-2003m -- steady "
+                                     "(implicit Newton pseudo-time: not "
+                                     "time-accurate)\n") != std::string::npos,
+              "describe: SST implicit label");
+    }
+    // The json: "steady" appended only on an implicit run.
+    {
+        namespace fs = std::filesystem;
+        const fs::path tmp = fs::temp_directory_path() / "dns_test_channel_config";
+        fs::remove_all(tmp);
+        fs::create_directories(tmp);
+        auto jsonOf = [&](std::initializer_list<const char*> extra) {
+            auto c = runCli(with(extra));
+            if (!c) return std::string();
+            dns::RunOutput::Config cfg;
+            cfg.prefix = (tmp / "j").string();
+            cfg.kinds = {dns::Emit::Stats};
+            {
+                auto o = dns::RunOutput::make(cfg, c->meta, c->grid, {});
+                if (!o) return std::string();
+            }
+            std::ifstream f(cfg.prefix + ".json");
+            return std::string(std::istreambuf_iterator<char>(f), {});
+        };
+        const std::string ji = jsonOf({"--rans", "sa-neg", "--steady", "1e-4",
+                                       "--steady-scheme", "implicit"});
+        const std::string je = jsonOf({"--rans", "sa-neg", "--steady", "1e-4"});
+        check(ji.find(",\"rans\":\"SA-neg\",\"steady\":\"implicit\"}") !=
+                  std::string::npos,
+              "json: implicit run carries \"steady\":\"implicit\"");
+        check(!je.empty() && je.find("steady") == std::string::npos &&
+                  je.find(",\"rans\":\"SA-neg\"}") != std::string::npos,
+              "json: explicit run has no \"steady\" field");
+        fs::remove_all(tmp);
+    }
+
     {
         auto c = runCli({"channel", "--rans", "sa-neg", "--ny", "16"});
         check(c.has_value() && c->warnings.size() == 2,

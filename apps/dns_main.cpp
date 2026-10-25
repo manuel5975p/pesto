@@ -648,6 +648,7 @@ int runChannel(const Case& c)
     rr.rans = c.rans;
     rr.steadyTol = c.steadyTol;
     rr.steadySteps = c.steadySteps;
+    rr.implicitSteady = c.steadyScheme == SteadyScheme::Implicit;
     rr.wallDist = std::move(wallDist);
     rr.icTurb = std::move(icTurb);
 

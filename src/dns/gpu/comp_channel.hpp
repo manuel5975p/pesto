@@ -54,6 +54,21 @@ private:
 void addBodyForceX(const GpuGrid& g, double f, const StageCombine& cmb,
                    const DeviceScalar& u, DeviceCompState& out);
 
+// The implicit steady march's column transfer (--steady-scheme implicit,
+// docs/rans.md): the RANS channel mean is x/z-homogeneous, so ONE column
+// carries the whole state. Packed layout field-major [v * ny + j], v in
+// DeviceCompState order (rho, mx, my, mz, E, t0[, t1]), 5 + s.nT fields.
+// Column (0, j, 0) of every field into `host` (resized), through `packed`
+// (allocated on first use).
+hipError_t channelGatherColumn(const GpuGrid& g, const DeviceCompState& s,
+                               DeviceBuffer<Real>& packed,
+                               std::vector<Real>& host);
+// Every cell (i, j, k) of the FLUID rows 1..ny-2 takes host[v * ny + j]; the
+// ghost rows are the wall's (apply it after). A plain-state edit, like
+// boostX. Pre: host.size() == (5 + s.nT) * ny, !s.compensated().
+hipError_t channelSetRows(const GpuGrid& g, const std::vector<Real>& host,
+                          DeviceBuffer<Real>& packed, DeviceCompState& s);
+
 // Deterministic FP64 per-y-plane sum and max of one field: out[j*2 + 0] =
 // sum over (i,k), out[j*2 + 1] = max over (i,k). One thread per row, fixed
 // order. `host` is resized to g.ny * 2.

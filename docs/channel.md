@@ -93,7 +93,8 @@ defaults to 0 and a given `--kick > 0` is rejected. `--steady` runs local
 time stepping in PSEUDO-time (rejects `--tt`, `--profile-dt`, the frame
 cadences and frame `--emit`; profiles are written once, at convergence or the
 cap) and needs isothermal walls. Stats append `mutMax` (SST also
-`floorHits`) and, with `--steady`, `iter, resid, resU, resE, resT`; profiles
+`floorHits`) and, with `--steady`, `iter, resid, resU, resE, resT, Tbulk,
+remaining` (implicit also `cfl, alpha, rejects`); profiles
 append `mutRatio` and SA `nutilde` | SST `kplus, omegaplus`. RANS off is the
 DNS channel byte for byte.
 
@@ -103,6 +104,23 @@ Measured (FP64 oracle = the same discrete operator; MKM ub⁺ 15.679 at Re_τ
 (−3.5%). The FP32 steady march lands on the oracle (ub within 0.06% after
 3–4e5 iterations, 45–55 s at ny 64) but its residual floors at ~1 (the FP32
 update floor) — it cannot certify convergence; see `docs/rans.md`.
+
+`--steady-scheme explicit|implicit` picks the pseudo-time scheme (default
+`explicit`, the local-time-stepping march above). `implicit` is a coupled
+Newton line solve: the host holds ONE FP64 column (the mean is x/z-
+homogeneous), the GPU evaluates the residual of its FP32 broadcast, an FP64
+host line operator only preconditions, the CFL ramps 100 ×2 → 1e8, and every
+update is projected onto the IC's total mass. Labelled `RANS <variant> --
+steady (implicit Newton pseudo-time: not time-accurate)`; `--steady-steps`
+defaults to 500; `--cfl`/`--dt-recompute` are rejected; stats append `cfl,
+alpha, rejects`. Measured (gfx1100, M 0.2, TOL 1e-4, `--n 4 --nz 1`): Re_τ
+180 ny 64 in 27–28 iterations, Re_τ 1e4 ny 128/256 (`--stretch 4`) in 27–28,
+every closure within 8e-8 of the FP64 oracle, 0.10–0.13 s wall per run.
+
+The explicit march's cold starts settle +0.03% above the oracle because local
+time stepping drifts the total mass (−7.8e-4 at TOL 1e-4) and the steady
+equations are a one-parameter family in it; the implicit scheme pins the mass
+and lands on the oracle. `docs/rans.md`, "Implicit pseudo-time".
 
 ## Cost notes
 

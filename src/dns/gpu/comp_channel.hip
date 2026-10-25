@@ -94,6 +94,53 @@ __global__ void kChannelWallSst(GpuGrid g, Real coef, const Real* rho, Real* t0,
     t1[c] = rho[c] * (Real(2) * ww - t1[s] / rho[s]);
 }
 
+// The 5 + nT field pointers of a state, DeviceCompState order.
+template <class P> struct FieldPtrs
+{
+    P p[7];
+    int n;
+};
+
+template <class S> auto fieldPtrs(S& s)
+{
+    FieldPtrs<decltype(s.rho.data())> f{
+        {s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(), s.E.data()},
+        5 + s.nT};
+    for (int i = 0; i < s.nT; ++i) f.p[5 + i] = s.t[i].data();
+    return f;
+}
+
+// One thread per y row: column (0, j, 0) of every field, field-major.
+__global__ void kChannelGatherColumn(GpuGrid g, FieldPtrs<const Real*> f,
+                                     Real* packed)
+{
+    const int j = int(std::size_t(blockIdx.x) * blockDim.x + threadIdx.x);
+    if (j >= g.ny) return;
+    const std::size_t c = gidx(g, 0, j, 0);
+    for (int v = 0; v < f.n; ++v) packed[std::size_t(v) * g.ny + j] = f.p[v][c];
+}
+
+// Every fluid-row cell takes its row's packed value; ghost rows untouched.
+__global__ void kChannelSetRows(GpuGrid g, const Real* packed,
+                                FieldPtrs<Real*> f)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= g.size()) return;
+    int i, j, k;
+    decompose(g, c, i, j, k);
+    if (j < 1 || j > g.ny - 2) return;
+    for (int v = 0; v < f.n; ++v) f.p[v][c] = packed[std::size_t(v) * g.ny + j];
+}
+
+hipError_t ensurePacked(DeviceBuffer<Real>& packed, std::size_t n)
+{
+    if (packed.size() == n) return hipSuccess;
+    auto b = DeviceBuffer<Real>::make(n);
+    if (!b) return b.error();
+    packed = std::move(*b);
+    return hipSuccess;
+}
+
 // One thread per y row; each sums its whole (i,k) plane in FP64 in a fixed
 // order. ~ny threads is a tiny launch, but the plane sums are exact-order
 // deterministic, which the ground rules require of anything reported.
@@ -182,6 +229,34 @@ void addBodyForceX(const GpuGrid& g, double f, const StageCombine& cmb,
             g, Real(f), cmb, u.data(), out.mx.data(), out.E.data());
     });
     checkLastKernel("kBodyForceX");
+}
+
+hipError_t channelGatherColumn(const GpuGrid& g, const DeviceCompState& s,
+                               DeviceBuffer<Real>& packed,
+                               std::vector<Real>& host)
+{
+    const auto f = fieldPtrs(s);
+    const std::size_t n = std::size_t(f.n) * g.ny;
+    if (auto e = ensurePacked(packed, n); e != hipSuccess) return e;
+    kChannelGatherColumn<<<launchBlocks(std::size_t(g.ny)), blockSize>>>(
+        g, f, packed.data());
+    checkLastKernel("kChannelGatherColumn");
+    host.resize(n);
+    return packed.download(host.data());
+}
+
+hipError_t channelSetRows(const GpuGrid& g, const std::vector<Real>& host,
+                          DeviceBuffer<Real>& packed, DeviceCompState& s)
+{
+    assert(!s.compensated()); // a plain-state edit (see boostX)
+    const auto f = fieldPtrs(s);
+    const std::size_t n = std::size_t(f.n) * g.ny;
+    assert(host.size() == n);
+    if (auto e = ensurePacked(packed, n); e != hipSuccess) return e;
+    if (auto e = packed.upload(host.data()); e != hipSuccess) return e;
+    kChannelSetRows<<<launchBlocks(g.size()), blockSize>>>(g, packed.data(), f);
+    checkLastKernel("kChannelSetRows");
+    return hipSuccess;
 }
 
 hipError_t channelPlaneStats(const GpuGrid& g, const DeviceScalar& rho,

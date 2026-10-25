@@ -33,7 +33,9 @@ endif()
 find_package(ZLIB REQUIRED) # fieldpng.cpp (PNG frame export)
 
 add_library(dns_core
+    src/dns/blockband.cpp
     src/dns/bodies.cpp
+    src/dns/channel_line.cpp
     src/dns/cli.cpp
     src/dns/casegeom.cpp
     src/dns/config.cpp
@@ -52,6 +54,7 @@ add_library(dns_core
     src/dns/ogrid.cpp
     src/dns/poisson.cpp
     src/dns/prop/spec.cpp
+    src/dns/pseudo_time.cpp
     src/dns/rans_channel1d.cpp
     src/dns/rotor.cpp
     src/dns/scene.cpp
@@ -371,7 +374,7 @@ if(BUILD_TESTING)
     set(DNS_TESTS cli geometry output poisson projection tgv tgv3d cutcell cutcell_sphere comp comp_curv meshsdf
         fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport
         rotor focal cli_defaults comp_axis_permute rans rans_channel1d
-        steady_stop)
+        steady_stop blockband channel_line pseudo_time)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)
     endif()
@@ -382,7 +385,8 @@ if(BUILD_TESTING)
         set_tests_properties(${t} PROPERTIES TIMEOUT 120)
     endforeach()
     target_link_libraries(test_fieldpng PRIVATE ZLIB::ZLIB) # decodes IDAT
-    set_tests_properties(cli_defaults comp_axis_permute PROPERTIES TIMEOUT 60)
+    set_tests_properties(cli_defaults comp_axis_permute blockband channel_line
+                         pseudo_time PROPERTIES TIMEOUT 60)
 
     # The exit-code contract, driven through the real binary. GPU-free: every
     # case is reachable in phases 1-3a.
@@ -500,6 +504,9 @@ if(BUILD_TESTING)
         dns_gpu_bin_test(gpu_determinism 120)
         # Linear Rayleigh-Benard onset (Ra_c 1708) on both conv branches.
         dns_gpu_bin_test(gpu_rb_onset 60)
+        # The implicit steady RANS march: in-process device checks against the
+        # host line operator, and the runner through the binary (I4/I5/I7).
+        dns_gpu_bin_test(gpu_rans_implicit 60)
 
 
         # --- Physical validation suite (docs/validation.md) -----------------

@@ -30,6 +30,9 @@ enum class BodyKind { None, Cylinder, Sphere, Cube, Lens, Fence, Floor, Mesh, Sc
 // theta = 0 value of the exact coefficient); the other two derive it from the
 // data, per face cell or per transverse DCT mode. See docs/nscbc.md.
 enum class NscbcAbc { YooIm, Adaptive, Modal };
+// The pseudo-time scheme of `dns channel --rans --steady` (docs/rans.md):
+// explicit local-time-stepping SSP-RK3, or the implicit Newton line march.
+enum class SteadyScheme { Explicit, Implicit };
 
 // The ONE spelling of each of these enums, indexed BY the enum value. The CLI
 // parser, the resolved-case printer, the --body error text and the editor's
@@ -42,12 +45,14 @@ std::span<const char* const> physicsNames();
 std::span<const char* const> sgsModelNames();
 std::span<const char* const> nscbcAbcNames();
 std::span<const char* const> subcommandNames();
+std::span<const char* const> steadySchemeNames();
 const char* name(BodyKind);
 const char* name(FarField);
 const char* name(Physics);
 const char* name(SgsModel);
 const char* name(NscbcAbc);
 const char* name(Subcommand);
+const char* name(SteadyScheme);
 // The inverses the parsers need; nullopt when `s` is not a keyword.
 std::optional<Subcommand> subcommandFromName(std::string_view s);
 std::optional<SgsModel> sgsModelFromName(std::string_view s);
@@ -234,6 +239,7 @@ struct RawConfig
     // carries for the channel too).
     int rans = 0;
     int steadySteps = 1000000;
+    int steadyScheme = 0;  // SteadyScheme index: 0 explicit, 1 implicit
 
     // conv (Rayleigh-Benard: heated floor, cooled lid, gravity in -y)
     double rayleigh = 1e6;  // Rayleigh number on the SUPERADIABATIC drop
@@ -370,6 +376,9 @@ public:
     // iterations (exit 8 past it); without it, URANS on the global dt.
     RansModel rans = RansModel::None;
     long steadySteps = 0;
+    // --steady-scheme: Implicit is the Newton line march (docs/rans.md,
+    // "Implicit pseudo-time"); its cap defaults to kImplicitSteadySteps.
+    SteadyScheme steadyScheme = SteadyScheme::Explicit;
 
     // conv (Rayleigh-Benard; see the validate() conv branch for the full
     // derivation). Box units: H = 1, Tref = Rgas = rho_ref = 1, so p_ref = 1

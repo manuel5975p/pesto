@@ -49,6 +49,9 @@ struct ChannelRun
     RansModel rans = RansModel::None;
     double steadyTol = 0;
     long steadySteps = 0;
+    // --steady-scheme implicit: the Newton line march (dns/channel_line,
+    // dns/pseudo_time; docs/rans.md). Pre: steadyTol > 0.
+    bool implicitSteady = false;
     std::vector<double> wallDist;  // g.size(), the model's d (rans only)
     // Conserved scalars, g.size() each, the first ransScalars(rans) used:
     // rho nu~ (SA) or rho k, rho omega (SST).

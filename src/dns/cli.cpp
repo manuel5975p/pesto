@@ -274,6 +274,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         for (const RansModel m : ransBuiltChannel())
             v.emplace_back(ransCliNames()[std::size_t(m)], int(m));
         enums.push_back({"--rans", std::move(v), &c.rans});
+        enums.push_back({"--steady-scheme", enumValues(steadySchemeNames()),
+                         &c.steadyScheme});
     }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Conv)
         enums.push_back({"--visc", {{"constant", 0}, {"sutherland", 1}},
@@ -1049,9 +1051,19 @@ everywhere, docs/rans.md)
                      walls; rejects --tt/--profile-dt and frame
                      output (pseudo-time is not time). Profiles are
                      written once, at convergence or at the cap.
-                     Re_tau 180, ny 64: TOL 1e-4 ~3.2e5 iterations,
-                     1e-5 ~4.5e5.                          [0 = URANS]
-  --steady-steps N   iteration cap; reaching it is exit 8     [1000000]
+                     Two schemes (--steady-scheme): explicit Re_tau
+                     180, ny 64: TOL 1e-4 ~3.2e5 iterations, 1e-5
+                     ~4.5e5; implicit ~26 iterations.      [0 = URANS]
+  --steady-steps N   iteration cap; reaching it is exit 8
+                     [1000000 explicit, 500 implicit]
+  --steady-scheme explicit|implicit
+                     pseudo-time scheme of --steady. explicit = local-
+                     time-stepping SSP-RK3 (Re_tau 180 ny 64 TOL 1e-4:
+                     ~3.1e5 iterations). implicit = coupled Newton line
+                     solve, CFL ramp 100 x2 -> 1e8, total mass pinned
+                     (~26 iterations, Re_tau 180-1e4); rejects --cfl
+                     and --dt-recompute; --steady-steps defaults to 500.
+                     Requires --steady.                       [explicit]
 
 RUN LENGTH
   --tt N             eddy turnovers (delta/u_tau = 1) to integrate   [30]
@@ -1061,7 +1073,9 @@ OUTPUT
   --emit stats       <out>_stats.csv (t,dt,ubulk,utauBot,utauTop,
                      retau,KE; RANS appends mutMax, SST floorHits,
                      and --steady iter,resid,resU,resE,resT,
-                     Tbulk,remaining)                            [on]
+                     Tbulk,remaining; implicit also cfl,alpha,
+                     rejects, one row per iteration, t and dt in
+                     pseudo-time)                                [on]
   --profile-dt DT    <out>_profiles.csv y-profile dump interval
                      (t,y,yplus,uplus,urms,vrms,wrms,uv,rho,T; RANS
                      appends mutRatio and SA nutilde | SST kplus,

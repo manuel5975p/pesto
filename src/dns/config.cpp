@@ -3,6 +3,7 @@
 
 #include "dns/ogrid.hpp"
 
+#include "dns/pseudo_time.hpp"
 #include "dns/remap.hpp"
 #include "dns/scene.hpp"
 #include "dns/steady_stop.hpp"
@@ -292,6 +293,12 @@ std::span<const char* const> subcommandNames()
     return kNames;
 }
 
+std::span<const char* const> steadySchemeNames()
+{
+    static constexpr const char* kNames[] = {"explicit", "implicit"};
+    return kNames;
+}
+
 const char* name(BodyKind b) { return nameAt(bodyKindNames(), std::size_t(b)); }
 const char* name(FarField f) { return nameAt(farFieldNames(), std::size_t(f)); }
 const char* name(Physics p) { return nameAt(physicsNames(), std::size_t(p)); }
@@ -300,6 +307,10 @@ const char* name(NscbcAbc a) { return nameAt(nscbcAbcNames(), std::size_t(a)); }
 const char* name(Subcommand s)
 {
     return nameAt(subcommandNames(), std::size_t(s));
+}
+const char* name(SteadyScheme s)
+{
+    return nameAt(steadySchemeNames(), std::size_t(s));
 }
 
 std::optional<Subcommand> subcommandFromName(std::string_view s)
@@ -434,7 +445,8 @@ std::expected<Case, ConfigError> validateBench(const RawConfig& r, Case c)
               .farField = "periodic",
               .physics = name(c.physics),
               .sgs = "",
-              .rans = ""};
+              .rans = "",
+              .steady = ""};
     c.meta.setGrid(c.grid);
     return c;
 }
@@ -479,7 +491,8 @@ std::expected<Case, ConfigError> validatePeriodic(const RawConfig& r, Case c)
               .farField = "periodic",
               .physics = name(c.physics),
               .sgs = "",
-              .rans = ""};
+              .rans = "",
+              .steady = ""};
     c.meta.setGrid(c.grid);
     return c;
 }
@@ -517,6 +530,23 @@ std::optional<ConfigError> channelRans(const RawConfig& r, Case& c)
             return err(2, "--steady-steps", "caps the --steady iteration; "
                                             "requires --steady TOL");
         if (r.steadySteps < 1) return err(2, "--steady-steps", "must be >= 1");
+    }
+    c.steadyScheme = SteadyScheme(r.steadyScheme);
+    if (r.given.contains("--steady-scheme") && c.steadyTol <= 0)
+        return err(2, "--steady-scheme", "selects the --steady pseudo-time "
+                                         "scheme; requires --steady TOL");
+    if (c.steadyScheme == SteadyScheme::Implicit)
+    {
+        if (auto e = rejectGiven(r, {"--cfl", "--dt-recompute"},
+                                 "with --steady-scheme implicit: explicit-"
+                                 "march knobs; the implicit march ramps its "
+                                 "own pseudo-time step");
+            e)
+            return e;
+        // Measured stops 25-29 iterations: the explicit march's 1000000 would
+        // let a stalled implicit run spin for hours before exit 8.
+        if (!r.given.contains("--steady-steps"))
+            c.steadySteps = kImplicitSteadySteps;
     }
     if (c.steadyTol > 0)
     {
@@ -630,7 +660,10 @@ std::expected<Case, ConfigError> validateChannel(const RawConfig& r, Case c)
               .kick = c.kick,
               .sgs = "",
               .rans = c.rans == RansModel::None ? std::string()
-                                                : std::string(ransName(c.rans))};
+                                                : std::string(ransName(c.rans)),
+              .steady = c.steadyScheme == SteadyScheme::Implicit
+                            ? std::string(name(c.steadyScheme))
+                            : std::string()};
     c.meta.setGrid(c.grid);
     return c;
 }
@@ -853,7 +886,8 @@ std::expected<Case, ConfigError> validateConv(const RawConfig& r, Case c)
               .physics = name(c.physics),
               .kick = c.kick,
               .sgs = "",
-              .rans = ""};
+              .rans = "",
+              .steady = ""};
     c.meta.setGrid(c.grid);
     return c;
 }
@@ -2159,7 +2193,8 @@ std::optional<ConfigError> flowOutput(const RawConfig& r, Case& c)
               .physics = name(c.physics),
               .kick = comp ? c.kick : 0.0,
               .sgs = c.lesLabel ? name(c.sgsModel) : "",
-              .rans = ""};
+              .rans = "",
+              .steady = ""};
     c.meta.setGrid(c.grid);
     return std::nullopt;
 }
@@ -2546,23 +2581,33 @@ std::string Case::describe() const
         // RANS: the label names the closure and the mode, and a RANS mean
         // really IS 1D -- it never carries the 2D "qualitative" suffix.
         const bool ransOn = rans != RansModel::None;
+        const bool implicitSteady =
+            steadyTol > 0 && steadyScheme == SteadyScheme::Implicit;
+        // The ramp's three constants, spelled as the help text spells them.
+        static_assert(kImplicitCfl0 == 100 && kImplicitCflGrowth == 2 &&
+                      kImplicitCflMax == 1e8);
         const std::string runLine =
             steadyTol > 0
-                ? std::format("steady TOL={:.6g} cap {} iterations",
-                              steadyTol, steadySteps)
+                ? std::format("steady TOL={:.6g} cap {} iterations{}",
+                              steadyTol, steadySteps,
+                              implicitSteady ? ", implicit Newton (CFL 100 x2 "
+                                               "-> 1e8, total mass pinned)"
+                                             : "")
                 : std::format("tt={:.6g} eddy turnovers (tEnd={:.6g})  "
                               "kick={:.3g}  profile-dt={:.3g}",
                               ft, tEnd, kick, profileDt);
+        const char* mode =
+            steadyTol <= 0   ? "URANS (time-accurate)"
+            : implicitSteady ? "steady (implicit Newton pseudo-time: not "
+                               "time-accurate)"
+                             : "steady (local time stepping: pseudo-time, not "
+                               "time-accurate)";
         const std::string label =
             !ransOn ? std::string("DNS") +
                           (grid.nz == 1
                                ? " (2D: qualitative only, no vortex stretching)"
                                : "")
-                    : std::format("RANS {} -- {}", ransName(rans),
-                                  steadyTol > 0
-                                      ? "steady (local time stepping: "
-                                        "pseudo-time, not time-accurate)"
-                                      : "URANS (time-accurate)");
+                    : std::format("RANS {} -- {}", ransName(rans), mode);
         const std::string wallScalars =
             ransSst(rans) ? "k_wall = 0 (antimirrored ghost), omega_wall = 60 "
                             "nu/(beta1 d1^2) (TMR; Dirichlet image),\n"
