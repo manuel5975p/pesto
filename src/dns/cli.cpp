@@ -1040,16 +1040,18 @@ everywhere, docs/rans.md)
                      A trip is meaningless: --kick defaults to 0 and a
                      given --kick > 0 is rejected.                 [none]
   --steady TOL       STEADY solve in local-time-stepping pseudo-time
-                     (not time-accurate) until the residual
-                     max(resU, resE, resT) < TOL (wall units; docs/
-                     rans.md). Requires --rans and isothermal walls;
-                     rejects --tt/--profile-dt and frame output
-                     (pseudo-time is not time). Profiles are written
-                     once, at convergence or at the cap. The FP32
-                     march floors at resid ~1 on the M 0.2 channel and
-                     cannot certify the mean below it (docs/rans.md).
-                                                           [0 = URANS]
-  --steady-steps N   iteration cap; reaching it is exit 8      [200000]
+                     (not time-accurate) until the integrals (ub,
+                     bulk T, the turbulence scalars) are within TOL,
+                     RELATIVE, of their extrapolated fixed point;
+                     TOL in [1e-6, 1). The residual is reported, not
+                     used: its FP32 floor hides the slow mode
+                     (docs/rans.md). Requires --rans and isothermal
+                     walls; rejects --tt/--profile-dt and frame
+                     output (pseudo-time is not time). Profiles are
+                     written once, at convergence or at the cap.
+                     Re_tau 180, ny 64: TOL 1e-4 ~3.2e5 iterations,
+                     1e-5 ~4.5e5.                          [0 = URANS]
+  --steady-steps N   iteration cap; reaching it is exit 8     [1000000]
 
 RUN LENGTH
   --tt N             eddy turnovers (delta/u_tau = 1) to integrate   [30]
@@ -1058,7 +1060,8 @@ RUN LENGTH
 OUTPUT
   --emit stats       <out>_stats.csv (t,dt,ubulk,utauBot,utauTop,
                      retau,KE; RANS appends mutMax, SST floorHits,
-                     and --steady iter,resid,resU,resE,resT)         [on]
+                     and --steady iter,resid,resU,resE,resT,
+                     Tbulk,remaining)                            [on]
   --profile-dt DT    <out>_profiles.csv y-profile dump interval
                      (t,y,yplus,uplus,urms,vrms,wrms,uv,rho,T; RANS
                      appends mutRatio and SA nutilde | SST kplus,

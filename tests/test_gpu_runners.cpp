@@ -136,6 +136,42 @@ void testChannel()
     cleanup(prefix);
 }
 
+// runner_channel's steady RANS march and its stop rule (dns/steady_stop):
+// exit 0 at TOL 1e-3, with ub where the rule claims. Measured 2026-10-25:
+// stops at 177800 iterations (~28 s), ub 15.8196. ub ALONE would certify at
+// 3400 iterations, 2.8% low (its dip); the companion integrals are what hold
+// the stop off, so the iteration count is checked as well as ub. The FP64
+// oracle (rans_channel1d, Re_tau 180, ny 64) is 15.8300; the march's own
+// fixed point sits +3.3e-4 above it (docs/rans.md), so the band is TOL plus
+// that offset, rounded up.
+void testChannelSteady()
+{
+    const std::string prefix = "runner_channel_steady";
+    const int rc = runDns("channel --n 4 --nz 1 --ny 64 --rans sa-neg "
+                          "--steady 1e-3 --out " + prefix);
+    check(rc == 0, "runner_channel --steady 1e-3: converges, exits 0");
+    if (rc == 0)
+    {
+        const auto tbl = valtest::loadCsv(prefix + "_stats.csv");
+        check(tbl.has_value(), "runner_channel --steady: stats readable");
+        if (tbl)
+        {
+            const double it = tbl->col("iter").back(),
+                         ub = tbl->col("ubulk").back(),
+                         rem = tbl->col("remaining").back();
+            std::printf("  channel steady: iter %.0f ub %.6g remaining %.3g\n",
+                        it, ub, rem);
+            check(rem < 1e-3, "runner_channel --steady: last row certifies");
+            check(it > 1e5, "runner_channel --steady: not stopped at ub's "
+                            "early dip");
+            check(std::abs(ub / 15.8300 - 1) < 1.5e-3,
+                  "runner_channel --steady: ub within TOL of the oracle "
+                  "(+ the fixed point's offset)");
+        }
+    }
+    cleanup(prefix);
+}
+
 } // namespace
 
 int main()
@@ -150,5 +186,6 @@ int main()
     testIncompTunnel();
     testCompNscbc();
     testChannel();
+    testChannelSteady();
     return dnstest::finish();
 }

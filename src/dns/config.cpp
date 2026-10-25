@@ -5,6 +5,7 @@
 
 #include "dns/remap.hpp"
 #include "dns/scene.hpp"
+#include "dns/steady_stop.hpp"
 #include "dns/transport.hpp"
 
 #include <algorithm>
@@ -502,6 +503,13 @@ std::optional<ConfigError> channelRans(const RawConfig& r, Case& c)
     c.steadyTol = r.steady;
     if (!(std::isfinite(c.steadyTol) && c.steadyTol >= 0))
         return err(2, "--steady", "must be finite and >= 0 (0 = off)");
+    // A relative change: >= 1 certifies nothing, and below kSteadyTolMin the
+    // FP32 integrals' sampling noise decides (docs/rans.md).
+    if (c.steadyTol > 0 && !(c.steadyTol >= kSteadyTolMin && c.steadyTol < 1))
+        return err(2, "--steady",
+                   std::format("is a relative change of the integrals: must "
+                               "be in [{:g}, 1)",
+                               kSteadyTolMin));
     c.steadySteps = r.steadySteps;
     if (r.given.contains("--steady-steps"))
     {

@@ -116,8 +116,8 @@ pinned test requires zero hits.
 - **Norms** (D11), wall units L = δ = 1, U = u_τ = 1, Ue = ub estimate:
   resU = rms(|R_m|/ρ), resE = rms(R_E/ρ)/Ue, resT = SA rms(R_ν̃/ρ), SST
   max(rms(R_k/ρ), rms(R_ω/(ρω))) (ω spans six decades: its rate of ln ω).
-  `resid = max(resU, resE, resT)`; `--steady TOL` stops on resid < TOL,
-  `--steady-steps` (200000) is exit 8.
+  `resid = max(resU, resE, resT)`, reported in the stats, NOT the stop
+  (below). `--steady-steps` (1000000) is exit 8.
 
 ### The FP32 update floor — what the residual can and cannot certify
 
@@ -131,13 +131,81 @@ in the wall cell) — reached within ~1e3 iterations even when started AT the
 oracle. The plan's TOL = 10 × static floor is therefore unreachable, and
 worse: the slow mode (ub) carries a residual below that floor long before it
 has converged (a cold start sits at resid ~1.3 with ub 1.6% low). The
-residual cannot certify convergence of the mean here; `--steady TOL` stops on
-it as specified, but no TOL separates converged from unconverged on this
-case. The solution itself DOES converge onto the oracle (G9: −0.16% ub after
-2.2e5 iterations from a perturbed state, 30 s). **Open user decision**
-(alongside U1): certify differently (an FP64 or compensated state for the
-steady mode, a residual normalised by the update resolution, or larger
-pseudo-time steps); none is built.
+residual cannot certify convergence of the mean here: no TOL separates
+converged from unconverged on this case (hence the integral stop below). The solution itself DOES converge onto the oracle (G9: −0.16% ub after
+2.2e5 iterations from a perturbed state, 30 s).
+
+**The compensated state (built 2026-10-25).** `--steady` now marches a
+Kahan pair per field (`DeviceCompState::lo`, `DeviceComp::enableCompensation`):
+the kernels read hi, every stage write (`gpu/internal/stage_write.hpp`)
+accumulates into hi + lo in the increment form a + cb (b − a) + cr R, exact
+because ca == 1 − cb. Fluxes stay FP32. Plain/compensated is a COMPILE-TIME
+kernel switch: a runtime branch at the write moved the NSCBC rows' FMA
+contraction off the old bits; the plain instantiation is bit-for-bit the
+pre-compensation solver (7 cases compared byte for byte: comp NSCBC + sink,
+sponge, O-grid, conv gravity, DNS / SA / SST channel). The channel wall zeroes
+its ghost cells' low words; boostX / penalizeMomentum assert a plain state.
+Measured (gfx1100):
+
+| | plain | compensated |
+|---|---|---|
+| u drift, 2e4 LTS steps from the oracle (G10) | 6.3e-5 | 3.2e-8 |
+| resid plateau from the oracle (G10, max of tail) | 2.03 | 0.56 |
+| ub after 2.2e5 it from the perturbed state | −0.160% | −0.104% |
+| cold start 4e5 it, resid tail median (SA / 2003m / Vm) | 1.27 / 1.25 / 1.27 | 0.35 / 0.36 / 0.36 |
+| cold start final ub vs oracle | +0.057 / +0.019 / −0.003% | +0.032 / +0.030 / +0.030% |
+| ub drift over the last 1e5 it | +0.027 / +0.022 / +0.015% | +0.009 / +0.008 / +0.007% |
+| ms/iteration 4×66 (SA / SST) | 0.133 / 0.146 | 0.159 / 0.179 |
+| ms/iteration 64³ | 0.531 / 0.738 | 0.600 / 0.849 (1.13× / 1.15×) |
+
+The plain march's ub never stops creeping (it crossed the oracle and kept
+going); the compensated one decays onto a fixed point. What it does NOT do is
+reach the static floor (0.042): the plateau is ~10× above it, so the
+residual still certifies nothing. Unexplained, recorded: the cold starts
+settle +0.03% above the oracle on all three closures while the oracle-start
+drift is 3e-8.
+
+### Stopping on the integrals (built 2026-10-25)
+
+`--steady TOL` stops when every monitored integral is within TOL, RELATIVE,
+of its extrapolated fixed point: ub, bulk T (not T − Tw: the 0.6% excess is a
+difference of FP32-resolved numbers, relative noise 5e-6 against 3e-8), and
+∫ρν̃ dy | ∫ρk dy, ∫ρω dy. `dns/steady_stop`, test `steady_stop`. Per series,
+on the regular stats rows (every 200 iterations; the cap row is off the
+cadence and not sampled):
+
+- window = the second half of the history, four samples at spacing n/6;
+- every row in the window monotone to kSteadyFlat = 2^-20 (else +inf): four
+  samples alone alias an oscillation into a contracting sequence — without
+  this an undamped 1e-4 wave certified at TOL 1e-5 and a damped one stopped
+  8.7× early;
+- both difference ratios in [0, 1) → remaining = |d3| r/(1 − r), r the larger
+  (exact for one geometric mode); otherwise +inf, except a window flat to
+  min(TOL/4, 2^-20) (converged to sampling noise) → max|d|.
+
+TOL ∈ [1e-6, 1) (validator): below 1e-6 the sampling noise decides. ONE
+series is not enough: approaching a turning point looks geometric, and the
+channel's ub dips first (fast mode) and then rises (slow mode) — ub alone
+certifies TOL 1e-3 at 3400 iterations, 2.8% low. The companions are not at
+their turning point then, which holds the stop off. That is the reason for
+monitoring several integrals; a transient that turns every one of them at
+once would still fool it.
+
+Measured (gfx1100, Re_τ 180, ny 64, M 0.2, cold start; error = vs the march's
+own fixed point extrapolated from 6e5 iterations; these stops are exactly
+those predicted offline from the recorded histories):
+
+| TOL | SA-neg | SST-2003m | SST-Vm |
+|---|---|---|---|
+| 1e-3 | 177800 it, ub −9.9e-4 | 210200, −4.9e-4 | 206200, −4.6e-4 |
+| 1e-4 | 305800 it, ub −9.6e-5 | 326600, −5.8e-5 | 318400, −5.9e-5 |
+| 1e-5 (offline) | 433000 | 453000 | 443200 |
+
+Every stop is exit 0, ~0.16–0.18 ms/iteration (49 s at TOL 1e-4 SA). The
+slow mode's e-fold is ~5.6e4 iterations at Re_τ 180 and ~1.1–1.5e5 at Re_τ
+395 (ny 96), where bulk T is the slowest series: TOL 1e-4 needs ~5e5
+iterations and 1e-5 is past 6e5. The stop certifies the MARCH's fixed point;
+its +0.03% offset from the oracle is a separate, open question.
 
 ## dt with RANS (D12)
 
@@ -186,14 +254,17 @@ Laminar limit: 2nd order to the exact compressible Poiseuille (u and T).
 
 | test | what |
 |---|---|
-| `rans` | SA/SST closed forms: fv1, fw, cw1, r cap, S̃ limiter, the log-layer identity (cw1; γ1 derived vs 5/9: 0 vs 0.43%), SA-neg branch continuity, J ≥ 0, positive branch == standard SA, point-implicit fixed point, float/double, F1/F2 limits, limiters, μt branches, wall distance |
+| `rans` | SA/SST closed forms: fv1, fw, cw1, r cap, S̃ limiter, the log-layer identity (cw1; γ1 derived vs 5/9: 0 vs 0.43%), SA-neg branch continuity, J ≥ 0, positive branch == standard SA, point-implicit fixed point (and its increment form, exactly 0 there), float/double, F1/F2 limits, limiters, μt branches, wall distance |
 | `rans_channel1d` | the oracle: laminar order, MKM band (5% provisional ceiling, values pinned to 1e-6), log slope, ub order (SA 2nd, SST 1st), Newton < 2 s |
-| `gpu_rans` | G1 lts = 1.0f bitwise; G2 ν̃ ≡ 0 (and SST k ≡ 0) bitwise to RANS off; G3 uniform scalar exact; G4 wall face μt == 0, ghost algebra (SST: ω_w on the face); G5 residual at the oracle at the FP32 floor; G6/G7 oracle fixed point (uniform / random lts); G8 SA-neg ν̃ < 0 patch; G9 (SA, SST-2003m) march onto the oracle; SST rough-field positivity, 0 guard hits |
-| `channel_config` | every `--rans`/`--steady` rule, labels, describe lines, RANS-off describe unchanged |
+| `gpu_rans` | G1 lts = 1.0f bitwise; G2 ν̃ ≡ 0 (and SST k ≡ 0) bitwise to RANS off; G3 uniform scalar exact; G4 wall face μt == 0, ghost algebra (SST: ω_w on the face); G5 residual at the oracle at the FP32 floor; G6/G7 oracle fixed point (uniform / random lts); G8 SA-neg ν̃ < 0 patch; G9 (SA, SST-2003m) march onto the oracle; G10 compensated state (TwoSum exact, pair upload/download, plateau ≤ ½ plain, oracle fixed point, perturbed march); SST rough-field positivity, 0 guard hits |
+| `channel_config` | every `--rans`/`--steady` rule (TOL ∈ [1e-6, 1)), labels, describe lines, RANS-off describe unchanged |
+| `steady_stop` | the stop rule: geometric tail exact, never early; growth / drift / short / zero-scale never certified; undamped oscillation never, damped only once flat; 3e-8 noise certified; a single series fooled at a turning point, a companion holds it off |
+| `gpu_runners` | `--steady 1e-3` SA-neg end to end: exit 0, > 1e5 iterations (not at ub's dip), ub within 1.5e-3 of the oracle |
 
-Manual cold starts (not in ctest — they cannot exit 0, see the floor above),
-`dns channel --n 4 --nz 1 --ny 64 --rans <m> --steady 1e-6 --steady-steps N`,
-Re_τ 180, measured 2026-10-24 (gfx1100):
+Manual cold starts, `dns channel --n 4 --nz 1 --ny 64 --rans <m> --steady
+1e-6 --steady-steps N`, Re_τ 180, measured 2026-10-24 (gfx1100), BEFORE the
+compensated state and the integral stop (both tables above supersede it; the
+residual stop then could not exit 0):
 
 | closure | oracle ub | ub −0.3% reached | final ub (iterations) | resid plateau | wall |
 |---|---|---|---|---|---|

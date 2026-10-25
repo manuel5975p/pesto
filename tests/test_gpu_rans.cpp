@@ -11,6 +11,9 @@
 //   G7  ... with RANDOM lts ratios (an additive hook ignoring lts drifts O(1))
 //   G8  SA-neg stress: a negative nu~ patch stays finite with mu_t == 0
 //   G9  --steady from the perturbed state converges onto the oracle
+//   G10 the compensated state: TwoSum exact, upload/download of the pair,
+//       the plateau below the plain march's, the oracle a fixed point, and
+//       the perturbed march onto the oracle
 // docs/rans.md. Seconds.
 #include "dns/comp.hpp"
 #include "dns/config.hpp"
@@ -55,7 +58,7 @@ struct Rig
 };
 
 std::unique_ptr<Rig> makeRig(const Channel1dCase& cc, int nx, int nz,
-                             RansModel model)
+                             RansModel model, bool compensated = false)
 {
     auto r = std::make_unique<Rig>();
     r->g = channel1dGrid(cc, nx, nz, 4.0, 1.0);
@@ -69,7 +72,8 @@ std::unique_ptr<Rig> makeRig(const Channel1dCase& cc, int nx, int nz,
     r->d = channelWallDistance(mesh, 1.0);
     const double d1 = r->d[r->g.idx(0, 1, 0)];
     auto dev = gpu::DeviceComp::make(*r->m, kGamma, r->mu);
-    auto ds = gpu::DeviceCompState::make(r->g.size(), ransScalars(model));
+    auto ds = gpu::DeviceCompState::make(r->g.size(), ransScalars(model),
+                                         compensated);
     auto wall = gpu::DeviceChannelWall::make(
         r->g, {kGamma, 1.0, r->Twall, true,
                ransSst(model) ? sst::omegaWallFactor * r->mu / (d1 * d1) : 0.0});
@@ -83,6 +87,7 @@ std::unique_ptr<Rig> makeRig(const Channel1dCase& cc, int nx, int nz,
         !r->dev->enableRans({.model = model, .wallDist = r->d,
                              .mirrorYLo = true, .mirrorYHi = true}))
         return nullptr;
+    if (compensated && !r->dev->enableCompensation()) return nullptr;
     Rig* p = r.get();
     p->dev->setStageHook([p](gpu::DeviceCompState& s) { p->wall->apply(s); });
     p->dev->setRhsHook([p](const gpu::DeviceCompState&, gpu::DeviceCompState& o,
@@ -268,7 +273,8 @@ struct OracleRig
 };
 
 std::unique_ptr<OracleRig> oracleRig(RansModel model = RansModel::SaNeg,
-                                     int ny = 64, double reTau = 180)
+                                     int ny = 64, double reTau = 180,
+                                     bool compensated = false)
 {
     Channel1dCase cc;
     cc.ny = ny;
@@ -281,7 +287,7 @@ std::unique_ptr<OracleRig> oracleRig(RansModel model = RansModel::SaNeg,
     }
     auto o = std::make_unique<OracleRig>();
     o->sol = std::move(*s);
-    o->rig = makeRig(cc, 4, 1, model);
+    o->rig = makeRig(cc, 4, 1, model, compensated);
     if (!o->rig) return nullptr;
     return o;
 }
@@ -585,6 +591,117 @@ void steadyConverges()
           "G9: the residual sits on the oracle-start plateau (<= 2x)");
 }
 
+// --- G10: the compensated state (DeviceCompState::lo) ---------------------------
+
+// twoSum is error-free for any magnitudes (no |a| >= |b| precondition), and
+// addWord2 leaves |lo| <= ulp(hi)/2 with hi + lo the sum to the lo rounding.
+void word2Exact()
+{
+    std::mt19937 rng(11);
+    std::uniform_real_distribution<float> M(-1.0f, 1.0f);
+    std::uniform_int_distribution<int> E(-30, 30);
+    bool exact = true, normal = true;
+    for (int i = 0; i < 200000; ++i) {
+        const float a = std::ldexp(M(rng), E(rng)), b = std::ldexp(M(rng), E(rng));
+        const gpu::Word2 s = gpu::twoSum(a, b);
+        exact = exact && double(s.hi) + double(s.lo) == double(a) + double(b) &&
+                s.hi == a + b;
+        const float lo = std::ldexp(M(rng), E(rng) - 30);
+        const gpu::Word2 w = gpu::addWord2(a, lo, b);
+        const float ulp = std::nextafter(std::abs(w.hi), 1e30f) - std::abs(w.hi);
+        normal = normal && std::abs(w.lo) <= 0.5f * ulp;
+    }
+    check(exact, "G10: twoSum is exact (hi + lo == a + b in FP64) for any magnitudes");
+    check(normal, "G10: addWord2 renormalises (|lo| <= ulp(hi)/2)");
+}
+
+// Upload zeroes the low words; download returns hi + lo. A compensated state
+// holding a plain upload reads back the exact floats.
+void compensatedIo()
+{
+    Channel1dCase cc;
+    cc.ny = 32;
+    cc.reTau = 2.0;
+    auto r = makeRig(cc, 8, 4, RansModel::SaNeg, true);
+    if (!r) { check(false, "G10 io rig"); return; }
+    const auto s0 = laminarState(r->g, r->Twall);
+    std::vector<double> t(r->g.size(), 0.25);
+    march(*r, 3, stableOf(*r)); // dirty the low words first
+    (void)r->ds->upload(s0);
+    (void)r->ds->uploadTurb(0, t);
+    auto h = CompState::zeros(r->g);
+    std::vector<double> th;
+    (void)r->ds->download(h);
+    (void)r->ds->downloadTurb(0, th);
+    bool same = true;
+    for (std::size_t q = 0; q < h.rho.size(); ++q)
+        same = same && h.rho[q] == double(float(s0.rho[q])) &&
+               h.E[q] == double(float(s0.E[q])) && th[q] == 0.25;
+    check(r->ds->compensated() && r->dev->compensated(), "G10: rig is compensated");
+    check(same, "G10: upload zeroes lo; download is the uploaded floats exactly");
+}
+
+// MEASURED 2026-10-25 (cold starts, docs/rans.md): the compensated march keeps
+// the sub-ulp updates the plain one rounds away. Its residual plateau sits
+// ~3.5x below the plain one, ub stops creeping, and it lands on a fixed point
+// (the FP32 operator's) a few 1e-4 from the oracle on every closure.
+void compensatedMarch()
+{
+    auto p = oracleRig();
+    auto c = oracleRig(RansModel::SaNeg, 64, 180, true);
+    if (!p || !c) { check(false, "G10 oracle rigs"); return; }
+    const auto h = toCompState(p->sol, p->rig->g);
+    const auto t = toTurb(p->sol, p->rig->g);
+    upload(*p->rig, h, t);
+    upload(*c->rig, h, t);
+    const double plain = steadyMarch(*p->rig, 20000, 10000, p->sol.ubEst);
+    const double comp = steadyMarch(*c->rig, 20000, 10000, c->sol.ubEst);
+    const auto [dup, dnp] = drift(*p->rig, p->sol);
+    const auto [duc, dnc] = drift(*c->rig, c->sol);
+    std::printf("G10: 2e4 LTS steps from the oracle: plateau plain %.3e, "
+                "compensated %.3e (static floor %.3e); u drift %.2e / %.2e\n",
+                plain, comp, g5Floor, dup, duc);
+    check(comp <= 0.5 * plain,
+          "G10: the compensated plateau is <= half the plain one");
+    check(duc < 1e-4 && dnc < 5e-4,
+          "G10: the oracle is a fixed point of the compensated march");
+
+    // From the perturbed state: G9's march, compensated.
+    auto hp = h;
+    auto tp = t;
+    for (std::size_t q = 0; q < hp.rho.size(); ++q) {
+        const double u = h.mx[q] / h.rho[q];
+        const double e = h.E[q] - 0.5 * h.rho[q] * u * u;
+        hp.mx[q] = h.rho[q] * 0.95 * u;
+        hp.E[q] = e + 0.5 * h.rho[q] * 0.95 * u * 0.95 * u;
+        tp[q] = 0.7 * t[q];
+    }
+    Rig& r = *c->rig;
+    upload(r, hp, tp);
+    const auto t0 = std::chrono::steady_clock::now();
+    const long n = 220000;
+    const double res = steadyMarch(r, n, 10000, c->sol.ubEst);
+    const double sec =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    auto hs = CompState::zeros(r.g);
+    (void)r.ds->download(hs);
+    double mom = 0, mass = 0;
+    for (int j = 1; j <= r.g.ny - 2; ++j) {
+        const std::size_t q = r.g.idx(0, j, 0);
+        const double dyj = r.m->vol[q] / r.m->S[1][1][q];
+        mom += hs.mx[q] * dyj;
+        mass += hs.rho[q] * dyj;
+    }
+    const double ub = mom / mass;
+    std::printf("G10: compensated, %ld LTS iterations from the perturbed state, "
+                "%.1f s: ub %.6f vs oracle %.6f (%+.3f%%), resid %.3e\n",
+                n, sec, ub, c->sol.ub, 100 * (ub - c->sol.ub) / c->sol.ub, res);
+    check(std::abs(ub - c->sol.ub) <= 3e-3 * c->sol.ub,
+          "G10: compensated ub within 0.3% of the oracle");
+    check(res <= 2.0 * comp,
+          "G10: the compensated residual sits on its oracle-start plateau (<= 2x)");
+}
+
 // --- SST (phase B) -------------------------------------------------------------
 
 // Laminar limit with k == 0: mu_t = 0 exactly, so SST on is SST off bit for
@@ -760,6 +877,9 @@ int main()
     fixedPoint(true);
     negativePatch();
     steadyConverges();
+    word2Exact();
+    compensatedIo();
+    compensatedMarch();
     for (RansModel m : {RansModel::Sst2003m, RansModel::SstVm})
         sstLaminarLimit(m);
     sstSuite(RansModel::Sst2003m, true);

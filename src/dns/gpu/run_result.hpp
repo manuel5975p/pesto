@@ -15,7 +15,7 @@ struct RunStats
     double cd = 0, cl = 0, cs = 0, cdf = 0;   // last measured
     double resid = 0;         // last steady residual, uInf^2/D units
     double tStop = 0;         // time actually reached
-    bool converged = false;   // steady mode only: resid fell below steadyTol
+    bool converged = false;   // steady mode only: the stop rule was met
 };
 
 // Errors carry the process exit code the masterplan assigns (6 resource,

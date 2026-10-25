@@ -339,4 +339,12 @@ template <class T> DNS_HD T pointImplicit(T comb, T cr, T R, T J, T q)
     return (comb + cr * (R + J * q)) / (T(1) + cr * J);
 }
 
+// The same update as an INCREMENT on comb: pointImplicit == comb + this,
+// algebraically. The compensated stage adds it to comb's (hi, lo) pair, where
+// the quotient form would round the whole value. Pre: as pointImplicit.
+template <class T> DNS_HD T pointImplicitDelta(T comb, T cr, T R, T J, T q)
+{
+    return cr * (R + J * (q - comb)) / (T(1) + cr * J);
+}
+
 } // namespace dns

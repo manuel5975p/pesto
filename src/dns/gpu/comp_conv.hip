@@ -1,6 +1,7 @@
 #include "dns/gpu/comp_conv.hpp"
 
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/internal/stage_write.hpp"
 #include "dns/gpu/hotpatch.hpp"
 #include "dns/gpu/index.hpp"
 #include "dns/gpu/internal/plane_sums.hpp"
@@ -60,6 +61,8 @@ __global__ void kConvWallSide(GpuGrid g, int axis, Real* rho, Real* mx, Real* my
 // combination, so the source enters scaled by the same crAt(c) (comp.hpp,
 // StageCombine) that multiplied the interior rhs. Momentum takes -g rho, the
 // energy equation the work rate -g rho v = -g my of the SAME stage state.
+// Comp: the compensated write (internal/stage_write.hpp).
+template <bool Comp>
 __global__ void kGravityY(GpuGrid g, int ox, int oz, Real gy, StageCombine cmb,
                           const Real* rho, const Real* my, Real* omy, Real* oE)
 {
@@ -70,9 +73,10 @@ __global__ void kGravityY(GpuGrid g, int ox, int oz, Real gy, StageCombine cmb,
     // Ghost cells: the wall mirror owns them (the rows always, the lateral
     // columns once that side is a wall).
     if (!inFluid(g, i, j, k, ox, oz)) return;
+    // out += (cr gy)(-q): the same float as out -= cr gy q (negation is exact).
     const Real cr = cmb.crAt(c);
-    omy[c] -= cr * gy * rho[c];
-    oE[c] -= cr * gy * my[c];
+    internal::stageAdd<Comp>(cmb, 2, c, cr * gy, -rho[c], omy);
+    internal::stageAdd<Comp>(cmb, 4, c, cr * gy, -my[c], oE);
 }
 
 // One thread per y row; each sums its whole (i,k) plane in FP64 in a fixed
@@ -138,9 +142,11 @@ void DeviceConvWall::apply(DeviceCompState& s) const
 void addGravityY(const GpuGrid& g, double gy, const StageCombine& cmb,
                  bool closed, const DeviceCompState& s, DeviceCompState& out)
 {
-    kGravityY<<<launchBlocks(g.size()), blockSize>>>(
-        g, sideGhostX(closed), sideGhostZ(g, closed), Real(gy), cmb,
-        s.rho.data(), s.my.data(), out.my.data(), out.E.data());
+    internal::withCompensation(cmb, [&](auto comp) {
+        kGravityY<decltype(comp)::value><<<launchBlocks(g.size()), blockSize>>>(
+            g, sideGhostX(closed), sideGhostZ(g, closed), Real(gy), cmb,
+            s.rho.data(), s.my.data(), out.my.data(), out.E.data());
+    });
     checkLastKernel("kGravityY");
 }
 

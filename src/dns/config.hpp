@@ -233,7 +233,7 @@ struct RawConfig
     // and the pseudo-time iteration cap of --steady (which `steady` above
     // carries for the channel too).
     int rans = 0;
-    int steadySteps = 200000;
+    int steadySteps = 1000000;
 
     // conv (Rayleigh-Benard: heated floor, cooled lid, gravity in -y)
     double rayleigh = 1e6;  // Rayleigh number on the SUPERADIABATIC drop

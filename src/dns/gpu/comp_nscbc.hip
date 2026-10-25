@@ -2,6 +2,7 @@
 
 #include "dns/gpu/internal/comp_flux.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/internal/stage_write.hpp"
 #include "dns/gpu/farpot.hpp"
 #include "dns/gpu/index.hpp"
 #include "dns/remap.hpp"
@@ -48,8 +49,8 @@ constexpr Real kBetaXMax = Real(18);
 // faceFluxCurv on the metric tables cv (the curvilinear interior scheme,
 // exactly). The IdentityRemap instantiation keeps the historical uniform
 // arithmetic UNTOUCHED (cv unused), so the validated uniform NSCBC runs are
-// bit-identical.
-template <class Remap>
+// bit-identical. Comp: the compensated write (internal/stage_write.hpp).
+template <class Remap, bool Comp>
 __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
                             Real gam, PrimView q,
                             int openY, int openZ, int fr, Real invLx, Real invLy,
@@ -337,7 +338,7 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
     Real* out[5] = {orho, omx, omy, omz, oE};
     const Real cr = cmb.crAt(c);
     for (int v = 0; v < 5; ++v)
-        out[v][c] = cmb.ca * cmb.a[v][c] + cmb.cb * cmb.b[v][c] + cr * rhs[v];
+        internal::stagePut<Comp>(cmb, v, c, cr, rhs[v], out[v]);
 }
 
 // Shared launch: both public apply overloads funnel here; the remap type
@@ -361,19 +362,21 @@ void launchNscbc(const GpuGrid& g, const DeviceCompNscbc::Config& c, double u,
     // Doublet strength tracks the ramped freestream: 2D u a^2, 3D u a^3 / 2.
     const double a2 = c.aBody * c.aBody;
     const double dbl = g.nz == 1 ? u * a2 : 0.5 * u * a2 * c.aBody;
-    kNscbcCells<<<launchBlocks(nb), blockSize>>>(
-        g, R, cv, viscView(d.transport()), Real(c.gamma), q, int(c.openY),
-        int(c.openZ), c.floorRows,
-        Real(1.0 / (g.nx * g.hx)), Real(1.0 / (g.ny * g.hy)),
-        Real(1.0 / (g.nz * g.hz)), Real(c.sigma), Real(c.etaIn),
-        Real(c.etaInShear < 0 ? c.etaIn : c.etaInShear),
-        Real(1.0 - M * M), Real(betaT), int(c.betaAuto), Real(c.sigLat),
-        Real(c.etaLat),
-        Real(u), Real(c.rhoInf), Real(c.pInf), int(c.potCorrect), Real(Q),
-        Real(dbl), Real(c.xc), Real(c.yc), Real(c.zc),
-        Real(c.thermalInflow ? 1.0 / (c.Rgas * c.TInf) : 0.0), cmb, linHi,
-        out.rho.data(),
-        out.mx.data(), out.my.data(), out.mz.data(), out.E.data());
+    internal::withCompensation(cmb, [&](auto comp) {
+        kNscbcCells<Remap, decltype(comp)::value><<<launchBlocks(nb), blockSize>>>(
+            g, R, cv, viscView(d.transport()), Real(c.gamma), q, int(c.openY),
+            int(c.openZ), c.floorRows,
+            Real(1.0 / (g.nx * g.hx)), Real(1.0 / (g.ny * g.hy)),
+            Real(1.0 / (g.nz * g.hz)), Real(c.sigma), Real(c.etaIn),
+            Real(c.etaInShear < 0 ? c.etaIn : c.etaInShear),
+            Real(1.0 - M * M), Real(betaT), int(c.betaAuto), Real(c.sigLat),
+            Real(c.etaLat),
+            Real(u), Real(c.rhoInf), Real(c.pInf), int(c.potCorrect), Real(Q),
+            Real(dbl), Real(c.xc), Real(c.yc), Real(c.zc),
+            Real(c.thermalInflow ? 1.0 / (c.Rgas * c.TInf) : 0.0), cmb, linHi,
+            out.rho.data(),
+            out.mx.data(), out.my.data(), out.mz.data(), out.E.data());
+    });
     checkLastKernel("kNscbcCells");
 }
 

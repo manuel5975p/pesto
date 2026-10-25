@@ -1,6 +1,7 @@
 #include "dns/gpu/rans.hpp"
 
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/internal/stage_write.hpp"
 #include "dns/gpu/internal/wall_ghost.hpp"
 #include "dns/rans.hpp"
 #include "dns/sgs.hpp"
@@ -109,6 +110,8 @@ __device__ inline Real sstFaceFlux(ViscView vv, PrimView q, const CurvView& m,
     return F - (muf + sig * mutf) * gS;
 }
 
+// Comp: the compensated write (gpu/internal/stage_write.hpp).
+template <bool Comp>
 __global__ void kSstStageCurv(GpuGrid g, ViscView vv, PrimView q, CurvView m,
                               MrfView mz, StageCombine cmb, SstStageArgs A,
                               int residual, Real* out0, Real* out1)
@@ -166,24 +169,37 @@ __global__ void kSstStageCurv(GpuGrid g, ViscView vv, PrimView q, CurvView m,
         return;
     }
     const Real cr = cmb.crAt(c);
-    Real ok = pointImplicit(cmb.ca * cmb.ta[0][c] + cmb.cb * cmb.tb[0][c], cr,
-                            rk, P.Jk, A.t0[c]);
-    Real ow = pointImplicit(cmb.ca * cmb.ta[1][c] + cmb.cb * cmb.tb[1][c], cr,
-                            rw, P.Jw, A.t1[c]);
+    const Real ck = cmb.ca * cmb.ta[0][c] + cmb.cb * cmb.tb[0][c];
+    const Real cw = cmb.ca * cmb.ta[1][c] + cmb.cb * cmb.tb[1][c];
+    Word2 ok, ow;
+    if constexpr (Comp) {
+        ok = internal::stageCombineT(
+            cmb, 0, c, pointImplicitDelta(ck, cr, rk, P.Jk, A.t0[c]));
+        ow = internal::stageCombineT(
+            cmb, 1, c, pointImplicitDelta(cw, cr, rw, P.Jw, A.t1[c]));
+    } else {
+        ok = {pointImplicit(ck, cr, rk, P.Jk, A.t0[c]), Real(0)};
+        ow = {pointImplicit(cw, cr, rw, P.Jw, A.t1[c]), Real(0)};
+    }
     // The COUNTED positivity guard (docs/rans.md): never silent -- every
     // pinned test requires zero hits. Ghost rows are the wall's to overwrite.
+    // On the pair it tests hi: a renormalised hi of 0 has lo == 0.
     const bool counted = !((j == 0 && A.skipLo) || (j == g.ny - 1 && A.skipHi));
     const Real wmin = A.omegaFloor * A.outRho[c];
-    if (!(ok >= Real(0))) {
-        ok = Real(0);
+    if (!(ok.hi >= Real(0))) {
+        ok = {Real(0), Real(0)};
         if (counted) atomicAdd(A.hits, 1ull);
     }
-    if (!(ow >= wmin)) {
-        ow = wmin;
+    if (!(ow.hi >= wmin)) {
+        ow = {wmin, Real(0)};
         if (counted) atomicAdd(A.hits, 1ull);
     }
-    out0[c] = ok;
-    out1[c] = ow;
+    out0[c] = ok.hi;
+    out1[c] = ow.hi;
+    if constexpr (Comp) {
+        cmb.otl[0][c] = ok.lo;
+        cmb.otl[1][c] = ow.lo;
+    }
 }
 
 // The advecting area flux through the +`axis` face of the a-b pair: the
@@ -227,6 +243,7 @@ __device__ inline Real saFaceFlux(ViscView vv, PrimView q, const CurvView& m,
     return F - Real(1.0 / sa::sigma) * rf * saDiffCoef(nuf, ntf) * gS;
 }
 
+template <bool Comp>
 __global__ void kSaStageCurv(GpuGrid g, ViscView vv, PrimView q, CurvView m,
                              MrfView mz, StageCombine cmb, const Real* t0,
                              const Real* d, int residual, int transportOnly,
@@ -297,7 +314,14 @@ __global__ void kSaStageCurv(GpuGrid g, ViscView vv, PrimView q, CurvView m,
         return;
     }
     const Real comb = cmb.ca * cmb.ta[0][c] + cmb.cb * cmb.tb[0][c];
-    out0[c] = pointImplicit(comb, cmb.crAt(c), rhs, J, t0[c]);
+    if constexpr (!Comp) {
+        out0[c] = pointImplicit(comb, cmb.crAt(c), rhs, J, t0[c]);
+    } else {
+        const Word2 w = internal::stageCombineT(
+            cmb, 0, c, pointImplicitDelta(comb, cmb.crAt(c), rhs, J, t0[c]));
+        out0[c] = w.hi;
+        cmb.otl[0][c] = w.lo;
+    }
 }
 
 } // namespace
@@ -330,8 +354,10 @@ void sstStageCurv(const GpuGrid& g, ViscView vv, PrimView q, CurvView m,
                   MrfView mz, const StageCombine& cmb, const SstStageArgs& a,
                   bool residual, Real* out0, Real* out1)
 {
-    kSstStageCurv<<<launchBlocks(g.size()), blockSize>>>(
-        g, vv, q, m, mz, cmb, a, int(residual), out0, out1);
+    internal::withCompensation(cmb, [&](auto comp) {
+        kSstStageCurv<decltype(comp)::value><<<launchBlocks(g.size()), blockSize>>>(
+            g, vv, q, m, mz, cmb, a, int(residual), out0, out1);
+    });
     checkLastKernel("kSstStageCurv");
 }
 
@@ -339,8 +365,10 @@ void saStageCurv(const GpuGrid& g, ViscView vv, PrimView q, CurvView m,
                  MrfView mz, const StageCombine& cmb, const Real* t0,
                  const Real* d, bool residual, bool transportOnly, Real* out0)
 {
-    kSaStageCurv<<<launchBlocks(g.size()), blockSize>>>(
-        g, vv, q, m, mz, cmb, t0, d, int(residual), int(transportOnly), out0);
+    internal::withCompensation(cmb, [&](auto comp) {
+        kSaStageCurv<decltype(comp)::value><<<launchBlocks(g.size()), blockSize>>>(
+            g, vv, q, m, mz, cmb, t0, d, int(residual), int(transportOnly), out0);
+    });
     checkLastKernel("kSaStageCurv");
 }
 

@@ -3,6 +3,7 @@
 #include "dns/curvmesh.hpp"
 #include "dns/gpu/internal/comp_flux.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/internal/stage_write.hpp"
 #include "dns/gpu/rans.hpp"
 #include "dns/remap.hpp"
 
@@ -105,7 +106,9 @@ __device__ inline void mrfSource(const MrfView& mz, PrimView q, std::size_t c,
 }
 
 // out = cmb.ca a + cmb.cb b + cmb.crAt(c) * (-div F): the rhs and the RK
-// combination in one pass (see StageCombine in comp.hpp).
+// combination in one pass (see StageCombine in comp.hpp). Comp: the
+// compensated write (internal/stage_write.hpp).
+template <bool Comp>
 __global__ void kCompStage(GpuGrid g, ViscView vv, PrimView q,
                            StageCombine cmb, Real* orho, Real* omx, Real* omy,
                            Real* omz, Real* oE, const Real* nut, Real kapScale,
@@ -141,7 +144,7 @@ __global__ void kCompStage(GpuGrid g, ViscView vv, PrimView q,
     Real* out[5] = {orho, omx, omy, omz, oE};
     const Real cr = cmb.crAt(c);
     for (int v = 0; v < 5; ++v)
-        out[v][c] = cmb.ca * cmb.a[v][c] + cmb.cb * cmb.b[v][c] + cr * rhs[v];
+        internal::stagePut<Comp>(cmb, v, c, cr, rhs[v], out[v]);
 }
 
 // Curvilinear twin of kCompSmagNut. The velocity gradient comes from the mesh
@@ -168,6 +171,7 @@ __global__ void kCompSmagNutCurv(GpuGrid g, Real cs2, int sigma, CurvView m,
     nut[c] = rho[c] * cd * sgsRate(sigma, gd);
 }
 
+template <bool Comp>
 __global__ void kCompStageCurv(GpuGrid g, ViscView vv, PrimView q,
                                CurvView m, StageCombine cmb, Real* orho,
                                Real* omx, Real* omy, Real* omz, Real* oE,
@@ -215,7 +219,7 @@ __global__ void kCompStageCurv(GpuGrid g, ViscView vv, PrimView q,
     Real* out[5] = {orho, omx, omy, omz, oE};
     const Real cr = cmb.crAt(c);
     for (int v = 0; v < 5; ++v)
-        out[v][c] = cmb.ca * cmb.a[v][c] + cmb.cb * cmb.b[v][c] + cr * rhs[v];
+        internal::stagePut<Comp>(cmb, v, c, cr, rhs[v], out[v]);
 }
 
 // The FP64 primitive recovery every stableDt reduction starts from: velocity
@@ -407,6 +411,9 @@ __global__ void kBoostX(std::size_t n, Real du, const Real* rho, Real* mx,
 
 void boostX(const GpuGrid& g, DeviceCompState& s, double du)
 {
+    // A frame change of the plain state; the compensated (steady) state never
+    // takes one, and the boost would need its own pair arithmetic.
+    assert(!s.compensated());
     if (du == 0.0) return;
     kBoostX<<<launchBlocks(g.size()), blockSize>>>(g.size(), Real(du),
                                                    s.rho.data(), s.mx.data(),
@@ -441,20 +448,54 @@ std::expected<DeviceCurv, hipError_t> DeviceCurv::make(const CurvMetrics& m)
     return d;
 }
 
-std::expected<DeviceCompState, hipError_t> DeviceCompState::make(std::size_t n,
-                                                                 int nT)
+namespace {
+
+hipError_t zero(DeviceScalar& b)
+{
+    return b.size() ? hipMemset(b.data(), 0, b.size() * sizeof(Real))
+                    : hipSuccess;
+}
+
+// h = hi (+ lo when compensated): both floats widen exactly, so the FP64 sum
+// is the pair's value up to one double rounding.
+hipError_t widenPair(const DeviceScalar& hi, const DeviceScalar& lo,
+                     std::vector<double>& h)
+{
+    if (auto e = downloadWiden(hi, h); e != hipSuccess) return e;
+    if (lo.size() == 0) return hipSuccess;
+    std::vector<double> l(h.size());
+    if (auto e = downloadWiden(lo, l); e != hipSuccess) return e;
+    for (std::size_t i = 0; i < h.size(); ++i) h[i] += l[i];
+    return hipSuccess;
+}
+
+} // namespace
+
+std::expected<DeviceCompState, hipError_t>
+DeviceCompState::make(std::size_t n, int nT, bool compensated)
 {
     assert(nT >= 0 && nT <= 2);
     DeviceCompState s;
-    for (auto* b : {&s.rho, &s.mx, &s.my, &s.mz, &s.E}) {
+    auto alloc = [n](DeviceScalar& b, bool zeroed) -> hipError_t {
         auto e = DeviceScalar::make(n);
-        if (!e) return std::unexpected(e.error());
-        *b = std::move(*e);
+        if (!e) return e.error();
+        b = std::move(*e);
+        return zeroed ? zero(b) : hipSuccess;
+    };
+    for (int v = 0; v < 5; ++v) {
+        DeviceScalar* hi[5] = {&s.rho, &s.mx, &s.my, &s.mz, &s.E};
+        if (auto e = alloc(*hi[v], false); e != hipSuccess)
+            return std::unexpected(e);
+        if (compensated)
+            if (auto e = alloc(s.lo[v], true); e != hipSuccess)
+                return std::unexpected(e);
     }
     for (int i = 0; i < nT; ++i) {
-        auto e = DeviceScalar::make(n);
-        if (!e) return std::unexpected(e.error());
-        s.t[i] = std::move(*e);
+        if (auto e = alloc(s.t[i], false); e != hipSuccess)
+            return std::unexpected(e);
+        if (compensated)
+            if (auto e = alloc(s.tlo[i], true); e != hipSuccess)
+                return std::unexpected(e);
     }
     s.nT = nT;
     return s;
@@ -463,6 +504,7 @@ std::expected<DeviceCompState, hipError_t> DeviceCompState::make(std::size_t n,
 hipError_t DeviceCompState::uploadTurb(int i, const std::vector<double>& h)
 {
     assert(i >= 0 && i < nT && h.size() == t[i].size());
+    if (auto e = zero(tlo[i]); e != hipSuccess) return e;
     return uploadNarrow(h, t[i]);
 }
 
@@ -470,11 +512,13 @@ hipError_t DeviceCompState::downloadTurb(int i, std::vector<double>& h) const
 {
     assert(i >= 0 && i < nT);
     h.resize(t[i].size());
-    return downloadWiden(t[i], h);
+    return widenPair(t[i], tlo[i], h);
 }
 
 hipError_t DeviceCompState::upload(const CompState& h)
 {
+    for (auto& l : lo)
+        if (auto e = zero(l); e != hipSuccess) return e;
     if (auto e = uploadNarrow(h.rho, rho); e != hipSuccess) return e;
     if (auto e = uploadNarrow(h.mx, mx); e != hipSuccess) return e;
     if (auto e = uploadNarrow(h.my, my); e != hipSuccess) return e;
@@ -484,11 +528,11 @@ hipError_t DeviceCompState::upload(const CompState& h)
 
 hipError_t DeviceCompState::download(CompState& h) const
 {
-    if (auto e = downloadWiden(rho, h.rho); e != hipSuccess) return e;
-    if (auto e = downloadWiden(mx, h.mx); e != hipSuccess) return e;
-    if (auto e = downloadWiden(my, h.my); e != hipSuccess) return e;
-    if (auto e = downloadWiden(mz, h.mz); e != hipSuccess) return e;
-    return downloadWiden(E, h.E);
+    if (auto e = widenPair(rho, lo[0], h.rho); e != hipSuccess) return e;
+    if (auto e = widenPair(mx, lo[1], h.mx); e != hipSuccess) return e;
+    if (auto e = widenPair(my, lo[2], h.my); e != hipSuccess) return e;
+    if (auto e = widenPair(mz, lo[3], h.mz); e != hipSuccess) return e;
+    return widenPair(E, lo[4], h.E);
 }
 
 std::expected<DeviceComp, hipError_t> DeviceComp::make(const Grid& g,
@@ -499,11 +543,7 @@ std::expected<DeviceComp, hipError_t> DeviceComp::make(const Grid& g,
            csLes >= 0.0);
     DeviceComp d(GpuGrid::from(g), tr, Real(csLes), sgs);
     const std::size_t n = g.size();
-    for (auto* s : {&d.q1_, &d.q2_}) {
-        auto e = DeviceCompState::make(n);
-        if (!e) return std::unexpected(e.error());
-        *s = std::move(*e);
-    }
+    if (auto e = d.allocStages(0); !e) return std::unexpected(e.error());
     for (auto* b : {&d.u_, &d.v_, &d.w_, &d.e_, &d.p_, &d.T_}) {
         auto e = DeviceScalar::make(n);
         if (!e) return std::unexpected(e.error());
@@ -762,18 +802,26 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
     const Real* nutp = nullptr;
     Real kapScale = Real(0);
     const MrfView mz = mrf_ ? mrfView() : MrfView{};
+    assert(!cmb.ol[0] || cmb.ca == Real(1) - cmb.cb); // the increment form
     if (curv_) {
         const CurvView cv = curvView();
+        auto curvStage = [&] {
+            internal::withCompensation(cmb, [&](auto comp) {
+                kCompStageCurv<decltype(comp)::value>
+                    <<<launchBlocks(n), blockSize>>>(
+                        g_, vv, q, cv, cmb, out.rho.data(), out.mx.data(),
+                        out.my.data(), out.mz.data(), out.E.data(), nutp,
+                        kapScale, mz);
+            });
+            checkLastKernel("kCompStageCurv");
+        };
         if (rans()) {
             // mu_t lagged within the stage exactly like LES: from the stage
             // input, through the SAME nut slot of the mean-flow flux.
             ransMut(s);
             nutp = nut_.data();
             kapScale = kapLes;
-            kCompStageCurv<<<launchBlocks(n), blockSize>>>(
-                g_, vv, q, cv, cmb, out.rho.data(), out.mx.data(),
-                out.my.data(), out.mz.data(), out.E.data(), nutp, kapScale, mz);
-            checkLastKernel("kCompStageCurv");
+            curvStage();
             if (ransSst(ransModel_)) {
                 const rans::SstStageArgs a{
                     ransModel_,         s.t[0].data(), s.t[1].data(),
@@ -798,10 +846,7 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
             nutp = nut_.data();
             kapScale = kapLes;
         }
-        kCompStageCurv<<<launchBlocks(n), blockSize>>>(
-            g_, vv, q, cv, cmb, out.rho.data(), out.mx.data(),
-            out.my.data(), out.mz.data(), out.E.data(), nutp, kapScale, mz);
-        checkLastKernel("kCompStageCurv");
+        curvStage();
         if (rhsHook_) rhsHook_(s, out, cmb);
         return;
     }
@@ -813,9 +858,11 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
         nutp = nut_.data();
         kapScale = kapLes;
     }
-    kCompStage<<<launchBlocks(n), blockSize>>>(
-        g_, vv, q, cmb, out.rho.data(), out.mx.data(), out.my.data(),
-        out.mz.data(), out.E.data(), nutp, kapScale, mz);
+    internal::withCompensation(cmb, [&](auto comp) {
+        kCompStage<decltype(comp)::value><<<launchBlocks(n), blockSize>>>(
+            g_, vv, q, cmb, out.rho.data(), out.mx.data(), out.my.data(),
+            out.mz.data(), out.E.data(), nutp, kapScale, mz);
+    });
     checkLastKernel("kCompStage");
     if (rhsHook_) rhsHook_(s, out, cmb);
 }
@@ -840,6 +887,7 @@ __global__ void kPenalizeMomentum(std::size_t n, const Real* lam, Real idte,
 void penalizeMomentum(const GpuGrid& g, const DeviceScalar& lam, Real eta,
                       Real dt, DeviceCompState& s)
 {
+    assert(!s.compensated()); // a plain-state edit (see boostX)
     kPenalizeMomentum<<<launchBlocks(g.size()), blockSize>>>(
         g.size(), lam.data(), dt / eta, s.mx.data(), s.my.data(), s.mz.data());
     checkLastKernel("penalizeMomentum");
@@ -857,9 +905,13 @@ void DeviceComp::step(DeviceCompState& s, Real dt)
     // failed.) The swap is a buffer-handle exchange, not a copy -- no caller
     // may hold a raw device pointer into the state across a step.
     assert(s.nT == q1_.nT); // the scalars ride the same buffers and swap
+    assert(s.compensated() == compensated_); // ...and so do the low words
     const Real* lts = ltsOn_ ? lts_.data() : nullptr;
+    // Every (ca, cb) below has ca == 1 - cb EXACTLY in FP32, which is what the
+    // compensated increment form (StageCombine::put) relies on.
     auto cmb = [lts](const DeviceCompState& a, Real ca,
-                     const DeviceCompState& b, Real cb, Real cr) {
+                     const DeviceCompState& b, Real cb, Real cr,
+                     DeviceCompState& out) {
         StageCombine k{{a.rho.data(), a.mx.data(), a.my.data(), a.mz.data(),
                         a.E.data()},
                        {b.rho.data(), b.mx.data(), b.my.data(), b.mz.data(),
@@ -870,12 +922,23 @@ void DeviceComp::step(DeviceCompState& s, Real dt)
             k.tb[i] = b.t[i].data();
         }
         k.lts = lts;
+        if (!out.compensated()) return k;
+        for (int v = 0; v < 5; ++v) {
+            k.al[v] = a.lo[v].data();
+            k.bl[v] = b.lo[v].data();
+            k.ol[v] = out.lo[v].data();
+        }
+        for (int i = 0; i < a.nT; ++i) {
+            k.tal[i] = a.tlo[i].data();
+            k.tbl[i] = b.tlo[i].data();
+            k.otl[i] = out.tlo[i].data();
+        }
         return k;
     };
     if (hook_) hook_(s);
-    stage(s, cmb(s, Real(1), s, Real(0), dt), q1_);
+    stage(s, cmb(s, Real(1), s, Real(0), dt, q1_), q1_);
     if (hook_) hook_(q1_);
-    stage(q1_, cmb(s, Real(0.75), q1_, Real(0.25), Real(0.25) * dt), q2_);
+    stage(q1_, cmb(s, Real(0.75), q1_, Real(0.25), Real(0.25) * dt, q2_), q2_);
     if (hook_) hook_(q2_);
     // ca = 1 - cb, not Real(1/3): the two rounded thirds sum to 1 + 3e-8 in
     // FP32, which inflated every conserved total by ~2e-8 per step on any
@@ -883,7 +946,7 @@ void DeviceComp::step(DeviceCompState& s, Real dt)
     // RANS residual at 2^-25 q / dt. 1 - Real(2/3) is exact (Sterbenz), so
     // ca + cb == 1 exactly; cr = cb dt is unchanged.
     const Real cb3 = Real(2.0 / 3.0), ca3 = Real(1) - cb3;
-    stage(q2_, cmb(s, ca3, q2_, cb3, cb3 * dt), q1_);
+    stage(q2_, cmb(s, ca3, q2_, cb3, cb3 * dt, q1_), q1_);
     std::swap(s, q1_);
 }
 
@@ -1033,12 +1096,7 @@ std::expected<void, hipError_t> DeviceComp::enableRans(const RansSetup& rs)
            rs.wallDist.size() == g_.size() && rs.omegaFloor > 0.0);
     assert(std::ranges::all_of(rs.wallDist, [](double d) { return d > 0.0; }));
     const std::size_t n = g_.size();
-    const int nT = ransScalars(rs.model);
-    for (auto* q : {&q1_, &q2_}) {
-        auto e = DeviceCompState::make(n, nT);
-        if (!e) return std::unexpected(e.error());
-        *q = std::move(*e);
-    }
+    if (auto e = allocStages(ransScalars(rs.model)); !e) return e;
     for (auto* b : {&nut_, &lts_}) {
         auto e = DeviceScalar::make(n);
         if (!e) return std::unexpected(e.error());
@@ -1098,6 +1156,22 @@ void DeviceComp::setLts(bool on)
 {
     assert(!on || lts_.size() == g_.size());
     ltsOn_ = on;
+}
+
+std::expected<void, hipError_t> DeviceComp::allocStages(int nT)
+{
+    for (auto* q : {&q1_, &q2_}) {
+        auto e = DeviceCompState::make(g_.size(), nT, compensated_);
+        if (!e) return std::unexpected(e.error());
+        *q = std::move(*e);
+    }
+    return {};
+}
+
+std::expected<void, hipError_t> DeviceComp::enableCompensation()
+{
+    compensated_ = true;
+    return allocStages(nTurb());
 }
 
 hipError_t DeviceComp::uploadLts(const std::vector<Real>& ratios)

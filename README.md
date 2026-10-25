@@ -202,13 +202,14 @@ RANS (spec `docs/rans.md`): `--rans none|sa-neg|sst-2003m|sst-vm` (TMR SA-neg
 with ft2; Menter SST 2003 / 1994-with-vorticity, both with ⅔ρk dropped).
 Labelled `RANS <variant> -- steady|URANS` everywhere. The mean is 1D, so
 `--n 4 --nz 1` is the case; no trip (`--kick` > 0 rejected). `--steady TOL`
-runs local-time-stepping PSEUDO-time to `resid < TOL`, `--steady-steps N`
-(200000) is exit 8; it needs isothermal walls and rejects `--tt`,
-`--profile-dt` and frame output. Measured: ub⁺ vs MKM 15.679 at Re_τ 178 —
-SA-neg +0.82%, SST-2003m −0.29% (ny 64; SST is first order in ny, limit
-−3.5%). The FP32 march lands on the FP64 oracle's discrete solution, but its
-residual floors at ~1 (the FP32 update floor), so the residual stop cannot
-certify the mean on this case — read `docs/rans.md` before choosing TOL.
+runs local-time-stepping PSEUDO-time on a compensated (Kahan) state until
+ub, bulk T and the turbulence integrals are within TOL (relative, [1e-6, 1))
+of their extrapolated fixed point; `--steady-steps N` (1000000) is exit 8;
+it needs isothermal walls and rejects `--tt`, `--profile-dt` and frame
+output. The residual is reported, never the stop: its FP32 floor hides the
+slow mode. Re_τ 180, ny 64: TOL 1e-4 in ~3.1–3.3e5 iterations (~50–60 s).
+Measured: ub⁺ vs MKM 15.679 at Re_τ 178 — SA-neg +0.82%, SST-2003m −0.29%
+(ny 64; SST is first order in ny, limit −3.5%). `docs/rans.md`.
 
 ### `conv` — Rayleigh-Bénard convection
 

@@ -47,23 +47,59 @@ struct MrfZone
 // Conservative state on device; each buffer has g.size() cells. The RANS
 // scalars ride in the SAME struct so the stage choreography (no-alias rule,
 // handle swap) covers them by construction; nT == 0 leaves t[] empty.
+//
+// Compensated (DeviceComp::enableCompensation, --steady): every field also
+// carries a LOW word, value = hi + lo with |lo| <= ulp(hi)/2. The kernels read
+// hi only; the stage combination accumulates into the pair, so an update
+// below ulp(hi)/2 is kept instead of rounding away (docs/rans.md, "The FP32
+// update floor"). Empty lo = the plain FP32 state.
 struct DeviceCompState
 {
     DeviceScalar rho, mx, my, mz, E;
     DeviceScalar t[2]; // conserved turbulence scalars (rho nu~ | rho k, rho omega)
+    DeviceScalar lo[5], tlo[2]; // low words of the above; empty = plain
     int nT = 0;
 
-    // Pre: 0 <= nT <= 2.
-    static std::expected<DeviceCompState, hipError_t> make(std::size_t n,
-                                                           int nT = 0);
+    // Pre: 0 <= nT <= 2. compensated allocates the low words, zeroed.
+    static std::expected<DeviceCompState, hipError_t>
+    make(std::size_t n, int nT = 0, bool compensated = false);
 
+    bool compensated() const { return lo[0].size() != 0; }
+
+    // Uploads replace the value: they zero the matching low words.
     hipError_t upload(const CompState& h);         // the five mean-flow fields
+    // hi + lo in FP64 (exact: both words widen without rounding).
     hipError_t download(CompState& h) const;
     // Turbulence scalar i from/to host doubles (download resizes h).
     // Pre: i < nT; upload: h.size() == n.
     hipError_t uploadTurb(int i, const std::vector<double>& h);
     hipError_t downloadTurb(int i, std::vector<double>& h) const;
 };
+
+// An unevaluated sum hi + lo of two floats (the compensated state's words).
+struct Word2
+{
+    Real hi, lo;
+};
+
+// Knuth's TwoSum: s.hi + s.lo == a + b EXACTLY, for any magnitudes (no
+// |a| >= |b| precondition, unlike Fast2Sum -- a momentum near zero takes an
+// update larger than itself). Needs IEEE rounding; contraction cannot touch
+// it (no products).
+__host__ __device__ inline Word2 twoSum(Real a, Real b)
+{
+    const Real s = a + b;
+    const Real bb = s - a;
+    return {s, (a - (s - bb)) + (b - bb)};
+}
+
+// (hi + lo) + d as a renormalised pair: the hi sum is error-free, the
+// leftover is rounded once at the lo level (~ulp(hi) * eps).
+__host__ __device__ inline Word2 addWord2(Real hi, Real lo, Real d)
+{
+    const Word2 s = twoSum(hi, d);
+    return twoSum(s.hi, s.lo + lo);
+}
 
 // Exact uniform Galilean x-boost by du: mx += rho du, E += mx_old du +
 // rho du^2/2. A frame change -- no divergence, vorticity or acoustics;
@@ -93,14 +129,21 @@ struct DeviceCurv
 //
 // A boundary hook that OVERWRITES rhs rows (NSCBC) still expresses an RHS and
 // never a state overwrite -- it just writes that rhs THROUGH this same
-// combination on its own rows. An additive hook (the channel body force) scales
-// its contribution by crAt(c).
+// combination on its own rows (stagePut). An additive hook (the channel body
+// force) scales its contribution by crAt(c) (stageAdd). Every write goes
+// through those two (gpu/internal/stage_write.hpp), which is what makes the
+// compensated mode reach the hooks too.
 //
 // lts (--steady, local time stepping) is a per-cell RATIO dt_c / dtRef >= 1
 // on top of cr, which already carries the RK coefficient and dtRef. EVERY
 // consumer of cr reads it through crAt(c): an additive term scaled by the bare
 // cr while the interior uses crAt converges to lts R + f = 0, the WRONG steady
 // state. Null lts is the uniform step, bit-for-bit.
+//
+// Compensated (al/bl/ol set, DeviceCompState::lo): stagePut writes the INCREMENT
+// form a + cb (b - a) + cr R into the (hi, lo) pair of the output -- equal to
+// ca a + cb b because ca == 1 - cb exactly (DeviceComp::step), and it keeps
+// what plain FP32 rounds away. Null = the plain expression, bit-for-bit.
 struct StageCombine
 {
     const Real* a[5];
@@ -109,6 +152,13 @@ struct StageCombine
     const Real* ta[2] = {nullptr, nullptr}; // turbulence a/b; null when nT == 0
     const Real* tb[2] = {nullptr, nullptr};
     const Real* lts = nullptr;              // dt_c/dtRef >= 1; null = uniform
+    // Low words of a, b and the stage OUTPUT; null = plain FP32.
+    const Real* al[5] = {};
+    const Real* bl[5] = {};
+    Real* ol[5] = {};
+    const Real* tal[2] = {};
+    const Real* tbl[2] = {};
+    Real* otl[2] = {};
 
     __host__ __device__ Real crAt(std::size_t c) const
     {
@@ -222,6 +272,13 @@ public:
     // step() passes the lts ratios in every StageCombine when on.
     // Pre (on): localDt or uploadLts ran.
     void setLts(bool on);
+    // Compensated accumulation (DeviceCompState::lo): the stage buffers gain
+    // low words and every step() writes through them. Irreversible. Only the
+    // channel wall keeps its overwritten cells' low words consistent; a runner
+    // installing any other state-overwriting hook must not enable this.
+    // Post: step() requires s.compensated().
+    std::expected<void, hipError_t> enableCompensation();
+    bool compensated() const { return compensated_; }
     // Diagnostic/test: the lts ratios from host, g.size() entries >= 1.
     hipError_t uploadLts(const std::vector<Real>& ratios);
     // SST: positivity-guard hits since enableRans (0 for SA). Synchronizes.
@@ -300,6 +357,9 @@ private:
     void ransMut(const DeviceCompState& s);
     // The per-cell RANS diffusive dt functor over s. Pre: rans().
     rans::RansDiffDt ransDiffDt(const DeviceCompState& s) const;
+    // (Re)allocate both stage buffers for nT scalars, low words iff
+    // compensated_.
+    std::expected<void, hipError_t> allocStages(int nT);
     // Device pointer table of curv_; pre: curvilinear().
     CurvView curvView() const;
 
@@ -330,6 +390,7 @@ private:
     DeviceBuffer<unsigned long long> hits_;
     double omegaFloor_ = 0;
     bool ltsOn_ = false;
+    bool compensated_ = false;
     std::function<void(DeviceCompState&)> hook_;
     std::function<void(const DeviceCompState&, DeviceCompState&,
                        const StageCombine&)> rhsHook_;

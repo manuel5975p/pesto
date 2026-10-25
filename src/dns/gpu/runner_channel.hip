@@ -12,6 +12,7 @@
 #include "dns/gpu/internal/run_loop.hpp"
 #include "dns/gpu/reductions.hpp"
 #include "dns/remap.hpp"
+#include "dns/steady_stop.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -20,6 +21,7 @@
 #include <cmath>
 #include <cstdio>
 #include <format>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -44,7 +46,10 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     auto m = CurvMetrics::build(CurvMesh::channelY(g, r.stretchBeta, r.delta));
     if (!m) return fail(2, "channel mesh: " + m.error());
     auto dev = DeviceComp::make(*m, r.gamma, r.mu);
-    auto ds = DeviceCompState::make(g.size(), ransScalars(r.rans));
+    // Steady: the compensated state, so pseudo-time updates below ulp(q)/2
+    // still accumulate (docs/rans.md, "The FP32 update floor"). The channel
+    // wall is the only state-overwriting hook here, and it keeps the low words.
+    auto ds = DeviceCompState::make(g.size(), ransScalars(r.rans), steady);
     auto red = ReduceScratch::make();
     if (!dev || !ds || !red) return fail(6, "GPU allocation failed");
     // Both plates are walls: mu_t is mirrored odd on both ghost rows, so it
@@ -54,6 +59,8 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
                                   .mirrorYLo = true,
                                   .mirrorYHi = true}))
         return fail(6, "GPU allocation failed (RANS)");
+    if (steady && !dev->enableCompensation())
+        return fail(6, "GPU allocation failed (compensated state)");
 
     // SST's wall omega: TMR's 60 nu_w / (beta1 d1^2) with d1 the first cell
     // centre's distance (the same on both plates: the mesh is a reflection).
@@ -95,7 +102,8 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     if (rans) cols.emplace_back("mutMax");
     if (sst) cols.emplace_back("floorHits");
     if (steady)
-        cols.insert(cols.end(), {"iter", "resid", "resU", "resE", "resT"});
+        cols.insert(cols.end(), {"iter", "resid", "resU", "resE", "resT",
+                                 "Tbulk", "remaining"});
     if (auto e = out.declareSeries("stats", cols); !e)
         return fail(4, e.error());
     std::vector<std::string> pcols = {"t",    "y",    "yplus", "uplus", "urms",
@@ -137,6 +145,9 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     struct WallState
     {
         double ubulk = 0, utauBot = 0, utauTop = 0, ke = 0, mutMax = 0;
+        // Favre bulk T - Twall and the y-integrated conserved scalars
+        // (rho nu~ | rho k, rho omega): the steady stop's other integrals.
+        double tExcess = 0, turb[2] = {};
     };
     auto measure = [&]() -> std::expected<WallState, RunError> {
         dev->primitives(*ds);
@@ -145,14 +156,16 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
             e != hipSuccess)
             return fail(6, "plane stats download failed");
         WallState w;
-        double mass = 0, mom = 0, ke = 0;
+        double mass = 0, mom = 0, ke = 0, heat = 0;
         for (int j = jLo; j <= jHi; ++j)
         {
             mass += dy[j] * ps[j * 8 + 0];
             mom += dy[j] * ps[j * 8 + 1];
             ke += dy[j] * (ps[j * 8 + 3] + ps[j * 8 + 4] + ps[j * 8 + 5]);
+            heat += dy[j] * ps[j * 8 + 7];
         }
         w.ubulk = mass > 0 ? mom / mass : 0;
+        w.tExcess = mass > 0 ? heat / mass - r.Twall : 0;
         w.ke = 0.5 * g.hx * g.hz * ke;
         auto favreU = [&](int j) { return ps[j * 8 + 1] / ps[j * 8 + 0]; };
         w.utauBot = std::sqrt(std::max(
@@ -173,7 +186,11 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
                         hipSuccess))
             return fail(6, "RANS plane sums download failed");
         for (int j = jLo; j <= jHi; ++j)
+        {
             w.mutMax = std::max(w.mutMax, pmut[j * 2 + 1] / r.mu);
+            w.turb[0] += dy[j] * pnt[j * 2];
+            if (sst) w.turb[1] += dy[j] * pnt2[j * 2];
+        }
         return w;
     };
 
@@ -226,12 +243,15 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     if (steady)
     {
         // Steady RANS in local-time-stepping PSEUDO-time: every cell marches
-        // at its own stable dt (the lts ratios on top of dtRef), and the run
-        // stops on the explicit-mode residual (docs/rans.md: not state
-        // differencing). t accumulates dtRef and is NOT a physical time.
+        // at its own stable dt (the lts ratios on top of dtRef). It stops on
+        // the integrals (ub, bulk T, the turbulence scalars) extrapolated to
+        // their fixed point, not on the residual: the FP32 residual floors
+        // above the slow mode's (docs/rans.md, "Stopping on the integrals").
+        // t accumulates dtRef and is NOT a physical time.
         dev->setLts(true);
         bool converged = false;
-        double resid = HUGE_VAL;
+        double resid = HUGE_VAL, remaining = HUGE_VAL;
+        SteadyStop stop(sst ? 4 : 3);
         // Residual in wall units: L = delta = 1, U = u_tau = 1, and the
         // energy scaled by the bulk estimate (docs/rans.md, D11).
         auto statsRow = [&](double dt) -> std::expected<void, RunError> {
@@ -247,21 +267,33 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
             if (!std::isfinite(resid))
                 return fail(7, "the residual is not finite (the state "
                                "diverged)");
+            // Bulk T, not T - Twall: the excess is a 0.6% difference of two
+            // FP32-resolved numbers, its relative noise is 5e-6, not 3e-8.
+            const double tBulk = r.Twall + w->tExcess;
+            // Equally spaced samples only: the cap row is off the cadence.
+            if (st.steps % cad.every == 0)
+            {
+                const double q[4] = {w->ubulk, tBulk, w->turb[0], w->turb[1]};
+                stop.push(std::span(q, sst ? 4 : 3));
+                remaining = stop.remaining(r.steadyTol);
+            }
             const double retau = 0.5 * (w->utauBot + w->utauTop) * r.delta / nu;
             std::vector<double> row = {t, dt, w->ubulk, w->utauBot, w->utauTop,
                                        retau, w->ke, w->mutMax};
             if (sst) row.push_back(double(dev->floorHits()));
-            row.insert(row.end(),
-                       {double(st.steps), resid, resU, resE, resT});
+            row.insert(row.end(), {double(st.steps), resid, resU, resE, resT,
+                                   tBulk, remaining});
             out.row("stats", row);
-            converged = resid < r.steadyTol;
+            converged = remaining < r.steadyTol;
             if (converged || st.steps >= r.steadySteps ||
                 st.steps - cad.lastPrint >= 10 * cad.every)
             {
                 std::printf("iter=%ld ub=%.4f Re_tau=%.2f mutMax=%.2f "
-                            "dtRef=%.2e %s resid=%.3e (U %.2e E %.2e T %.2e)\n",
+                            "dtRef=%.2e %s remaining=%.2e resid=%.3e "
+                            "(U %.2e E %.2e T %.2e)\n",
                             st.steps, w->ubulk, retau, w->mutMax, dt,
-                            ransLabel.c_str(), resid, resU, resE, resT);
+                            ransLabel.c_str(), remaining, resid, resU, resE,
+                            resT);
                 std::fflush(stdout);
                 cad.printed(st.steps);
             }
@@ -290,8 +322,10 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
         finishTiming(st, wall0, out);
         if (!converged && !stopRequested())
             return fail(8, std::format("steady state not reached in {} "
-                                       "iterations (resid {:.3e} > {:.3g})",
-                                       st.steps, resid, r.steadyTol));
+                                       "iterations (remaining change {:.3e} "
+                                       "> {:.3g})",
+                                       st.steps, remaining, r.steadyTol));
+        st.converged = converged;
         return st;
     }
 

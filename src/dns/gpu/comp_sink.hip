@@ -1,6 +1,7 @@
 #include "dns/gpu/comp_sink.hpp"
 
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/internal/stage_write.hpp"
 #include "dns/gpu/index.hpp"
 
 namespace dns::gpu {
@@ -30,7 +31,9 @@ __device__ Real bandRamp(int q, int n, int nb)
 //
 // Both cells sharing a face evaluate the identical expression (same indices,
 // same order), so the telescoping holds in floats, not just on paper.
-// Deterministic; no atomics; each thread owns its cell.
+// Deterministic; no atomics; each thread owns its cell. Comp: the compensated
+// write (internal/stage_write.hpp).
+template <bool Comp>
 __global__ void kCompSink(GpuGrid g, int nb, Real sgx, Real sgy, Real sgz,
                           StageCombine cmb, const Real* __restrict__ sr,
                           const Real* __restrict__ smx,
@@ -92,11 +95,9 @@ __global__ void kCompSink(GpuGrid g, int nb, Real sgx, Real sgy, Real sgz,
     }
     if (!banded) return;
     const Real cr = cmb.crAt(c);
-    orho[c] += cr * add[0];
-    omx[c] += cr * add[1];
-    omy[c] += cr * add[2];
-    omz[c] += cr * add[3];
-    oE[c] += cr * add[4];
+    Real* out[5] = {orho, omx, omy, omz, oE};
+    for (int v = 0; v < 5; ++v)
+        internal::stageAdd<Comp>(cmb, v, c, cr, add[v], out[v]);
 }
 
 } // namespace
@@ -124,11 +125,13 @@ void DeviceCompSink::apply(const DeviceCompState& s, DeviceCompState& out,
                            const StageCombine& cmb) const
 {
     const Real a = Real(c_.alpha * c_.cInf);
-    kCompSink<<<launchBlocks(g_.size()), blockSize>>>(
-        g_, c_.nb, a / g_.hx, c_.openY ? a / g_.hy : Real(0),
-        c_.openZ ? a / g_.hz : Real(0), cmb, s.rho.data(), s.mx.data(),
-        s.my.data(), s.mz.data(), s.E.data(), out.rho.data(), out.mx.data(),
-        out.my.data(), out.mz.data(), out.E.data());
+    internal::withCompensation(cmb, [&](auto comp) {
+        kCompSink<decltype(comp)::value><<<launchBlocks(g_.size()), blockSize>>>(
+            g_, c_.nb, a / g_.hx, c_.openY ? a / g_.hy : Real(0),
+            c_.openZ ? a / g_.hz : Real(0), cmb, s.rho.data(), s.mx.data(),
+            s.my.data(), s.mz.data(), s.E.data(), out.rho.data(), out.mx.data(),
+            out.my.data(), out.mz.data(), out.E.data());
+    });
     checkLastKernel("kCompSink");
 }
 

@@ -118,8 +118,8 @@ int main()
         {
             check(c->rans == dns::RansModel::SaNeg, "--rans sa-neg resolves");
             check(c->kick == 0.0, "RANS kick defaults to 0 (no trip)");
-            check(c->steadyTol == 1e-3 && c->steadySteps == 200000,
-                  "--steady TOL, cap 200000 by default");
+            check(c->steadyTol == 1e-3 && c->steadySteps == 1000000,
+                  "--steady TOL, cap 1000000 by default");
             check(c->meta.rans == "SA-neg", "RunMeta carries the RANS label");
             check(c->warnings.empty(), "n 4 nz 1 y+ 0.876: no warnings");
             const std::string d = c->describe();
@@ -131,7 +131,7 @@ int main()
                          "mu_t = 0 on the wall face, Pr_t = 0.9, wall-resolved "
                          "(y+_1 = 0.876 est.)\n") != std::string::npos,
                   "describe: turbulence line");
-            check(d.find("  run        steady TOL=0.001 cap 200000 "
+            check(d.find("  run        steady TOL=0.001 cap 1000000 "
                          "iterations\n") != std::string::npos,
                   "describe: steady run line replaces the tt line");
             check(d.find("qualitative only") == std::string::npos,
@@ -177,12 +177,18 @@ int main()
     check(fieldIs(with({"--rans", "sa-neg", "--steady-steps", "10"}),
                   "--steady-steps"),
           "--steady-steps without --steady rejected");
-    check(fieldIs(with({"--rans", "sa-neg", "--steady", "1", "--steady-steps",
+    check(fieldIs(with({"--rans", "sa-neg", "--steady", "0.5", "--steady-steps",
                         "0"}),
                   "--steady-steps"),
           "--steady-steps 0 rejected");
     check(fieldIs(with({"--rans", "sa-neg", "--steady", "-1"}), "--steady"),
           "negative --steady rejected");
+    // A relative change of the integrals: [kSteadyTolMin, 1).
+    for (const char* tol : {"1", "2", "5e-7"})
+        check(fieldIs(with({"--rans", "sa-neg", "--steady", tol}), "--steady"),
+              std::string("--steady ") + tol + " rejected (outside [1e-6, 1))");
+    check(runCli(with({"--rans", "sa-neg", "--steady", "1e-6"})).has_value(),
+          "--steady 1e-6 (kSteadyTolMin) accepted");
     rejected(with({"--rans", "k-epsilon"}), 1, "unknown --rans value");
     for (auto [cli, label] : {std::pair{"sst-2003m", "SST-2003m"},
                               std::pair{"sst-vm", "SST-Vm"}})

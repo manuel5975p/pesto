@@ -56,6 +56,7 @@ add_library(dns_core
     src/dns/rotor.cpp
     src/dns/scene.cpp
     src/dns/shmframes.cpp
+    src/dns/steady_stop.cpp
     src/dns/timestepper.cpp
     src/dns/trimesh.cpp
     src/dns/vtk_writer.cpp
@@ -369,7 +370,8 @@ include(CTest)
 if(BUILD_TESTING)
     set(DNS_TESTS cli geometry output poisson projection tgv tgv3d cutcell cutcell_sphere comp comp_curv meshsdf
         fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport
-        rotor focal cli_defaults comp_axis_permute rans rans_channel1d)
+        rotor focal cli_defaults comp_axis_permute rans rans_channel1d
+        steady_stop)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)
     endif()

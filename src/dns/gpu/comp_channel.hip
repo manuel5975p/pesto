@@ -1,6 +1,7 @@
 #include "dns/gpu/comp_channel.hpp"
 
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/internal/stage_write.hpp"
 #include "dns/gpu/index.hpp"
 #include "dns/gpu/internal/plane_sums.hpp"
 #include "dns/gpu/internal/wall_ghost.hpp"
@@ -30,7 +31,9 @@ __global__ void kChannelWallY(GpuGrid g, int isothermal, Real gam, Real Rgas,
 
 // Additive rhs contribution: the stage kernel already wrote the interior
 // combination, so the force enters scaled by the same crAt(c) (comp.hpp,
-// StageCombine) that multiplied the interior rhs.
+// StageCombine) that multiplied the interior rhs. Comp: the compensated write
+// (internal/stage_write.hpp).
+template <bool Comp>
 __global__ void kBodyForceX(GpuGrid g, Real f, StageCombine cmb, const Real* u,
                             Real* omx, Real* oE)
 {
@@ -40,8 +43,26 @@ __global__ void kBodyForceX(GpuGrid g, Real f, StageCombine cmb, const Real* u,
     decompose(g, c, i, j, k);
     if (j < 1 || j > g.ny - 2) return; // ghost rows: the stage hook owns them
     const Real cr = cmb.crAt(c);
-    omx[c] += cr * f;
-    oE[c] += cr * f * u[c];
+    internal::stageAdd<Comp>(cmb, 1, c, cr, f, omx);
+    internal::stageAdd<Comp>(cmb, 4, c, cr * f, u[c], oE);
+}
+
+// The wall's ghost cells are SET, not accumulated: their low words are zero,
+// so the compensated pair holds exactly the value the wall wrote.
+struct GhostLo
+{
+    Real* p[7];
+    int n;
+};
+
+__global__ void kChannelGhostLo(GpuGrid g, GhostLo lo)
+{
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    int i, k;
+    bool hi;
+    std::size_t c, s;
+    if (!internal::yGhostPair(g, t, i, k, hi, c, s)) return;
+    for (int v = 0; v < lo.n; ++v) lo.p[v][c] = Real(0);
 }
 
 // The SA ghost scalar on both plates: mirror the SPECIFIC nu~ odd and rebuild
@@ -133,8 +154,15 @@ void DeviceChannelWall::apply(DeviceCompState& s) const
         g_, int(c_.isothermal), Real(c_.gamma), Real(c_.Rgas), Real(c_.Twall),
         s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(), s.E.data());
     checkLastKernel("kChannelWallY");
-    if (s.nT == 0) return;
     const std::size_t nb = launchBlocks(2 * std::size_t(g_.nx) * g_.nz);
+    if (s.compensated()) {
+        GhostLo lo{{}, 5 + s.nT};
+        for (int v = 0; v < 5; ++v) lo.p[v] = s.lo[v].data();
+        for (int i = 0; i < s.nT; ++i) lo.p[5 + i] = s.tlo[i].data();
+        kChannelGhostLo<<<nb, blockSize>>>(g_, lo);
+        checkLastKernel("kChannelGhostLo");
+    }
+    if (s.nT == 0) return;
     if (s.nT == 1) {
         kChannelWallTurb<<<nb, blockSize>>>(g_, s.rho.data(), s.t[0].data());
         checkLastKernel("kChannelWallTurb");
@@ -149,8 +177,10 @@ void DeviceChannelWall::apply(DeviceCompState& s) const
 void addBodyForceX(const GpuGrid& g, double f, const StageCombine& cmb,
                    const DeviceScalar& u, DeviceCompState& out)
 {
-    kBodyForceX<<<launchBlocks(g.size()), blockSize>>>(
-        g, Real(f), cmb, u.data(), out.mx.data(), out.E.data());
+    internal::withCompensation(cmb, [&](auto comp) {
+        kBodyForceX<decltype(comp)::value><<<launchBlocks(g.size()), blockSize>>>(
+            g, Real(f), cmb, u.data(), out.mx.data(), out.E.data());
+    });
     checkLastKernel("kBodyForceX");
 }
 

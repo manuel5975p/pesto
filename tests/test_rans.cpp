@@ -160,6 +160,25 @@ void pointImplicitForm()
               pointImplicit(1.25f, 0.5f, 0.0f, 0.0f, 9.0f) == 1.25f,
           "exact where the arithmetic is: J = 0 is comb + cr R");
     check(pos, "out >= 0 for comb >= 0 and R + J q >= 0");
+
+    // The increment form the compensated stage uses: comb + delta is the
+    // quotient form algebraically (FP64, 1e-14), and at the fixed point
+    // (R = 0, comb = q) delta is EXACTLY 0 in float -- q - comb is exact --
+    // where the quotient form lands up to 6 ulp off.
+    double worstRel = 0;
+    bool fixedZero = true;
+    for (int i = 0; i < 100000; ++i) {
+        const double comb = U(rng) * 5, cr = U(rng), J = U(rng) * 100,
+                     q = U(rng) * 5, R = U(rng) - 0.5;
+        const double a = pointImplicit(comb, cr, R, J, q);
+        const double b = comb + pointImplicitDelta(comb, cr, R, J, q);
+        worstRel = std::max(worstRel, std::abs(a - b) / std::max(std::abs(a), 1.0));
+        const float qf = float(q);
+        fixedZero = fixedZero &&
+                    pointImplicitDelta(qf, float(cr), 0.0f, float(J), qf) == 0.0f;
+    }
+    check(worstRel <= 1e-14, "comb + pointImplicitDelta == pointImplicit (1e-14)");
+    check(fixedZero, "pointImplicitDelta == 0 exactly at the fixed point (float)");
 }
 
 void floatDouble()
