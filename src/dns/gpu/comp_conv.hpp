@@ -24,8 +24,9 @@ namespace dns::gpu {
 // ny-2 (uniform mesh, so the mirror is an exact geometric reflection and the
 // value mirror is 2nd order at the wall face). No-slip: all momentum
 // antimirrored. Isothermal with a DIFFERENT temperature per wall -- that
-// difference is the entire experiment: T_ghost = 2 Twall - T_in, p copied
-// (zero wall-normal pressure gradient), rho from the EOS.
+// difference is the entire experiment: T_ghost = 2 Twall - T_in, p imaged
+// HYDROSTATICALLY (dp/dy = -rho g at the plate, the wall-normal momentum
+// balance under gravity: p_ghost = p_in +- rho_in g hy), rho from the EOS.
 //
 // Tbot == Ttop reproduces DeviceChannelWall's isothermal branch bit-for-bit.
 class DeviceConvWall
@@ -48,9 +49,13 @@ public:
         // across the PLATES is the experiment, and a conducting side would be a
         // second uncontrolled source. false leaves x and z periodic.
         bool closedSides = false;
+        // Gravity magnitude (along -y), the SAME gy addGravityY applies: the
+        // plates' pressure image balances it. 0 is the zero-gradient copy.
+        double gravity = 0.0;
     };
 
-    // ny >= 4, gamma > 1, Rgas > 0, both wall temperatures > 0; with
+    // ny >= 4, gamma > 1, Rgas > 0, both wall temperatures > 0, gravity >= 0;
+    // with
     // closedSides, nx >= 4 and (nz == 1 or nz >= 4).
     static std::expected<DeviceConvWall, hipError_t> make(const Grid& g,
                                                           Config c);
@@ -67,7 +72,7 @@ private:
 
 // Gravity of magnitude gy pointing in -y, on the FLUID cells (rows 1..ny-2,
 // and with `closed` the lateral ghost columns excluded too):
-// out.my += cr * (-gy rho) and out.E += cr * (-gy my), with rho and my the
+// out.my += crAt * (-gy rho) and out.E += crAt * (-gy my), with rho and my the
 // live stage state. Applied inside the RHS hook so it rides SSP-RK3 exactly
 // and the FUSED stage kernel stays untouched (StageCombine, comp.hpp); the
 // ghost rows are excluded because the wall mirror owns them.
@@ -75,8 +80,8 @@ private:
 // gy does not enter stableDt: the free-fall bound sqrt(h/gy) is orders above
 // the acoustic one for every case this solver can run (the layer would have to
 // be shorter than a cell for it to bind).
-void addGravityY(const GpuGrid& g, double gy, Real cr, bool closed,
-                 const DeviceCompState& s, DeviceCompState& out);
+void addGravityY(const GpuGrid& g, double gy, const StageCombine& cmb,
+                 bool closed, const DeviceCompState& s, DeviceCompState& out);
 
 // Deterministic FP64 per-y-plane moment sums: for every row j,
 //   out[j*6 + 0..5] = sum over (i,k) of

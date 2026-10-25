@@ -154,6 +154,7 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
         bc.cx = r.rotor.shaft[0];
         bc.cy = r.rotor.shaft[1];
         bc.wallPos = ogridWallMidpoints(og);
+        bc.wallSpan = ogridWallSpans(og);
     }
     auto wall = DeviceOGridBc::make(g, bc);
     if (!wall) return fail(6, "O-grid boundary init failed");

@@ -19,6 +19,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <format>
+#include <string>
 #include <vector>
 
 namespace dns::gpu {
@@ -35,16 +37,30 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     const auto gg = GpuGrid::from(g);
     const ChannelStretchY remap{double(g.ny) * g.hy, g.ny, r.stretchBeta,
                                 r.delta};
+    const bool rans = r.rans != RansModel::None;
+    const bool sst = ransSst(r.rans);
+    const bool steady = rans && r.steadyTol > 0;
 
     auto m = CurvMetrics::build(CurvMesh::channelY(g, r.stretchBeta, r.delta));
     if (!m) return fail(2, "channel mesh: " + m.error());
     auto dev = DeviceComp::make(*m, r.gamma, r.mu);
-    auto ds = DeviceCompState::make(g.size());
+    auto ds = DeviceCompState::make(g.size(), ransScalars(r.rans));
     auto red = ReduceScratch::make();
     if (!dev || !ds || !red) return fail(6, "GPU allocation failed");
+    // Both plates are walls: mu_t is mirrored odd on both ghost rows, so it
+    // is exactly 0 on the wall faces (docs/rans.md).
+    if (rans && !dev->enableRans({.model = r.rans,
+                                  .wallDist = r.wallDist,
+                                  .mirrorYLo = true,
+                                  .mirrorYHi = true}))
+        return fail(6, "GPU allocation failed (RANS)");
 
+    // SST's wall omega: TMR's 60 nu_w / (beta1 d1^2) with d1 the first cell
+    // centre's distance (the same on both plates: the mesh is a reflection).
+    const double d1 = sst ? r.wallDist[g.idx(0, 1, 0)] : 0.0;
     auto wall = DeviceChannelWall::make(
-        g, {r.gamma, r.Rgas, r.Twall, r.isothermal});
+        g, {r.gamma, r.Rgas, r.Twall, r.isothermal,
+            sst ? sst::omegaWallFactor * r.mu / (d1 * d1) : 0.0});
     if (!wall) return fail(6, "channel wall init failed");
 
     dev->setStageHook([&](DeviceCompState& s) { wall->apply(s); });
@@ -52,11 +68,13 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     // SSP-RK3 exactly, like the NSCBC rhs overwrite (never a state edit).
     dev->setRhsHook([&](const DeviceCompState&, DeviceCompState& out,
                         const StageCombine& cmb) {
-        addBodyForceX(gg, r.fBody, cmb.cr, dev->u(), out);
+        addBodyForceX(gg, r.fBody, cmb, dev->u(), out);
     });
 
-    if (ds->upload(ic) != hipSuccess)
-        return fail(6, "initial condition upload failed");
+    bool upOk = ds->upload(ic) == hipSuccess;
+    for (int i = 0; i < ds->nT; ++i)
+        upOk = upOk && ds->uploadTurb(i, r.icTurb[i]) == hipSuccess;
+    if (!upOk) return fail(6, "initial condition upload failed");
     if (auto h = internal::checkDevice("the initial condition"); !h)
         return std::unexpected(h.error());
     wall->apply(*ds);
@@ -71,12 +89,20 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     }
     const int jLo = 1, jHi = g.ny - 2; // fluid rows
 
-    const std::string cols[] = {"t",       "dt",      "ubulk", "utauBot",
-                                "utauTop", "retau",   "KE"};
+    // RANS appends columns; the DNS channel's series are untouched.
+    std::vector<std::string> cols = {"t",       "dt",      "ubulk", "utauBot",
+                                     "utauTop", "retau",   "KE"};
+    if (rans) cols.emplace_back("mutMax");
+    if (sst) cols.emplace_back("floorHits");
+    if (steady)
+        cols.insert(cols.end(), {"iter", "resid", "resU", "resE", "resT"});
     if (auto e = out.declareSeries("stats", cols); !e)
         return fail(4, e.error());
-    const std::string pcols[] = {"t",    "y",    "yplus", "uplus", "urms",
-                                 "vrms", "wrms", "uv",    "rho",   "T"};
+    std::vector<std::string> pcols = {"t",    "y",    "yplus", "uplus", "urms",
+                                      "vrms", "wrms", "uv",    "rho",   "T"};
+    if (rans) pcols.emplace_back("mutRatio");
+    if (rans && !sst) pcols.emplace_back("nutilde");
+    if (sst) pcols.insert(pcols.end(), {"kplus", "omegaplus"});
     if (auto e = out.declareSeries("profiles", pcols); !e)
         return fail(4, e.error());
 
@@ -102,12 +128,15 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
         fs.emit(out, t, ff);
     };
 
-    DeviceBuffer<double> planeScratch;
-    std::vector<double> ps; // g.ny * 8 plane moment sums
+    DeviceBuffer<double> planeScratch, mutScratch, ntScratch, nt2Scratch;
+    std::vector<double> ps;          // g.ny * 8 plane moment sums
+    // g.ny * 2 {sum, max}: mu_t, and the conserved scalars (rho nu~ | rho k,
+    // rho omega)
+    std::vector<double> pmut, pnt, pnt2;
 
     struct WallState
     {
-        double ubulk = 0, utauBot = 0, utauTop = 0, ke = 0;
+        double ubulk = 0, utauBot = 0, utauTop = 0, ke = 0, mutMax = 0;
     };
     auto measure = [&]() -> std::expected<WallState, RunError> {
         dev->primitives(*ds);
@@ -134,14 +163,26 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
         w.utauTop = std::sqrt(std::max(
             nu * wallGradientPinned(favreU(jHi), favreU(jHi - 1), dTop1, dTop2),
             0.0));
+        if (!rans) return w;
+        // mu_t of THIS state (the stage buffer holds the last stage's input).
+        dev->updateMut(*ds);
+        if (channelPlaneScalarSums(gg, dev->mut(), mutScratch, pmut) !=
+                hipSuccess ||
+            channelPlaneScalarSums(gg, ds->t[0], ntScratch, pnt) != hipSuccess ||
+            (sst && channelPlaneScalarSums(gg, ds->t[1], nt2Scratch, pnt2) !=
+                        hipSuccess))
+            return fail(6, "RANS plane sums download failed");
+        for (int j = jLo; j <= jHi; ++j)
+            w.mutMax = std::max(w.mutMax, pmut[j * 2 + 1] / r.mu);
         return w;
     };
 
     auto emitProfiles = [&](double t, const WallState& w) {
         const double ut = std::max(0.5 * (w.utauBot + w.utauTop), 1e-12);
+        const double nxz = double(g.nx) * g.nz;
         for (int j = jLo; j <= jHi; ++j)
         {
-            const double rhoM = ps[j * 8 + 0] / (double(g.nx) * g.nz);
+            const double rhoM = ps[j * 8 + 0] / nxz;
             const double uF = ps[j * 8 + 1] / ps[j * 8 + 0];
             const double vF = ps[j * 8 + 2] / ps[j * 8 + 0];
             const double uu = ps[j * 8 + 3] / ps[j * 8 + 0] - uF * uF;
@@ -150,16 +191,24 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
             const double uv = ps[j * 8 + 6] / ps[j * 8 + 0] - uF * vF;
             const double TM = ps[j * 8 + 7] / ps[j * 8 + 0];
             const double dWall = std::min(yc[j], 2 * r.delta - yc[j]);
-            const double row[] = {t,
-                                  yc[j],
-                                  dWall * ut / nu,
-                                  uF / ut,
-                                  std::sqrt(std::max(uu, 0.0)) / ut,
-                                  std::sqrt(std::max(vv, 0.0)) / ut,
-                                  std::sqrt(std::max(ww, 0.0)) / ut,
-                                  uv / (ut * ut),
-                                  rhoM,
-                                  TM};
+            std::vector<double> row = {t,
+                                       yc[j],
+                                       dWall * ut / nu,
+                                       uF / ut,
+                                       std::sqrt(std::max(uu, 0.0)) / ut,
+                                       std::sqrt(std::max(vv, 0.0)) / ut,
+                                       std::sqrt(std::max(ww, 0.0)) / ut,
+                                       uv / (ut * ut),
+                                       rhoM,
+                                       TM};
+            // Plane means of mu_t/mu and nu~/nu = (rho nu~)/mu (constant mu);
+            // SST: Favre k+ = k/u_tau^2 and omega+ = omega nu/u_tau^2.
+            if (rans) row.push_back(pmut[j * 2] / nxz / r.mu);
+            if (rans && !sst) row.push_back(pnt[j * 2] / nxz / r.mu);
+            if (sst)
+                row.insert(row.end(),
+                           {pnt[j * 2] / ps[j * 8 + 0] / (ut * ut),
+                            pnt2[j * 2] / ps[j * 8 + 0] * nu / (ut * ut)});
             out.row("profiles", row);
         }
     };
@@ -171,6 +220,80 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     int sinceDt = 1 << 30;
     internal::ProfileSchedule prof(r.profileDt);
     const auto wall0 = std::chrono::steady_clock::now();
+    const std::string ransLabel = rans ? "RANS " + std::string(ransName(r.rans))
+                                       : std::string();
+
+    if (steady)
+    {
+        // Steady RANS in local-time-stepping PSEUDO-time: every cell marches
+        // at its own stable dt (the lts ratios on top of dtRef), and the run
+        // stops on the explicit-mode residual (docs/rans.md: not state
+        // differencing). t accumulates dtRef and is NOT a physical time.
+        dev->setLts(true);
+        bool converged = false;
+        double resid = HUGE_VAL;
+        // Residual in wall units: L = delta = 1, U = u_tau = 1, and the
+        // energy scaled by the bulk estimate (docs/rans.md, D11).
+        auto statsRow = [&](double dt) -> std::expected<void, RunError> {
+            const ResidualNorms n = dev->residual(*ds, jLo, jHi, *red);
+            auto w = measure();
+            if (!w) return std::unexpected(w.error());
+            if (auto h = internal::checkDevice("a stats row", &*red); !h)
+                return std::unexpected(h.error());
+            // SST: k and ln(omega) rates, the larger of the two.
+            const double resU = n.mom, resE = n.E / ubEst,
+                         resT = sst ? std::max(n.t[0], n.t[1]) : n.t[0];
+            resid = std::max({resU, resE, resT});
+            if (!std::isfinite(resid))
+                return fail(7, "the residual is not finite (the state "
+                               "diverged)");
+            const double retau = 0.5 * (w->utauBot + w->utauTop) * r.delta / nu;
+            std::vector<double> row = {t, dt, w->ubulk, w->utauBot, w->utauTop,
+                                       retau, w->ke, w->mutMax};
+            if (sst) row.push_back(double(dev->floorHits()));
+            row.insert(row.end(),
+                       {double(st.steps), resid, resU, resE, resT});
+            out.row("stats", row);
+            converged = resid < r.steadyTol;
+            if (converged || st.steps >= r.steadySteps ||
+                st.steps - cad.lastPrint >= 10 * cad.every)
+            {
+                std::printf("iter=%ld ub=%.4f Re_tau=%.2f mutMax=%.2f "
+                            "dtRef=%.2e %s resid=%.3e (U %.2e E %.2e T %.2e)\n",
+                            st.steps, w->ubulk, retau, w->mutMax, dt,
+                            ransLabel.c_str(), resid, resU, resE, resT);
+                std::fflush(stdout);
+                cad.printed(st.steps);
+            }
+            cad.logged(st.steps);
+            if (converged || st.steps >= r.steadySteps) emitProfiles(t, *w);
+            return {};
+        };
+        while (!converged && st.steps < r.steadySteps)
+        {
+            if (stopRequested()) break;
+            if (auto e = internal::recomputeDt(
+                    sinceDt, dtStab, r.dtRecompute, r.dtMargin, 1e-9,
+                    [&] { return dev->localDt(*ds, *red, r.cfl); });
+                !e)
+                return fail(7, e.error());
+            dev->step(*ds, Real(dtStab));
+            wall->apply(*ds);
+            t += dtStab;
+            ++st.steps;
+            if (st.steps - cad.lastLog >= cad.every || st.steps >= r.steadySteps)
+                if (auto e = statsRow(dtStab); !e)
+                    return std::unexpected(e.error());
+        }
+        if (auto h = internal::checkDevice("the end of the run", &*red); !h)
+            return std::unexpected(h.error());
+        finishTiming(st, wall0, out);
+        if (!converged && !stopRequested())
+            return fail(8, std::format("steady state not reached in {} "
+                                       "iterations (resid {:.3e} > {:.3g})",
+                                       st.steps, resid, r.steadyTol));
+        return st;
+    }
 
     while (t < r.tEnd)
     {
@@ -205,16 +328,19 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
             {
                 const double retau =
                     0.5 * (w->utauBot + w->utauTop) * r.delta / nu;
-                const double row[] = {t,          dt,         w->ubulk,
-                                      w->utauBot, w->utauTop, retau,
-                                      w->ke};
+                std::vector<double> row = {t,          dt,         w->ubulk,
+                                           w->utauBot, w->utauTop, retau,
+                                           w->ke};
+                if (rans) row.push_back(w->mutMax);
+                if (sst) row.push_back(double(dev->floorHits()));
                 out.row("stats", row);
                 if (cad.printDue(st.steps, t, r.tEnd))
                 {
                     std::printf("t=%.2f/%.2f ub=%.2f Re_tau=%.1f "
-                                "(bot %.3f top %.3f) dt=%.2e\n",
+                                "(bot %.3f top %.3f) dt=%.2e%s%s\n",
                                 t, r.tEnd, w->ubulk, retau, w->utauBot,
-                                w->utauTop, dt);
+                                w->utauTop, dt, rans ? " " : "",
+                                ransLabel.c_str());
                     std::fflush(stdout);
                     cad.printed(st.steps);
                 }

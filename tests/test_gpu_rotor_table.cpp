@@ -61,7 +61,9 @@ Rotor rotorFor(int bins)
 bool sameTables(const gpu::CompGhostTables& a, const gpu::CompGhostTables& b)
 {
     return a.gcell == b.gcell && a.gnbr == b.gnbr && a.gw == b.gw
-           && a.gscale == b.gscale && a.uwall == b.uwall && a.deep == b.deep
+           && a.tnbr == b.tnbr && a.tw == b.tw
+           && a.gscale == b.gscale && a.uwall == b.uwall && a.aspan == b.aspan
+           && a.deep == b.deep
            && a.fcell == b.fcell && a.fdir == b.fdir && a.fpos == b.fpos
            && a.solid == b.solid;
 }
@@ -154,9 +156,7 @@ int main()
         {
             const gpu::GhostSdf turned =
                 rotorSdf(rot, gpu::GhostSdf(sdfDiamond), rotorBinAngle(rot, m));
-            const gpu::GhostWallVelocity uw = [&](double x, double y, double z) {
-                return rotorWallVelocity(rot, {x, y, z});
-            };
+            const gpu::GhostWallMotion uw = gpu::rotorWallMotion(rot);
             const auto fresh = gpu::classifyCompGhost(g, turned, nullptr,
                                                       uniform, &uw);
             if (!sameTables(fresh, table->bins[std::size_t(m)])) { bad = m; break; }
@@ -246,8 +246,11 @@ int main()
         big.gcell.push_back(0);
         big.gnbr.resize(big.gnbr.size() + 8, 0);
         big.gw.resize(big.gw.size() + 8, gpu::Real(0));
+        big.tnbr.resize(big.tnbr.size() + 8, 0);
+        big.tw.resize(big.tw.size() + 8, gpu::Real(0));
         big.gscale.push_back(gpu::Real(0));
         big.uwall.resize(big.uwall.size() + 3, gpu::Real(0));
+        big.aspan.push_back(gpu::Real(0));
         check(gh->load(big) != hipSuccess,
               "loading a table larger than the capacity is refused");
     }

@@ -52,12 +52,14 @@ add_library(dns_core
     src/dns/ogrid.cpp
     src/dns/poisson.cpp
     src/dns/prop/spec.cpp
+    src/dns/rans_channel1d.cpp
     src/dns/rotor.cpp
     src/dns/scene.cpp
     src/dns/shmframes.cpp
     src/dns/timestepper.cpp
     src/dns/trimesh.cpp
     src/dns/vtk_writer.cpp
+    src/dns/walldist.cpp
     src/dns/webframes.cpp
 )
 target_include_directories(dns_core PUBLIC src)
@@ -119,6 +121,7 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/les.hip
     src/dns/gpu/ogrid_bc.hip
     src/dns/gpu/poisson.hip
+    src/dns/gpu/rans.hip
     src/dns/gpu/reductions.hip
     src/dns/gpu/rotortable.hip
     src/dns/gpu/runner_channel.hip
@@ -366,7 +369,7 @@ include(CTest)
 if(BUILD_TESTING)
     set(DNS_TESTS cli geometry output poisson projection tgv tgv3d cutcell cutcell_sphere comp comp_curv meshsdf
         fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport
-        rotor focal)
+        rotor focal cli_defaults comp_axis_permute rans rans_channel1d)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)
     endif()
@@ -377,6 +380,7 @@ if(BUILD_TESTING)
         set_tests_properties(${t} PROPERTIES TIMEOUT 120)
     endforeach()
     target_link_libraries(test_fieldpng PRIVATE ZLIB::ZLIB) # decodes IDAT
+    set_tests_properties(cli_defaults comp_axis_permute PROPERTIES TIMEOUT 60)
 
     # The exit-code contract, driven through the real binary. GPU-free: every
     # case is reachable in phases 1-3a.
@@ -417,12 +421,34 @@ if(BUILD_TESTING)
                   gpu_acoustics gpu_comp_sink
                   gpu_les_smag gpu_derived
                   gpu_poisson_wally gpu_rotor_wall gpu_rotor_table gpu_mrf
-                  gpu_channel gpu_cutflux gpu_ogrid)
+                  gpu_channel gpu_cutflux gpu_ogrid gpu_rans
+                  index_offsets_wrap stats_cadence
+                  gpu_tally_couette_torque gpu_tally_conduction
+                  gpu_tally_archimedes gpu_tally_kutta_joukowski
+                  gpu_mrf_conservation gpu_mrf_stabledt gpu_ogrid_rotation
+                  gpu_rb_modes
+                  gpu_comp_ghost_closure_focal gpu_comp_ghost_couette_exact
+                  gpu_rotor_comoving_fixed_point gpu_comp_scale_invariance
+                  gpu_ghost_translate
+                  gpu_comp_axis_permute gpu_comp_curv_axis_permute
+                  comp_time_order gpu_comp_viscous_modes)
             add_executable(test_${t} tests/test_${t}.cpp)
             target_link_libraries(test_${t} PRIVATE dns_gpu)
             add_test(NAME ${t} COMMAND test_${t})
             set_tests_properties(${t} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
         endforeach()
+        # Small verification tests (seconds each): a hang is a failure.
+        set_tests_properties(index_offsets_wrap stats_cadence
+            gpu_tally_couette_torque gpu_tally_conduction gpu_tally_archimedes
+            gpu_tally_kutta_joukowski gpu_mrf_conservation gpu_mrf_stabledt
+            gpu_ogrid_rotation gpu_rb_modes gpu_comp_ghost_closure_focal
+            gpu_comp_ghost_couette_exact gpu_rotor_comoving_fixed_point
+            gpu_comp_scale_invariance gpu_ghost_translate gpu_comp_axis_permute
+            gpu_comp_curv_axis_permute comp_time_order gpu_comp_viscous_modes
+            PROPERTIES TIMEOUT 60)
+        # ~65 s alone (two 2.2e5-iteration marches onto the oracle); 273 s was
+        # measured under ctest -j4 GPU contention, so give it headroom.
+        set_tests_properties(gpu_rans PROPERTIES TIMEOUT 600)
 
         # These define their own kernels (the pre-recomposition kernel variants,
         # as identity oracles), so they are HIP TUs rather than plain .cpp --
@@ -465,6 +491,13 @@ if(BUILD_TESTING)
         # Sponge-free open tunnel: library-level freestream cycles + a short
         # end-to-end run of the built binary.
         dns_gpu_bin_test(gpu_tunnel_open 600)
+        # The rotor tip-Mach guard: library replay of the runner's measurement,
+        # then the binary's exit 2 (the binary half skips without a device).
+        dns_gpu_bin_test(rotor_tip_guard 60)
+        # Every runner twice: the stats CSVs must be byte-identical.
+        dns_gpu_bin_test(gpu_determinism 120)
+        # Linear Rayleigh-Benard onset (Ra_c 1708) on both conv branches.
+        dns_gpu_bin_test(gpu_rb_onset 60)
 
 
         # --- Physical validation suite (docs/validation.md) -----------------

@@ -16,7 +16,7 @@ __device__ Real bandRamp(int q, int n, int nb)
     return Real(0.5) * (Real(1) - cosf(Real(M_PI) * d));
 }
 
-// Scale-selective damping band: out += cr * rhs with
+// Scale-selective damping band: out += crAt(c) * rhs with
 //   rhs_i = -( sig_{i+1/2} t_{i+1/2} - sig_{i-1/2} t_{i-1/2} )   per axis,
 //   t_{m+1/2} = [ (q_{m+2}-q_{m+1}) - 2(q_{m+1}-q_m) + (q_m-q_{m-1}) ] / 16,
 // the compounded undivided Laplacian D4 (Fourier symbol sin^4(kh/2)) in
@@ -32,7 +32,7 @@ __device__ Real bandRamp(int q, int n, int nb)
 // same order), so the telescoping holds in floats, not just on paper.
 // Deterministic; no atomics; each thread owns its cell.
 __global__ void kCompSink(GpuGrid g, int nb, Real sgx, Real sgy, Real sgz,
-                          Real cr, const Real* __restrict__ sr,
+                          StageCombine cmb, const Real* __restrict__ sr,
                           const Real* __restrict__ smx,
                           const Real* __restrict__ smy,
                           const Real* __restrict__ smz,
@@ -91,6 +91,7 @@ __global__ void kCompSink(GpuGrid g, int nb, Real sgx, Real sgy, Real sgz,
             add[v] -= shi * flux(f[v], q) - slo * flux(f[v], q - 1);
     }
     if (!banded) return;
+    const Real cr = cmb.crAt(c);
     orho[c] += cr * add[0];
     omx[c] += cr * add[1];
     omy[c] += cr * add[2];
@@ -125,7 +126,7 @@ void DeviceCompSink::apply(const DeviceCompState& s, DeviceCompState& out,
     const Real a = Real(c_.alpha * c_.cInf);
     kCompSink<<<launchBlocks(g_.size()), blockSize>>>(
         g_, c_.nb, a / g_.hx, c_.openY ? a / g_.hy : Real(0),
-        c_.openZ ? a / g_.hz : Real(0), cmb.cr, s.rho.data(), s.mx.data(),
+        c_.openZ ? a / g_.hz : Real(0), cmb, s.rho.data(), s.mx.data(),
         s.my.data(), s.mz.data(), s.E.data(), out.rho.data(), out.mx.data(),
         out.my.data(), out.mz.data(), out.E.data());
     checkLastKernel("kCompSink");

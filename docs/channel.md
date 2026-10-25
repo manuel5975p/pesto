@@ -57,7 +57,8 @@ studies only. `isothermal = false` reproduces kFarWallY bit-for-bit
   thread per row, fixed order). Host forms Favre means, Reynolds stresses,
   u_tau from a one-sided 2-point quadratic wall fit (u(0) = 0 pinned),
   bulk velocity mass-weighted with the stretched row heights.
-- `<out>_stats.csv`: t, dt, ubulk, utauBot, utauTop, retau, KE.
+- `<out>_stats.csv`: t, dt, ubulk, utauBot, utauTop, retau, KE (RANS
+  appends columns, below).
 - `<out>_profiles.csv` (long format, every `--profile-dt`): t, y, yplus,
   uplus, urms, vrms, wrms, uv, rho, T — instantaneous x,z-plane averages;
   time-average offline over the stationary window.
@@ -80,6 +81,28 @@ Untripped (`--kick 0`) stays laminar — that is the test oracle, not a bug.
   default grid. `--mach 0.3` cuts ~35% at the price of compressibility
   drift from the incompressible reference. Do not cite KMM agreement until
   a stationary-window average has been measured and recorded here.
+
+## RANS (`--rans sa-neg|sst-2003m|sst-vm`, `--steady TOL`)
+
+Spec and measurements: `docs/rans.md`. The channel is the first RANS path: an
+exact reflected ghost wall, an exact wall distance, no far field, and
+τ_w ≡ 1 by force balance. The mean is homogeneous in x and z, so `--n 4
+--nz 1` is the same answer (the validator warns above nx·nz = 4); the IC is
+the untripped Reichardt profile + the model's starting scalars, `--kick`
+defaults to 0 and a given `--kick > 0` is rejected. `--steady` runs local
+time stepping in PSEUDO-time (rejects `--tt`, `--profile-dt`, the frame
+cadences and frame `--emit`; profiles are written once, at convergence or the
+cap) and needs isothermal walls. Stats append `mutMax` (SST also
+`floorHits`) and, with `--steady`, `iter, resid, resU, resE, resT`; profiles
+append `mutRatio` and SA `nutilde` | SST `kplus, omegaplus`. RANS off is the
+DNS channel byte for byte.
+
+Measured (FP64 oracle = the same discrete operator; MKM ub⁺ 15.679 at Re_τ
+178.12): SA-neg ny 64 15.807 (+0.82%), SST-2003m 15.633 (−0.29%), SST-Vm
+15.599 (−0.51%); SST converges FIRST order in ny (the TMR wall ω), to 15.13
+(−3.5%). The FP32 steady march lands on the oracle (ub within 0.06% after
+3–4e5 iterations, 45–55 s at ny 64) but its residual floors at ~1 (the FP32
+update floor) — it cannot certify convergence; see `docs/rans.md`.
 
 ## Cost notes
 

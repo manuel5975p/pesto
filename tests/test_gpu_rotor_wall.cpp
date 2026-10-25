@@ -18,6 +18,7 @@
 #include "dns/comp.hpp"
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_ghost.hpp"
+#include "dns/gpu/rotortable.hpp"
 #include "dns/rotor.hpp"
 
 #include "gpu_test_util.hpp"
@@ -78,10 +79,7 @@ struct SpinResult
 SpinResult spinUp(const Grid& g, double mu, double omega, double tEnd)
 {
     const Rotor rot = spin(omega);
-    const gpu::DeviceCompGhost::WallVelocity uw = [&rot](double x, double y,
-                                                         double z) {
-        return rotorWallVelocity(rot, {x, y, z});
-    };
+    const gpu::DeviceCompGhost::WallMotion uw = gpu::rotorWallMotion(rot);
     auto dev = gpu::DeviceComp::make(g, gamma_, mu);
     auto gh = gpu::DeviceCompGhost::make(g, sdfCyl, gamma_, rhoInf, pInf,
                                          nullptr, {}, &uw);
@@ -149,8 +147,8 @@ int main()
     // for bit; the energy differs only by the rounding of a*a*|u|^2 against
     // |a*u|^2, so it is checked in ulps, not exactly.
     {
-        const gpu::DeviceCompGhost::WallVelocity zero =
-            [](double, double, double) { return std::array<double, 3>{}; };
+        const gpu::DeviceCompGhost::WallMotion zero =
+            [](double, double, double) { return gpu::GhostWallKinematics{}; };
         auto dev = gpu::DeviceComp::make(g, gamma_, mu);
         auto still = gpu::DeviceCompGhost::make(g, sdfCyl, gamma_, rhoInf, pInf);
         auto moving = gpu::DeviceCompGhost::make(g, sdfCyl, gamma_, rhoInf,
@@ -228,10 +226,7 @@ int main()
     // a wrong face position or a mismatched span would break it immediately.
     {
         const Rotor rot = spin(omega);
-        const gpu::DeviceCompGhost::WallVelocity uw =
-            [&rot](double x, double y, double z) {
-                return rotorWallVelocity(rot, {x, y, z});
-            };
+        const gpu::DeviceCompGhost::WallMotion uw = gpu::rotorWallMotion(rot);
         auto dev = gpu::DeviceComp::make(g, gamma_, mu);
         auto gh = gpu::DeviceCompGhost::make(g, sdfCyl, gamma_, rhoInf, pInf,
                                              nullptr, {}, &uw);

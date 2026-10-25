@@ -75,7 +75,8 @@ void TimeStepper::step(DeviceField& U, double dt)
     project(g_, poisson_, h, s2_, scratch_);
 
     // stage 3: U = 1/3 U + 2/3 (s2 + dt L(s2))
-    stage(Real(1.0 / 3.0), U, Real(2.0 / 3.0), s2_, h, U);
+    // 1 - Real(2/3) is exact, so the weights sum to exactly 1 in FP32.
+    stage(Real(1) - Real(2.0 / 3.0), U, Real(2.0 / 3.0), s2_, h, U);
     project(g_, poisson_, h, U, scratch_);
 }
 

@@ -82,6 +82,19 @@ std::array<double, 3> rotorWallVelocity(const Rotor& r,
     return u;
 }
 
+std::array<double, 3> rotorWallAcceleration(const Rotor& r,
+                                            const std::array<double, 3>& p)
+{
+    const auto [b, c] = planeAxes(r.axis);
+    const int s = rotorAxisIndex(r.axis);
+    const double w2 = r.omega * r.omega;
+    std::array<double, 3> a{};
+    a[s] = 0.0;
+    a[b] = -w2 * (p[b] - r.shaft[b]);
+    a[c] = -w2 * (p[c] - r.shaft[c]);
+    return a;
+}
+
 double rotorOmegaFromTipMach(double tipMach, double cInf, double radius)
 {
     assert(radius > 0);

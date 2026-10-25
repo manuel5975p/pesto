@@ -23,6 +23,7 @@
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_ghost.hpp"
 #include "dns/gpu/ogrid_bc.hpp"
+#include "dns/gpu/rotortable.hpp"
 #include "dns/remap.hpp"
 #include "dns/rotor.hpp"
 
@@ -140,10 +141,7 @@ SpinResult spinUp(bool mrf, double tEnd)
     const auto sdf = [&](double x, double y, double) {
         return std::hypot(x - cx, y - cy) - R;
     };
-    const gpu::DeviceCompGhost::WallVelocity uw = [&rot](double x, double y,
-                                                         double z2) {
-        return rotorWallVelocity(rot, {x, y, z2});
-    };
+    const gpu::DeviceCompGhost::WallMotion uw = gpu::rotorWallMotion(rot);
     auto dev = gpu::DeviceComp::make(g, gamma_, mu);
     auto gh = gpu::DeviceCompGhost::make(g, sdf, gamma_, rhoInf, pInf, nullptr,
                                          {}, &uw);
@@ -338,6 +336,7 @@ SpinResult spinUpOGrid(double tEnd)
     bc.cx = 0.0;
     bc.cy = 0.0;
     bc.wallPos = ogridWallMidpoints(*og);
+    bc.wallSpan = ogridWallSpans(*og);
     auto wall = gpu::DeviceOGridBc::make(g, bc);
     if (!wall) { check(false, "ogrid spinUp bc"); return {}; }
     dev->setStageHook([&](gpu::DeviceCompState& s) { wall->apply(s); });

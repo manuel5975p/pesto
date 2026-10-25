@@ -102,7 +102,7 @@ outlines come from `hb-draw`), no widget toolkit. Full description: `docs/ui.md`
 | `flow` | a body in a uniform free stream: drag/lift, wake, slices |
 | `tgv` | Taylor-Green vortex — 2D analytic check or 3D Re1600 benchmark |
 | `hit` | forced homogeneous isotropic turbulence (SI-configured) |
-| `channel` | wall-resolved turbulent channel flow (compressible, forced; spec: `docs/channel.md`) |
+| `channel` | wall-resolved turbulent channel flow (compressible, forced; spec: `docs/channel.md`); `--rans` SA-neg / SST mean (`docs/rans.md`) |
 | `conv` | Rayleigh-Bénard convection: heated floor, cooled lid, gravity |
 | `bench` | step-time and throughput benchmark |
 | `prop` | propeller thrust curve by BEMT or lifting line — host-only, never a GPU |
@@ -197,6 +197,18 @@ climbs until dt collapses: short transients only), `--cfl` 0.4. Start-up
 `--kick` 0.2 (solenoidal trip on the laminar Poiseuille IC; 0 stays laminar).
 Run length `--tt` 30 eddy turnovers (δ/u_τ = 1), `--dt-recompute` 16. Output
 adds `--profile-dt` 1.0 (`<out>_profiles.csv`, Favre-averaged over x and z).
+
+RANS (spec `docs/rans.md`): `--rans none|sa-neg|sst-2003m|sst-vm` (TMR SA-neg
+with ft2; Menter SST 2003 / 1994-with-vorticity, both with ⅔ρk dropped).
+Labelled `RANS <variant> -- steady|URANS` everywhere. The mean is 1D, so
+`--n 4 --nz 1` is the case; no trip (`--kick` > 0 rejected). `--steady TOL`
+runs local-time-stepping PSEUDO-time to `resid < TOL`, `--steady-steps N`
+(200000) is exit 8; it needs isothermal walls and rejects `--tt`,
+`--profile-dt` and frame output. Measured: ub⁺ vs MKM 15.679 at Re_τ 178 —
+SA-neg +0.82%, SST-2003m −0.29% (ny 64; SST is first order in ny, limit
+−3.5%). The FP32 march lands on the FP64 oracle's discrete solution, but its
+residual floors at ~1 (the FP32 update floor), so the residual stop cannot
+certify the mean on this case — read `docs/rans.md` before choosing TOL.
 
 ### `conv` — Rayleigh-Bénard convection
 
@@ -825,12 +837,27 @@ literal preserved); otherwise the body sits at lx/3.
 ## 8. Ghost-fill sharp viscous wall
 
 `gpu/ghostfill.*`, GPU backend only. Per RK stage the **diffusion** term reads a
-ghost-filled copy of the field (solid faces get mirror values `−q(image)` from the
-body sdf, no-slip at the true sub-cell surface); convection keeps the masked zeros
+ghost-filled copy of the field (solid faces get `(sdf/d)·q(image)`, the image `d`
+out along the sdf normal from the wall foot — the mirror `−q(image)` at
+`d = |sdf|` — no-slip at the true sub-cell surface); convection keeps the masked zeros
 — mirror values in the skew form inject energy (tested), so NEVER feed the ghost
 view to convection or leak it into the state. Ghost faces have zero aperture:
 projection/continuity never see them. `kBodyFriction` / `kBodySgsFriction` tally
 per-link `(q − q_ghost)` drains through the ghost view.
+
+The image is read by the TRUE trilinear interpolant over a cell whose weighted
+corners are all open faces; where the mirror point's cell has a closed corner the
+image moves out along the normal (1/16-cell steps, up to a cell diagonal) until it
+is clean. Dropping the closed corners and renormalizing — what it did until
+2026-10-24 — reads the field at the open corners' centroid, O(h) off, i.e. an O(1)
+error in the wall gradient on ~5% of the ghost faces: on an imposed circular
+Couette field the friction tally plateaued at +6% (convex) / +7–12% (concave) from
+R/h 13 to 64 instead of converging (`gpu_tally_couette_torque`). Now first order
+(−4.5/−2.4/−1.3% at R/h 16/32/64, the linear image missing the profile's wall
+curvature); at the solver's own steady state −0.17/−0.048/−0.018%. Unresolved
+spots (no clean cell within a diagonal: sub-cell gaps, concave corners) take the
+renormalized image with the open corners' own wall distance, capped at the mirror
+(`fallbackCount()`; 0 on a resolved convex body).
 
 Measured (cylinder Re60, matched t ≈ 21.7): ghost cd 256² = 1.803, 512² = 1.785,
 1024² = 1.785 (grid-converged); the old staircase 512² was 1.719 — 0.066 below the
@@ -935,7 +962,7 @@ upstream at +pitch) before trusting it. VIEWER: the three.js up-vector must be +
 renders as a sideways swing. Body and flow are marching-cubed from the same
 λ/velocity grid, so they align.
 
-## 11. DNS vs LES — which runs mean what
+## 11. DNS vs LES vs RANS — which runs mean what
 
 The core scheme is DNS: KE-conserving skew-symmetric advection, the ONLY
 dissipation is the physical ν. Valid iff the grid resolves the smallest active
@@ -986,6 +1013,13 @@ artifacts, memory) and state Cs; use the DNS label only when `--les 0` and
 BL ≥ ~3 cells. `--dry-run` prints the resolved DNS/LES label.
 Tests: `gpu_comp_les` (Cs = 0 bit-identical, conserves mass/momentum/E,
 KE < DNS in 3D).
+
+**RANS** (`dns channel --rans`, `docs/rans.md`) is a third label and a third
+kind of result: an ensemble-mean MODEL output (`RANS SA-neg`, `RANS
+SST-2003m`, `RANS SST-Vm`, plus `-- steady (local time stepping:
+pseudo-time, not time-accurate)` or `-- URANS (time-accurate)`), never a
+grounder. Its μt rides the same eddy-viscosity slot as LES; ν̃ ≡ 0 / k ≡ 0 is
+the DNS bit for bit.
 
 ## 12. Curvilinear (distorted regular) meshes — compressible
 
@@ -1210,7 +1244,13 @@ the failing angle by name if it is not.
 `--ogrid` rejects `--focal`, `--stretch`, `--cut-flux`, `--penalize`, `--open`,
 `--far`, `--dr` and `--seq`: all of those describe a box with a body immersed in
 it. The far field is the outer circle, handled by a characteristic (LODI)
-condition in the local radial normal — never a sponge.
+condition in the local radial normal — never a sponge, and NOT NSCBC: every
+`--nscbc-*` flag and `--pot` is rejected by name (they used to be accepted and
+silently ignored — `--nscbc-strip` even "satisfied" the Re-800 rule), and
+Re > 800 only warns (that far row is unmeasured there). `--dry-run` prints
+`far field  o-grid outer row (characteristic LODI, gpu/ogrid_bc)` and the
+nominal-circle first cell `h1≈…`; the boundary-layer warning counts cells
+through the clustered radial distribution, not the nominal hy.
 
 **Measured, Re 100 cylinder, M 0.2** (`--ogrid --n 192 --ny 96 --ogrid-far 20
 --ogrid-beta 3.5 --ramp 1.5`, 38 shedding cycles of the limit cycle,

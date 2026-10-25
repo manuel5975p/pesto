@@ -16,7 +16,10 @@ namespace {
 // -(dw/ds) u_sample; exact mirror when dw >= ds). Thermodynamics: adiabatic
 // (iso == 0) copies pressure and density, a zero wall-normal dT/dn; isothermal
 // images the temperature about the wall face (see below) and rebuilds rho from
-// the EOS. iso == 0 executes exactly the arithmetic it always did.
+// the EOS. rho and p come from the THERMO stencil (tnbr/tw), which is the
+// velocity stencil wherever that one is all fluid and an on-normal sample a
+// little further out where it is not (classifyCompGhost); where the two
+// coincide, every ghost value is bit-identical to the single-stencil fill.
 //
 // uw != nullptr makes the wall MOVE at that per-ghost velocity. The image is
 // the same one the isothermal temperature uses, about u_wall instead of about
@@ -25,13 +28,37 @@ namespace {
 // and a == 1 makes it the familiar 2 Uw - u_s. The resting branch is kept
 // VERBATIM rather than folded into the general form: a*a*(ui*ui) and
 // (a*ui)*(a*ui) are not the same float, and the static path must not move.
+//
+// WALL PRESSURE. The pressure is not a boundary condition of a no-slip wall --
+// only u (and T or q) are -- so the ghost pressure is a closure, and the right
+// closure is the one the solution itself satisfies at the wall: the momentum
+// equation there, where the fluid moves with the wall (Du/Dt = a_wall),
+//   grad p |wall = -rho a_wall + div tau.
+// The inviscid part is imaged exactly: p_ghost = p_sample + rho_sample *
+// a_wall . (x_sample - x_ghost) (`as`, per ghost). At rest a_wall = 0 and that
+// is the historical copy, so the resting branch is the same condition, not an
+// approximation of it. The viscous part is NOT imaged, deliberately: it is the
+// normal half of the wall's viscous compatibility, whose tangential half
+// (mu d2u_t/dn2 = dp/ds) the linear velocity image omits at the same order --
+// imaging one half does not raise the order of the force, and imaging both
+// needs a curvature-carrying (two-sample) image. Such an image has non-convex
+// weights, and for the pressure the dissipation-free central flux makes it
+// unstable outright: in the 1D semi-discrete acoustic operator with this
+// image, swept over the sub-cell wall offset, a wall-bound mode grows at
+// Re(lambda) = 0.58 c/h with one cell between the two samples and 0.009 c/h
+// with two, while the copy -- from any distance -- stays at Re(lambda) = 0 to
+// round-off. A pressure-only extrapolation is therefore not offered.
+// The adiabatic image keeps T, not rho: rho_ghost = rho_sample p_g / p_s, so
+// dT/dn stays zero and the gradient lives in the density, as in the gas.
 __global__ void kGhostFill(Real gamma, int iso, Real Twall, Real Rgas,
                            const int* gcell, const int* gnbr, const Real* gw,
-                           const Real* gscale, const Real* uw, int m, Real* rho,
+                           const int* tnbr, const Real* tw, const Real* gscale,
+                           const Real* uw, const Real* as, int m, Real* rho,
                            Real* mx, Real* my, Real* mz, Real* E)
 {
     const int q = blockIdx.x * blockDim.x + threadIdx.x;
     if (q >= m) return;
+    // Velocity sample (and its rho, p: the isothermal T image's sample).
     Real ri = 0, ui = 0, vi = 0, wi = 0, pi = 0;
     for (int s = 0; s < 8; ++s) {
         const Real w = gw[8 * q + s];
@@ -46,8 +73,42 @@ __global__ void kGhostFill(Real gamma, int iso, Real Twall, Real Rgas,
               (E[c] -
                Real(0.5) * (mx[c] * mx[c] + my[c] * my[c] + mz[c] * mz[c]) / r);
     }
+    // Thermo sample: rho and p on the normal. Same arithmetic as above, so a
+    // coinciding stencil gives rt == ri and pt == pi bit for bit.
+    Real rt = 0, pt = 0;
+    for (int s = 0; s < 8; ++s) {
+        const Real w = tw[8 * q + s];
+        if (w == Real(0)) continue;
+        const int c = tnbr[8 * q + s];
+        const Real r = rho[c];
+        rt += w * r;
+        pt += w * (gamma - Real(1)) *
+              (E[c] -
+               Real(0.5) * (mx[c] * mx[c] + my[c] * my[c] + mz[c] * mz[c]) / r);
+    }
     const Real a = gscale[q];
     const int c = gcell[q];
+    if (uw) {
+        const Real pg = pt + rt * as[q];
+        Real rg = rt * (pg / pt);
+        if (iso) {
+            // The resting branch's floored temperature image, below.
+            const Real Ts = pi / (Rgas * ri);
+            const Real Tg = fmaxf(Twall + a * (Twall - Ts), Real(0.05) * Twall);
+            rg = pg / (Rgas * Tg);
+        }
+        rho[c] = rg;
+        const Real b = Real(1) + a;
+        const Real ug = b * uw[3 * q + 0] - a * ui;
+        const Real vg = b * uw[3 * q + 1] - a * vi;
+        const Real wg = b * uw[3 * q + 2] - a * wi;
+        mx[c] = rg * ug;
+        my[c] = rg * vg;
+        mz[c] = rg * wg;
+        E[c] = pg / (gamma - Real(1)) +
+               Real(0.5) * rg * (ug * ug + vg * vg + wg * wg);
+        return;
+    }
     // Isothermal image of the temperature. Let s be the outward wall-normal
     // coordinate with s = 0 on the wall face: the ghost centre sits at
     // s = -dw and the sample point at s = +dsmp, and a = gscale = dw/dsmp is
@@ -59,9 +120,10 @@ __global__ void kGhostFill(Real gamma, int iso, Real Twall, Real Rgas,
     //                    = Twall + a (Twall - T_sample).
     // a == 1 -- ghost and sample equidistant from the face -- is the channel
     // wall's 2 Twall - T_sample, i.e. that mirror is this image's special case.
-    // Pressure is still copied (zero wall-normal dp/dn) and density follows
-    // from p = rho R T, so the ghost state is thermodynamically consistent.
-    Real rg = ri;
+    // Pressure is still copied (zero wall-normal dp/dn, from the thermo sample)
+    // and density follows from p = rho R T, so the ghost state is
+    // thermodynamically consistent.
+    Real rg = rt;
     if (iso) {
         const Real Ts = pi / (Rgas * ri);
         // Floor: a transient with T_sample > (1 + 1/a) Twall makes the exact
@@ -74,25 +136,13 @@ __global__ void kGhostFill(Real gamma, int iso, Real Twall, Real Rgas,
         // condition; a run that keeps hitting it is not resolving the thermal
         // layer and its wall heat flux is not trustworthy.
         const Real Tg = fmaxf(Twall + a * (Twall - Ts), Real(0.05) * Twall);
-        rg = pi / (Rgas * Tg);
+        rg = pt / (Rgas * Tg);
     }
     rho[c] = rg;
-    if (uw) {
-        const Real b = Real(1) + a;
-        const Real ug = b * uw[3 * q + 0] - a * ui;
-        const Real vg = b * uw[3 * q + 1] - a * vi;
-        const Real wg = b * uw[3 * q + 2] - a * wi;
-        mx[c] = rg * ug;
-        my[c] = rg * vg;
-        mz[c] = rg * wg;
-        E[c] = pi / (gamma - Real(1)) +
-               Real(0.5) * rg * (ug * ug + vg * vg + wg * wg);
-        return;
-    }
     mx[c] = -a * rg * ui;
     my[c] = -a * rg * vi;
     mz[c] = -a * rg * wi;
-    E[c] = pi / (gamma - Real(1)) +
+    E[c] = pt / (gamma - Real(1)) +
            Real(0.5) * a * a * rg * (ui * ui + vi * vi + wi * wi);
 }
 
@@ -257,13 +307,13 @@ __global__ void kBodyMoment(const Real* fpos, double px, double py, double pz,
 
 std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
     const Grid& g, const Sdf& sdf, double gamma, double rhoInf, double pInf,
-    const double* bbox, WallThermal wall, const WallVelocity* uwall)
+    const double* bbox, WallThermal wall, const WallMotion* motion)
 {
     const double L[3] = {g.nx * g.hx, g.ny * g.hy, g.nz * g.hz};
     return make(g, sdf, gamma, rhoInf, pInf, bbox,
                 AxisRemap3{Focal1D::identity(L[0]), Focal1D::identity(L[1]),
                            Focal1D::identity(L[2])},
-                wall, uwall);
+                wall, motion);
 }
 
 void CompGhostCapacity::cover(const CompGhostTables& t)
@@ -275,7 +325,7 @@ void CompGhostCapacity::cover(const CompGhostTables& t)
 
 CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                                   const double* bbox, const AxisRemap3& R,
-                                  const GhostWallVelocity* uwall)
+                                  const GhostWallMotion* motion)
 {
     const int nx = g.nx, ny = g.ny, nz = g.nz;
     const double hx = g.hx, hy = g.hy, hz = g.hz;
@@ -382,20 +432,90 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
     auto& fdir = T.fdir;
     auto& solid = T.solid;
     auto& gw = T.gw;
+    auto& tnbr = T.tnbr;
+    auto& tw = T.tw;
     auto& gscale = T.gscale;
     auto& uw = T.uwall;
+    auto& aspan = T.aspan;
     auto& fpos = T.fpos;
     std::vector<char> isGhost(g.size(), 0);
 
-    // One ghost's image: up to 8 fluid source cells and their weights (wsum
-    // their sum, normalized at push), the extrapolation ratio a = dw/dsmp, and
-    // the wall point where the surface velocity is sampled.
-    struct Image
+    // One trilinear stencil: 8 source cells, their weights (fluid cells only;
+    // wsum their sum, normalized at push), and the physical point the
+    // renormalized weights actually sample, as an offset from the ghost.
+    struct Stencil
     {
         int nb[8];
         double w[8];
-        double wsum, a;
+        double wsum = 0.0, wphi = 0.0;
+        double span[3];
+        bool dropped = false; // a positive-weight corner was solid
+    };
+    // One ghost's image: the velocity stencil, the extrapolation ratio
+    // a = dw/dsmp, the wall point where the surface kinematics are sampled,
+    // and the THERMODYNAMIC stencil (rho, p) -- see normalImage.
+    struct Image
+    {
+        Stencil v, t;
+        double a;
         double wall[3];
+    };
+    const double Lbox[3] = {Lx, Ly, Lz};
+    const int nbox[3] = {nx, ny, nz};
+    // Physical centre of cell `i` on axis `ax`, unwrapped to lie within half a
+    // box of `near` (the sample point the stencil was built around).
+    auto centreNear = [&](int ax, int i, double near) {
+        const double c = ax == 0 ? cx(i) : ax == 1 ? cy(i) : cz(i);
+        const double d = c - near;
+        return nbox[ax] == 1 ? near
+               : d > 0.5 * Lbox[ax] ? c - Lbox[ax]
+               : d < -0.5 * Lbox[ax] ? c + Lbox[ax] : c;
+    };
+
+    // Trilinear stencil at the point `dist` from the ghost centre (x, y, z)
+    // along the unit normal nv. The point is a PHYSICAL offset along the
+    // physical normal; the per-axis inverse takes it back to reference space,
+    // where the cell-centre lattice is uniform and the trilinear weights are
+    // the Cartesian ones. The map is box-preserving, so the physical wrap is
+    // the reference wrap. Solid corners get weight 0 (renormalized at push).
+    auto stencilAt = [&](double x, double y, double z, const double nv[3],
+                         double dist, Stencil& st) {
+        const double xs[3] = {x + dist * nv[0], y + dist * nv[1],
+                              z + dist * nv[2]};
+        const double xi = R.fx.inverse(pmod(xs[0], Lx));
+        const double yi = R.fy.inverse(pmod(xs[1], Ly));
+        const double zi = R.fz.inverse(pmod(xs[2], Lz));
+        const double fx = xi / hx - 0.5, fy = yi / hy - 0.5, fz = zi / hz - 0.5;
+        const int i0 = int(std::floor(fx)), j0 = int(std::floor(fy)),
+                  k0 = int(std::floor(fz));
+        const double ax = fx - i0, ay = fy - j0, az = fz - k0;
+        st.wsum = st.wphi = 0.0;
+        st.dropped = false;
+        double wx[3] = {0.0, 0.0, 0.0};
+        for (int s = 0; s < 8; ++s) {
+            const int sx = s & 1, sy = (s >> 1) & 1, sz = s >> 2;
+            const int ii = (i0 + sx + nx) % nx, jj = (j0 + sy + ny) % ny,
+                      kk = ((k0 + sz) % nz + nz) % nz;
+            const std::size_t cc = g.idx(ii, jj, kk);
+            const double ww =
+                (sx ? ax : 1 - ax) * (sy ? ay : 1 - ay) * (sz ? az : 1 - az);
+            st.nb[s] = int(cc);
+            st.w[s] = phi[cc] > 0.0 ? ww : 0.0;
+            st.dropped = st.dropped || (ww > 0.0 && phi[cc] <= 0.0);
+            st.wsum += st.w[s];
+            st.wphi += st.w[s] * phi[cc];
+            wx[0] += st.w[s] * centreNear(0, ii, xs[0]);
+            wx[1] += st.w[s] * centreNear(1, jj, xs[1]);
+            wx[2] += st.w[s] * centreNear(2, kk, xs[2]);
+        }
+        // The point the renormalized weights sample: the requested point for a
+        // full stencil (up to the map's curvature on a focal mesh), the fluid
+        // cells' weighted centre -- OFF the normal -- when corners dropped.
+        if (st.wsum > 0.0) {
+            st.span[0] = wx[0] / st.wsum - x;
+            st.span[1] = wx[1] / st.wsum - y;
+            st.span[2] = wx[2] / st.wsum - z;
+        }
     };
 
     // The normal-sampled image: a sample point ds beyond the wall along the
@@ -403,6 +523,20 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
     // unusable -- deeper than the mirror band, a degenerate normal, or a
     // sample landing among solid cells (thin bodies, concave junctions, an
     // sdf that is not a distance).
+    //
+    // The thermodynamic state (rho, p) is read from its own stencil, ON the
+    // normal. Where the velocity stencil dropped a solid corner, its
+    // renormalized point sits off the normal (up to 0.2 h measured on a focal
+    // cylinder), and that is harmless for u, which vanishes at the wall and
+    // varies along it only at O(h), but not for p, which varies along the
+    // wall at O(1): a copy of p there carries an O(h) tangential error, a
+    // first-order wall-pressure term (measured: the Froude-Krylov closure
+    // error on the focal mesh fell 2.6e-4 -> 1.4e-4 over R/h 16 -> 32). So
+    // the thermo sample moves OUT along the normal, in steps of h/8 up to two
+    // cells, to the nearest point whose stencil is all fluid; when there is
+    // none (a concave pocket), it keeps the velocity stencil. Where the
+    // velocity stencil is already full the two coincide, and so do the images,
+    // bit for bit.
     auto normalImage = [&](std::size_t c, int i, int j, int k,
                            const double dloc[3], Image& im) {
         const double hl = minSpacing(dloc);
@@ -429,33 +563,22 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
         // the stencil always reaches fluid, even for cells barely inside).
         const double dw = -phi[c];
         const double dsmp = std::max(dw, 0.75 * hl);
-        // The sample point is a PHYSICAL offset along the physical normal; the
-        // per-axis inverse takes it back to reference space, where the
-        // cell-centre lattice is uniform and the trilinear weights are the
-        // Cartesian ones. The map is box-preserving, so the physical wrap is
-        // the reference wrap.
-        const double xi = R.fx.inverse(pmod(x + (dw + dsmp) * nv[0], Lx));
-        const double yi = R.fy.inverse(pmod(y + (dw + dsmp) * nv[1], Ly));
-        const double zi = R.fz.inverse(pmod(z + (dw + dsmp) * nv[2], Lz));
-        // Trilinear over cell centres, fluid cells only, renormalized.
-        const double fx = xi / hx - 0.5, fy = yi / hy - 0.5, fz = zi / hz - 0.5;
-        const int i0 = int(std::floor(fx)), j0 = int(std::floor(fy)),
-                  k0 = int(std::floor(fz));
-        const double ax = fx - i0, ay = fy - j0, az = fz - k0;
-        im.wsum = 0.0;
-        for (int s = 0; s < 8; ++s) {
-            const int sx = s & 1, sy = (s >> 1) & 1, sz = s >> 2;
-            const std::size_t cc =
-                g.idx((i0 + sx + nx) % nx, (j0 + sy + ny) % ny,
-                      ((k0 + sz) % nz + nz) % nz);
-            const double ww =
-                (sx ? ax : 1 - ax) * (sy ? ay : 1 - ay) * (sz ? az : 1 - az);
-            im.nb[s] = int(cc);
-            im.w[s] = phi[cc] > 0.0 ? ww : 0.0;
-            im.wsum += im.w[s];
+        stencilAt(x, y, z, nv, dw + dsmp, im.v);
+        if (im.v.wsum < 0.05) return false;
+        // A dropped solid corner moves the renormalized sample off the point
+        // at dsmp: it now reads the fluid cells' weighted wall distance, and
+        // a must use THAT distance or the image is wrong by a grid-independent
+        // factor (measured: +2.08% wall shear at dw = h/8, a non-converging
+        // torque/heat plateau). With it, any wall-linear profile is exact.
+        // Full stencils keep dw/dsmp, so their images are bit-identical.
+        im.a = im.v.dropped ? std::min(1.0, dw / (im.v.wphi / im.v.wsum))
+                            : dw / dsmp;
+        im.t = im.v;
+        for (int s = 1; im.v.dropped && s <= 16; ++s) {
+            Stencil st;
+            stencilAt(x, y, z, nv, dw + dsmp + s * 0.125 * hl, st);
+            if (!st.dropped && st.wsum > 0.0) { im.t = st; break; }
         }
-        if (im.wsum < 0.05) return false;
-        im.a = dw / dsmp;
         // Wall velocity at the FOOT OF THE NORMAL, not at the ghost centre:
         // that point is on the surface, so a rotor's omega x r there is the
         // actual surface speed the fluid sees.
@@ -486,23 +609,28 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                     continue;
                 const std::size_t cc = g.idx(i + s[0], j + s[1], k + s[2]);
                 if (phi[cc] < 0.0) continue;
-                im.nb[m] = int(cc);
+                im.v.nb[m] = int(cc);
                 phiS += phi[cc];
                 for (int q = 0; q < 3; ++q) disp[q] += s[q] * dloc[q];
                 ++m;
             }
         assert(m > 0 && "neighbourImage: caller checked inFluidReach");
         for (int s = 0; s < 8; ++s) {
-            im.w[s] = s < m ? 1.0 : 0.0;
-            if (s >= m) im.nb[s] = im.nb[0];
+            im.v.w[s] = s < m ? 1.0 : 0.0;
+            if (s >= m) im.v.nb[s] = im.v.nb[0];
         }
-        im.wsum = double(m);
+        im.v.wsum = double(m);
         phiS /= m;
         const double dw = -phi[c];
         im.a = phiS > 0.0 ? std::min(1.0, dw / phiS) : 1.0;
         const double t = im.a / (1.0 + im.a);
         const double p[3] = {cx(i), cy(j), cz(k)};
-        for (int q = 0; q < 3; ++q) im.wall[q] = p[q] + t * disp[q] / m;
+        for (int q = 0; q < 3; ++q) {
+            im.wall[q] = p[q] + t * disp[q] / m;
+            im.v.span[q] = disp[q] / m;
+        }
+        // No usable normal here, so no on-normal thermo sample either.
+        im.t = im.v;
     };
 
     for (int k = 0; k < nz; ++k)
@@ -530,14 +658,23 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                 isGhost[c] = 1;
                 gscale.push_back(Real(im.a));
                 for (int s = 0; s < 8; ++s) {
-                    gnbr.push_back(im.nb[s]);
-                    gw.push_back(Real(im.w[s] / im.wsum));
+                    gnbr.push_back(im.v.nb[s]);
+                    gw.push_back(Real(im.v.w[s] / im.v.wsum));
                 }
-                if (uwall) {
-                    const auto v = (*uwall)(im.wall[0], im.wall[1], im.wall[2]);
-                    uw.push_back(Real(v[0]));
-                    uw.push_back(Real(v[1]));
-                    uw.push_back(Real(v[2]));
+                for (int s = 0; s < 8; ++s) {
+                    tnbr.push_back(im.t.nb[s]);
+                    tw.push_back(Real(im.t.w[s] / im.t.wsum));
+                }
+                if (motion) {
+                    const GhostWallKinematics kin =
+                        (*motion)(im.wall[0], im.wall[1], im.wall[2]);
+                    uw.push_back(Real(kin.u[0]));
+                    uw.push_back(Real(kin.u[1]));
+                    uw.push_back(Real(kin.u[2]));
+                    // Span of the PRESSURE image: ghost -> thermo sample.
+                    aspan.push_back(Real(kin.a[0] * im.t.span[0]
+                                         + kin.a[1] * im.t.span[1]
+                                         + kin.a[2] * im.t.span[2]));
                 }
             }
 
@@ -580,9 +717,9 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
 std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
     const Grid& g, const Sdf& sdf, double gamma, double rhoInf, double pInf,
     const double* bbox, const AxisRemap3& R, WallThermal wall,
-    const WallVelocity* uwall)
+    const WallMotion* motion)
 {
-    CompGhostTables T = classifyCompGhost(g, sdf, bbox, R, uwall);
+    CompGhostTables T = classifyCompGhost(g, sdf, bbox, R, motion);
     CompGhostCapacity cap;
     cap.cover(T);
     const bool curv = R.fx.active || R.fy.active || R.fz.active;
@@ -627,9 +764,13 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::fromTables(
     if (auto e = alloc(out.gcell_, ng); e != hipSuccess) return std::unexpected(e);
     if (auto e = alloc(out.gnbr_, 8 * ng); e != hipSuccess) return std::unexpected(e);
     if (auto e = alloc(out.gw_, 8 * ng); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.tnbr_, 8 * ng); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.tw_, 8 * ng); e != hipSuccess) return std::unexpected(e);
     if (auto e = alloc(out.gscale_, ng); e != hipSuccess) return std::unexpected(e);
     if (auto e = alloc(out.uwall_, t.uwall.empty() ? 0 : 3 * ng);
         e != hipSuccess)
+        return std::unexpected(e);
+    if (auto e = alloc(out.aspan_, t.uwall.empty() ? 0 : ng); e != hipSuccess)
         return std::unexpected(e);
     if (auto e = alloc(out.deep_, std::size_t(cap.nDeep)); e != hipSuccess)
         return std::unexpected(e);
@@ -654,7 +795,9 @@ hipError_t DeviceCompGhost::load(const CompGhostTables& t)
     // A wall that moves must keep moving and one at rest must stay at rest:
     // the kernel selects its branch on whether the buffer exists, so a bin
     // whose velocities were dropped would silently freeze the surface.
-    if (t.uwall.empty() != (uwall_.data() == nullptr))
+    if (t.uwall.empty() != (uwall_.data() == nullptr)
+        || t.aspan.size() * 3 != t.uwall.size()
+        || t.tnbr.size() != t.gnbr.size() || t.tw.size() != t.gw.size())
         return hipErrorInvalidValue;
     auto put = [](auto& dst, const auto& src) -> hipError_t {
         if (src.empty()) return hipSuccess;
@@ -664,8 +807,11 @@ hipError_t DeviceCompGhost::load(const CompGhostTables& t)
     if (auto e = put(gcell_, t.gcell); e != hipSuccess) return e;
     if (auto e = put(gnbr_, t.gnbr); e != hipSuccess) return e;
     if (auto e = put(gw_, t.gw); e != hipSuccess) return e;
+    if (auto e = put(tnbr_, t.tnbr); e != hipSuccess) return e;
+    if (auto e = put(tw_, t.tw); e != hipSuccess) return e;
     if (auto e = put(gscale_, t.gscale); e != hipSuccess) return e;
     if (auto e = put(uwall_, t.uwall); e != hipSuccess) return e;
+    if (auto e = put(aspan_, t.aspan); e != hipSuccess) return e;
     if (auto e = put(deep_, t.deep); e != hipSuccess) return e;
     if (auto e = put(fcell_, t.fcell); e != hipSuccess) return e;
     if (auto e = put(fdir_, t.fdir); e != hipSuccess) return e;
@@ -699,7 +845,8 @@ void DeviceCompGhost::apply(DeviceCompState& s)
     if (nGhost_ > 0) {
         kGhostFill<<<launchBlocks(nGhost_), blockSize>>>(
             gamma_, iso_, Twall_, Rgas_, gcell_.data(), gnbr_.data(),
-            gw_.data(), gscale_.data(), uwall_.data(), nGhost_, s.rho.data(),
+            gw_.data(), tnbr_.data(), tw_.data(), gscale_.data(),
+            uwall_.data(), aspan_.data(), nGhost_, s.rho.data(),
             s.mx.data(), s.my.data(), s.mz.data(), s.E.data());
         checkLastKernel("kGhostFill");
     }

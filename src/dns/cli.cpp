@@ -206,7 +206,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--cfl", &c.cfl}, {"--dt-recompute", &c.dtRecompute},
              {"--profile-dt", &c.profileDt},
              {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
-             {"--planes", &c.planes}, {"--png-down", &c.pngDown}});
+             {"--planes", &c.planes}, {"--png-down", &c.pngDown},
+             {"--steady", &c.steady}, {"--steady-steps", &c.steadySteps}});
     if (c.sub == Subcommand::Conv)
         add({{"--ny", &c.ny}, {"--rayleigh", &c.rayleigh},
              {"--dtemp", &c.dtemp}, {"--aspect", &c.convAspect},
@@ -265,6 +266,15 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Channel)
         enums.push_back({"--wall", {{"isothermal", 1}, {"adiabatic", 0}},
                          &c.wallIso});
+    // RANS closures: only the BUILT ones are registered, so --help and the
+    // "one of:" message stay truthful (docs/rans.md, phases).
+    if (c.sub == Subcommand::Channel)
+    {
+        std::vector<std::pair<const char*, int>> v;
+        for (const RansModel m : ransBuiltChannel())
+            v.emplace_back(ransCliNames()[std::size_t(m)], int(m));
+        enums.push_back({"--rans", std::move(v), &c.rans});
+    }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Conv)
         enums.push_back({"--visc", {{"constant", 0}, {"sutherland", 1}},
                          &c.visc});
@@ -813,7 +823,11 @@ BODY-FITTED O-GRID (compressible)
                      and --ny the RADIAL one (two of which are ghost
                      rows). Rejects --focal/--stretch/--cut-flux/
                      --penalize/--open/--far/--dr/--seq: those all
-                     describe a box with a body immersed in it.
+                     describe a box with a body immersed in it. The
+                     far boundary is the O-grid's own characteristic
+                     row, not NSCBC: every --nscbc-* flag and --pot is
+                     rejected (they would be ignored), and Re > 800 only
+                     warns (that far row is unmeasured there).
                      Bodies with a z-invariant cross-section only
                      (cylinder, lens, cube, z-invariant mesh) -- a
                      sphere would need a 3D O-grid, whose polar axis is
@@ -1012,15 +1026,43 @@ START-UP
                      the bulk-velocity estimate) on the laminar
                      Poiseuille IC; 0 = untripped (stays laminar)   [0.2]
 
+RANS (an ensemble-mean MODEL, never a DNS; labelled "RANS <variant>"
+everywhere, docs/rans.md)
+  --rans none|sa-neg|sst-2003m|sst-vm
+                     turbulence closure. sa-neg = TMR's SA-neg (standard
+                     SA with ft2 for nu~ >= 0, the negative branch
+                     below); sst-2003m / sst-vm = Menter SST, 2003
+                     constants with S / 1994 with vorticity, both with
+                     2/3 rho k dropped from the stress (TMR "m"). k and
+                     omega carry a COUNTED positivity guard (stats
+                     floorHits; never silent). The mean is homogeneous
+                     in x and z, so --n 4 --nz 1 is the same answer.
+                     A trip is meaningless: --kick defaults to 0 and a
+                     given --kick > 0 is rejected.                 [none]
+  --steady TOL       STEADY solve in local-time-stepping pseudo-time
+                     (not time-accurate) until the residual
+                     max(resU, resE, resT) < TOL (wall units; docs/
+                     rans.md). Requires --rans and isothermal walls;
+                     rejects --tt/--profile-dt and frame output
+                     (pseudo-time is not time). Profiles are written
+                     once, at convergence or at the cap. The FP32
+                     march floors at resid ~1 on the M 0.2 channel and
+                     cannot certify the mean below it (docs/rans.md).
+                                                           [0 = URANS]
+  --steady-steps N   iteration cap; reaching it is exit 8      [200000]
+
 RUN LENGTH
   --tt N             eddy turnovers (delta/u_tau = 1) to integrate   [30]
   --dt-recompute N   steps between stableDt recomputes               [16]
 
 OUTPUT
   --emit stats       <out>_stats.csv (t,dt,ubulk,utauBot,utauTop,
-                     retau,KE)                                       [on]
+                     retau,KE; RANS appends mutMax, SST floorHits,
+                     and --steady iter,resid,resU,resE,resT)         [on]
   --profile-dt DT    <out>_profiles.csv y-profile dump interval
-                     (t,y,yplus,uplus,urms,vrms,wrms,uv,rho,T),
+                     (t,y,yplus,uplus,urms,vrms,wrms,uv,rho,T; RANS
+                     appends mutRatio and SA nutilde | SST kplus,
+                     omegaplus),
                      Favre-averaged over x,z; 0 = off               [1.0]
   --emit png|web|bin mid-plane frames (png renders the centre z-plane,
                      2D or 3D)

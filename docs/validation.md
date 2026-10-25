@@ -102,6 +102,31 @@ TGV dissipation-peak convergence (repo curves vs spectral 0.012858 at t = 8.97):
 512^3 0.013010 (+1.2%) -- oscillatory, not monotone from below.
 | `hit_mini` (extended, CPU, label `slow;validation;literature`, not `heavy`) | Kolmogorov constant ~1.5 (Pope 2000), corrected by Pope's model spectrum for this resolution | C = 0.942 (8 samples) | C = <E(k) k^(5/3) eps^(-2/3)>, k in [4,10], in [0.7, 1.6] | at 64^3 with h = 1.5 eta the band reaches k*eta = 0.26..0.65 (dissipation rolloff): the model spectrum (C = 1.5, beta = 5.2, c_eta = 0.4, f_L for L = k^1.5/eps) predicts a band mean of 0.78; bottleneck lifts the measured value to ~0.94. Band = [0.9x, 2x] model | 45 s |
 
+### RANS channel vs MKM (a MODEL vs DNS comparison; `rans_channel1d`)
+
+Not a `val_*` test: the comparison runs on the FP64 oracle (the GPU's own
+discrete operator, `docs/rans.md`) in milliseconds, and the GPU is pinned to
+the oracle (`gpu_rans`) rather than to MKM. Truth: MKM `chan180.means` /
+`chan395.means`, ub⁺ by trapezoid over the published profile (15.679 at
+Re_τ 178.12, 17.545 at 392.24; the headers carry no Re_b).
+
+| closure | Re_τ 178.12, ny 64 | Re_τ 392.24, ny 96 | asserted |
+|---|---|---|---|
+| SA-neg | 15.8069 (+0.82%) | 17.5596 (+0.08%) | within 5% (provisional ceiling); own value pinned 1e-6 |
+| SST-2003m | 15.6332 (−0.29%) | 17.8881 (+1.96%) | same |
+| SST-Vm | 15.5986 (−0.51%) | 17.8455 (+1.71%) | same |
+
+SA-neg is grid-converged at these resolutions to ~0.2% (2nd order). SST is
+FIRST order in ny (the TMR wall ω moves with the first cell): its limit is
+15.13 (−3.5%) at Re_τ 178.12, so the ny-64 agreement is partly grid error —
+cite the limit. The 5% band is a ceiling on model error, not a calibration;
+a DNS grounder on this solver (docs/channel.md) has not been run.
+
+The planned `val_rans_channel` (CLI cold start `--steady TOL` → exit 0) is NOT
+in ctest: the FP32 steady march cannot reach any TOL that certifies the mean
+(the update floor, `docs/rans.md`), so the run is exit 8 by design. It is a
+manual check there (ub within 0.06% of the oracle after 3–4e5 iterations).
+
 ## Tolerance adjustments vs the original plan
 
 Recorded per the rule "widen only with written justification":

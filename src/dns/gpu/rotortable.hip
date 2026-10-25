@@ -14,10 +14,20 @@ std::size_t RotorTable::bytes() const
     for (const auto& t : bins)
         n += t.gcell.size() * sizeof(int) + t.gnbr.size() * sizeof(int)
              + t.gw.size() * sizeof(Real) + t.gscale.size() * sizeof(Real)
-             + t.uwall.size() * sizeof(Real) + t.deep.size() * sizeof(int)
+             + t.tnbr.size() * sizeof(int) + t.tw.size() * sizeof(Real)
+             + t.uwall.size() * sizeof(Real) + t.aspan.size() * sizeof(Real)
+             + t.deep.size() * sizeof(int)
              + t.fcell.size() * sizeof(int) + t.fdir.size() * sizeof(int)
              + t.fpos.size() * sizeof(Real) + t.solid.size() * sizeof(int);
     return n;
+}
+
+GhostWallMotion rotorWallMotion(const Rotor& rot)
+{
+    return [rot](double x, double y, double z) {
+        return GhostWallKinematics{rotorWallVelocity(rot, {x, y, z}),
+                                   rotorWallAcceleration(rot, {x, y, z})};
+    };
 }
 
 std::expected<RotorTable, std::string>
@@ -46,14 +56,9 @@ buildRotorTable(const Grid& g, const Rotor& rot,
         {
             const double theta = rotorBinAngle(rot, m);
             const GhostSdf turned = rotorSdf(rot, sdf, theta);
-            // The wall velocity is a property of the SHAFT, not of the
-            // azimuth: omega x r at a world point is the same whatever
-            // angle the blade has reached, so this closure is bin-free.
-            const GhostWallVelocity uw = [&rot](double x, double y, double z) {
-                return rotorWallVelocity(rot, {x, y, z});
-            };
+            const GhostWallMotion motion = rotorWallMotion(rot);
             out.bins[std::size_t(m)] =
-                classifyCompGhost(g, turned, bbox, remap, &uw);
+                classifyCompGhost(g, turned, bbox, remap, &motion);
         }
     };
     {   // jthread joins at scope exit, before `out` is read below.

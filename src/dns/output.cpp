@@ -105,14 +105,18 @@ struct RunOutput::Impl
 
     std::string json() const
     {
+        // "rans" is an appended field, present only on a RANS run, so every
+        // other run's .json reads exactly as it did.
         return std::format(
             "{{\"nx\":{},\"ny\":{},\"nz\":{},\"frames\":{},\"frameDt\":{},"
             "\"D\":{},\"re\":{},\"mach\":{},\"cs\":{},\"les\":{},\"sgs\":\"{}\","
             "\"body\":\"{}\",\"far\":\"{}\",\"physics\":\"{}\",\"kick\":{},"
-            "\"msPerStep\":{}}}\n",
+            "\"msPerStep\":{}{}}}\n",
             meta.nx, meta.ny, meta.nz, frames, meta.frameDt, meta.D, meta.re,
             meta.mach, meta.cs, meta.les ? 1 : 0, meta.sgs, meta.body,
-            meta.farField, meta.physics, meta.kick, msPerStep);
+            meta.farField, meta.physics, meta.kick, msPerStep,
+            meta.rans.empty() ? std::string()
+                              : ",\"rans\":\"" + meta.rans + "\"");
     }
 
     void writeJson() const

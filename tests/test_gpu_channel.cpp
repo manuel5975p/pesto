@@ -146,7 +146,7 @@ void laminarPoiseuille()
     dev->setStageHook([&](gpu::DeviceCompState& s) { wall->apply(s); });
     dev->setRhsHook([&](const gpu::DeviceCompState&, gpu::DeviceCompState& out,
                         const gpu::StageCombine& cmb) {
-        gpu::addBodyForceX(gg, f, cmb.cr, dev->u(), out);
+        gpu::addBodyForceX(gg, f, cmb, dev->u(), out);
     });
 
     auto s = CompState::zeros(g);

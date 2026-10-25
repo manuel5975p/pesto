@@ -40,7 +40,8 @@ runConv(const Grid& g, const CompState& ic, const ConvRun& r, RunOutput& out)
 
     auto wall = DeviceConvWall::make(
         g, {.gamma = r.gamma, .Rgas = r.Rgas, .Tbot = r.Tbot, .Ttop = r.Ttop,
-            .patch = r.patch, .closedSides = r.closedSides});
+            .patch = r.patch, .closedSides = r.closedSides,
+            .gravity = r.gravity});
     if (!wall) return fail(6, "convection wall init failed");
 
     dev->setStageHook([&](DeviceCompState& s) { wall->apply(s); });
@@ -49,7 +50,7 @@ runConv(const Grid& g, const CompState& ic, const ConvRun& r, RunOutput& out)
     // untouched (never a state edit).
     dev->setRhsHook([&](const DeviceCompState& s, DeviceCompState& o,
                         const StageCombine& cmb) {
-        addGravityY(gg, r.gravity, cmb.cr, r.closedSides, s, o);
+        addGravityY(gg, r.gravity, cmb, r.closedSides, s, o);
     });
 
     if (ds->upload(ic) != hipSuccess)

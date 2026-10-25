@@ -5,6 +5,7 @@
 
 #include "dns/grid.hpp"
 #include "dns/prop/spec.hpp"
+#include "dns/rans.hpp"
 #include "dns/rotor.hpp"
 #include "dns/runmeta.hpp"
 #include "dns/sgs.hpp"
@@ -228,6 +229,11 @@ struct RawConfig
     double lzBox = 0;      // box span;   0 = 4 pi/3 delta (KMM)
     double profileDt = 1.0; // y-profile dump interval; 0 = off
     int wallIso = 1;       // 1 isothermal (default), 0 adiabatic
+    // RANS closure (RansModel index; 0 = none, the DNS channel bit-for-bit)
+    // and the pseudo-time iteration cap of --steady (which `steady` above
+    // carries for the channel too).
+    int rans = 0;
+    int steadySteps = 200000;
 
     // conv (Rayleigh-Benard: heated floor, cooled lid, gravity in -y)
     double rayleigh = 1e6;  // Rayleigh number on the SUPERADIABATIC drop
@@ -343,6 +349,9 @@ public:
     // every immersed-body knob -- the wall is a mesh face here.
     bool ogrid = false;
     double ogridRFar = 0, ogridBeta = 0, ogridSpan = 0;
+    // First fluid cell height on the nominal circle (ogridNominalH1): what the
+    // validator can know without the sdf; exact for a cylinder.
+    double ogridH1 = 0;
 
     // hit (SI inputs)
     double urms = 0, spin = 0, stats = 0;
@@ -355,6 +364,12 @@ public:
     double profileDt = 0;  // y-profile dump interval; 0 = off
     double lxBox = 0, lzBox = 0;
     bool wallIso = true;   // isothermal walls (adiabatic heats unboundedly)
+    // RANS closure (dns/rans.hpp; docs/rans.md). None is the DNS channel bit
+    // for bit. With steadyTol > 0 the run is a STEADY RANS solve in local-time-
+    // stepping pseudo-time (not time-accurate), capped at steadySteps
+    // iterations (exit 8 past it); without it, URANS on the global dt.
+    RansModel rans = RansModel::None;
+    long steadySteps = 0;
 
     // conv (Rayleigh-Benard; see the validate() conv branch for the full
     // derivation). Box units: H = 1, Tref = Rgas = rho_ref = 1, so p_ref = 1
@@ -435,6 +450,14 @@ private:
 // focalActive, the grid's otherwise, both by the hMin rule (z excluded at
 // nz == 1). Computed, not stored, so no validator stage can read it stale.
 double hFine(const Case&);
+
+// The channel's log-law bulk-velocity estimate 2.5 ln(max(reTau, 3)) + 2.6 in
+// wall units: the ONE definition the validator, the IC and the RANS oracle
+// read. Pre: reTau > 0.
+double channelUbEstimate(double reTau);
+// The channel background pressure that puts that estimate at bulk Mach `mach`:
+// (ub/M)^2/gamma (rho = R = 1, so Twall = pRef). Pre: reTau > 0, mach > 0.
+double channelPRef(double reTau, double mach);
 
 struct Scene;   // dns/scene.hpp
 

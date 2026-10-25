@@ -36,6 +36,7 @@ struct RunMeta
     std::string body, farField, physics;
     double kick = 0;
     std::string sgs;   // "smag" | "sigma" when les, "" for DNS
+    std::string rans;  // "SA-neg" | "SST-2003m" | "SST-Vm" when RANS, "" otherwise
 
     // The six grid fields from the grid the artefacts are written on.
     void setGrid(const Grid& g)

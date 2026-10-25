@@ -23,8 +23,13 @@ Sdf sdfOf(const CylinderZ& c)
 
 Sdf sdfOf(const RotatedCube& b)
 {
-    // L1 ball in x-y crossed with a z slab. Exact outside, a conservative
-    // (Chebyshev-style) underestimate inside -- enough for the ghost band.
+    // L1 ball in x-y crossed with a z slab. Exact outside only off the
+    // vertex regions: past a corner of the square the L1-line distance
+    // underestimates the true (vertex) distance, and max(dxy, dz) does the
+    // same at the z edges. Inside it is a conservative (Chebyshev-style)
+    // underestimate. The zero level set -- all the classification and the
+    // ghost band read -- is exact; a consumer needing true exterior distance
+    // (a RANS wall distance) must not take it from here.
     return [b](double x, double y, double z) {
         const double dxy = (std::abs(x - b.cx) + std::abs(y - b.cy) - b.r)
                            / std::numbers::sqrt2;

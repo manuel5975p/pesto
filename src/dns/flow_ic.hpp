@@ -17,6 +17,7 @@
 #include "dns/field.hpp"
 #include "dns/remap.hpp"
 
+#include <array>
 #include <vector>
 
 namespace dns {
@@ -70,6 +71,20 @@ void compressibleBodyIC(const Case& c, const CaseGeometry& geo,
 void channelIC(const Case& c, const ChannelStretchY& remap, double delta,
                double rho0, double gamma, CompState& state,
                std::vector<float>& mask);
+
+// RANS channel (--rans): the deterministic MEAN-flow start -- Reichardt's
+// u+(y+) at the case's rho0 / pRef (u_tau = 1, y+ = d reTau) and the model's
+// starting scalars into `turb` (conserved): SA rho nu~ with the parabola
+// nu~ = kappa d (1 - d/2); SST rho k, rho omega from sstInitialKOmega. No
+// trip: an ensemble mean has nothing to trip. `wallDist` is the model's own d
+// (dns/walldist.hpp), so the start sits where the closure reads it. Ghost rows
+// are marked 0 in `mask`; the wall mirror owns them.
+// Pre: c.rans != None, wallDist sized c.grid.size(); turb[i] is resized for
+// the first ransScalars(c.rans) entries.
+void channelRansIC(const Case& c, const std::vector<double>& wallDist,
+                   double rho0, double gamma, CompState& state,
+                   std::array<std::vector<double>, 2>& turb,
+                   std::vector<float>& mask);
 
 // Rayleigh-Benard: the HYDROSTATIC conduction state plus the same
 // deterministic curl(psi) trip the channel uses.

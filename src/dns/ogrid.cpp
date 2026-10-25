@@ -123,6 +123,27 @@ double ogridRadialDist(double t, double beta)
     return 1.0 + std::tanh(beta * (t - 1.0)) / std::tanh(beta);
 }
 
+double ogridNominalH1(int ny, double rWall, double rFar, double beta)
+{
+    assert(ny >= 4 && rWall > 0.0 && rFar > rWall);
+    return (rFar - rWall) * ogridRadialDist(1.0 / (ny - 2), beta);
+}
+
+double ogridRadialCells(double len, int ny, double rWall, double rFar,
+                        double beta)
+{
+    assert(ny >= 4 && rWall > 0.0 && rFar > rWall && len >= 0.0);
+    const int nf = ny - 2;
+    const double target = len / (rFar - rWall);
+    if (target >= 1.0) return nf;
+    double lo = 0.0, hi = 1.0;
+    for (int it = 0; it < 200 && hi - lo > 1e-15; ++it) {
+        const double mid = 0.5 * (lo + hi);
+        (ogridRadialDist(mid, beta) < target ? lo : hi) = mid;
+    }
+    return nf * 0.5 * (lo + hi);
+}
+
 Grid ogridGrid(int nx, int ny, int nz, double rWall, double rFar, double span)
 {
     assert(nx >= 3 && ny >= 4 && nz >= 1);
@@ -294,6 +315,27 @@ std::vector<std::array<double, 2>> ogridWallMidpoints(const OGrid& og)
         mid[std::size_t(i)] = {0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])};
     }
     return mid;
+}
+
+std::vector<std::array<double, 2>> ogridWallSpans(const OGrid& og)
+{
+    const int nx = og.mesh.g.nx;
+    auto centre = [&](int i, int j) {
+        std::array<double, 2> c{0.0, 0.0};
+        for (int dj = 0; dj < 2; ++dj)
+            for (int di = 0; di < 2; ++di) {
+                const auto p = og.mesh.node(i + di, j + dj, 0);
+                c[0] += 0.25 * p[0];
+                c[1] += 0.25 * p[1];
+            }
+        return c;
+    };
+    std::vector<std::array<double, 2>> span(static_cast<std::size_t>(nx));
+    for (int i = 0; i < nx; ++i) {
+        const auto c0 = centre(i, 0), c1 = centre(i, 1);
+        span[std::size_t(i)] = {c1[0] - c0[0], c1[1] - c0[1]};
+    }
+    return span;
 }
 
 } // namespace dns

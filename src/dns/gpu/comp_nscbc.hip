@@ -335,9 +335,9 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
             Real(0.5) * (vc[0] * vc[0] + vc[1] * vc[1] + vc[2] * vc[2]) * drdt +
             r * (vc[0] * dvdt[0] + vc[1] * dvdt[1] + vc[2] * dvdt[2]) + tE};
     Real* out[5] = {orho, omx, omy, omz, oE};
+    const Real cr = cmb.crAt(c);
     for (int v = 0; v < 5; ++v)
-        out[v][c] = cmb.ca * cmb.a[v][c] + cmb.cb * cmb.b[v][c] +
-                    cmb.cr * rhs[v];
+        out[v][c] = cmb.ca * cmb.a[v][c] + cmb.cb * cmb.b[v][c] + cr * rhs[v];
 }
 
 // Shared launch: both public apply overloads funnel here; the remap type

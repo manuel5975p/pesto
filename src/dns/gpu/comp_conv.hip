@@ -14,10 +14,14 @@ namespace {
 // (internal/wall_ghost.hpp) -- the same one the channel plates and the O-grid
 // body surface get. What is specific here is only WHICH temperature each
 // column sees: Ttop on the whole lid, Tbot on the floor inside the hot patch
-// and Ttop outside it.
+// and Ttop outside it -- and the hydrostatic pressure image. Gravity is normal
+// to the plates, so the wall-normal momentum balance at rest is dp/dy = -rho
+// g, not zero: the ghost a cell below the floor holds p1 + rho1 g hy, the one
+// above the lid p1 - rho1 g hy. The copy dropped that and left the first
+// fluid row of the hydrostatic IC short of its weight by half a cell.
 __global__ void kConvWallY(GpuGrid g, Real gam, Real Rgas, Real Tbot,
-                           Real Ttop, Real patch, int ox, int oz, Real* rho,
-                           Real* mx, Real* my, Real* mz, Real* E)
+                           Real Ttop, Real patch, Real ghy, int ox, int oz,
+                           Real* rho, Real* mx, Real* my, Real* mz, Real* E)
 {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     int i, k;
@@ -26,7 +30,9 @@ __global__ void kConvWallY(GpuGrid g, Real gam, Real Rgas, Real Tbot,
     if (!internal::yGhostPair(g, t, i, k, hi, c, s)) return;
     const Real Twall =
         hi ? Ttop : (inHotPatch(g, i, k, patch, ox, oz) ? Tbot : Ttop);
-    internal::isothermalGhost(c, s, gam, Rgas, Twall, rho, mx, my, mz, E);
+    // fspan = -f . (x1 - x0) with f = -g y: +g hy on the floor, -g hy on the lid.
+    internal::isothermalGhost(c, s, gam, Rgas, Twall, hi ? -ghy : ghy, rho, mx,
+                              my, mz, E);
 }
 
 // Lateral no-slip ADIABATIC mirror (--sides closed). T and p are COPIED --
@@ -51,10 +57,10 @@ __global__ void kConvWallSide(GpuGrid g, int axis, Real* rho, Real* mx, Real* my
 }
 
 // Additive rhs contribution: the stage kernel already wrote the interior
-// combination, so the source enters scaled by the same cr (comp.hpp,
+// combination, so the source enters scaled by the same crAt(c) (comp.hpp,
 // StageCombine) that multiplied the interior rhs. Momentum takes -g rho, the
 // energy equation the work rate -g rho v = -g my of the SAME stage state.
-__global__ void kGravityY(GpuGrid g, int ox, int oz, Real gy, Real cr,
+__global__ void kGravityY(GpuGrid g, int ox, int oz, Real gy, StageCombine cmb,
                           const Real* rho, const Real* my, Real* omy, Real* oE)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -64,6 +70,7 @@ __global__ void kGravityY(GpuGrid g, int ox, int oz, Real gy, Real cr,
     // Ghost cells: the wall mirror owns them (the rows always, the lateral
     // columns once that side is a wall).
     if (!inFluid(g, i, j, k, ox, oz)) return;
+    const Real cr = cmb.crAt(c);
     omy[c] -= cr * gy * rho[c];
     oE[c] -= cr * gy * my[c];
 }
@@ -100,7 +107,7 @@ std::expected<DeviceConvWall, hipError_t> DeviceConvWall::make(const Grid& g,
                                                                Config c)
 {
     if (g.ny < 4 || !(c.gamma > 1) || !(c.Rgas > 0) || !(c.Tbot > 0)
-        || !(c.Ttop > 0) || !(c.patch > 0 && c.patch <= 1))
+        || !(c.Ttop > 0) || !(c.patch > 0 && c.patch <= 1) || !(c.gravity >= 0))
         return std::unexpected(hipErrorInvalidValue);
     // A walled axis needs its two ghost columns plus at least two fluid cells,
     // or the mirror would read a cell that is itself a ghost.
@@ -115,8 +122,8 @@ void DeviceConvWall::apply(DeviceCompState& s) const
     const int oz = sideGhostZ(g_, c_.closedSides);
     kConvWallY<<<launchBlocks(2 * std::size_t(g_.nx) * g_.nz), blockSize>>>(
         g_, Real(c_.gamma), Real(c_.Rgas), Real(c_.Tbot), Real(c_.Ttop),
-        Real(c_.patch), ox, oz, s.rho.data(), s.mx.data(), s.my.data(),
-        s.mz.data(), s.E.data());
+        Real(c_.patch), Real(c_.gravity * g_.hy), ox, oz, s.rho.data(),
+        s.mx.data(), s.my.data(), s.mz.data(), s.E.data());
     checkLastKernel("kConvWallY");
     if (ox == 0) return;
     kConvWallSide<<<launchBlocks(2 * std::size_t(g_.ny) * g_.nz), blockSize>>>(
@@ -128,11 +135,11 @@ void DeviceConvWall::apply(DeviceCompState& s) const
     checkLastKernel("kConvWallSide z");
 }
 
-void addGravityY(const GpuGrid& g, double gy, Real cr, bool closed,
-                 const DeviceCompState& s, DeviceCompState& out)
+void addGravityY(const GpuGrid& g, double gy, const StageCombine& cmb,
+                 bool closed, const DeviceCompState& s, DeviceCompState& out)
 {
     kGravityY<<<launchBlocks(g.size()), blockSize>>>(
-        g, sideGhostX(closed), sideGhostZ(g, closed), Real(gy), cr,
+        g, sideGhostX(closed), sideGhostZ(g, closed), Real(gy), cmb,
         s.rho.data(), s.my.data(), out.my.data(), out.E.data());
     checkLastKernel("kGravityY");
 }

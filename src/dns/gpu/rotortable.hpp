@@ -50,7 +50,14 @@ struct RotorTable
     std::size_t bytes() const;
 };
 
-// Classify `base` at every bin of `rot`, with the wall velocity that azimuth
+// The ghost wall's view of a rigid rotor's surface: rotorWallVelocity and
+// rotorWallAcceleration at a world point. A property of the SHAFT, not of the
+// azimuth -- omega x r at a world point is the same whatever angle the blade
+// has reached -- so one closure serves every bin, the frozen-rotor (mrf)
+// classification included.
+GhostWallMotion rotorWallMotion(const Rotor& rot);
+
+// Classify `base` at every bin of `rot`, with the wall kinematics that azimuth
 // implies. `base` is the body at azimuth 0 IN ITS OWN FRAME -- rotorSdf turns
 // it, so it must NOT already carry a rotation. `threads` <= 0 uses the hardware
 // concurrency; the work is embarrassingly parallel because each bin classifies

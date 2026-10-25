@@ -31,6 +31,7 @@
 #include "dns/trimesh.hpp"
 #include "dns/units.hpp"
 #include "dns/vtk_writer.hpp"
+#include "dns/walldist.hpp"
 
 #if DNS_WITH_GPU
 #include "dns/gpu/device_util.hpp"
@@ -607,10 +608,20 @@ int runChannel(const Case& c)
     const ChannelStretchY remap{double(g.ny) * g.hy, g.ny, c.stretchBeta,
                                 delta};
 
-    // IC: Poiseuille + solenoidal curl(psi) trip (dns/flow_ic.hpp).
+    // IC: Poiseuille + solenoidal curl(psi) trip (dns/flow_ic.hpp), or under
+    // --rans the untripped mean start on the model's own wall distance.
     auto host = CompState::zeros(g);
     std::vector<float> mask(g.size(), 1.0f);
-    channelIC(c, remap, delta, rho0, gamma, host, mask);
+    std::vector<double> wallDist;
+    std::array<std::vector<double>, 2> icTurb;
+    if (c.rans == RansModel::None)
+        channelIC(c, remap, delta, rho0, gamma, host, mask);
+    else
+    {
+        wallDist = channelWallDistance(
+            CurvMesh::channelY(g, c.stretchBeta, delta), delta);
+        channelRansIC(c, wallDist, rho0, gamma, host, icTurb, mask);
+    }
 
     FrameGeometry fg = FrameGeometry::centred(g, 2 * delta);
     fg.mask = std::move(mask);
@@ -634,6 +645,11 @@ int runChannel(const Case& c)
     rr.tEnd = c.tEnd;
     rr.dtRecompute = c.dtRecompute;
     rr.profileDt = c.profileDt;
+    rr.rans = c.rans;
+    rr.steadyTol = c.steadyTol;
+    rr.steadySteps = c.steadySteps;
+    rr.wallDist = std::move(wallDist);
+    rr.icTurb = std::move(icTurb);
 
     auto res = gpu::runChannel(g, host, rr, *out);
     if (!res) return die(res.error().code, res.error().message);

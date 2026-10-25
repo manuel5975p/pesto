@@ -350,6 +350,48 @@ __host__ __device__ inline void curvVelGradCentre(const CurvView& m,
                        dxi[c][2] * Jc[2][e];
 }
 
+// Scalar twin of curvVelGradCentre: d phi / d x_e at the centre of cell
+// `here`, same index-space central differences and cell-centre inverse
+// Jacobian. `phi(cell)` supplies the scalar.
+template <class T, class Phi>
+__host__ __device__ inline void curvScalarGradCentre(const CurvView& m,
+                                                     const Offsets& o,
+                                                     std::size_t here, Phi phi,
+                                                     T g[3])
+{
+    T dxi[3];
+    for (int d = 0; d < 3; ++d)
+        dxi[d] = T(0.5) * (T(phi(here + o.p[d])) - T(phi(here + o.m[d])));
+    for (int e = 0; e < 3; ++e) g[e] = T(0);
+    for (int d = 0; d < 3; ++d) {
+        const std::size_t back = here + o.m[d];
+        for (int e = 0; e < 3; ++e)
+            g[e] += dxi[d] * (T(0.5) * (T(m.Ji[d][d * 3 + e][here]) +
+                                        T(m.Ji[d][d * 3 + e][back])));
+    }
+}
+
+// Scalar twin of faceFluxCurv's gradient lines: d phi / d x_c at the face
+// between a and b (b = a + o.p[axis]), normal compact, tangential the
+// two-cell average of central differences, mapped through the face inverse
+// Jacobian. Same contract on `o` as faceFluxCurv.
+template <class Phi>
+__device__ inline void curvScalarFaceGrad(const CurvView& m, const Offsets& o,
+                                          std::size_t a, std::size_t b,
+                                          int axis, Phi phi, Real gr[3])
+{
+    Real dxi[3];
+    dxi[axis] = phi(b) - phi(a);
+    for (int d = 0; d < 3; ++d) {
+        if (d == axis) continue;
+        dxi[d] = Real(0.25) * (phi(a + o.p[d]) - phi(a + o.m[d]) +
+                               phi(b + o.p[d]) - phi(b + o.m[d]));
+    }
+    for (int cx = 0; cx < 3; ++cx)
+        gr[cx] = dxi[0] * m.Ji[axis][0 + cx][a] + dxi[1] * m.Ji[axis][3 + cx][a] +
+                 dxi[2] * m.Ji[axis][6 + cx][a];
+}
+
 // SGS filter width squared of a curvilinear cell: the isotropic (dx dy dz)^(2/3)
 // written through the exact cell volume, and vol/hz at nz == 1 (the unit
 // z-depth carries no filter width). Both reduce to the uniform-mesh Delta^2 of

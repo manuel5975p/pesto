@@ -99,6 +99,119 @@ int main()
     }
     rejected({"channel", "--wall", "slippery"}, 1, "unknown wall kind");
 
+    // --- RANS (docs/rans.md) ------------------------------------------------
+    auto fieldIs = [](std::vector<std::string> a, const char* f) {
+        auto c = runCli(std::move(a));
+        return !c && c.error().code == 2 && c.error().field == f;
+    };
+    const std::vector<std::string> base = {"channel", "--n",   "4", "--nz",
+                                           "1",       "--ny",  "64"};
+    auto with = [&](std::initializer_list<const char*> extra) {
+        auto v = base;
+        v.insert(v.end(), extra.begin(), extra.end());
+        return v;
+    };
+    {
+        auto c = runCli(with({"--rans", "sa-neg", "--steady", "1e-3"}));
+        check(c.has_value(), "RANS steady channel validates");
+        if (c)
+        {
+            check(c->rans == dns::RansModel::SaNeg, "--rans sa-neg resolves");
+            check(c->kick == 0.0, "RANS kick defaults to 0 (no trip)");
+            check(c->steadyTol == 1e-3 && c->steadySteps == 200000,
+                  "--steady TOL, cap 200000 by default");
+            check(c->meta.rans == "SA-neg", "RunMeta carries the RANS label");
+            check(c->warnings.empty(), "n 4 nz 1 y+ 0.876: no warnings");
+            const std::string d = c->describe();
+            check(d.find("  label      RANS SA-neg -- steady (local time "
+                         "stepping: pseudo-time, not time-accurate)\n") !=
+                      std::string::npos,
+                  "describe: steady RANS label");
+            check(d.find("  turbulence nu~_wall = 0 (antimirrored ghost), "
+                         "mu_t = 0 on the wall face, Pr_t = 0.9, wall-resolved "
+                         "(y+_1 = 0.876 est.)\n") != std::string::npos,
+                  "describe: turbulence line");
+            check(d.find("  run        steady TOL=0.001 cap 200000 "
+                         "iterations\n") != std::string::npos,
+                  "describe: steady run line replaces the tt line");
+            check(d.find("qualitative only") == std::string::npos,
+                  "a RANS 1D mean carries no 2D suffix");
+        }
+    }
+    {
+        auto c = runCli(with({"--rans", "sa-neg"}));
+        check(c.has_value() && c->describe().find(
+                                   "  label      RANS SA-neg -- URANS "
+                                   "(time-accurate)\n") != std::string::npos,
+              "describe: URANS label");
+    }
+    {
+        auto c = runCli({"channel", "--nz", "1"});
+        check(c.has_value() && c->rans == dns::RansModel::None &&
+                  c->meta.rans.empty() && c->kick == 0.2 &&
+                  c->describe().find("turbulence") == std::string::npos &&
+                  c->describe().find("  label      DNS (2D: qualitative only, "
+                                     "no vortex stretching)\n") !=
+                      std::string::npos,
+              "RANS off: DNS label, kick 0.2, no turbulence line");
+    }
+    check(fieldIs(with({"--rans", "sa-neg", "--kick", "0.1"}), "--kick"),
+          "--kick > 0 with --rans rejected");
+    {
+        auto c = runCli(with({"--rans", "sa-neg", "--kick", "0"}));
+        check(c.has_value(), "--kick 0 with --rans accepted");
+    }
+    check(fieldIs(with({"--steady", "1e-3"}), "--steady"),
+          "--steady without --rans rejected (no DNS steady state)");
+    check(fieldIs(with({"--rans", "sa-neg", "--steady", "1e-3", "--wall",
+                        "adiabatic"}),
+                  "--steady"),
+          "--steady with adiabatic walls rejected (no heat sink)");
+    for (const char* f : {"--tt", "--profile-dt", "--fdt", "--pdt", "--wdt"})
+        check(fieldIs(with({"--rans", "sa-neg", "--steady", "1e-3", f, "1"}), f),
+              std::string("--steady rejects ") + f);
+    for (const char* k : {"png", "web", "bin", "shm", "volume", "slices", "vtk"})
+        check(fieldIs(with({"--rans", "sa-neg", "--steady", "1e-3", "--emit", k}),
+                      "--emit"),
+              std::string("--steady rejects --emit ") + k);
+    check(fieldIs(with({"--rans", "sa-neg", "--steady-steps", "10"}),
+                  "--steady-steps"),
+          "--steady-steps without --steady rejected");
+    check(fieldIs(with({"--rans", "sa-neg", "--steady", "1", "--steady-steps",
+                        "0"}),
+                  "--steady-steps"),
+          "--steady-steps 0 rejected");
+    check(fieldIs(with({"--rans", "sa-neg", "--steady", "-1"}), "--steady"),
+          "negative --steady rejected");
+    rejected(with({"--rans", "k-epsilon"}), 1, "unknown --rans value");
+    for (auto [cli, label] : {std::pair{"sst-2003m", "SST-2003m"},
+                              std::pair{"sst-vm", "SST-Vm"}})
+    {
+        auto c = runCli(with({"--rans", cli, "--steady", "0.5"}));
+        check(c.has_value() && c->meta.rans == label &&
+                  c->describe().find(std::string("  label      RANS ") + label +
+                                     " -- steady (local time stepping: "
+                                     "pseudo-time, not time-accurate)\n") !=
+                      std::string::npos &&
+                  c->describe().find("omega_wall = 60 nu/(beta1 d1^2)") !=
+                      std::string::npos,
+              std::string("--rans ") + cli + ": label, RunMeta and wall line");
+    }
+    {
+        auto c = runCli({"channel", "--rans", "sa-neg", "--ny", "16"});
+        check(c.has_value() && c->warnings.size() == 2,
+              "RANS on a 3D box with y+ > 1: both warnings");
+        if (c && c->warnings.size() == 2)
+        {
+            check(c->warnings[0] == "the RANS mean is homogeneous in x and z; "
+                                    "--n 4 --nz 1 is the same answer",
+                  "homogeneity warning text");
+            check(c->warnings[1].starts_with("wall-resolved RANS with "
+                                             "first-cell y+ "),
+                  "y+ warning text");
+        }
+    }
+
     if (dnstest::gFailures) { std::printf("%d failures\n", dnstest::gFailures); return 1; }
     std::printf("all ok\n");
     return 0;

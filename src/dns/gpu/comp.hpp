@@ -6,6 +6,7 @@
 #include "dns/comp.hpp"
 #include "dns/cutcell.hpp"
 #include "dns/transport.hpp"
+#include "dns/rans.hpp"
 #include "dns/sgs.hpp"
 #include "dns/gpu/device_buffer.hpp"
 #include "dns/gpu/index.hpp"
@@ -14,6 +15,7 @@
 #include <expected>
 #include <functional>
 #include <optional>
+#include <vector>
 
 namespace dns {
 struct CurvMetrics;
@@ -25,6 +27,7 @@ namespace dns::gpu {
 
 struct CurvView; // dns/gpu/internal/comp_flux.hpp (HIP TUs only)
 struct MrfView;  // dns/gpu/internal/comp_flux.hpp (HIP TUs only)
+namespace rans { struct RansDiffDt; } // dns/gpu/rans.hpp (HIP TUs only)
 
 // Rotating-frame zone of --rotor-frame mrf, in world units: the frozen-rotor
 // approximation on static geometry. f = 1 on the shaft-aligned cylinder
@@ -41,15 +44,25 @@ struct MrfZone
     double a1 = 0, a2 = 0;      // axial |s| blend bounds
 };
 
-// Conservative state on device; each buffer has g.size() cells.
+// Conservative state on device; each buffer has g.size() cells. The RANS
+// scalars ride in the SAME struct so the stage choreography (no-alias rule,
+// handle swap) covers them by construction; nT == 0 leaves t[] empty.
 struct DeviceCompState
 {
     DeviceScalar rho, mx, my, mz, E;
+    DeviceScalar t[2]; // conserved turbulence scalars (rho nu~ | rho k, rho omega)
+    int nT = 0;
 
-    static std::expected<DeviceCompState, hipError_t> make(std::size_t n);
+    // Pre: 0 <= nT <= 2.
+    static std::expected<DeviceCompState, hipError_t> make(std::size_t n,
+                                                           int nT = 0);
 
-    hipError_t upload(const CompState& h);
+    hipError_t upload(const CompState& h);         // the five mean-flow fields
     hipError_t download(CompState& h) const;
+    // Turbulence scalar i from/to host doubles (download resizes h).
+    // Pre: i < nT; upload: h.size() == n.
+    hipError_t uploadTurb(int i, const std::vector<double>& h);
+    hipError_t downloadTurb(int i, std::vector<double>& h) const;
 };
 
 // Exact uniform Galilean x-boost by du: mx += rho du, E += mx_old du +
@@ -81,12 +94,50 @@ struct DeviceCurv
 // A boundary hook that OVERWRITES rhs rows (NSCBC) still expresses an RHS and
 // never a state overwrite -- it just writes that rhs THROUGH this same
 // combination on its own rows. An additive hook (the channel body force) scales
-// its contribution by cr.
+// its contribution by crAt(c).
+//
+// lts (--steady, local time stepping) is a per-cell RATIO dt_c / dtRef >= 1
+// on top of cr, which already carries the RK coefficient and dtRef. EVERY
+// consumer of cr reads it through crAt(c): an additive term scaled by the bare
+// cr while the interior uses crAt converges to lts R + f = 0, the WRONG steady
+// state. Null lts is the uniform step, bit-for-bit.
 struct StageCombine
 {
     const Real* a[5];
     const Real* b[5];
     Real ca, cb, cr;
+    const Real* ta[2] = {nullptr, nullptr}; // turbulence a/b; null when nT == 0
+    const Real* tb[2] = {nullptr, nullptr};
+    const Real* lts = nullptr;              // dt_c/dtRef >= 1; null = uniform
+
+    __host__ __device__ Real crAt(std::size_t c) const
+    {
+        return lts ? cr * lts[c] : cr;
+    }
+};
+
+// The RANS closure installed by DeviceComp::enableRans. Host-side; validated
+// upstream.
+struct RansSetup
+{
+    RansModel model = RansModel::None;   // != None
+    std::vector<double> wallDist;        // g.size(), > 0 everywhere
+    bool mirrorYLo = false, mirrorYHi = false; // mu_t odd across y ghost rows
+    // TEST ONLY (gpu_rans G3): transport by the mean mass flux alone -- no
+    // sources, no diffusion (SA). Never set by a runner.
+    bool transportOnly = false;
+    // SST: the specific-omega floor of the COUNTED positivity guard (hits
+    // are reported, never silent; docs/rans.md).
+    double omegaFloor = 1e-10;
+};
+
+// Per-equation RMS of the pure rhs over rows [jLo, jHi] (FP64): continuity,
+// |momentum| / rho, energy / rho, and the scalars: SA nu~ as R / rho; SST k
+// as R_k / rho and omega as R_w / (rho omega), the rate of ln omega (omega
+// spans six decades across the wall layer).
+struct ResidualNorms
+{
+    double rho = 0, mom = 0, E = 0, t[2] = {0, 0};
 };
 
 // Owns RK3 / primitive scratch; periodic domain (BCs via the stage hook).
@@ -139,11 +190,44 @@ public:
     // divergence from them so boundary cells use the interior scheme exactly.
     const DeviceCurv* curvTables() const { return curv_ ? &*curv_ : nullptr; }
 
-    // One SSP-RK3 step in place; dt within stableDt.
+    // One SSP-RK3 step in place; dt within stableDt (the reference dt under
+    // setLts(true)). Pre: s.nT == nTurb().
     void step(DeviceCompState& s, Real dt);
 
-    // Largest stable dt (acoustic CFL + viscous limit), FP64 reduction.
+    // Largest stable dt (acoustic CFL + viscous limit), FP64 reduction. With
+    // RANS on, the diffusive bound is per cell and carries mu_t (RANS-only
+    // branch); RANS off is the DNS/LES bound byte for byte.
     double stableDt(const DeviceCompState& s, ReduceScratch& r, double cfl = 0.4) const;
+
+    // --- RANS (dns/rans.hpp, gpu/rans.hpp; docs/rans.md) ---------------------
+    // Install the closure: allocates the scalar stage buffers, mu_t and d.
+    // Pre: curvilinear(), !les(), s.model != None, s.wallDist sized g.size(),
+    // d > 0. Never calling it keeps every path bit-for-bit today's solver.
+    std::expected<void, hipError_t> enableRans(const RansSetup& s);
+    bool rans() const { return ransModel_ != RansModel::None; }
+    RansModel ransModel() const { return ransModel_; }
+    int nTurb() const { return ransScalars(ransModel_); }
+    // Per-cell mu_t of the last stage or updateMut (LES: the SGS mu_t).
+    const DeviceScalar& mut() const { return nut_; }
+    // mu_t of s into mut() (primitives refreshed). Pre: rans().
+    void updateMut(const DeviceCompState& s);
+    // Pure rhs of every equation at s (hooks included, scalar kernel in
+    // explicit mode) into scratch, then FP64 RMS per equation over rows
+    // [jLo, jHi]. Not state differencing. Pre: rans(), s stage-hook
+    // consistent, between steps only (it reuses the stage scratch).
+    ResidualNorms residual(const DeviceCompState& s, int jLo, int jHi,
+                           ReduceScratch& r);    // Per-cell local dt_c = min(cfl/wave_c, diffusive_c) into the lts ratios
+    // dt_c/dtRef; returns dtRef = min_c dt_c (FP64). Pre: rans().
+    double localDt(const DeviceCompState& s, ReduceScratch& r, double cfl);
+    // step() passes the lts ratios in every StageCombine when on.
+    // Pre (on): localDt or uploadLts ran.
+    void setLts(bool on);
+    // Diagnostic/test: the lts ratios from host, g.size() entries >= 1.
+    hipError_t uploadLts(const std::vector<Real>& ratios);
+    // SST: positivity-guard hits since enableRans (0 for SA). Synchronizes.
+    unsigned long long floorHits() const;
+    // SST: the per-cell F1 blend of the last stage or updateMut.
+    const DeviceScalar& f1() const { return f1_; }
 
     // Primitives of s into the internal scratch (valid until next step call);
     // exposed for app-side diagnostics/BC kernels.
@@ -202,11 +286,20 @@ public:
 private:
     DeviceComp(const GpuGrid& g, const Transport& tr, Real csLes, SgsModel sgs);
 
-    // One RK stage: out = cmb.ca a + cmb.cb b + cmb.cr L(s), boundary hooks
-    // included. `s` supplies the stencil, `out` may alias cmb.a (read at the
-    // own cell only) but never the stencil state.
+    // One RK stage: out = cmb.ca a + cmb.cb b + cmb.crAt(c) L(s), boundary
+    // hooks included. `s` supplies the stencil. `out` must alias NEITHER the
+    // stencil state NOR cmb.a: the rhs hook is a second kernel over the same
+    // cells that re-reads a (see step()).
+    // residualMode: the scalar kernel writes its pure rhs instead of the
+    // point-implicit combination (the mean flow is pure rhs under ca = cb = 0,
+    // cr = 1 already).
     void stage(const DeviceCompState& s, const StageCombine& cmb,
-               DeviceCompState& out);
+               DeviceCompState& out, bool residualMode = false);
+    // mu_t from the live primitives of s into nut_, mirrored odd across the
+    // wall ghost rows. Pre: rans(), primitives(s) current.
+    void ransMut(const DeviceCompState& s);
+    // The per-cell RANS diffusive dt functor over s. Pre: rans().
+    rans::RansDiffDt ransDiffDt(const DeviceCompState& s) const;
     // Device pointer table of curv_; pre: curvilinear().
     CurvView curvView() const;
 
@@ -227,7 +320,16 @@ private:
     DeviceScalar mrfCc_[3], mrfFc_[3];
     DeviceScalar mrfPsi_, mrfPc_[3];
     DeviceScalar u_, v_, w_, e_, p_, T_;
-    DeviceScalar nut_;      // per-cell dynamic eddy viscosity (LES only)
+    DeviceScalar nut_;      // per-cell dynamic eddy viscosity (LES or RANS)
+    // RANS (enableRans): model, wall distance, mirror flags, the lts ratios
+    // and the FP64 per-cell dt scratch localDt reduces.
+    RansModel ransModel_ = RansModel::None;
+    bool ransMirrorLo_ = false, ransMirrorHi_ = false, ransTransport_ = false;
+    DeviceScalar wd_, lts_, f1_;
+    DeviceBuffer<double> dtc_;
+    DeviceBuffer<unsigned long long> hits_;
+    double omegaFloor_ = 0;
+    bool ltsOn_ = false;
     std::function<void(DeviceCompState&)> hook_;
     std::function<void(const DeviceCompState&, DeviceCompState&,
                        const StageCombine&)> rhsHook_;

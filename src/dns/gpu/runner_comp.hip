@@ -193,11 +193,9 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         // into the mesh blend (measured 2026-07-31: 4-blade prop, reported
         // tip 0.5608 vs real 0.3927, r2 0.718 against a plateau half-width
         // 0.589, diverged at t = 3.07).
-        GhostWallVelocity uw = [rot = r.rotor](double x, double y, double z2) {
-            return rotorWallVelocity(rot, {x, y, z2});
-        };
+        const GhostWallMotion motion = rotorWallMotion(r.rotor);
         const CompGhostTables tbls = classifyCompGhost(
-            g, sdf, bbox ? bbox->data() : nullptr, fremap, &uw);
+            g, sdf, bbox ? bbox->data() : nullptr, fremap, &motion);
         if (tbls.nGhost() == 0 || tbls.nFace() == 0)
             return fail(3, "rotor: the body has no mirrored ghost cells -- it "
                            "is not resolved by this grid at all");

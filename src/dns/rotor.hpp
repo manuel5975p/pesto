@@ -85,6 +85,14 @@ Sdf rotorSdf(const Rotor& r, const Sdf& base, double theta);
 std::array<double, 3> rotorWallVelocity(const Rotor& r,
                                         const std::array<double, 3>& p);
 
+// Surface acceleration omega x (omega x (p - shaft)) = -omega^2 times the
+// in-plane offset from the shaft: the centripetal acceleration of the wall
+// material point. The ghost wall's pressure image needs it (wall-normal
+// momentum: grad p = -rho a at a no-slip wall). Constant rate, so no
+// tangential part.
+std::array<double, 3> rotorWallAcceleration(const Rotor& r,
+                                            const std::array<double, 3>& p);
+
 // Tip Mach -> rate. The tip travels at mach * cInf, so omega = mach*cInf/radius.
 // Pre: radius > 0.
 double rotorOmegaFromTipMach(double tipMach, double cInf, double radius);

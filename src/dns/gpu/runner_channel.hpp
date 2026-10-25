@@ -11,9 +11,12 @@
 #include "dns/config.hpp"
 #include "dns/gpu/run_result.hpp" // RunStats, RunError
 #include "dns/output.hpp"
+#include "dns/rans.hpp"
 #include "dns/transport.hpp"
 
+#include <array>
 #include <expected>
+#include <vector>
 
 namespace dns::gpu {
 
@@ -40,10 +43,21 @@ struct ChannelRun
     int statsEvery = 200;       // steps between stats rows
     double profileDt = 1.0;     // y-profile dump interval; 0 = off
     double curlMax = 0;         // frame vorticity scale; 0 = reTau/4
+    // RANS (docs/rans.md). None = the DNS channel bit for bit. steadyTol > 0
+    // is the steady pseudo-time solve (local time stepping, residual stop,
+    // exit 8 past steadySteps); 0 is URANS on the global dt.
+    RansModel rans = RansModel::None;
+    double steadyTol = 0;
+    long steadySteps = 0;
+    std::vector<double> wallDist;  // g.size(), the model's d (rans only)
+    // Conserved scalars, g.size() each, the first ransScalars(rans) used:
+    // rho nu~ (SA) or rho k, rho omega (SST).
+    std::array<std::vector<double>, 2> icTurb;
 };
 
-// `ic` is the initial conservative state (perturbed laminar profile); the
-// ghost rows are overwritten by the wall mirror before the first step.
+// `ic` is the initial conservative state (perturbed laminar profile, or the
+// RANS mean start with r.icTurb); the ghost rows are overwritten by the wall
+// mirror before the first step.
 std::expected<RunStats, RunError>
 runChannel(const Grid&, const CompState& ic, const ChannelRun&, RunOutput&);
 

@@ -1,8 +1,10 @@
 // Sharp sub-cell no-slip wall for the compressible solver (2D/3D): solid cells
 // near the surface become mirror ghosts (velocity extrapolated through the
-// wall; thermodynamics either adiabatic -- p/rho copied -- or isothermal),
-// refilled per RK stage via the solver stage hook; drag/lift/wall heat are the
-// exact discrete fluxes through the fluid/ghost interface. GPU-only header.
+// wall; thermodynamics either adiabatic -- T copied -- or isothermal; pressure
+// imaged by the wall-normal momentum balance, grad p = -rho a_wall, sampled on
+// the wall normal), refilled per RK stage via the solver stage hook;
+// drag/lift/wall heat are the exact discrete fluxes through the fluid/ghost
+// interface. GPU-only header.
 #pragma once
 
 #include "dns/gpu/comp.hpp"
@@ -34,14 +36,26 @@ struct GhostWallThermal
 // sdf(x, y, z) > 0 in fluid, < 0 in solid, approximately a distance.
 using GhostSdf = std::function<double(double, double, double)>;
 
-// Surface velocity of the body at a WORLD point on its wall. Passing one makes
-// the wall an inhomogeneous no-slip surface: the mirror images the velocity
-// about u_wall instead of about rest. This module stays ignorant of WHY the
-// wall moves -- a rotor supplies dns::rotorWallVelocity, a translating or
-// pitching body would supply its own -- so no motion model lives here. nullptr
-// keeps the resting wall, arithmetic untouched.
-using GhostWallVelocity =
-    std::function<std::array<double, 3>(double x, double y, double z)>;
+// Kinematics of the wall material point at a WORLD point on the surface: its
+// velocity u and its acceleration a. Both are needed because the wall enters
+// two images. The velocity mirror images about u instead of about rest. The
+// pressure image carries the wall-normal momentum balance: at a no-slip wall
+// the fluid moves with the wall, so rho Du/Dt = rho a there and
+//   grad p |wall = -rho a + div tau
+// (no body force on any ghost-wall path). A resting wall has a == 0 and keeps
+// the zero-gradient copy; a spinning one has the centripetal a = w x (w x r),
+// which the copy drops at first order (half a cell of rho w^2 r of pressure
+// on every face that sees the shaft). The viscous term is not imaged -- see
+// kGhostFill. This module stays ignorant of WHY the wall moves -- a rotor
+// supplies dns::rotorWallVelocity/rotorWallAcceleration, a translating or
+// pitching body would supply its own -- so no motion model lives here.
+struct GhostWallKinematics
+{
+    std::array<double, 3> u{}, a{};
+};
+// nullptr keeps the resting wall, arithmetic untouched.
+using GhostWallMotion =
+    std::function<GhostWallKinematics(double x, double y, double z)>;
 
 // Everything the ghost wall uploads, before it reaches the device: the pure
 // HOST result of classifying one body against one grid.
@@ -54,10 +68,19 @@ using GhostWallVelocity =
 struct CompGhostTables
 {
     std::vector<int> gcell;  // ghost cell index
-    std::vector<int> gnbr;   // 8 trilinear source cells per ghost
+    std::vector<int> gnbr;   // 8 trilinear source cells per ghost (velocity)
     std::vector<Real> gw;    // 8 renormalized weights per ghost
+    // The thermodynamic (rho, p) stencil, 8 + 8 per ghost: the same as the
+    // velocity one where that is all fluid, otherwise ON the normal a little
+    // further out (classifyCompGhost says why).
+    std::vector<int> tnbr;
+    std::vector<Real> tw;
     std::vector<Real> gscale;// velocity extrapolation factor dw/ds per ghost
     std::vector<Real> uwall; // wall velocity per ghost, xyz; empty = at rest
+    // Per ghost, a_wall . (x_sample - x_ghost): the pressure image's increment
+    // per unit sample density, p_ghost = p_sample + rho_sample * aspan. Present
+    // exactly when uwall is.
+    std::vector<Real> aspan;
     std::vector<int> deep;   // deep-solid cells (quiescent fill)
     std::vector<int> fcell;  // fluid cell of an interface face
     std::vector<int> fdir;   // 0:+x 1:-x 2:+y 3:-y 4:+z 5:-z (ghost side)
@@ -90,14 +113,14 @@ struct CompGhostCapacity
 // resting pInf cell. Pre: bbox is null or 6 doubles [lo xyz, hi xyz].
 CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                                   const double* bbox, const AxisRemap3& remap,
-                                  const GhostWallVelocity* uwall);
+                                  const GhostWallMotion* motion);
 
 class DeviceCompGhost
 {
 public:
     using Sdf = GhostSdf;
     using WallThermal = GhostWallThermal;
-    using WallVelocity = GhostWallVelocity;
+    using WallMotion = GhostWallMotion;
 
     // Freestream (rhoInf, pInf) fills deep-solid cells (quiescent interior);
     // sdf resolved by the grid (body radius >> h). bbox (optional, 6 doubles
@@ -109,14 +132,14 @@ public:
     // wall selects the surface thermal condition; the default is the adiabatic
     // wall this class has always had. Fails with hipErrorInvalidValue on an
     // isothermal wall with Twall <= 0 or Rgas <= 0.
-    // uwall != nullptr makes the surface MOVE at that velocity (see
-    // WallVelocity); it is sampled once per ghost cell at the foot of the wall
-    // normal, so it costs nothing per step and rides the azimuth table for a
-    // rotor. nullptr is the resting wall, bit for bit.
+    // motion != nullptr makes the surface MOVE (see WallMotion); it is sampled
+    // once per ghost cell at the foot of the wall normal, so it costs nothing
+    // per step and rides the azimuth table for a rotor. nullptr is the resting
+    // wall, bit for bit.
     static std::expected<DeviceCompGhost, hipError_t> make(
         const Grid& g, const Sdf& sdf, double gamma, double rhoInf, double pInf,
         const double* bbox = nullptr, WallThermal wall = {},
-        const WallVelocity* uwall = nullptr);
+        const WallMotion* motion = nullptr);
 
     // Focal (curvilinear) variant: cell centres are the remap of the uniform
     // reference centres, so every distance, normal and band test is taken in
@@ -130,7 +153,7 @@ public:
     static std::expected<DeviceCompGhost, hipError_t> make(
         const Grid& g, const Sdf& sdf, double gamma, double rhoInf, double pInf,
         const double* bbox, const AxisRemap3& remap, WallThermal wall = {},
-        const WallVelocity* uwall = nullptr);
+        const WallMotion* motion = nullptr);
 
     // Build from already-classified tables, with the device buffers sized for
     // `cap` rather than for `t` -- the entry point a moving body uses, so that
@@ -222,10 +245,13 @@ private:
     DeviceBuffer<int> gcell_;    // ghost cell index
     DeviceBuffer<int> gnbr_;     // 8 trilinear source cells per ghost
     DeviceBuffer<Real> gw_;      // 8 renormalized weights per ghost
+    DeviceBuffer<int> tnbr_;     // 8 thermo (rho, p) source cells per ghost
+    DeviceBuffer<Real> tw_;      // and their weights
     DeviceBuffer<Real> gscale_;  // velocity extrapolation factor dw/ds
     // Wall velocity at each ghost's own wall point, xyz interleaved; empty on a
     // resting wall, which is what selects the untouched arithmetic in kGhostFill.
     DeviceBuffer<Real> uwall_;
+    DeviceBuffer<Real> aspan_;   // a_wall . (x_sample - x_ghost); with uwall_
     DeviceBuffer<int> deep_;     // deep-solid cell index
     DeviceBuffer<int> fcell_;    // fluid cell of an interface face
     DeviceBuffer<int> fdir_;     // 0:+x 1:-x 2:+y 3:-y 4:+z 5:-z (ghost side)

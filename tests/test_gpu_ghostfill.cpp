@@ -3,8 +3,12 @@
 //     linear-in-wall-distance profile that vanishes on the true boundary.
 //     After maskSolidFaces + ghost fill, each ghost face must recover ~sdf
 //     (negative inside); a sign/index bug produces O(field) errors, the
-//     correct fill is off by interpolation error O(h^2/r) except where the
-//     image stencil loses corners (O(h) worst case). Also: open faces must be
+//     correct fill is off by interpolation error O(h^2/r) EVERYWHERE: the
+//     image always reads a clean trilinear cell (no closed corner), so no
+//     face is off by O(h). Measured (2026-10-24): max 0.011 h / 0.028 h, mean
+//     0.006 h / 0.016 h (cylinder / sphere); the renormalized image it
+//     replaced was 0.63 h / 0.70 h max, 0.045 h mean. No face takes the
+//     fallback image on these convex bodies. Also: open faces must be
 //     untouched, and w must stay 0-consistent in native 2D.
 //  2) Energy: the energy-stability scenario (off-node sphere, random projected
 //     field, 300 RK3 + cut projection steps) using the split-stage form
@@ -15,6 +19,7 @@
 #include "gpu_test_util.hpp"
 
 #include "dns/cutcell.hpp"
+#include "dns/geometry.hpp"
 #include "dns/gpu/cutpoisson.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/ghostfill.hpp"
@@ -104,9 +109,81 @@ bool checkReconstruction(const char* name, const Grid& g, CutGeometry cut,
     std::printf("%s: filled=%zu maxErr/h=%.3f meanErr/h=%.3f openDrift=%.2e\n",
                 name, nGhost, maxErr / h, meanErr / h, maxOpenDrift);
     bool ok = true;
-    ok &= test::checkClose("ghost max", maxErr, h, 0.8);
-    ok &= test::checkClose("ghost mean", meanErr, h, 0.1);
+    ok &= test::checkClose("ghost max", maxErr, h, 0.1);
+    ok &= test::checkClose("ghost mean", meanErr, h, 0.03);
     ok &= test::checkClose("open faces", maxOpenDrift, 1.0, 1e-6);
+    if (ghost->fallbackCount() != 0)
+    {
+        std::printf("FAIL: %zu ghost faces on the fallback image\n",
+                    ghost->fallbackCount());
+        ok = false;
+    }
+    return ok;
+}
+
+// Unresolved geometry: two cylinders a sub-cell gap apart. Across the gap no
+// image cell is clean within a diagonal, so those ghosts take the fallback
+// image; it must exist, stay finite, and stay bounded by the open samples
+// (|q_ghost| <= max |q_open|, the stability property of every image).
+bool checkFallback()
+{
+    const int n = 64;
+    const double L = 2 * pi;
+    const auto g = Grid::make(n, n, 1, L, L, L / n);
+    const double h = g.hx, r = L / 8, gap = 0.6 * h;
+    const double cy = L / 2 + 0.23 * h, x1 = L / 2 - r - 0.5 * gap + 0.11 * h,
+                 x2 = x1 + 2 * r + gap;
+    const gpu::Sdf sdf = [&](double x, double y, double) {
+        return std::min(std::hypot(x - x1, y - cy), std::hypot(x - x2, y - cy)) - r;
+    };
+    auto cut = sampleCut(g, [&](double x, double y, double z) { return sdf(x, y, z); });
+    if (!cut)
+    {
+        std::printf("FAIL: sampleCut: %s\n", cut.error().c_str());
+        return false;
+    }
+    (void)sanitizeCut(g, *cut);
+    auto ghost = gpu::DeviceGhostFill::make(g, *cut, sdf);
+    auto dU = gpu::DeviceField::make(g.size());
+    auto dG = gpu::DeviceField::make(g.size());
+    if (!ghost || !dU || !dG)
+    {
+        std::fprintf(stderr, "FAIL: GPU alloc\n");
+        return false;
+    }
+    auto U = sdfField(g, sdf);
+    maskSolidFaces(g, *cut, U);
+    (void)gpu::uploadField(U, *dU);
+    ghost->fillFrom(*dU, *dG);
+    auto out = VectorField::zeros(g);
+    (void)gpu::downloadField(*dG, out);
+    const double tol = CutGeometry::openTol;
+    double openMax = 0.0, ghostMax = 0.0;
+    bool finite = true;
+    auto scan = [&](const Scalar& a, const Scalar& q) {
+        for (std::size_t c = 0; c < g.size(); ++c)
+        {
+            finite = finite && std::isfinite(q[c]);
+            (a[c] > tol ? openMax : ghostMax) =
+                std::max(a[c] > tol ? openMax : ghostMax, std::abs(q[c]));
+        }
+    };
+    scan(cut->ax, out.u);
+    scan(cut->ay, out.v);
+    std::printf("gap: %zu ghost faces, %zu on the fallback, max|ghost| %.4f "
+                "max|open| %.4f\n", ghost->count(), ghost->fallbackCount(),
+                ghostMax, openMax);
+    bool ok = true;
+    if (ghost->fallbackCount() == 0)
+    {
+        std::printf("FAIL: the sub-cell gap took no fallback image\n");
+        ok = false;
+    }
+    if (!finite || ghostMax > openMax * (1 + 1e-6))
+    {
+        std::printf("FAIL: fallback image unbounded or non-finite\n");
+        ok = false;
+    }
     return ok;
 }
 
@@ -243,6 +320,7 @@ int main()
         };
         ok &= checkReconstruction("sphere3d", g, CutGeometry::make(g, s), sdf);
     }
+    ok &= checkFallback();
     ok &= energyRun(0.0);
     ok &= energyRun(0.05);
 

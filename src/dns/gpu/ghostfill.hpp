@@ -2,10 +2,13 @@
 // maskSolidFaces leaves hard zeros in every closed face, which the momentum
 // stencils read as the wall -- a staircase pinned to grid lines, O(h). This
 // module instead fills each solid face that a fluid stencil can read with
-//   q_ghost = -q(image),   image = face_center + 2*|sdf| * n_wall,
-// (q(image) by trilinear interpolation over open faces of the same component)
-// so the linear profile across the wall vanishes at the true boundary: the
-// momentum wall becomes sub-cell accurate. Ghost faces all have zero aperture,
+//   q_ghost = (sdf / d) q(image),   image = wall foot + d * n_wall,
+// q(image) by the trilinear interpolant over a cell whose weighted corners are
+// ALL open faces of the same component; d = |sdf| (the mirror) where that cell
+// is clean, else the smallest d (1/16-cell steps, up to a cell diagonal past
+// the mirror) where it is. The profile linear along the normal then vanishes
+// at the true boundary and the image is exact for linear fields: the momentum
+// wall becomes sub-cell accurate. Ghost faces all have zero aperture,
 // hence the apertured projection/continuity never sees their values; only the
 // advection/diffusion stencils do. GPU-only header.
 #pragma once
@@ -39,7 +42,8 @@ public:
     DeviceGhostFill& operator=(DeviceGhostFill&&) noexcept = default;
 
     // Overwrite every ghost face: q[face] = sum_m w_m * q[nbr_m] (weights carry
-    // the mirror sign and sum to -1 over open faces; |q_ghost| <= max|q_nbr|).
+    // the mirror sign and sum to sdf/d in [-1, 0) over open faces;
+    // |q_ghost| <= max|q_nbr|).
     // Pre: U's solid faces hold zeros (maskSolidFaces ran on it).
     void apply(DeviceField& U) const;
 
@@ -49,12 +53,17 @@ public:
     void fillFrom(const DeviceField& in, DeviceField& diff) const;
 
     std::size_t count() const { return count_; }
+    // Ghost faces with no clean interpolation cell within reach (geometry
+    // unresolved there: gaps / concave corners under ~2 cells), imaged by the
+    // renormalized fallback instead. 0 on any resolved convex body.
+    std::size_t fallbackCount() const { return fallback_; }
 
 private:
     DeviceGhostFill(DeviceBuffer<int> face, DeviceBuffer<int> comp,
-                    DeviceBuffer<int> nbr, DeviceBuffer<Real> w, std::size_t n)
+                    DeviceBuffer<int> nbr, DeviceBuffer<Real> w, std::size_t n,
+                    std::size_t fallback)
         : face_(std::move(face)), comp_(std::move(comp)), nbr_(std::move(nbr)),
-          w_(std::move(w)), count_(n)
+          w_(std::move(w)), count_(n), fallback_(fallback)
     {
     }
 
@@ -67,6 +76,7 @@ private:
     DeviceBuffer<int> nbr_;  // 8 sample indices per ghost face
     DeviceBuffer<Real> w_;   // 8 weights per ghost face (0 for excluded samples)
     std::size_t count_ = 0;
+    std::size_t fallback_ = 0;
 };
 
 } // namespace dns::gpu

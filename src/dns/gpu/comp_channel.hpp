@@ -20,6 +20,11 @@ namespace dns::gpu {
 // wall-normal pressure gradient), rho from the EOS -- the Fourier flux
 // through the wall face is the heat sink that balances the body-force power.
 // isothermal = false reproduces the adiabatic kFarWallY mirror bit-for-bit.
+// A state carrying RANS scalars also gets their ghosts, rebuilt with the
+// ghost's OWN density: SA (nT == 1) nu~ antimirrored; SST (nT == 2) k
+// antimirrored and omega_g = 2 omega_w - omega_1 with TMR's wall value
+// omega_w = 60 nu_w / (beta1 d1^2) = sstOmegaCoef / rho_w, rho_w the wall-face
+// average density.
 class DeviceChannelWall
 {
 public:
@@ -27,6 +32,7 @@ public:
     {
         double gamma = 1.4, Rgas = 1.0, Twall = 1.0;
         bool isothermal = true;
+        double sstOmegaCoef = 0; // 60 mu / (beta1 d1^2), d1 the first centre
     };
 
     static std::expected<DeviceChannelWall, hipError_t> make(const Grid& g,
@@ -40,12 +46,20 @@ private:
     Config c_;
 };
 
-// Constant streamwise body force on the FLUID rows (1..ny-2): k.mx += f and
-// k.E += f * u, with u the live stage primitive. Applied inside the RHS hook
-// so it rides SSP-RK3 exactly; the ghost rows are excluded (the stage hook
-// overwrites them anyway).
-void addBodyForceX(const GpuGrid& g, double f, Real cr, const DeviceScalar& u,
-                   DeviceCompState& out);
+// Constant streamwise body force on the FLUID rows (1..ny-2): out.mx +=
+// crAt(c) f and out.E += crAt(c) f u, with u the live stage primitive. Applied
+// inside the RHS hook so it rides SSP-RK3 exactly (and local time stepping:
+// the per-cell crAt is what keeps the steady state right); the ghost rows are
+// excluded (the stage hook overwrites them anyway).
+void addBodyForceX(const GpuGrid& g, double f, const StageCombine& cmb,
+                   const DeviceScalar& u, DeviceCompState& out);
+
+// Deterministic FP64 per-y-plane sum and max of one field: out[j*2 + 0] =
+// sum over (i,k), out[j*2 + 1] = max over (i,k). One thread per row, fixed
+// order. `host` is resized to g.ny * 2.
+hipError_t channelPlaneScalarSums(const GpuGrid& g, const DeviceScalar& field,
+                                  DeviceBuffer<double>& scratch,
+                                  std::vector<double>& host);
 
 // Deterministic FP64 per-y-plane moment sums: for every row j,
 //   out[j*8 + 0..7] = sum over (i,k) of {rho, rho u, rho v, rho u^2,

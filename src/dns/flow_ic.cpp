@@ -1,6 +1,7 @@
 #include "dns/flow_ic.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <numbers>
 
@@ -169,6 +170,40 @@ void channelIC(const Case& c, const ChannelStretchY& remap, double delta,
                 host.mz[q] = rho0 * ww;
                 host.E[q] = c.pRef / (gamma - 1.0)
                           + 0.5 * rho0 * (uu * uu + vv * vv + ww * ww);
+            }
+}
+
+void channelRansIC(const Case& c, const std::vector<double>& wallDist,
+                   double rho0, double gamma, CompState& host,
+                   std::array<std::vector<double>, 2>& turb,
+                   std::vector<float>& mask)
+{
+    const auto& g = c.grid;
+    assert(c.rans != RansModel::None && wallDist.size() == g.size());
+    const bool sst = ransSst(c.rans);
+    for (int i = 0; i < ransScalars(c.rans); ++i) turb[i].assign(g.size(), 0.0);
+    for (int k = 0; k < g.nz; ++k)
+        for (int j = 0; j < g.ny; ++j)
+            for (int i = 0; i < g.nx; ++i)
+            {
+                const std::size_t q = g.idx(i, j, k);
+                const bool fluid = j >= 1 && j <= g.ny - 2;
+                const double d = wallDist[q];
+                const double uu = fluid ? reichardtUplus(d * c.reTau) : 0.0;
+                if (!fluid) mask[q] = 0.0f;
+                host.rho[q] = rho0;
+                host.mx[q] = rho0 * uu;
+                host.my[q] = 0.0;
+                host.mz[q] = 0.0;
+                host.E[q] = c.pRef / (gamma - 1.0) + 0.5 * rho0 * uu * uu;
+                if (!fluid) continue;
+                if (!sst) {
+                    turb[0][q] = rho0 * saInitialNut(d, 1.0, 1.0);
+                    continue;
+                }
+                const KOmega kw = sstInitialKOmega(d, c.nu / rho0, 1.0);
+                turb[0][q] = rho0 * kw.k;
+                turb[1][q] = rho0 * kw.omega;
             }
 }
 

@@ -34,7 +34,7 @@ public:
     static std::expected<DeviceCompSink, hipError_t> make(const Grid& g,
                                                           Config c);
 
-    // out += cmb.cr * rhs on the banded cells: the compounded-Laplacian
+    // out += cmb.crAt(c) * rhs on the banded cells: the compounded-Laplacian
     // high-pass D4 (symbol sin^4(kh/2)) in conservative flux form, flux zero
     // through the domain faces, one-sided (clamped) closure -- exactly zero on
     // constant and linear fields, and sums to zero per axis, so the band

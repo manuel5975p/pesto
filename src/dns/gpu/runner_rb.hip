@@ -81,11 +81,13 @@ runRb(const Grid& g, const VectorField& icU, const Scalar& icT, const RbRun& r,
     auto stage = [&](const DeviceField& inU, const DeviceScalar& inT,
                      DeviceField& outU, DeviceScalar& outT, double a,
                      double dt) {
-        fusedRhsStage(gg, Real(r.nu), Real(0), 0, 0, 0, Real(a), *dU0,
-                      Real(1.0 - a), inU, Real(dt), outU);
+        // ca + cb == 1 exactly in FP32 (see runner_incomp).
+        const Real cb = Real(1.0 - a), ca = Real(1) - cb;
+        fusedRhsStage(gg, Real(r.nu), Real(0), 0, 0, 0, ca, *dU0, cb, inU,
+                      Real(dt), outU);
         addBuoyancy(gg, Real(r.gAlpha), Real(r.Tref), Real((1.0 - a) * dt), inT,
                     outU);
-        stageTemperature(gg, Real(r.kappa), Real(a), *dT0, Real(1.0 - a), inU,
+        stageTemperature(gg, Real(r.kappa), ca, *dT0, cb, inU,
                          inT, Real(dt), outT);
         applyRbWall(gg, Real(r.Tbot), Real(r.Ttop), Real(r.patch), r.closedSides,
                     outU, outT);

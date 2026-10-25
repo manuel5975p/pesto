@@ -27,17 +27,23 @@ namespace {
 // Both ghost states are the shared no-slip wall (internal/wall_ghost.hpp) --
 // the same one the channel and convection plates get. Only the row differs:
 // there are two plates on a box and one wall here, at j = 0.
-// uwx/uwy (both null or both set, nx entries): wall velocity for a rigidly
+// uwx/uwy/as (all null or all set, nx entries): wall velocity for a rigidly
 // rotating body (--rotor-frame mrf). The moving image is u0 = 2 u_wall - u1
-// -- the resting mirror's general form at reflection factor exactly 1 -- with
-// the thermodynamic state built exactly as the resting branch builds it
-// (adiabatic: rho and p copied, so T0 == T1 and the Fourier flux vanishes;
-// isothermal: the same floored T0 and rho0). The resting branch is kept
+// -- the resting mirror's general form at reflection factor exactly 1. The
+// pressure is the wall-normal momentum balance, grad p = -rho a_wall (the
+// fluid at the wall moves with it; in the rotating frame the same balance is
+// the Coriolis term at u_rel = 0): p0 = p1 + rho1 a_wall . (x1 - x0), `as`.
+// The temperature is built exactly as the resting branch builds it
+// (adiabatic: T0 == T1, so rho0 = rho1 p0/p1 and the Fourier flux vanishes;
+// isothermal: the same floored T0, rho0 = p0/(R T0)). The viscous part of the
+// balance is not imaged, for the reason comp_ghost.hip's kGhostFill gives.
+// The resting branch (a_wall = 0: the copy, the same condition) is kept
 // VERBATIM under the null check rather than folded into the general form:
 // -m and 2*rho*uw - m are not the same float at uw == 0.
 __global__ void kOGridWall(GpuGrid g, int isothermal, Real gam, Real Rgas,
                            Real Twall, const Real* uwx, const Real* uwy,
-                           Real* rho, Real* mx, Real* my, Real* mz, Real* E)
+                           const Real* as, Real* rho, Real* mx, Real* my,
+                           Real* mz, Real* E)
 {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t nxz = std::size_t(g.nx) * g.nz;
@@ -47,8 +53,8 @@ __global__ void kOGridWall(GpuGrid g, int isothermal, Real gam, Real Rgas,
     const std::size_t s = gidx(g, i, 1, k);
     if (!uwx) {
         if (!isothermal) internal::adiabaticGhost(c, s, rho, mx, my, mz, E);
-        else internal::isothermalGhost(c, s, gam, Rgas, Twall, rho, mx, my,
-                                       mz, E);
+        else internal::isothermalGhost(c, s, gam, Rgas, Twall, Real(0), rho,
+                                       mx, my, mz, E);
         return;
     }
     const Real r1 = rho[s];
@@ -59,17 +65,18 @@ __global__ void kOGridWall(GpuGrid g, int isothermal, Real gam, Real Rgas,
     const Real u0 = Real(2) * uwx[i] - u1, v0 = Real(2) * uwy[i] - v1,
                w0 = -w1;
     const Real ke0 = Real(0.5) * (u0 * u0 + v0 * v0 + w0 * w0);
-    Real r0 = r1;
+    const Real p0 = p1 + r1 * as[i];
+    Real r0 = r1 * (p0 / p1);
     if (isothermal) {
         const Real T0 =
             fmaxf(Real(2) * Twall - p1 / (Rgas * r1), Real(0.05) * Twall);
-        r0 = p1 / (Rgas * T0);
+        r0 = p0 / (Rgas * T0);
     }
     rho[c] = r0;
     mx[c] = r0 * u0;
     my[c] = r0 * v0;
     mz[c] = r0 * w0;
-    E[c] = p1 / (gam - Real(1)) + r0 * ke0;
+    E[c] = p0 / (gam - Real(1)) + r0 * ke0;
 }
 
 // --- outer far-field row (j = ny-1) ------------------------------------------
@@ -221,7 +228,8 @@ std::expected<DeviceOGridBc, hipError_t> DeviceOGridBc::make(const Grid& g,
                     c.band > 0 &&
                     (c.thermal == OGridThermal::Adiabatic || c.Twall > 0) &&
                     (c.omega == 0 ||
-                     c.wallPos.size() == std::size_t(g.nx));
+                     (c.wallPos.size() == std::size_t(g.nx) &&
+                      c.wallSpan.size() == std::size_t(g.nx)));
     if (!ok) return std::unexpected(hipErrorInvalidValue);
 
     // Cell-centre radial normal, one per angular cell: the bisector of the far
@@ -257,17 +265,23 @@ std::expected<DeviceOGridBc, hipError_t> DeviceOGridBc::make(const Grid& g,
         // Wall-face midpoints and the rigid wall velocity omega x (p - c)
         // there, both in double on the host so the tables are the same every
         // run; the kernels read them as Real like every field.
-        std::vector<Real> px(g.nx), py(g.nx), ux(g.nx), uy(g.nx);
+        std::vector<Real> px(g.nx), py(g.nx), ux(g.nx), uy(g.nx), as(g.nx);
+        const double w2 = c.omega * c.omega;
         for (int i = 0; i < g.nx; ++i)
         {
             const auto& p = c.wallPos[std::size_t(i)];
+            const auto& d = c.wallSpan[std::size_t(i)];
             px[std::size_t(i)] = Real(p[0]);
             py[std::size_t(i)] = Real(p[1]);
             ux[std::size_t(i)] = Real(-c.omega * (p[1] - c.cy));
             uy[std::size_t(i)] = Real(c.omega * (p[0] - c.cx));
+            // Centripetal a = -omega^2 (p - c), dotted with the image span.
+            as[std::size_t(i)] =
+                Real(-w2 * ((p[0] - c.cx) * d[0] + (p[1] - c.cy) * d[1]));
         }
         for (auto [dst, src] : {std::pair{&out.wpx_, &px}, {&out.wpy_, &py},
-                                {&out.uwx_, &ux}, {&out.uwy_, &uy}})
+                                {&out.uwx_, &ux}, {&out.uwy_, &uy},
+                                {&out.aspan_, &as}})
         {
             auto b = DeviceScalar::make(std::size_t(g.nx));
             if (!b) return std::unexpected(b.error());
@@ -290,8 +304,9 @@ void DeviceOGridBc::apply(DeviceCompState& s) const
     const std::size_t nxz = std::size_t(g_.nx) * g_.nz;
     kOGridWall<<<launchBlocks(nxz), blockSize>>>(
         g_, c_.thermal == OGridThermal::Isothermal ? 1 : 0, Real(c_.gamma),
-        Real(c_.Rgas), Real(c_.Twall), uwx_.data(), uwy_.data(), s.rho.data(),
-        s.mx.data(), s.my.data(), s.mz.data(), s.E.data());
+        Real(c_.Rgas), Real(c_.Twall), uwx_.data(), uwy_.data(),
+        aspan_.data(), s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
+        s.E.data());
     checkLastKernel("kOGridWall");
     kOGridFar<<<launchBlocks(nxz), blockSize>>>(
         g_, Real(c_.gamma), Real(c_.rhoInf), Real(u_), Real(c_.pInf),

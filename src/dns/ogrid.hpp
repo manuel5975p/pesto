@@ -87,6 +87,17 @@ struct OGrid
 // Pre: t in [0, 1].
 double ogridRadialDist(double t, double beta);
 
+// First fluid cell height of the O-grid around a CIRCLE of radius rWall, the
+// flags-only number the validator can quote (no sdf): (rFar - rWall) D(1/nf),
+// nf = ny - 2. Exact for a cylinder, where n == e_r. Pre: ny >= 4, 0 < rWall < rFar.
+double ogridNominalH1(int ny, double rWall, double rFar, double beta);
+
+// Radial FLUID cells spanned by a wall-normal length `len` on that circle:
+// nf t* with D(t*) = len / (rFar - rWall), by bisection (D is monotone); nf when
+// len reaches the far circle. Pre: as ogridNominalH1, len >= 0.
+double ogridRadialCells(double len, int ny, double rWall, double rFar,
+                        double beta);
+
 // Reference box for an O-grid, so the validator can size the Grid without an
 // sdf: hx = 2 pi / nx, hy = (rFar - rWall) / (ny - 2), hz = span / nz.
 // hy is NOMINAL -- the radial axis is Extend, so no node ever picks up a y
@@ -113,5 +124,12 @@ std::expected<OGrid, std::string> buildOGrid(const Grid& g, const Sdf& sdf,
 // arms and mirror points of a rigidly rotating wall (gpu/ogrid_bc).
 // Pre: og from buildOGrid.
 std::vector<std::array<double, 2>> ogridWallMidpoints(const OGrid& og);
+
+// In-plane vector from the inner ghost cell (i, 0) to the first fluid cell
+// (i, 1), centres taken as their four-node averages: the span the wall row's
+// pressure image covers (p0 = p1 - grad p . span). The ghost row is the
+// reflection of row 1 about the wall, so this lies along the wall normal and
+// is twice the first centre's wall distance. Pre: og from buildOGrid.
+std::vector<std::array<double, 2>> ogridWallSpans(const OGrid& og);
 
 } // namespace dns

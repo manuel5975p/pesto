@@ -78,26 +78,34 @@ __host__ __device__ inline void adiabaticGhost(std::size_t c, std::size_t s,
 }
 
 // Isothermal no-slip: the ghost thermodynamic state is built so the wall face
-// holds T = Twall and dp/dn = 0 with the mirrored velocity. T0 = 2 Twall - T1,
-// FLOORED at Twall/20 so a transient cannot construct a negative-temperature
-// ghost; p0 = p1; rho0 = p0/(R T0); m0 = -rho0 u1; E0 from (p0, rho0, |u1|).
+// holds T = Twall and the wall-normal momentum balance with the mirrored
+// velocity. T0 = 2 Twall - T1, FLOORED at Twall/20 so a transient cannot
+// construct a negative-temperature ghost; p0 = p1 + rho1 * fspan; rho0 =
+// p0/(R T0); m0 = -rho0 u1; E0 from (p0, rho0, |u1|).
+// fspan = -f . (x1 - x0), f the body force per unit mass: at a resting no-slip
+// wall the fluid does not accelerate, so grad p = rho f there (plus the
+// viscous term, not imaged -- comp_ghost.hip kGhostFill says why), and the
+// copy p0 = p1 is that balance only where f . n == 0. A gravity plate is
+// where it is not (comp_conv: the hydrostatic gradient). fspan == 0 is the
+// copy bit-for-bit: p1 + rho1 * 0 is p1.
 // Pre: rho[s] > 0, gam > 1, Rgas > 0, Twall > 0.
 __host__ __device__ inline void isothermalGhost(std::size_t c, std::size_t s,
                                                 Real gam, Real Rgas, Real Twall,
-                                                Real* rho, Real* mx, Real* my,
-                                                Real* mz, Real* E)
+                                                Real fspan, Real* rho, Real* mx,
+                                                Real* my, Real* mz, Real* E)
 {
     const Real r1 = rho[s];
     const Real u1 = mx[s] / r1, v1 = my[s] / r1, w1 = mz[s] / r1;
     const Real ke1 = Real(0.5) * (u1 * u1 + v1 * v1 + w1 * w1);
     const Real p1 = (gam - Real(1)) * (E[s] - r1 * ke1);
     const Real T0 = fmaxf(Real(2) * Twall - p1 / (Rgas * r1), Real(0.05) * Twall);
-    const Real r0 = p1 / (Rgas * T0);
+    const Real p0 = p1 + r1 * fspan;
+    const Real r0 = p0 / (Rgas * T0);
     rho[c] = r0;
     mx[c] = -r0 * u1;
     my[c] = -r0 * v1;
     mz[c] = -r0 * w1;
-    E[c] = p1 / (gam - Real(1)) + r0 * ke1;
+    E[c] = p0 / (gam - Real(1)) + r0 * ke1;
 }
 
 } // namespace dns::gpu::internal

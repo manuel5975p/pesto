@@ -432,7 +432,8 @@ std::expected<Case, ConfigError> validateBench(const RawConfig& r, Case c)
     c.meta = {.body = "none",
               .farField = "periodic",
               .physics = name(c.physics),
-              .sgs = ""};
+              .sgs = "",
+              .rans = ""};
     c.meta.setGrid(c.grid);
     return c;
 }
@@ -476,12 +477,74 @@ std::expected<Case, ConfigError> validatePeriodic(const RawConfig& r, Case c)
               .body = "none",
               .farField = "periodic",
               .physics = name(c.physics),
-              .sgs = ""};
+              .sgs = "",
+              .rans = ""};
     c.meta.setGrid(c.grid);
     return c;
 }
 
 // --- channel ----------------------------------------------------------------
+
+// The channel's RANS knobs (docs/rans.md). Every rule rejects, never
+// ignores; --rans none with no --steady leaves the case untouched.
+// Pre: the grid, wall and run epilogue are resolved (c.kick from --kick).
+std::optional<ConfigError> channelRans(const RawConfig& r, Case& c)
+{
+    c.rans = RansModel(r.rans);
+    const bool rans = c.rans != RansModel::None;
+    if (rans)
+    {
+        if (r.given.contains("--kick") && r.kick > 0)
+            return err(2, "--kick", "a RANS field is an ensemble mean; there "
+                                    "is nothing to trip");
+        c.kick = 0;
+    }
+    c.steadyTol = r.steady;
+    if (!(std::isfinite(c.steadyTol) && c.steadyTol >= 0))
+        return err(2, "--steady", "must be finite and >= 0 (0 = off)");
+    c.steadySteps = r.steadySteps;
+    if (r.given.contains("--steady-steps"))
+    {
+        if (c.steadyTol <= 0)
+            return err(2, "--steady-steps", "caps the --steady iteration; "
+                                            "requires --steady TOL");
+        if (r.steadySteps < 1) return err(2, "--steady-steps", "must be >= 1");
+    }
+    if (c.steadyTol > 0)
+    {
+        if (!rans)
+            return err(2, "--steady", "a DNS channel has no steady state "
+                                      "(it needs --rans)");
+        if (!c.wallIso)
+            return err(2, "--steady", "--wall adiabatic has no heat sink: no "
+                                      "steady state");
+        if (auto e = rejectGiven(r, {"--tt", "--profile-dt", "--fdt", "--pdt",
+                                     "--wdt"},
+                                 "with --steady: pseudo-time is not time; "
+                                 "frames/profiles are time-keyed (profiles "
+                                 "are written once, at convergence or at the "
+                                 "cap)");
+            e)
+            return e;
+        for (const Emit k : {Emit::Png, Emit::Web, Emit::Bin, Emit::Shm,
+                             Emit::Volume, Emit::Slices, Emit::Vtk})
+            if (c.emit.contains(k))
+                return err(2, "--emit", "frames with --steady: pseudo-time is "
+                                        "not time; frames/profiles are "
+                                        "time-keyed");
+    }
+    if (!rans) return std::nullopt;
+    if (std::size_t(c.grid.nx) * c.grid.nz > 4)
+        c.warnings.emplace_back(
+            "the RANS mean is homogeneous in x and z; --n 4 --nz 1 is the same "
+            "answer");
+    if (c.chanH1 * c.reTau > 1.0)
+        c.warnings.push_back(std::format(
+            "wall-resolved RANS with first-cell y+ {:.3g} > 1",
+            c.chanH1 * c.reTau));
+    return std::nullopt;
+}
+
 // Wall units: delta = 1, u_tau = 1, f = 1, nu = 1/reTau. The box momentum
 // balance (f * V = 2 tau_w * A_wall with Ly = 2 delta) pins tau_w = 1, so
 // reTau is the run's friction Reynolds number by construction.
@@ -537,12 +600,13 @@ std::expected<Case, ConfigError> validateChannel(const RawConfig& r, Case c)
     // Bulk-velocity estimate (log law) fixes the sound speed for the
     // requested BULK Mach: c_s = ubEst/Mach, p = rho c_s^2/gamma,
     // Twall = p (rho = R = 1). The IC and the isothermal wall share it.
-    c.ubEst = 2.5 * std::log(std::max(c.reTau, 3.0)) + 2.6;
-    c.pRef = (c.ubEst / c.mach) * (c.ubEst / c.mach) / kGammaAir;
+    c.ubEst = channelUbEstimate(c.reTau);
+    c.pRef = channelPRef(c.reTau, c.mach);
 
     // --cfl has no channel-specific default: the parser's 0.4 stands.
     if (auto e = validateWallRun(r, c, r.cfl); e) return std::unexpected(*e);
     c.tEnd = r.tt;
+    if (auto e = channelRans(r, c); e) return std::unexpected(*e);
     // PNG is allowed at nz > 1 here: it renders the centre z-plane,
     // which for a channel is exactly the picture you want.
     c.physics = Physics::Compressible;
@@ -556,7 +620,9 @@ std::expected<Case, ConfigError> validateChannel(const RawConfig& r, Case c)
               .farField = "periodic",
               .physics = "compressible",
               .kick = c.kick,
-              .sgs = ""};
+              .sgs = "",
+              .rans = c.rans == RansModel::None ? std::string()
+                                                : std::string(ransName(c.rans))};
     c.meta.setGrid(c.grid);
     return c;
 }
@@ -778,7 +844,8 @@ std::expected<Case, ConfigError> validateConv(const RawConfig& r, Case c)
               .farField = c.closedSides ? "closed-sides" : "periodic",
               .physics = name(c.physics),
               .kick = c.kick,
-              .sgs = ""};
+              .sgs = "",
+              .rans = ""};
     c.meta.setGrid(c.grid);
     return c;
 }
@@ -954,6 +1021,7 @@ std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
         // the unit depth the 2D convention requires.
         c.ogridSpan = nzI > 1 ? pi * D : 1.0;
         c.grid = ogridGrid(r.n, ny, nzI, 0.5 * D, c.ogridRFar, c.ogridSpan);
+        c.ogridH1 = ogridNominalH1(ny, 0.5 * D, c.ogridRFar, c.ogridBeta);
         if (auto e = checkCells(c.grid.size()); e) return e;
         c.L = 2.0 * c.ogridRFar;
         c.h = c.grid.hy; // nominal radial spacing; the mesh reports the real h1
@@ -1144,6 +1212,28 @@ std::optional<ConfigError> flowNscbc(const RawConfig& r, Case& c)
     c.nscbcEtaLat = r.nscbcEtaLat;
     c.nscbcSink = r.nscbcSink;
     c.nscbcSinkAmp = r.nscbcSinkAmp;
+    // The O-grid's far boundary is its own characteristic row (gpu/ogrid_bc);
+    // runFlowOGrid reads none of the NSCBC knobs, so each one is rejected by
+    // name rather than accepted and ignored -- including the strip that used
+    // to "satisfy" the Re-800 rule below without doing anything.
+    if (r.ogrid)
+    {
+        if (auto e = rejectGiven(
+                r, {"--nscbc-strip", "--nscbc-etain", "--nscbc-beta",
+                    "--nscbc-abc", "--nscbc-etain-shear", "--nscbc-etalat",
+                    "--nscbc-sink", "--nscbc-sink-amp", "--nscbc-tinflow",
+                    "--pot"},
+                "the O-grid's far boundary is its own characteristic row "
+                "(gpu/ogrid_bc), not NSCBC; the flag would be ignored");
+            e)
+            return e;
+        c.nscbcSink = 0;
+        if (c.re > 800)
+            c.warnings.emplace_back(
+                "o-grid far row is unmeasured above Re 800 (the NSCBC Re-800 "
+                "rule does not apply to it)");
+        return std::nullopt;
+    }
     // The sink is ON by default for --far nscbc wherever it is defined
     // (uniform mesh, whole faces, band fits twice on every open axis) --
     // measured free where it does not absorb: cd moved +0.003% on the Re60
@@ -1654,8 +1744,15 @@ std::optional<ConfigError> flowFocal(const RawConfig& r, Case& c)
     // resolved by the spacing AT the body -- the plateau's under --focal, which
     // the containment rule above guarantees the body sits on. Hence here, once
     // the mesh is known, and not with the LES label.
+    // On the O-grid the spacing at the wall is the CLUSTERED radial
+    // distribution's, not the nominal hy: count the cells D/sqrt(Re) spans
+    // through it (exact for a cylinder, the nominal circle otherwise).
     const double hBody = c.focalActive ? hFine(c) : c.h;
-    const double blCells = c.placement.D / std::sqrt(c.re) / hBody;
+    const double blLen = c.placement.D / std::sqrt(c.re);
+    const double blCells =
+        c.ogrid ? ogridRadialCells(blLen, c.grid.ny, 0.5 * c.placement.D,
+                                   c.ogridRFar, c.ogridBeta)
+                : blLen / hBody;
     if (blCells < 3.0 && !c.lesLabel && c.bodyKind != BodyKind::None)
     {
         c.warnings.push_back(
@@ -2053,7 +2150,8 @@ std::optional<ConfigError> flowOutput(const RawConfig& r, Case& c)
               .farField = name(c.far),
               .physics = name(c.physics),
               .kick = comp ? c.kick : 0.0,
-              .sgs = c.lesLabel ? name(c.sgsModel) : ""};
+              .sgs = c.lesLabel ? name(c.sgsModel) : "",
+              .rans = ""};
     c.meta.setGrid(c.grid);
     return std::nullopt;
 }
@@ -2324,6 +2422,17 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     return validateFlow(r, std::move(c));
 }
 
+double channelUbEstimate(double reTau)
+{
+    return 2.5 * std::log(std::max(reTau, 3.0)) + 2.6;
+}
+
+double channelPRef(double reTau, double mach)
+{
+    const double ub = channelUbEstimate(reTau);
+    return (ub / mach) * (ub / mach) / kGammaAir;
+}
+
 double hFine(const Case& c)
 {
     return c.focalActive ? hMin(c.grid.nz, c.focalHFine[0], c.focalHFine[1],
@@ -2426,6 +2535,37 @@ std::string Case::describe() const
     }
     if (sub == Subcommand::Channel)
     {
+        // RANS: the label names the closure and the mode, and a RANS mean
+        // really IS 1D -- it never carries the 2D "qualitative" suffix.
+        const bool ransOn = rans != RansModel::None;
+        const std::string runLine =
+            steadyTol > 0
+                ? std::format("steady TOL={:.6g} cap {} iterations",
+                              steadyTol, steadySteps)
+                : std::format("tt={:.6g} eddy turnovers (tEnd={:.6g})  "
+                              "kick={:.3g}  profile-dt={:.3g}",
+                              ft, tEnd, kick, profileDt);
+        const std::string label =
+            !ransOn ? std::string("DNS") +
+                          (grid.nz == 1
+                               ? " (2D: qualitative only, no vortex stretching)"
+                               : "")
+                    : std::format("RANS {} -- {}", ransName(rans),
+                                  steadyTol > 0
+                                      ? "steady (local time stepping: "
+                                        "pseudo-time, not time-accurate)"
+                                      : "URANS (time-accurate)");
+        const std::string wallScalars =
+            ransSst(rans) ? "k_wall = 0 (antimirrored ghost), omega_wall = 60 "
+                            "nu/(beta1 d1^2) (TMR; Dirichlet image),\n"
+                            "             "
+                          : "nu~_wall = 0 (antimirrored ghost), ";
+        const std::string turb =
+            !ransOn ? std::string()
+                    : std::format("  turbulence {}mu_t = 0 on the wall face, "
+                                  "Pr_t = {:.3g}, wall-resolved (y+_1 = {:.3g} "
+                                  "est.)\n",
+                                  wallScalars, kPrandtlTurb, chanH1 * reTau);
         return std::format(
             "case:\n"
             "  mode       compressible turbulent channel (periodic x/z, "
@@ -2438,9 +2578,9 @@ std::string Case::describe() const
             "(u_bulk est {:.3g}, p={:.6g})  cfl={:.3g}\n"
             "  walls      {} no-slip mirrors; force f=1 (constant), "
             "u_tau target 1\n"
-            "  run        tt={:.6g} eddy turnovers (tEnd={:.6g})  kick={:.3g}  "
-            "profile-dt={:.3g}\n"
-            "  label      DNS{}\n"
+            "{}"
+            "  run        {}\n"
+            "  label      {}\n"
             "  out        {}\n",
             grid.nx, grid.ny, grid.nz, grid.ny - 2,
             lxBox, 2.0, lzBox, grid.nz == 1 ? "  [native 2D]" : "",
@@ -2448,10 +2588,7 @@ std::string Case::describe() const
             reTau, nu, mach, ubEst, pRef, cfl,
             wallIso ? "isothermal" : "ADIABATIC (no heat sink -- short "
                                      "transients only)",
-            ft, tEnd, kick, profileDt,
-            grid.nz == 1 ? " (2D: qualitative only, no vortex stretching)"
-                         : "",
-            outPrefix);
+            turb, runLine, label, outPrefix);
     }
     // A mesh or scene path can be any length, which is why this is std::format
     // and not a fixed buffer: snprintf TRUNCATED the report of exactly the runs
@@ -2472,8 +2609,11 @@ std::string Case::describe() const
         "  out        {}\n",
         name(physics), name(bodyKind), bodyPath,
         cutFlux ? " [cut-flux]" : "",
-        name(far),
-        open ? (farPot ? " (lateral open, potential-corrected)"
+        // c.far stays Nscbc internally on the O-grid (nothing on that path
+        // reads it); the report names the boundary the run actually has.
+        ogrid ? "o-grid outer row (characteristic LODI, gpu/ogrid_bc)"
+              : name(far),
+        open ?(farPot ? " (lateral open, potential-corrected)"
                        : " (lateral open)")
              : (farPot ? " (potential-corrected)" : ""),
         grid.nx, grid.ny, grid.nz, h, L, grid.nz == 1 ? "  [native 2D]" : "",
@@ -2521,13 +2661,14 @@ std::string Case::describe() const
         s += std::format(
             "  o-grid     BODY-FITTED: {} angular x {} radial (2 ghost rows)"
             " x {} spanwise\n"
-            "             rFar={:.6g} ({:.6g} D)  beta={:.6g}  span={:.6g}\n"
+            "             rFar={:.6g} ({:.6g} D)  beta={:.6g}  span={:.6g}  "
+            "h1≈{:.3e} (nominal circle, beta={:.6g})\n"
             "             the wall is a MESH FACE -- no cut cells, no immersed"
             " body,\n"
             "             forces are an exact surface integral\n",
             grid.nx, grid.ny, grid.nz, ogridRFar,
             placement.D > 0 ? ogridRFar / placement.D : 0.0, ogridBeta,
-            ogridSpan);
+            ogridSpan, ogridH1, ogridBeta);
     }
     if (stretchBeta > 0)
     {

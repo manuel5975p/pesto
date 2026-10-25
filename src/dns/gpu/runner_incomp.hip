@@ -165,13 +165,15 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
             .ax = dCut->ax.data(),
             .ay = dCut->ay.data(),
             .az = dCut->az.data()};
+        // ca + cb == 1 exactly in FP32 (1 - cb is exact for cb >= 1/2,
+        // Sterbenz); Real(1/3) + Real(2/3) is 1 + 3e-8 and biases every total.
+        const Real cb = Real(1.0 - a), ca = Real(1) - cb;
         if (dFlag)
-            fusedRhsStageCut(gg, Real(r.nu), Real(0), 0, 0, 0, Real(a), *dU0,
-                             Real(1.0 - a), in, *dG, *dCut, *dFlag, Real(dt),
-                             outF, tail);
+            fusedRhsStageCut(gg, Real(r.nu), Real(0), 0, 0, 0, ca, *dU0, cb,
+                             in, *dG, *dCut, *dFlag, Real(dt), outF, tail);
         else
-            fusedRhsStage(gg, Real(r.nu), Real(0), 0, 0, 0, Real(a), *dU0,
-                          Real(1.0 - a), in, *dG, Real(dt), outF, tail);
+            fusedRhsStage(gg, Real(r.nu), Real(0), 0, 0, 0, ca, *dU0, cb, in,
+                          *dG, Real(dt), outF, tail);
         if (les)
         {
             les->computeNut(*dG, *dCut);

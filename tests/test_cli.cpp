@@ -371,6 +371,33 @@ int main()
         check(!str.has_value(), "--penalize with --stretch is rejected");
     }
 
+    // The O-grid's far row is not NSCBC: every NSCBC knob (and --pot) used to
+    // be accepted and silently ignored there -- the strip even "satisfied"
+    // the Re-800 rule. Each is now rejected by name; Re > 800 only warns.
+    {
+        const std::string base =
+            "flow --physics compressible --body cylinder --ogrid --re 100 ";
+        for (const char* f : {"--nscbc-strip 2", "--nscbc-etain 0.5",
+                              "--nscbc-beta 0.3", "--nscbc-abc adaptive",
+                              "--nscbc-etain-shear 1", "--nscbc-etalat 0.05",
+                              "--nscbc-sink 16", "--nscbc-sink-amp 1",
+                              "--nscbc-tinflow", "--pot"})
+        {
+            const std::string flag = split(f).front();
+            auto c = runCli(split(base + f));
+            check(!c && c.error().code == 2 && c.error().field == flag,
+                  std::string("o-grid rejects ") + flag + " by name");
+        }
+        auto hi = runCli(split("flow --physics compressible --body cylinder "
+                               "--ogrid --re 801"));
+        check(hi.has_value(), "o-grid Re 801 is accepted (no NSCBC rule)");
+        if (hi)
+            check(!hi->warnings.empty() &&
+                      hi->warnings.front().starts_with(
+                          "o-grid far row is unmeasured above Re 800"),
+                  "o-grid Re 801 carries the unmeasured-far-row warning");
+    }
+
     if (dnstest::gFailures == 0) std::printf("cli: ok\n");
     return dnstest::finish();
 }

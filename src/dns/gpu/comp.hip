@@ -3,6 +3,7 @@
 #include "dns/curvmesh.hpp"
 #include "dns/gpu/internal/comp_flux.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/rans.hpp"
 #include "dns/remap.hpp"
 
 #include <rocprim/device/device_reduce.hpp>
@@ -11,6 +12,7 @@
 
 #include <rocprim/iterator/transform_iterator.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <climits>
 #include <cmath>
@@ -102,7 +104,7 @@ __device__ inline void mrfSource(const MrfView& mz, PrimView q, std::size_t c,
     *dm[c2] -= fo * mom[b];
 }
 
-// out = cmb.ca a + cmb.cb b + cmb.cr * (-div F): the rhs and the RK
+// out = cmb.ca a + cmb.cb b + cmb.crAt(c) * (-div F): the rhs and the RK
 // combination in one pass (see StageCombine in comp.hpp).
 __global__ void kCompStage(GpuGrid g, ViscView vv, PrimView q,
                            StageCombine cmb, Real* orho, Real* omx, Real* omy,
@@ -137,9 +139,9 @@ __global__ void kCompStage(GpuGrid g, ViscView vv, PrimView q,
     if (mz.active) mrfSource(mz, q, c, i, j, k, dmx, dmy, dmz);
     const Real rhs[5] = {drho, dmx, dmy, dmz, dE};
     Real* out[5] = {orho, omx, omy, omz, oE};
+    const Real cr = cmb.crAt(c);
     for (int v = 0; v < 5; ++v)
-        out[v][c] = cmb.ca * cmb.a[v][c] + cmb.cb * cmb.b[v][c] +
-                    cmb.cr * rhs[v];
+        out[v][c] = cmb.ca * cmb.a[v][c] + cmb.cb * cmb.b[v][c] + cr * rhs[v];
 }
 
 // Curvilinear twin of kCompSmagNut. The velocity gradient comes from the mesh
@@ -211,9 +213,9 @@ __global__ void kCompStageCurv(GpuGrid g, ViscView vv, PrimView q,
     // divergence, in the same per-volume units.
     if (mz.active) mrfSource(mz, q, c, i, j, k, rhs[1], rhs[2], rhs[3]);
     Real* out[5] = {orho, omx, omy, omz, oE};
+    const Real cr = cmb.crAt(c);
     for (int v = 0; v < 5; ++v)
-        out[v][c] = cmb.ca * cmb.a[v][c] + cmb.cb * cmb.b[v][c] +
-                    cmb.cr * rhs[v];
+        out[v][c] = cmb.ca * cmb.a[v][c] + cmb.cb * cmb.b[v][c] + cr * rhs[v];
 }
 
 // The FP64 primitive recovery every stableDt reduction starts from: velocity
@@ -439,15 +441,36 @@ std::expected<DeviceCurv, hipError_t> DeviceCurv::make(const CurvMetrics& m)
     return d;
 }
 
-std::expected<DeviceCompState, hipError_t> DeviceCompState::make(std::size_t n)
+std::expected<DeviceCompState, hipError_t> DeviceCompState::make(std::size_t n,
+                                                                 int nT)
 {
+    assert(nT >= 0 && nT <= 2);
     DeviceCompState s;
     for (auto* b : {&s.rho, &s.mx, &s.my, &s.mz, &s.E}) {
         auto e = DeviceScalar::make(n);
         if (!e) return std::unexpected(e.error());
         *b = std::move(*e);
     }
+    for (int i = 0; i < nT; ++i) {
+        auto e = DeviceScalar::make(n);
+        if (!e) return std::unexpected(e.error());
+        s.t[i] = std::move(*e);
+    }
+    s.nT = nT;
     return s;
+}
+
+hipError_t DeviceCompState::uploadTurb(int i, const std::vector<double>& h)
+{
+    assert(i >= 0 && i < nT && h.size() == t[i].size());
+    return uploadNarrow(h, t[i]);
+}
+
+hipError_t DeviceCompState::downloadTurb(int i, std::vector<double>& h) const
+{
+    assert(i >= 0 && i < nT);
+    h.resize(t[i].size());
+    return downloadWiden(t[i], h);
 }
 
 hipError_t DeviceCompState::upload(const CompState& h)
@@ -695,8 +718,40 @@ void DeviceComp::primitives(const DeviceCompState& s)
     checkLastKernel("kPrim");
 }
 
+void DeviceComp::ransMut(const DeviceCompState& s)
+{
+    assert(rans());
+    const bool sst = ransSst(ransModel_);
+    if (sst) {
+        const PrimView q{s.rho.data(), u_.data(), v_.data(), w_.data(),
+                         e_.data(), p_.data(), T_.data()};
+        rans::sstMutCurv(g_, viscView(tr_), q, curvView(), ransModel_,
+                         s.t[0].data(), s.t[1].data(), wd_.data(), nut_.data(),
+                         f1_.data());
+    } else {
+        rans::mutCurv(g_, viscView(tr_), s.rho.data(), T_.data(),
+                      s.t[0].data(), nut_.data());
+    }
+    rans::mutMirrorY(g_, ransMirrorLo_, ransMirrorHi_, nut_.data(),
+                     sst ? f1_.data() : nullptr);
+}
+
+unsigned long long DeviceComp::floorHits() const
+{
+    if (hits_.size() == 0) return 0;
+    unsigned long long h = 0;
+    if (hits_.download(&h) != hipSuccess) return ~0ull; // reads as a failure
+    return h;
+}
+
+void DeviceComp::updateMut(const DeviceCompState& s)
+{
+    primitives(s);
+    ransMut(s);
+}
+
 void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
-                       DeviceCompState& out)
+                       DeviceCompState& out, bool residualMode)
 {
     primitives(s);
     const ViscView vv = viscView(tr_);
@@ -709,6 +764,32 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
     const MrfView mz = mrf_ ? mrfView() : MrfView{};
     if (curv_) {
         const CurvView cv = curvView();
+        if (rans()) {
+            // mu_t lagged within the stage exactly like LES: from the stage
+            // input, through the SAME nut slot of the mean-flow flux.
+            ransMut(s);
+            nutp = nut_.data();
+            kapScale = kapLes;
+            kCompStageCurv<<<launchBlocks(n), blockSize>>>(
+                g_, vv, q, cv, cmb, out.rho.data(), out.mx.data(),
+                out.my.data(), out.mz.data(), out.E.data(), nutp, kapScale, mz);
+            checkLastKernel("kCompStageCurv");
+            if (ransSst(ransModel_)) {
+                const rans::SstStageArgs a{
+                    ransModel_,         s.t[0].data(), s.t[1].data(),
+                    nut_.data(),        f1_.data(),    wd_.data(),
+                    out.rho.data(),     Real(omegaFloor_),
+                    int(ransMirrorLo_), int(ransMirrorHi_), hits_.data()};
+                rans::sstStageCurv(g_, vv, q, cv, mz, cmb, a, residualMode,
+                                   out.t[0].data(), out.t[1].data());
+            } else {
+                rans::saStageCurv(g_, vv, q, cv, mz, cmb, s.t[0].data(),
+                                  wd_.data(), residualMode, ransTransport_,
+                                  out.t[0].data());
+            }
+            if (rhsHook_) rhsHook_(s, out, cmb);
+            return;
+        }
         if (csLes_ > Real(0)) {
             kCompSmagNutCurv<<<launchBlocks(n), blockSize>>>(
                 g_, csLes_ * csLes_, sgs_ == SgsModel::Sigma ? 1 : 0, cv,
@@ -775,21 +856,34 @@ void DeviceComp::step(DeviceCompState& s, Real dt)
     // output would already have overwritten. (It did, and every NSCBC check
     // failed.) The swap is a buffer-handle exchange, not a copy -- no caller
     // may hold a raw device pointer into the state across a step.
-    auto cmb = [](const DeviceCompState& a, Real ca, const DeviceCompState& b,
-                  Real cb, Real cr) {
-        return StageCombine{{a.rho.data(), a.mx.data(), a.my.data(),
-                             a.mz.data(), a.E.data()},
-                            {b.rho.data(), b.mx.data(), b.my.data(),
-                             b.mz.data(), b.E.data()},
-                            ca, cb, cr};
+    assert(s.nT == q1_.nT); // the scalars ride the same buffers and swap
+    const Real* lts = ltsOn_ ? lts_.data() : nullptr;
+    auto cmb = [lts](const DeviceCompState& a, Real ca,
+                     const DeviceCompState& b, Real cb, Real cr) {
+        StageCombine k{{a.rho.data(), a.mx.data(), a.my.data(), a.mz.data(),
+                        a.E.data()},
+                       {b.rho.data(), b.mx.data(), b.my.data(), b.mz.data(),
+                        b.E.data()},
+                       ca, cb, cr};
+        for (int i = 0; i < a.nT; ++i) {
+            k.ta[i] = a.t[i].data();
+            k.tb[i] = b.t[i].data();
+        }
+        k.lts = lts;
+        return k;
     };
     if (hook_) hook_(s);
     stage(s, cmb(s, Real(1), s, Real(0), dt), q1_);
     if (hook_) hook_(q1_);
     stage(q1_, cmb(s, Real(0.75), q1_, Real(0.25), Real(0.25) * dt), q2_);
     if (hook_) hook_(q2_);
-    stage(q2_, cmb(s, Real(1.0 / 3.0), q2_, Real(2.0 / 3.0),
-                   Real(2.0 / 3.0) * dt), q1_);
+    // ca = 1 - cb, not Real(1/3): the two rounded thirds sum to 1 + 3e-8 in
+    // FP32, which inflated every conserved total by ~2e-8 per step on any
+    // non-uniform field (measured, gpu_mrf_conservation) and floored a steady
+    // RANS residual at 2^-25 q / dt. 1 - Real(2/3) is exact (Sterbenz), so
+    // ca + cb == 1 exactly; cr = cb dt is unchanged.
+    const Real cb3 = Real(2.0 / 3.0), ca3 = Real(1) - cb3;
+    stage(q2_, cmb(s, ca3, q2_, cb3, cb3 * dt), q1_);
     std::swap(s, q1_);
 }
 
@@ -812,6 +906,15 @@ double DeviceComp::stableDt(const DeviceCompState& s, ReduceScratch& r,
                            g_.nz > 1 ? 1.0 / g_.hz : 0.0},
                  rocprim::maximum<double>(), 0.0);
     double dt = cfl / wmax;
+    // RANS: the diffusive bound is PER CELL (mu_t varies by orders of
+    // magnitude across a boundary layer, and the global-extreme form below
+    // would pair the largest mu_t with the smallest cell). RANS-only, so the
+    // DNS/LES bound below stays byte for byte what every anchor ran with.
+    if (rans()) {
+        const double dtv = reduce(r, g_.size(), ransDiffDt(s),
+                                  rocprim::minimum<double>(), 1e300);
+        return dtv < dt ? dtv : dt;
+    }
     // Sutherland: mu is largest where T is largest, and the law is monotone,
     // so the field maximum comes from one extra reduction rather than a
     // per-cell viscosity pass. Constant viscosity skips the reduction entirely.
@@ -856,6 +959,192 @@ double DeviceComp::stableDt(const DeviceCompState& s, ReduceScratch& r,
         if (dtv < dt) dt = dtv;
     }
     return dt;
+}
+
+// --- RANS ---------------------------------------------------------------------
+
+namespace {
+
+// dtc[c] = min(cfl / wave_c, diffusive_c): the local dt of --steady.
+__global__ void kLocalDt(WavePerDtCurv wave, rans::RansDiffDt diff, double cfl,
+                         std::size_t n, double* dtc)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    const double w = wave(int(c));
+    const double a = w > 0.0 ? cfl / w : HUGE_VAL;
+    const double v = diff(int(c));
+    dtc[c] = a < v ? a : v;
+}
+
+__global__ void kLtsRatio(std::size_t n, const double* dtc, double dtRef,
+                          Real* lts)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    lts[c] = Real(dtc[c] / dtRef);
+}
+
+struct DtAt
+{
+    const double* dtc;
+    __host__ __device__ double operator()(int c) const { return dtc[c]; }
+};
+
+// Squared per-cell residual of one equation over rows [jLo, jHi], 0
+// elsewhere: 0 continuity, 1 |momentum|/rho, 2 R0/rho (energy, a scalar),
+// 4 R0/rho[] with `rho` the conserved scalar itself (SST omega: the rate of
+// ln omega).
+struct ResidSq
+{
+    GpuGrid g;
+    int jLo, jHi, which;
+    const Real *rho, *R0, *R1, *R2, *R3; // R1..R3: momentum when which == 1
+    __host__ __device__ double operator()(int c) const
+    {
+        int i, j, k;
+        decompose(g, std::size_t(c), i, j, k);
+        if (j < jLo || j > jHi) return 0.0;
+        if (which == 1) {
+            const double r = rho[c];
+            const double a = R1[c] / r, b = R2[c] / r, d = R3[c] / r;
+            return a * a + b * b + d * d;
+        }
+        const double v = which == 0 ? double(R0[c]) : double(R0[c]) / rho[c];
+        return v * v;
+    }
+};
+
+} // namespace
+
+rans::RansDiffDt DeviceComp::ransDiffDt(const DeviceCompState& s) const
+{
+    return rans::RansDiffDt{s.rho.data(), s.mx.data(), s.my.data(),
+                            s.mz.data(), s.E.data(), s.t[0].data(),
+                            ransSst(ransModel_) ? s.t[1].data() : nullptr,
+                            curv_->aov[0].data(), curv_->aov[1].data(),
+                            g_.nz > 1 ? curv_->aov[2].data() : nullptr, tr_,
+                            double(prt_)};
+}
+
+std::expected<void, hipError_t> DeviceComp::enableRans(const RansSetup& rs)
+{
+    assert(curvilinear() && !les() && rs.model != RansModel::None &&
+           rs.wallDist.size() == g_.size() && rs.omegaFloor > 0.0);
+    assert(std::ranges::all_of(rs.wallDist, [](double d) { return d > 0.0; }));
+    const std::size_t n = g_.size();
+    const int nT = ransScalars(rs.model);
+    for (auto* q : {&q1_, &q2_}) {
+        auto e = DeviceCompState::make(n, nT);
+        if (!e) return std::unexpected(e.error());
+        *q = std::move(*e);
+    }
+    for (auto* b : {&nut_, &lts_}) {
+        auto e = DeviceScalar::make(n);
+        if (!e) return std::unexpected(e.error());
+        *b = std::move(*e);
+    }
+    auto d = makeNarrow(rs.wallDist);
+    if (!d) return std::unexpected(d.error());
+    wd_ = std::move(*d);
+    auto t = DeviceBuffer<double>::make(n);
+    if (!t) return std::unexpected(t.error());
+    dtc_ = std::move(*t);
+    if (ransSst(rs.model)) {
+        auto f = DeviceScalar::make(n);
+        auto h = DeviceBuffer<unsigned long long>::make(1);
+        if (!f) return std::unexpected(f.error());
+        if (!h) return std::unexpected(h.error());
+        const unsigned long long zero = 0;
+        if (auto e = h->upload(&zero); e != hipSuccess)
+            return std::unexpected(e);
+        f1_ = std::move(*f);
+        hits_ = std::move(*h);
+    }
+    omegaFloor_ = rs.omegaFloor;
+    ransModel_ = rs.model;
+    ransMirrorLo_ = rs.mirrorYLo;
+    ransMirrorHi_ = rs.mirrorYHi;
+    ransTransport_ = rs.transportOnly;
+    return {};
+}
+
+double DeviceComp::localDt(const DeviceCompState& s, ReduceScratch& r,
+                           double cfl)
+{
+    assert(rans());
+    const std::size_t n = g_.size();
+    const MrfView mz = mrf_ ? mrfView() : MrfView{};
+    const WavePerDtCurv wave{g_, mz, s.rho.data(), s.mx.data(), s.my.data(),
+                             s.mz.data(), s.E.data(), curv_->aov[0].data(),
+                             curv_->aov[1].data(),
+                             g_.nz > 1 ? curv_->aov[2].data() : nullptr,
+                             double(tr_.gamma)};
+    kLocalDt<<<launchBlocks(n), blockSize>>>(wave, ransDiffDt(s), cfl, n,
+                                             dtc_.data());
+    checkLastKernel("kLocalDt");
+    const double dtRef = reduce(r, n, DtAt{dtc_.data()},
+                                rocprim::minimum<double>(), 1e300);
+    // A collapsed or non-finite reference is the caller's divergence report;
+    // the ratios are only meaningful against a positive one.
+    if (!(dtRef > 0.0) || !std::isfinite(dtRef)) return dtRef;
+    kLtsRatio<<<launchBlocks(n), blockSize>>>(n, dtc_.data(), dtRef,
+                                              lts_.data());
+    checkLastKernel("kLtsRatio");
+    return dtRef;
+}
+
+void DeviceComp::setLts(bool on)
+{
+    assert(!on || lts_.size() == g_.size());
+    ltsOn_ = on;
+}
+
+hipError_t DeviceComp::uploadLts(const std::vector<Real>& ratios)
+{
+    if (ratios.size() != g_.size()) return hipErrorInvalidValue;
+    if (lts_.size() != g_.size()) {
+        auto e = DeviceScalar::make(g_.size());
+        if (!e) return e.error();
+        lts_ = std::move(*e);
+    }
+    return lts_.upload(ratios.data());
+}
+
+ResidualNorms DeviceComp::residual(const DeviceCompState& s, int jLo, int jHi,
+                                   ReduceScratch& r)
+{
+    assert(rans() && s.nT == q2_.nT && 0 <= jLo && jLo <= jHi && jHi < g_.ny);
+    // ca = cb = 0, cr = 1, no lts: the mean-flow kernel and every hook then
+    // write the pure rhs (0 a + 0 b + 1 R == R exactly); the scalar kernel
+    // needs its explicit mode, because the point-implicit form would return
+    // (R + J q)/(1 + J) instead.
+    StageCombine k{{s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
+                    s.E.data()},
+                   {s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
+                    s.E.data()},
+                   Real(0), Real(0), Real(1)};
+    for (int i = 0; i < s.nT; ++i) k.ta[i] = k.tb[i] = s.t[i].data();
+    stage(s, k, q2_, true);
+    const std::size_t n = g_.size();
+    const double cnt = double(jHi - jLo + 1) * g_.nx * g_.nz;
+    auto rms = [&](int which, const Real* R0) {
+        const ResidSq f{g_, jLo, jHi, which, s.rho.data(), R0, q2_.mx.data(),
+                        q2_.my.data(), q2_.mz.data()};
+        return std::sqrt(
+            reduce(r, n, f, rocprim::plus<double>(), 0.0) / cnt);
+    };
+    ResidualNorms out;
+    out.rho = rms(0, q2_.rho.data());
+    out.mom = rms(1, nullptr);
+    out.E = rms(2, q2_.E.data());
+    out.t[0] = rms(2, q2_.t[0].data());
+    if (s.nT > 1) { // SST omega: R_w / (rho omega)
+        const ResidSq f{g_, jLo, jHi, 4, s.t[1].data(), q2_.t[1].data(),
+                        nullptr, nullptr, nullptr};
+        out.t[1] = std::sqrt(reduce(r, n, f, rocprim::plus<double>(), 0.0) / cnt);
+    }
+    return out;
 }
 
 } // namespace dns::gpu

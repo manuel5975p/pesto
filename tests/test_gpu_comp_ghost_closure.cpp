@@ -33,6 +33,7 @@
 #include "dns/comp.hpp"
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_ghost.hpp"
+#include "dns/gpu/rotortable.hpp"
 #include "dns/meshsdf.hpp"
 #include "dns/rotor.hpp"
 #include "dns/trimesh.hpp"
@@ -246,9 +247,7 @@ struct Spin
 Spin spinUp(const Grid& g, const gpu::GhostSdf& sdf, const Rotor& rot,
             double mu, double tEnd)
 {
-    const gpu::GhostWallVelocity uw = [&rot](double x, double y, double z) {
-        return rotorWallVelocity(rot, {x, y, z});
-    };
+    const gpu::GhostWallMotion uw = gpu::rotorWallMotion(rot);
     auto dev = gpu::DeviceComp::make(g, gamma_, mu);
     auto gh = gpu::DeviceCompGhost::make(g, sdf, gamma_, rhoInf, pInf, nullptr,
                                          {}, &uw);

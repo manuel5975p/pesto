@@ -90,15 +90,20 @@ public:
         // the resting wall bit-for-bit (the resting branch is kept verbatim,
         // not folded into the general form). When omega != 0, wallPos must
         // hold the nx wall-face midpoints as (x, y) pairs (ogridWallMidpoints)
-        // -- they set both the mirror velocity and the torque lever arms.
+        // -- they set both the mirror velocity and the torque lever arms --
+        // and wallSpan the nx ghost-to-fluid centre vectors (ogridWallSpans),
+        // which the pressure image needs: the wall accelerates
+        // (a = -omega^2 (p - c)), so the wall-normal momentum balance is
+        // grad p = -rho a, not zero, and p0 = p1 + rho1 a . span.
         double omega = 0;
         double cx = 0, cy = 0;
         std::vector<std::array<double, 2>> wallPos;
+        std::vector<std::array<double, 2>> wallSpan;
     };
 
     // ny >= 4, gamma > 1, Rgas > 0, rhoInf > 0, pInf > 0, |uInf| subsonic,
     // sigma in (0, 1], band > 0, Twall > 0 when isothermal, and
-    // wallPos.size() == nx when omega != 0.
+    // wallPos.size() == wallSpan.size() == nx when omega != 0.
     static std::expected<DeviceOGridBc, hipError_t> make(const Grid& g,
                                                          Config c);
 
@@ -174,9 +179,10 @@ private:
     double u_ = 0;      // live (ramped) freestream speed
     double cInf_ = 0;   // freestream sound speed
     DeviceScalar cosT_, sinT_; // nx entries: the cell-centre radial normal
-    // Moving wall only (omega != 0), nx entries each: wall-face midpoints and
-    // the wall velocity omega x (p - c) there. Null = resting wall.
-    DeviceScalar wpx_, wpy_, uwx_, uwy_;
+    // Moving wall only (omega != 0), nx entries each: wall-face midpoints, the
+    // wall velocity omega x (p - c) there, and the pressure image's increment
+    // per unit density a_wall . span. Null = resting wall.
+    DeviceScalar wpx_, wpy_, uwx_, uwy_, aspan_;
     DeviceBuffer<double> acc_; // 5 * nx * nz staging for the surface tally
     ReduceScratch red_;
 };

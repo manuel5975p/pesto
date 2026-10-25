@@ -8,11 +8,14 @@
 #include "dns/bodies.hpp"
 #include "dns/curvmesh.hpp"
 #include "check.hpp"
+#include "cli_test_util.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <format>
+#include <string>
 #include <numbers>
 #include <vector>
 
@@ -365,6 +368,61 @@ void rejection()
 
 } // namespace
 
+// The validator's flags-only O-grid numbers: the nominal-circle h1 it prints
+// IS the built mesh's first cell for a cylinder, and the boundary-layer
+// warning counts cells through the clustered radial distribution, not the
+// nominal hy (which read "0.0 cells" at Re 1e5 before).
+void validatorNumbers()
+{
+    auto c = dnstest::runCli({"flow", "--physics", "compressible", "--body",
+                              "cylinder", "--ogrid", "--n", "64", "--ny", "96",
+                              "--ogrid-far", "5", "--re", "100", "--dry-run"});
+    check(c.has_value(), "o-grid case validates");
+    if (!c) return;
+    const double R = 0.5 * c->placement.D;
+    const auto og = buildOGrid(c->grid, sdfOf(CylinderZ{0.0, 0.0, R}),
+                               OGridSpec{0.0, 0.0, 0.0, c->ogridRFar,
+                                         c->ogridBeta, c->ogridSpan});
+    check(og.has_value(), "o-grid of the validated case builds");
+    if (og) {
+        const double rel = std::abs(c->ogridH1 - og->h1) / og->h1;
+        std::printf("o-grid h1: validator %.12e, mesh %.12e (rel %.1e)\n",
+                    c->ogridH1, og->h1, rel);
+        check(rel < 1e-9, "dry-run h1 equals buildOGrid(...).h1 (cylinder)");
+    }
+    check(c->describe().find("o-grid outer row") != std::string::npos,
+          "describe names the o-grid outer row, not nscbc");
+
+    auto hi = dnstest::runCli({"flow", "--physics", "compressible", "--body",
+                               "cylinder", "--ogrid", "--re", "1e5", "--n",
+                               "512", "--ny", "256", "--dry-run"});
+    check(hi.has_value(), "o-grid Re 1e5 validates (warning only)");
+    if (!hi) return;
+    const double D = hi->placement.D;
+    const double cells = ogridRadialCells(D / std::sqrt(1e5), 256, 0.5 * D,
+                                          hi->ogridRFar, hi->ogridBeta);
+    // Bisection against the closed form: D(t*) is the target length.
+    const double tStar = cells / 254.0;
+    const double back = ogridRadialDist(tStar, hi->ogridBeta) *
+                        (hi->ogridRFar - 0.5 * D);
+    std::printf("o-grid Re 1e5: BL %.4f cells (D(t*) %.6e vs %.6e)\n", cells,
+                back, D / std::sqrt(1e5));
+    check(cells > 0.0, "BL cell count is positive");
+    check(std::abs(back - D / std::sqrt(1e5)) < 1e-12 * D,
+          "bisection solves D(t*) = (D/sqrt Re)/(rFar - D/2)");
+    const std::string want = std::format(
+        "boundary layer is {:.1f} cells (D/sqrt(Re)/h); this is "
+        "under-resolved for DNS", cells);
+    check(std::ranges::find(hi->warnings, want) != hi->warnings.end(),
+          "BL warning quotes the clustered-distribution count");
+    check(std::ranges::find(hi->warnings,
+                            std::string("o-grid far row is unmeasured above "
+                                        "Re 800 (the NSCBC Re-800 rule does "
+                                        "not apply to it)")) !=
+              hi->warnings.end(),
+          "Re > 800 on the o-grid warns");
+}
+
 int main()
 {
     axisWrapModes();
@@ -374,5 +432,6 @@ int main()
     ghostMirrorAndExtrusion();
     nonCircular();
     rejection();
+    validatorNumbers();
     return dnstest::finish();
 }
