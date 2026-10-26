@@ -89,8 +89,10 @@ public:
     // assembles P (frozen at s), factors its lines, and solves for the
     // update with GMRES. Pre: residual(s) ran at this iterate. An error
     // (exit 7) on a singular or non-finite line pivot.
+    // maxKrylov > 0 overrides Config::maxKrylov for this solve.
     std::expected<NkLinear, std::string> solve(DeviceCompState& s, double cfl,
-                                               ReduceScratch& r);
+                                               ReduceScratch& r,
+                                               int maxKrylov = 0);
 
     // The largest alpha in (0, 1] keeping rho and E within 20% and SST rho
     // omega above -50%, rho k above -90% of the iterate (whole-step scaling,
@@ -138,8 +140,9 @@ private:
     DeviceBuffer<Real> V_, w_, z_, x_;       // Krylov basis, work vectors
     DeviceBuffer<Real> Am_, At_;             // P blocks (scaled)
     DeviceBuffer<Real> Lm_, Fm_, Gm_, Lt_, Ft_, Gt_; // line factors
+    DeviceBuffer<Real> Cm_, Ct_;             // i-/i+ couplings, line-major
     DeviceBuffer<int> err_;                  // a singular pivot was met
-    DeviceBuffer<Real> rhs_;                 // line-sweep scratch
+    DeviceBuffer<Real> rhs_;                 // line-sweep scratch (line-major)
 };
 
 } // namespace dns::gpu

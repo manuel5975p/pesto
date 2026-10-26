@@ -234,13 +234,14 @@ void testOGridRansUrans()
     cleanup(prefix);
 }
 
-// runner_ogrid's explicit steady march (SA, Re 40). Measured 2026-10-25
-// (gfx1100): the integrals reach their FP32 plateau within ~5e4 iterations
-// but jitter there by ~2e-6 relative (pressure-integrated cd amplifies the
-// FP32 residual floor by p/q ~ 36 at M 0.2), above kSteadyFlat = 2^-20, so
-// the stop never certifies and the march ends at its cap with exit 8 -- the
-// honest non-convergence report (masterplan_flowrans U1/U2, docs/rans.md).
-// The smoke checks the march, the columns and the cap's exit code.
+// runner_ogrid's explicit steady march (SA, Re 40). The integrals jitter at
+// their FP32 plateau (cd 3e-7 rms: the pressure-integrated cd amplifies the
+// residual floor by p/q ~ 36 at M 0.2), which the channel's geometric rule
+// (kSteadyFlat 2^-20) never certifies; the flow's jitter-floored rule
+// (dns/steady_stop) does. Replayed offline on the recorded 1e6-iteration
+// history: TOL 1e-4 certifies at 28600 iterations, cd 2.2e-7 off the
+// plateau 1.5701190 (gfx1100, 2026-10-26). The 2000-iteration cap is still
+// exit 8 with a row every 200 iterations.
 void testOGridRansSteadyCap()
 {
     const std::string prefix = "runner_ogrid_sa_steady";
@@ -260,6 +261,28 @@ void testOGridRansSteadyCap()
         check(maxOf(prefix, "floorHits") == 0, "runner_ogrid --steady: 0 hits");
     }
     cleanup(prefix);
+
+    const std::string cert = "runner_ogrid_sa_certify";
+    const int rc2 = runDns("flow --physics compressible --body cylinder --ogrid "
+                           "--n 256 --ny 96 --re 40 --rans sa-neg --steady 1e-4 "
+                           "--steady-steps 200000 --out " + cert);
+    check(rc2 == 0, "runner_ogrid --steady 1e-4: the jitter-floored stop "
+                    "certifies (exit 0)");
+    const auto t2 = valtest::loadCsv(cert + "_stats.csv");
+    if (t2 && !t2->col("iter").empty())
+    {
+        const double it = t2->col("iter").back(), cd = t2->col("cd").back();
+        const double rem = t2->col("remaining").back();
+        std::printf("  SA Re 40 certified at %.0f iterations, cd %.7f, "
+                    "remaining %.2e\n", it, cd, rem);
+        check(it >= 2e4 && it <= 6e4,
+              "certified between 2e4 and 6e4 iterations (offline 28600)");
+        check(std::abs(cd / 1.5701190 - 1) < 1e-4,
+              "certified cd within TOL of the 1e6-iteration plateau 1.5701190");
+        check(rem < 1e-4, "the last row's remaining < TOL");
+        check(maxOf(cert, "floorHits") == 0, "certified run: 0 hits");
+    }
+    cleanup(cert);
 }
 
 // The revolved sphere's axisymmetric wedge through the binary: the steady
@@ -350,6 +373,21 @@ void testImmersedRansUrans()
         check(maxOf(prefix, "floorHits") == 0, "runner_comp RANS: 0 hits");
     }
     cleanup(prefix);
+
+    // Immersed SST on the 384^2 Re 1000 cylinder (48 cells across D): the
+    // counted k guard used to fire from the first steps (1.2e3 hits by t 0.25,
+    // 5.5e5 over 7.5e4 steps) through the odd ghost image of k; the even
+    // quadratic image + wall-value convection: 0 over 7.5e4 steps (measured
+    // 2026-10-26, gfx1100). Pinned on the first ~4000 steps (~3 s).
+    const std::string sst = "runner_comp_sst_urans";
+    const int rc2 = runDns("flow --physics compressible --body cylinder --nz 1 "
+                           "--n 384 --re 1000 --rans sst-2003m --ft 0.55 "
+                           "--emit stats --out " + sst);
+    check(rc2 == 0, "runner_comp --rans sst-2003m 384^2: exits 0");
+    if (rc2 == 0)
+        check(maxOf(sst, "floorHits") == 0,
+              "runner_comp SST 384^2: 0 counted k / omega guard hits");
+    cleanup(sst);
 }
 
 } // namespace

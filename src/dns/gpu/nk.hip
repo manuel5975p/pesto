@@ -420,17 +420,30 @@ struct LineArgs
     NkLayout lay;
     int nT;
     const Real *Am, *At;
-    Real *Fm, *Lm, *Gm; // Dinv'_j, L'_j and G_j = Dinv'_j U_j per cell
-    Real *Ft, *Lt, *Gt; // their scalar twins
+    // The line factors, LINE-MAJOR (row l = lineCell(i, jj, k)) with each
+    // row's entries contiguous, so a chain's chunk of rows is one contiguous
+    // read: Dinv'_j, L'_j and G_j = Dinv'_j U_j (25 per row), their scalar
+    // twins (2 per row), and the i-/i+ couplings (2 x 25, 2 x 2 per row)
+    // copied out of Am/At (zero where the neighbour is not a real cell).
+    Real *Fm, *Lm, *Gm;
+    Real *Ft, *Lt, *Gt;
+    Real *Cm, *Ct;
     int* err;
+    __device__ int lines() const { return lay.iHi - lay.iLo + 1; }
+    __device__ std::size_t lineCell(int i, int jj, int k) const
+    {
+        return (std::size_t(k - lay.kLo) * lines() + std::size_t(i - lay.iLo)) *
+                   std::size_t(g.ny - 2) +
+               std::size_t(jj);
+    }
 };
 
 // One thread per line (i, k): block Thomas along j. The substitution then
 // needs y_j = rhs_j - L'_j y_{j-1} and x_j = Dinv'_j y_j - G_j x_{j+1}: one
 // 5x5 product per row on each serial chain.
-__global__ void kFactor(LineArgs A)
+__global__ void kFactor(LineArgs A, const std::uint8_t* mask)
 {
-    const int ni = A.lay.iHi - A.lay.iLo + 1;
+    const int ni = A.lines();
     const int t = int(std::size_t(blockIdx.x) * blockDim.x + threadIdx.x);
     if (t >= ni * (A.lay.kHi - A.lay.kLo + 1)) return;
     const int i = A.lay.iLo + t % ni, k = A.lay.kLo + t / ni;
@@ -445,6 +458,19 @@ __global__ void kFactor(LineArgs A)
     double tdinv[2] = {0, 0}, tuprev[2] = {0, 0};
     for (int j = 1; j <= g.ny - 2; ++j) {
         const std::size_t c = gidx(g, i, j, k);
+        const std::size_t l = A.lineCell(i, j - 1, k);
+        // The off-line couplings (slots 0, 1: i-, i+), real neighbours only.
+        const Offsets o = offsetsAt(g, i, j, k);
+        for (int slot = 0; slot < 2; ++slot) {
+            const std::size_t nb = slot ? c + o.p[0] : c + o.m[0];
+            const bool real = mask[nb] && nb != c;
+            for (int e = 0; e < 25; ++e)
+                A.Cm[(l * 2 + slot) * 25 + e] =
+                    real ? A.Am[std::size_t((1 + slot) * 25 + e) * n + c] : Real(0);
+            for (int e = 0; e < A.nT; ++e)
+                A.Ct[(l * 2 + slot) * 2 + e] =
+                    real ? A.At[std::size_t(e * kBlocks + 1 + slot) * n + c] : Real(0);
+        }
         double D[5][5], L[5][5] = {};
         blk(0, c, D);
         if (j > 1) {
@@ -472,16 +498,16 @@ __global__ void kFactor(LineArgs A)
             for (int s = 0; s < 5; ++s) {
                 double gq = 0;
                 for (int q = 0; q < 5; ++q) gq += Dinv[r][q] * Uprev[q][s];
-                A.Fm[std::size_t(r * 5 + s) * n + c] = Real(Dinv[r][s]);
-                A.Lm[std::size_t(r * 5 + s) * n + c] = Real(L[r][s]);
-                A.Gm[std::size_t(r * 5 + s) * n + c] = Real(gq);
+                A.Fm[l * 25 + r * 5 + s] = Real(Dinv[r][s]);
+                A.Lm[l * 25 + r * 5 + s] = Real(L[r][s]);
+                A.Gm[l * 25 + r * 5 + s] = Real(gq);
             }
         for (int e = 0; e < A.nT; ++e) {
             const double a = A.At[std::size_t(e * kBlocks) * n + c];
-            double l = 0, d = a;
+            double lt = 0, d = a;
             if (j > 1) {
-                l = A.At[std::size_t(e * kBlocks + 3) * n + c] * tdinv[e];
-                d -= l * tuprev[e];
+                lt = A.At[std::size_t(e * kBlocks + 3) * n + c] * tdinv[e];
+                d -= lt * tuprev[e];
             }
             if (!(fabs(d) > 1e-300) || !isfinite(d)) {
                 atomicExch(A.err, 1);
@@ -489,9 +515,9 @@ __global__ void kFactor(LineArgs A)
             }
             tdinv[e] = 1.0 / d;
             tuprev[e] = A.At[std::size_t(e * kBlocks + 4) * n + c];
-            A.Ft[std::size_t(e) * n + c] = Real(tdinv[e]);
-            A.Lt[std::size_t(e) * n + c] = Real(l);
-            A.Gt[std::size_t(e) * n + c] = Real(tdinv[e] * tuprev[e]);
+            A.Ft[l * 2 + e] = Real(tdinv[e]);
+            A.Lt[l * 2 + e] = Real(lt);
+            A.Gt[l * 2 + e] = Real(tdinv[e] * tuprev[e]);
         }
     }
 }
@@ -502,108 +528,198 @@ struct SweepArgs
     const std::uint8_t* mask;
     const Real* r;  // F x n
     Real* z;        // F x n
-    Real* y;        // F x n: the forward substitution of the line being solved
+    Real* y;        // line-major scratch, 8 per row: the line's substitution
     int F;
 };
 
-// Line i, one 32-lane workgroup per plane k (k couples nothing: nz == 1 skips
-// it, the wedge's k neighbours are folded ghosts). Phase 1, all rows in
-// parallel: rhs_j = r_j - (i+-, k+- couplings) z. Phase 2, the serial
-// chain y_j = rhs_j - L'_j y_{j-1}: lane l < 25 forms one product of the 5x5,
-// the five row sums are a shared-memory reduction. Phase 3, all rows:
-// w_j = Dinv'_j y_j. Phase 4, the chain x_j = w_j - G_j x_{j+1} into z.
+// The whole symmetric sweep in ONE launch: one 32-lane workgroup (one
+// wavefront) per plane k (k couples nothing: nz == 1 skips it, the wedge's k
+// neighbours are folded ghosts), looping over the lines in the fixed order
+// iLo..iHi, iHi-1..iLo. Per line i: phase 1, all rows in parallel: rhs_j =
+// r_j - (i-, i+ couplings) z; phase 2, the serial chain y_j = rhs_j - L'_j
+// y_{j-1}; phase 3, all rows: w_j = Dinv'_j y_j; phase 4, the chain x_j =
+// w_j - G_j x_{j+1} into z. FP32 throughout (P is a preconditioner: N3 pins
+// it against a host FP64 dense block GS). The chains are latency-bound: their
+// rows are staged into LDS a contiguous chunk at a time, and EVERY lane
+// carries the whole running vector (the 5 x 5 product redundantly, broadcast
+// LDS reads), so a row costs no shuffle and no barrier. Measured (gfx1100,
+// cylinder 256 x 96): 62 ms per sweep with one launch per line, FP64 chains
+// and cell-major factors -- 99% of a Newton step (docs/rans.md).
 constexpr int kLineLanes = 32;
-__global__ void __launch_bounds__(kLineLanes)
-kSweepLine(SweepArgs A, int i)
+constexpr int kChainChunk = 64;
+__device__ void sweepOneLine(const SweepArgs& A, int i, int k)
 {
     const GpuGrid& g = A.L.g;
     const std::size_t n = g.size();
-    const int k = A.L.lay.kLo + int(blockIdx.x);
     const int nf = g.ny - 2, F = A.F, nT = A.L.nT;
     const int lane = threadIdx.x;
-    auto cell = [&](int jj) { return gidx(g, i, 1 + jj, k); };
-    // Phase 1.
+    const std::size_t l0 = A.L.lineCell(i, 0, k);
+    // Phase 1 (every load issued before the arithmetic that consumes it).
     for (int jj = lane; jj < nf; jj += kLineLanes) {
         const int j = 1 + jj;
-        const std::size_t c = cell(jj);
+        const std::size_t c = gidx(g, i, j, k), l = l0 + jj;
         const Offsets o = offsetsAt(g, i, j, k);
-        double y[7];
-        for (int f = 0; f < F; ++f) y[f] = A.r[f * n + c];
-        for (int slot = 0; slot < 6; ++slot) {
-            if (slot == 2 || slot == 3) continue; // j: in-line
-            const int a = slot / 2, side = slot % 2;
-            const std::size_t nb = side ? c + o.p[a] : c + o.m[a];
-            if (!A.mask[nb] || nb == c) continue;
+        const std::size_t nb[2] = {c + o.m[0], c + o.p[0]};
+        float y[7], zn[2][7], C[2][25], Cs[2][2];
+#pragma unroll
+        for (int f = 0; f < 7; ++f) {
+            y[f] = f < F ? A.r[f * n + c] : 0.0f;
+#pragma unroll
+            for (int slot = 0; slot < 2; ++slot)
+                zn[slot][f] = f < F ? A.z[f * n + nb[slot]] : 0.0f;
+        }
+#pragma unroll
+        for (int slot = 0; slot < 2; ++slot) {
+#pragma unroll
+            for (int e = 0; e < 25; ++e) C[slot][e] = A.L.Cm[(l * 2 + slot) * 25 + e];
+#pragma unroll
+            for (int e = 0; e < 2; ++e)
+                Cs[slot][e] = e < nT ? A.L.Ct[(l * 2 + slot) * 2 + e] : 0.0f;
+        }
+#pragma unroll
+        for (int slot = 0; slot < 2; ++slot) {
+#pragma unroll
             for (int r = 0; r < 5; ++r) {
-                double sum = 0;
-                for (int q = 0; q < 5; ++q)
-                    sum += double(A.L.Am[std::size_t((1 + slot) * 25 + r * 5 + q) *
-                                             n + c]) *
-                           double(A.z[q * n + nb]);
+                float sum = 0;
+#pragma unroll
+                for (int q = 0; q < 5; ++q) sum += C[slot][r * 5 + q] * zn[slot][q];
                 y[r] -= sum;
             }
-            for (int e = 0; e < nT; ++e)
-                y[5 + e] -=
-                    double(A.L.At[std::size_t(e * kBlocks + 1 + slot) * n + c]) *
-                    double(A.z[(5 + e) * n + nb]);
+#pragma unroll
+            for (int e = 0; e < 2; ++e) y[5 + e] -= Cs[slot][e] * zn[slot][5 + e];
         }
-        for (int f = 0; f < F; ++f) A.y[f * n + c] = Real(y[f]);
+#pragma unroll
+        for (int f = 0; f < 7; ++f)
+            if (f < F) A.y[l * 8 + f] = y[f];
     }
     __syncthreads();
-    // Phases 2 and 4: one serial chain v_j = b_j - M_j v_{j -+ 1}.
-    __shared__ double prod[kLineLanes];
-    __shared__ double vprev[7];
-    const int r = lane / 5, q = lane % 5;
-    auto chain = [&](const Real* M, const Real* Ms, const Real* b, Real* out,
-                     bool down) {
-        if (lane < 7) vprev[lane] = 0.0;
-        __syncthreads();
-        for (int step = 0; step < nf; ++step) {
-            const int jj = down ? nf - 1 - step : step;
-            const std::size_t c = cell(jj);
-            if (lane < 25)
-                prod[lane] = step ? double(M[std::size_t(lane) * n + c]) * vprev[q]
-                                  : 0.0;
-            else if (lane < 25 + nT)
-                prod[lane] = step ? double(Ms[std::size_t(lane - 25) * n + c]) *
-                                        vprev[5 + lane - 25]
-                                  : 0.0;
-            __syncthreads();
-            double v = 0;
-            if (lane < 5) {
-                v = double(b[std::size_t(lane) * n + c]) -
-                    (prod[lane * 5] + prod[lane * 5 + 1] + prod[lane * 5 + 2] +
-                     prod[lane * 5 + 3] + prod[lane * 5 + 4]);
-            } else if (lane < 5 + nT) {
-                v = double(b[std::size_t(lane) * n + c]) - prod[25 + lane - 5];
+    // Phases 2 and 4: one serial chain v_j = b_j - M_j v_{j -+ 1}. A chunk's
+    // rows are one contiguous range [r0, r0 + cnt) of l; the staging copies
+    // them FLAT and unrolled (independent loads in flight before any LDS
+    // write: a load-wait-store loop serialised ~70 global round trips per
+    // chunk, which was the sweep's cost).
+    __shared__ float sM[kChainChunk * 25];
+    __shared__ float sS[kChainChunk * 2];
+    __shared__ float sB[kChainChunk * 8];
+    auto stage = [&](float* dst, const Real* src, int m) {
+        constexpr int U = 32;
+        for (int e0 = 0; e0 < m; e0 += U * kLineLanes) {
+            float t[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int e = e0 + u * kLineLanes + lane;
+                t[u] = e < m ? src[e] : 0.0f;
             }
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int e = e0 + u * kLineLanes + lane;
+                if (e < m) dst[e] = t[u];
+            }
+        }
+    };
+    auto chain = [&](const Real* M, const Real* Ms, bool down, bool toZ) {
+        float v[7] = {0, 0, 0, 0, 0, 0, 0};
+        for (int base = 0; base < nf; base += kChainChunk) {
+            const int cnt = nf - base < kChainChunk ? nf - base : kChainChunk;
+            // Rows jj in [j0, j0 + cnt): ascending from base, or the top ones.
+            const int j0 = down ? nf - base - cnt : base;
+            const std::size_t r0 = l0 + j0;
+            stage(sM, M + r0 * 25, cnt * 25);
+            stage(sS, Ms + r0 * 2, cnt * 2);
+            stage(sB, A.y + r0 * 8, cnt * 8);
             __syncthreads();
-            if (lane < 5 + nT) {
-                vprev[lane] = v;
-                out[std::size_t(lane) * n + c] = Real(v);
+            // Row rr's operands are read one row ahead (software pipelined:
+            // the LDS latency overlaps the previous row's arithmetic).
+            auto rowOf = [&](int rr) {
+                const int jj = down ? nf - 1 - (base + rr) : base + rr;
+                return jj - j0;
+            };
+            float Mc[25], Bc[7], Sc[2];
+            auto fetch = [&](int q0) {
+#pragma unroll
+                for (int e = 0; e < 25; ++e) Mc[e] = sM[q0 * 25 + e];
+#pragma unroll
+                for (int e = 0; e < 7; ++e) Bc[e] = sB[q0 * 8 + e];
+                Sc[0] = sS[q0 * 2];
+                Sc[1] = sS[q0 * 2 + 1];
+            };
+            fetch(rowOf(0));
+            for (int rr = 0; rr < cnt; ++rr) {
+                const int step = base + rr;
+                const int jj = down ? nf - 1 - step : step;
+                const float on = step ? 1.0f : 0.0f;
+                float M2[25], B2[7], S2[2];
+#pragma unroll
+                for (int e = 0; e < 25; ++e) M2[e] = Mc[e];
+#pragma unroll
+                for (int e = 0; e < 7; ++e) B2[e] = Bc[e];
+                S2[0] = Sc[0];
+                S2[1] = Sc[1];
+                if (rr + 1 < cnt) fetch(rowOf(rr + 1));
+                float nv[7];
+#pragma unroll
+                for (int r = 0; r < 5; ++r) {
+                    float acc = 0;
+#pragma unroll
+                    for (int q = 0; q < 5; ++q) acc += M2[r * 5 + q] * v[q];
+                    nv[r] = B2[r] - on * acc;
+                }
+#pragma unroll
+                for (int e = 0; e < 2; ++e)
+                    nv[5 + e] = e < nT ? B2[5 + e] - on * S2[e] * v[5 + e] : 0.0f;
+#pragma unroll
+                for (int f = 0; f < 7; ++f) v[f] = nv[f];
+                if (lane < F) {
+                    float o = v[0];
+#pragma unroll
+                    for (int f = 1; f < 7; ++f)
+                        if (lane == f) o = v[f];
+                    if (toZ) A.z[std::size_t(lane) * n + gidx(g, i, 1 + jj, k)] = o;
+                    else A.y[(l0 + jj) * 8 + lane] = o;
+                }
             }
             __syncthreads();
         }
-        (void)r;
     };
-    chain(A.L.Lm, A.L.Lt, A.y, A.y, false);
-    // Phase 3: w_j = Dinv'_j y_j, in place.
+    chain(A.L.Lm, A.L.Lt, false, false);
+    // Phase 3: w_j = Dinv'_j y_j, in place (loads first).
     for (int jj = lane; jj < nf; jj += kLineLanes) {
-        const std::size_t c = cell(jj);
-        double y[7], w[7];
-        for (int f = 0; f < F; ++f) y[f] = A.y[f * n + c];
+        const std::size_t l = l0 + jj;
+        float y[7], Fr[25], Fs[2], w[7];
+#pragma unroll
+        for (int f = 0; f < 7; ++f) y[f] = f < F ? A.y[l * 8 + f] : 0.0f;
+#pragma unroll
+        for (int e = 0; e < 25; ++e) Fr[e] = A.L.Fm[l * 25 + e];
+#pragma unroll
+        for (int e = 0; e < 2; ++e) Fs[e] = e < nT ? A.L.Ft[l * 2 + e] : 0.0f;
+#pragma unroll
         for (int rr = 0; rr < 5; ++rr) {
-            double sum = 0;
-            for (int qq = 0; qq < 5; ++qq)
-                sum += double(A.L.Fm[std::size_t(rr * 5 + qq) * n + c]) * y[qq];
+            float sum = 0;
+#pragma unroll
+            for (int qq = 0; qq < 5; ++qq) sum += Fr[rr * 5 + qq] * y[qq];
             w[rr] = sum;
         }
-        for (int e = 0; e < nT; ++e)
-            w[5 + e] = double(A.L.Ft[std::size_t(e) * n + c]) * y[5 + e];
-        for (int f = 0; f < F; ++f) A.y[f * n + c] = Real(w[f]);
+#pragma unroll
+        for (int e = 0; e < 2; ++e) w[5 + e] = Fs[e] * y[5 + e];
+#pragma unroll
+        for (int f = 0; f < 7; ++f)
+            if (f < F) A.y[l * 8 + f] = w[f];
     }
     __syncthreads();
-    chain(A.L.Gm, A.L.Gt, A.y, A.z, true);
+    chain(A.L.Gm, A.L.Gt, true, true);
+}
+
+__global__ void __launch_bounds__(kLineLanes) kSweepAll(SweepArgs A)
+{
+    const int k = A.L.lay.kLo + int(blockIdx.x);
+    const int iLo = A.L.lay.iLo, ni = A.L.lay.iHi - iLo + 1;
+    for (int s = 0; s < 2 * ni - 1; ++s) {
+        const int i = s < ni ? iLo + s : iLo + 2 * ni - 2 - s;
+        sweepOneLine(A, i, k);
+        // The next line's phase 1 reads this line's z (same workgroup).
+        __threadfence_block();
+        __syncthreads();
+    }
 }
 
 // Step bounds per real cell: the largest alpha in (0, 1] keeping rho and E
@@ -664,6 +780,10 @@ DeviceNk::make(DeviceComp& dev, const std::vector<std::uint8_t>& mask,
     k.n_ = k.g_.size();
     k.count_ = double(std::ranges::count(mask, std::uint8_t(1)));
     const std::size_t n = k.n_, F = std::size_t(k.F_);
+    // Line-major rows: every real (i, k) line's ny - 2 cells.
+    const std::size_t nl = std::size_t(c.lay.iHi - c.lay.iLo + 1) *
+                           std::size_t(c.lay.kHi - c.lay.kLo + 1) *
+                           std::size_t(k.g_.ny - 2);
     auto mk = [&](auto& b, std::size_t sz) -> hipError_t {
         auto e = std::remove_reference_t<decltype(b)>::make(sz);
         if (!e) return e.error();
@@ -678,11 +798,10 @@ DeviceNk::make(DeviceComp& dev, const std::vector<std::uint8_t>& mask,
                          {&k.w_, F * n}, {&k.z_, F * n}, {&k.x_, F * n},
                          {&k.Am_, std::size_t(kBlocks) * 25 * n},
                          {&k.At_, std::size_t(kBlocks) * std::max(1, k.nT_) * n},
-                         {&k.Lm_, 25 * n}, {&k.Fm_, 25 * n}, {&k.Gm_, 25 * n},
-                         {&k.Lt_, std::size_t(std::max(1, k.nT_)) * n},
-                         {&k.Ft_, std::size_t(std::max(1, k.nT_)) * n},
-                         {&k.Gt_, std::size_t(std::max(1, k.nT_)) * n},
-                         {&k.rhs_, F * n}})
+                         {&k.Lm_, 25 * nl}, {&k.Fm_, 25 * nl}, {&k.Gm_, 25 * nl},
+                         {&k.Lt_, 2 * nl}, {&k.Ft_, 2 * nl}, {&k.Gt_, 2 * nl},
+                         {&k.Cm_, 50 * nl}, {&k.Ct_, 4 * nl},
+                         {&k.rhs_, 8 * nl}})
         if ((e = mk(*b, sz)) != hipSuccess) return std::unexpected(e);
     if ((e = mk(k.mask_, n)) != hipSuccess) return std::unexpected(e);
     if ((e = k.mask_.upload(mask.data())) != hipSuccess) return std::unexpected(e);
@@ -822,11 +941,11 @@ std::expected<void, std::string> DeviceNk::assemble(DeviceCompState& s,
     checkLastKernel("kAssemble");
     const int zero = 0;
     (void)err_.upload(&zero);
-    LineArgs L{g_,         c_.lay,      nT_,         Am_.data(), At_.data(),
-               Fm_.data(), Lm_.data(),  Gm_.data(),  Ft_.data(), Lt_.data(),
-               Gt_.data(), err_.data()};
+    LineArgs L{g_,         c_.lay,     nT_,        Am_.data(), At_.data(),
+               Fm_.data(), Lm_.data(), Gm_.data(), Ft_.data(), Lt_.data(),
+               Gt_.data(), Cm_.data(), Ct_.data(), err_.data()};
     const int lines = (c_.lay.iHi - c_.lay.iLo + 1) * (c_.lay.kHi - c_.lay.kLo + 1);
-    kFactor<<<launchBlocks(std::size_t(lines)), blockSize>>>(L);
+    kFactor<<<launchBlocks(std::size_t(lines)), blockSize>>>(L, mask_.data());
     checkLastKernel("kFactor");
     int bad = 0;
     (void)err_.download(&bad);
@@ -840,7 +959,8 @@ void DeviceNk::precond(const DeviceBuffer<Real>& rr, DeviceBuffer<Real>& z)
     (void)hipMemset(z.data(), 0, z.size() * sizeof(Real));
     const LineArgs L{g_,         c_.lay,     nT_,        Am_.data(),
                      At_.data(), Fm_.data(), Lm_.data(), Gm_.data(),
-                     Ft_.data(), Lt_.data(), Gt_.data(), err_.data()};
+                     Ft_.data(), Lt_.data(), Gt_.data(), Cm_.data(),
+                     Ct_.data(), err_.data()};
     const SweepArgs S{L, mask_.data(), rr.data(), z.data(), rhs_.data(), F_};
     // Symmetric LEXICOGRAPHIC line Gauss-Seidel: i ascending, then
     // descending (the last line not repeated); a cyclic i's wrap neighbour
@@ -848,17 +968,16 @@ void DeviceNk::precond(const DeviceBuffer<Real>& rr, DeviceBuffer<Real>& z)
     // 96): 5-8 Krylov per Newton step at the CFL cap, against 200 (the cap,
     // stalled) for red-black lines -- which the plan forbids anyway.
     const unsigned nk = unsigned(c_.lay.kHi - c_.lay.kLo + 1);
-    for (int i = c_.lay.iLo; i <= c_.lay.iHi; ++i)
-        kSweepLine<<<nk, kLineLanes>>>(S, i);
-    for (int i = c_.lay.iHi - 1; i >= c_.lay.iLo; --i)
-        kSweepLine<<<nk, kLineLanes>>>(S, i);
-    checkLastKernel("kSweepLine");
+    kSweepAll<<<nk, kLineLanes>>>(S);
+    checkLastKernel("kSweepAll");
 }
 
 std::expected<NkLinear, std::string> DeviceNk::solve(DeviceCompState& s,
                                                      double cfl,
-                                                     ReduceScratch& r)
+                                                     ReduceScratch& r,
+                                                     int maxKrylov)
 {
+    const int cap = maxKrylov > 0 ? maxKrylov : c_.maxKrylov;
     if (auto a = assemble(s, cfl, r); !a) return std::unexpected(a.error());
     const std::size_t m = n_ * F_;
     const int M = c_.restart;
@@ -878,14 +997,14 @@ std::expected<NkLinear, std::string> DeviceNk::solve(DeviceCompState& s,
     auto Vk = [&](int j) { return V_.data() + std::size_t(j) * m; };
     // r0 = b - A x (x = 0 first cycle: r0 = b).
     (void)hipMemcpy(Vk(0), w_.data(), m * sizeof(Real), hipMemcpyDeviceToDevice);
-    while (out.krylov < c_.maxKrylov) {
+    while (out.krylov < cap) {
         const double beta = std::sqrt(dot(Vk(0), Vk(0), r));
         if (!std::isfinite(beta)) return std::unexpected("GMRES breakdown");
         kScale<<<launchBlocks(m), blockSize>>>(m, Real(1.0 / beta), Vk(0), Vk(0));
         std::fill(gv.begin(), gv.end(), 0.0);
         gv[0] = beta;
         int jUsed = 0;
-        for (int j = 0; j < M && out.krylov < c_.maxKrylov; ++j) {
+        for (int j = 0; j < M && out.krylov < cap; ++j) {
             // w = A P^-1 v_j
             (void)hipMemcpy(w_.data(), Vk(j), m * sizeof(Real),
                             hipMemcpyDeviceToDevice);

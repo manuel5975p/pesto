@@ -16,8 +16,10 @@
 
 #include <cmath>
 #include <expected>
+#include <format>
 #include <functional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace dns::gpu::internal {
@@ -27,12 +29,28 @@ struct SteadyMarchParams
     double cfl = 0.4;        // local CFL of every cell
     double dtMargin = 0.95;  // dtRef = margin * min_c dt_c
     double collapse = 1e-6;  // dtRef below this: exit 7 (per-physics, run_loop)
+    // > 0: ALSO exit 7 when dtRef falls below collapseRel x the first dtRef.
+    // A mesh whose smallest cell legitimately sits under `collapse` (the
+    // revolved wedge's axis cells, width rho dphi: ~1e-6 at 256 x 192 x 5 deg
+    // laminar) sets collapse = 0 and keeps this divergence guard instead.
+    double collapseRel = 0;
     double tol = 0;          // --steady TOL; > 0
     int dtRecompute = 16;    // iterations between localDt calls
     long cap = 0;            // --steady-steps; reaching it ends the march
     long statsEvery = 200;   // iterations between stop samples
     int series = 1;          // stop series per sample
+    // -1: the channel's geometric rule (steadyRemaining); >= 0: the flow's
+    // jitter-floored rule (steadyFloor), the first `observables` series being
+    // reported values and the rest monitors.
+    int observables = -1;
 };
+
+// The stop the params ask for.
+inline SteadyStop makeSteadyStop(const SteadyMarchParams& p)
+{
+    return p.observables < 0 ? SteadyStop(p.series)
+                             : SteadyStop(p.series, p.observables);
+}
 
 // What the runner sees of one stats sample, after the stop has heard it.
 struct SteadyRow
@@ -68,7 +86,28 @@ struct SteadyResult
     double t = 0;          // accumulated dtRef
     bool converged = false;
     double remaining = HUGE_VAL;
+    // The floored rule's last per-series reading (empty under the geometric
+    // rule): the trend and the jitter floor the runner reports.
+    std::vector<SteadyFloor> floors;
 };
+
+// The floored rule's end-of-run line: per series its trend and jitter floor
+// (relative), "-" where the window is still too short. Empty under the
+// geometric rule. Pre: names.size() == floors.size() when non-empty.
+inline std::string steadyFloorReport(const std::vector<SteadyFloor>& floors,
+                                     std::span<const char* const> names)
+{
+    if (floors.empty()) return {};
+    std::string s = "# steady stop (jitter-floored, relative):";
+    for (std::size_t i = 0; i < floors.size(); ++i) {
+        const SteadyFloor& f = floors[i];
+        s += std::format("{} {} ", i ? " |" : "", names[i]);
+        s += std::isfinite(f.jitter)
+                 ? std::format("trend {:.2e} jitter {:.2e}", f.trend, f.jitter)
+                 : std::string("window too short");
+    }
+    return s + "\n";
+}
 
 // The march. Pre: dev.localDt is callable (enableRans or enableSteady ran),
 // s is boundary-consistent, p.tol > 0, p.cap >= 1. Leaves the lts ratios ON.
@@ -79,10 +118,10 @@ explicitSteadyMarch(DeviceComp& dev, DeviceCompState& s, ReduceScratch& red,
                     const SteadyMarchParams& p, const SteadyMarchIo& io)
 {
     dev.setLts(true);
-    SteadyStop stop(p.series);
+    SteadyStop stop = makeSteadyStop(p);
     StatsCadence cad{p.statsEvery};
     SteadyResult res;
-    double dtRef = 0.0;
+    double dtRef = 0.0, dt0 = 0.0;
     int sinceDt = 1 << 30;
     while (!res.converged && res.steps < p.cap) {
         if (stopRequested()) break;
@@ -91,6 +130,11 @@ explicitSteadyMarch(DeviceComp& dev, DeviceCompState& s, ReduceScratch& red,
                                  [&] { return dev.localDt(s, red, p.cfl); });
             !e)
             return fail(7, e.error());
+        if (dt0 == 0) dt0 = dtRef;
+        if (p.collapseRel > 0 && dtRef < p.collapseRel * dt0)
+            return fail(7, std::format("dt collapsed to {:.3e} from {:.3e} -- "
+                                       "the state diverged",
+                                       dtRef, dt0));
         dev.step(s, Real(dtRef));
         io.afterStep(s);
         res.t += dtRef;
@@ -112,6 +156,7 @@ explicitSteadyMarch(DeviceComp& dev, DeviceCompState& s, ReduceScratch& red,
         if (print) cad.printed(res.steps);
         cad.logged(res.steps);
     }
+    res.floors = stop.floors();
     return res;
 }
 

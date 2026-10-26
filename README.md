@@ -175,19 +175,23 @@ replace the positional. Explicit CLI flags override the file.
   residual R = max|du/dt|·D/U² < TOL, `--ft` the give-up cap. Compressible
   (`--ogrid` with or without `--rans`, or an immersed body with `--rans`):
   PSEUDO-time, stopped on the integrals (cd, cdf, the wake deficit, the
-  turbulence integrals) extrapolated to their fixed point, TOL ∈ [1e-6, 1),
-  `--steady-steps` the cap (exit 8); rejects `--ft`, `--ramp`, `--kick`,
-  `--seq`, time-keyed frames. `--steady-scheme explicit` (default; local time
-  stepping on the compensated state, cap 1000000) or `implicit` (Newton–
-  Krylov, `--ogrid` at `--nz 1` or the wedge, cap 500). Neither stop
-  certifies on an external flow (the integrals' FP32 jitter is ~1e-5, above
-  2^-20; gate B0 failed, `docs/rans.md`): runs end at the cap with exit 8 and
-  the settled plateau in the stats.
+  turbulence integrals), TOL ∈ [1e-6, 1), `--steady-steps` the cap (exit 8);
+  rejects `--ft`, `--ramp`, `--kick`, `--seq`, time-keyed frames. On
+  `dns flow` the stop is JITTER-FLOORED (`docs/rans.md` "Stopping on a
+  jitter floor"): the trend of block means below TOL (cd, cdf: trend +
+  √2·jitter, the last sample inside TOL), monitors' jitter ≤ 2^-10; every
+  run ends with a `# steady stop (jitter-floored, relative): ... trend ...
+  jitter ...` line. `--steady-scheme explicit` (default; local time stepping
+  on the compensated state, cap 1000000) or `implicit` (Newton–Krylov,
+  `--ogrid` at `--nz 1` or the wedge, cap 500; slower than explicit wherever
+  measured, and it does not converge from a cold start on the Re 1e4
+  wedge).
 * **RANS** (`--physics compressible`; `docs/rans.md` "dns flow"): `--rans
   none|sa-neg|sst-2003m|sst-vm` on the O-grid or on the immersed ghost wall
   (labelled `[immersed ghost wall: first-order wall position, NOT
-  body-fitted]`; two of its gates failed — SST guard hits at the staircase,
-  scalar drift at the NSCBC columns), freestream in freestream units
+  body-fitted]`; even quadratic ghost image of k, wall-value convection
+  through the staircase faces, the scalars carried by the NSCBC density at
+  the open faces), freestream in freestream units
   `--rans-nutinf` 3 (SA ν̃∞/ν∞), `--rans-kinf` 2.25e-7 (SST k∞/U∞²),
   `--rans-mutinf` 0.009 (SST μt∞/μ∞); labelled `RANS <variant> -- URANS
   (time-accurate)` or `-- steady (...)`. O-grid stats append `cdp,cdf,mutMax,
@@ -1623,8 +1627,8 @@ gfx1100 (RX 7900 XTX) and tagged so; older ones are not rescaled.
 | channel RANS SST-2003m Re_τ 1e4 ny 128 β4, steady implicit TOL 1e-4 | 27 it, ub 25.9915408 (+3.1e-8), 0.11 s |
 | channel RANS SA-neg Re_τ 1e4 ny 256 β4, steady implicit TOL 1e-4 | 27 it, ub 25.4021882 (−7.7e-9), 0.11 s |
 | channel RANS SST-2003m Re_τ 1e4 ny 256 β4, steady implicit TOL 1e-4 | 28 it, ub 25.6762395 (+3.7e-8), 0.13 s |
-| O-grid cyl Re40 M0.2 256×96, explicit LTS plateau (gfx1100) | DNS cd 1.56656, RANS SA-neg 1.57012, RANS SST-2003m 1.56656; settles to 1e-4 in ~1.86e4 it (0.10 / 0.24 / 0.25 ms/it); the integral stop does not certify (FP32 jitter 2–3e-6 > 2^-20) |
+| O-grid cyl Re40 M0.2 256×96, explicit LTS (gfx1100) | DNS cd 1.56656, RANS SA-neg 1.57012, RANS SST-2003m 1.56656; settles to 1e-4 in ~1.86e4 it (0.10 / 0.24 / 0.25 ms/it); the jitter-floored stop certifies TOL 1e-4 at 31200 it, 3.0 s (DNS) |
 | O-grid cyl Re1e4 M0.2 384×192 β4 URANS, 5 D/U (gfx1100) | 0.117 (DNS) / 0.275 (SA-neg) / 0.325 (SST-2003m) ms/step, y⁺max 0.66, 0 guard hits |
 | Sphere Re100 M0.2 revolved wedge 5°, β3, explicit LTS plateau (gfx1100) | cd 1.09280 / 1.09492 / 1.09543 at 64×48 / 128×96 / 256×192 (M 0.1: 1.08709 / 1.08918 / 1.08967); tier B cd0 vs OpenFOAM simpleFoam on the SAME mesh −0.49% / −0.095% / −0.013%; θ_s 126.7° (OF 126.8°), L_r 0.867 D (OF 0.865) at L3 (`docs/validation.md` sph100) |
-| O-grid cyl Re40 256×96 Newton–Krylov (gfx1100) | plateau cd 1.565558 (DNS) / 1.570117 (SA-neg) = the explicit march's; ~21 Newton steps to the plateau, 5–8 Krylov/step at CFL 1e8, 2 s/step; integrals jitter 7–10e-6 (gate B0 2^-21 FAILED); SST-2003m not converged in 60 steps |
+| O-grid cyl Re40 256×96 Newton–Krylov (gfx1100) | certified (TOL 1e-4) cd 1.56656 (DNS, 78 steps, 28 s) / 1.57012 (SA-neg, 73, 30 s) / 1.56656 (SST-2003m, 174, 55 s) = the explicit march's; line-SGS 13 ms per application (59 ms at 75f39db) |
 | Immersed cyl Re1000 M0.2 384² URANS (gfx1100) | 0.37 (RANS-off, Cartesian) / 0.70 (SA-neg) / 0.75 (SST-2003m, curvilinear) ms/step; SST counts staircase k-guard hits (open finding) |

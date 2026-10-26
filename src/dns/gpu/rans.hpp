@@ -62,6 +62,16 @@ void saStageCurv(const GpuGrid& g, ViscView vv, PrimView q, CurvView m,
                  const Real* d, bool residual, bool transportOnly,
                  const Real* src, Real* out0, const ScalarBoundary& sb = {});
 
+// After the mean flow's boundary rhs hook (NSCBC) on the immersed path: the
+// scalars of every open-face cell are re-carried by the density the mean flow
+// actually produced (phi R_rho form; rans.hip kOpenScalarFix). A uniform
+// specific scalar then stays exact through NSCBC faces. Pre: sb.any(),
+// s.nT >= 1, out the stage output of s under cmb (residual: the pure rhs).
+void openScalarConsistency(const GpuGrid& g, const ScalarBoundary& sb,
+                           PrimView q, CurvView m, const StageCombine& cmb,
+                           bool residual, const DeviceCompState& s,
+                           DeviceCompState& out);
+
 // Per-cell explicit diffusive dt bound under RANS, FP64 straight off the
 // conserved state (pointwise -- no gradient):
 //   dt_c = 0.25 / (D_c amax_c^2),  amax_c = max_a aov_a[c],

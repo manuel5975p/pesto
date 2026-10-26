@@ -223,6 +223,7 @@ std::expected<CurvMetrics, std::string> CurvMetrics::build(const CurvMesh& m)
         for (int e = 0; e < 9; ++e) t.Ji[a][e].assign(n, 0.0);
         t.aov[a].assign(n, 0.0);
     }
+    if (m.wrap[2] == AxisWrap::MirrorZ) t.aovSteadyZ.assign(n, 0.0);
     t.vol.assign(n, 0.0);
 
     auto nd = [&](int i, int j, int k) -> V3 {
@@ -372,12 +373,15 @@ std::expected<CurvMetrics, std::string> CurvMetrics::build(const CurvMesh& m)
                     // ghost planes are slaved rotations of the real plane,
                     // so no azimuthal mode exists and the side faces only
                     // carry the hoop terms, whose rates go as 1/rho, not
-                    // 1/(rho dphi). The CFL width is rho: aov * dphi
-                    // (measured: the 1/(rho dphi) width put the axis
-                    // cells' diffusive dt below the 1e-6 collapse guard at
-                    // 256 x 192 x 5 deg and 128 x 96 x 2.5 deg).
-                    if (a == 2 && m.wrap[2] == AxisWrap::MirrorZ)
+                    // 1/(rho dphi). The TIME march's CFL width is rho: aov
+                    // * dphi. The steady local dt keeps the side faces' real
+                    // spacing rho dphi (aovSteadyZ, docs/rans.md
+                    // "Axisymmetric wedge"): with rho there the cold-start
+                    // RANS transient falls into a pseudo-time limit cycle.
+                    if (a == 2 && m.wrap[2] == AxisWrap::MirrorZ) {
+                        t.aovSteadyZ[c] = t.aov[a][c];
                         t.aov[a][c] *= g.hz;
+                    }
                     if (a < 2 || g.nz > 1)
                         t.hmin = std::min(t.hmin, 1.0 / t.aov[a][c]);
                 }

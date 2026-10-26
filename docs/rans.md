@@ -26,11 +26,12 @@ Built: `dns channel --rans none|sa-neg|sst-2003m|sst-vm`, plus
 `dns flow --physics compressible --rans ...` on the body-fitted O-grid
 (2D/z-extruded and the revolved sphere wedge) and on the immersed ghost wall
 (uniform or `--focal`), URANS and the explicit local-time-stepping steady
-march -- whose integral stop does NOT certify on external flows (section
-"dns flow" below) -- plus the laminar compressible `--steady` on `--ogrid`,
-and the flow Newton-Krylov march (`--steady-scheme implicit`, O-grid at
-`--nz 1` or the wedge), which reaches the same plateau but failed its stop
-gate B0 too. A laminar steady run is labelled `DNS -- steady (local time
+march -- stopped on external flows by the jitter-floored integral rule
+(section "Stopping on a jitter floor") -- plus the laminar compressible
+`--steady` on `--ogrid`, and the flow Newton-Krylov march
+(`--steady-scheme implicit`, O-grid at `--nz 1` or the wedge), which
+certifies the same plateaus on the cylinder but is slower than the explicit
+march everywhere it converges. A laminar steady run is labelled `DNS -- steady (local time
 stepping: pseudo-time, not time-accurate)`. Not built: the full-revolution
 3D sphere, dual-time URANS, wall models, the incompressible branch, MUSCL
 scalar convection. `--rans` is registered only where it is built
@@ -433,35 +434,78 @@ residual converges at order 1.85 (SA, u = 0: diffusion, sources, cb2, ∇ρ),
 convection-isolated: the first-order upwind) and 0.92/0.90 (SST full); the
 FP64 reference's own error is ≤ 1e-7 of the finest.
 
-### The explicit steady march does not certify on the O-grid (G1b, U1/U2)
+### Stopping on a jitter floor (`dns flow --steady`, built 2026-10-26)
 
-Measured 2026-10-25 (gfx1100), cylinder Re 40, `--n 256 --ny 96`, M 0.2,
-`--steady 1e-4`, cap 1e6:
+The channel's geometric rule (above) never certified an external flow
+(G1b, B0): the integrals settle, then JITTER at the FP32 floor -- the
+residual floor moves the state by ~1 ulp per cell every iteration, and a
+pressure-integrated coefficient amplifies p's ulp by p/q∞ = 2/(γM²) ≈ 36 at
+M 0.2. Measured jitter (rms about the trend, relative, 200-iteration
+samples): cd 3e-7 / cdf 4e-7 / W 5e-7 on the cylinder Re 40; cd 1.5e-6 / W
+2e-5 on the laminar sphere wedge L3; cd 5.4e-5 / cdf 1.5e-5 / W 2.6e-4 /
+∫ρν̃ 3e-7 on the SA sphere wedge Re 1e4 L2 -- WHITE (lag-1 autocorrelation
+−0.1..0.3, block means of 100 fall as 1/√100). kSteadyFlat = 2⁻²⁰ is below
+all of them, and so is the plan's 2⁻²¹ B0 gate. The mean of the last 8
+iterates (U2) measured insufficient. A pseudo-time LIMIT CYCLE looks
+different: SST sphere Re 1e4 L2 swings cd by 4.3e-3 (lag-1 acf −0.90, W
+3.2e-2).
 
-| run | cd at the plateau | settles to 1e-4 / 1e-5 (all three series) | ms/iteration | stop |
-|---|---|---|---|---|
-| laminar (`DNS -- steady`) | 1.56656 | 18600 / 27400 it | 0.10 | never certifies (exit 8 at 1e6) |
-| RANS SA-neg | 1.57012 | 18000 / 25400 it | 0.24 | never certifies |
-| RANS SST-2003m | 1.56656 | 18600 / 27800 it | 0.25 | never certifies |
-| RANS SA-neg, lens `--aspect 4` Re 1e5, 256×128 β 5.5 | 0.084–0.088 | — (cd p-p 7%, cl −0.013 to −0.017, resid ~18) | 0.25 | never: no steady state reached |
+`dns/steady_stop` `steadyFloor` (flow runners: O-grid explicit and NK,
+immersed explicit; the channel keeps `steadyRemaining`, byte for byte), per
+series over the second half of the history (three blocks of b ≥ 8
+samples, twelve sub-blocks):
 
-The cylinder integrals converge, then JITTER at the FP32 floor: cd, cdf and
-the wake deficit W reverse by 2.1e-6, 2.5e-6 and 3.3e-6 RELATIVE inside the
-stop's window (sd 3–6e-7) — above kSteadyFlat = 2^-20 = 9.5e-7, so the
-window is never "monotone to the sampling noise" and the flat branch never
-fires. The turbulence integrals are flat (1e-8). Cause: the FP32 residual
-floor moves the compensated state by ~1 ulp per cell, and a pressure-
-integrated coefficient amplifies p's ulp by p/q∞ = 2/(γM²) ≈ 36 at M 0.2
-(the channel's ub and bulk T are not amplified: 1.4e-7 there). The proposed
-U2 remedy measured NOT sufficient: the mean of the last 8 iterates jitters
-the same (the noise is correlated over hundreds of iterations); a 200-
-iterate mean certifies cd and cdf but W still reverses by 1.9e-6. The lens
-at Re 1e5 does not reach a steady state at all (non-geometric oscillation).
-Per the masterplan this is the G1b stop clause: reported, no constant
-loosened, nothing flipped — a decision (U1/U2) for the user. Until then a
-compressible `--steady` run on the O-grid ends at its cap with exit 8, the
-honest non-convergence report, and the settled plateau is read from the
-stats.
+- **jitter J** = rms of the samples about each block's own least-squares
+  line (relative) -- REPORTED per series at the end of every run
+  (`# steady stop (jitter-floored, relative): cd trend ... jitter ...`);
+- **trend** from the block means m1, m2, m3 (which average the jitter
+  down), against their detection limit δ = 3√2 σ_m, σ_m from the second
+  differences of the sub-block means (blind to a linear trend, so a decaying
+  mode cannot inflate it; it sees correlation up to b/4 samples):
+  |d1|, |d2| ≤ δ → trend = max|d| + δ; same sign and |d2| + δ < |d1| − δ →
+  geometric with r = (|d2| + δ)/(|d1| − δ), trend = (|d2| + δ) r/(1 − r);
+  otherwise +inf. A window flat to kSteadyFlat (block means and their
+  reversal) is trend = max|d|;
+- **monotone to the noise**: the sub-block means' reversal must stay within
+  3√2 of their own σ (the jitter-tolerant form of the geometric rule's
+  monotone window; without it the test's damped swing certified TOL 1e-3 at
+  sample 51 with the last sample 5.1e-3 off, instead of at 784);
+- **verdict**: an OBSERVABLE (cd, cdf: reported values) is certified when
+  trend + √2 J < TOL -- the LAST sample, jitter included, is inside TOL of
+  the fixed point; a MONITOR (W, the turbulence integrals: slow-mode
+  detectors) when trend < TOL and J ≤ **kSteadyJitterMax = 2⁻¹⁰** (9.8e-4,
+  the stated floor: above the largest FP32 jitter measured, 4.2e-4 for W on
+  the Re 1e4 wedge; below the SST limit cycle's 4e-3 / 3e-2).
+
+What it does not do: an oscillation of a MONITOR below 2⁻¹⁰ is not told
+from FP32 jitter; an observable's undamped swing of amplitude A is
+certified iff trend + A < TOL (every sample is then inside TOL); a single
+series decelerating into a turning point beyond its window is fooled, as
+under the geometric rule -- the reason for several series. The window is
+half the history, so a run certifies at about twice its settling time.
+Test `steady_stop` (white jitter read back; geometric tails clean and under
+jitter, never early; linear and slow drifts never once resolved; undamped
+swings 1.5 TOL at three frequencies never; a period-2 limit cycle never; a
+damped swing never early, clean and jittered; the turning-point pair; the
+rule split bit for bit) and `gpu_runners` (SA cylinder Re 40 certifies).
+
+Measured (gfx1100, 2026-10-26, M 0.2, cap far above the stop):
+
+| run | stop | iterations | wall | cd | jitter cd / W |
+|---|---|---|---|---|---|
+| cylinder Re 40 laminar 256×96, TOL 1e-4 | exit 0 | 31200 | 3.0 s | 1.56656 | -- |
+| — NK (`--steady-scheme implicit`) | exit 0 | 78 Newton | 28.4 s | 1.56656 | -- |
+| — RANS SA-neg, NK | exit 0 | 73 | 30.1 s | 1.57012 | -- |
+| — RANS SST-2003m, NK | exit 0 | 174 (13 rejections) | 55.4 s | 1.56656 | 4.1e-7 / 2.5e-6 |
+| sphere wedge laminar Re 100 L3 256×192 | exit 0 | 100000 | 26.1 s | 1.09543 | 8.7e-6 / 8.7e-5 |
+| — L2, wedge 2.5° | exit 0 | 244000 | 35.3 s | 1.09558 | 1.6e-5 / 8.4e-5 |
+| sphere wedge RANS SA-neg Re 1e4 L2 128×96 | exit 0 | 606000 | 184 s | 0.42480 | 6.4e-5 / 3.1e-4 |
+| — RANS SST-2003m | exit 8 (limit cycle) | 1e6 cap | 340 s | 0.4088–0.4136 | 4.3e-3 / 3.3e-2 |
+
+Offline replays of the recorded G1b/G2a histories with the same rule
+certify the cylinders (laminar, SA, SST) at TOL 1e-4 within 2.9–3.1e4
+iterations (cd 1e-7..2e-6 off the 1e6-iteration plateau) and never the
+lens at Re 1e5 (cd jitter 1.6e-2: no steady state).
 
 **URANS** (G1c, cylinder Re 1e4, `--n 384 --ny 192 --ogrid-beta 4
 --ogrid-far 30`, quiet start, 5 D/U): finite, 0 guard hits, y⁺max 0.65–0.66;
@@ -506,15 +550,27 @@ sphere's physical shedding`). The full revolution (`--nz N`) is P4, not built.
 - **`AxisWrap::MirrorZ`**: node planes 0..2 at φ = −3/2, −1/2, +1/2 Δφ are
   written as exact z-mirrors, node(3) is the mirror of node(0), so the two
   side faces of the real plane are exact mirrors (bitwise).
-- **The wedge's azimuthal CFL width is ρ, not ρΔφ** (a deviation from the
-  masterplan's "no change"): the ghost planes are slaved rotations, no
-  azimuthal mode exists, and the side faces carry only hoop terms whose
-  rates go as 1/ρ. `build()` scales aov[2] by Δφ on a MirrorZ axis. With the
-  1/(ρΔφ) width the axis cells' diffusive dt fell below the 1e-6 collapse
-  guard at 256×192×5° and 128×96×2.5° (measured, exit 7 on the first
-  iterations); with ρ the same runs march, and L1/L2 reach the same plateau
-  as before (cd to 6 digits) in fewer iterations (cd settled to 1e-4: L1
-  31400 → 16000, L2 45200 → 32200).
+- **The wedge's azimuthal CFL width: ρ for the time march, ρΔφ for the
+  steady local dt** (2026-10-26). The ghost planes are slaved rotations, so
+  the side faces carry only hoop terms whose rates go as 1/ρ: the time
+  march's `aov[2]` keeps 75f39db's ×Δφ (time-accurate wedge runs are byte
+  for byte 75f39db's). The steady march's local dt reads
+  `CurvMetrics::aovSteadyZ`, the side faces' real spacing 1/(ρΔφ) (the
+  masterplan's "no change"). With ρ there (75f39db) the converged SA L2
+  state is linearly fine -- restarted from it the march holds cd 0.42481,
+  resid 0.06, for 4e4 iterations -- but the cold-start RANS transient falls
+  into a pseudo-time LIMIT CYCLE (sphere Re 1e4 SA L2: cd −6.5..7.0, resid
+  ~800, ρ off by 22% near the body after 6e4 iterations), and so it does
+  with ρ in the axis columns only, off them only, in the wave bound only,
+  or in the diffusive bound only (5 runs, 3e5 iterations each). The ρΔφ
+  width gives the laminar L3 (256×192×5°) and 128×96×2.5° marches an axis
+  dtRef of 6.7e-7 -- LEGITIMATELY below the compressible 1e-6 collapse
+  guard, which exited 7 there (the reason for 75f39db's change). The
+  revolved steady march therefore replaces that absolute guard by a
+  RELATIVE one, dtRef < 1e-3 × the first dtRef
+  (`SteadyMarchParams::collapseRel`; every other runner keeps its absolute
+  guard bit for bit). Measured: laminar L3 exit 0 at 1e5 iterations, cd
+  1.09543 (26 s); L2 2.5° exit 0 at 2.44e5, cd 1.09558.
 - **Far row**: the same LODI algebra on each far face's own 3D normal (from
   the metrics), the tangential deviation blended by the same tanh weight.
 - **Tallies** over the real faces only (i ∈ [1, nTheta], plane 1) times
@@ -528,9 +584,10 @@ sphere's physical shedding`). The full revolution (`--nz N`) is P4, not built.
   column); the run prints θ_s (first cf sign change from the front) and L_r
   at the end.
 
-Laminar sphere Re 100, M 0.2, wedge 5°, rFar 20 D, β 3 (G2a.2, gfx1100; the
-integral stop does not certify, so these are the settled plateaus at the cap;
-cd settles to 1e-4 in ~16k / 32k iterations at L1 / L2):
+Laminar sphere Re 100, M 0.2, wedge 5°, rFar 20 D, β 3 (G2a.2, gfx1100;
+measured before the jitter-floored stop, so the settled plateaus at the cap,
+with the 75f39db azimuthal width; the restored ρΔφ width certifies L3 at
+the same cd 1.09543 and L2 2.5° at 1.09558, +2e-5, see above):
 
 | level (n × ny) | cd | θ_s | L_r / D | ms/iteration |
 |---|---|---|---|---|
@@ -548,27 +605,22 @@ cd 1.09543, θ_s 126.47°, L_r 0.889 D (0.266 ms/it, 47k iterations to 1e-4).
 −0.013% at L1 / L2 / L3 — gate |ΔCd| ≤ 0.5% at L2 passes and the gap closes
 monotonically; θ_s within 0.2°, L_r within 0.3% at L3.
 
-**RANS on the wedge, sphere Re 1e4 (G2b, gfx1100): the explicit march does
-not reach a steady state.** M 0.2, 5°, rFar 20 D, β 4.5, cap 2e6:
+**RANS on the wedge, sphere Re 1e4 (G2b, gfx1100, 2026-10-26).** Explicit
+LTS, 5°, rFar 20 D, β 4.5, the restored ρΔφ azimuthal width:
 
 | run | ms/it | outcome |
 |---|---|---|
-| SA-neg L1 64×48 | 0.24 | exit 8: cd oscillates between −5.5 and +6.2 with a period ~1.5e6 iterations, resid ~800 (y⁺max 0.77, μt/μ max 108, 0 hits) |
-| SST-2003m L1 | 0.45 | exit 7 at 4.5e5 (diverged; 0 guard hits before) |
-| SA-neg L2 128×96 | 0.31 | stopped at 5.8e5: cd between −2.3 and +7.3 |
+| SA-neg L2 128×96, M 0.2, TOL 1e-4 | 0.30 | **exit 0 at 606000 iterations, 184 s**: cd 0.42480, cdf 0.03496, θ_s 87.40°, L_r 1.2206 D, y⁺max 0.33, μt/μ max 108, 0 hits (cd within 1e-3 of it from 2.6e5 iterations, 79 s) |
+| — M 0.1 | 0.31 | exit 8 at 2.5e6 (766 s), settled: cd 0.41943 (to 1e-3 from 5.0e5), θ_s 87.64°, L_r 1.2065 D. Its jitter is above TOL 1e-4 (cd 1.6e-4) and its W jitter above the monitor floor (4.7e-3 > 2⁻¹⁰): the p/q∞ amplification is 4× M 0.2's |
+| SST-2003m L2, M 0.2 | 0.34 | exit 8 at 1e6: a pseudo-time LIMIT CYCLE in the near wake (θ 125–145°, j 38–50; u swings 0.28 in 100 iterations), cd 0.4088–0.4136 |
+| SA-neg L1 64×48, M 0.2 / 0.1 | 0.22 | exit 8 at 2.5e6: no steady state -- cd 0.4197 / 0.4264 with a 1.1% / 0.8% jitter, θ_s 12.9°: a spurious front recirculation (cp 0.58 at the stagnation point) |
+| SST-2003m L1 | -- | exit 7 at 4.8e4 (both widths) |
 
-Before the azimuthal-CFL-width change above (the 1/(ρΔφ) width, i.e. a
-smaller axis dt) the same march gave L1 SA garbage (θ_s 3.7°), L1 SST exit 7
-at 4.8e4, but L2 SA settled near cd 0.4248 (θ_s 87.4°, L_r 1.22 D, resid
-0.045) and L2 SST near 0.4098 (θ_s 86.7°, L_r 1.25 D, resid 1.08) — against
-a3's OpenFOAM SA (a different 128-cell mesh) 0.4149. Whether the width change
-or the pseudo-time path is responsible is not isolated; the masterplan's
-answer to a non-geometric oscillation is "stop and report" (R3/U1), and the
-Newton-Krylov march that was to fix it does not converge here either (next
-section). The OpenFOAM half of `sph1e4` is built (`tools/parity/sph1e4.py
-case <mesh> <dir> sa|sst 1e4`); the comparison waits for a dns steady state.
+The 75f39db azimuthal width ρ (see "Axisymmetric wedge") is what turned the
+SA L2 cold start into the cd −6.5..7.0 limit cycle of the G2b report.
+`sph1e4` against OpenFOAM: docs/validation.md (tier B at L2 +1.16%).
 
-## Newton–Krylov pseudo-time on `dns flow` (built 2026-10-26; stop gate B0 FAILED)
+## Newton–Krylov pseudo-time on `dns flow` (built 2026-10-26; slower than explicit)
 
 `--steady TOL --steady-scheme implicit` on `--ogrid` at `--nz 1` or the
 revolved wedge (`gpu/nk`, `gpu/internal/nk_march.hpp`; masterplan_flowrans
@@ -586,9 +638,11 @@ revolved wedge (`gpu/nk`, `gpu/internal/nk_march.hpp`; masterplan_flowrans
   the wall mirror and the wedge rotations folded into the diagonal; the
   scalars block-diagonal (upwind on the frozen KG mass flux, compact
   diffusion, the point-implicit source rate). Applied by a symmetric
-  LEXICOGRAPHIC line Gauss–Seidel along the wall-normal lines (one 32-lane
-  workgroup per line: the block-Thomas chain per row is one 5×5 product,
-  lane-parallel).
+  LEXICOGRAPHIC line Gauss–Seidel along the wall-normal lines in FP32: ONE
+  launch per application (a 32-lane workgroup walks the lines i ascending
+  then descending), the line factors stored line-major with each row's
+  entries contiguous, each chain's rows staged into LDS by unrolled flat
+  loads, every lane carrying the whole running vector (no shuffles).
 - Continuation: CFL 10, ×2 per undamped step to 1e8, rejection (residual
   growth > 3×, non-finite, singular line pivot, GMRES breakdown) restores and
   cuts ×0.1, exit 7 below 0.1; the step length keeps ρ and E within 20%, SST
@@ -601,6 +655,7 @@ revolved wedge (`gpu/nk`, `gpu/internal/nk_march.hpp`; masterplan_flowrans
 | `kNkRejectGrowth` | 3 | plan |
 | `kNkRestart`, `kNkMaxKrylov`, `kNkForcing` | 40, 200, 0.1 | a2: 1e-2 stalled at the cap, 0.1 converged |
 | `kNkFdStep` | **2⁻¹⁴** (the plan's 2⁻¹⁰ FAILED N1) | N1 sweep below |
+| `kNkStallKrylov` | 40 (one restart cycle) | at the CFL cap after a solve that hit the 200 cap unconverged: the FP32 floor (below) |
 
 Gates (gfx1100; test `gpu_nk` for N1–N3):
 
@@ -618,38 +673,46 @@ Gates (gfx1100; test `gpu_nk` for N1–N3):
   Gauss–Seidel on the downloaded P, same order, to 1.4e-7 (laminar) / 9.5e-8
   (SA).
 - 2D: ρw stays exactly 0 through Newton iterations.
-- **B0 (stop jitter) — FAILED.** Cylinder Re 40, 256×96, β 3, M 0.2, the
-  last 30 armed iterations at CFL 1e8, (max − min)/mean, gate 2⁻²¹ = 4.8e-7:
+- **B0 (stop jitter, the 2⁻²¹ gate) — FAILED, superseded.** Cylinder Re
+  40, 256×96, β 3, M 0.2, the last 30 armed iterations at CFL 1e8,
+  (max − min)/mean: laminar cd 7.4e-6, cdf 3.8e-6, W 4.2e-5; SA-neg 9.9e-6,
+  2.6e-6, 2.9e-5 (∫ρν̃ 2.4e-7); wedge laminar Re 100 L1 8.0e-6, 6.5e-6,
+  1.6e-3. The march sits at the FP32 residual floor and a Newton step at CFL
+  1e8 is J⁻¹ of that floor. The jitter-floored stop ("Stopping on a jitter
+  floor") certifies these marches: laminar exit 0 at 78 Newton iterations,
+  SA 73, SST-2003m 174 (table there).
+- **N5 (fixed point)**: NK and explicit plateaus agree -- cd 1.56656 (both,
+  laminar), 1.57012 (SA), 1.56656 (SST-2003m), wedge laminar 1.092797 vs
+  1.09280, wedge SA Re 1e4 L2 0.42482–0.42483 vs 0.42480.
+- **Sweep cost (2026-10-26, rocprofv3, cylinder 256×96 laminar, 6 Newton
+  steps)**: the line-SGS was 99% of the kernel time, 59 ms per application
+  (one launch per line, FP64 chains, cell-major factors: 116 µs per line,
+  dominated by SERIALISED global round trips -- one load, wait, use per
+  element), now 13.4 ms (26 µs per line): one launch instead of 511, no gain
+  (62 ms; launches were not the cost); line-major FP32 factors, no gain;
+  unrolled flat LDS staging 62 → 17 ms; phase operands preloaded 17 → 15
+  ms; row pipelining + wider staging 15 → 13.4 ms. The serial chain
+  (2 × 94 rows per line, 2 × 256 lines) is the floor of this algorithm.
+  Wall: 6 Newton steps 3.09 → 0.95 s.
+- **Converges, slower than explicit**: laminar cylinder 78 steps / 28.4 s
+  (explicit 31200 iterations / 3.0 s); SA 73 / 30.1 s; SST-2003m 174 / 55.4
+  s with 13 rejections (it did not converge before the sweep rewrite: 25
+  rejections in 60).
+- **Does not converge from a cold start on the wedge**: sphere Re 1e4 SA L2
+  exit 7 (CFL < 0.1 after 16 rejections, 71 iterations, 54 s, cd 0.39 at
+  resid 31). From the explicit march's state after 1.5e5 iterations it
+  reaches cd 0.42482 in ~10 Newton steps with a residual 30× below the
+  explicit plateau (1.4e-3 vs 4.8e-2), but at the cap GMRES no longer meets
+  its forcing (200 Krylov, 1.5 s per step: the FD J v is FP32 noise there;
+  `kNkStallKrylov` cuts the stalled steps to one cycle), rejections every
+  ~15 steps reset the armed history, and W jitters at 8.4e-4: 200 steps (129
+  s) do not certify -- the explicit march certifies the same plateau in 184
+  s from cold. SST on the wedge has no steady state at L2 (the explicit
+  limit cycle above). G3-scale / G3-time not reached. Red-black lines
+  (measured at 75f39db, then removed -- the plan forbids them): every step
+  at the cap ran the full 200 Krylov, jitter 1.4e-4.
 
-  | case | cd | cdf | wake W | ∫ρν̃ | Krylov/step at the cap |
-  |---|---|---|---|---|---|
-  | laminar | 7.4e-6 | 3.8e-6 | 4.2e-5 | — | 5–8 |
-  | SA-neg | 9.9e-6 | 2.6e-6 | 2.9e-5 | 2.4e-7 | 5–7 |
-  | wedge laminar Re 100 L1 | 8.0e-6 | 6.5e-6 | 1.6e-3 | — | ≤ 34 |
-
-  The march sits at the FP32 residual floor (scaled RMS ~6e-5, the explicit
-  compensated march's resid in freestream units, 2.7e-3 vs 2.1e-3), and a
-  Newton step at CFL 1e8 is J⁻¹ of that floor: the integrals jitter at
-  ~1e-5, as the explicit march's do (2–3e-6), so `--steady` never certifies
-  (`remaining` stays inf). Per the plan: STOP, report, U2 (the stop on the
-  mean of the last m armed iterates; measured on the explicit march as
-  insufficient at m = 8, section "dns flow").
-- **N5 (fixed point)**: NK and explicit plateaus agree — cd 1.565558 vs
-  1.56656 (laminar), 1.570117 vs 1.57012 (SA), wedge 1.092797 vs 1.09280.
-  Neither certifies at TOL 1e-5, so the gate's stop-to-stop form is moot.
-- **Not converged**: SST-2003m on the same cylinder (60 iterations: 25
-  rejections, CFL bouncing 27–5e3, cd 1.5696 vs explicit 1.56656, rn 7e-4),
-  the wedge sphere Re 1e4 SA (80 iterations, rn ~1, cd 0.46 ± 36%) and SST
-  (α → 0 from the first step: the ω step bound against the ω_w wall jump;
-  rn 1e7). G3-scale and G3-time were therefore not reached.
-- Cost: 2 s per Newton step at 256×96 (the lexicographic sweep is 2 × 256
-  sequential line launches per Krylov iteration); the laminar cylinder
-  reaches its plateau in ~21 steps (40 s) — the explicit LTS march settles cd
-  to 1e-4 in ~2 s. Red-black lines (measured, then removed — the plan
-  forbids them): every step at the cap ran the full 200 Krylov with GMRES
-  stalled (rel 0.99), jitter 1.4e-4.
-
-## Immersed-wall RANS (built 2026-10-26; labelled; two P5 gates FAILED)
+## Immersed-wall RANS (built 2026-10-26; labelled)
 
 `dns flow --physics compressible --rans ...` WITHOUT `--ogrid`: the body is
 the compressible sharp ghost wall on the uniform or `--focal` box. Labelled
@@ -663,17 +726,32 @@ under-resolved (the validator's y⁺ estimate uses h_fine/2).
   Cartesian 0.37 ms/step, SA 0.70, SST 0.75 (1.9–2.0×, curvilinear + RANS).
 - d = |sdf| at the physical cell centre (`immersedWallDistance`; exact for
   sphere/cylinder/cube/mesh, the lens warns).
-- Ghost images through the velocity's own linear image (`DeviceCompGhost::
-  applyTurb`, after `apply`): ν̃_g = −a Σw ν̃_s, k_g = −a Σw k_s, ω_g = (1 +
-  a)ω_w − a Σw ω_s with ω_w = 60ν_w/(β1 d_s²), d_s = d_w/a, ν_w from the
-  thermo sample — **an UNVERIFIED sub-cell choice**; deep cells ν̃ = k = 0,
-  ω = ω∞; μt_g = −a Σw μt_s and F1_g = Σw F1_s (`mirrorMut`); a compensated
-  state's ghost and deep low words zeroed.
+- Ghost images through the velocity's own image stencil (`DeviceCompGhost::
+  applyTurb`, after `apply`): ν̃_g = −a Σw ν̃_s (odd: ν̃ ∝ d at the wall);
+  **k_g = +a² Σw k_s** (EVEN and quadratic: k ∝ d² in the sublayer, wall
+  value 0 and zero wall slope; the odd −a Σw k_s of 75f39db is negative and
+  fed the counted guard, below); ω_g = (1 + a)ω_w − a Σw ω_s with ω_w =
+  60ν_w/(β1 d_s²), d_s = d_w/a, ν_w from the thermo sample — **an
+  UNVERIFIED sub-cell choice**; deep cells ν̃ = k = 0, ω = ω∞; μt_g = −a Σw
+  μt_s and F1_g = Σw F1_s (`mirrorMut`); a compensated state's ghost and deep
+  low words zeroed.
+- **Wall-value convection** (`ScalarBoundary::solid`, the body's ghost and
+  deep cells): a face between a fluid and a body cell lies at the wall to
+  within the staircase, so when its mass flux points INTO the fluid ν̃ and
+  k are carried at their wall value 0, not at the ghost's. ω keeps its wall
+  image; diffusion still reads the ghost (the Dirichlet image).
 - Open domain faces (x always, y/z with `--open`): `ScalarBoundary`, a
   compile-time branch of the scalar kernels — mdot = ρ_c u_c·S of the
   boundary cell, φ∞ in, φ_c out, no diffusion. The sponge/strip relaxes the
   scalars to ρφ∞ with the density's strength; the free-slip mirror rows copy
-  scalars, μt and F1 even. NSCBC and the sink stay mean-flow only.
+  scalars, μt and F1 even. NSCBC and the sink stay mean-flow only. After
+  the NSCBC rhs hook, every open-face cell's scalars are re-carried by the
+  density the mean flow actually produced (`rans::openScalarConsistency`,
+  the φ R_ρ form): φ = t/ρ_s with ρ_s the density the scalar's own fluxes
+  imply, then t = φ ρ_out (residual mode: R_t += φ_c (R_ρ − M)). NSCBC
+  overwrites continuity with its characteristic form, which no scalar FLUX
+  can match; the specific scalar is therefore advanced non-conservatively
+  there, exactly as the characteristic continuity itself is.
 - The body tally carries μt through the solver's own curvilinear flux; stats
   add `mutMax, yplusMax, yplusMean, floorHits` (y⁺ the linear-sublayer
   estimate sqrt(|u_c| d_c/ν_c) per interface face); immersed `--steady` (with
@@ -684,29 +762,30 @@ Gates (`gpu_rans_immersed`, gfx1100):
 
 - **G2-flow — PASS**: focal + ghost wall + NSCBC, SA ν̃ ≡ 0 and SST k ≡ 0:
   mean flow AND body tally bit for bit the RANS-off run's over 50 steps.
-- **Wall-linear image — PASS**: a plane tilted 30° at a 0.37-cell offset,
-  ν̃ = k = μt = c·d: every ghost reproduces c·sdf to 2.6e-7 (c h); the ω image
-  is ω_w-anchored.
-- **G3-flow — boundary clause FAILED**: a uniform 2⁻¹³ specific scalar rides
-  a non-uniform flow EXACTLY (0 ulp) in the interior, but the NSCBC columns
-  drift 1.36e4 ulp (8e-4 relative) in 100 steps (plan: ≤ 2 ulp) and the
-  drift convects downstream. Cause: NSCBC overwrites the boundary cells'
-  continuity rhs with the characteristic form, which no scalar FLUX — the
-  plan's ρ_c u_c·S included — can match. A consistent form would put the
-  scalar's boundary rhs on φ R_ρ(NSCBC) (non-conservative there); not built
-  without a decision. Pinned in the test as a measured ceiling, not a pass.
-- **SST guard — FAILED (open finding)**: SST trips the COUNTED k guard in a
-  few fluid cells beside the staircase (710 hits in 200 steps on a 128²
-  cylinder, 4 cells; 2.6e4 over 8600 steps at 384² Re 1000). The interface
-  faces carry a nonzero mass flux (the face-average velocity is not the
-  wall's), which upwinds the antimirrored ghost k into the fluid. SA-neg
-  takes ν̃ < 0 by design: 0 hits. Reported in `floorHits`, never silent.
+- **Wall image — PASS**: a plane tilted 30° at a 0.37-cell offset: ν̃ = μt =
+  c·d reproduced on every ghost to 2.6e-7 (c h); k = c·d² reproduced to the
+  sample's bilinear interpolation error (≤ 0.25 c h², the image ≥ 0
+  everywhere); the ω image is ω_w-anchored.
+- **G3-flow — PASS (2026-10-26)**: a uniform 2⁻¹³ specific scalar rides a
+  non-uniform flow EXACTLY (0 ulp) in the interior AND in the NSCBC columns
+  (75f39db: 1.36e4 ulp, 8e-4 relative, in 100 steps, convected downstream;
+  the φ R_ρ form above is what closes it).
+- **SST guard — PASS (2026-10-26)**: 0 counted hits on the 128² cylinder
+  (200 steps; 710 at 75f39db, 4 staircase-corner cells) and on 384² Re 1000
+  over 7.5e4 steps (75f39db: 5.5e5; the first 1.2e3 by t = 0.25). Localised
+  (a hit-cell dump) at convex staircase corners with two body neighbours;
+  the ODD ghost k is what reached them: with the even quadratic image alone
+  the hits are 0 (with the odd image capped at a ≤ 1: unchanged, so not an
+  over-large a), cd moves 1.2e-5 at 384². The wall-value convection alone
+  took the 128² case to 0 but left 3.6e4 hits at 384²; both are kept.
 - Not run (the phase stopped): the immersed channel oracle (heavy tier), the
   uniform-curvilinear/focal/sinusoidal MMS levels, the momentum-budget tally
   test (only its ν̃ ≡ 0 bitwise form above).
-- Measured: immersed cylinder Re 40 SA `--steady` (384²): exit 8 at 4e4
-  iterations, cd 2.09 → 2.12 still drifting, resid 0.45 — the uniform mesh
-  gives local time stepping no leverage.
+- Measured (2026-10-26): immersed cylinder Re 40 SA `--steady 1e-4` (384²):
+  exit 8 at 4e5 iterations (311 s): cd a slowly DAMPED oscillation (2.059,
+  2.124, 2.083, 2.108, 2.094, 2.1015, 2.097, 2.0995, 2.0983 at 4e4-iteration
+  steps), jitter 8e-4 (the staircase), resid 3e-3 — not certified, correctly;
+  the uniform mesh gives local time stepping no leverage.
 
 ## dt with RANS (D12)
 
@@ -759,20 +838,20 @@ Laminar limit: 2nd order to the exact compressible Poiseuille (u and T).
 | `rans_channel1d` | the oracle: laminar order, MKM band (5% provisional ceiling, values pinned to 1e-6), log slope, ub order (SA 2nd, SST 1st), Newton < 2 s |
 | `gpu_rans` | G1 lts = 1.0f bitwise; G2 ν̃ ≡ 0 (and SST k ≡ 0) bitwise to RANS off; G3 uniform scalar exact; G4 wall face μt == 0, ghost algebra (SST: ω_w on the face); G5 residual at the oracle at the FP32 floor; G6/G7 oracle fixed point (uniform / random lts); G8 SA-neg ν̃ < 0 patch; G9 (SA, SST-2003m) march onto the oracle; G10 compensated state (TwoSum exact, pair upload/download, plateau ≤ ½ plain, oracle fixed point, perturbed march); SST rough-field positivity, 0 guard hits |
 | `channel_config` | every `--rans`/`--steady`/`--steady-scheme` rule (TOL ∈ [1e-6, 1); implicit rejects `--cfl`/`--dt-recompute`, cap 500, a given `--steady-steps` honoured), labels and describe lines of both schemes, explicit given == defaulted byte for byte, json `"steady"` only on implicit, RANS-off describe unchanged |
-| `steady_stop` | the stop rule: geometric tail exact, never early; growth / drift / short / zero-scale never certified; undamped oscillation never, damped only once flat; 3e-8 noise certified; a single series fooled at a turning point, a companion holds it off |
+| `steady_stop` | the channel's geometric rule: geometric tail exact, never early; growth / drift / short / zero-scale never certified; undamped oscillation never, damped only once flat; 3e-8 noise certified; a single series fooled at a turning point, a companion holds it off. The flow's jitter-floored rule (`steadyFloor`): white jitter 3e-7 / 5e-5 read back, certifies TOL 1e-3 and never a TOL below it; geometric tails clean and under 3e-7 / 1e-6 jitter, never early; linear drift and a 1e-6 drift under 1e-6 jitter never, a 1e-7 drift never once its window resolves it; undamped 1.5 TOL swings (3 frequencies) never; a period-2 limit cycle never; a monitor swing above 2⁻¹⁰ never; damped swings clean / jittered never early; the turning-point pair; SteadyStop(n) == steadyRemaining and SteadyStop(n, k) == steadyFloor bit for bit |
 | `blockband` | block LU vs a dense partial-pivot LU: random B 5/6 × K 1/2 × n 8/64/254 and the line matrix at CFL 100 (backward error ≤ 1e-12, agreement ≤ 1e-10); at CFL 1e8 backward errors only (the matrix is singular to ~1e-8 by Σ V R_ρ ≡ 0, so ANY two solvers differ by ~cond eps); singular / NaN / Inf → error |
 | `channel_line` | (a) R at the oracle (tol 1e-11) ≤ 1e-10 momentum/k, ω 1e-13 relative, E ≤ max(1e-7, its 1-ulp floor); (b) band EXACTLY K, ghosts included; (c) J δ vs central FD ≤ 1e-6 (measured 1.5e-7); (d) host Newton from Reichardt: SA/2003m/Vm Re_τ 180 ny 64, SA/2003m Re_τ 1e4 ny 128 in 27–28 iterations, ub ≤ 7e-10 off, mass 1e-12; (e) a damped march never certified (an unarmed stop does); (f) projection: 2 ulp, mass 1e-15; host timings |
 | `pseudo_time` | CFL 100·2^n to the cap at n = 20; α < 1 holds and disarms; rejection ×0.1, false below 1; armed only after an undamped step at the cap; R-b ramp/reject/regrow never arms below the cap; each step bound binds alone, SA has none |
 | `gpu_rans_implicit` | I1 GPU vs line residual per equation (10× measured: ρ 2e-6, mx 3e-4, my 1e-3, E 2e-4, t 5e-4 / 7e-5); I2 line J vs GPU FP32 central FD ≤ 2e-2 (measured ≤ 1.8e-2); I3 one iteration at the oracle: dub ≤ 1.2e-10, mass exact, resid 0.016–0.031; I4 Re_τ 180 cold starts via the binary (27–28 it, ub ≤ 8e-8 off, 0 rejects / hits) + R_mz, w ≡ 0 and bitwise column-uniform state every iteration; I5 Re_τ 1e4 ny 128 (27 it, ≤ 3e-8, 0.1 s); I6 IC residual column-uniform, nx 6 nz 2 iterate == nx 4 nz 1 bitwise; I7 TOL 1e-6 |
-| `gpu_runners` | `--steady 1e-3 --steady-scheme explicit` SA-neg end to end: exit 0, > 1e5 iterations (not at ub's dip), ub within 1.5e-3 of the oracle (TOL + the mass-drift offset); `--steady 1e-4 --steady-scheme implicit`: exit 0, ≤ 60 iterations (27), ub within 1e-5 of the oracle, < 2 s; O-grid SA URANS (RANS columns finite, 0 hits) and the O-grid SA explicit steady march to a 2000-iteration cap (exit 8, a row every 200, finite, 0 hits) |
+| `gpu_runners` | `--steady 1e-3 --steady-scheme explicit` SA-neg end to end: exit 0, > 1e5 iterations (not at ub's dip), ub within 1.5e-3 of the oracle (TOL + the mass-drift offset); `--steady 1e-4 --steady-scheme implicit`: exit 0, ≤ 60 iterations (27), ub within 1e-5 of the oracle, < 2 s; O-grid SA URANS (RANS columns finite, 0 hits), the O-grid SA explicit steady march to a 2000-iteration cap (exit 8, a row every 200, finite, 0 hits) and certified at TOL 1e-4 (exit 0 within 2–6e4 iterations, cd within 1e-4 of the plateau 1.5701190); immersed SST 384² Re 1000 URANS, 0 guard hits |
 | `gpu_rans_mask` | the P0 plumbing on the channel: masked residual == row-range residual bitwise (every norm), `residualInto` == `residualField`, the channel mutHook odd μt / even F1, the SST guard counts only masked cells (0 vs 120 with every cell), `testSource` enters R as one FP32 add, laminar `localDt` == SST's at k ≡ 0 bitwise and the nT = 0 compensated LTS march |
 | `gpu_rans_ogrid` | (a) RANS tables on a RANS-off solver change no bit; (b) ν̃ ≡ 0 / k ≡ 0 mean flow == RANS off bitwise over 50 fixed-dt steps; (c) far row φ∞ to 0.4/0.8 ulp, outer rows after 100 steps; (d) wall-face μt == 0.0, far ghost even copy, F1 even, ω_w per face to 1e-5; (e) a uniform 2^-13 scalar rides ρ exactly (0 ulp) everywhere; (f) SA/SST 200-step URANS on 256×96 finite, 0 hits; (g) compensated LTS: rows 0 and ny−1 low words 0 after every apply |
 | `gpu_rans_mms` | residual MMS on the O-grid annulus, 3 levels: SA u = 0 order 1.85, SST u = 0 1.88/1.85, SA full 0.91, SA convection 0.97, SST full 0.92/0.90 (bands [p − 0.25, p + 0.5]); FP64 reference error ≤ 1e-3 of the finest; the revolved WEDGE ladder with axisymmetric fields (hoop terms): SA u = 0 1.94, SA full 0.97, SST u = 0 1.92/1.93, SST full 0.97/0.89 |
 | `gpu_axisym` | the revolved wedge: (a) uniform x-freestream fixed point (3.4 ulp, outer rows 3.0); (b) side-face mass flux of a random axisymmetric state 0.02 ulp·ρvA; (c) ghost-column R_x(π) / plane R_x(±Δφ) bit-exact vs host; (d) w ≡ 0 kept (2e-10 U over 200 steps); (e) laminar Re 100 smoke; (f) SA/SST 200-step smoke, 0 hits, μt 0 on the wall faces; (g) Archimedes on a linear pressure within 0.5% (×2π/Δφ) |
 | `flow_rans_config` | every `dns flow --rans` / compressible `--steady` accept, reject (by flag, exit 2) and warning; the label/turbulence/wall/y⁺/run describe lines; RANS-off describes byte-identical to HEAD's strings; explicit given == defaulted; RunMeta keys only on flow RANS/steady |
 | `gpu_determinism` | + the O-grid SA URANS run twice, stats byte-identical |
-| `gpu_nk` | the flow Newton–Krylov pieces: dual blocks == 4th-order FD of F_P (5e-12); N2 GPU P blocks == host FD restatement (5.7e-8, FP32 storage); N3 line-SGS == host dense block GS (1.4e-7); N1 forward vs central J v per field at 2⁻¹⁴ (the 2⁻¹⁰/2⁻¹² sweep printed); ρw ≡ 0 and the residual falls through 6 Newton steps (laminar, SA) |
-| `gpu_rans_immersed` | (a) G2-flow: focal + ghost + NSCBC, ν̃ ≡ 0 / k ≡ 0 mean flow and tally == RANS off bitwise; (b) G3-flow: a uniform scalar exact (0 ulp) in the interior, the NSCBC band's drift pinned as a CEILING (the plan's 2 ulp FAILED); (c) the 30° wall-linear image exact to FP32 (ν̃, k, μt) and the ω_w-anchored ω image; (d) SA/SST 200-step immersed URANS finite, μt 0 on deep cells, SA 0 hits (SST's staircase hits counted: an open finding) |
+| `gpu_nk` | the flow Newton–Krylov pieces: dual blocks == 4th-order FD of F_P (5e-12); N2 GPU P blocks == host FD restatement (5.7e-8, FP32 storage); N3 the single-launch FP32 line-SGS == host dense block GS (≤ 1e-5; measured ~1e-7); N1 forward vs central J v per field at 2⁻¹⁴ (the 2⁻¹⁰/2⁻¹² sweep printed); ρw ≡ 0 and the residual falls through 6 Newton steps (laminar, SA) |
+| `gpu_rans_immersed` | (a) G2-flow: focal + ghost + NSCBC, ν̃ ≡ 0 / k ≡ 0 mean flow and tally == RANS off bitwise; (b) G3-flow: a uniform scalar exact (0 ulp) in the interior AND ≤ 2 ulp in the NSCBC band (measured 0; 1.36e4 at 75f39db); (c) the 30° wall image: ν̃, μt = c·d exact to FP32, k = c·d² to its interpolation error with k_g ≥ 0, the ω_w-anchored ω image; (d) SA/SST 200-step immersed URANS on 128² finite, μt 0 on deep cells, 0 guard hits with and without the wall-value convection (SST: 710 at 75f39db) |
 
 Manual cold starts, `dns channel --n 4 --nz 1 --ny 64 --rans <m> --steady
 1e-6 --steady-steps N`, Re_τ 180, measured 2026-10-24 (gfx1100), BEFORE the

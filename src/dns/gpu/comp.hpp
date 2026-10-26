@@ -112,6 +112,7 @@ void boostX(const GpuGrid& g, DeviceCompState& s, double du);
 struct DeviceCurv
 {
     DeviceScalar S[3][3], Ji[3][9], invVol, aov[3];
+    DeviceScalar aovSteadyZ; // CurvMetrics::aovSteadyZ (empty: not a wedge)
     double hmin = 0.0;
 
     // m must come from CurvMetrics::build (already validated).
@@ -177,10 +178,21 @@ using MutHook = std::function<void(Real* nut, Real* f1)>;
 // alone, carrying the specific freestream value in and the cell's out, with
 // no diffusion. A COMPILE-TIME kernel branch: none open is the scalar stage
 // verbatim (the O-grid and the channel never open a face).
+//
+// solid (device, set by enableRans from RansSetup::solidMask; null = none):
+// 1 on the immersed body's ghost and deep cells. A face between a fluid and a
+// solid cell lies at the wall to within the staircase, so when its mass flux
+// points INTO the fluid the zero-wall-value scalars (SA nu~, SST k) are
+// carried at their wall value 0, not at the antimirrored ghost value
+// -a sum w phi_s < 0 -- which the counted SST k guard measured as negative k
+// upwinded into the fluid (docs/rans.md, "Immersed-wall RANS"). omega keeps
+// its (positive) wall image. Diffusion still reads the ghost: that IS the
+// Dirichlet image.
 struct ScalarBoundary
 {
     int open[3] = {0, 0, 0};       // x, y, z domain faces
     double phiInf[2] = {0.0, 0.0}; // specific freestream scalars
+    const std::uint8_t* solid = nullptr;
     bool any() const { return open[0] || open[1] || open[2]; }
 };
 
@@ -205,6 +217,9 @@ struct RansSetup
     double omegaFloor = 1e-10;
     // The open domain faces (immersed path); default none.
     ScalarBoundary bnd{};
+    // The immersed body's ghost + deep cells (1), uploaded into bnd.solid;
+    // empty = none. Pre: empty unless bnd.any().
+    std::vector<std::uint8_t> solidMask{};
 };
 
 // The channel's mutHook: mu_t odd (exactly 0.0 on the wall face) and F1
@@ -458,6 +473,7 @@ private:
     // Residual / guard mask (1 = counted); empty = every cell. maskCount_ is
     // the number of counted cells, the residual's RMS denominator.
     DeviceBuffer<std::uint8_t> mask_;
+    DeviceBuffer<std::uint8_t> solid_; // ScalarBoundary::solid (immersed)
     double maskCount_ = 0;
     DeviceBuffer<unsigned long long> hits_;
     double omegaFloor_ = 0;

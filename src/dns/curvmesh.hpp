@@ -135,8 +135,13 @@ struct CurvMetrics
     // Per-axis mean cross-face area / volume (acoustic CFL width 1/aov); at
     // index 0 of an Extend axis the missing lo neighbour is clamped to the
     // cell's own face. On a MirrorZ (wedge) axis the width is rho, not
-    // rho dphi: aov[2] carries the factor hz = dphi (no azimuthal mode).
+    // rho dphi: aov[2] carries the factor hz = dphi (no azimuthal mode) for
+    // the time march.
     std::array<std::vector<double>, 3> aov;
+    // MirrorZ only (else empty): the azimuthal aov WITHOUT that factor,
+    // 1/(rho dphi) -- the width of the steady local dt (DeviceComp::localDt):
+    // the cold-start RANS march needs it (docs/rans.md).
+    std::vector<double> aovSteadyZ;
     double hmin = 0.0; // min cell width over cells and non-degenerate axes
 
     // nx, ny >= 2; nz == 1 or nz >= 2; node arrays sized g.size().

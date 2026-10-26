@@ -505,6 +505,18 @@ void revolvedWedge()
     check(pos, "every volume > 0, placeholder columns and ghost planes "
                "included");
     check(sides, "the wedge's two side faces are exact z-mirrors (bitwise)");
+    // The two azimuthal widths: the time march's rho (aov[2] = |S|/V x dphi)
+    // and the steady local dt's real side-face spacing rho dphi
+    // (aovSteadyZ = aov[2] / dphi exactly: the product is the only change).
+    bool widths = mt->aovSteadyZ.size() == g.size();
+    double ratio = 0;
+    for (std::size_t c = 0; widths && c < g.size(); ++c) {
+        widths = mt->aovSteadyZ[c] * g.hz == mt->aov[2][c] && mt->aovSteadyZ[c] > 0;
+        ratio = std::max(ratio, mt->aovSteadyZ[c] / mt->aov[2][c]);
+    }
+    check(widths, "wedge: aovSteadyZ * dphi == aov[2] bitwise, every cell");
+    check(std::abs(ratio - 1.0 / dphi) < 1e-9 * ratio,
+          "wedge: the steady width is dphi x the time-march width (1/dphi = 11.46)");
     // An sdf that is not a body of revolution about x is rejected.
     const Sdf ell = [=](double x, double y, double z) {
         return std::sqrt(x * x + y * y + 4 * z * z) - R;

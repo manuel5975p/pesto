@@ -402,7 +402,11 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     if (rans)
     {
         fluid.assign(g.size(), 1);
-        for (int c : ghost->solidCells()) fluid[std::size_t(c)] = 0;
+        std::vector<std::uint8_t> solid(g.size(), 0);
+        for (int c : ghost->solidCells()) {
+            fluid[std::size_t(c)] = 0;
+            solid[std::size_t(c)] = 1;
+        }
         for (int k = 0; k < g.nz; ++k)
             for (int i = 0; i < g.nx; ++i)
                 for (int j : {0, g.ny - 1})
@@ -426,7 +430,8 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                                   fp->applyMut(nut, f1);
                               },
                               .fluidMask = fluid,
-                              .bnd = bnd}))
+                              .bnd = bnd,
+                              .solidMask = std::move(solid)}))
             return fail(6, "GPU allocation failed (RANS)");
         if (steady && !dev->enableCompensation())
             return fail(6, "GPU allocation failed (compensated state)");
@@ -669,9 +674,20 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                                              .dtRecompute = r.dtRecompute,
                                              .cap = r.steadySteps,
                                              .statsEvery = r.statsEvery,
-                                             .series = 1 + ds->nT};
+                                             .series = 1 + ds->nT,
+                                             .observables = 1};
         auto res = internal::explicitSteadyMarch(*dev, *ds, *red, sp, io);
         if (!res) return std::unexpected(res.error());
+        {
+            const char* names[3] = {"cd", sst ? "int rho k" : "int rho nu~",
+                                    "int rho omega"};
+            std::fputs(internal::steadyFloorReport(
+                           res->floors,
+                           std::span<const char* const>(names, 1 + ds->nT))
+                           .c_str(),
+                       stdout);
+            std::fflush(stdout);
+        }
         st.steps = res->steps;
         st.tStop = res->t;
         if (auto h = internal::checkDevice("the end of the run", &*red); !h)

@@ -120,14 +120,19 @@ __global__ void kSstMutCurv(GpuGrid g, ViscView vv, PrimView q, CurvView m,
 // Total flux (convective minus diffusive) of rho phi, phi = t/rho, through the
 // face a-b: upwind on the mean mass flux, diffusion (mu_f + sig mu_t,f)
 // (grad phi . S) with mu_t,f the face average of the (mirrored) cell mu_t.
+// wallSide (immersed only, ScalarBoundary::solid): 1 = a, 2 = b is a body
+// cell whose convected value is the wall value 0; 0 = neither (verbatim).
 __device__ inline Real sstFaceFlux(ViscView vv, PrimView q, const CurvView& m,
                                    const Offsets& o, std::size_t a,
                                    std::size_t b, int axis, const Real* t,
-                                   Real mdot, Real sig, Real mutf)
+                                   Real mdot, Real sig, Real mutf,
+                                   int wallSide = 0)
 {
     const Real Sv[3] = {m.S[axis][0][a], m.S[axis][1][a], m.S[axis][2][a]};
     auto ph = [&](std::size_t x) { return t[x] / q.rho[x]; };
-    const Real F = fmaxf(mdot, Real(0)) * ph(a) + fminf(mdot, Real(0)) * ph(b);
+    const Real pa = wallSide == 1 ? Real(0) : ph(a);
+    const Real pb = wallSide == 2 ? Real(0) : ph(b);
+    const Real F = fmaxf(mdot, Real(0)) * pa + fminf(mdot, Real(0)) * pb;
     const Real muf = muAt(vv, Real(0.5) * (q.T[a] + q.T[b]));
     Real gr[3];
     curvScalarFaceGrad(m, o, a, b, axis, ph, gr);
@@ -194,7 +199,12 @@ __global__ void kSstStageCurv(GpuGrid g, ViscView vv, PrimView q, CurvView m,
             const Real mutf = Real(0.5) * (A.nut[fa] + A.nut[fb]);
             const Real sk = sstBlendC(F1f, sst::sigmaK1, sst::sigmaK2);
             const Real sw = sstBlendC(F1f, sst::sigmaW1, sst::sigmaW2);
-            const Real fk = sstFaceFlux(vv, q, m, o, fa, fb, a, A.t0, mdot, sk, mutf);
+            int ws = 0;
+            if constexpr (Bnd)
+                if (sb.solid && sb.solid[fa] != sb.solid[fb])
+                    ws = sb.solid[fa] ? 1 : 2;
+            const Real fk =
+                sstFaceFlux(vv, q, m, o, fa, fb, a, A.t0, mdot, sk, mutf, ws);
             const Real fw = sstFaceFlux(vv, q, m, o, fa, fb, a, A.t1, mdot, sw, mutf);
             divK -= side ? -fk : fk;
             divW -= side ? -fw : fw;
@@ -275,12 +285,15 @@ __device__ inline Real massFlux(PrimView q, const Real Sv[3], std::size_t a,
 __device__ inline Real saFaceFlux(ViscView vv, PrimView q, const CurvView& m,
                                   const Offsets& o, std::size_t a,
                                   std::size_t b, int axis, const Real* t0,
-                                  const Real* wf, Real wS, bool transportOnly)
+                                  const Real* wf, Real wS, bool transportOnly,
+                                  int wallSide = 0)
 {
     const Real Sv[3] = {m.S[axis][0][a], m.S[axis][1][a], m.S[axis][2][a]};
     auto nt = [&](std::size_t x) { return t0[x] / q.rho[x]; };
     const Real mdot = massFlux(q, Sv, a, b, wf, wS);
-    Real F = fmaxf(mdot, Real(0)) * nt(a) + fminf(mdot, Real(0)) * nt(b);
+    const Real pa = wallSide == 1 ? Real(0) : nt(a);
+    const Real pb = wallSide == 2 ? Real(0) : nt(b);
+    Real F = fmaxf(mdot, Real(0)) * pa + fminf(mdot, Real(0)) * pb;
     if (transportOnly) return F;
     const Real rf = Real(0.5) * (q.rho[a] + q.rho[b]);
     const Real nuf = muAt(vv, Real(0.5) * (q.T[a] + q.T[b])) / rf;
@@ -328,15 +341,22 @@ __global__ void kSaStageCurv(GpuGrid g, ViscView vv, PrimView q, CurvView m,
             openFaces(g, sb, i, j, k, a, openHi, openLo);
             const Real phiC = t0[c] / q.rho[c], phiI = Real(sb.phiInf[0]);
             Real Sv[3];
-            const std::size_t fl = c + o.m[a];
+            const std::size_t fl = c + o.m[a], fh = c + o.p[a];
+            // A body neighbour convects the wall value (ScalarBoundary).
+            auto side = [&](std::size_t x, std::size_t y) {
+                return sb.solid && sb.solid[x] != sb.solid[y]
+                           ? (sb.solid[x] ? 1 : 2)
+                           : 0;
+            };
             for (int x = 0; x < 3; ++x) Sv[x] = m.S[a][x][c];
             const Real hi = openHi ? openFaceFlux(q, Sv, c, phiC, phiI, true)
-                                   : saFaceFlux(vv, q, m, o, c, c + o.p[a], a,
-                                                t0, pwhi, qhi, transportOnly);
+                                   : saFaceFlux(vv, q, m, o, c, fh, a, t0, pwhi,
+                                                qhi, transportOnly, side(c, fh));
             for (int x = 0; x < 3; ++x) Sv[x] = m.S[a][x][fl];
             const Real lo = openLo ? openFaceFlux(q, Sv, c, phiC, phiI, false)
                                    : saFaceFlux(vv, q, m, o, fl, c, a, t0,
-                                                pwlo, qlo, transportOnly);
+                                                pwlo, qlo, transportOnly,
+                                                side(fl, c));
             div -= hi - lo;
         } else {
             const Real hi = saFaceFlux(vv, q, m, o, c, c + o.p[a], a, t0, pwhi,
@@ -392,7 +412,127 @@ __global__ void kSaStageCurv(GpuGrid g, ViscView vv, PrimView q, CurvView m,
     }
 }
 
+// The scalar's own mass divergence (div of the fluxes the scalar kernels'
+// Bnd instantiation uses, accumulated in the same order) and the stage
+// combination of rho it implies, at an open-boundary cell c.
+__device__ inline Real scalarMassDiv(const GpuGrid& g, const ScalarBoundary& sb,
+                                     PrimView q, const CurvView& m, int i, int j,
+                                     int k, std::size_t c)
+{
+    const Offsets o = offsetsAt(g, i, j, k);
+    Real div = 0;
+    for (int a = 0; a < 3; ++a) {
+        bool openHi = false, openLo = false;
+        openFaces(g, sb, i, j, k, a, openHi, openLo);
+        const std::size_t fl = c + o.m[a], fh = c + o.p[a];
+        Real Sv[3];
+        for (int x = 0; x < 3; ++x) Sv[x] = m.S[a][x][c];
+        const Real hi = openHi ? q.rho[c] * (q.u[c] * Sv[0] + q.v[c] * Sv[1] +
+                                             q.w[c] * Sv[2])
+                               : massFlux(q, Sv, c, fh, nullptr, Real(0));
+        for (int x = 0; x < 3; ++x) Sv[x] = m.S[a][x][fl];
+        const Real lo = openLo ? q.rho[c] * (q.u[c] * Sv[0] + q.v[c] * Sv[1] +
+                                             q.w[c] * Sv[2])
+                               : massFlux(q, Sv, fl, c, nullptr, Real(0));
+        div -= hi - lo;
+    }
+    return div * m.invVol[c];
+}
+
+// Open-boundary scalar consistency (docs/rans.md, "Immersed-wall RANS"):
+// one thread per open-face cell. The mean flow's rhs there is NOT the flux
+// divergence (NSCBC overwrites continuity with its characteristic form; a
+// sponge face carries the periodic wrap), so no scalar FLUX can ride it.
+// The scalar is instead carried by the density the mean flow produced: its
+// SPECIFIC value phi = t / rho_s, rho_s the density the scalar's own fluxes
+// imply, then t = phi rho_out -- the phi R_rho form. A uniform phi stays
+// exact (t = phi rho_s and t / rho_s are exact for a power-of-two phi).
+// Residual mode (ca = cb = 0, cr = 1): R_t += phi_c (R_rho - M).
+__global__ void kOpenScalarFix(GpuGrid g, ScalarBoundary sb, PrimView q,
+                               CurvView m, StageCombine cmb, int residual,
+                               int nT, const Real* sT0, const Real* sT1,
+                               const Real* oRho, const Real* oRhoLo, Real* t0,
+                               Real* t1, Real* t0lo, Real* t1lo)
+{
+    const std::size_t nA = std::size_t(g.ny) * g.nz,
+                      nB = std::size_t(g.nx) * g.nz,
+                      nC = std::size_t(g.nx) * g.ny;
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= 2 * (nA + nB + nC)) return;
+    int i, j, k;
+    if (t < 2 * nA) {
+        if (!sb.open[0]) return;
+        const std::size_t r = t % nA;
+        i = t < nA ? 0 : g.nx - 1;
+        j = int(r % g.ny);
+        k = int(r / g.ny);
+    } else if (t < 2 * (nA + nB)) {
+        if (!sb.open[1]) return;
+        const std::size_t u = t - 2 * nA, r = u % nB;
+        j = u < nB ? 0 : g.ny - 1;
+        i = int(r % g.nx);
+        k = int(r / g.nx);
+        if (sb.open[0] && (i == 0 || i == g.nx - 1)) return; // x owns it
+    } else {
+        if (!sb.open[2]) return;
+        const std::size_t u = t - 2 * (nA + nB), r = u % nC;
+        k = u < nC ? 0 : g.nz - 1;
+        i = int(r % g.nx);
+        j = int(r / g.nx);
+        if (sb.open[0] && (i == 0 || i == g.nx - 1)) return;
+        if (sb.open[1] && (j == 0 || j == g.ny - 1)) return;
+    }
+    const std::size_t c = gidx(g, i, j, k);
+    if (sb.solid && sb.solid[c]) return; // the ghost wall owns body cells
+    const Real M = scalarMassDiv(g, sb, q, m, i, j, k, c);
+    Real* tt[2] = {t0, t1};
+    Real* tl[2] = {t0lo, t1lo};
+    const Real* st[2] = {sT0, sT1};
+    if (residual) {
+        for (int e = 0; e < nT; ++e)
+            tt[e][c] += st[e][c] / q.rho[c] * (oRho[c] - M);
+        return;
+    }
+    const Real combR = cmb.ca * cmb.a[0][c] + cmb.cb * cmb.b[0][c];
+    if (!oRhoLo) {
+        const Real rs = pointImplicit(combR, cmb.crAt(c), M, Real(0), Real(0));
+        for (int e = 0; e < nT; ++e) tt[e][c] = tt[e][c] / rs * oRho[c];
+        return;
+    }
+    // Compensated: the pairs in FP64 (hi + lo), the result split again.
+    const double rs = double(cmb.a[0][c]) + double(cmb.al[0][c]) +
+                      double(cmb.cb) * ((double(cmb.b[0][c]) + double(cmb.bl[0][c])) -
+                                        (double(cmb.a[0][c]) + double(cmb.al[0][c]))) +
+                      double(cmb.crAt(c)) * double(M);
+    const double ro = double(oRho[c]) + double(oRhoLo[c]);
+    for (int e = 0; e < nT; ++e) {
+        const double v = (double(tt[e][c]) + double(tl[e][c])) / rs * ro;
+        const Real hi = Real(v);
+        tt[e][c] = hi;
+        tl[e][c] = Real(v - double(hi));
+    }
+}
+
 } // namespace
+
+void openScalarConsistency(const GpuGrid& g, const ScalarBoundary& sb,
+                           PrimView q, CurvView m, const StageCombine& cmb,
+                           bool residual, const DeviceCompState& s,
+                           DeviceCompState& out)
+{
+    assert(sb.any() && s.nT >= 1);
+    const std::size_t n = 2 * (std::size_t(g.ny) * g.nz + std::size_t(g.nx) * g.nz +
+                               std::size_t(g.nx) * g.ny);
+    const bool comp = out.compensated() && !residual && cmb.al[0] && cmb.ol[0];
+    kOpenScalarFix<<<launchBlocks(n), blockSize>>>(
+        g, sb, q, m, cmb, int(residual), s.nT, s.t[0].data(),
+        s.nT > 1 ? s.t[1].data() : nullptr, out.rho.data(),
+        comp ? out.lo[0].data() : nullptr, out.t[0].data(),
+        s.nT > 1 ? out.t[1].data() : nullptr,
+        comp ? out.tlo[0].data() : nullptr,
+        comp && s.nT > 1 ? out.tlo[1].data() : nullptr);
+    checkLastKernel("kOpenScalarFix");
+}
 
 void mutCurv(const GpuGrid& g, ViscView vv, const Real* rho, const Real* T,
              const Real* t0, Real* nut)

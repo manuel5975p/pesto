@@ -149,11 +149,16 @@ __global__ void kGhostFill(Real gamma, int iso, Real Twall, Real Rgas,
 }
 
 // RANS scalar images of the ghosts (DeviceCompGhost::applyTurb): the specific
-// scalars sampled through the velocity stencil, imaged like the velocity
-// about a wall value (0 for nu~ and k, omega_w for omega), stored with the
-// ghost density kGhostFill wrote. omega_w = 60 nu_w / (beta1 d_s^2), d_s =
-// dw / a the sample's wall distance, nu_w = mu(T_s) / rho_s of the thermo
-// sample.
+// scalars sampled through the velocity stencil, stored with the ghost density
+// kGhostFill wrote. SA nu~ is imaged like the velocity (odd about its wall
+// value 0: nu~ ~ kappa u_tau d is linear at the wall). SST k is imaged EVEN
+// and quadratic, k_g = a^2 sum w k_s: k ~ d^2 in the sublayer (wall value 0
+// AND zero wall slope), and the odd image -a sum w k_s -- negative -- read
+// into the fluid through the staircase faces tripped the counted k guard
+// (measured 5.5e5 hits over 7.5e4 steps, cylinder 384^2 Re 1000; 0 with
+// this image, cd unchanged to 1e-5). omega: (1 + a) omega_w - a sum w
+// omega_s, omega_w = 60 nu_w / (beta1 d_s^2), d_s = dw / a the sample's
+// wall distance, nu_w = mu(T_s) / rho_s of the thermo sample.
 __global__ void kGhostTurb(int sst, ViscView vv, Real gamma, Real Rgas,
                            const int* gcell, const int* gnbr, const Real* gw,
                            const int* tnbr, const Real* tw, const Real* gscale,
@@ -174,8 +179,11 @@ __global__ void kGhostTurb(int sst, ViscView vv, Real gamma, Real Rgas,
     const Real a = gscale[q];
     const int c = gcell[q];
     const Real rg = rho[c];
-    t0[c] = rg * (-a * s0);
-    if (!sst) return;
+    if (!sst) {
+        t0[c] = rg * (-a * s0);
+        return;
+    }
+    t0[c] = rg * (a * a * s0);
     Real rt = 0, pt = 0;
     for (int s = 0; s < 8; ++s) {
         const Real w = tw[8 * q + s];

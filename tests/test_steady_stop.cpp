@@ -183,6 +183,235 @@ void slowestSeriesGoverns()
           "remaining is the slowest series' tail");
 }
 
+// --- the jitter-floored rule (dns flow) ---------------------------------------
+
+std::vector<double> noisy(const std::function<double(int)>& f, int n, double sd,
+                          unsigned seed)
+{
+    std::mt19937 gen(seed);
+    std::normal_distribution<double> nd(0, sd);
+    std::vector<double> x(n);
+    for (int k = 0; k < n; ++k) x[k] = f(k) * (1 + nd(gen));
+    return x;
+}
+
+// First n in [48, nMax] whose rule certifies tol, else -1; `err` = the last
+// sample's true relative distance from `limit` there.
+int firstStop(const std::function<std::vector<double>(int)>& hist, int nMax,
+              double tol, bool observable, double limit, double& err)
+{
+    for (int n = 48; n <= nMax; ++n)
+    {
+        const auto x = hist(n);
+        if (!(steadyFloor(x, observable).remaining < tol)) continue;
+        err = std::abs(x.back() - limit) / std::abs(limit);
+        return n;
+    }
+    return -1;
+}
+
+// White FP32-like jitter on a converged value (the measured floors: 3e-7
+// cylinder Re 40, 5e-5 sphere Re 1e4): certified at the first full window as
+// an observable iff TOL clears trend + sqrt(2) J, the jitter J read back.
+void flooredNoise()
+{
+    for (const double sd : {3e-7, 5e-5})
+    {
+        const auto x = noisy([](int) { return 0.4248; }, 48, sd, 3);
+        const SteadyFloor f = steadyFloor(x, true);
+        check(std::abs(f.jitter / sd - 1) < 0.35,
+              std::format("jitter {:.1e} read back as {:.2e}", sd, f.jitter));
+        check(f.remaining < 3 * sd + f.trend && f.trend < 3 * sd,
+              std::format("white jitter {:.1e}: no trend (trend {:.2e})", sd,
+                          f.trend));
+        check(f.remaining < 1e-3, std::format("jitter {:.1e} certifies TOL 1e-3", sd));
+        check(!(f.remaining < sd), std::format("jitter {:.1e} never certifies "
+                                               "TOL below it", sd));
+    }
+    check(std::isinf(steadyFloor(std::vector<double>(47, 1.0), true).remaining),
+          "47 samples: a block under kSteadyBlockMin, never certified");
+    check(steadyFloor(std::vector<double>(48, 1.0), true).remaining == 0,
+          "48 equal samples: exactly 0");
+    check(std::isinf(steadyFloor(std::vector<double>(96, 0.0), true).remaining),
+          "x_last == 0: never certified");
+}
+
+// Geometric tails, clean and under jitter: never early (the last sample
+// within tol of the limit at the first certification).
+void flooredGeometric()
+{
+    for (const double sd : {0.0, 3e-7, 1e-6})
+        for (const double tol : {1e-3, 1e-4, 1e-5})
+            for (const double rate : {0.99, 0.995})
+            {
+                double err = 0;
+                const int n = firstStop(
+                    [&](int m) {
+                        return noisy([&](int k) { return 1 + 0.03 * std::pow(rate, k); },
+                                     m, sd, 5);
+                    },
+                    6000, tol, true, 1.0, err);
+                check(n > 0 && err < tol,
+                      std::format("geometric rate {} jitter {:.0e} tol {}: stops ({}), "
+                                  "never early (err {:.1e})",
+                                  rate, sd, tol, n, err));
+            }
+}
+
+// Drift is never certified once the window resolves it: linear (no fixed
+// point) above the noise from the first window, and a slow drift buried in
+// jitter (1e-7 / sample under 1e-6) from the window that resolves it (b
+// 48 samples: drift 4.8e-6 per block against a detection limit 6e-7) --
+// before that it is indistinguishable from jitter by ANY rule on that window,
+// and the trend it reports (drift + detection limit) is what it is.
+void flooredDrift()
+{
+    double err = 0;
+    for (const bool obs : {true, false})
+    {
+        check(firstStop([](int m) { return sample([](int k) { return 1 + 1e-5 * k; }, m); },
+                        3000, 1e-3, obs, 1.0, err) < 0,
+              std::format("linear drift 1e-5 / sample: never certified ({})",
+                          obs ? "observable" : "monitor"));
+        check(firstStop([](int m) {
+                  return noisy([](int k) { return 1 + 1e-6 * k; }, m, 1e-6, 9);
+              }, 3000, 1e-4, obs, 1.0, err) < 0,
+              std::format("drift 1e-6 / sample under 1e-6 jitter: never certified "
+                          "({})", obs ? "observable" : "monitor"));
+        int late = 0;
+        for (int n = 288; n <= 3000; n += 7)
+            late += steadyFloor(noisy([](int k) { return 1 + 1e-7 * k; }, n, 1e-6, 9),
+                                obs)
+                        .remaining < 1e-5;
+        check(late == 0, std::format("slow drift 1e-7 / sample under 1e-6 jitter: "
+                                     "never certified at 1e-5 once resolved ({}, "
+                                     "{} windows)", obs ? "observable" : "monitor",
+                                     late));
+    }
+}
+
+// Oscillations above the floor are never certified; a damped one only once
+// its swing is under tol, never early. As a monitor, an undamped swing above
+// kSteadyJitterMax is refused although its block means are flat. (An
+// observable's undamped swing of amplitude A is certified iff trend + A <
+// tol: every sample is then inside tol of the fixed point. A monitor's swing
+// below kSteadyJitterMax is the stated floor: not told from FP32 jitter.)
+void flooredOscillation()
+{
+    double err = 0;
+    for (const double tol : {1e-3, 1e-4, 1e-5, kSteadyTolMin})
+    {
+        for (const double w : {0.37, 1.9})
+            check(firstStop([&](int m) {
+                      return sample([&](int k) { return 1 + 1.5 * tol * std::cos(w * k); },
+                                    m);
+                  }, 3000, tol, true, 1.0, err) < 0,
+                  std::format("undamped 1.5 tol oscillation (w {}) never certified at "
+                              "tol {}", w, tol));
+        // A period (126 samples) longer than the early windows: a window
+        // shorter than the period decelerating into a crest IS a turning
+        // point (the one-series limitation, turningPoint()); once the window
+        // spans the period it is never certified.
+        int late = 0;
+        for (int n = 260; n <= 3000; n += 3)
+            late += steadyFloor(sample([&](int k) { return 1 + 1.5 * tol * std::cos(0.05 * k); },
+                                       n),
+                                true)
+                        .remaining < tol;
+        check(late == 0, std::format("slow undamped oscillation (period 126) never "
+                                     "certified once the window spans it, tol {} ({})",
+                                     tol, late));
+    }
+    // Period 2 (the measured SST sphere Re 1e4 L2 limit cycle: acf -0.9).
+    check(firstStop([](int m) {
+              return sample([](int k) { return 0.41 * (1 + 4e-3 * (k % 2 ? 1 : -1)); }, m);
+          }, 3000, 1e-3, true, 0.41, err) < 0,
+          "period-2 limit cycle 4e-3: never certified at tol 1e-3");
+    check(firstStop([](int m) {
+              return sample([](int k) { return 1 + 3e-3 * std::cos(0.37 * k); }, m);
+          }, 3000, 1e-3, false, 1.0, err) < 0,
+          "monitor oscillation 3e-3 > kSteadyJitterMax: never certified");
+    check(firstStop([](int m) {
+              return sample([](int k) { return 1 + 3e-3 * std::cos(0.37 * k); }, m);
+          }, 3000, 1e-3, true, 1.0, err) < 0,
+          "observable oscillation 3e-3 at tol 1e-3: never certified");
+    for (const double tol : {1e-3, 1e-4, 1e-5})
+    {
+        const int n = firstStop([](int m) {
+            return sample([](int k) {
+                return 1 + 0.01 * std::exp(-k / 200.0) * std::cos(k / 7.0);
+            }, m);
+        }, 8000, tol, true, 1.0, err);
+        check(n > 0 && err < tol,
+              std::format("damped oscillation at tol {}: certified ({}), never early "
+                          "(err {:.1e})", tol, n, err));
+    }
+    // The same swing under jitter.
+    for (const double tol : {1e-3, 1e-4})
+    {
+        const int n = firstStop([](int m) {
+            return noisy([](int k) {
+                return 1 + 0.01 * std::exp(-k / 200.0) * std::cos(k / 7.0);
+            }, m, 1e-6, 13);
+        }, 8000, tol, true, 1.0, err);
+        check(n > 0 && err < tol,
+              std::format("damped oscillation + 1e-6 jitter at tol {}: certified ({}), "
+                          "never early (err {:.1e})", tol, n, err));
+    }
+}
+
+// The turning-point lesson under the floored rule: one series alone is fooled
+// at its turning point, the pair with a slow-mode monitor is not.
+void flooredTurningPoint()
+{
+    const double tol = 1e-3;
+    auto X = [](int k) {
+        return 1 + 0.03 * std::exp(-k / 10.0) - 0.06 * std::exp(-k / 300.0);
+    };
+    auto Y = [](int k) { return 1 + 0.05 * std::exp(-k / 300.0); };
+    SteadyStop stop(2, 1);
+    for (int k = 0; k < 8000; ++k)
+    {
+        const double q[2] = {X(k), Y(k)};
+        stop.push(q);
+        if (!(stop.remaining(tol) < tol)) continue;
+        const double ex = std::abs(q[0] - 1) / q[0], ey = std::abs(q[1] - 1) / q[1];
+        check(ex < tol && ey < tol,
+              std::format("floored pair stops inside tol (row {}, x {:.1e}, y {:.1e})",
+                          k, ex, ey));
+        const auto f = stop.floors();
+        check(f.size() == 2 && std::isfinite(f[0].jitter) && std::isfinite(f[1].jitter),
+              "floors() reports both series");
+        return;
+    }
+    check(false, "floored pair never stopped");
+}
+
+// The rule split: SteadyStop(n) stays the channel's geometric rule, bit for
+// bit steadyRemaining; floors() is empty there.
+void ruleSplit()
+{
+    SteadyStop geo(1);
+    std::vector<double> x;
+    for (int k = 0; k < 300; ++k)
+    {
+        const double q[1] = {1 + 0.03 * std::pow(0.99, k)};
+        geo.push(q);
+        x.push_back(q[0]);
+    }
+    check(geo.remaining(1e-4) == steadyRemaining(x, 1e-4),
+          "SteadyStop(n) == steadyRemaining exactly");
+    check(geo.floors().empty() && !geo.floored(), "geometric rule: no floors");
+    SteadyStop fl(1, 1);
+    for (const double v : x)
+    {
+        const double q[1] = {v};
+        fl.push(q);
+    }
+    check(fl.floored() && fl.remaining(1e-4) == steadyFloor(x, true).remaining,
+          "SteadyStop(n, k) == steadyFloor exactly");
+}
+
 } // namespace
 
 int main()
@@ -193,5 +422,11 @@ int main()
     noise();
     turningPoint();
     slowestSeriesGoverns();
+    flooredNoise();
+    flooredGeometric();
+    flooredDrift();
+    flooredOscillation();
+    flooredTurningPoint();
+    ruleSplit();
     return dnstest::finish();
 }

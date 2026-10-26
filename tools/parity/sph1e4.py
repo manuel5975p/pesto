@@ -153,7 +153,8 @@ boundaryField
     else:
         k = 2.25e-7
         w = k / (0.009 * nu)
-        ww = "\n".join(f"{60 * nu / (BETA1 * d * d)!r}" for d in d1)
+        # float(): numpy 2 reprs np.float64 as "np.float64(...)".
+        ww = "\n".join(f"{float(60 * nu / (BETA1 * d * d))!r}" for d in d1)
         field("k", "volScalarField", "[0 2 -2 0 0 0 0]", f"{k!r}",
               "type fixedValue; value uniform 0;",
               f"type inletOutlet; inletValue uniform {k!r}; value uniform {k!r};")

@@ -2,6 +2,7 @@
 
 Full reference: **README.md** (CLI, solvers, BCs, measured anchors). Design history: `docs/archive/`.
 Specs: `docs/nscbc.md`, `docs/validation.md`, `docs/viewer-format.md`, `docs/channel.md`, `docs/scene.md`, `docs/rans.md`.
+**Open issues: `issues.md`** — what is broken, unproven or undecided at this commit. Read it before starting work; update it in the same commit that fixes, finds or defers an issue. This file stays the stable invariants.
 
 ## Ground rules
 
@@ -110,6 +111,12 @@ A RANS field (`dns channel --rans`, `docs/rans.md`) is an ensemble-mean MODEL ou
 - **Never build J by FP32 FD of the GPU residual.** The working step window is non-monotone and case-dependent (2^-10 fails SST Re_τ 1e4; 2^-14 passes).
 - **The stop listens only after an undamped step taken AT the CFL cap.** Unarmed it certified ub 1.1% off after rejections, and a damped stall. Measured: 27–28 iterations, ≤ 8e-8 off the oracle, 0.1 s, Re_τ 180 to 1e4.
 - **The O-grid far boundary is its own characteristic row, not NSCBC**: every `--nscbc-*` flag and `--pot` is rejected with `--ogrid` (they were silently ignored), Re > 800 only warns.
+- **`dns flow --steady` stops on a JITTER FLOOR (`steadyFloor`); the channel keeps `steadyRemaining` bit for bit.** External-flow integrals settle, then jitter white at the FP32 floor (pressure coefficients amplify p's ulp by 2/(γM²)), far above 2^-20 — the geometric rule never certified one. Trend from block means against a noise detection limit, sub-block means monotone to the noise; cd/cdf certify on trend + √2·jitter < TOL, monitors also need jitter ≤ 2^-10 (`kSteadyJitterMax`). Every run prints the per-series trend/jitter line. TOL below the jitter never certifies — by design.
+- **The wedge has TWO azimuthal widths**: ρ (`aov`) for the time march — time-accurate wedge runs byte-identical to 75f39db — and ρΔφ (`aovSteadyZ`) for the steady local dt only, with a RELATIVE collapse guard (1e-3 × first dtRef; the axis dtRef is legitimately ~7e-7). Widening the time-march width put the cold-start SA wedge into a pseudo-time limit cycle (5 variants measured).
+- **Axisymmetry is a mesh plus a ghost hook**: axis faces have S == 0 exactly with the analytic limit metric; ghost columns carry the across-axis continuation (R_x(π)) on placeholder geometry (their real neighbour's metrics).
+- **Immersed RANS scalars**: the ghost k image is EVEN and quadratic (a²·Σw·k, k ∝ d²) — the odd image fed negative k into staircase corners (710 guard hits / 200 steps → 0); interface faces convect ν̃ and k at the wall value 0; open-face scalars are re-carried by the mean-flow density after the NSCBC hook (`rans::openScalarConsistency`, drift 1.4e4 ulp → 0). Label `[immersed ghost wall: first-order wall position, NOT body-fitted]`.
+- **Flow NK**: R is always the GPU residual-mode stage, dissipation only in P; lexicographic line-GS only (red-black stalled at the 200-Krylov cap); FD step 2^-14. In NK kernels a load-wait-use loop over global memory serializes — stage operands with unrolled loads first (line-SGS 59 → 13.4 ms).
+- **OpenFOAM parity**: v2606 SA defaults are ft2 OFF and Prt 1.0 — set `ft2 true`, Prt 0.9. `exactDistance` fails in parallel: run serial.
 
 ## Known gotchas
 

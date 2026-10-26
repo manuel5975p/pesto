@@ -442,6 +442,9 @@ std::expected<DeviceCurv, hipError_t> DeviceCurv::make(const CurvMetrics& m)
         if (auto e = up(d.aov[a], m.aov[a]); e != hipSuccess)
             return std::unexpected(e);
     }
+    if (!m.aovSteadyZ.empty())
+        if (auto e = up(d.aovSteadyZ, m.aovSteadyZ); e != hipSuccess)
+            return std::unexpected(e);
     std::vector<double> iv(n);
     for (std::size_t i = 0; i < n; ++i) iv[i] = 1.0 / m.vol[i];
     if (auto e = up(d.invVol, iv); e != hipSuccess) return std::unexpected(e);
@@ -852,6 +855,9 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
                                   testSrc_[0], out.t[0].data(), bnd_);
             }
             if (rhsHook_) rhsHook_(s, out, cmb);
+            if (bnd_.any())
+                rans::openScalarConsistency(g_, bnd_, q, cv, cmb, residualMode,
+                                            s, out);
             return;
         }
         if (csLes_ > Real(0)) {
@@ -1171,6 +1177,15 @@ std::expected<void, hipError_t> DeviceComp::enableRans(const RansSetup& rs)
     testSrc_[1] = rs.testSource[1];
     ransTransport_ = rs.transportOnly;
     bnd_ = rs.bnd;
+    assert(rs.solidMask.empty() || (rs.bnd.any() && rs.solidMask.size() == n));
+    if (!rs.solidMask.empty()) {
+        auto sm = DeviceBuffer<std::uint8_t>::make(n);
+        if (!sm) return std::unexpected(sm.error());
+        if (auto e = sm->upload(rs.solidMask.data()); e != hipSuccess)
+            return std::unexpected(e);
+        solid_ = std::move(*sm);
+        bnd_.solid = solid_.data();
+    }
     return {};
 }
 
@@ -1180,20 +1195,24 @@ double DeviceComp::localDt(const DeviceCompState& s, ReduceScratch& r,
     assert(curvilinear() && dtc_.size() == g_.size());
     const std::size_t n = g_.size();
     const MrfView mz = mrf_ ? mrfView() : MrfView{};
+    // The wedge's steady local dt reads the side faces' real spacing
+    // (DeviceCurv::aovSteadyZ); every other mesh its time-march aov.
+    const Real* az = curv_->aovSteadyZ.size() ? curv_->aovSteadyZ.data()
+                     : g_.nz > 1              ? curv_->aov[2].data()
+                                              : nullptr;
     const WavePerDtCurv wave{g_, mz, s.rho.data(), s.mx.data(), s.my.data(),
                              s.mz.data(), s.E.data(), curv_->aov[0].data(),
-                             curv_->aov[1].data(),
-                             g_.nz > 1 ? curv_->aov[2].data() : nullptr,
-                             double(tr_.gamma)};
+                             curv_->aov[1].data(), az, double(tr_.gamma)};
     if (rans()) {
-        kLocalDt<<<launchBlocks(n), blockSize>>>(wave, ransDiffDt(s), cfl, n,
+        rans::RansDiffDt diff = ransDiffDt(s);
+        diff.az = az;
+        kLocalDt<<<launchBlocks(n), blockSize>>>(wave, diff, cfl, n,
                                                  dtc_.data());
     } else {
         const rans::LaminarDiffDt diff{
             s.rho.data(),         s.mx.data(),          s.my.data(),
             s.mz.data(),          s.E.data(),           curv_->aov[0].data(),
-            curv_->aov[1].data(), g_.nz > 1 ? curv_->aov[2].data() : nullptr,
-            tr_};
+            curv_->aov[1].data(), az,                   tr_};
         kLocalDt<<<launchBlocks(n), blockSize>>>(wave, diff, cfl, n,
                                                  dtc_.data());
     }

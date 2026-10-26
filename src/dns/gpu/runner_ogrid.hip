@@ -729,18 +729,33 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
             if (!nk) return fail(6, "GPU allocation failed (Newton-Krylov)");
             return internal::nkSteadyMarch(*nk, *ds, *red, p, nio);
         };
+        // A revolved mesh's axis cells are legitimately below the absolute
+        // 1e-6 guard at L3 (width rho dphi); it keeps the relative one.
         const internal::SteadyMarchParams sp{.cfl = r.cfl,
                                              .dtMargin = r.dtMargin,
-                                             .collapse = 1e-6,
+                                             .collapse = rev ? 0.0 : 1e-6,
+                                             .collapseRel = rev ? 1e-3 : 0.0,
                                              .tol = r.steadyTol,
                                              .dtRecompute = r.dtRecompute,
                                              .cap = r.steadySteps,
                                              .statsEvery = r.statsEvery,
-                                             .series = 3 + ds->nT};
+                                             .series = 3 + ds->nT,
+                                             .observables = 2};
         auto res = implicit ? nkMarch(sp, io)
                             : internal::explicitSteadyMarch(*dev, *ds, *red,
                                                             sp, io);
         if (!res) return std::unexpected(res.error());
+        {
+            const char* names[5] = {"cd", "cdf", "W", sst ? "int rho k"
+                                                          : "int rho nu~",
+                                    "int rho omega"};
+            std::fputs(internal::steadyFloorReport(
+                           res->floors,
+                           std::span<const char* const>(names, 3 + ds->nT))
+                           .c_str(),
+                       stdout);
+            std::fflush(stdout);
+        }
         st.steps = res->steps;
         st.tStop = res->t;
         if (auto h = internal::checkDevice("the end of the run", &*red); !h)

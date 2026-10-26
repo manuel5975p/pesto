@@ -135,8 +135,8 @@ Code-to-code, not literature: OpenFOAM v2606 `simpleFoam` (incompressible,
 `constant/polyMesh` (axis cells become prisms, `checkMesh` OK), and
 `tools/parity/sph1e4.py case|run|read|dns` drives and reads both sides. Tier
 B: dns cd0 = (4 cd(M 0.1) − cd(M 0.2))/3 against the incompressible solver.
-Both dns runs are the explicit LTS march stopped at its plateau (exit 8; the
-integrals jitter at ~1e-5 and never certify, `docs/rans.md`); OpenFOAM to
+Both dns runs are the explicit LTS march stopped at its plateau (measured
+before the jitter-floored stop, exit 8 at the cap; docs/rans.md); OpenFOAM to
 `|q − q_final| ≤ 1e-4` settle. Wedge 5°, rFar 20 D, β 3 (gfx1100, 2026-10-26):
 
 | level (nθ × ny) | dns cd M 0.2 | dns cd M 0.1 | dns cd0 | OpenFOAM cd | Δ | θ_s dns M0.1 / OF | L_r dns cd0-extrap / OF |
@@ -151,12 +151,38 @@ correction is not small (cd falls 0.5% from M 0.2 to M 0.1), so a tier-A M 0.2
 comparison would read +0.7%. Δφ: a 2.5° wedge at L2 moves cd by +5.8e-4
 (1.09556). OpenFOAM wall times 10 / 75 / 617 s serial.
 
-`sph1e4` (SA-neg / SST-2003m at Re 1e4) has NO dns side yet: the explicit LTS
-march on the wedge does not reach a steady state (cd oscillates between −5.5
-and +6.2 over ~1.5e6 iterations on SA L1; SST L1 diverged at 4.5e5, exit 7;
-`docs/rans.md`), and the Newton-Krylov march that was to fix it failed its
-gates (B0). The OpenFOAM half of the harness is built and checked
-(`sph1e4.py case <mesh> <dir> sa|sst 1e4`).
+### Sphere Re 1e4 RANS on the revolved wedge vs OpenFOAM (`sph1e4`, identical mesh)
+
+Same harness, β 4.5, models per masterplan §8: dns `RANS SA-neg -- steady
+(local time stepping: pseudo-time, not time-accurate) [axisymmetric wedge 5
+deg: ...]` against OpenFOAM v2606 `simpleFoam` `SpalartAllmaras { ft2 true;
+Ct3 1.2; Ct4 0.5; }`, `Prt 0.9` (OpenFOAM's SA is NOT SA-neg: it bounds ν̃
+≥ 0 and lacks TMR's ∇ρ term; both vanish in tier B except the bound), and
+`kOmegaSST` against `RANS SST-2003m`. OpenFOAM serial (its `exactDistance`
+wall distance does not decompose), 3000 iterations, settled to 1e-4 within
+245–712. gfx1100 / host CPU, 2026-10-26:
+
+| | dns M 0.2 | dns M 0.1 | dns cd0 | OpenFOAM | Δ (tier B) |
+|---|---|---|---|---|---|
+| SA L2 128×96 cd | 0.42480 (exit 0, 606000 it, 184 s) | 0.41943 (settled; exit 8 at 2.5e6, 766 s) | 0.41764 | 0.41285 (59 s) | **+1.16%** |
+| SA L2 θ_s | 87.40° | 87.64° | | 87.59° | +0.05° (M 0.1) |
+| SA L2 L_r / D | 1.2206 | 1.2065 | 1.2018 | 1.2566 | −4.4% |
+| SA L1 64×48 cd | 0.4197 ± 1.1% (no steady state) | 0.4264 ± 0.8% | (0.4286) | 0.39282 (11 s) | (+9%, not a converged comparison) |
+| SST L2 cd | 0.4088–0.4136 (limit cycle) | -- | -- | 0.39496 (70 s) | -- |
+| SST L1 cd | diverged (exit 7) | -- | -- | 0.39964 (15 s) | -- |
+
+- Tier B at L2 is +1.16% (the plan's tolerance max(1%, ½ · OpenFOAM's L1 →
+  L2 change of 5.1%) = 2.6%: PASS at L2; the "non-increasing L1 → L3" clause
+  cannot be read: dns L1 has no steady state and L3 was not run). θ_s
+  within 0.05°. L_r −4.4% (the ±3% tolerance is set at L3).
+- The dns Mach correction is −1.3% from M 0.2 to M 0.1 (tier A at M 0.2
+  would read +2.9%).
+- OpenFOAM `ft2 false` at L2: 0.40885, −0.97% from `ft2 true` -- above the
+  U4 trigger (0.5%): a `sa-noft2` dns variant is a user decision, not built.
+- dns time to solution, SA L2 M 0.2: 79 s to cd within 1e-3 of its plateau,
+  184 s to the certified stop (TOL 1e-4, explicit LTS, 0.30 ms/iteration).
+  OpenFOAM: 59 s serial for 3000 iterations, settled to 1e-4 in 413.
+- SST and L1: no dns steady state (docs/rans.md, issues.md 1-2).
 
 ## Tolerance adjustments vs the original plan
 

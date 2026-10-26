@@ -77,6 +77,7 @@ struct Opt
     double phi[2] = {0, 0};
     double re = 100;
     int n = 96;
+    bool wallValue = true;   // ScalarBoundary::solid (the runner's setting)
 };
 
 std::unique_ptr<Rig> makeRig(const Opt& o)
@@ -147,6 +148,11 @@ std::unique_ptr<Rig> makeRig(const Opt& o)
         bnd.phiInf[1] = o.phi[1];
         const auto d = o.body ? immersedWallDistance(r->g, circle, r->remap)
                               : std::vector<double>(r->g.size(), 1.0);
+        std::vector<std::uint8_t> solid;
+        if (r->ghost && o.wallValue) {
+            solid.assign(r->g.size(), 0);
+            for (int c : r->ghost->solidCells()) solid[std::size_t(c)] = 1;
+        }
         if (!r->dev->enableRans({.model = o.model,
                                  .wallDist = d,
                                  .mutHook =
@@ -156,7 +162,8 @@ std::unique_ptr<Rig> makeRig(const Opt& o)
                                      },
                                  .fluidMask = r->fluid,
                                  .transportOnly = o.transportOnly,
-                                 .bnd = bnd}))
+                                 .bnd = bnd,
+                                 .solidMask = std::move(solid)}))
             return nullptr;
     }
     p->bc = [p](gpu::DeviceCompState& s) {
@@ -283,14 +290,14 @@ void uniformTransport()
                 interior, edge);
     check(interior == 0.0, "(b) a uniform specific scalar rides the density "
                            "EXACTLY in the interior (0 ulp)");
-    // GATE G3-flow's boundary clause (<= 2 ulp) FAILED: the NSCBC rows
-    // overwrite the continuity rhs with the characteristic form, which no
-    // scalar FLUX can match, so the open-face flux of the plan
-    // (rho_c u_c . S) drifts phi by 1.36e4 ulp (8e-4 relative) in 100 steps
-    // (gfx1100, measured 2026-10-26). Pinned here as a regression CEILING,
-    // not a pass (docs/rans.md "Immersed-wall RANS").
-    check(edge <= 2.0e4, "(b) the x-face band's drift stays under its measured "
-                         "ceiling (2e4 ulp; the plan's 2 ulp FAILED)");
+    // GATE G3-flow's boundary clause (<= 2 ulp). The NSCBC rows overwrite
+    // the continuity rhs with the characteristic form, which no scalar FLUX
+    // can match (the plan's open-face flux rho_c u_c . S alone drifted phi by
+    // 1.36e4 ulp, 8e-4 relative, in 100 steps). The open-face cells now carry
+    // the scalar by the density the mean flow produced (the phi R_rho form,
+    // rans::openScalarConsistency): measured 0 ulp (gfx1100, 2026-10-26).
+    check(edge <= 2.0, "(b) the NSCBC x-face band rides the density to <= 2 "
+                       "ulp (the phi R_rho form; 1.36e4 ulp before)");
 }
 
 // (c) the planar wall, read back on the host.
@@ -319,7 +326,9 @@ void wallLinear()
             check(false, "(c) enableRans");
             return;
         }
-        // Uniform gas at rest; nu~ (or k) = c sdf, omega uniform on fluid.
+        // Uniform gas at rest; nu~ = c sdf (SA: the linear sublayer) or
+        // k = c sdf^2 (SST: the quadratic one), omega uniform on fluid.
+        const bool sstK = m == RansModel::Sst2003m;
         const double cc = 0.3, om = 50.0;
         auto h = CompState::zeros(g);
         std::vector<double> t0(g.size()), t1(g.size(), om);
@@ -328,7 +337,8 @@ void wallLinear()
                 const std::size_t c = g.idx(i, j, 0);
                 h.rho[c] = 1.3;
                 h.E[c] = kPInf / (kGam - 1);
-                t0[c] = 1.3 * cc * plane((i + 0.5) * g.hx, (j + 0.5) * g.hy, 0);
+                const double s = plane((i + 0.5) * g.hx, (j + 0.5) * g.hy, 0);
+                t0[c] = 1.3 * cc * (sstK ? s * s : s);
                 t1[c] = 1.3 * om;
             }
         (void)ds->upload(h);
@@ -342,7 +352,7 @@ void wallLinear()
         const auto rho = down(ds->rho);
         // Every solid cell the fluid reads is a ghost; check those within one
         // cell of the wall (deep cells hold 0).
-        double err = 0, scale = cc * g.hx;
+        double err = 0, scale = cc * g.hx, kmin = 1e30, kerr = 0;
         int checked = 0;
         for (int j = 0; j < n; ++j)
             for (int i = 0; i < n; ++i) {
@@ -350,15 +360,31 @@ void wallLinear()
                 const double s = plane((i + 0.5) * g.hx, (j + 0.5) * g.hy, 0);
                 if (s >= 0 || s < -1.5 * g.hx) continue;
                 if (i < 3 || i > n - 4 || j < 3 || j > n - 4) continue;
-                err = std::max(err, std::abs(g0[c] / rho[c] - cc * s));
+                const double v = g0[c] / rho[c];
+                err = std::max(err, std::abs(v - cc * s));
+                kmin = std::min(kmin, v);
+                // k_g - c sdf_g^2 = a^2 c E, E >= 0 the sample's bilinear
+                // interpolation error of sdf^2 (<= h^2 / 4 per axis).
+                kerr = std::max(kerr, std::abs(v - cc * s * s) / (cc * g.hx * g.hx));
                 ++checked;
             }
         const std::string nm = m == RansModel::SaNeg ? "SA nu~" : "SST k";
-        std::printf("  (c) %s: %d ghosts, max |phi_g - c sdf| / (c h) = %.3e\n",
-                    nm.c_str(), checked, err / scale);
-        check(checked > 20 && err <= 1e-5 * scale,
-              "(c) " + nm + " = c d is reproduced on every ghost (a linear "
-                            "image of a linear field)");
+        if (!sstK) {
+            std::printf("  (c) %s: %d ghosts, max |phi_g - c sdf| / (c h) = %.3e\n",
+                        nm.c_str(), checked, err / scale);
+            check(checked > 20 && err <= 1e-5 * scale,
+                  "(c) " + nm + " = c d is reproduced on every ghost (a linear "
+                                "image of a linear field)");
+        } else {
+            std::printf("  (c) %s: %d ghosts, min k_g %.3e, max |k_g - c sdf^2| / "
+                        "(c h^2) = %.3e\n",
+                        nm.c_str(), checked, kmin, kerr);
+            check(checked > 20 && kmin >= 0,
+                  "(c) SST k_g = a^2 sum w k_s >= 0 on every ghost (the even, "
+                  "quadratic sublayer image: never negative)");
+            check(kerr <= 0.5, "(c) SST k = c d^2 reproduced on every ghost to "
+                               "the sample's interpolation error (<= c h^2/2)");
+        }
         // mu_t through mirrorMut: the same image, the wall face ~ 0.
         auto nut = gpu::DeviceBuffer<gpu::Real>::make(g.size());
         std::vector<gpu::Real> hn(g.size());
@@ -399,6 +425,7 @@ void wallLinear()
 // (d)
 void smoke()
 {
+    for (const bool wv : {false, true})
     for (RansModel m : {RansModel::SaNeg, RansModel::Sst2003m}) {
         const double nu = kRhoInf * kUInf * (0.25 * 2 * std::numbers::pi) /
                           1000.0;
@@ -408,7 +435,8 @@ void smoke()
             phi[1] = omegaInf(phi[0], kRansMutInfRatio, nu);
         }
         auto r = makeRig({.model = m, .rans = true, .focal = false,
-                          .phi = {phi[0], phi[1]}, .re = 1000, .n = 128});
+                          .phi = {phi[0], phi[1]}, .re = 1000, .n = 128,
+                          .wallValue = wv});
         if (!r) { check(false, "(d) rig"); return; }
         upload(*r, phi[0], phi[1]);
         for (int s = 0; s < 200; ++s) {
@@ -426,22 +454,19 @@ void smoke()
         for (int c : r->ghost->deepCells()) deepZero = deepZero && mut[c] == 0;
         const std::string n = m == RansModel::SaNeg ? "SA" : "SST";
         const auto F = r->ghost->force(*r->dev, *r->ds);
-        std::printf("  (d) %s 200 steps: cd-like fx %.4f, hits %llu\n",
-                    n.c_str(), F.fx, r->dev->floorHits());
+        std::printf("  (d) %s 200 steps (wall value %d): cd-like fx %.4f, hits %llu\n",
+                    n.c_str(), int(wv), F.fx, r->dev->floorHits());
         check(finite && std::isfinite(F.fx), "(d) " + n + " 200-step immersed "
                                                           "URANS is finite");
-        // SA: 0. SST trips the COUNTED guard (k < 0) in a few fluid cells
-        // beside the staircase: the interface faces carry a nonzero mass
-        // flux (the face-average velocity is not the wall's), which upwinds
-        // the antimirrored ghost k = -a k_s into the fluid. Measured 710 hits
-        // in 200 steps here (4 cells); reported, never silent -- an open
-        // finding of P5, not a pass (docs/rans.md).
-        if (m == RansModel::SaNeg)
-            check(r->dev->floorHits() == 0, "(d) SA: 0 guard hits");
-        else
-            check(r->dev->floorHits() > 0,
-                  "(d) SST: the staircase k guard hits are COUNTED (an open "
-                  "P5 finding; see docs/rans.md)");
+        // 0 hits for both, with and without the wall-value convection. SST
+        // used to trip the COUNTED k guard here (710 hits in 200 steps, 4
+        // staircase-corner cells) through the ODD ghost image k_g = -a k_s
+        // < 0; the even quadratic image k_g = a^2 k_s removes it alone (and
+        // the wall-value convection keeps a ghost value from being carried
+        // through an interface face at all).
+        check(r->dev->floorHits() == 0,
+              "(d) " + n + (wv ? "" : " (no wall-value convection)") +
+                  ": 0 guard hits");
         check(deepZero, "(d) " + n + ": mu_t == 0 on the deep cells");
     }
 }

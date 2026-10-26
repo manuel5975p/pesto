@@ -941,14 +941,16 @@ RUN LENGTH
                      COMPRESSIBLE (--ogrid with or without --rans, or
                      immersed with --rans): PSEUDO-time, stopped on the
                      integrals (cd, cdf, wake deficit, turbulence; the
-                     immersed wall: cd and turbulence) each extrapolated
-                     to its fixed point -- TOL is their relative
-                     remaining change, in [1e-6, 1). Not time-accurate:
-                     rejects --ft, --ramp, --kick, --seq and time-keyed
-                     frames; --steady-steps is the cap. The FP32 state
-                     jitters the integrals at ~1e-5 on external flows,
-                     so a tight TOL may never certify (exit 8; the
-                     plateau is the answer, docs/rans.md).
+                     immersed wall: cd and turbulence) -- TOL is their
+                     relative remaining change, in [1e-6, 1). The FP32
+                     state jitters the integrals (3e-7..5e-5 relative,
+                     measured), so the stop is JITTER-FLOORED: the trend
+                     of block means < TOL, cd/cdf with sqrt(2) x their
+                     jitter added, the other series' jitter <= 2^-10;
+                     the run prints each series' trend and jitter
+                     (docs/rans.md). Not time-accurate: rejects --ft,
+                     --ramp, --kick, --seq and time-keyed frames;
+                     --steady-steps is the cap.
                      0 = plain time-march.                            [0]
   --steady-steps N   compressible --steady iteration cap; reaching it is
                      exit 8.                                     [1000000]
@@ -958,9 +960,10 @@ RUN LENGTH
                      (--ogrid at --nz 1 or the revolved wedge only: JFNK
                      GMRES(40) with a line Gauss-Seidel first-order
                      Rusanov preconditioner, CFL 10 x2 -> 1e8; cap
-                     default 500). Same fixed point; it reaches the
-                     laminar/SA plateau in ~20 Newton steps but does
-                     NOT certify a stop either (docs/rans.md).
+                     default 500). Same fixed point; certifies the
+                     cylinder (laminar/SA/SST) in 70-180 Newton steps,
+                     slower than explicit, and does not converge from a
+                     cold start on the Re 1e4 wedge (docs/rans.md).
                                                                [explicit]
   --seq LEVELS       grid sequencing (requires --steady): converge on a
                      ladder of grids n/2^(LEVELS-1) .. n, prolonging each

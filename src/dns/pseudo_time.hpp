@@ -69,6 +69,12 @@ inline constexpr double kNkRejectGrowth = 3;
 // GMRES: restart length, Krylov cap per Newton step, constant forcing.
 inline constexpr int kNkRestart = 40, kNkMaxKrylov = 200;
 inline constexpr double kNkForcing = 0.1;
+// At the CFL cap a GMRES that ran to kNkMaxKrylov without its forcing is at
+// the FP32 residual floor (the FD J v is noise there): the NEXT armed step
+// gets one restart cycle only. Measured (sphere wedge Re 1e4 SA L2 from the
+// explicit plateau, gfx1100): every capped step ran the full 200 (1.5 s) for
+// the same residual band 1.3-2.3e-3 the 40-cycle steps hold.
+inline constexpr int kNkStallKrylov = kNkRestart;
 // The JFNK differencing step, relative to rms of the scaled direction. The
 // plan's 2^-10 failed gate N1 on SA (forward vs central J v of the nu~ field
 // 2.3e-2 mid-transient, 7.2e-2 near the plateau, against 1e-2; the mean flow
