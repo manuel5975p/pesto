@@ -77,3 +77,36 @@ a version bump), not a writer fix — do it deliberately or not at all.
 
 u16, 2048²: 8.4 MB/field/frame raw, ~2-4 MB gzipped on the wire; 512²:
 0.5 MB. Same cadence flag as the PNGs (`--pdt`-style, own `--wdt`).
+
+## The run `.json` (not the web manifest)
+
+`<prefix>.json` (`dns/output.cpp`) always carries `nx, ny, nz, frames,
+frameDt, D, re, mach, cs, les, sgs, body, far, physics, kick, msPerStep`.
+Appended keys, each present ONLY when it applies (every other run's json
+reads exactly as before):
+
+| key | when | value |
+|---|---|---|
+| `rans` | a RANS run (channel or flow) | `"SA-neg"`, `"SST-2003m"`, `"SST-Vm"` |
+| `steady` | `dns channel --steady-scheme implicit` | `"implicit"` |
+| `ransMode` | `dns flow` RANS, or a compressible `--steady` run | `"urans"`, `"steady-explicit"`, `"steady-implicit-nk"` (`--steady-scheme implicit`; later `"urans-dual"`) |
+| `ransInflow` | `dns flow` RANS | the describe's freestream turbulence string, e.g. `"nu~inf/nu = 3 (TMR)"` |
+
+## `<prefix>_surface.csv` (`--emit surface`, `dns flow --ogrid`)
+
+Written once, at the end of the run. Line 1 is `# ` + the run label
+(`dns/rans_label`; `DNS` on a DNS time march), line 2 the header, then one row
+per real wall face (i fastest, then k):
+
+| column | meaning |
+|---|---|
+| `i`, `k` | the wall face's mesh indices (face between ghost row 0 and fluid row 1) |
+| `x`, `y`, `z` | face midpoint (mean of its four wall nodes) |
+| `theta_deg` | angle from the UPSTREAM axis about the body centre: 0 at front stagnation, ±180 at the rear, positive over the top (y > cy) |
+| `area` | face area |
+| `cp` | (p_f − p∞)/(½ρ∞U∞²), p_f the flux's own face pressure |
+| `cf` | viscous traction on the body along the downstream surface tangent (from front stagnation toward the rear on each side), / ½ρ∞U∞² — negative = reversed flow |
+| `tau_x`, `tau_y`, `tau_z` | viscous traction ON the body (force / area): total momentum flux minus p_f S |
+| `yplus` | d1 u_τ/ν_f, u_τ from the TANGENTIAL viscous traction, ρ_f, ν_f on the face |
+| `d1` | the first fluid cell's wall distance (exact, to the discrete wall) |
+| `qw` | energy flux into the body per area (conduction at a resting wall) |

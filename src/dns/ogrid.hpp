@@ -67,9 +67,27 @@ struct OGridSpec
     double span = 1;               // spanwise physical extent (nz == 1: the unit depth)
 };
 
+// The azimuthal layout of a REVOLVED O-grid (a body of revolution about the
+// x axis through the centre): the axisymmetric WEDGE -- one real cell plane
+// of angle dphi between two ghost planes, AxisWrap::MirrorZ -- or the FULL
+// revolution of nphi cells (Cyclic, nphi even: every azimuthal cell has its
+// partner across the axis).
+struct RevolvedSpec
+{
+    bool wedge = true;
+    double dphi = 0;   // wedge angle, radians, in (0, 10 deg]
+    int nphi = 0;      // full revolution: even, >= 4
+};
+
 struct OGrid
 {
     CurvMesh mesh;
+    // Revolved meshes only (buildRevolvedOGrid): i = theta from the
+    // UPSTREAM axis, nTheta real columns between ghost columns 0 and
+    // nTheta + 1, j = r, k = phi; the axis faces are mesh.axisFaces.
+    bool revolved = false;
+    RevolvedSpec rev{};
+    int nTheta = 0;
     std::vector<double> rWall;                    // nx entries, r_w(theta_i)
     std::vector<std::array<double, 3>> wallNormal; // nx entries, unit outward, z == 0
     double h1 = 0;      // first fluid cell height, min over theta (the CFL one)
@@ -118,6 +136,31 @@ Grid ogridGrid(int nx, int ny, int nz, double rWall, double rFar, double span);
 // build's job; call it on the result.
 std::expected<OGrid, std::string> buildOGrid(const Grid& g, const Sdf& sdf,
                                              const OGridSpec& spec);
+
+// Reference box of a revolved O-grid: nx = nTheta + 2 (a ghost column past
+// each axis), ny radial INCLUDING two ghost rows, nz = 3 (wedge: one real
+// plane, two ghost planes) or nphi; hx = pi / nTheta, hz = dphi or
+// 2 pi / nphi, hy nominal as ogridGrid's.
+// Pre: nTheta >= 4, ny >= 4, 0 < rWall < rFar, r valid (RevolvedSpec).
+Grid ogridRevolvedGrid(int nTheta, int ny, const RevolvedSpec& r, double rWall,
+                       double rFar);
+
+// The revolved O-grid around a body of revolution about the x axis through
+// (cx, cy, cz) -- masterplan_flowrans section 4.5. Node i = 1..nTheta+1 at
+// theta = pi (i - 1)/nTheta from the UPSTREAM axis (node 1 and node
+// nTheta+1 ON the axis, rho == 0 exactly), the meridional nodes the
+// buildOGrid blend in the (x, rho) half-plane, revolved to (x, cy + rho cos
+// phi, cz + rho sin phi). Wedge node planes at phi = -3/2, -1/2, +1/2 dphi
+// (written as exact z-mirrors; MirrorZ supplies +3/2), full revolution at
+// phi = 2 pi k / nphi with the planes k and k + nphi/2 exactly opposite.
+// Ghost column nodes 0 (and nTheta+2 by Extend) are the point reflections
+// 2 node(1) - node(2): a positive-volume placeholder no real cell reads.
+// Errors (never asserts) as buildOGrid, plus an sdf that is not rotationally
+// invariant (5 azimuths, 1e-9 rFar). Requires spec.span == 1 (unused).
+std::expected<OGrid, std::string> buildRevolvedOGrid(const Grid& g,
+                                                     const Sdf& sdf,
+                                                     const OGridSpec& spec,
+                                                     const RevolvedSpec& r);
 
 // In-plane midpoints of the nx wall faces (the +j face of cell (i, 0):
 // nodes (i, 1) and (i+1, 1) averaged, angular wrap included) -- the lever

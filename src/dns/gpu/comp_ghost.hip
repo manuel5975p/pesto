@@ -1,7 +1,9 @@
 #include "dns/gpu/comp_ghost.hpp"
 
 #include "dns/gpu/internal/comp_flux.hpp"
+#include "dns/gpu/internal/reduce.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "dns/rans.hpp"
 
 #include <algorithm> // std::max(initializer_list): NOT in <bits/stl_algobase.h>
 #include <cassert>
@@ -146,6 +148,123 @@ __global__ void kGhostFill(Real gamma, int iso, Real Twall, Real Rgas,
            Real(0.5) * a * a * rg * (ui * ui + vi * vi + wi * wi);
 }
 
+// RANS scalar images of the ghosts (DeviceCompGhost::applyTurb): the specific
+// scalars sampled through the velocity stencil, imaged like the velocity
+// about a wall value (0 for nu~ and k, omega_w for omega), stored with the
+// ghost density kGhostFill wrote. omega_w = 60 nu_w / (beta1 d_s^2), d_s =
+// dw / a the sample's wall distance, nu_w = mu(T_s) / rho_s of the thermo
+// sample.
+__global__ void kGhostTurb(int sst, ViscView vv, Real gamma, Real Rgas,
+                           const int* gcell, const int* gnbr, const Real* gw,
+                           const int* tnbr, const Real* tw, const Real* gscale,
+                           const Real* gdw, int m, const Real* rho,
+                           const Real* mx, const Real* my, const Real* mz,
+                           const Real* E, Real* t0, Real* t1)
+{
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= m) return;
+    Real s0 = 0, s1 = 0;
+    for (int s = 0; s < 8; ++s) {
+        const Real w = gw[8 * q + s];
+        if (w == Real(0)) continue;
+        const int c = gnbr[8 * q + s];
+        s0 += w * t0[c] / rho[c];
+        if (sst) s1 += w * t1[c] / rho[c];
+    }
+    const Real a = gscale[q];
+    const int c = gcell[q];
+    const Real rg = rho[c];
+    t0[c] = rg * (-a * s0);
+    if (!sst) return;
+    Real rt = 0, pt = 0;
+    for (int s = 0; s < 8; ++s) {
+        const Real w = tw[8 * q + s];
+        if (w == Real(0)) continue;
+        const int x = tnbr[8 * q + s];
+        const Real r = rho[x];
+        rt += w * r;
+        pt += w * (gamma - Real(1)) *
+              (E[x] -
+               Real(0.5) * (mx[x] * mx[x] + my[x] * my[x] + mz[x] * mz[x]) / r);
+    }
+    const Real Ts = pt / (Rgas * rt);
+    const Real muw = vv.sutherland ? vv.mu * vv.ratio(Ts) : vv.mu;
+    const Real ds = gdw[q] / a;
+    const Real omw = Real(60) * (muw / rt) / (Real(sst::beta1) * ds * ds);
+    t1[c] = rg * ((Real(1) + a) * omw - a * s1);
+}
+
+// Deep cells under RANS: nu~ = k = 0, omega = omega_inf (density as filled).
+__global__ void kDeepTurb(const int* cells, int m, int sst, Real omegaInf,
+                          const Real* rho, Real* t0, Real* t1)
+{
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= m) return;
+    const int c = cells[q];
+    t0[c] = Real(0);
+    if (sst) t1[c] = rho[c] * omegaInf;
+}
+
+// Zero the low words of the listed cells, every field (compensated state).
+struct LowWords
+{
+    Real* lo[7];
+    int n;
+};
+__global__ void kZeroLow(const int* cells, int m, LowWords L)
+{
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= m) return;
+    const int c = cells[q];
+    for (int f = 0; f < L.n; ++f) L.lo[f][c] = Real(0);
+}
+
+// mu_t odd and F1 even through the ghost image (mirrorMut); deep: 0 and 1.
+__global__ void kGhostMut(const int* gcell, const int* gnbr, const Real* gw,
+                          const Real* gscale, int m, Real* nut, Real* f1)
+{
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= m) return;
+    Real sm = 0, sf = 0;
+    for (int s = 0; s < 8; ++s) {
+        const Real w = gw[8 * q + s];
+        if (w == Real(0)) continue;
+        const int c = gnbr[8 * q + s];
+        sm += w * nut[c];
+        if (f1) sf += w * f1[c];
+    }
+    const int c = gcell[q];
+    nut[c] = -gscale[q] * sm;
+    if (f1) f1[c] = sf;
+}
+__global__ void kDeepMut(const int* cells, int m, Real* nut, Real* f1)
+{
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= m) return;
+    nut[cells[q]] = Real(0);
+    if (f1) f1[cells[q]] = Real(1);
+}
+
+// First-cell y+ of every interface face (DeviceCompGhost::wallYplus).
+__global__ void kWallYplus(ViscView vv, PrimView q, const Real* d,
+                           const int* fcell, int m, double* out)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= m) return;
+    const int c = fcell[t];
+    const double u = q.u[c], v = q.v[c], w = q.w[c];
+    const double mu =
+        vv.sutherland ? double(vv.mu) * double(vv.ratio(q.T[c])) : double(vv.mu);
+    const double nu = mu / double(q.rho[c]);
+    out[t] = sqrt(sqrt(u * u + v * v + w * w) * double(d[c]) / nu);
+}
+
+struct SpanMax
+{
+    const double* v;
+    __host__ __device__ double operator()(int i) const { return v[i]; }
+};
+
 __global__ void kQuiescent(const int* cells, int m, Real rhoInf, Real EInf,
                            Real* rho, Real* mx, Real* my, Real* mz, Real* E)
 {
@@ -227,7 +346,7 @@ __device__ inline Real faceConductionCurv(const GpuGrid& g, ViscView vv,
 // one and vanishes on the resolved surface.
 __global__ void kBodyFlux(GpuGrid g, ViscView vv, int iso, PrimView q,
                           const int* fcell, const int* fdir, int m, double* acc,
-                          MrfView mz)
+                          MrfView mz, const Real* nut, Real kapScale)
 {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= m) return;
@@ -241,7 +360,7 @@ __global__ void kBodyFlux(GpuGrid g, ViscView vv, int iso, PrimView q,
     const int fi = i - (minus ? (axis == 0) : 0),
               fj = j - (minus ? (axis == 1) : 0),
               fk = k - (minus ? (axis == 2) : 0);
-    const Flux f = faceFlux(g, vv, q, fi, fj, fk, axis, nullptr, Real(0),
+    const Flux f = faceFlux(g, vv, q, fi, fj, fk, axis, nut, kapScale,
                             mz.active ? &mz : nullptr);
     const Real area = axis == 0 ? g.hy * g.hz
                     : axis == 1 ? g.hx * g.hz
@@ -261,7 +380,8 @@ __global__ void kBodyFlux(GpuGrid g, ViscView vv, int iso, PrimView q,
 // face area vector S, so there is no separate area multiply here.
 __global__ void kBodyFluxCurv(GpuGrid g, ViscView vv, int iso, PrimView q,
                               CurvView m, const int* fcell, const int* fdir,
-                              int n, double* acc, MrfView mz)
+                              int n, double* acc, MrfView mz, const Real* nut,
+                              Real kapScale)
 {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n) return;
@@ -273,8 +393,8 @@ __global__ void kBodyFluxCurv(GpuGrid g, ViscView vv, int iso, PrimView q,
     const int fi = i - (minus ? (axis == 0) : 0),
               fj = j - (minus ? (axis == 1) : 0),
               fk = k - (minus ? (axis == 2) : 0);
-    const Flux f = faceFluxCurv(g, vv, q, m, fi, fj, fk, axis, nullptr,
-                                Real(0), mz.active ? &mz : nullptr);
+    const Flux f = faceFluxCurv(g, vv, q, m, fi, fj, fk, axis, nut, kapScale,
+                                mz.active ? &mz : nullptr);
     const Real sgn = minus ? Real(-1) : Real(1);
     acc[t] = double(sgn * f.mx);
     acc[n + t] = double(sgn * f.my);
@@ -435,6 +555,7 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
     auto& tnbr = T.tnbr;
     auto& tw = T.tw;
     auto& gscale = T.gscale;
+    auto& gdw = T.gdw;
     auto& uw = T.uwall;
     auto& aspan = T.aspan;
     auto& fpos = T.fpos;
@@ -657,6 +778,7 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                 gcell.push_back(int(c));
                 isGhost[c] = 1;
                 gscale.push_back(Real(im.a));
+                gdw.push_back(Real(-phi[c]));
                 for (int s = 0; s < 8; ++s) {
                     gnbr.push_back(im.v.nb[s]);
                     gw.push_back(Real(im.v.w[s] / im.v.wsum));
@@ -767,6 +889,7 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::fromTables(
     if (auto e = alloc(out.tnbr_, 8 * ng); e != hipSuccess) return std::unexpected(e);
     if (auto e = alloc(out.tw_, 8 * ng); e != hipSuccess) return std::unexpected(e);
     if (auto e = alloc(out.gscale_, ng); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.gdw_, ng); e != hipSuccess) return std::unexpected(e);
     if (auto e = alloc(out.uwall_, t.uwall.empty() ? 0 : 3 * ng);
         e != hipSuccess)
         return std::unexpected(e);
@@ -810,6 +933,7 @@ hipError_t DeviceCompGhost::load(const CompGhostTables& t)
     if (auto e = put(tnbr_, t.tnbr); e != hipSuccess) return e;
     if (auto e = put(tw_, t.tw); e != hipSuccess) return e;
     if (auto e = put(gscale_, t.gscale); e != hipSuccess) return e;
+    if (auto e = put(gdw_, t.gdw); e != hipSuccess) return e;
     if (auto e = put(uwall_, t.uwall); e != hipSuccess) return e;
     if (auto e = put(aspan_, t.aspan); e != hipSuccess) return e;
     if (auto e = put(deep_, t.deep); e != hipSuccess) return e;
@@ -852,6 +976,73 @@ void DeviceCompGhost::apply(DeviceCompState& s)
     }
 }
 
+void DeviceCompGhost::applyTurb(DeviceCompState& s, RansModel model,
+                                const Transport& tr, double omegaInf) const
+{
+    const ViscView vv = viscView(tr);
+    assert(s.nT == ransScalars(model));
+    const int sst = ransSst(model) ? 1 : 0;
+    Real* t1 = sst ? s.t[1].data() : nullptr;
+    if (nGhost_ > 0) {
+        kGhostTurb<<<launchBlocks(nGhost_), blockSize>>>(
+            sst, vv, gamma_, Rgas_, gcell_.data(), gnbr_.data(), gw_.data(),
+            tnbr_.data(), tw_.data(), gscale_.data(), gdw_.data(), nGhost_,
+            s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(), s.E.data(),
+            s.t[0].data(), t1);
+        checkLastKernel("kGhostTurb");
+    }
+    if (nDeep_ > 0) {
+        kDeepTurb<<<launchBlocks(nDeep_), blockSize>>>(
+            deep_.data(), nDeep_, sst, Real(omegaInf), s.rho.data(),
+            s.t[0].data(), t1);
+        checkLastKernel("kDeepTurb");
+    }
+    if (!s.compensated()) return;
+    LowWords L{{}, 5 + s.nT};
+    for (int f = 0; f < 5; ++f) L.lo[f] = s.lo[f].data();
+    for (int i = 0; i < s.nT; ++i) L.lo[5 + i] = s.tlo[i].data();
+    if (nGhost_ > 0)
+        kZeroLow<<<launchBlocks(nGhost_), blockSize>>>(gcell_.data(), nGhost_,
+                                                       L);
+    if (nDeep_ > 0)
+        kZeroLow<<<launchBlocks(nDeep_), blockSize>>>(deep_.data(), nDeep_, L);
+    checkLastKernel("kZeroLow");
+}
+
+void DeviceCompGhost::mirrorMut(Real* nut, Real* f1) const
+{
+    if (nGhost_ > 0) {
+        kGhostMut<<<launchBlocks(nGhost_), blockSize>>>(
+            gcell_.data(), gnbr_.data(), gw_.data(), gscale_.data(), nGhost_,
+            nut, f1);
+        checkLastKernel("kGhostMut");
+    }
+    if (nDeep_ > 0) {
+        kDeepMut<<<launchBlocks(nDeep_), blockSize>>>(deep_.data(), nDeep_,
+                                                      nut, f1);
+        checkLastKernel("kDeepMut");
+    }
+}
+
+DeviceCompGhost::YPlus DeviceCompGhost::wallYplus(DeviceComp& solver,
+                                                  const DeviceCompState& s)
+{
+    assert(solver.rans());
+    if (nFace_ == 0) return {0.0, 0.0};
+    solver.primitives(s);
+    const PrimView q{s.rho.data(),      solver.u().data(), solver.v().data(),
+                     solver.w().data(), solver.e().data(), solver.p().data(),
+                     solver.T().data()};
+    kWallYplus<<<launchBlocks(nFace_), blockSize>>>(
+        viscView(solver.transport()), q, solver.wallDistance().data(),
+        fcell_.data(), nFace_, facc_.data());
+    checkLastKernel("kWallYplus");
+    const std::size_t m = std::size_t(nFace_);
+    const double mx = internal::reduce(red_, m, SpanMax{facc_.data()},
+                                       rocprim::maximum<double>(), 0.0);
+    return {mx, sumDouble(facc_.data(), m, red_) / double(m)};
+}
+
 DeviceCompGhost::Force DeviceCompGhost::force(DeviceComp& solver,
                                               const DeviceCompState& s,
                                               const std::array<double, 3>& pivot)
@@ -862,19 +1053,28 @@ DeviceCompGhost::Force DeviceCompGhost::force(DeviceComp& solver,
                      solver.w().data(), solver.e().data(), solver.p().data(),
                      solver.T().data()};
     const MrfView mz = solver.mrfActive() ? solver.mrfView() : MrfView{};
-    if (curv_) {
+    // RANS: mu_t of the state (updateMut refreshes primitives too) on the
+    // solver's own curvilinear flux; otherwise null, today's tally.
+    const Real* nut = nullptr;
+    Real kap = Real(0);
+    if (solver.rans()) {
+        solver.updateMut(s);
+        nut = solver.mut().data();
+        kap = solver.eddyKapScale();
+    }
+    if (curv_ || solver.rans()) {
         const DeviceCurv* t = solver.curvTables();
         assert(t && "focal ghost force needs the curvilinear DeviceComp");
         if (!t) return {};
         const CurvView cv = t->view();
         kBodyFluxCurv<<<launchBlocks(nFace_), blockSize>>>(
             g_, viscView(solver.transport()), iso_, q, cv, fcell_.data(),
-            fdir_.data(), nFace_, facc_.data(), mz);
+            fdir_.data(), nFace_, facc_.data(), mz, nut, kap);
         checkLastKernel("kBodyFluxCurv");
     } else {
         kBodyFlux<<<launchBlocks(nFace_), blockSize>>>(
             g_, viscView(solver.transport()), iso_, q, fcell_.data(),
-            fdir_.data(), nFace_, facc_.data(), mz);
+            fdir_.data(), nFace_, facc_.data(), mz, nut, kap);
         checkLastKernel("kBodyFlux");
     }
     kBodyMoment<<<launchBlocks(nFace_), blockSize>>>(

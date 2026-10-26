@@ -36,6 +36,13 @@ enum class AxisWrap
     // the wall, and it supplies the outer ghost row's top nodes for free.
     // Needs n >= 2 (build() rejects a degenerate Extend axis).
     Extend,
+    // The axisymmetric WEDGE's azimuthal axis (z only, n == 3 exactly): node
+    // planes 0..2 are stored and node(i, j, 3) is node(i, j, 0) mirrored in
+    // z about CurvMesh::mirrorZ0 -- so the two side faces of the real cell
+    // plane k = 1 are exact z-mirrors and every metric of the ghost planes is
+    // the mirror of its partner's. Any other out-of-range k is a programmer
+    // error (asserted): build() reaches only one node past the top.
+    MirrorZ,
 };
 
 struct CurvMesh
@@ -45,6 +52,22 @@ struct CurvMesh
     // Per-axis continuation for node(); all-Translate is the historical mesh.
     std::array<AxisWrap, 3> wrap = {AxisWrap::Translate, AxisWrap::Translate,
                                     AxisWrap::Translate};
+    // The z of the MirrorZ plane (wrap[2] == MirrorZ only).
+    double mirrorZ0 = 0;
+    // Degenerate AXIS faces of a revolved mesh: the +i face of every cell
+    // in columns axisFaces[0] and axisFaces[1] (-1 = none, today's mesh)
+    // lies on the axis of revolution, S == 0 EXACTLY. build() requires that,
+    // skips their Jacobian inversion and stores the analytic limit metric:
+    // rows j and k of dXi/dx are 0 (only ever read multiplied by S = 0) and
+    // row i is the across-axis central difference's, (t_j x e_phi)/(c_i .
+    // (t_j x e_phi)) with c_i = +-2 rho_F rho^_F the vector from the fluid
+    // cell F's centroid to its across-axis continuation, oriented +i.
+    // The columns PAST the axis (axisFaces[0] itself and axisFaces[1] + 1)
+    // are placeholders whose node geometry has the wrong handedness (an
+    // across-axis continuation runs its azimuth backwards in index space):
+    // build() gives them their real neighbour's volume and j-/k-face tables.
+    // No real cell reads them; the ghost's own rhs is discarded.
+    std::array<int, 2> axisFaces = {-1, -1};
 
     // Undistorted mesh: node (i,j,k) = (i hx, j hy, k hz).
     static CurvMesh uniform(const Grid& g);
@@ -111,7 +134,8 @@ struct CurvMetrics
     std::vector<double> vol;
     // Per-axis mean cross-face area / volume (acoustic CFL width 1/aov); at
     // index 0 of an Extend axis the missing lo neighbour is clamped to the
-    // cell's own face.
+    // cell's own face. On a MirrorZ (wedge) axis the width is rho, not
+    // rho dphi: aov[2] carries the factor hz = dphi (no azimuthal mode).
     std::array<std::vector<double>, 3> aov;
     double hmin = 0.0; // min cell width over cells and non-degenerate axes
 

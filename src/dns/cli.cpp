@@ -1,5 +1,6 @@
 #include "dns/cli.hpp"
 #include "dns/numparse.hpp"
+#include "dns/rans_label.hpp"
 
 #include <tomlplusplus/toml.hpp>
 
@@ -91,6 +92,8 @@ Emit emitOf(string_view s, bool& ok)
     if (s == "error") return Emit::Error;
     if (s == "spectrum") return Emit::Spectrum;
     if (s == "snapshot") return Emit::Snapshot;
+    if (s == "surface") return Emit::Surface;
+    if (s == "mesh") return Emit::Mesh;
     if (s == "none") return Emit::None;
     ok = false;
     return Emit::None;
@@ -185,9 +188,13 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--rotor-span", &c.rotorSpan},
              {"--blade-thicken", &c.bladeThicken},
              {"--ogrid-far", &c.ogridFar}, {"--ogrid-beta", &c.ogridBeta},
+             {"--ogrid-wedge", &c.ogridWedge},
              {"--ramp", &c.ramp}, {"--kick", &c.kick}, {"--tol", &c.tol},
              {"--max-iters", &c.maxIters}, {"--dt-recompute", &c.dtRecompute},
              {"--steady", &c.steady}, {"--seq", &c.seq},
+             {"--steady-steps", &c.steadySteps},
+             {"--rans-nutinf", &c.ransNutInf}, {"--rans-kinf", &c.ransKInf},
+             {"--rans-mutinf", &c.ransMutInf},
              {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
              {"--planes", &c.planes}, {"--png-down", &c.pngDown},
              {"--vort-max", &c.vortMax}});
@@ -268,10 +275,10 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                          &c.wallIso});
     // RANS closures: only the BUILT ones are registered, so --help and the
     // "one of:" message stay truthful (docs/rans.md, phases).
-    if (c.sub == Subcommand::Channel)
+    if (!ransBuilt(c.sub).empty())
     {
         std::vector<std::pair<const char*, int>> v;
-        for (const RansModel m : ransBuiltChannel())
+        for (const RansModel m : ransBuilt(c.sub))
             v.emplace_back(ransCliNames()[std::size_t(m)], int(m));
         enums.push_back({"--rans", std::move(v), &c.rans});
         enums.push_back({"--steady-scheme", enumValues(steadySchemeNames()),
@@ -330,7 +337,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
             if (!ok)
                 return err("unknown --emit kind '" + string(argv[a])
                            + "' (stats, bin, png, web, volume, slices, vtk, error, "
-                             "spectrum, snapshot, none)");
+                             "spectrum, snapshot, surface, mesh, none)");
             c.emit.insert(e);
             c.given.insert("--emit");
             continue;
@@ -830,13 +837,43 @@ BODY-FITTED O-GRID (compressible)
                      row, not NSCBC: every --nscbc-* flag and --pot is
                      rejected (they would be ignored), and Re > 800 only
                      warns (that far row is unmeasured there).
-                     Bodies with a z-invariant cross-section only
-                     (cylinder, lens, cube, z-invariant mesh) -- a
-                     sphere would need a 3D O-grid, whose polar axis is
-                     a mesh singularity.
+                     Bodies with a z-invariant cross-section (cylinder,
+                     lens, cube, z-invariant mesh) are extruded in z.
+                     `--body sphere` REVOLVES the mesh about x: --n is
+                     then the MERIDIONAL cell count over theta in [0, pi]
+                     (>= 16), and --nz 1 is the AXISYMMETRIC WEDGE (one
+                     real azimuthal plane of --ogrid-wedge degrees; the
+                     axis faces are degenerate, the cells beside them
+                     read the across-axis continuation). Labelled
+                     "[axisymmetric wedge ...]": no swirl, no 3D wake
+                     modes. The full revolution (--nz N) is not built.
   --ogrid-far R      far-boundary radius, in diameters.               [20]
   --ogrid-beta B     radial tanh clustering toward the wall; 0 =
                      uniform. Higher = thinner first cell.             [3]
+  --ogrid-wedge DEG  the revolved sphere's wedge angle, (0, 10].      [5]
+
+RANS (compressible; an ensemble-mean MODEL, never a DNS; labelled
+"RANS <variant> -- <mode>" everywhere, docs/rans.md "dns flow")
+  --rans none|sa-neg|sst-2003m|sst-vm
+                     turbulence closure, on the body-fitted O-grid
+                     (--ogrid) or on the IMMERSED ghost wall (uniform or
+                     --focal box; labelled "[immersed ghost wall:
+                     first-order wall position, NOT body-fitted]" -- a
+                     staircase wall, never a code-to-code number when
+                     under-resolved). The wall is resolved (wall
+                     functions do not exist here): the run warns when
+                     the first-cell y+ estimate is above 1. Without
+                     --steady: URANS (explicit SSP-RK3, time-accurate).
+                     Rejects the incompressible solver, --les/--sgs (one
+                     eddy viscosity), any --rotor-*, --scene,
+                     --penalize, --cut-flux, --pot, --seq, --stretch,
+                     --noslip and wall-mounted bodies.             [none]
+  --rans-nutinf R    SA freestream nu~/nu (TMR: 3 to 5).                [3]
+  --rans-kinf K      SST freestream k/U^2 (TMR's 9e-9 c^2 at M 0.2: Tu
+                     0.0387%), in FREESTREAM units so a Mach study keeps
+                     the inflow turbulence.                     [2.25e-7]
+  --rans-mutinf R    SST freestream mu_t/mu; sets omega = rho k/(R mu)
+                     (TMR).                                       [0.009]
 
 THERMAL (compressible only; every knob is off by default, and a run
 that names none of them is bit-for-bit the constant-viscosity,
@@ -893,14 +930,38 @@ SOLVER
 
 RUN LENGTH
   --ft N             flow-throughs to integrate                      [20]
-  --steady TOL       stationary solve: march until the field stops
+  --steady TOL       stationary solve; TWO meanings by --physics.
+                     INCOMPRESSIBLE: march until the field stops
                      changing, then stop. TOL is on the residual
                      R = max|du/dt| * D / uInf^2 (dt- and grid-free);
                      1e-6 is tight, 1e-4 loose. --ft becomes the
                      give-up cap -- reaching it is exit 8, not a
-                     silent answer. Incompressible, --les 0. Only
-                     converges below the shedding onset (cyl Re<47).
+                     silent answer. --les 0. Only converges below the
+                     shedding onset (cyl Re<47).
+                     COMPRESSIBLE (--ogrid with or without --rans, or
+                     immersed with --rans): PSEUDO-time, stopped on the
+                     integrals (cd, cdf, wake deficit, turbulence; the
+                     immersed wall: cd and turbulence) each extrapolated
+                     to its fixed point -- TOL is their relative
+                     remaining change, in [1e-6, 1). Not time-accurate:
+                     rejects --ft, --ramp, --kick, --seq and time-keyed
+                     frames; --steady-steps is the cap. The FP32 state
+                     jitters the integrals at ~1e-5 on external flows,
+                     so a tight TOL may never certify (exit 8; the
+                     plateau is the answer, docs/rans.md).
                      0 = plain time-march.                            [0]
+  --steady-steps N   compressible --steady iteration cap; reaching it is
+                     exit 8.                                     [1000000]
+  --steady-scheme explicit|implicit
+                     compressible --steady pseudo-time scheme: explicit
+                     local time stepping, or implicit Newton-Krylov
+                     (--ogrid at --nz 1 or the revolved wedge only: JFNK
+                     GMRES(40) with a line Gauss-Seidel first-order
+                     Rusanov preconditioner, CFL 10 x2 -> 1e8; cap
+                     default 500). Same fixed point; it reaches the
+                     laminar/SA plateau in ~20 Newton steps but does
+                     NOT certify a stop either (docs/rans.md).
+                                                               [explicit]
   --seq LEVELS       grid sequencing (requires --steady): converge on a
                      ladder of grids n/2^(LEVELS-1) .. n, prolonging each
                      solution as the next level's initial guess. Only the
@@ -914,6 +975,11 @@ OUTPUT (--emit is repeatable; default = stats,bin)
                        incompressible: t,dt,K,cd,cl,cdf,cfl,maxDiv,
                                        pcgIters,resid
                        compressible:   t,dt,cd,cl,cs,wmax
+                     (--ogrid adds heat; --rans appends cdp,cdf,mutMax,
+                     yplusMax,yplusMean,floorHits -- immersed: mutMax,
+                     yplusMax,yplusMean,floorHits; compressible --steady
+                     appends iter,resid,resU,resE,resT,remaining, and
+                     --steady-scheme implicit cfl,alpha,rejects,krylov.)
                      (dns channel writes a third schema; see its help.)
                      Parse by COLUMN NAME from the header row, never
                      by index.
@@ -930,6 +996,16 @@ OUTPUT (--emit is repeatable; default = stats,bin)
   --emit volume      <out>_{vol,lam}.bin full 3D field per frame
   --emit slices      three centre planes instead of the volume
   --emit vtk         <out>_%05d.vtk legacy structured points
+  --emit mesh        <out>_mesh.bin (the O-grid's nodes and d1, written
+                     before the run) and <out>_final.bin (FP64 rho, u, v,
+                     w, p, T, the RANS scalars, mu_t, d at the end);
+                     --ogrid only (docs/viewer-format.md). The OpenFOAM
+                     parity tools build an identical polyMesh from it.
+  --emit surface     <out>_surface.csv once at the end (--ogrid): one
+                     row per wall face, i,k,x,y,z,theta_deg,area,cp,cf,
+                     tau_x,tau_y,tau_z,yplus,d1,qw; theta from the
+                     upstream axis, cf signed along the downstream
+                     surface tangent. Header comment: the run label.
   --emit none        diagnostics only
 
   --fdt DT           .bin / volume frame interval                  [0.15]

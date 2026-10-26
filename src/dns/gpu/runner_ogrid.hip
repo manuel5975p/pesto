@@ -3,22 +3,31 @@
 #include "dns/interrupt.hpp"
 
 #include "dns/curvmesh.hpp"
+#include "dns/gpu/axis_bc.hpp"
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/derived.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/internal/comp_flux.hpp"
 #include "dns/gpu/internal/frame_scratch.hpp"
+#include "dns/gpu/internal/rans_stats.hpp"
 #include "dns/gpu/internal/run_loop.hpp"
+#include "dns/gpu/internal/nk_march.hpp"
+#include "dns/gpu/internal/steady_march.hpp"
+#include "dns/gpu/nk.hpp"
 #include "dns/gpu/reductions.hpp"
+#include "dns/meshio.hpp"
+#include "dns/walldist.hpp"
 
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <format>
 #include <numbers>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -68,6 +77,27 @@ __global__ void kOGridCurl(GpuGrid g, CurvView m, int signedWz, const Real* u,
     out[c] = sqrt(wx * wx + wy * wy + wz * wz);
 }
 
+// The real fluid cells of an O-grid: every cell but the two ghost rows, and on
+// a revolved mesh also the two ghost columns past the axis and the wedge's
+// two ghost planes.
+std::vector<std::uint8_t> ogridFluidMask(const Grid& g, const OGrid& og)
+{
+    if (!og.revolved) return rowMask(g, 1, g.ny - 2);
+    std::vector<std::uint8_t> m(g.size(), 0);
+    const int kLo = og.rev.wedge ? 1 : 0, kHi = og.rev.wedge ? 1 : g.nz - 1;
+    for (int k = kLo; k <= kHi; ++k)
+        for (int j = 1; j <= g.ny - 2; ++j)
+            for (int i = 1; i <= og.nTheta; ++i) m[g.idx(i, j, k)] = 1;
+    return m;
+}
+
+// Is wall face (i, k) a real one (not a ghost column / ghost plane)?
+bool realWallFace(const OGrid& og, int i, int k)
+{
+    if (!og.revolved) return true;
+    return i >= 1 && i <= og.nTheta && (!og.rev.wedge || k == 1);
+}
+
 } // namespace
 
 std::expected<RunStats, RunError>
@@ -76,10 +106,19 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
 {
     const auto gg = GpuGrid::from(g);
 
+    const bool rans = r.rans != RansModel::None;
+    const bool sst = ransSst(r.rans);
+    const bool steady = r.steadyTol > 0;
     auto mtr = CurvMetrics::build(og.mesh);
     if (!mtr) return fail(2, "O-grid metrics: " + mtr.error());
     auto dev = DeviceComp::make(*mtr, r.tr, r.les, r.sgs);
-    auto ds = DeviceCompState::make(g.size());
+    // Explicit steady: the compensated state, so pseudo-time updates below
+    // ulp(q)/2 still accumulate (docs/rans.md, "The FP32 update floor"); both
+    // O-grid rows zero the low words they overwrite. The Newton-Krylov march
+    // keeps its own FP64 iterate and hands the kernels a plain state.
+    const bool implicit = steady && r.steadyImplicit;
+    auto ds = DeviceCompState::make(g.size(), ransScalars(r.rans),
+                                    steady && !implicit);
     auto red = ReduceScratch::make();
     if (!dev || !ds || !red) return fail(6, "GPU allocation failed");
 
@@ -156,20 +195,84 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
         bc.wallPos = ogridWallMidpoints(og);
         bc.wallSpan = ogridWallSpans(og);
     }
+    bc.tr = r.tr;
+    if (!r.wallDist.empty()) bc.wallD1 = wallFirstCellDistance(g, r.wallDist);
+    if (rans)
+    {
+        bc.rans = r.rans;
+        bc.phiInf[0] = r.phiInf[0];
+        bc.phiInf[1] = r.phiInf[1];
+    }
+    // A revolved mesh: the far row on each far face's own 3D normal, and the
+    // tallies over the REAL wall faces (wedge: one plane times 2 pi/dphi).
+    const bool rev = og.revolved;
+    const bool wedge = rev && og.rev.wedge;
+    if (rev)
+    {
+        bc.farNormal.resize(std::size_t(g.nx) * g.nz);
+        for (int k = 0; k < g.nz; ++k)
+            for (int i = 0; i < g.nx; ++i)
+            {
+                const std::size_t c = g.idx(i, g.ny - 2, k);
+                const double s[3] = {mtr->S[1][0][c], mtr->S[1][1][c],
+                                     mtr->S[1][2][c]};
+                const double l = std::hypot(s[0], s[1], s[2]);
+                bc.farNormal[std::size_t(k) * g.nx + i] = {s[0] / l, s[1] / l,
+                                                            s[2] / l};
+            }
+        bc.faceILo = 1;
+        bc.faceIHi = og.nTheta;
+        bc.faceKLo = wedge ? 1 : 0;
+        bc.faceKHi = wedge ? 1 : g.nz - 1;
+        bc.tallyScale = wedge ? 2.0 * std::numbers::pi / og.rev.dphi : 1.0;
+    }
     auto wall = DeviceOGridBc::make(g, bc);
     if (!wall) return fail(6, "O-grid boundary init failed");
+    std::optional<DeviceAxisBc> axis;
+    if (rev)
+    {
+        auto a = DeviceAxisBc::make(g, og.rev);
+        if (!a) return fail(6, "axis boundary init failed");
+        axis = *a;
+    }
+
+    // The real fluid cells: everything but the two ghost rows (and, on a
+    // revolved mesh, the ghost columns and the wedge's ghost planes).
+    const std::vector<std::uint8_t> fluid = ogridFluidMask(g, og);
+    MutHook mutHook = wall->mutHook();
+    if (axis)
+        mutHook = [h = wall->mutHook(), a = *axis](Real* n, Real* f) {
+            h(n, f);
+            a.applyMut(n, f);
+        };
+    if (rans && !dev->enableRans({.model = r.rans,
+                                  .wallDist = r.wallDist,
+                                  .mutHook = mutHook,
+                                  .fluidMask = fluid}))
+        return fail(6, "GPU allocation failed (RANS)");
+    if (steady && !rans && !dev->enableSteady(fluid))
+        return fail(6, "GPU allocation failed (steady)");
+    if (steady && !implicit && !dev->enableCompensation())
+        return fail(6, "GPU allocation failed (compensated state)");
 
     // Both boundary rows ride the stage hook: they carry no solution, so the
-    // rhs computed on them is discarded and re-derived every stage.
-    dev->setStageHook([&](DeviceCompState& s) { wall->apply(s); });
+    // rhs computed on them is discarded and re-derived every stage. The axis
+    // ghosts follow the rows (they copy the rows' ghost cells too).
+    auto applyBc = [&](DeviceCompState& s) {
+        wall->apply(s);
+        if (axis) axis->apply(s);
+    };
+    dev->setStageHook(applyBc);
 
-    if (ds->upload(ic) != hipSuccess)
-        return fail(6, "initial condition upload failed");
+    bool upOk = ds->upload(ic) == hipSuccess;
+    for (int i = 0; i < ds->nT; ++i)
+        upOk = upOk && ds->uploadTurb(i, r.icTurb[i]) == hipSuccess;
+    if (!upOk) return fail(6, "initial condition upload failed");
     if (auto h = internal::checkDevice("the initial condition"); !h)
         return std::unexpected(h.error());
     const double u0 = r.ramp > 0 ? 0.0 : r.uInf;
     wall->setFreestream(u0);
-    wall->apply(*ds);
+    applyBc(*ds);
 
     // heat: the wall energy flux INTO the body, raw (not a coefficient) --
     // a Nusselt number needs the caller's own kappa and temperature scale.
@@ -179,13 +282,23 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
     // A rotor adds thrust, shaft torque and their propeller coefficients
     // (rho n^2 D^4 / D^5, n = rev per unit time), exactly runner_comp's
     // columns; a static run keeps the columns it has always had.
-    const std::vector<std::string> cols =
+    // RANS appends its columns and a steady march its own; a DNS/LES time
+    // march keeps exactly the columns it always had.
+    std::vector<std::string> cols =
         r.rotor.active()
             ? std::vector<std::string>{"t",    "dt",   "cd",     "cl",
                                        "cs",   "heat", "wmax",   "thrust",
                                        "torque", "ct", "cq"}
             : std::vector<std::string>{"t",  "dt",   "cd",  "cl",
                                        "cs", "heat", "wmax"};
+    if (rans)
+        cols.insert(cols.end(), {"cdp", "cdf", "mutMax", "yplusMax",
+                                 "yplusMean", "floorHits"});
+    if (steady)
+        cols.insert(cols.end(),
+                    {"iter", "resid", "resU", "resE", "resT", "remaining"});
+    if (og.revolved) cols.emplace_back("lr");
+    if (implicit) cols.insert(cols.end(), {"cfl", "alpha", "rejects", "krylov"});
     if (auto e = out.declareSeries("stats", cols); !e)
         return fail(4, e.error());
     const auto [ctDen, cqDen] = internal::propellerDen(r.rhoInf, r.rotor.omega, r.D);
@@ -230,8 +343,420 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
     internal::StatsCadence cad{r.statsEvery};
     double dtStab = 0.0;
     int sinceDt = 1 << 30;
-    const double span = g.nz > 1 ? g.nz * g.hz : 1.0;
+    // Per unit span on a z-extruded mesh; a revolved mesh is a whole body.
+    const double span = !rev && g.nz > 1 ? g.nz * g.hz : 1.0;
     const auto wall0 = std::chrono::steady_clock::now();
+
+    // --- RANS / steady measurements (docs/rans.md, "dns flow") -------------
+    // FP64 volumes of the fluid cells and the mask, for the stop integrals.
+    DeviceBuffer<double> vol64;
+    DeviceBuffer<std::uint8_t> fluidDev;
+    if (rans || steady)
+    {
+        auto v = DeviceBuffer<double>::make(g.size());
+        auto f = DeviceBuffer<std::uint8_t>::make(g.size());
+        if (!v || !f || v->upload(mtr->vol.data()) != hipSuccess ||
+            f->upload(fluid.data()) != hipSuccess)
+            return fail(6, "GPU allocation failed (stop integrals)");
+        vol64 = std::move(*v);
+        fluidDev = std::move(*f);
+    }
+    struct Extra
+    {
+        double cdp = 0, cdf = 0, mutMax = 0, ypMax = 0, ypMean = 0;
+        double hits = 0, wake = 0, turb[2] = {0, 0};
+    };
+    // The exact surface tally. On the axisymmetric wedge the side forces
+    // and the torque of the revolved body vanish by symmetry: the scaled sum
+    // of one wedge plane would report its lateral force times 2 pi/dphi.
+    auto surfaceTally = [&] {
+        auto F = wall->surface(*dev, *ds);
+        if (wedge) F.fy = F.fz = F.tz = 0.0;
+        return F;
+    };
+    // The real wall faces, derived per face from the per-face tally
+    // (surfaceFaces): position, the angle from the UPSTREAM axis (front
+    // stagnation 0; signed over the top/bottom on a z-extruded mesh, the
+    // polar angle in [0, 180] on a revolved one), cp, cf along the
+    // downstream surface tangent, the viscous traction, y+, d1, qw.
+    struct WallFace
+    {
+        int i, k;
+        double x[3], thetaDeg, area, cp, cf, tau[3], yplus, d1, qw, fpx;
+    };
+    const double tallyScale =
+        wedge ? 2.0 * std::numbers::pi / og.rev.dphi : 1.0;
+    const std::vector<double> d1All =
+        r.wallDist.empty() ? std::vector<double>{}
+                           : wallFirstCellDistance(g, r.wallDist);
+    auto wallFaces = [&]() {
+        const auto Fc = wall->surfaceFaces(*dev, *ds);
+        const double qd = 0.5 * r.rhoInf * r.uInf * r.uInf;
+        std::vector<WallFace> fs;
+        for (int k = 0; k < g.nz; ++k)
+            for (int i = 0; i < g.nx; ++i)
+            {
+                if (!realWallFace(og, i, k)) continue;
+                const std::size_t q = std::size_t(k) * g.nx + i;
+                WallFace w{};
+                w.i = i;
+                w.k = k;
+                // Face midpoint: the mean of its four wall nodes.
+                for (double& v : w.x) v = 0;
+                for (int dk = 0; dk < 2; ++dk)
+                    for (int di = 0; di < 2; ++di)
+                    {
+                        const auto p = og.mesh.node(i + di, 1, k + dk);
+                        for (int a = 0; a < 3; ++a) w.x[a] += 0.25 * p[a];
+                    }
+                // rho^: the unit direction away from the axis through the
+                // centre (z-extruded: +-y, the side of the face).
+                double rv[3] = {0, w.x[1] - r.cy, rev ? w.x[2] - r.cz : 0.0};
+                const double rho = std::hypot(rv[1], rv[2]);
+                const double th =
+                    std::atan2(rev ? rho : rv[1], r.cx - w.x[0]);
+                for (double& v : rv) v = rho > 0 ? v / rho : 0.0;
+                // Downstream tangent: d/d|theta| of (cx - r cos, r sin rho^).
+                const double at = std::abs(th);
+                double e[3] = {std::sin(at), std::cos(at) * rv[1],
+                               std::cos(at) * rv[2]};
+                const double en = e[0] * Fc.n[0][q] + e[1] * Fc.n[1][q] +
+                                  e[2] * Fc.n[2][q];
+                for (int a = 0; a < 3; ++a) e[a] -= en * Fc.n[a][q];
+                const double el = std::hypot(e[0], e[1], e[2]);
+                w.area = Fc.area[q];
+                w.cf = 0;
+                for (int a = 0; a < 3; ++a)
+                {
+                    w.tau[a] = w.area > 0 ? Fc.fv[a][q] / w.area : 0.0;
+                    if (el > 0) w.cf += w.tau[a] * e[a] / el;
+                }
+                w.cf /= qd;
+                w.thetaDeg = th * 180.0 / std::numbers::pi;
+                w.cp = (Fc.p[q] - r.pInf) / qd;
+                w.yplus = Fc.yplus[q];
+                w.d1 = d1All.empty() ? 0.0 : d1All[q];
+                w.qw = w.area > 0 ? Fc.heat[q] / w.area : 0.0;
+                w.fpx = Fc.fp[0][q];
+                fs.push_back(w);
+            }
+        return fs;
+    };
+    // cd from the exact tally, cdp from the per-face pressure force, the
+    // wake deficit W = sum_fluid V (rho u - rho_inf U), the turbulence
+    // integrals sum_fluid V t_i, max mu_t/mu_inf and the wall-face y+.
+    auto measureExtra = [&](double cd) {
+        Extra x;
+        const auto fs = wallFaces();
+        double fpx = 0, ys = 0;
+        for (const auto& w : fs)
+        {
+            fpx += w.fpx;
+            ys += w.yplus;
+            x.ypMax = std::max(x.ypMax, w.yplus);
+        }
+        x.cdp = fpx * tallyScale / (r.qRef * span);
+        x.cdf = cd - x.cdp;
+        x.ypMean = fs.empty() ? 0.0 : ys / double(fs.size());
+        x.wake = internal::reduce(*red, g.size(),
+                                  internal::MaskedVolSum{
+                                      fluidDev.data(), vol64.data(),
+                                      ds->mx.data(), r.rhoInf * r.uInf},
+                                  rocprim::plus<double>(), 0.0);
+        for (int i = 0; i < ds->nT; ++i)
+            x.turb[i] = internal::reduce(
+                *red, g.size(),
+                internal::MaskedVolSum{fluidDev.data(), vol64.data(),
+                                       ds->t[i].data(), 0.0},
+                rocprim::plus<double>(), 0.0);
+        if (rans)
+        {
+            dev->updateMut(*ds);
+            x.mutMax = internal::reduce(
+                *red, g.size(),
+                internal::MaskedMax{fluidDev.data(), dev->mut().data(),
+                                    1.0 / r.tr.muRef},
+                rocprim::maximum<double>(), -HUGE_VAL);
+            x.hits = double(dev->floorHits());
+        }
+        return x;
+    };
+
+    // Revolved meshes: the recirculation length L_r on the downstream axis
+    // column (i = nTheta; 3D: the k-mean), from the rear stagnation point to
+    // the interpolated u = 0 crossing along j, in D; 0 without reversed flow.
+    auto recircLength = [&]() {
+        if (!rev) return 0.0;
+        dev->primitives(*ds);
+        std::vector<Real> u(g.size());
+        if (dev->u().download(u.data()) != hipSuccess) return 0.0;
+        const int i = og.nTheta;
+        const int kLo = wedge ? 1 : 0, kHi = wedge ? 1 : g.nz - 1;
+        auto at = [&](int j, double& xc) {
+            double s = 0;
+            xc = 0;
+            for (int k = kLo; k <= kHi; ++k)
+            {
+                s += u[g.idx(i, j, k)];
+                for (int dk = 0; dk < 2; ++dk)
+                    for (int dj = 0; dj < 2; ++dj)
+                        for (int di = 0; di < 2; ++di)
+                            xc += og.mesh.node(i + di, j + dj, k + dk)[0];
+            }
+            const double nk = kHi - kLo + 1;
+            xc /= 8.0 * nk;
+            return s / nk;
+        };
+        const double xRear = og.mesh.node(og.nTheta + 1, 1, kLo)[0];
+        double x0 = 0, u0 = at(1, x0);
+        if (!(u0 < 0)) return 0.0;
+        for (int j = 2; j <= g.ny - 2; ++j)
+        {
+            double x1 = 0;
+            const double u1 = at(j, x1);
+            if (u1 >= 0)
+                return (x0 + (x1 - x0) * (-u0) / (u1 - u0) - xRear) / r.D;
+            x0 = x1;
+            u0 = u1;
+        }
+        return 0.0;
+    };
+    // The separation angle: the first sign change of cf from the front
+    // (revolved: along the k = kLo meridian; z-extruded: the upper side),
+    // linearly interpolated; 0 when the flow never separates.
+    auto separationDeg = [&](const std::vector<WallFace>& fs) {
+        const WallFace* prev = nullptr;
+        // Faces in increasing theta along one meridian / the upper side.
+        std::vector<const WallFace*> line;
+        for (const auto& w : fs)
+            if ((rev && w.k == (wedge ? 1 : 0)) ||
+                (!rev && w.k == 0 && w.thetaDeg >= 0))
+                line.push_back(&w);
+        std::ranges::sort(line, {}, [](const WallFace* w) { return w->thetaDeg; });
+        for (const WallFace* w : line)
+        {
+            if (prev && prev->cf > 0 && w->cf <= 0)
+                return prev->thetaDeg + (w->thetaDeg - prev->thetaDeg) *
+                                            prev->cf / (prev->cf - w->cf);
+            prev = w;
+        }
+        return 0.0;
+    };
+
+    // The surface CSV (--emit surface), once at the end of the run.
+    auto writeSurface = [&]() -> std::expected<void, RunError> {
+        const auto fs = wallFaces();
+        if (auto h = internal::checkDevice("the surface tally", &*red); !h)
+            return std::unexpected(h.error());
+        if (rev)
+        {
+            const double lr = recircLength();
+            std::printf("# axisymmetric wall: separation theta_s %.2f deg "
+                        "from the front, recirculation L_r %.4f D\n",
+                        separationDeg(fs), lr);
+            std::fflush(stdout);
+        }
+        if (!out.wantsSurface()) return {};
+        std::vector<std::vector<double>> rows;
+        rows.reserve(fs.size());
+        for (const auto& w : fs)
+            rows.push_back({double(w.i), double(w.k), w.x[0], w.x[1], w.x[2],
+                            w.thetaDeg, w.area, w.cp, w.cf, w.tau[0],
+                            w.tau[1], w.tau[2], w.yplus, w.d1, w.qw});
+        const std::string cs[] = {"i",     "k",    "x",     "y",     "z",
+                                  "theta_deg", "area", "cp", "cf", "tau_x",
+                                  "tau_y", "tau_z", "yplus", "d1",   "qw"};
+        if (auto e = out.writeSurface(r.label.empty() ? std::string("DNS")
+                                                      : r.label,
+                                      cs, rows);
+            !e)
+            return fail(4, e.error());
+        return {};
+    };
+    // --emit mesh's end artefact: the final state in FP64 (the compensated
+    // pair's value), primitives, the specific RANS scalars, mu_t and d.
+    auto writeFinal = [&]() -> std::expected<void, RunError> {
+        if (!out.wantsMesh()) return {};
+        auto h = CompState::zeros(g);
+        if (ds->download(h) != hipSuccess)
+            return fail(6, "final state download failed");
+        const std::size_t n = g.size();
+        std::vector<std::vector<double>> f(6, std::vector<double>(n));
+        for (std::size_t c = 0; c < n; ++c)
+        {
+            const double rho = h.rho[c], u = h.mx[c] / rho, v = h.my[c] / rho,
+                         w = h.mz[c] / rho;
+            const double p = (r.tr.gamma - 1.0) *
+                             (h.E[c] - 0.5 * rho * (u * u + v * v + w * w));
+            f[0][c] = rho;
+            f[1][c] = u;
+            f[2][c] = v;
+            f[3][c] = w;
+            f[4][c] = p;
+            f[5][c] = p / (rho * r.tr.Rgas);
+        }
+        std::vector<std::string> names = {"rho", "u", "v", "w", "p", "T"};
+        const char* tn[2][2] = {{"nutilde", ""}, {"k", "omega"}};
+        for (int i = 0; i < ds->nT; ++i)
+        {
+            std::vector<double> t;
+            if (ds->downloadTurb(i, t) != hipSuccess)
+                return fail(6, "final scalar download failed");
+            for (std::size_t c = 0; c < n; ++c) t[c] /= f[0][c];
+            names.emplace_back(tn[sst ? 1 : 0][i]);
+            f.push_back(std::move(t));
+        }
+        std::vector<double> mut(n, 0.0), dd(n, 0.0);
+        if (rans)
+        {
+            dev->updateMut(*ds);
+            if (downloadWiden(dev->mut(), mut) != hipSuccess)
+                return fail(6, "final mu_t download failed");
+        }
+        if (!r.wallDist.empty()) dd = r.wallDist;
+        names.emplace_back("mut");
+        f.push_back(std::move(mut));
+        names.emplace_back("d");
+        f.push_back(std::move(dd));
+        if (auto e = out.writeMeshArtefact("final", encodeFinal(g, names, f));
+            !e)
+            return fail(4, e.error());
+        return {};
+    };
+
+    if (steady)
+    {
+        // The pseudo-time march. Residual norms in freestream units (rho_inf,
+        // U_inf, D): mom D/U^2, energy D/U^3, SA nu~ 1/U^2, SST k D/U^3 and
+        // ln omega D/U. Reported, never the stop: the stop is on cd, cdf, the
+        // wake deficit and the turbulence integrals (decision 13).
+        const double tU = r.D / r.uInf; // the time scale D/U
+        double resid = HUGE_VAL, resU = 0, resE = 0, resT = 0;
+        DeviceOGridBc::Surface F{};
+        Extra x;
+        internal::SteadyMarchIo io;
+        io.afterStep = [&](DeviceCompState& s) { applyBc(s); };
+        io.sample = [&](long) -> std::expected<std::vector<double>, RunError> {
+            const ResidualNorms n = dev->residual(*ds, *red);
+            F = surfaceTally();
+            st.cd = F.fx / (r.qRef * span);
+            st.cl = F.fy / (r.qRef * span);
+            st.cs = F.fz / (r.qRef * span);
+            x = measureExtra(st.cd);
+            if (auto h = internal::checkDevice("a stats row", &*red); !h)
+                return std::unexpected(h.error());
+            resU = n.mom * tU / r.uInf;
+            resE = n.E * tU / (r.uInf * r.uInf);
+            resT = !rans ? 0.0
+                   : sst ? std::max(n.t[0] * tU / (r.uInf * r.uInf),
+                                    n.t[1] * tU)
+                         : n.t[0] / (r.uInf * r.uInf);
+            resid = std::max({resU, resE, resT});
+            if (!std::isfinite(resid) || !std::isfinite(st.cd))
+                return fail(7, "the residual is not finite (the state "
+                               "diverged)");
+            std::vector<double> q = {st.cd, x.cdf, x.wake};
+            for (int i = 0; i < ds->nT; ++i) q.push_back(x.turb[i]);
+            return q;
+        };
+        io.row = [&](const internal::SteadyRow& sr) {
+            // wmax: the explicit march's dt bound; the implicit one has none.
+            const double wmax =
+                sr.dtRef > 0 ? r.cfl / sr.dtRef * mtr->hmin : 0.0;
+            std::vector<double> row = {sr.t,  sr.dtRef, st.cd, st.cl,
+                                       st.cs, F.heat,   wmax};
+            if (rans)
+                row.insert(row.end(), {x.cdp, x.cdf, x.mutMax, x.ypMax,
+                                       x.ypMean, x.hits});
+            row.insert(row.end(), {double(sr.iter), resid, resU, resE, resT,
+                                   sr.remaining});
+            if (rev) row.push_back(recircLength());
+            if (implicit)
+                row.insert(row.end(), {sr.cfl, sr.alpha, double(sr.rejects),
+                                       double(sr.krylov)});
+            out.row("stats", row);
+            if (!sr.print) return;
+            // The march's own step: dtRef (explicit) or the CFL, step length
+            // and Krylov count (implicit).
+            const std::string stepText =
+                implicit ? std::format("cfl={:.2e} alpha={:.3f} krylov={}",
+                                       sr.cfl, sr.alpha, sr.krylov)
+                         : std::format("dtRef={:.2e}", sr.dtRef);
+            std::printf("iter=%ld cd=%.5f cdf=%.5f cl=%+.2e%s remaining=%.2e "
+                        "resid=%.3e (U %.2e E %.2e T %.2e) %s %s\n",
+                        sr.iter, st.cd, x.cdf, st.cl,
+                        rans ? std::format(" mutMax={:.3g} y+max={:.3g}",
+                                           x.mutMax, x.ypMax)
+                                   .c_str()
+                             : "",
+                        sr.remaining, resid, resU, resE, resT,
+                        stepText.c_str(), r.label.c_str());
+            std::fflush(stdout);
+        };
+        // The Newton-Krylov march (gpu/nk): lines along j for every real
+        // (i, k); the freestream scales of decision 1.
+        auto nkMarch = [&](const internal::SteadyMarchParams& p,
+                           const internal::SteadyMarchIo& nio)
+            -> std::expected<internal::SteadyResult, RunError> {
+            DeviceNk::Config nc;
+            if (og.revolved)
+                nc.lay = {.iLo = 1, .iHi = og.nTheta, .kLo = 1, .kHi = 1,
+                          .cyclicI = false, .skipK = false, .wedge = true,
+                          .dphi = og.rev.dphi};
+            else
+                nc.lay = {.iLo = 0, .iHi = g.nx - 1, .kLo = 0, .kHi = g.nz - 1,
+                          .cyclicI = true, .skipK = g.nz == 1, .wedge = false,
+                          .dphi = 0};
+            const double cInf = std::sqrt(r.tr.gamma * r.pInf / r.rhoInf);
+            nc.sc.rho = r.rhoInf;
+            nc.sc.mom = r.rhoInf * (r.uInf + cInf);
+            nc.sc.E = r.rhoInf * cInf * cInf;
+            if (sst) {
+                nc.sc.t[0] = r.rhoInf * r.uInf * r.uInf;
+                nc.sc.omegaInf = r.phiInf[1];
+            } else if (rans) {
+                nc.sc.t[0] =
+                    r.rhoInf * std::max(r.phiInf[0], r.tr.muRef / r.rhoInf);
+            }
+            nc.model = r.rans;
+            nc.gamma = r.tr.gamma;
+            nc.Rgas = r.tr.Rgas;
+            nc.restart = kNkRestart;
+            nc.maxKrylov = kNkMaxKrylov;
+            nc.forcing = kNkForcing;
+            nc.fdStep = kNkFdStep;
+            auto nk = DeviceNk::make(*dev, fluid, nc, applyBc);
+            if (!nk) return fail(6, "GPU allocation failed (Newton-Krylov)");
+            return internal::nkSteadyMarch(*nk, *ds, *red, p, nio);
+        };
+        const internal::SteadyMarchParams sp{.cfl = r.cfl,
+                                             .dtMargin = r.dtMargin,
+                                             .collapse = 1e-6,
+                                             .tol = r.steadyTol,
+                                             .dtRecompute = r.dtRecompute,
+                                             .cap = r.steadySteps,
+                                             .statsEvery = r.statsEvery,
+                                             .series = 3 + ds->nT};
+        auto res = implicit ? nkMarch(sp, io)
+                            : internal::explicitSteadyMarch(*dev, *ds, *red,
+                                                            sp, io);
+        if (!res) return std::unexpected(res.error());
+        st.steps = res->steps;
+        st.tStop = res->t;
+        if (auto h = internal::checkDevice("the end of the run", &*red); !h)
+            return std::unexpected(h.error());
+        if (auto e = writeSurface(); !e) return std::unexpected(e.error());
+        if (auto e = writeFinal(); !e) return std::unexpected(e.error());
+        finishTiming(st, wall0, out);
+        if (!res->converged && !stopRequested())
+            return fail(8, std::format("steady state not reached in {} "
+                                       "iterations (remaining change {:.3e} "
+                                       "> {:.3g})",
+                                       res->steps, res->remaining,
+                                       r.steadyTol));
+        st.converged = res->converged;
+        return st;
+    }
 
     while (t < r.tEnd)
     {
@@ -260,13 +785,13 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
             boostX(gg, *ds, uNew - wall->freestream());
             wall->setFreestream(uNew);
         }
-        wall->apply(*ds); // leave the state boundary-consistent between steps
+        applyBc(*ds); // leave the state boundary-consistent between steps
         t += dt;
         ++st.steps;
 
         if (cad.due(st.steps, t, r.tEnd))
         {
-            const auto F = wall->surface(*dev, *ds);
+            const auto F = surfaceTally();
             if (auto h = internal::checkDevice("a stats row", &*red); !h)
                 return std::unexpected(h.error());
             st.cd = F.fx / (r.qRef * span);
@@ -284,6 +809,21 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
                                       cqDen > 0 ? F.tz / cqDen : 0.0};
                 out.row("stats", row);
             }
+            else if (rans || rev)
+            {
+                std::vector<double> row = {t,     dt,   st.cd, st.cl,
+                                           st.cs, heat, wmax};
+                if (rans)
+                {
+                    const Extra x = measureExtra(st.cd);
+                    row.insert(row.end(), {x.cdp, x.cdf, x.mutMax, x.ypMax,
+                                           x.ypMean, x.hits});
+                }
+                if (rev) row.push_back(recircLength());
+                if (auto h = internal::checkDevice("a stats row", &*red); !h)
+                    return std::unexpected(h.error());
+                out.row("stats", row);
+            }
             else
             {
                 const double row[] = {t, dt, st.cd, st.cl, st.cs, heat, wmax};
@@ -295,6 +835,11 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
                     std::printf("t=%.2f/%.2f torque=%+.4e cd=%.3f cl=%+.3f "
                                 "wmax=%.2f dt=%.2e\n",
                                 t, r.tEnd, F.tz, st.cd, st.cl, wmax, dt);
+                else if (rans)
+                    std::printf("t=%.2f/%.2f cd=%.3f cl=%+.3f cs=%+.3f "
+                                "q=%+.3e wmax=%.2f dt=%.2e %s\n",
+                                t, r.tEnd, st.cd, st.cl, st.cs, heat, wmax,
+                                dt, r.label.c_str());
                 else
                     std::printf("t=%.2f/%.2f cd=%.3f cl=%+.3f cs=%+.3f "
                                 "q=%+.3e wmax=%.2f dt=%.2e\n",
@@ -309,6 +854,8 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
     }
     if (auto h = internal::checkDevice("the end of the run", &*red); !h)
         return std::unexpected(h.error());
+    if (auto e = writeSurface(); !e) return std::unexpected(e.error());
+        if (auto e = writeFinal(); !e) return std::unexpected(e.error());
     st.tStop = t;
     finishTiming(st, wall0, out);
     return st;

@@ -22,6 +22,8 @@
 #include "dns/gpu/run_result.hpp" // RunStats, RunError
 
 #include <expected>
+#include <string>
+#include <vector>
 
 namespace dns::gpu {
 
@@ -97,6 +99,35 @@ struct OGridRun
     // Off by default (it changes what every artefact of the run holds); see
     // the same field on CompRun.
     bool tempFrames = false;
+
+    // Body centre: the origin of the surface CSV's angle (and, on a revolved
+    // mesh, the axis of revolution through it along x).
+    double cx = 0, cy = 0, cz = 0;
+
+    // RANS (docs/rans.md, "dns flow"). None = the DNS/LES runner bit for
+    // bit. wallDist: d at every cell (ogridWallDistance; ghosts their source
+    // row's), also given without RANS for a steady run or --emit surface
+    // (then it only feeds d1 and y+). phiInf: the freestream SPECIFIC
+    // scalars (SA nu~ | SST k, omega). icTurb: the initial CONSERVED
+    // scalars, g.size() each, for the model's nT.
+    RansModel rans = RansModel::None;
+    std::vector<double> wallDist;
+    double phiInf[2] = {0, 0};
+    std::vector<double> icTurb[2];
+
+    // Compressible --steady (> 0): the explicit local-time-stepping pseudo-
+    // time march on the compensated state (gpu/internal/steady_march.hpp),
+    // stopped on cd, cdf, the wake deficit and the turbulence integrals;
+    // steadySteps caps it (exit 8). tEnd and ramp are not read then.
+    double steadyTol = 0;
+    long steadySteps = 0;
+    // The Newton-Krylov march (gpu/nk) instead of the explicit LTS one.
+    // Pre: nz == 1 or the revolved wedge.
+    bool steadyImplicit = false;
+
+    // The run label (dns/rans_label): the progress line's tail and the
+    // surface CSV's header comment. Empty on a DNS/LES time march.
+    std::string label;
 };
 
 // `ic` is the initial conservative state on the O-grid's logical grid (a rest

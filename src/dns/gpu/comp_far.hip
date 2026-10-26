@@ -89,6 +89,91 @@ __global__ void kFarWallZ(GpuGrid g, Real* rho, Real* mx, Real* my, Real* mz,
     E[c] = E[s];
 }
 
+// The fields of a state as one pointer table (5 mean + nT scalars), with
+// their low words when compensated.
+struct Fields
+{
+    Real* q[7];
+    Real* lo[7];
+    int n;
+};
+
+Fields fields(DeviceCompState& s)
+{
+    Fields f{{s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(), s.E.data()},
+             {},
+             5 + s.nT};
+    for (int i = 0; i < s.nT; ++i) f.q[5 + i] = s.t[i].data();
+    if (s.compensated()) {
+        for (int v = 0; v < 5; ++v) f.lo[v] = s.lo[v].data();
+        for (int i = 0; i < s.nT; ++i) f.lo[5 + i] = s.tlo[i].data();
+    }
+    return f;
+}
+
+// RANS twin of kFarSponge (runs after it, so rho is the relaxed density):
+// the conserved scalars relax to rho phi_inf with the band strength the
+// density uses; a compensated state's low words are zeroed on every cell the
+// sponge touched.
+__global__ void kFarSpongeTurb(GpuGrid g, int ns, Real sigMax, int openY,
+                               int openZ, Real phi0, Real phi1, Fields f)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= g.size()) return;
+    int i, j, k;
+    decompose(g, c, i, j, k);
+    auto depth = [ns](int q, int n) { return bandDepth(q, n, ns); };
+    auto sig = [sigMax](Real r) {
+        return r > Real(0) ? sigMax * Real(0.5) * (Real(1) - cosf(Real(M_PI) * r))
+                           : Real(0);
+    };
+    const Real sx = sig(depth(i, g.nx));
+    const Real sy = openY ? sig(depth(j, g.ny)) : Real(0);
+    const Real sz = openZ ? sig(depth(k, g.nz)) : Real(0);
+    if (sx <= Real(0) && sy <= Real(0) && sz <= Real(0)) return;
+    const Real srp = fmaxf(sx, fmaxf(sy, sz));
+    const Real r = f.q[0][c];
+    const Real phi[2] = {phi0, phi1};
+    for (int e = 5; e < f.n; ++e)
+        f.q[e][c] += srp * (r * phi[e - 5] - f.q[e][c]);
+    if (f.lo[0])
+        for (int v = 0; v < f.n; ++v) f.lo[v][c] = Real(0);
+}
+
+// RANS / compensated twin of the mirror-row kernels: scalars EVEN, every
+// low word of the written row zeroed. axis 1 (y) or 2 (z).
+__global__ void kFarWallTurb(GpuGrid g, int axis, Fields f)
+{
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    bool hi;
+    std::size_t c, s;
+    if (axis == 1) {
+        int i, k;
+        if (!internal::yGhostPair(g, t, i, k, hi, c, s)) return;
+    } else if (!internal::sideGhostPair(g, 2, t, hi, c, s)) {
+        return;
+    }
+    for (int e = 5; e < f.n; ++e) f.q[e][c] = f.q[e][s];
+    if (f.lo[0])
+        for (int v = 0; v < f.n; ++v) f.lo[v][c] = Real(0);
+}
+
+// mu_t / F1 even on the mirror rows.
+__global__ void kFarWallMut(GpuGrid g, int axis, Real* nut, Real* f1)
+{
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    bool hi;
+    std::size_t c, s;
+    if (axis == 1) {
+        int i, k;
+        if (!internal::yGhostPair(g, t, i, k, hi, c, s)) return;
+    } else if (!internal::sideGhostPair(g, 2, t, hi, c, s)) {
+        return;
+    }
+    nut[c] = nut[s];
+    if (f1) f1[c] = f1[s];
+}
+
 } // namespace
 
 std::expected<DeviceCompFar, hipError_t> DeviceCompFar::make(const Grid& g,
@@ -124,6 +209,37 @@ void DeviceCompFar::apply(DeviceCompState& s) const
         kFarWallZ<<<launchBlocks(2 * std::size_t(g_.nx) * g_.ny), blockSize>>>(
             g_, s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(), s.E.data());
         checkLastKernel("kFarWallZ");
+    }
+    // RANS scalars / compensated low words: absent without RANS.
+    if (s.nT == 0 && !s.compensated()) return;
+    const Fields f = fields(s);
+    kFarSpongeTurb<<<launchBlocks(g_.size()), blockSize>>>(
+        g_, c_.ns, Real(c_.sigMax), int(c_.openY), int(c_.openZ),
+        Real(c_.phiInf[0]), Real(c_.phiInf[1]), f);
+    checkLastKernel("kFarSpongeTurb");
+    if (!c_.openY) {
+        kFarWallTurb<<<launchBlocks(2 * std::size_t(g_.nx) * g_.nz),
+                       blockSize>>>(g_, 1, f);
+        checkLastKernel("kFarWallTurb");
+    }
+    if (!c_.openZ && g_.nz > 1) {
+        kFarWallTurb<<<launchBlocks(2 * std::size_t(g_.nx) * g_.ny),
+                       blockSize>>>(g_, 2, f);
+        checkLastKernel("kFarWallTurb");
+    }
+}
+
+void DeviceCompFar::applyMut(Real* nut, Real* f1) const
+{
+    if (!c_.openY) {
+        kFarWallMut<<<launchBlocks(2 * std::size_t(g_.nx) * g_.nz),
+                      blockSize>>>(g_, 1, nut, f1);
+        checkLastKernel("kFarWallMut");
+    }
+    if (!c_.openZ && g_.nz > 1) {
+        kFarWallMut<<<launchBlocks(2 * std::size_t(g_.nx) * g_.ny),
+                      blockSize>>>(g_, 2, nut, f1);
+        checkLastKernel("kFarWallMut");
     }
 }
 

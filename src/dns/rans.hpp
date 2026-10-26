@@ -37,14 +37,7 @@ inline std::span<const char* const> ransCliNames()
     static constexpr const char* n[] = {"none", "sa-neg", "sst-2003m", "sst-vm"};
     return n;
 }
-// The closures `dns channel --rans` accepts: only what is BUILT is
-// registered, so --help and the CLI's "one of:" list stay truthful.
-inline std::span<const RansModel> ransBuiltChannel()
-{
-    static constexpr RansModel m[] = {RansModel::None, RansModel::SaNeg,
-                                      RansModel::Sst2003m, RansModel::SstVm};
-    return m;
-}
+// Which closures each subcommand accepts: dns/rans_label.hpp ransBuilt().
 // Conserved turbulence scalars the model carries: 0 | 1 (rho nu~) | 2 (rho k,
 // rho omega).
 inline int ransScalars(RansModel m)
@@ -289,6 +282,25 @@ DNS_HD SstPoint<T> sstSource(RansModel m, T rho, T k, T omega, T R, T mut,
     s.Rw = Pw - beta * rho * omega * omega + cdw;
     s.Jw = T(2) * beta * omega + (cdw < T(0) ? -cdw / (rho * omega) : T(0));
     return s;
+}
+
+// --- freestream turbulence (dns flow; masterplan_flowrans decision 4) --------
+// The inflow flags are in FREESTREAM units, so a Mach study does not change
+// the inflow turbulence (TMR's c_inf-based values would make Tu ~ 1/M).
+// Defaults: SA nu~/nu = 3 (TMR); SST k = 2.25e-7 U^2 (TMR's 9e-9 c^2 at
+// M 0.2, Tu 0.0387%) and mu_t/mu = 0.009 (TMR, M- and Re-independent).
+inline constexpr double kRansNutInfRatio = 3.0, kRansKInf = 2.25e-7,
+                        kRansMutInfRatio = 0.009;
+
+// SA freestream nu~ = R nu. Pre: R >= 0, nu > 0.
+inline double nuTildaInf(double ratio, double nu) { return ratio * nu; }
+// SST freestream k = K U^2. Pre: K > 0.
+inline double kInf(double K, double U) { return K * U * U; }
+// SST freestream omega = rho k / (R mu) = k / (R nu): mu_t/mu = R exactly
+// (sstMut at F2 = 0). Pre: k > 0, R > 0, nu > 0.
+inline double omegaInf(double k, double ratio, double nu)
+{
+    return k / (ratio * nu);
 }
 
 // --- wall-bounded initial guesses (channel IC, oracle start) -----------------

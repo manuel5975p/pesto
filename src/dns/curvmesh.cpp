@@ -79,6 +79,44 @@ bool invert3(const double m[3][3], double inv[3][3], double& det)
     return true;
 }
 
+// Is the +i face of column i one of the mesh's degenerate axis faces?
+bool isAxisFace(const CurvMesh& m, int i)
+{
+    return i >= 0 && (i == m.axisFaces[0] || i == m.axisFaces[1]);
+}
+
+// Is column i a placeholder past the axis (the -i side of axisFaces[0]'s
+// face, the +i side of axisFaces[1]'s)?
+bool isGhostColumn(const CurvMesh& m, int i)
+{
+    return (m.axisFaces[0] >= 0 && i == m.axisFaces[0]) ||
+           (m.axisFaces[1] >= 0 && i == m.axisFaces[1] + 1);
+}
+
+double norm(V3 a) { return std::sqrt(dot(a, a)); }
+
+// Row i of dXi/dx on a degenerate axis face (CurvMesh::axisFaces): the
+// across-axis central difference's limit. tj: the face's tangent along the
+// axis; p0: a face node (on the axis); F: the fluid cell's centroid; lo: the
+// face is F's -i face (the iLo column). Error when F sits on the axis.
+std::expected<V3, std::string> axisLimitRow(V3 tj, V3 p0, V3 F, bool lo)
+{
+    const double tl = norm(tj);
+    if (!(tl > 0.0)) return std::unexpected("zero tangent along the axis");
+    const V3 ax = (1.0 / tl) * tj;
+    const V3 d = F - p0;
+    const V3 rv = d - dot(d, ax) * ax;
+    const double rho = norm(rv);
+    if (!(rho > 0.0)) return std::unexpected("fluid centroid on the axis");
+    const V3 rh = (1.0 / rho) * rv;
+    const V3 ephi = cross(ax, rh);
+    const V3 c = (lo ? 2.0 * rho : -2.0 * rho) * rh;
+    const V3 te = cross(tj, ephi);
+    const double den = dot(c, te);
+    if (!(std::abs(den) > 0.0)) return std::unexpected("singular limit row");
+    return (1.0 / den) * te;
+}
+
 } // namespace
 
 CurvMesh CurvMesh::uniform(const Grid& g)
@@ -117,6 +155,14 @@ CurvMesh CurvMesh::channelY(const Grid& g, double beta, double delta)
 
 std::array<double, 3> CurvMesh::node(int i, int j, int k) const
 {
+    if (wrap[2] == AxisWrap::MirrorZ && (k < 0 || k >= g.nz)) {
+        // Only the wedge's one node past the top exists: node(3) is the
+        // z-mirror of node(0).
+        assert(g.nz == 3 && k == 3);
+        auto p = node(i, j, 0);
+        p[2] = 2.0 * mirrorZ0 - p[2];
+        return p;
+    }
     const AxisTerms A = axisTerms(wrap[0], i, g.nx, g.hx);
     const AxisTerms B = axisTerms(wrap[1], j, g.ny, g.hy);
     const AxisTerms C = axisTerms(wrap[2], k, g.nz, g.hz);
@@ -160,6 +206,14 @@ std::expected<CurvMetrics, std::string> CurvMetrics::build(const CurvMesh& m)
                 "axis {} is Extend but has {} cell(s): linear extension needs "
                 "two node rows",
                 a, na[a]));
+    if (m.wrap[0] == AxisWrap::MirrorZ || m.wrap[1] == AxisWrap::MirrorZ ||
+        (m.wrap[2] == AxisWrap::MirrorZ && g.nz != 3))
+        return std::unexpected("MirrorZ is the wedge's z axis only, with "
+                               "exactly 3 cells (one real plane, two ghosts)");
+    for (const int f : m.axisFaces)
+        if (f >= g.nx || f < -1)
+            return std::unexpected(
+                std::format("axis face column {} outside [0, {})", f, g.nx));
 
     CurvMetrics t;
     t.g = g;
@@ -230,6 +284,28 @@ std::expected<CurvMetrics, std::string> CurvMetrics::build(const CurvMesh& m)
                     col[a] = cc1 - cc0;
                     col[t1] = 0.5 * ((P[1] + P[2]) - (P[0] + P[3]));
                     col[t2] = 0.5 * ((P[3] + P[2]) - (P[0] + P[1]));
+                    if (a == 0 && isAxisFace(m, i)) {
+                        if (Sv.x != 0.0 || Sv.y != 0.0 || Sv.z != 0.0)
+                            return std::unexpected(std::format(
+                                "axis face ({}, {}, {}) is not degenerate (S = "
+                                "{:.3e} {:.3e} {:.3e})",
+                                i, j, k, Sv.x, Sv.y, Sv.z));
+                        const V3 F = i == m.axisFaces[0]
+                                         ? centroid(i + 1, j, k)
+                                         : cc0;
+                        const auto row = axisLimitRow(col[t1], P[0], F,
+                                                      i == m.axisFaces[0]);
+                        if (!row)
+                            return std::unexpected(std::format(
+                                "axis face ({}, {}, {}): {}", i, j, k,
+                                row.error()));
+                        t.Ji[a][0][c] = row->x;
+                        t.Ji[a][1][c] = row->y;
+                        t.Ji[a][2][c] = row->z;
+                        continue; // rows j, k stay 0: read only times S = 0
+                    }
+                    // A placeholder column's own faces are replaced below.
+                    if (isGhostColumn(m, i)) continue;
                     const double M[3][3] = {{col[0].x, col[1].x, col[2].x},
                                             {col[0].y, col[1].y, col[2].y},
                                             {col[0].z, col[1].z, col[2].z}};
@@ -244,12 +320,32 @@ std::expected<CurvMetrics, std::string> CurvMetrics::build(const CurvMesh& m)
                             t.Ji[a][d * 3 + cx][c] = inv[d][cx];
                 }
                 const double vol = v6 / 6.0;
+                if (isGhostColumn(m, i)) continue;
                 if (!(vol > 0.0))
                     return std::unexpected(std::format(
                         "non-positive cell volume at ({}, {}, {}): {}", i, j, k,
                         vol));
                 t.vol[c] = vol;
             }
+
+    // The placeholder columns past the axis: their j- and k-face tables and
+    // volume are their real neighbour's (the ghost's own rhs is discarded;
+    // no real cell reads its metrics). The axis face itself (column
+    // axisFaces[0]'s +i face) keeps S = 0 and its limit row.
+    for (const int f : m.axisFaces) {
+        if (f < 0) continue;
+        const bool lo = f == m.axisFaces[0];
+        const int ig = lo ? f : f + 1, is = lo ? f + 1 : f;
+        for (int k = 0; k < g.nz; ++k)
+            for (int j = 0; j < g.ny; ++j) {
+                const std::size_t c = g.idx(ig, j, k), s = g.idx(is, j, k);
+                t.vol[c] = t.vol[s];
+                for (int a = lo ? 1 : 0; a < 3; ++a) {
+                    for (int q = 0; q < 3; ++q) t.S[a][q][c] = t.S[a][q][s];
+                    for (int e = 0; e < 9; ++e) t.Ji[a][e][c] = t.Ji[a][e][s];
+                }
+            }
+    }
 
     // Widths need the neighbour's face norms, hence the second pass.
     t.hmin = 1e300;
@@ -272,6 +368,16 @@ std::expected<CurvMetrics, std::string> CurvMetrics::build(const CurvMesh& m)
                                          t.S[a][2][f] * t.S[a][2][f]);
                     };
                     t.aov[a][c] = 0.5 * (norm(c) + norm(lo)) / t.vol[c];
+                    // The wedge's azimuth is not a resolved direction: its
+                    // ghost planes are slaved rotations of the real plane,
+                    // so no azimuthal mode exists and the side faces only
+                    // carry the hoop terms, whose rates go as 1/rho, not
+                    // 1/(rho dphi). The CFL width is rho: aov * dphi
+                    // (measured: the 1/(rho dphi) width put the axis
+                    // cells' diffusive dt below the 1e-6 collapse guard at
+                    // 256 x 192 x 5 deg and 128 x 96 x 2.5 deg).
+                    if (a == 2 && m.wrap[2] == AxisWrap::MirrorZ)
+                        t.aov[a][c] *= g.hz;
                     if (a < 2 || g.nz > 1)
                         t.hmin = std::min(t.hmin, 1.0 / t.aov[a][c]);
                 }

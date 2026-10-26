@@ -13,7 +13,9 @@
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/internal/derived_remap.hpp"
 #include "dns/gpu/internal/frame_scratch.hpp"
+#include "dns/gpu/internal/rans_stats.hpp"
 #include "dns/gpu/internal/run_loop.hpp"
+#include "dns/gpu/internal/steady_march.hpp"
 #include "dns/gpu/reductions.hpp"
 #include "dns/gpu/rotortable.hpp"
 
@@ -45,6 +47,11 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     const bool nscbc = r.far == FarField::Nscbc;
     const bool stretched = r.stretchBeta > 0;
     const bool focal = r.focalActive;
+    // RANS on the immersed wall (masterplan_flowrans P5): off is every path
+    // below bit for bit.
+    const bool rans = r.rans != RansModel::None;
+    const bool steady = r.steadyTol > 0;
+    assert(!steady || rans); // the validator: immersed --steady needs --rans
 
     // The PointRemaps of the two curvilinear meshes; both are the exact
     // identity when their parameters are off, so building them unconditionally
@@ -73,9 +80,18 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         if (!m) return fail(2, "focal mesh: " + m.error());
         mtr = std::move(*m);
     }
+    else if (rans)
+    {
+        // The closure lives on the curvilinear path only: a uniform mesh is
+        // its identity-map instance (the cost ratio is recorded in
+        // docs/rans.md).
+        auto m = CurvMetrics::build(CurvMesh::uniform(g));
+        if (!m) return fail(2, "uniform mesh: " + m.error());
+        mtr = std::move(*m);
+    }
     auto dev = mtr ? DeviceComp::make(*mtr, r.tr, r.les, r.sgs)
                    : DeviceComp::make(g, r.tr, r.les, r.sgs);
-    auto ds = DeviceCompState::make(g.size());
+    auto ds = DeviceCompState::make(g.size(), ransScalars(r.rans), steady);
     auto red = ReduceScratch::make();
     if (!dev || !ds || !red) return fail(6, "GPU allocation failed");
 
@@ -101,6 +117,8 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     fc.openY = r.open;
     fc.openZ = r.open && g.nz > 1;
     fc.noslipY = r.noslipY;
+    fc.phiInf[0] = r.phiInf[0];
+    fc.phiInf[1] = r.phiInf[1];
     if (nscbc)
     {   // x is handled characteristically; an optional thin strip inside the
         // NSCBC rows absorbs the residual reflection that pumps box modes above
@@ -376,6 +394,44 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     int rotorMaskBin = -1;
     if (r.rotor.active()) rotorMask.assign(g.size(), 1.0f);
 
+    // RANS: the closure on the curvilinear solver. The fluid mask (cells
+    // that are neither solid nor a far mirror row) is where the SST guard
+    // counts, the residual norms and the stop integrals sum; mu_t gets the
+    // ghost wall's odd image and the mirror rows' even copy.
+    std::vector<std::uint8_t> fluid;
+    if (rans)
+    {
+        fluid.assign(g.size(), 1);
+        for (int c : ghost->solidCells()) fluid[std::size_t(c)] = 0;
+        for (int k = 0; k < g.nz; ++k)
+            for (int i = 0; i < g.nx; ++i)
+                for (int j : {0, g.ny - 1})
+                    if (!r.open) fluid[g.idx(i, j, k)] = 0;
+        if (!r.open && g.nz > 1)
+            for (int j = 0; j < g.ny; ++j)
+                for (int i = 0; i < g.nx; ++i)
+                    for (int k : {0, g.nz - 1}) fluid[g.idx(i, j, k)] = 0;
+        ScalarBoundary bnd;
+        bnd.open[0] = 1;   // x: the NSCBC / sponge faces
+        bnd.open[1] = r.open ? 1 : 0;
+        bnd.open[2] = r.open && g.nz > 1 ? 1 : 0;
+        bnd.phiInf[0] = r.phiInf[0];
+        bnd.phiInf[1] = r.phiInf[1];
+        DeviceCompGhost* gp = ghost;
+        DeviceCompFar* fp = &*far;
+        if (!dev->enableRans({.model = r.rans,
+                              .wallDist = r.wallDist,
+                              .mutHook = [gp, fp](Real* nut, Real* f1) {
+                                  gp->mirrorMut(nut, f1);
+                                  fp->applyMut(nut, f1);
+                              },
+                              .fluidMask = fluid,
+                              .bnd = bnd}))
+            return fail(6, "GPU allocation failed (RANS)");
+        if (steady && !dev->enableCompensation())
+            return fail(6, "GPU allocation failed (compensated state)");
+    }
+
     // --penalize: the band decay rides the stage hook (runs once per RK
     // stage, so each application carries dt/3; penDt is set per step below).
     // It precedes the ghost fill so the mirrors sample the penalized field.
@@ -386,6 +442,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                              Real(penDt), s);
         far->apply(s);
         ghost->apply(s);
+        if (rans) ghost->applyTurb(s, r.rans, r.tr, r.phiInf[1]);
     };
     dev->setStageHook(applyBc);
     if (nsc)
@@ -402,6 +459,15 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
 
     if (ds->upload(ic) != hipSuccess)
         return fail(6, "initial condition upload failed");
+    // RANS: every scalar at its freestream value, rho_ic phi_inf.
+    for (int i = 0; i < ds->nT; ++i)
+    {
+        std::vector<double> t0(g.size());
+        for (std::size_t c = 0; c < g.size(); ++c)
+            t0[c] = ic.rho[c] * r.phiInf[i];
+        if (ds->uploadTurb(i, t0) != hipSuccess)
+            return fail(6, "initial condition upload failed");
+    }
     if (auto h = internal::checkDevice("the initial condition"); !h)
         return std::unexpected(h.error());
     const double u0 = r.ramp > 0 ? 0.0 : r.uInf;
@@ -415,13 +481,22 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     // propeller convention (n = revolutions per unit time, D the disc
     // diameter). Only when it is spinning: a static run's stats file must keep
     // exactly the columns it has always had.
-    const std::vector<std::string> cols =
+    // RANS appends its columns (y+ is the linear-sublayer estimate of the
+    // staircase wall, DeviceCompGhost::wallYplus) and a steady march its own;
+    // a DNS/LES run keeps exactly the columns it always had.
+    std::vector<std::string> cols =
         r.rotor.active()
             ? std::vector<std::string>{"t",  "dt", "cd", "cl",     "cs",
                                        "wmax", "qw", "thrust", "torque",
                                        "ct", "cq"}
             : std::vector<std::string>{"t", "dt", "cd", "cl", "cs", "wmax",
                                        "qw"};
+    if (rans)
+        cols.insert(cols.end(),
+                    {"mutMax", "yplusMax", "yplusMean", "floorHits"});
+    if (steady)
+        cols.insert(cols.end(),
+                    {"iter", "resid", "resU", "resE", "resT", "remaining"});
     if (auto e = out.declareSeries("stats", cols); !e)
         return fail(4, e.error());
     const int shaftAxis = rotorAxisIndex(r.rotor.axis);
@@ -495,6 +570,123 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     internal::WakeEma wake{.tLast = r.ramp};
     const auto wall0 = std::chrono::steady_clock::now();
 
+    // --- RANS measurements (fluid mask) ------------------------------------
+    // max mu_t/mu_inf, the wall's first-cell y+ estimate, the SST guard hits,
+    // and the stop integrals sum_fluid V t_i.
+    DeviceBuffer<double> vol64;
+    DeviceBuffer<std::uint8_t> fluidDev;
+    if (rans)
+    {
+        auto v = DeviceBuffer<double>::make(g.size());
+        auto f = DeviceBuffer<std::uint8_t>::make(g.size());
+        if (!v || !f || v->upload(mtr->vol.data()) != hipSuccess ||
+            f->upload(fluid.data()) != hipSuccess)
+            return fail(6, "GPU allocation failed (RANS measurements)");
+        vol64 = std::move(*v);
+        fluidDev = std::move(*f);
+    }
+    struct RansExtra
+    {
+        double mutMax = 0, ypMax = 0, ypMean = 0, hits = 0, turb[2] = {0, 0};
+    };
+    auto measureRans = [&]() {
+        RansExtra x;
+        dev->updateMut(*ds);
+        x.mutMax = internal::reduce(
+            *red, g.size(),
+            internal::MaskedMax{fluidDev.data(), dev->mut().data(),
+                                1.0 / r.tr.muRef},
+            rocprim::maximum<double>(), -HUGE_VAL);
+        const auto yp = ghost->wallYplus(*dev, *ds);
+        x.ypMax = yp.max;
+        x.ypMean = yp.mean;
+        x.hits = double(dev->floorHits());
+        for (int i = 0; i < ds->nT; ++i)
+            x.turb[i] = internal::reduce(
+                *red, g.size(),
+                internal::MaskedVolSum{fluidDev.data(), vol64.data(),
+                                       ds->t[i].data(), 0.0},
+                rocprim::plus<double>(), 0.0);
+        return x;
+    };
+    const double span = g.nz > 1 ? g.nz * g.hz : 1.0;
+
+    if (steady)
+    {
+        // The pseudo-time march (docs/rans.md, "Immersed-wall RANS"): the
+        // stop is on cd and the turbulence integrals, never the residual,
+        // whose norms are reported in freestream units (mom D/U^2, energy
+        // D/U^3, SA nu~ 1/U^2, SST k D/U^3 and ln omega D/U).
+        const bool sst = ransSst(r.rans);
+        const double tU = r.D / r.uInf;
+        double resid = HUGE_VAL, resU = 0, resE = 0, resT = 0;
+        DeviceCompGhost::Force F{};
+        RansExtra x;
+        internal::SteadyMarchIo io;
+        io.afterStep = [&](DeviceCompState& s) { applyBc(s); };
+        io.sample = [&](long) -> std::expected<std::vector<double>, RunError> {
+            const ResidualNorms n = dev->residual(*ds, *red);
+            F = ghost->force(*dev, *ds, r.rotor.shaft);
+            st.cd = F.fx / (r.qRef * span);
+            st.cl = F.fy / (r.qRef * span);
+            st.cs = F.fz / (r.qRef * span);
+            x = measureRans();
+            if (auto h = internal::checkDevice("a stats row", &*red); !h)
+                return std::unexpected(h.error());
+            resU = n.mom * tU / r.uInf;
+            resE = n.E * tU / (r.uInf * r.uInf);
+            resT = sst ? std::max(n.t[0] * tU / (r.uInf * r.uInf), n.t[1] * tU)
+                       : n.t[0] / (r.uInf * r.uInf);
+            resid = std::max({resU, resE, resT});
+            if (!std::isfinite(resid) || !std::isfinite(st.cd))
+                return fail(7, "the residual is not finite (the state "
+                               "diverged)");
+            std::vector<double> q = {st.cd};
+            for (int i = 0; i < ds->nT; ++i) q.push_back(x.turb[i]);
+            return q;
+        };
+        io.row = [&](const internal::SteadyRow& sr) {
+            const double wmax =
+                r.cfl / sr.dtRef * std::min({g.hx, g.hy, g.hz});
+            const double row[] = {sr.t,     sr.dtRef,  st.cd,    st.cl,
+                                  st.cs,    wmax,      F.heat,   x.mutMax,
+                                  x.ypMax,  x.ypMean,  x.hits,
+                                  double(sr.iter), resid, resU, resE, resT,
+                                  sr.remaining};
+            out.row("stats", row);
+            if (!sr.print) return;
+            std::printf("iter=%ld cd=%.5f cl=%+.2e mutMax=%.3g y+max=%.3g "
+                        "remaining=%.2e resid=%.3e (U %.2e E %.2e T %.2e) "
+                        "dtRef=%.2e %s\n",
+                        sr.iter, st.cd, st.cl, x.mutMax, x.ypMax, sr.remaining,
+                        resid, resU, resE, resT, sr.dtRef, r.label.c_str());
+            std::fflush(stdout);
+        };
+        const internal::SteadyMarchParams sp{.cfl = r.cfl,
+                                             .dtMargin = r.dtMargin,
+                                             .collapse = 1e-6,
+                                             .tol = r.steadyTol,
+                                             .dtRecompute = r.dtRecompute,
+                                             .cap = r.steadySteps,
+                                             .statsEvery = r.statsEvery,
+                                             .series = 1 + ds->nT};
+        auto res = internal::explicitSteadyMarch(*dev, *ds, *red, sp, io);
+        if (!res) return std::unexpected(res.error());
+        st.steps = res->steps;
+        st.tStop = res->t;
+        if (auto h = internal::checkDevice("the end of the run", &*red); !h)
+            return std::unexpected(h.error());
+        finishTiming(st, wall0, out);
+        if (!res->converged && !stopRequested())
+            return fail(8, std::format("steady state not reached in {} "
+                                       "iterations (remaining change {:.3e} "
+                                       "> {:.3g})",
+                                       res->steps, res->remaining,
+                                       r.steadyTol));
+        st.converged = res->converged;
+        return st;
+    }
+
     while (t < r.tEnd)
     {
         // A stop signal ends the run the SAME way reaching tEnd does: return
@@ -553,9 +745,9 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         if (cad.due(st.steps, t, r.tEnd))
         {
             const auto F = ghost->force(*dev, *ds, r.rotor.shaft);
+            const RansExtra rx = rans ? measureRans() : RansExtra{};
             if (auto h = internal::checkDevice("a stats row", &*red); !h)
                 return std::unexpected(h.error());
-            const double span = g.nz > 1 ? g.nz * g.hz : 1.0;
             st.cd = F.fx / (r.qRef * span);
             st.cl = F.fy / (r.qRef * span);
             st.cs = F.fz / (r.qRef * span);
@@ -581,6 +773,13 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                                       cqDen > 0 ? torque / cqDen : 0.0};
                 out.row("stats", row);
             }
+            else if (rans)
+            {
+                const double row[] = {t,        dt,       st.cd,     st.cl,
+                                      st.cs,    wmax,     F.heat,    rx.mutMax,
+                                      rx.ypMax, rx.ypMean, rx.hits};
+                out.row("stats", row);
+            }
             else
             {
                 const double row[] = {t, dt, st.cd, st.cl, st.cs, wmax, F.heat};
@@ -592,6 +791,12 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                     std::printf("t=%.2f/%.2f T=%+.4g Q=%+.4g cd=%.3f "
                                 "wmax=%.2f dt=%.2e\n",
                                 t, r.tEnd, thrust, torque, st.cd, wmax, dt);
+                else if (rans)
+                    std::printf("t=%.2f/%.2f cd=%.3f cl=%+.3f cs=%+.3f "
+                                "wmax=%.2f dt=%.2e mutMax=%.3g y+max=%.3g "
+                                "%s\n",
+                                t, r.tEnd, st.cd, st.cl, st.cs, wmax, dt,
+                                rx.mutMax, rx.ypMax, r.label.c_str());
                 else
                     std::printf("t=%.2f/%.2f cd=%.3f cl=%+.3f cs=%+.3f "
                                 "wmax=%.2f dt=%.2e\n",

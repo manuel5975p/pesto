@@ -76,6 +76,9 @@ struct CompGhostTables
     std::vector<int> tnbr;
     std::vector<Real> tw;
     std::vector<Real> gscale;// velocity extrapolation factor dw/ds per ghost
+    // Wall distance of each ghost centre (-sdf): the RANS omega image needs
+    // the sample's wall distance d_s = dw / a (dns/rans.hpp, applyTurb).
+    std::vector<Real> gdw;
     std::vector<Real> uwall; // wall velocity per ghost, xyz; empty = at rest
     // Per ghost, a_wall . (x_sample - x_ghost): the pressure image's increment
     // per unit sample density, p_ghost = p_sample + rho_sample * aspan. Present
@@ -176,6 +179,29 @@ public:
     // DeviceComp::setStageHook.
     void apply(DeviceCompState& s);
 
+    // --- RANS (immersed ghost wall; masterplan_flowrans 4.9) ---------------
+    // The turbulence scalars of the ghosts, after apply() (they carry the
+    // ghost density apply() wrote), through the SAME linear image the
+    // velocity uses: nu~_g = -a sum w nu~_s, k_g = -a sum w k_s (specific
+    // values), omega_g = (1 + a) omega_w - a sum w omega_s with omega_w =
+    // 60 nu_w / (beta1 d_s^2), d_s = dw / a the sample's wall distance and nu_w
+    // from the thermo sample -- an UNVERIFIED choice for a sub-cell wall,
+    // labelled and measured on the immersed channel. Deep cells: nu~ = k = 0,
+    // omega = omega_inf. A compensated state gets the low words of every ghost
+    // and deep cell (all fields) zeroed. Pre: s.nT == ransScalars(model).
+    void applyTurb(DeviceCompState& s, RansModel model, const Transport& tr,
+                   double omegaInf) const;
+    // mu_t / F1 images for the mutHook: mu_t_g = -a sum w mu_t_s (the wall
+    // face average ~ 0, never computed from ghost scalars), F1_g = sum w F1_s;
+    // deep cells mu_t = 0, F1 = 1. f1 may be null (SA).
+    void mirrorMut(Real* nut, Real* f1) const;
+    // The first-cell y+ the immersed wall resolves, per interface face from
+    // its FLUID cell c: y+ = sqrt(|u_c| d_c / nu_c), the linear-sublayer
+    // estimate (u_tau^2 = nu |u_c| / d_c) -- an estimate on a staircase wall,
+    // reported as one. max and mean over the faces. Pre: solver.rans().
+    struct YPlus { double max, mean; };
+    YPlus wallYplus(DeviceComp& solver, const DeviceCompState& s);
+
     // Surface tallies, all in solver units and all with the same orientation:
     // the flux carried from the FLUID into the BODY across the fluid/ghost
     // interface. fx/fy/fz are forces; heat is an energy RATE, so heat > 0 means
@@ -210,6 +236,10 @@ public:
     // Momentum flux, wall heat and moment fluid -> body through the interface
     // (calls solver.primitives(s); state must be ghost-filled, i.e. after
     // apply). `pivot` is the world point the moment is taken about.
+    // Under RANS (solver.rans()) the viscous part carries the face mu_t with
+    // the solver's eddy conductivity, through the curvilinear flux the solver
+    // itself uses, so drag is the budget of the solved equations; without
+    // RANS, today's tally bit for bit.
     Force force(DeviceComp& solver, const DeviceCompState& s,
                 const std::array<double, 3>& pivot = {});
 
@@ -248,6 +278,7 @@ private:
     DeviceBuffer<int> tnbr_;     // 8 thermo (rho, p) source cells per ghost
     DeviceBuffer<Real> tw_;      // and their weights
     DeviceBuffer<Real> gscale_;  // velocity extrapolation factor dw/ds
+    DeviceBuffer<Real> gdw_;     // ghost wall distance (RANS omega image)
     // Wall velocity at each ghost's own wall point, xyz interleaved; empty on a
     // resting wall, which is what selects the untouched arithmetic in kGhostFill.
     DeviceBuffer<Real> uwall_;

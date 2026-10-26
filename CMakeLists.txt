@@ -50,12 +50,14 @@ add_library(dns_core
     src/dns/comp.cpp
     src/dns/curvmesh.cpp
     src/dns/interrupt.cpp
+    src/dns/meshio.cpp
     src/dns/meshsdf.cpp
     src/dns/ogrid.cpp
     src/dns/poisson.cpp
     src/dns/prop/spec.cpp
     src/dns/pseudo_time.cpp
     src/dns/rans_channel1d.cpp
+    src/dns/rans_label.cpp
     src/dns/rotor.cpp
     src/dns/scene.cpp
     src/dns/shmframes.cpp
@@ -105,6 +107,8 @@ target_link_libraries(dns PRIVATE dns_core dns_prop)
 
 # The one GPU source list, shared by both backends.
 set(DNS_GPU_SOURCES
+    src/dns/gpu/axis_bc.hip
+    src/dns/gpu/nk.hip
     src/dns/gpu/bodyforce.hip
     src/dns/gpu/boussinesq.hip
     src/dns/gpu/comp.hip
@@ -374,7 +378,7 @@ if(BUILD_TESTING)
     set(DNS_TESTS cli geometry output poisson projection tgv tgv3d cutcell cutcell_sphere comp comp_curv meshsdf
         fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport
         rotor focal cli_defaults comp_axis_permute rans rans_channel1d
-        steady_stop blockband channel_line pseudo_time)
+        steady_stop blockband channel_line pseudo_time flow_rans_config)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)
     endif()
@@ -427,7 +431,9 @@ if(BUILD_TESTING)
                   gpu_acoustics gpu_comp_sink
                   gpu_les_smag gpu_derived
                   gpu_poisson_wally gpu_rotor_wall gpu_rotor_table gpu_mrf
-                  gpu_channel gpu_cutflux gpu_ogrid gpu_rans
+                  gpu_channel gpu_cutflux gpu_ogrid gpu_rans gpu_rans_mask
+                  gpu_rans_ogrid gpu_rans_mms gpu_axisym gpu_nk
+                  gpu_rans_immersed
                   index_offsets_wrap stats_cadence
                   gpu_tally_couette_torque gpu_tally_conduction
                   gpu_tally_archimedes gpu_tally_kutta_joukowski
@@ -451,7 +457,10 @@ if(BUILD_TESTING)
             gpu_comp_ghost_couette_exact gpu_rotor_comoving_fixed_point
             gpu_comp_scale_invariance gpu_ghost_translate gpu_comp_axis_permute
             gpu_comp_curv_axis_permute comp_time_order gpu_comp_viscous_modes
+            gpu_rans_mask gpu_rans_ogrid gpu_rans_mms gpu_axisym
+            gpu_rans_immersed
             PROPERTIES TIMEOUT 60)
+        set_tests_properties(gpu_nk PROPERTIES TIMEOUT 120)
         # ~65 s alone (two 2.2e5-iteration marches onto the oracle); 273 s was
         # measured under ctest -j4 GPU contention, so give it headroom.
         set_tests_properties(gpu_rans PROPERTIES TIMEOUT 600)

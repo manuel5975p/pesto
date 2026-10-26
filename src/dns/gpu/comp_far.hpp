@@ -24,13 +24,24 @@ public:
         // Closed-y walls become adiabatic NO-SLIP mirrors (all momentum
         // antimirrored) instead of free-slip; ignored when openY.
         bool noslipY = false;
+        // RANS: the specific freestream scalars the sponge relaxes toward
+        // (read only when the state carries scalars).
+        double phiInf[2] = {0.0, 0.0};
     };
 
     // Periodic grid; 1 <= ns < nx/2, ny/nz >= 3 on walled axes.
     static std::expected<DeviceCompFar, hipError_t> make(const Grid& g, Config c);
 
-    // Sponge + walls toward the current freestream; call per RK stage.
+    // Sponge + walls toward the current freestream; call per RK stage. A
+    // state with RANS scalars (s.nT > 0) also gets them relaxed to rho phi_inf
+    // with the same strength and copied EVEN onto the mirror rows; a
+    // compensated one gets the low words of every cell written here zeroed.
+    // Neither exists without RANS, so that path is today's bit for bit.
     void apply(DeviceCompState& s) const;
+
+    // mu_t and F1 EVEN onto the mirror rows (the RANS mutHook's far part);
+    // f1 may be null. Nothing on an open axis.
+    void applyMut(Real* nut, Real* f1) const;
 
     // Exact Galilean x-boost of the whole state by du (silent by construction);
     // quiet start = repeated small boosts paired with setFreestream(u + du).

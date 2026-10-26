@@ -92,6 +92,9 @@ int main()
                         "--ft 0.03");
     twice("ogrid", "flow --physics compressible --body cylinder --ogrid "
                    "--n 128 --ny 66 --ogrid-far 5 --ramp 0 --ft 0.003");
+    twice("ogrid_sa", "flow --physics compressible --body cylinder --ogrid "
+                      "--n 128 --ny 66 --ogrid-far 5 --ramp 0 --ft 0.003 "
+                      "--rans sa-neg");
     twice("channel", "channel --n 32 --ny 32 --nz 32 --re-tau 180 --tt 0.02 "
                      "--profile-dt 0");
     twice("conv", "conv --n 64 --ny 34 --rayleigh 5e4 --tt 0.5 "

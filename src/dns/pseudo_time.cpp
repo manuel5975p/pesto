@@ -28,15 +28,15 @@ void PseudoTime::accepted(double alpha)
 {
     assert(alpha > 0.0 && alpha <= 1.0);
     const bool undamped = alpha == 1.0;
-    armed_ = undamped && cfl_ == kImplicitCflMax;
-    if (undamped) cfl_ = std::min(kImplicitCflMax, cfl_ * kImplicitCflGrowth);
+    armed_ = undamped && cfl_ == p_.cflMax;
+    if (undamped) cfl_ = std::min(p_.cflMax, cfl_ * p_.growth);
 }
 
 bool PseudoTime::rejected()
 {
     armed_ = false;
-    cfl_ *= kImplicitRejectFactor;
-    return cfl_ >= kImplicitCflMin;
+    cfl_ *= p_.rejectFactor;
+    return cfl_ >= p_.cflMin;
 }
 
 double stepLength(std::span<const double> q, std::span<const double> dq,

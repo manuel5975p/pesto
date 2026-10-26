@@ -25,6 +25,11 @@ public:
     // Signed distance to the mesh surface, < 0 inside the solid.
     double operator()(double x, double y, double z) const;
 
+    // UNSIGNED distance to the closest triangle: no orientation, no sign
+    // test, so an open surface (a wedge's wall strip) is fine. The minimum
+    // is order-independent, so the BVH order changes no bit.
+    double distance(double x, double y, double z) const;
+
     // Generalized winding number: ~1 inside, ~0 outside for a closed mesh.
     double winding(double x, double y, double z) const;
 

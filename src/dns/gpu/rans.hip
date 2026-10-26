@@ -6,6 +6,8 @@
 #include "dns/rans.hpp"
 #include "dns/sgs.hpp"
 
+#include <cassert>
+
 namespace dns::gpu::rans {
 
 namespace {
@@ -39,6 +41,29 @@ __global__ void kMutMirrorY(GpuGrid g, int lo, int hi, Real* nut, Real* f1)
 
 __device__ inline Real massFlux(PrimView q, const Real Sv[3], std::size_t a,
                                 std::size_t b, const Real* wf, Real wS);
+
+// The open-face scalar flux of the immersed path (ScalarBoundary), along +axis
+// through the face area vector Sv of boundary cell c: mdot = rho_c (u_c . S)
+// from the cell alone, carrying phi_c out and phi_inf in, no diffusion. `hi`:
+// the face is the cell's +axis domain face (else its -axis one).
+__device__ inline Real openFaceFlux(PrimView q, const Real Sv[3], std::size_t c,
+                                    Real phiC, Real phiInf, bool hi)
+{
+    const Real mdot =
+        q.rho[c] * (q.u[c] * Sv[0] + q.v[c] * Sv[1] + q.w[c] * Sv[2]);
+    const bool out = hi ? mdot > Real(0) : mdot < Real(0);
+    return mdot * (out ? phiC : phiInf);
+}
+
+// Is the +axis (hi) / -axis (lo) face of cell (i, j, k) an open domain face?
+__device__ inline void openFaces(const GpuGrid& g, const ScalarBoundary& sb,
+                                 int i, int j, int k, int a, bool& hi, bool& lo)
+{
+    const int ijk[3] = {i, j, k};
+    const int nn[3] = {g.nx, g.ny, g.nz};
+    hi = sb.open[a] && ijk[a] == nn[a] - 1;
+    lo = sb.open[a] && ijk[a] == 0;
+}
 
 // The rate the SST production and mu_t use: S = sqrt(2 S:S) (2003m) or the
 // vorticity magnitude Omega (Vm), from the cell-centre velocity gradient.
@@ -110,11 +135,16 @@ __device__ inline Real sstFaceFlux(ViscView vv, PrimView q, const CurvView& m,
     return F - (muf + sig * mutf) * gS;
 }
 
-// Comp: the compensated write (gpu/internal/stage_write.hpp).
-template <bool Comp>
+// Comp: the compensated write (gpu/internal/stage_write.hpp). Src: the TEST
+// ONLY sources are live (a compile-time switch, so the production
+// instantiation is the source-free code verbatim).
+// Bnd: the open domain faces of the immersed path are live (ScalarBoundary;
+// compile-time, so the instantiation without them is the stage verbatim).
+template <bool Comp, bool Src, bool Bnd>
 __global__ void kSstStageCurv(GpuGrid g, ViscView vv, PrimView q, CurvView m,
                               MrfView mz, StageCombine cmb, SstStageArgs A,
-                              int residual, Real* out0, Real* out1)
+                              int residual, Real* out0, Real* out1,
+                              ScalarBoundary sb)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
@@ -140,10 +170,24 @@ __global__ void kSstStageCurv(GpuGrid g, ViscView vv, PrimView q, CurvView m,
                 pwlo = wlo;
             }
         }
+        bool openHi = false, openLo = false;
+        if constexpr (Bnd) openFaces(g, sb, i, j, k, a, openHi, openLo);
         for (int side = 0; side < 2; ++side) {
             const std::size_t fa = side ? c + o.m[a] : c;
             const std::size_t fb = side ? c : c + o.p[a];
             const Real Sv[3] = {m.S[a][0][fa], m.S[a][1][fa], m.S[a][2][fa]};
+            if constexpr (Bnd) {
+                if (side ? openLo : openHi) {
+                    const Real r = q.rho[c];
+                    const Real fk = openFaceFlux(q, Sv, c, A.t0[c] / r,
+                                                 Real(sb.phiInf[0]), !side);
+                    const Real fw = openFaceFlux(q, Sv, c, A.t1[c] / r,
+                                                 Real(sb.phiInf[1]), !side);
+                    divK -= side ? -fk : fk;
+                    divW -= side ? -fw : fw;
+                    continue;
+                }
+            }
             const Real mdot = massFlux(q, Sv, fa, fb, side ? pwlo : pwhi,
                                        side ? qlo : qhi);
             const Real F1f = Real(0.5) * (A.f1[fa] + A.f1[fb]);
@@ -162,7 +206,11 @@ __global__ void kSstStageCurv(GpuGrid g, ViscView vv, PrimView q, CurvView m,
     const Real r = q.rho[c];
     const SstPoint<Real> P = sstSource(A.model, r, A.t0[c] / r, A.t1[c] / r, Rk,
                                        A.nut[c], A.f1[c], gkw);
-    const Real rk = divK * iv + P.Rk, rw = divW * iv + P.Rw;
+    Real rk = divK * iv + P.Rk, rw = divW * iv + P.Rw;
+    if constexpr (Src) {
+        rk += A.src0[c];
+        rw += A.src1[c];
+    }
     if (residual) {
         out0[c] = rk;
         out1[c] = rw;
@@ -182,9 +230,9 @@ __global__ void kSstStageCurv(GpuGrid g, ViscView vv, PrimView q, CurvView m,
         ow = {pointImplicit(cw, cr, rw, P.Jw, A.t1[c]), Real(0)};
     }
     // The COUNTED positivity guard (docs/rans.md): never silent -- every
-    // pinned test requires zero hits. Ghost rows are the wall's to overwrite.
-    // On the pair it tests hi: a renormalised hi of 0 has lo == 0.
-    const bool counted = !((j == 0 && A.skipLo) || (j == g.ny - 1 && A.skipHi));
+    // pinned test requires zero hits. Ghost cells are their mesh family's to
+    // overwrite. On the pair it tests hi: a renormalised hi of 0 has lo == 0.
+    const bool counted = !A.counted || A.counted[c];
     const Real wmin = A.omegaFloor * A.outRho[c];
     if (!(ok.hi >= Real(0))) {
         ok = {Real(0), Real(0)};
@@ -243,11 +291,13 @@ __device__ inline Real saFaceFlux(ViscView vv, PrimView q, const CurvView& m,
     return F - Real(1.0 / sa::sigma) * rf * saDiffCoef(nuf, ntf) * gS;
 }
 
-template <bool Comp>
+// Src: the TEST ONLY source is live; Bnd: the open domain faces (both
+// compile-time, as in kSstStageCurv).
+template <bool Comp, bool Src, bool Bnd>
 __global__ void kSaStageCurv(GpuGrid g, ViscView vv, PrimView q, CurvView m,
                              MrfView mz, StageCombine cmb, const Real* t0,
                              const Real* d, int residual, int transportOnly,
-                             Real* out0)
+                             const Real* src, Real* out0, ScalarBoundary sb)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
@@ -273,11 +323,28 @@ __global__ void kSaStageCurv(GpuGrid g, ViscView vv, PrimView q, CurvView m,
                 pwlo = wlo;
             }
         }
-        const Real hi = saFaceFlux(vv, q, m, o, c, c + o.p[a], a, t0, pwhi,
-                                   qhi, transportOnly);
-        const Real lo = saFaceFlux(vv, q, m, o, c + o.m[a], c, a, t0, pwlo,
-                                   qlo, transportOnly);
-        div -= hi - lo;
+        if constexpr (Bnd) {
+            bool openHi = false, openLo = false;
+            openFaces(g, sb, i, j, k, a, openHi, openLo);
+            const Real phiC = t0[c] / q.rho[c], phiI = Real(sb.phiInf[0]);
+            Real Sv[3];
+            const std::size_t fl = c + o.m[a];
+            for (int x = 0; x < 3; ++x) Sv[x] = m.S[a][x][c];
+            const Real hi = openHi ? openFaceFlux(q, Sv, c, phiC, phiI, true)
+                                   : saFaceFlux(vv, q, m, o, c, c + o.p[a], a,
+                                                t0, pwhi, qhi, transportOnly);
+            for (int x = 0; x < 3; ++x) Sv[x] = m.S[a][x][fl];
+            const Real lo = openLo ? openFaceFlux(q, Sv, c, phiC, phiI, false)
+                                   : saFaceFlux(vv, q, m, o, fl, c, a, t0,
+                                                pwlo, qlo, transportOnly);
+            div -= hi - lo;
+        } else {
+            const Real hi = saFaceFlux(vv, q, m, o, c, c + o.p[a], a, t0, pwhi,
+                                       qhi, transportOnly);
+            const Real lo = saFaceFlux(vv, q, m, o, c + o.m[a], c, a, t0, pwlo,
+                                       qlo, transportOnly);
+            div -= hi - lo;
+        }
     }
     Real rhs = div * m.invVol[c];
     Real J = 0;
@@ -309,6 +376,7 @@ __global__ void kSaStageCurv(GpuGrid g, ViscView vv, PrimView q, CurvView m,
                Real(1.0 / sa::sigma) * saDiffCoef(nu, ntc) * rg;
         J = P.J;
     }
+    if constexpr (Src) rhs += src[c];
     if (residual) {
         out0[c] = rhs;
         return;
@@ -352,22 +420,47 @@ void sstMutCurv(const GpuGrid& g, ViscView vv, PrimView q, CurvView m,
 
 void sstStageCurv(const GpuGrid& g, ViscView vv, PrimView q, CurvView m,
                   MrfView mz, const StageCombine& cmb, const SstStageArgs& a,
-                  bool residual, Real* out0, Real* out1)
+                  bool residual, Real* out0, Real* out1,
+                  const ScalarBoundary& sb)
 {
+    assert(!(sb.any() && a.src0)); // test sources and open faces never meet
     internal::withCompensation(cmb, [&](auto comp) {
-        kSstStageCurv<decltype(comp)::value><<<launchBlocks(g.size()), blockSize>>>(
-            g, vv, q, m, mz, cmb, a, int(residual), out0, out1);
+        constexpr bool C = decltype(comp)::value;
+        const unsigned nb = launchBlocks(g.size());
+        if (sb.any())
+            kSstStageCurv<C, false, true><<<nb, blockSize>>>(
+                g, vv, q, m, mz, cmb, a, int(residual), out0, out1, sb);
+        else if (a.src0)
+            kSstStageCurv<C, true, false><<<nb, blockSize>>>(
+                g, vv, q, m, mz, cmb, a, int(residual), out0, out1, sb);
+        else
+            kSstStageCurv<C, false, false><<<nb, blockSize>>>(
+                g, vv, q, m, mz, cmb, a, int(residual), out0, out1, sb);
     });
     checkLastKernel("kSstStageCurv");
 }
 
 void saStageCurv(const GpuGrid& g, ViscView vv, PrimView q, CurvView m,
                  MrfView mz, const StageCombine& cmb, const Real* t0,
-                 const Real* d, bool residual, bool transportOnly, Real* out0)
+                 const Real* d, bool residual, bool transportOnly,
+                 const Real* src, Real* out0, const ScalarBoundary& sb)
 {
+    assert(!(sb.any() && src)); // test sources and open faces never meet
     internal::withCompensation(cmb, [&](auto comp) {
-        kSaStageCurv<decltype(comp)::value><<<launchBlocks(g.size()), blockSize>>>(
-            g, vv, q, m, mz, cmb, t0, d, int(residual), int(transportOnly), out0);
+        constexpr bool C = decltype(comp)::value;
+        const unsigned nb = launchBlocks(g.size());
+        if (sb.any())
+            kSaStageCurv<C, false, true><<<nb, blockSize>>>(
+                g, vv, q, m, mz, cmb, t0, d, int(residual), int(transportOnly),
+                src, out0, sb);
+        else if (src)
+            kSaStageCurv<C, true, false><<<nb, blockSize>>>(
+                g, vv, q, m, mz, cmb, t0, d, int(residual), int(transportOnly),
+                src, out0, sb);
+        else
+            kSaStageCurv<C, false, false><<<nb, blockSize>>>(
+                g, vv, q, m, mz, cmb, t0, d, int(residual), int(transportOnly),
+                src, out0, sb);
     });
     checkLastKernel("kSaStageCurv");
 }

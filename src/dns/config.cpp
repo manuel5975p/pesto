@@ -4,6 +4,7 @@
 #include "dns/ogrid.hpp"
 
 #include "dns/pseudo_time.hpp"
+#include "dns/rans_label.hpp"
 #include "dns/remap.hpp"
 #include "dns/scene.hpp"
 #include "dns/steady_stop.hpp"
@@ -1002,7 +1003,9 @@ std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
     const int nzI = r.given.contains("--nz") ? r.nz : (body3d ? r.n : 1);
     if (auto e = checkNz(nzI, "must be >= 1 (interior cells; 1 = native 2D)"); e)
         return e;
-    if (body3d && nzI == 1)
+    // The revolved O-grid reads --nz 1 as its axisymmetric wedge.
+    const bool revolved = r.ogrid && c.bodyKind == BodyKind::Sphere;
+    if (body3d && nzI == 1 && !revolved)
         return err(2, "--nz", std::string("--body ") + name(c.bodyKind)
                    + " is a 3D body; --nz 1 leaves it with no solid cells");
     if (!finitePos(r.dr)) return err(2, "--dr", "must be finite and > 0");
@@ -1022,15 +1025,6 @@ std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
                                      "only (the curvilinear path is)");
         if (c.bodyKind == BodyKind::None)
             return err(2, "--ogrid", "wraps a body; there is none");
-        // A 3D O-grid around a closed surface has polar singularities (cells
-        // collapse on the axis, det -> 0), which is a different mesh topology,
-        // not a parameter. Only bodies with a z-invariant cross-section wrap.
-        if (c.bodyKind == BodyKind::Sphere)
-            return err(2, "--ogrid", "a sphere needs a 3D O-grid, whose polar "
-                                     "axis is a mesh singularity (collapsed "
-                                     "cells, det = 0). Bodies with a "
-                                     "z-invariant cross-section only: cylinder, "
-                                     "lens, cube, or a z-invariant mesh");
         if (c.bodyKind == BodyKind::Fence || c.bodyKind == BodyKind::Floor)
             return err(2, "--ogrid", "wall-mounted bodies are not star-shaped "
                                      "about a centre and have no annulus "
@@ -1059,10 +1053,37 @@ std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
         c.ogrid = true;
         c.ogridRFar = r.ogridFar * D;
         c.ogridBeta = r.ogridBeta;
-        // Spanwise extent: pi D, the usual cylinder-DNS span. nz == 1 keeps
-        // the unit depth the 2D convention requires.
-        c.ogridSpan = nzI > 1 ? pi * D : 1.0;
-        c.grid = ogridGrid(r.n, ny, nzI, 0.5 * D, c.ogridRFar, c.ogridSpan);
+        if (!revolved && r.given.contains("--ogrid-wedge"))
+            return err(2, "--ogrid-wedge", "is the revolved (--body sphere) "
+                                           "O-grid's axisymmetric wedge angle");
+        if (revolved)
+        {
+            // A body of revolution: the O-grid revolved about x. Axisymmetry
+            // is a mesh plus a ghost hook (dns/ogrid.hpp, gpu/axis_bc.hpp).
+            if (nzI > 1)
+                return err(2, "--nz", "the full-revolution sphere O-grid is "
+                                      "not built yet (P4); --nz 1 is the "
+                                      "axisymmetric wedge");
+            if (!(std::isfinite(r.ogridWedge) && r.ogridWedge > 0 &&
+                  r.ogridWedge <= 10))
+                return err(2, "--ogrid-wedge", "the wedge angle in degrees, "
+                                               "in (0, 10]");
+            c.ogridRevolved = true;
+            c.ogridWedgeDeg = r.ogridWedge;
+            c.ogridSpan = 1.0;
+            c.grid = ogridRevolvedGrid(
+                r.n, ny,
+                RevolvedSpec{.wedge = true, .dphi = r.ogridWedge * pi / 180.0},
+                0.5 * D, c.ogridRFar);
+            c.nzInterior = 1;
+        }
+        else
+        {
+            // Spanwise extent: pi D, the usual cylinder-DNS span. nz == 1
+            // keeps the unit depth the 2D convention requires.
+            c.ogridSpan = nzI > 1 ? pi * D : 1.0;
+            c.grid = ogridGrid(r.n, ny, nzI, 0.5 * D, c.ogridRFar, c.ogridSpan);
+        }
         c.ogridH1 = ogridNominalH1(ny, 0.5 * D, c.ogridRFar, c.ogridBeta);
         if (auto e = checkCells(c.grid.size()); e) return e;
         c.L = 2.0 * c.ogridRFar;
@@ -1070,6 +1091,9 @@ std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
         // The body sits at the origin: the mesh is built about its centre.
         c.placement = {0.0, 0.0, 0.0, D};
     }
+    else if (r.given.contains("--ogrid-wedge"))
+        return err(2, "--ogrid-wedge", "is the revolved (--body sphere) "
+                                       "O-grid's axisymmetric wedge angle");
     else if (comp)
     {
         // D = pi/4 fixed, h scales with ny AND --dr: box = dr*D in y
@@ -1124,7 +1148,9 @@ std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
         c.placement = {cx, cy, cz, D};
     }
 
-    if (c.placement.D < 4 * c.h)
+    // (The revolved O-grid's resolution is its meridional --n >= 16, and its
+    // nominal radial hy measures nothing about D.)
+    if (!c.ogridRevolved && c.placement.D < 4 * c.h)
         return err(2, "--dr", "body diameter is under 4 cells; refine --n or lower "
                               "--dr");
     // The fence is D/8 thick; below 32 cells of D the blocker itself is under
@@ -2107,22 +2133,23 @@ std::optional<ConfigError> flowGeometry(const RawConfig& r, Case& c)
 std::optional<ConfigError> flowOutput(const RawConfig& r, Case& c)
 {
     const bool comp = c.physics == Physics::Compressible;
+    // A compressible --steady run marches in PSEUDO-time: it has no run
+    // length (flowRans rejects --ft there) and stops on its integrals.
+    c.compSteady = comp && r.steady > 0;
     // Run length + output cadences.
     c.ft = r.ft;
-    if (!finitePos(c.ft)) return err(2, "--ft", "must be finite and > 0");
+    if (!c.compSteady && !finitePos(c.ft))
+        return err(2, "--ft", "must be finite and > 0");
     // One flow-through is L/uInf in both physics (c.L already carries each
     // physics' own box convention). Formerly a `comp ? X : X` ternary.
-    c.tEnd = c.ft * c.L / c.uInf;
+    c.tEnd = c.compSteady ? 0.0 : c.ft * c.L / c.uInf;
 
-    // Stationary mode. tEnd stops being the run length and becomes the
-    // give-up cap: not converging by then is exit 8, never a silent answer.
+    // Stationary mode. Incompressible: tEnd stops being the run length and
+    // becomes the give-up cap -- not converging by then is exit 8, never a
+    // silent answer. Compressible: the pseudo-time march (flowRans).
     c.steadyTol = r.steady;
     if (c.steadyTol < 0 || !std::isfinite(c.steadyTol))
         return err(2, "--steady", "must be finite and >= 0 (0 = time-march)");
-    if (c.steadyTol > 0 && comp)
-        return err(2, "--steady",
-                   "is incompressible-only; the compressible loop has acoustic "
-                   "transients that a velocity residual cannot certify");
     if (c.steadyTol > 0 && c.cs > 0)
         return err(2, "--steady",
                    "with --les is meaningless: a filtered field has no "
@@ -2167,7 +2194,11 @@ std::optional<ConfigError> flowOutput(const RawConfig& r, Case& c)
                                        "signed z-vorticity; the flag selects "
                                        "it for 3D compressible runs");
 
-    if (auto e = resolveEmit(c, {Emit::Stats, Emit::Bin}); e)
+    // Pseudo-time has no frame clock: a compressible steady run defaults to
+    // the stats alone (flowRans rejects time-keyed kinds that are asked for).
+    if (auto e = c.compSteady ? resolveEmit(c, {Emit::Stats})
+                              : resolveEmit(c, {Emit::Stats, Emit::Bin});
+        e)
         return e;
     // PNG at nz > 1 renders the centre z-plane (same machinery the channel
     // already uses); the old flow-only nz == 1 restriction was conservative,
@@ -2199,6 +2230,224 @@ std::optional<ConfigError> flowOutput(const RawConfig& r, Case& c)
     return std::nullopt;
 }
 
+// The freestream turbulence as the describe line and RunMeta print it: the
+// flags as given, and omega in U/D. Pre: c.rans != None, ransPhiInf resolved.
+std::string ransInflowText(const Case& c)
+{
+    if (!ransSst(c.rans))
+        return std::format("nu~inf/nu = {:g} (TMR)", c.ransNutInf);
+    const double tu = std::sqrt(2.0 * c.ransKInf / 3.0);
+    return std::format("k = {:.3g} U^2 (Tu {:.3g}%), mu_t/mu = {:g} -> "
+                       "omega = {:.3g} U/D",
+                       c.ransKInf, 100.0 * tu, c.ransMutInf,
+                       c.ransPhiInf[1] * c.placement.D / c.uInf);
+}
+
+// The first-cell wall distance the y+ estimate uses: the O-grid's h1, or half
+// the fine spacing of an immersed mesh (the mean centre offset of a
+// staircase wall).
+double ransFirstCellDistance(const Case& c)
+{
+    return c.ogrid ? c.ogridH1 : 0.5 * hFine(c);
+}
+
+// The first-cell y+ estimate the validator can quote without a run: the
+// bluff-body PEAK friction velocity u_tau ~ 0.38 Re^-0.1 U, calibrated on the
+// MEASURED 0.137 U of the OpenFOAM sphere at Re 1e4 (masterplan_flowrans
+// section 3.6). Pre: h1, D, re > 0.
+double ransYplusEstimate(double h1, double D, double re)
+{
+    return h1 / D * re * 0.38 * std::pow(re, -0.1);
+}
+
+// Stage: RANS and the compressible steady march (docs/rans.md, "dns flow").
+// LAST, so every geometry/physics error wins first; every rule rejects by
+// name, never ignores. RANS off and no compressible --steady leave the case
+// exactly as the earlier stages built it.
+std::optional<ConfigError> flowRans(const RawConfig& r, Case& c)
+{
+    const bool comp = c.physics == Physics::Compressible;
+    c.rans = RansModel(r.rans);
+    const bool rans = c.rans != RansModel::None;
+    const bool sa = c.rans == RansModel::SaNeg, sst = ransSst(c.rans);
+    if (c.ogridRevolved && c.cs > 0)
+        return err(2, "--les", "an axisymmetric wedge has no resolved 3D "
+                               "turbulence to filter");
+    if (r.given.contains("--rans-nutinf") && !sa)
+        return err(2, "--rans-nutinf", "is the SA freestream nu~/nu; it needs "
+                                       "--rans sa-neg");
+    if (auto e = rejectGiven(r, {"--rans-kinf", "--rans-mutinf"},
+                             "is an SST freestream value; it needs --rans "
+                             "sst-2003m|sst-vm");
+        e && !sst)
+        return e;
+    if (c.emit.contains(Emit::Surface) && !c.ogrid)
+        return err(2, "--emit", "surface is the body-fitted wall tally, per "
+                                "mesh face; it needs --ogrid");
+    if (c.emit.contains(Emit::Mesh) && !c.ogrid)
+        return err(2, "--emit", "mesh exports the body-fitted O-grid; it "
+                                "needs --ogrid");
+    if (rans)
+    {
+        if (!comp)
+            return err(2, "--rans", "there is no RANS on the incompressible "
+                                    "projection solver; add --physics "
+                                    "compressible");
+        if (c.cs > 0 || r.given.contains("--sgs"))
+            return err(2, "--rans", "and --les/--sgs would put two eddy "
+                                    "viscosities in one slot; drop --les/--sgs");
+        if (c.rotor.active())
+            return err(2, "--rans", "with a rotor is not built: moving geometry "
+                                    "changes d per azimuth bin, and MRF + RANS "
+                                    "needs a rotation-correction decision");
+        if (c.bodyKind == BodyKind::Scene)
+            return err(2, "--rans", "with --scene is not built: the scene model "
+                                    "block is dns|les");
+        if (c.penalize > 0)
+            return err(2, "--rans", "with --penalize: the Brinkman band is a "
+                                    "state edit the closure has no image for");
+        if (c.farPot)
+            return err(2, "--rans", "with --pot: the potential correction is an "
+                                    "unmeasured wake source under RANS");
+        if (r.seq > 1)
+            return err(2, "--rans", "with --seq: grid sequencing is the "
+                                    "incompressible steady solve's");
+        if (c.noslipY || c.bodyKind == BodyKind::None ||
+            c.bodyKind == BodyKind::Floor || c.bodyKind == BodyKind::Fence)
+            return err(2, "--rans", "needs a body (immersed, or wrapped by "
+                                    "--ogrid); box walls (--noslip, --body "
+                                    "none|floor|fence) need the ghost-row "
+                                    "adapter, which is not built");
+    }
+    c.compSteady = comp && c.steadyTol > 0;
+    if (!c.compSteady)
+    {
+        // Both knobs belong to the compressible pseudo-time march only.
+        const char* why = comp ? "requires --steady TOL (the compressible "
+                                 "pseudo-time march)"
+                               : "is compressible steady only (the "
+                                 "incompressible --steady has its own stop)";
+        if (auto e = rejectGiven(r, {"--steady-steps", "--steady-scheme"}, why);
+            e)
+            return e;
+    }
+    else
+    {
+        if (!c.ogrid && !rans)
+            return err(2, "--steady", "a compressible DNS has no steady pseudo-"
+                                      "time solve on an immersed body; add "
+                                      "--rans or use --ogrid");
+        // A relative change: >= 1 certifies nothing, and below kSteadyTolMin
+        // the FP32 integrals' sampling noise decides (docs/rans.md).
+        if (!(c.steadyTol >= kSteadyTolMin && c.steadyTol < 1))
+            return err(2, "--steady",
+                       std::format("is a relative change of the integrals: "
+                                   "must be in [{:g}, 1)",
+                                   kSteadyTolMin));
+        if (auto e = rejectGiven(r, {"--ramp", "--kick", "--ft", "--seq"},
+                                 "with --steady: pseudo-time is not time; "
+                                 "--steady-steps is the cap");
+            e)
+            return e;
+        for (const Emit k : {Emit::Png, Emit::Web, Emit::Bin, Emit::Shm,
+                             Emit::Volume, Emit::Slices, Emit::Vtk})
+            if (c.emit.contains(k))
+                return err(2, "--emit", "frames with --steady: pseudo-time is "
+                                        "not time; frames are time-keyed");
+        c.ramp = 0;   // the march starts from the uniform freestream
+        c.kick = 0;
+        c.steadySteps = r.steadySteps;
+        if (r.given.contains("--steady-steps") && r.steadySteps < 1)
+            return err(2, "--steady-steps", "must be >= 1");
+        c.steadyScheme = SteadyScheme(r.steadyScheme);
+        if (c.steadyScheme == SteadyScheme::Implicit)
+        {
+            if (auto e = rejectGiven(r, {"--cfl", "--dt-recompute"},
+                                     "with --steady-scheme implicit: explicit-"
+                                     "march knobs; the implicit march ramps "
+                                     "its own pseudo-time step");
+                e)
+                return e;
+            if (!c.ogrid)
+                return err(2, "--steady-scheme",
+                           "implicit (Newton-Krylov) needs --ogrid: the "
+                           "immersed body has no line structure (not built)");
+            if (c.grid.nz > 1 && !c.ogridRevolved)
+                return err(2, "--steady-scheme",
+                           "implicit (Newton-Krylov) on an extruded 3D O-grid "
+                           "is not built yet (P4); use --nz 1 or explicit");
+            // Measured stops are tens of Newton iterations: the explicit
+            // march's 1000000 would let a stalled run spin before exit 8.
+            if (!r.given.contains("--steady-steps"))
+                c.steadySteps = kImplicitSteadySteps;
+        }
+        else if (!r.given.contains("--dt-recompute"))
+        {
+            // localDt every 16 iterations unless asked (the O-grid default).
+            c.dtRecompute = 16;
+        }
+    }
+
+    // Freestream turbulence, in freestream units (decision 4).
+    c.ransNutInf = r.ransNutInf;
+    c.ransKInf = r.ransKInf;
+    c.ransMutInf = r.ransMutInf;
+    if (sa && !finitePos(c.ransNutInf))
+        return err(2, "--rans-nutinf", "must be finite and > 0");
+    if (sst && !finitePos(c.ransKInf))
+        return err(2, "--rans-kinf", "must be finite and > 0");
+    if (sst && !finitePos(c.ransMutInf))
+        return err(2, "--rans-mutinf", "must be finite and > 0");
+    if (sa)
+        c.ransPhiInf[0] = nuTildaInf(c.ransNutInf, c.nu);
+    if (sst)
+    {
+        c.ransPhiInf[0] = kInf(c.ransKInf, c.uInf);
+        c.ransPhiInf[1] = omegaInf(c.ransPhiInf[0], c.ransMutInf, c.nu);
+    }
+
+    if (rans)
+    {
+        if (sa && (c.ransNutInf < 3 || c.ransNutInf > 5))
+            c.warnings.push_back(std::format(
+                "--rans-nutinf {:g} is outside TMR's [3, 5]", c.ransNutInf));
+        if (sst && (c.ransMutInf < 1e-5 || c.ransMutInf > 1e-2))
+            c.warnings.push_back(std::format(
+                "--rans-mutinf {:g} is outside Spalart-Rumsey's [1e-5, 1e-2]",
+                c.ransMutInf));
+        if (c.ogrid && c.grid.nz > 1 && !c.ogridRevolved)
+            c.warnings.emplace_back(
+                "the RANS mean of a z-invariant body is z-invariant; --nz 1 is "
+                "the same answer");
+        const double yp =
+            ransYplusEstimate(ransFirstCellDistance(c), c.placement.D, c.re);
+        if (yp > 1.0)
+            c.warnings.push_back(std::format(
+                "wall-resolved RANS with first-cell y+ ~ {:.3g} > 1 (estimate, "
+                "bluff-body peak u_tau); {}",
+                yp, c.ogrid ? "refine --ny or raise --ogrid-beta"
+                            : "refine --n or cluster with --focal; an "
+                              "under-resolved immersed run is not a "
+                              "code-to-code number"));
+        // The immersed d is |sdf|, exact only where the sdf is a distance.
+        if (!c.ogrid && c.bodyKind == BodyKind::Lens)
+            c.warnings.emplace_back(
+                "--body lens: its sdf is not a true distance, so the wall "
+                "distance d = |sdf| the closure reads is approximate");
+    }
+
+    if (c.ogridRevolved) c.meta.wedgeDeg = c.ogridWedgeDeg;
+    if (!rans && !c.compSteady) return std::nullopt;
+    c.meta.rans = rans ? std::string(ransName(c.rans)) : std::string();
+    c.meta.steady = "";
+    c.meta.ransMode = !c.compSteady ? "urans"
+                      : c.steadyScheme == SteadyScheme::Implicit
+                          ? "steady-implicit-nk"
+                          : "steady-explicit";
+    c.meta.ransInflow = rans ? ransInflowText(c) : std::string();
+    return std::nullopt;
+}
+
 // The `dns flow` validator, as ordered stages over one Case. ORDER IS
 // LOAD-BEARING: the first error wins, so a stage may only move together with
 // every check before it. Each stage reads what the earlier ones resolved.
@@ -2209,7 +2458,7 @@ std::expected<Case, ConfigError> validateFlow(const RawConfig& r, Case c)
         flowBody, flowGrid, flowPhysics, flowThermal,
         flowLes, flowNscbc, flowBands, flowStretch,
         flowFocal, flowRotor, flowWalls, flowStartup,
-        flowSolver, flowGeometry, flowOutput
+        flowSolver, flowGeometry, flowOutput, flowRans
     };
     for (const Stage s : kStages)
         if (auto e = s(r, c); e) return std::unexpected(*e);
@@ -2452,6 +2701,12 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         return bad(2, "--out", "output prefix must not contain quotes, backslashes "
                                "or control characters (it is embedded in JSON)");
 
+    if (c.emit.contains(Emit::Surface) && r.sub != Subcommand::Flow)
+        return bad(2, "--emit", "surface is the body-fitted wall tally of dns "
+                                "flow --ogrid");
+    if (c.emit.contains(Emit::Mesh) && r.sub != Subcommand::Flow)
+        return bad(2, "--emit", "mesh exports the body-fitted O-grid of dns "
+                                "flow --ogrid");
     if (r.n < 1) return bad(2, "--n", "must be >= 1");
     if (!finitePos(r.re)) return bad(2, "--re", "must be finite and > 0");
     c.re = r.re;
@@ -2474,6 +2729,28 @@ double channelPRef(double reTau, double mach)
 {
     const double ub = channelUbEstimate(reTau);
     return (ub / mach) * (ub / mach) / kGammaAir;
+}
+
+std::string flowRunLabel(const Case& c)
+{
+    const bool rans = c.rans != RansModel::None;
+    const std::string geo =
+        c.ogridRevolved ? ransWedgeSuffix(c.ogridWedgeDeg, rans) : std::string();
+    if (rans || c.compSteady)
+    {
+        const RansMode mode =
+            !c.compSteady ? RansMode::Urans
+            : c.steadyScheme == SteadyScheme::Implicit
+                ? RansMode::SteadyImplicitNk
+                : RansMode::SteadyExplicit;
+        const std::string where =
+            rans && !c.ogrid ? std::string(kImmersedSuffix) : geo;
+        std::string l = ransRunLabel(c.rans, mode, 0, where);
+        if (c.ogridRevolved && !c.compSteady) l += kAxisymUnsteady;
+        return l;
+    }
+    if (c.ogridRevolved) return "DNS" + geo + std::string(kAxisymUnsteady);
+    return {};
 }
 
 double hFine(const Case& c)
@@ -2596,18 +2873,15 @@ std::string Case::describe() const
                 : std::format("tt={:.6g} eddy turnovers (tEnd={:.6g})  "
                               "kick={:.3g}  profile-dt={:.3g}",
                               ft, tEnd, kick, profileDt);
-        const char* mode =
-            steadyTol <= 0   ? "URANS (time-accurate)"
-            : implicitSteady ? "steady (implicit Newton pseudo-time: not "
-                               "time-accurate)"
-                             : "steady (local time stepping: pseudo-time, not "
-                               "time-accurate)";
+        const RansMode mode = steadyTol <= 0   ? RansMode::Urans
+                              : implicitSteady ? RansMode::SteadyImplicitLine
+                                               : RansMode::SteadyExplicit;
         const std::string label =
             !ransOn ? std::string("DNS") +
                           (grid.nz == 1
                                ? " (2D: qualitative only, no vortex stretching)"
                                : "")
-                    : std::format("RANS {} -- {}", ransName(rans), mode);
+                    : ransRunLabel(rans, mode);
         const std::string wallScalars =
             ransSst(rans) ? "k_wall = 0 (antimirrored ghost), omega_wall = 60 "
                             "nu/(beta1 d1^2) (TMR; Dirichlet image),\n"
@@ -2674,10 +2948,13 @@ std::string Case::describe() const
         h > 0 ? placement.D / h : 0.0,
         re, nu, mach, cfl, cs,
         lesLabel ? (sgsModel == SgsModel::Sigma ? "LES sigma" : "LES smag")
-                 : "DNS",
+        : rans != RansModel::None ? "RANS"
+                                  : "DNS",
         ft, tEnd, fdt,
-        steadyTol > 0 ? "stationary (stop at steady residual, tEnd = give-up cap)"
-                      : "time-march to tEnd",
+        compSteady      ? "steady pseudo-time (stop on the integrals, "
+                          "--steady-steps cap)"
+        : steadyTol > 0 ? "stationary (stop at steady residual, tEnd = give-up cap)"
+                        : "time-march to tEnd",
         outPrefix);
     // Derived outflow coefficient: printed only when asked for, so a default
     // case's --dry-run reads exactly as it always did. It CHANGES the boundary
@@ -2709,7 +2986,7 @@ std::string Case::describe() const
                            : std::string(),
             nscbcThermalInflow ? "T" : "rho");
     }
-    if (ogrid)
+    if (ogrid && !ogridRevolved)
     {
         s += std::format(
             "  o-grid     BODY-FITTED: {} angular x {} radial (2 ghost rows)"
@@ -2722,6 +2999,70 @@ std::string Case::describe() const
             grid.nx, grid.ny, grid.nz, ogridRFar,
             placement.D > 0 ? ogridRFar / placement.D : 0.0, ogridBeta,
             ogridSpan, ogridH1, ogridBeta);
+    }
+    if (ogridRevolved)
+    {
+        s += std::format(
+            "  o-grid     REVOLVED about x: {} meridional (theta 0..pi, + 2 "
+            "ghost columns past the axis) x {} radial\n"
+            "             (2 ghost rows), axisymmetric WEDGE {:g} deg (1 real "
+            "plane + 2 ghost planes)\n"
+            "             axis faces degenerate (S = 0, limit metric); qRef on "
+            "pi D^2/4\n",
+            grid.nx - 2, grid.ny, ogridWedgeDeg);
+    }
+    // RANS / compressible steady / the wedge: the label and what the closure
+    // resolved (RANS-off Cartesian or z-extruded time marches print none of
+    // these lines).
+    if (const std::string label = flowRunLabel(*this); !label.empty())
+        s += std::format("  label      {}\n", label);
+    if (rans != RansModel::None || compSteady)
+    {
+        if (rans != RansModel::None)
+        {
+            s += std::format("  turbulence {}, Pr_t = {:.3g}\n",
+                             ransInflowText(*this), kPrandtlTurb);
+            if (!ogrid)
+                s += ransSst(rans)
+                         ? "  wall       immersed ghost wall, the velocity's "
+                           "linear image: k_g = -a k_s, omega_g = (1+a)\n"
+                           "             omega_w - a omega_s, omega_w = 60 "
+                           "nu/(beta1 d_s^2) (an UNVERIFIED sub-cell choice), "
+                           "mu_t_g = -a mu_t_s\n"
+                         : "  wall       immersed ghost wall, the velocity's "
+                           "linear image: nu~_g = -a nu~_s, mu_t_g = -a "
+                           "mu_t_s\n";
+            else
+                s += ransSst(rans)
+                         ? "  wall       k_wall = 0 (antimirrored ghost), "
+                           "omega_wall = 60 nu/(beta1 d1^2) per wall face\n"
+                           "             (TMR; Dirichlet image), mu_t = 0 on "
+                           "the wall face\n"
+                         : "  wall       nu~_wall = 0 (antimirrored ghost), "
+                           "mu_t = 0 on the wall face\n";
+            s += std::format(
+                "  y+         first cell ~{:.3g} (estimate: bluff-body peak "
+                "u_tau = 0.38 Re^-0.1 U; the run measures it)\n",
+                ransYplusEstimate(ransFirstCellDistance(*this), placement.D,
+                                  re));
+        }
+        // The ramp's constants, spelled as the help text spells them.
+        static_assert(kNkCfl0 == 10 && kNkCflGrowth == 2 && kNkCflMax == 1e8);
+        s += !compSteady ? std::string()
+             : steadyScheme == SteadyScheme::Implicit
+                 ? std::format("  run        steady TOL={:.6g} cap {} "
+                               "iterations, implicit Newton-Krylov (CFL 10 "
+                               "x2 -> 1e8, GMRES({}) + line-SGS on a "
+                               "first-order Rusanov P)\n",
+                               steadyTol, steadySteps, kNkRestart)
+                 : std::format("  run        steady TOL={:.6g} cap {} "
+                               "iterations, local time stepping cfl={:.3g}, "
+                               "localDt every {}\n",
+                               steadyTol, steadySteps, cfl, dtRecompute);
+        s += compSteady ? std::string()
+                 : std::string("  run        URANS: SSP-RK3 on the global "
+                               "dt (acoustic + per-cell RANS diffusive "
+                               "bound)\n");
     }
     if (stretchBeta > 0)
     {

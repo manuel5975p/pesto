@@ -423,8 +423,100 @@ void validatorNumbers()
           "Re > 800 on the o-grid warns");
 }
 
+// The revolved wedge (buildRevolvedOGrid, masterplan_flowrans section 4.5):
+// degenerate axis faces with their limit metric, positive volumes everywhere
+// (the past-axis placeholder columns take their neighbour's), the wedge's
+// side faces exact z-mirrors, MirrorZ's one node past the top.
+void revolvedWedge()
+{
+    std::printf("--- revolved wedge ---\n");
+    const int nT = 32, ny = 20;
+    const double R = 0.5, rFar = 6.0, dphi = 5.0 * pi / 180.0;
+    const RevolvedSpec rv{.wedge = true, .dphi = dphi};
+    const Grid g = ogridRevolvedGrid(nT, ny, rv, R, rFar);
+    const Sdf sphere = [=](double x, double y, double z) {
+        return std::sqrt(x * x + y * y + z * z) - R;
+    };
+    auto og = buildRevolvedOGrid(g, sphere, {.rFar = rFar, .beta = 2.0}, rv);
+    if (!og) { check(false, "revolved build: " + og.error()); return; }
+    check(g.nx == nT + 2 && g.nz == 3 && og->nTheta == nT && og->revolved,
+          "wedge grid: nx = nTheta + 2, nz = 3");
+    const auto& m = og->mesh;
+    // Nodes on the axis: rho == 0 to the bit.
+    bool onAxis = true;
+    for (int k = 0; k < 3; ++k)
+        for (int j = 0; j < ny; ++j)
+            for (const int i : {1, nT + 1}) {
+                const auto p = m.node(i, j, k);
+                onAxis = onAxis && p[1] == 0.0 && p[2] == 0.0;
+            }
+    check(onAxis, "axis node columns sit at rho == 0 exactly");
+    bool mirror = true;
+    for (int j = 0; j <= ny; ++j)
+        for (int i = 0; i <= g.nx; ++i) {
+            const auto a = m.node(i, j, 0), b = m.node(i, j, 3);
+            const auto c = m.node(i, j, 1), d = m.node(i, j, 2);
+            mirror = mirror && a[0] == b[0] && a[1] == b[1] && a[2] == -b[2] &&
+                     c[0] == d[0] && c[1] == d[1] && c[2] == -d[2];
+        }
+    check(mirror, "MirrorZ: node(3) == z-mirror of node(0); planes 1 and 2 "
+                  "exact mirrors");
+    auto mt = CurvMetrics::build(m);
+    if (!mt) { check(false, "revolved metrics: " + mt.error()); return; }
+    bool zeroS = true, rows = true, limit = true, pos = true, sides = true;
+    double worstLim = 0;
+    for (int k = 0; k < 3; ++k)
+        for (int j = 0; j < ny; ++j) {
+            for (const int i : {0, nT}) {
+                const std::size_t c = g.idx(i, j, k);
+                zeroS = zeroS && mt->S[0][0][c] == 0.0 &&
+                        mt->S[0][1][c] == 0.0 && mt->S[0][2][c] == 0.0;
+                for (int e = 3; e < 9; ++e) rows = rows && mt->Ji[0][e][c] == 0.0;
+                if (k != 1 || j == 0 || j == ny - 1) continue;
+                // Row i on the real plane (phi = 0 centroid): +-y^/(2 rho_F).
+                const int f = i == 0 ? 1 : nT;
+                double rc = 0;
+                for (int dk = 0; dk < 2; ++dk)
+                    for (int dj = 0; dj < 2; ++dj)
+                        for (int di = 0; di < 2; ++di)
+                            rc += 0.125 * m.node(f + di, j + dj, k + dk)[1];
+                const double want = (i == 0 ? 1.0 : -1.0) / (2.0 * rc);
+                const double jx = mt->Ji[0][0][c], jy = mt->Ji[0][1][c],
+                             jz = mt->Ji[0][2][c];
+                worstLim = std::max({worstLim, std::abs(jy - want) / std::abs(want),
+                                     std::abs(jx) / std::abs(want),
+                                     std::abs(jz) / std::abs(want)});
+            }
+            for (int i = 0; i < g.nx; ++i) {
+                const std::size_t c = g.idx(i, j, k);
+                pos = pos && mt->vol[c] > 0.0;
+                if (k != 0) continue;
+                const std::size_t c1 = g.idx(i, j, 1);
+                sides = sides && mt->S[2][0][c1] == -mt->S[2][0][c] &&
+                        mt->S[2][1][c1] == -mt->S[2][1][c] &&
+                        mt->S[2][2][c1] == mt->S[2][2][c];
+            }
+        }
+    limit = worstLim < 1e-12;
+    std::printf("axis limit row vs +-y^/(2 rho_F): worst rel %.2e\n", worstLim);
+    check(zeroS, "axis faces: S == (0, 0, 0) exactly");
+    check(rows, "axis faces: Ji rows j and k == 0");
+    check(limit, "axis faces: row i is +-y^/(2 rho_F) on the real plane");
+    check(pos, "every volume > 0, placeholder columns and ghost planes "
+               "included");
+    check(sides, "the wedge's two side faces are exact z-mirrors (bitwise)");
+    // An sdf that is not a body of revolution about x is rejected.
+    const Sdf ell = [=](double x, double y, double z) {
+        return std::sqrt(x * x + y * y + 4 * z * z) - R;
+    };
+    auto bad = buildRevolvedOGrid(g, ell, {.rFar = rFar, .beta = 2.0}, rv);
+    check(!bad && bad.error().find("body of revolution") != std::string::npos,
+          "a non-axisymmetric sdf is rejected by name");
+}
+
 int main()
 {
+    revolvedWedge();
     axisWrapModes();
     circleExact();
     metricsAndClosure();

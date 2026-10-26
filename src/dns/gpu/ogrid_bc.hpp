@@ -97,13 +97,39 @@ public:
         // grad p = -rho a, not zero, and p0 = p1 + rho1 a . span.
         double omega = 0;
         double cx = 0, cy = 0;
-        std::vector<std::array<double, 2>> wallPos;
-        std::vector<std::array<double, 2>> wallSpan;
+        std::vector<std::array<double, 2>> wallPos{};
+        std::vector<std::array<double, 2>> wallSpan{};
+
+        // RANS (docs/rans.md, "dns flow"): the turbulence scalars' ghost
+        // rows. None = no scalar rows, the solver's rows bit-for-bit.
+        RansModel rans = RansModel::None;
+        // Freestream SPECIFIC scalars: SA nu~ | SST k, omega.
+        double phiInf[2] = {0, 0};
+        // First-cell wall distance per wall face d1(i, k), nx*nz, i fastest
+        // (wallFirstCellDistance): SST's omega_w and the y+ of the surface.
+        std::vector<double> wallD1{};
+        // The gas, for SST's omega_w = 60 mu(T_f)/(beta1 d1^2 rho_f) and
+        // the surface's nu_f; mu_t never reaches the wall face (odd image).
+        Transport tr{};
+
+        // Revolved meshes (buildRevolvedOGrid): the far face's outward unit
+        // normal per far face (i, k), nx*nz, i fastest, from the metrics --
+        // the far row then works in that 3D normal (the same LODI algebra in
+        // vector form). Empty = the z-extruded row on the analytic in-plane
+        // radial normal, bit-for-bit.
+        std::vector<std::array<double, 3>> farNormal{};
+        // The REAL wall faces the tallies sum (inclusive; -1 = the last) and
+        // the factor the sums are scaled by: the wedge sums its one real
+        // plane times 2 pi/dphi. Defaults: every face, 1 -- the z-extruded
+        // tally verbatim.
+        int faceILo = 0, faceIHi = -1, faceKLo = 0, faceKHi = -1;
+        double tallyScale = 1.0;
     };
 
     // ny >= 4, gamma > 1, Rgas > 0, rhoInf > 0, pInf > 0, |uInf| subsonic,
-    // sigma in (0, 1], band > 0, Twall > 0 when isothermal, and
-    // wallPos.size() == wallSpan.size() == nx when omega != 0.
+    // sigma in (0, 1], band > 0, Twall > 0 when isothermal,
+    // wallPos.size() == wallSpan.size() == nx when omega != 0, and
+    // wallD1.size() == nx*nz (all > 0) when rans != None.
     static std::expected<DeviceOGridBc, hipError_t> make(const Grid& g,
                                                          Config c);
 
@@ -127,7 +153,33 @@ public:
     //     continuation makes the outer ghost cell the exact reflection of the
     //     last fluid cell about the far circle. Do not port this to a mesh
     //     where that is not true.
+    // With RANS scalars (s.nT > 0) both rows also get theirs: the wall row
+    // the shared no-slip images (gpu/internal/rans_wall.hpp; SST omega the
+    // Dirichlet image of 60 mu(T_f)/(beta1 d1^2) per wall face), the far row
+    // the blended boundary value phi_b = w phi_1 + (1 - w) phi_inf with the
+    // mean-flow row's own tanh weight w -- a convex combination (positive),
+    // and the upwind inflow flux carries phi_inf exactly. Not a reflection.
+    // On a compensated state every written cell's low words are zeroed.
     void apply(DeviceCompState& s) const;
+
+    // The mu_t images of the two rows (RansSetup::mutHook): row 0 odd (the
+    // wall face holds exactly 0.0) with F1 even; row ny-1 an EVEN copy of row
+    // ny-2 for both -- SST's centre gradient on row ny-1 wraps to row 0, so
+    // the far ghost must hold a finite neighbour value, never a reflection.
+    MutHook mutHook() const;
+
+    // Per wall face (i, k), FP64, nx*nz entries each, i fastest: pressure and
+    // viscous force ON the body, the energy flux into it, the face area and
+    // unit normal (into the fluid), the face pressure, and y+ = d1 u_tau /
+    // nu_f with u_tau from the TANGENTIAL viscous traction. The same faces and
+    // faceFluxCurv as surface(); the viscous part is the total momentum flux
+    // minus p_f S (the convective flux vanishes on the resting no-slip face).
+    // Pre: as surface(); wallD1 configured (else yplus is 0).
+    struct Faces
+    {
+        std::vector<double> fp[3], fv[3], n[3], heat, area, p, yplus;
+    };
+    Faces surfaceFaces(DeviceComp& solver, const DeviceCompState& s);
 
     // Retarget the far-field freestream (quiet-start ramp). The run boosts the
     // frame with boostX and then calls this, exactly as runner_comp does.
@@ -185,6 +237,12 @@ private:
     DeviceScalar wpx_, wpy_, uwx_, uwy_, aspan_;
     DeviceBuffer<double> acc_; // 5 * nx * nz staging for the surface tally
     ReduceScratch red_;
+    // RANS (rans != None): per wall face, SST's omega_w coefficient
+    // 60 mu_ref/(beta1 d1^2) (Real) and d1 (FP64, the surface's y+).
+    DeviceScalar wcoef_;
+    DeviceBuffer<double> d1_;
+    DeviceBuffer<double> faces_; // 14 * nx * nz staging for surfaceFaces
+    DeviceScalar farN_;          // 3 * nx * nz far normals (revolved only)
 };
 
 } // namespace dns::gpu

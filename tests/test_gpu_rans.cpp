@@ -85,7 +85,8 @@ std::unique_ptr<Rig> makeRig(const Channel1dCase& cc, int nx, int nz,
     r->red = std::make_unique<gpu::ReduceScratch>(std::move(*red));
     if (model != RansModel::None &&
         !r->dev->enableRans({.model = model, .wallDist = r->d,
-                             .mirrorYLo = true, .mirrorYHi = true}))
+                             .mutHook = gpu::mutMirrorYHook(r->gg, true, true),
+                             .fluidMask = gpu::rowMask(r->g, 1, r->g.ny - 2)}))
         return nullptr;
     if (compensated && !r->dev->enableCompensation()) return nullptr;
     Rig* p = r.get();

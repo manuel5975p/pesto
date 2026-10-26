@@ -127,6 +127,37 @@ in ctest: the FP32 steady march cannot reach any TOL that certifies the mean
 (the update floor, `docs/rans.md`), so the run is exit 8 by design. It is a
 manual check there (ub within 0.06% of the oracle after 3–4e5 iterations).
 
+### Sphere Re 100 on the revolved wedge vs OpenFOAM (`sph100`, identical mesh)
+
+Code-to-code, not literature: OpenFOAM v2606 `simpleFoam` (incompressible,
+`linearUpwind` on U, SIMPLE consistent) run ON THE dns MESH — `dns flow
+--emit mesh` writes `_mesh.bin`, `tools/parity/dnsmesh.py` turns it into a
+`constant/polyMesh` (axis cells become prisms, `checkMesh` OK), and
+`tools/parity/sph1e4.py case|run|read|dns` drives and reads both sides. Tier
+B: dns cd0 = (4 cd(M 0.1) − cd(M 0.2))/3 against the incompressible solver.
+Both dns runs are the explicit LTS march stopped at its plateau (exit 8; the
+integrals jitter at ~1e-5 and never certify, `docs/rans.md`); OpenFOAM to
+`|q − q_final| ≤ 1e-4` settle. Wedge 5°, rFar 20 D, β 3 (gfx1100, 2026-10-26):
+
+| level (nθ × ny) | dns cd M 0.2 | dns cd M 0.1 | dns cd0 | OpenFOAM cd | Δ | θ_s dns M0.1 / OF | L_r dns cd0-extrap / OF |
+|---|---|---|---|---|---|---|---|
+| L1 64 × 48 | 1.09280 | 1.08709 | 1.08519 | 1.09053 | −0.49% | 126.54 / 127.15° | 0.877 / 0.840 D |
+| L2 128 × 96 | 1.09492 | 1.08918 | 1.08727 | 1.08830 | −0.095% | 126.71 / 126.89° | 0.869 / 0.860 D |
+| L3 256 × 192 | 1.09543 | 1.08967 | 1.08775 | 1.08789 | −0.013% | 126.74 / 126.83° | 0.867 / 0.865 D |
+
+Gate `sph100` (|ΔCd| ≤ 0.5% at L2): PASS, and |ΔCd| falls monotonically
+L1 → L3. θ_s within 0.2° and L_r within 0.3% at L3. The dns compressibility
+correction is not small (cd falls 0.5% from M 0.2 to M 0.1), so a tier-A M 0.2
+comparison would read +0.7%. Δφ: a 2.5° wedge at L2 moves cd by +5.8e-4
+(1.09556). OpenFOAM wall times 10 / 75 / 617 s serial.
+
+`sph1e4` (SA-neg / SST-2003m at Re 1e4) has NO dns side yet: the explicit LTS
+march on the wedge does not reach a steady state (cd oscillates between −5.5
+and +6.2 over ~1.5e6 iterations on SA L1; SST L1 diverged at 4.5e5, exit 7;
+`docs/rans.md`), and the Newton-Krylov march that was to fix it failed its
+gates (B0). The OpenFOAM half of the harness is built and checked
+(`sph1e4.py case <mesh> <dir> sa|sst 1e4`).
+
 ## Tolerance adjustments vs the original plan
 
 Recorded per the rule "widen only with written justification":

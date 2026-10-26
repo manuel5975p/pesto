@@ -16,6 +16,8 @@
 #include "dns/sdf.hpp"
 
 #include <expected>
+#include <string>
+#include <vector>
 
 namespace dns::gpu {
 
@@ -135,6 +137,26 @@ struct CompRun
     // size the zone's blend margins in cells.
     bool rotorMrf = false;
     double hFine = 0;
+
+    // --- RANS on the immersed ghost wall (masterplan_flowrans P5) ---------
+    // None leaves every path above bit for bit. Otherwise the solver runs
+    // the curvilinear path (CurvMesh::uniform without --focal), the ghost
+    // wall images the scalars and mu_t, the open domain faces carry the
+    // scalar boundary flux, and the sponge relaxes the scalars too. The
+    // validator guarantees: no stretch, rotor, penalize, potential
+    // correction, box walls, LES.
+    RansModel rans = RansModel::None;
+    std::vector<double> wallDist;   // g.size(), immersedWallDistance
+    double phiInf[2] = {0, 0};      // specific freestream scalars
+    // Compressible --steady (> 0, RANS only here): the explicit local-time-
+    // stepping march on the compensated state, stopped on cd and the
+    // turbulence integrals; steadySteps caps it (exit 8). tEnd and ramp are
+    // not read then.
+    double steadyTol = 0;
+    long steadySteps = 0;
+    // The run label (dns/rans_label): the progress line's tail. Empty on a
+    // DNS/LES run, whose line is unchanged.
+    std::string label;
 };
 
 // `ic` is the initial conservative state; `sdf` is the body, used to build the

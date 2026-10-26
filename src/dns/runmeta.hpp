@@ -18,7 +18,9 @@ namespace dns {
 // What a run writes. Which kinds a subcommand accepts is a validator question,
 // not a type-system one.
 enum class Emit { Stats, Bin, Png, Web, Shm, Volume, Slices, Vtk, Error,
-                  Spectrum, Snapshot, None };
+                  Spectrum, Snapshot, None,
+                  Surface,   // <prefix>_surface.csv: the O-grid wall, per face
+                  Mesh };    // <prefix>_mesh.bin + _final.bin (dns/meshio)
 
 // Body centre and diameter in grid (world) coordinates, ghost offset included.
 struct Placement
@@ -38,6 +40,12 @@ struct RunMeta
     std::string sgs;   // "smag" | "sigma" when les, "" for DNS
     std::string rans;  // "SA-neg" | "SST-2003m" | "SST-Vm" when RANS, "" otherwise
     std::string steady; // "implicit" on --steady-scheme implicit runs, "" otherwise
+    // flow RANS / flow compressible steady only ("" / 0 = key absent, so
+    // every other run's .json, the channel's included, reads as it did):
+    // "urans" | "urans-dual" | "steady-explicit" | "steady-implicit-nk", the
+    // describe's freestream turbulence string, the wedge angle in degrees.
+    std::string ransMode{}, ransInflow{};
+    double wedgeDeg = 0;
 
     // The six grid fields from the grid the artefacts are written on.
     void setGrid(const Grid& g)

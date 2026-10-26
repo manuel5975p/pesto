@@ -54,6 +54,40 @@ inline constexpr long kImplicitSteadySteps = 500;
 // line evaluations: 0.70 ms per Jacobian + solve at ny 256 SST.
 inline constexpr double kImplicitFdStep = 1e-7;
 
+// The flow Newton-Krylov march (--steady-scheme implicit on dns flow,
+// docs/rans.md "Newton-Krylov pseudo-time"), the one home of its constants.
+// Bracket: the analyst-2 2D prototype (cylinder O-grid, Re 40, M 0.2, KG
+// central residual, GMRES + lexicographic line-SGS on a first-order Rusanov
+// block P): from CFL 10, x2 per undamped step, cap 1e8, it reached cd 1e-4 in
+// 8 Newton / 532 Krylov iterations; forcing 1e-2 stalled at the Krylov cap,
+// 0.1 converged (masterplan_flowrans decision 14).
+inline constexpr double kNkCfl0 = 10, kNkCflGrowth = 2, kNkCflMax = 1e8,
+                        kNkCflMin = 0.1;
+// A trial whose scaled residual exceeds this multiple of the current one is
+// rejected (restore, CFL x0.1).
+inline constexpr double kNkRejectGrowth = 3;
+// GMRES: restart length, Krylov cap per Newton step, constant forcing.
+inline constexpr int kNkRestart = 40, kNkMaxKrylov = 200;
+inline constexpr double kNkForcing = 0.1;
+// The JFNK differencing step, relative to rms of the scaled direction. The
+// plan's 2^-10 failed gate N1 on SA (forward vs central J v of the nu~ field
+// 2.3e-2 mid-transient, 7.2e-2 near the plateau, against 1e-2; the mean flow
+// <= 4.6e-3); the N1 sweep's 2^-14 passes both (1.1e-3, 5.7e-3; mean flow
+// <= 2.9e-3), 2^-12 only the first (3.0e-3, 2.8e-2). 16 x 12 cylinder, Re 40
+// (gpu_nk, gfx1100).
+inline constexpr double kNkFdStep = 0x1p-14;
+
+// The CFL ramp's constants: the channel's line march (the default) or the
+// flow Newton-Krylov march's.
+struct PseudoTimePolicy
+{
+    double cfl0 = kImplicitCfl0, growth = kImplicitCflGrowth,
+           cflMax = kImplicitCflMax, cflMin = kImplicitCflMin,
+           rejectFactor = kImplicitRejectFactor;
+};
+inline constexpr PseudoTimePolicy kNkPolicy{kNkCfl0, kNkCflGrowth, kNkCflMax,
+                                            kNkCflMin, kImplicitRejectFactor};
+
 // The CFL ramp and its arming. accepted() after an undamped step grows the
 // CFL x2 up to the cap; a damped one holds it. rejected() cuts it x0.1.
 // armed(): the step that produced the current state was undamped AND taken AT
@@ -65,15 +99,18 @@ public:
     // cfl0 other than kImplicitCfl0: tests only (the pure-Newton stall).
     // Pre: kImplicitCflMin <= cfl0 <= kImplicitCflMax.
     explicit PseudoTime(double cfl0 = kImplicitCfl0) : cfl_(cfl0) {}
+    // Another march's constants (kNkPolicy). Pre: cflMin <= cfl0 <= cflMax.
+    explicit PseudoTime(const PseudoTimePolicy& p) : p_(p), cfl_(p.cfl0) {}
 
     double cfl() const { return cfl_; }
     // Pre: 0 < alpha <= 1.
     void accepted(double alpha);
-    // Disarms and cuts the CFL; false once it is below kImplicitCflMin.
+    // Disarms and cuts the CFL; false once it is below the policy's minimum.
     bool rejected();
     bool armed() const { return armed_; }
 
 private:
+    PseudoTimePolicy p_{};
     double cfl_ = kImplicitCfl0;
     bool armed_ = false;
 };

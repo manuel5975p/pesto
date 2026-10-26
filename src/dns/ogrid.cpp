@@ -305,6 +305,254 @@ std::expected<OGrid, std::string> buildOGrid(const Grid& g, const Sdf& sdf,
     return out;
 }
 
+Grid ogridRevolvedGrid(int nTheta, int ny, const RevolvedSpec& r, double rWall,
+                       double rFar)
+{
+    assert(nTheta >= 4 && ny >= 4 && rWall > 0.0 && rFar > rWall);
+    assert(r.wedge ? r.dphi > 0.0 : (r.nphi >= 4 && r.nphi % 2 == 0));
+    const int nx = nTheta + 2, nz = r.wedge ? 3 : r.nphi;
+    const double hz = r.wedge ? r.dphi : 2.0 * pi / r.nphi;
+    return Grid::make(nx, ny, nz, nx * pi / nTheta, ny * (rFar - rWall) / (ny - 2),
+                      nz * hz);
+}
+
+namespace {
+
+// cos and sin of theta = pi m / n, evaluated on the half nearer 0 and
+// reflected, so m == 0 gives (1, 0) and m == n gives (-1, 0) EXACTLY: the
+// two axis node columns then sit at rho == 0 to the bit.
+std::array<double, 2> polar(int m, int n)
+{
+    if (2 * m <= n) {
+        const double t = pi * m / n;
+        return {std::cos(t), std::sin(t)};
+    }
+    const double t = pi * (n - m) / n;
+    return {-std::cos(t), std::sin(t)};
+}
+
+// The sdf along the meridional ray at polar angle theta (cos ct, sin st) in
+// the half-plane phi: point (cx - r ct, cy + r st cos phi, cz + r st sin
+// phi). Distance r from the centre.
+double alongMeridian(const Sdf& sdf, const OGridSpec& sp, double ct, double st,
+                     double cphi, double sphi, double r)
+{
+    return sdf(sp.cx - r * ct, sp.cy + r * st * cphi, sp.cz + r * st * sphi);
+}
+
+} // namespace
+
+std::expected<OGrid, std::string> buildRevolvedOGrid(const Grid& g,
+                                                     const Sdf& sdf,
+                                                     const OGridSpec& sp,
+                                                     const RevolvedSpec& rv)
+{
+    if (!sdf) return std::unexpected("a revolved O-grid needs a body sdf");
+    if (!(sp.rFar > 0.0) || !(sp.beta >= 0.0))
+        return std::unexpected("rFar must be positive and beta >= 0");
+    if (rv.wedge ? !(rv.dphi > 0.0) : (rv.nphi < 4 || rv.nphi % 2))
+        return std::unexpected("revolved layout: a wedge angle > 0, or an even "
+                               "azimuthal count >= 4");
+    const int nTheta = g.nx - 2, ny = g.ny, nz = g.nz, nf = ny - 2;
+    if (nTheta < 4 || ny < 4 || nz != (rv.wedge ? 3 : rv.nphi))
+        return std::unexpected(std::format(
+            "a revolved O-grid needs nx = nTheta + 2 >= 6, ny >= 4 and nz = {}"
+            "; got {} x {} x {} (size it with ogridRevolvedGrid())",
+            rv.wedge ? 3 : rv.nphi, g.nx, ny, nz));
+
+    // --- the meridional contour: wall radius, meridional wall normal and
+    // the normal-ray length to the far circle, per node column i = 1..nT+1.
+    const double zTol = 1e-9 * sp.rFar;
+    std::vector<double> ct(g.nx), st(g.nx), rw(g.nx), ln(g.nx);
+    std::vector<std::array<double, 2>> nh(g.nx); // (n_x', n_rho) in -e_r frame
+    for (int i = 1; i <= nTheta + 1; ++i) {
+        const auto cs = polar(i - 1, nTheta);
+        ct[i] = cs[0];
+        st[i] = cs[1];
+        const double th = pi * (i - 1) / nTheta;
+        // The wall radius along this meridian at 5 azimuths: one value, or
+        // the body is not a body of revolution about x.
+        double r0 = 0;
+        for (int q = 0; q < 5; ++q) {
+            const double phi = 2.0 * pi * q / 5.0;
+            const double cp = std::cos(phi), spp = std::sin(phi);
+            auto f = [&](double r) {
+                return alongMeridian(sdf, sp, ct[i], st[i], cp, spp, r);
+            };
+            if (!(f(0.0) < 0.0))
+                return std::unexpected(std::format(
+                    "the O-grid centre ({:.6g}, {:.6g}, {:.6g}) is not inside "
+                    "the body",
+                    sp.cx, sp.cy, sp.cz));
+            int crossings = 0;
+            double lo = 0, hi = sp.rFar, prev = f(0.0);
+            for (int m = 1; m <= 1024; ++m) {
+                const double r = sp.rFar * m / 1024;
+                const double v = f(r);
+                if ((v < 0.0) != (prev < 0.0) && ++crossings == 1) {
+                    lo = sp.rFar * (m - 1) / 1024;
+                    hi = r;
+                }
+                prev = v;
+            }
+            if (crossings != 1)
+                return std::unexpected(std::format(
+                    "the meridian at theta = {:.6f} rad crosses the surface {} "
+                    "times: the body is not star-shaped about the centre",
+                    th, crossings));
+            for (int it = 0; it < 200 && hi - lo > 1e-15 * sp.rFar; ++it) {
+                const double mid = 0.5 * (lo + hi);
+                (f(mid) > 0.0 ? hi : lo) = mid;
+            }
+            const double r = 0.5 * (lo + hi);
+            if (q == 0) r0 = r;
+            else if (std::abs(r - r0) > zTol)
+                return std::unexpected(std::format(
+                    "the body is not a body of revolution about x: at theta = "
+                    "{:.6f} rad the wall radius is {:.12g} at phi = {:.4f} but "
+                    "{:.12g} at phi = 0",
+                    th, r, phi, r0));
+        }
+        rw[i] = r0;
+        // Meridional wall normal (radial, tangential parts by symmetric
+        // differences, as buildOGrid's wallNormal). ON the axis the normal
+        // is along it by symmetry: taken exactly, so rho stays exactly 0.
+        double nr = 1.0, nt = 0.0;
+        if (i != 1 && i != nTheta + 1) {
+            const double e = 1e-3 * rw[i];
+            auto at = [&](double dr, double dt) {
+                // (dr along e_r, dt along e_theta) from the wall point.
+                const double X = -rw[i] * ct[i] - dr * ct[i] + dt * st[i];
+                const double R = rw[i] * st[i] + dr * st[i] + dt * ct[i];
+                return sdf(sp.cx + X, sp.cy + R, sp.cz);
+            };
+            const double fr = (at(e, 0) - at(-e, 0)) / (2 * e);
+            const double ft = (at(0, e) - at(0, -e)) / (2 * e);
+            if (!(fr > 0.0))
+                return std::unexpected(std::format(
+                    "the sdf does not increase outward at theta = {:.6f} rad",
+                    th));
+            const double l = std::hypot(fr, ft);
+            nr = fr / l;
+            nt = ft / l;
+        }
+        nh[i] = {nr, nt};
+        const double disc = sp.rFar * sp.rFar - rw[i] * rw[i] * (1 - nr * nr);
+        ln[i] = disc > 0 ? -rw[i] * nr + std::sqrt(disc) : 0.0;
+        if (!(ln[i] > 0.0))
+            return std::unexpected(std::format(
+                "the wall-normal ray at theta = {:.6f} rad cannot reach the far "
+                "circle",
+                th));
+    }
+
+    // --- meridional nodes (X along x from the centre, R = rho >= 0), rows
+    // 1..ny-1 on the real columns; e_r = (-cos, sin), e_theta = (sin, cos).
+    std::vector<double> mx(std::size_t(g.nx) * ny), mr(std::size_t(g.nx) * ny);
+    auto at2 = [&](int i, int j) { return std::size_t(j) * g.nx + i; };
+    for (int j = 1; j < ny; ++j) {
+        const double t = double(j - 1) / nf;
+        const double d = ogridRadialDist(t, sp.beta);
+        const double w = t * t * (3.0 - 2.0 * t);
+        for (int i = 1; i <= nTheta + 1; ++i) {
+            const double erx = -ct[i], err = st[i];
+            const double nX = nh[i][0] * erx + nh[i][1] * st[i];
+            const double nR = nh[i][0] * err + nh[i][1] * ct[i];
+            const double bx = (1 - w) * ln[i] * nX + w * (sp.rFar - rw[i]) * erx;
+            const double br = (1 - w) * ln[i] * nR + w * (sp.rFar - rw[i]) * err;
+            mx[at2(i, j)] = rw[i] * erx + d * bx;
+            mr[at2(i, j)] = rw[i] * err + d * br;
+        }
+    }
+    // Axis columns: rho exactly 0 on every row (nR above is exactly 0 there
+    // too -- st == 0, nh = (1, 0) -- this only states it).
+    for (int j = 1; j < ny; ++j) {
+        mr[at2(1, j)] = 0.0;
+        mr[at2(nTheta + 1, j)] = 0.0;
+    }
+    // Ghost row 0: the point reflection of row 2 through the wall node.
+    for (int i = 1; i <= nTheta + 1; ++i) {
+        mx[at2(i, 0)] = 2 * mx[at2(i, 1)] - mx[at2(i, 2)];
+        mr[at2(i, 0)] = 2 * mr[at2(i, 1)] - mr[at2(i, 2)];
+    }
+
+    // --- revolve. Azimuthal node planes and the exact-mirror tables.
+    std::vector<double> cph(nz), sph(nz);
+    if (rv.wedge) {
+        const double c3 = std::cos(1.5 * rv.dphi), s3 = std::sin(1.5 * rv.dphi);
+        const double c1 = std::cos(0.5 * rv.dphi), s1 = std::sin(0.5 * rv.dphi);
+        cph = {c3, c1, c1};
+        sph = {-s3, -s1, s1};
+    } else {
+        for (int k = 0; k < nz; ++k) {
+            const int h = rv.nphi / 2;
+            const double a = 2.0 * pi * (k % h) / rv.nphi;
+            const double s = k < h ? 1.0 : -1.0; // phi + pi: (-cos, -sin)
+            cph[k] = s * std::cos(a);
+            sph[k] = s * std::sin(a);
+        }
+    }
+    OGrid out{.mesh = CurvMesh::uniform(g)};
+    out.revolved = true;
+    out.rev = rv;
+    out.nTheta = nTheta;
+    out.mesh.wrap = {AxisWrap::Extend, AxisWrap::Extend,
+                     rv.wedge ? AxisWrap::MirrorZ : AxisWrap::Cyclic};
+    out.mesh.mirrorZ0 = sp.cz;
+    out.mesh.axisFaces = {0, nTheta};
+    for (int k = 0; k < nz; ++k)
+        for (int j = 0; j < ny; ++j)
+            for (int i = 1; i <= nTheta + 1; ++i) {
+                const std::size_t c = g.idx(i, j, k);
+                const double R = mr[at2(i, j)];
+                out.mesh.x[c] = sp.cx + mx[at2(i, j)];
+                out.mesh.y[c] = sp.cy + R * cph[k];
+                out.mesh.z[c] = sp.cz + R * sph[k];
+            }
+    // Ghost column 0: 2 node(1) - node(2), every row and plane.
+    for (int k = 0; k < nz; ++k)
+        for (int j = 0; j < ny; ++j) {
+            const std::size_t a = g.idx(0, j, k), b = g.idx(1, j, k),
+                              cc = g.idx(2, j, k);
+            out.mesh.x[a] = 2 * out.mesh.x[b] - out.mesh.x[cc];
+            out.mesh.y[a] = 2 * out.mesh.y[b] - out.mesh.y[cc];
+            out.mesh.z[a] = 2 * out.mesh.z[b] - out.mesh.z[cc];
+        }
+
+    // --- diagnostics on the meridian (real columns, fluid rows).
+    out.rWall.assign(std::size_t(g.nx), 0.0);
+    out.wallNormal.assign(std::size_t(g.nx), {0.0, 0.0, 0.0});
+    out.h1 = 1e300;
+    out.h1Max = 0;
+    out.growth = 1;
+    out.rWallMin = 1e300;
+    out.rWallMax = 0;
+    for (int i = 1; i <= nTheta + 1; ++i) {
+        out.rWall[i] = rw[i];
+        out.rWallMin = std::min(out.rWallMin, rw[i]);
+        out.rWallMax = std::max(out.rWallMax, rw[i]);
+        out.wallNormal[i] = {nh[i][0] * -ct[i] + nh[i][1] * st[i],
+                             nh[i][0] * st[i] + nh[i][1] * ct[i], 0.0};
+        double prev = 0;
+        for (int j = 1; j <= nf; ++j) {
+            const double ex = mx[at2(i, j + 1)] - mx[at2(i, j)],
+                         er = mr[at2(i, j + 1)] - mr[at2(i, j)];
+            const double len = std::hypot(ex, er);
+            if (!(len > 0.0))
+                return std::unexpected(std::format(
+                    "radial edge {} collapsed at theta column {}", j, i));
+            if (j == 1) {
+                out.h1 = std::min(out.h1, len);
+                out.h1Max = std::max(out.h1Max, len);
+            } else {
+                out.growth = std::max(out.growth, len / prev);
+            }
+            prev = len;
+        }
+    }
+    return out;
+}
+
 std::vector<std::array<double, 2>> ogridWallMidpoints(const OGrid& og)
 {
     const int nx = og.mesh.g.nx;

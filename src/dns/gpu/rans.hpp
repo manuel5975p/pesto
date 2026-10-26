@@ -33,28 +33,34 @@ void sstMutCurv(const GpuGrid& g, ViscView vv, PrimView q, CurvView m,
 // flux, face diffusion (mu + sigma(F1_f) mu_t,f) grad . S with face-averaged
 // F1 and mu_t, pointwise sources, point-implicit combination (or the pure
 // rhs when residual). The counted positivity guard (k >= 0, omega >= floor
-// rho) runs only outside residual mode and counts into *hits (rows 0 /
-// ny-1 skipped where they are mirrored ghost rows).
+// rho) runs only outside residual mode and counts into *hits the cells the
+// fluid mask marks (ghost cells are their mesh family's to overwrite).
 struct SstStageArgs
 {
     RansModel model;
     const Real *t0, *t1, *nut, *f1, *d;
     const Real* outRho;   // the stage's mean-flow output density (guard)
     Real omegaFloor;      // specific omega floor of the counted guard
-    int skipLo, skipHi;   // ghost rows excluded from the count
+    const std::uint8_t* counted; // fluid mask; null = every cell counts
     unsigned long long* hits;
+    // TEST ONLY: added to R_k / R_omega before the quotient; null = none.
+    const Real *src0, *src1;
 };
+// sb: the open domain faces (ScalarBoundary; none = the kernel verbatim).
 void sstStageCurv(const GpuGrid& g, ViscView vv, PrimView q, CurvView m,
                   MrfView mz, const StageCombine& cmb, const SstStageArgs& a,
-                  bool residual, Real* out0, Real* out1);
+                  bool residual, Real* out0, Real* out1,
+                  const ScalarBoundary& sb = {});
 
 // The SA-neg scalar stage: first-order upwind convection on the mean mass
 // flux, face diffusion with face coefficients, pointwise sources and the
 // cb2 / grad rho cell terms, combined point-implicitly through cmb (or the
-// pure rhs when residual). Writes out0 on every cell.
+// pure rhs when residual). Writes out0 on every cell. src (TEST ONLY, may be
+// null) is added to R before the quotient.
 void saStageCurv(const GpuGrid& g, ViscView vv, PrimView q, CurvView m,
                  MrfView mz, const StageCombine& cmb, const Real* t0,
-                 const Real* d, bool residual, bool transportOnly, Real* out0);
+                 const Real* d, bool residual, bool transportOnly,
+                 const Real* src, Real* out0, const ScalarBoundary& sb = {});
 
 // Per-cell explicit diffusive dt bound under RANS, FP64 straight off the
 // conserved state (pointwise -- no gradient):
@@ -90,6 +96,32 @@ struct RansDiffDt
             const double sa = (nu + (s0 > 0.0 ? s0 : 0.0)) / sa::sigma;
             if (sa > D) D = sa;
         }
+        if (!(D > 0.0)) return isfinite(D) ? HUGE_VAL : 0.0; // inviscid | NaN
+        double a = ax[c] > ay[c] ? ax[c] : ay[c];
+        if (az && az[c] > a) a = az[c];
+        const double dt = 0.25 / (D * a * a);
+        return isfinite(dt) && dt > 0.0 ? dt : 0.0;
+    }
+};
+
+// The same per-cell bound without RANS (mu_t = 0): the laminar --steady
+// march. A separate functor, not a null t0 inside RansDiffDt, so the RANS
+// path's code (and its FMA contraction) is untouched.
+struct LaminarDiffDt
+{
+    const Real *rho, *mx, *my, *mz, *E;
+    const Real *ax, *ay, *az; // az == nullptr when nz == 1
+    Transport tr;
+    __host__ __device__ double operator()(int c) const
+    {
+        const double r = rho[c];
+        const double u = mx[c] / r, v = my[c] / r, w = mz[c] / r;
+        const double p =
+            (tr.gamma - 1.0) * (double(E[c]) - 0.5 * (u * u + v * v + w * w) * r);
+        const double mu = tr.mu(p / (r * tr.Rgas));
+        double D = mu / r;
+        const double th = tr.gamma * (mu / tr.Pr) / r;
+        if (th > D) D = th;
         if (!(D > 0.0)) return isfinite(D) ? HUGE_VAL : 0.0; // inviscid | NaN
         double a = ax[c] > ay[c] ? ax[c] : ay[c];
         if (az && az[c] > a) a = az[c];

@@ -1,11 +1,13 @@
 // dns/rans.hpp closed forms and dns/walldist: the SA-neg constants and
 // functions against their definitions (TMR spalart.html), the S~ limiter, the
 // log-layer identity that pins cw1, the negative branch, the point-implicit
-// combination, float/double agreement, and the channel wall distance.
-// Host-only, milliseconds.
+// combination, float/double agreement, the channel wall distance, and the
+// run labels (dns/rans_label). Host-only, milliseconds.
 #include "dns/rans.hpp"
 
 #include "dns/curvmesh.hpp"
+#include "dns/ogrid.hpp"
+#include "dns/rans_label.hpp"
 #include "dns/remap.hpp"
 #include "dns/walldist.hpp"
 #include "check.hpp"
@@ -14,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <format>
+#include <numbers>
 #include <random>
 
 using namespace dns;
@@ -319,6 +322,103 @@ void wallDistance()
     check(pos, "d > 0 on every cell");
 }
 
+// ogridWallDistance: the exact distance to the DISCRETE wall polyline. For a
+// circle of radius R the polyline's chords sit inside the circle by at most
+// the sagitta R (1 - cos(pi/nx)), so |d - (r - R)| is bounded by it; ghost
+// rows carry their source row's d; the thread count changes no bit.
+void ogridWallDistanceCircle()
+{
+    const double R = 0.5, rFar = 10.0;
+    for (int nx : {64, 256}) {
+        const int ny = 40, nz = 3;
+        const Grid g = ogridGrid(nx, ny, nz, R, rFar, 1.0);
+        const Sdf circle = [=](double x, double y, double) {
+            return std::hypot(x, y) - R;
+        };
+        auto og = buildOGrid(g, circle, {.rFar = rFar, .beta = 3.0, .span = 1.0});
+        if (!og) { check(false, "o-grid build: " + og.error()); return; }
+        const auto d = ogridWallDistance(og->mesh, 7);
+        const auto d1t = ogridWallDistance(og->mesh, 1);
+        const double sag = R * (1.0 - std::cos(std::numbers::pi / nx));
+        double worst = 0;
+        bool ghost = true, pos = true, zinv = true;
+        for (int k = 0; k < nz; ++k)
+            for (int j = 0; j < ny; ++j)
+                for (int i = 0; i < nx; ++i) {
+                    const std::size_t c = g.idx(i, j, k);
+                    pos = pos && d[c] > 0;
+                    zinv = zinv && d[c] == d[g.idx(i, j, 0)];
+                    if (j == 0) ghost = ghost && d[c] == d[g.idx(i, 1, k)];
+                    if (j == ny - 1)
+                        ghost = ghost && d[c] == d[g.idx(i, ny - 2, k)];
+                    if (j == 0 || j == ny - 1) continue;
+                    double cx = 0, cy = 0;
+                    for (int dj = 0; dj < 2; ++dj)
+                        for (int di = 0; di < 2; ++di) {
+                            const auto p = og->mesh.node(i + di, j + dj, 0);
+                            cx += 0.25 * p[0];
+                            cy += 0.25 * p[1];
+                        }
+                    worst = std::max(worst,
+                                     std::abs(d[c] - (std::hypot(cx, cy) - R)));
+                }
+        std::printf("walldist nx %d: max |d - (r - R)| %.3e, sagitta %.3e\n",
+                    nx, worst, sag);
+        check(worst <= sag * (1 + 1e-9),
+              std::format("o-grid wall distance within the sagitta (nx {})", nx));
+        check(ghost, "o-grid ghost rows carry their source row's d");
+        check(pos && zinv, "d > 0 everywhere and z-invariant");
+        check(d == d1t, "bitwise independent of the thread count");
+        const auto w1 = wallFirstCellDistance(g, d);
+        check(w1.size() == std::size_t(nx) * nz && w1[1] == d[g.idx(1, 1, 0)],
+              "d1(i, k) = d(i, 1, k)");
+    }
+}
+
+// dns/rans_label: the ONE label producer. The channel's three strings are the
+// ones its describe and progress lines have always printed (byte-identical).
+void labels()
+{
+    check(ransRunLabel(RansModel::SaNeg, RansMode::SteadyExplicit) ==
+              "RANS SA-neg -- steady (local time stepping: pseudo-time, not "
+              "time-accurate)",
+          "label: channel explicit steady");
+    check(ransRunLabel(RansModel::SstVm, RansMode::Urans) ==
+              "RANS SST-Vm -- URANS (time-accurate)",
+          "label: channel URANS");
+    check(ransRunLabel(RansModel::SstVm, RansMode::SteadyImplicitLine) ==
+              "RANS SST-Vm -- steady (implicit Newton pseudo-time: not "
+              "time-accurate)",
+          "label: channel implicit steady");
+    check(ransRunLabel(RansModel::Sst2003m, RansMode::SteadyImplicitNk) ==
+              "RANS SST-2003m -- steady (implicit Newton-Krylov pseudo-time: "
+              "not time-accurate)",
+          "label: flow Newton-Krylov");
+    check(ransRunLabel(RansModel::SaNeg, RansMode::UransDual, 0.05) ==
+              "RANS SA-neg -- URANS (time-accurate, dual time BDF2, dt=0.05 D/U)",
+          "label: dual time carries its dt");
+    check(ransRunLabel(RansModel::None, RansMode::SteadyExplicit) ==
+              "DNS -- steady (local time stepping: pseudo-time, not "
+              "time-accurate)",
+          "label: laminar steady");
+    check(ransRunLabel(RansModel::None, RansMode::Urans).empty(),
+          "label: RANS off, time-accurate: empty (callers keep DNS/LES)");
+    check(ransRunLabel(RansModel::SaNeg, RansMode::Urans, 0, " [x]") ==
+              "RANS SA-neg -- URANS (time-accurate) [x]",
+          "label: geometry suffix appended verbatim");
+    check(ransModelLabel(RansModel::Sst2003m) == "RANS SST-2003m",
+          "model label: the progress line's");
+    check(ransBuilt(Subcommand::Channel).size() == 4 &&
+              ransBuilt(Subcommand::Channel)[0] == RansModel::None,
+          "ransBuilt(channel): none + the three closures");
+    check(std::ranges::equal(ransBuilt(Subcommand::Flow),
+                             ransBuilt(Subcommand::Channel)),
+          "ransBuilt(flow): the same four (P1)");
+    check(ransBuilt(Subcommand::Conv).empty() &&
+              ransBuilt(Subcommand::Tgv).empty(),
+          "ransBuilt: conv/tgv register no --rans");
+}
+
 } // namespace
 
 int main()
@@ -332,5 +432,7 @@ int main()
     sstLogLayer();
     sstFunctions();
     wallDistance();
+    ogridWallDistanceCircle();
+    labels();
     return dnstest::finish();
 }

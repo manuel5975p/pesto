@@ -772,8 +772,24 @@ void DeviceComp::ransMut(const DeviceCompState& s)
         rans::mutCurv(g_, viscView(tr_), s.rho.data(), T_.data(),
                       s.t[0].data(), nut_.data());
     }
-    rans::mutMirrorY(g_, ransMirrorLo_, ransMirrorHi_, nut_.data(),
-                     sst ? f1_.data() : nullptr);
+    if (mutHook_) mutHook_(nut_.data(), sst ? f1_.data() : nullptr);
+}
+
+MutHook mutMirrorYHook(const GpuGrid& g, bool lo, bool hi)
+{
+    return [g, lo, hi](Real* nut, Real* f1) {
+        rans::mutMirrorY(g, lo, hi, nut, f1);
+    };
+}
+
+std::vector<std::uint8_t> rowMask(const Grid& g, int jLo, int jHi)
+{
+    assert(0 <= jLo && jLo <= jHi && jHi < g.ny);
+    std::vector<std::uint8_t> m(g.size(), 0);
+    for (int k = 0; k < g.nz; ++k)
+        for (int j = jLo; j <= jHi; ++j)
+            for (int i = 0; i < g.nx; ++i) m[g.idx(i, j, k)] = 1;
+    return m;
 }
 
 unsigned long long DeviceComp::floorHits() const
@@ -824,16 +840,16 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
             curvStage();
             if (ransSst(ransModel_)) {
                 const rans::SstStageArgs a{
-                    ransModel_,         s.t[0].data(), s.t[1].data(),
-                    nut_.data(),        f1_.data(),    wd_.data(),
-                    out.rho.data(),     Real(omegaFloor_),
-                    int(ransMirrorLo_), int(ransMirrorHi_), hits_.data()};
+                    ransModel_,     s.t[0].data(),     s.t[1].data(),
+                    nut_.data(),    f1_.data(),        wd_.data(),
+                    out.rho.data(), Real(omegaFloor_), mask_.data(),
+                    hits_.data(),   testSrc_[0],       testSrc_[1]};
                 rans::sstStageCurv(g_, vv, q, cv, mz, cmb, a, residualMode,
-                                   out.t[0].data(), out.t[1].data());
+                                   out.t[0].data(), out.t[1].data(), bnd_);
             } else {
                 rans::saStageCurv(g_, vv, q, cv, mz, cmb, s.t[0].data(),
                                   wd_.data(), residualMode, ransTransport_,
-                                  out.t[0].data());
+                                  testSrc_[0], out.t[0].data(), bnd_);
             }
             if (rhsHook_) rhsHook_(s, out, cmb);
             return;
@@ -1028,8 +1044,10 @@ double DeviceComp::stableDt(const DeviceCompState& s, ReduceScratch& r,
 
 namespace {
 
-// dtc[c] = min(cfl / wave_c, diffusive_c): the local dt of --steady.
-__global__ void kLocalDt(WavePerDtCurv wave, rans::RansDiffDt diff, double cfl,
+// dtc[c] = min(cfl / wave_c, diffusive_c): the local dt of --steady. Diff is
+// rans::RansDiffDt or rans::LaminarDiffDt.
+template <class Diff>
+__global__ void kLocalDt(WavePerDtCurv wave, Diff diff, double cfl,
                          std::size_t n, double* dtc)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1054,20 +1072,21 @@ struct DtAt
     __host__ __device__ double operator()(int c) const { return dtc[c]; }
 };
 
-// Squared per-cell residual of one equation over rows [jLo, jHi], 0
-// elsewhere: 0 continuity, 1 |momentum|/rho, 2 R0/rho (energy, a scalar),
-// 4 R0/rho[] with `rho` the conserved scalar itself (SST omega: the rate of
-// ln omega).
+// Squared per-cell residual of one equation over the counted cells -- the
+// fluid mask when set, else rows [jLo, jHi] -- and 0 elsewhere: 0 continuity,
+// 1 |momentum|/rho, 2 R0/rho (energy, a scalar), 4 R0/rho[] with `rho` the
+// conserved scalar itself (SST omega: the rate of ln omega).
 struct ResidSq
 {
     GpuGrid g;
+    const std::uint8_t* mask;
     int jLo, jHi, which;
     const Real *rho, *R0, *R1, *R2, *R3; // R1..R3: momentum when which == 1
     __host__ __device__ double operator()(int c) const
     {
         int i, j, k;
         decompose(g, std::size_t(c), i, j, k);
-        if (j < jLo || j > jHi) return 0.0;
+        if (mask ? !mask[c] : (j < jLo || j > jHi)) return 0.0;
         if (which == 1) {
             const double r = rho[c];
             const double a = R1[c] / r, b = R2[c] / r, d = R3[c] / r;
@@ -1090,6 +1109,36 @@ rans::RansDiffDt DeviceComp::ransDiffDt(const DeviceCompState& s) const
                             double(prt_)};
 }
 
+std::expected<void, hipError_t>
+DeviceComp::allocSteady(const std::vector<std::uint8_t>& mask)
+{
+    assert(mask.empty() || mask.size() == g_.size());
+    const std::size_t n = g_.size();
+    auto l = DeviceScalar::make(n);
+    auto t = DeviceBuffer<double>::make(n);
+    if (!l) return std::unexpected(l.error());
+    if (!t) return std::unexpected(t.error());
+    lts_ = std::move(*l);
+    dtc_ = std::move(*t);
+    mask_ = {};
+    maskCount_ = double(n);
+    if (mask.empty()) return {};
+    auto m = DeviceBuffer<std::uint8_t>::make(n);
+    if (!m) return std::unexpected(m.error());
+    if (auto e = m->upload(mask.data()); e != hipSuccess)
+        return std::unexpected(e);
+    mask_ = std::move(*m);
+    maskCount_ = double(std::ranges::count(mask, std::uint8_t(1)));
+    return {};
+}
+
+std::expected<void, hipError_t>
+DeviceComp::enableSteady(const std::vector<std::uint8_t>& fluidMask)
+{
+    assert(curvilinear());
+    return allocSteady(fluidMask);
+}
+
 std::expected<void, hipError_t> DeviceComp::enableRans(const RansSetup& rs)
 {
     assert(curvilinear() && !les() && rs.model != RansModel::None &&
@@ -1097,17 +1146,13 @@ std::expected<void, hipError_t> DeviceComp::enableRans(const RansSetup& rs)
     assert(std::ranges::all_of(rs.wallDist, [](double d) { return d > 0.0; }));
     const std::size_t n = g_.size();
     if (auto e = allocStages(ransScalars(rs.model)); !e) return e;
-    for (auto* b : {&nut_, &lts_}) {
-        auto e = DeviceScalar::make(n);
-        if (!e) return std::unexpected(e.error());
-        *b = std::move(*e);
-    }
+    auto nb = DeviceScalar::make(n);
+    if (!nb) return std::unexpected(nb.error());
+    nut_ = std::move(*nb);
     auto d = makeNarrow(rs.wallDist);
     if (!d) return std::unexpected(d.error());
     wd_ = std::move(*d);
-    auto t = DeviceBuffer<double>::make(n);
-    if (!t) return std::unexpected(t.error());
-    dtc_ = std::move(*t);
+    if (auto e = allocSteady(rs.fluidMask); !e) return e;
     if (ransSst(rs.model)) {
         auto f = DeviceScalar::make(n);
         auto h = DeviceBuffer<unsigned long long>::make(1);
@@ -1121,16 +1166,18 @@ std::expected<void, hipError_t> DeviceComp::enableRans(const RansSetup& rs)
     }
     omegaFloor_ = rs.omegaFloor;
     ransModel_ = rs.model;
-    ransMirrorLo_ = rs.mirrorYLo;
-    ransMirrorHi_ = rs.mirrorYHi;
+    mutHook_ = rs.mutHook;
+    testSrc_[0] = rs.testSource[0];
+    testSrc_[1] = rs.testSource[1];
     ransTransport_ = rs.transportOnly;
+    bnd_ = rs.bnd;
     return {};
 }
 
 double DeviceComp::localDt(const DeviceCompState& s, ReduceScratch& r,
                            double cfl)
 {
-    assert(rans());
+    assert(curvilinear() && dtc_.size() == g_.size());
     const std::size_t n = g_.size();
     const MrfView mz = mrf_ ? mrfView() : MrfView{};
     const WavePerDtCurv wave{g_, mz, s.rho.data(), s.mx.data(), s.my.data(),
@@ -1138,8 +1185,18 @@ double DeviceComp::localDt(const DeviceCompState& s, ReduceScratch& r,
                              curv_->aov[1].data(),
                              g_.nz > 1 ? curv_->aov[2].data() : nullptr,
                              double(tr_.gamma)};
-    kLocalDt<<<launchBlocks(n), blockSize>>>(wave, ransDiffDt(s), cfl, n,
-                                             dtc_.data());
+    if (rans()) {
+        kLocalDt<<<launchBlocks(n), blockSize>>>(wave, ransDiffDt(s), cfl, n,
+                                                 dtc_.data());
+    } else {
+        const rans::LaminarDiffDt diff{
+            s.rho.data(),         s.mx.data(),          s.my.data(),
+            s.mz.data(),          s.E.data(),           curv_->aov[0].data(),
+            curv_->aov[1].data(), g_.nz > 1 ? curv_->aov[2].data() : nullptr,
+            tr_};
+        kLocalDt<<<launchBlocks(n), blockSize>>>(wave, diff, cfl, n,
+                                                 dtc_.data());
+    }
     checkLastKernel("kLocalDt");
     const double dtRef = reduce(r, n, DtAt{dtc_.data()},
                                 rocprim::minimum<double>(), 1e300);
@@ -1185,40 +1242,66 @@ hipError_t DeviceComp::uploadLts(const std::vector<Real>& ratios)
     return lts_.upload(ratios.data());
 }
 
-ResidualNorms DeviceComp::residual(const DeviceCompState& s, int jLo, int jHi,
-                                   ReduceScratch& r)
+void DeviceComp::residualInto(const DeviceCompState& s, DeviceCompState& out)
 {
-    assert(rans() && s.nT == q2_.nT && 0 <= jLo && jLo <= jHi && jHi < g_.ny);
+    assert(curvilinear() && s.nT == nTurb() && out.nT == s.nT && &out != &s);
     // ca = cb = 0, cr = 1, no lts: the mean-flow kernel and every hook then
     // write the pure rhs (0 a + 0 b + 1 R == R exactly); the scalar kernel
     // needs its explicit mode, because the point-implicit form would return
-    // (R + J q)/(1 + J) instead.
+    // (R + J q)/(1 + J) instead. No low words are named, so the plain write.
     StageCombine k{{s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
                     s.E.data()},
                    {s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
                     s.E.data()},
                    Real(0), Real(0), Real(1)};
     for (int i = 0; i < s.nT; ++i) k.ta[i] = k.tb[i] = s.t[i].data();
-    stage(s, k, q2_, true);
-    const std::size_t n = g_.size();
-    const double cnt = double(jHi - jLo + 1) * g_.nx * g_.nz;
+    stage(s, k, out, true);
+}
+
+namespace {
+
+// FP64 RMS norms of the pure rhs R (a stage buffer) of state s over the
+// counted cells (mask, else rows [jLo, jHi]); cnt is their number.
+ResidualNorms residualNorms(const GpuGrid& g, const DeviceCompState& s,
+                            const DeviceCompState& R, const std::uint8_t* mask,
+                            int jLo, int jHi, double cnt, ReduceScratch& r)
+{
+    const std::size_t n = g.size();
     auto rms = [&](int which, const Real* R0) {
-        const ResidSq f{g_, jLo, jHi, which, s.rho.data(), R0, q2_.mx.data(),
-                        q2_.my.data(), q2_.mz.data()};
+        const ResidSq f{g, mask, jLo, jHi, which, s.rho.data(), R0,
+                        R.mx.data(), R.my.data(), R.mz.data()};
         return std::sqrt(
             reduce(r, n, f, rocprim::plus<double>(), 0.0) / cnt);
     };
     ResidualNorms out;
-    out.rho = rms(0, q2_.rho.data());
+    out.rho = rms(0, R.rho.data());
     out.mom = rms(1, nullptr);
-    out.E = rms(2, q2_.E.data());
-    out.t[0] = rms(2, q2_.t[0].data());
+    out.E = rms(2, R.E.data());
+    if (s.nT > 0) out.t[0] = rms(2, R.t[0].data());
     if (s.nT > 1) { // SST omega: R_w / (rho omega)
-        const ResidSq f{g_, jLo, jHi, 4, s.t[1].data(), q2_.t[1].data(),
+        const ResidSq f{g, mask, jLo, jHi, 4, s.t[1].data(), R.t[1].data(),
                         nullptr, nullptr, nullptr};
         out.t[1] = std::sqrt(reduce(r, n, f, rocprim::plus<double>(), 0.0) / cnt);
     }
     return out;
+}
+
+} // namespace
+
+ResidualNorms DeviceComp::residual(const DeviceCompState& s, ReduceScratch& r)
+{
+    assert(dtc_.size() == g_.size()); // enableRans or enableSteady ran
+    residualInto(s, q2_);
+    return residualNorms(g_, s, q2_, mask_.data(), 0, g_.ny - 1, maskCount_, r);
+}
+
+ResidualNorms DeviceComp::residual(const DeviceCompState& s, int jLo, int jHi,
+                                   ReduceScratch& r)
+{
+    assert(0 <= jLo && jLo <= jHi && jHi < g_.ny);
+    residualInto(s, q2_);
+    const double cnt = double(jHi - jLo + 1) * g_.nx * g_.nz;
+    return residualNorms(g_, s, q2_, nullptr, jLo, jHi, cnt, r);
 }
 
 } // namespace dns::gpu

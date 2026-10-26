@@ -199,6 +199,7 @@ struct RawConfig
     bool ogrid = false;
     double ogridFar = 20.0;  // far-boundary radius, in diameters
     double ogridBeta = 3.0;  // radial tanh clustering toward the wall
+    double ogridWedge = 5.0; // revolved --nz 1: the wedge angle, degrees
 
     // start-up (compressible)
     double ramp = 2.0, kick = 0.05;
@@ -240,6 +241,10 @@ struct RawConfig
     int rans = 0;
     int steadySteps = 1000000;
     int steadyScheme = 0;  // SteadyScheme index: 0 explicit, 1 implicit
+    // flow RANS freestream turbulence, in FREESTREAM units (dns/rans.hpp):
+    // SA nu~/nu, SST k/U^2 and mu_t/mu (which sets omega).
+    double ransNutInf = kRansNutInfRatio, ransKInf = kRansKInf,
+           ransMutInf = kRansMutInfRatio;
 
     // conv (Rayleigh-Benard: heated floor, cooled lid, gravity in -y)
     double rayleigh = 1e6;  // Rayleigh number on the SUPERADIABATIC drop
@@ -355,6 +360,13 @@ public:
     // every immersed-body knob -- the wall is a mesh face here.
     bool ogrid = false;
     double ogridRFar = 0, ogridBeta = 0, ogridSpan = 0;
+    // REVOLVED O-grid (a body of revolution, `--body sphere`; dns/ogrid.hpp
+    // buildRevolvedOGrid): --n meridional cells over theta in [0, pi], grid
+    // nx = n + 2 (a ghost column past each axis). --nz 1 is the axisymmetric
+    // WEDGE of ogridWedgeDeg (internal nz 3); the full revolution (--nz N)
+    // is not built yet (P4).
+    bool ogridRevolved = false;
+    double ogridWedgeDeg = 0;
     // First fluid cell height on the nominal circle (ogridNominalH1): what the
     // validator can know without the sdf; exact for a cylinder.
     double ogridH1 = 0;
@@ -379,6 +391,13 @@ public:
     // --steady-scheme: Implicit is the Newton line march (docs/rans.md,
     // "Implicit pseudo-time"); its cap defaults to kImplicitSteadySteps.
     SteadyScheme steadyScheme = SteadyScheme::Explicit;
+    // flow RANS (docs/rans.md, "dns flow"): the freestream inflow flags as
+    // given, and the freestream SPECIFIC scalars they resolve to in box units
+    // (SA: nu~ | SST: k, omega). compSteady: a compressible --steady run
+    // (the pseudo-time march, with or without --rans).
+    double ransNutInf = 0, ransKInf = 0, ransMutInf = 0;
+    double ransPhiInf[2] = {0, 0};
+    bool compSteady = false;
 
     // conv (Rayleigh-Benard; see the validate() conv branch for the full
     // derivation). Box units: H = 1, Tref = Rgas = rho_ref = 1, so p_ref = 1
@@ -454,6 +473,11 @@ private:
     Case() = default;
     friend std::expected<Case, ConfigError> validate(const RawConfig&);
 };
+
+// The run label of a `dns flow` case (dns/rans_label): RANS, a compressible
+// steady march, or the axisymmetric wedge; "" for a plain DNS/LES time march
+// (whose label is the DNS/LES slot of describe()).
+std::string flowRunLabel(const Case& c);
 
 // The finest cell spacing the run resolves: the focal plateau's when
 // focalActive, the grid's otherwise, both by the hMin rule (z excluded at

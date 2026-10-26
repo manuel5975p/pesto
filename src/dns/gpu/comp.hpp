@@ -12,6 +12,7 @@
 #include "dns/gpu/index.hpp"
 #include "dns/gpu/reductions.hpp"
 
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <optional>
@@ -166,20 +167,53 @@ struct StageCombine
     }
 };
 
+// The wall/far images of mu_t (and F1 for SST, null for SA) a mesh family
+// writes after mu_t is formed on every cell and before any flux reads it.
+// Eddy-viscosity agnostic: an LES/DES wall image can reuse the slot.
+using MutHook = std::function<void(Real* nut, Real* f1)>;
+
+// Open domain faces of the immersed RANS path (masterplan_flowrans 4.9): at
+// an open face the scalar flux is mdot = rho_c (u_c . S) of the boundary cell
+// alone, carrying the specific freestream value in and the cell's out, with
+// no diffusion. A COMPILE-TIME kernel branch: none open is the scalar stage
+// verbatim (the O-grid and the channel never open a face).
+struct ScalarBoundary
+{
+    int open[3] = {0, 0, 0};       // x, y, z domain faces
+    double phiInf[2] = {0.0, 0.0}; // specific freestream scalars
+    bool any() const { return open[0] || open[1] || open[2]; }
+};
+
 // The RANS closure installed by DeviceComp::enableRans. Host-side; validated
 // upstream.
 struct RansSetup
 {
     RansModel model = RansModel::None;   // != None
-    std::vector<double> wallDist;        // g.size(), > 0 everywhere
-    bool mirrorYLo = false, mirrorYHi = false; // mu_t odd across y ghost rows
+    std::vector<double> wallDist{};      // g.size(), > 0 everywhere
+    MutHook mutHook{};                   // null = no image rows
+    // 1 = real fluid cell: the SST guard counts only these and residual()
+    // norms only these. Empty = every cell.
+    std::vector<std::uint8_t> fluidMask{};
     // TEST ONLY (gpu_rans G3): transport by the mean mass flux alone -- no
     // sources, no diffusion (SA). Never set by a runner.
     bool transportOnly = false;
+    // TEST ONLY (MMS): per-cell sources (g.size() each, device) added to the
+    // scalar rhs INSIDE R, before the point-implicit quotient. Null = none.
+    const Real* testSource[2] = {nullptr, nullptr};
     // SST: the specific-omega floor of the COUNTED positivity guard (hits
     // are reported, never silent; docs/rans.md).
     double omegaFloor = 1e-10;
+    // The open domain faces (immersed path); default none.
+    ScalarBoundary bnd{};
 };
+
+// The channel's mutHook: mu_t odd (exactly 0.0 on the wall face) and F1
+// even across the y ghost rows named. Pre: g outlives the hook.
+MutHook mutMirrorYHook(const GpuGrid& g, bool lo, bool hi);
+
+// 1 on rows [jLo, jHi] of every (i, k), 0 elsewhere: the fluid mask of a
+// mesh whose only ghosts are y rows. Pre: 0 <= jLo <= jHi < g.ny.
+std::vector<std::uint8_t> rowMask(const Grid& g, int jLo, int jHi);
 
 // Per-equation RMS of the pure rhs over rows [jLo, jHi] (FP64): continuity,
 // |momentum| / rho, energy / rho, and the scalars: SA nu~ as R / rho; SST k
@@ -250,10 +284,17 @@ public:
     double stableDt(const DeviceCompState& s, ReduceScratch& r, double cfl = 0.4) const;
 
     // --- RANS (dns/rans.hpp, gpu/rans.hpp; docs/rans.md) ---------------------
-    // Install the closure: allocates the scalar stage buffers, mu_t and d.
+    // Install the closure: allocates the scalar stage buffers, mu_t, d and
+    // the local-dt buffers, and installs s.fluidMask (enableSteady's).
     // Pre: curvilinear(), !les(), s.model != None, s.wallDist sized g.size(),
-    // d > 0. Never calling it keeps every path bit-for-bit today's solver.
+    // d > 0, fluidMask empty or g.size(). Never calling it keeps every path
+    // bit-for-bit today's solver.
     std::expected<void, hipError_t> enableRans(const RansSetup& s);
+    // The steady pseudo-time march without RANS (laminar --steady): the
+    // local-dt buffers and the residual mask (1 = real fluid cell, empty =
+    // every cell). Pre: curvilinear(), mask empty or g.size().
+    std::expected<void, hipError_t>
+    enableSteady(const std::vector<std::uint8_t>& fluidMask);
     bool rans() const { return ransModel_ != RansModel::None; }
     RansModel ransModel() const { return ransModel_; }
     int nTurb() const { return ransScalars(ransModel_); }
@@ -262,24 +303,36 @@ public:
     // mu_t of s into mut() (primitives refreshed). Pre: rans().
     void updateMut(const DeviceCompState& s);
     // Pure rhs of every equation at s (hooks included, scalar kernel in
-    // explicit mode) into scratch, then FP64 RMS per equation over rows
-    // [jLo, jHi]. Not state differencing. Pre: rans(), s stage-hook
-    // consistent, between steps only (it reuses the stage scratch).
+    // explicit mode) into scratch, then FP64 RMS per equation over the
+    // installed fluid mask. Not state differencing. Pre: enableRans or
+    // enableSteady ran, s stage-hook consistent, between steps only (it
+    // reuses the stage scratch).
+    ResidualNorms residual(const DeviceCompState& s, ReduceScratch& r);
+    // The same over rows [jLo, jHi] instead of the mask (gpu_rans_mask pins
+    // the two equal bitwise on the channel). Pre: as residual().
     ResidualNorms residual(const DeviceCompState& s, int jLo, int jHi,
                            ReduceScratch& r);
+    // The pure rhs of every equation at s into `out` (the stage's residual
+    // mode; ghost cells meaningless). Pre: as residual(), &out != &s, out
+    // sized like s with out.nT == nTurb() (low words never written).
+    void residualInto(const DeviceCompState& s, DeviceCompState& out);
     // The pure rhs the last residual() wrote, every equation and cell; ghost
     // rows meaningless. Valid until the next step() or residual().
     const DeviceCompState& residualField() const { return q2_; }
     // Per-cell local dt_c = min(cfl/wave_c, diffusive_c) into the lts ratios
-    // dt_c/dtRef; returns dtRef = min_c dt_c (FP64). Pre: rans().
+    // dt_c/dtRef; returns dtRef = min_c dt_c (FP64). The diffusive bound is
+    // RANS's per-cell one, or the molecular one (mu_t = 0) without RANS.
+    // Pre: enableRans or enableSteady ran.
     double localDt(const DeviceCompState& s, ReduceScratch& r, double cfl);
+    // The per-cell dt_c of the last localDt, FP64, g.size() entries.
+    const DeviceBuffer<double>& localDtCells() const { return dtc_; }
     // step() passes the lts ratios in every StageCombine when on.
     // Pre (on): localDt or uploadLts ran.
     void setLts(bool on);
     // Compensated accumulation (DeviceCompState::lo): the stage buffers gain
-    // low words and every step() writes through them. Irreversible. Only the
-    // channel wall keeps its overwritten cells' low words consistent; a runner
-    // installing any other state-overwriting hook must not enable this.
+    // low words and every step() writes through them. Irreversible. Every
+    // state-overwriting hook must zero its overwritten cells' low words (the
+    // channel wall and the O-grid rows do).
     // Post: step() requires s.compensated().
     std::expected<void, hipError_t> enableCompensation();
     bool compensated() const { return compensated_; }
@@ -289,6 +342,10 @@ public:
     unsigned long long floorHits() const;
     // SST: the per-cell F1 blend of the last stage or updateMut.
     const DeviceScalar& f1() const { return f1_; }
+    // The eddy conductivity scale cp / Pr_t the RANS/LES face flux uses.
+    Real eddyKapScale() const { return Real(tr_.cp() / prt_); }
+    // RANS: the wall distance enableRans uploaded (FP32, g.size()).
+    const DeviceScalar& wallDistance() const { return wd_; }
 
     // Primitives of s into the internal scratch (valid until next step call);
     // exposed for app-side diagnostics/BC kernels.
@@ -356,14 +413,18 @@ private:
     // cr = 1 already).
     void stage(const DeviceCompState& s, const StageCombine& cmb,
                DeviceCompState& out, bool residualMode = false);
-    // mu_t from the live primitives of s into nut_, mirrored odd across the
-    // wall ghost rows. Pre: rans(), primitives(s) current.
+    // mu_t from the live primitives of s into nut_, then the mesh family's
+    // image rows (mutHook_). Pre: rans(), primitives(s) current.
     void ransMut(const DeviceCompState& s);
     // The per-cell RANS diffusive dt functor over s. Pre: rans().
     rans::RansDiffDt ransDiffDt(const DeviceCompState& s) const;
     // (Re)allocate both stage buffers for nT scalars, low words iff
     // compensated_.
     std::expected<void, hipError_t> allocStages(int nT);
+    // The local-dt buffers (lts_, dtc_) and the residual mask. Pre: mask
+    // empty or g.size().
+    std::expected<void, hipError_t>
+    allocSteady(const std::vector<std::uint8_t>& mask);
     // Device pointer table of curv_; pre: curvilinear().
     CurvView curvView() const;
 
@@ -372,6 +433,7 @@ private:
     Real csLes_ = Real(0);  // SGS model constant (0 = molecular DNS)
     Real smagCd_ = Real(0); // C^2 * Delta^2 (filter width folded in)
     SgsModel sgs_ = SgsModel::Smagorinsky;
+    ScalarBoundary bnd_{};  // RANS open domain faces (enableRans)
     Real prt_ = Real(0.9);  // turbulent Prandtl number
     // Two stage buffers, not three: SSP-RK3 needs the running state plus one
     // stage output at a time once the rhs is not materialized separately.
@@ -385,12 +447,18 @@ private:
     DeviceScalar mrfPsi_, mrfPc_[3];
     DeviceScalar u_, v_, w_, e_, p_, T_;
     DeviceScalar nut_;      // per-cell dynamic eddy viscosity (LES or RANS)
-    // RANS (enableRans): model, wall distance, mirror flags, the lts ratios
-    // and the FP64 per-cell dt scratch localDt reduces.
+    // RANS (enableRans): model, wall distance, the mu_t image hook, the lts
+    // ratios and the FP64 per-cell dt scratch localDt reduces.
     RansModel ransModel_ = RansModel::None;
-    bool ransMirrorLo_ = false, ransMirrorHi_ = false, ransTransport_ = false;
+    bool ransTransport_ = false;
+    MutHook mutHook_;
+    const Real* testSrc_[2] = {nullptr, nullptr};
     DeviceScalar wd_, lts_, f1_;
     DeviceBuffer<double> dtc_;
+    // Residual / guard mask (1 = counted); empty = every cell. maskCount_ is
+    // the number of counted cells, the residual's RMS denominator.
+    DeviceBuffer<std::uint8_t> mask_;
+    double maskCount_ = 0;
     DeviceBuffer<unsigned long long> hits_;
     double omegaFloor_ = 0;
     bool ltsOn_ = false;

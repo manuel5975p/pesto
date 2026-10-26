@@ -4,6 +4,7 @@
 #include "dns/gpu/internal/stage_write.hpp"
 #include "dns/gpu/index.hpp"
 #include "dns/gpu/internal/plane_sums.hpp"
+#include "dns/gpu/internal/rans_wall.hpp"
 #include "dns/gpu/internal/wall_ghost.hpp"
 
 #include <cassert>
@@ -75,7 +76,7 @@ __global__ void kChannelWallTurb(GpuGrid g, const Real* rho, Real* t0)
     bool hi;
     std::size_t c, s;
     if (!internal::yGhostPair(g, t, i, k, hi, c, s)) return;
-    t0[c] = -rho[c] * t0[s] / rho[s];
+    t0[c] = internal::saGhost(rho[c], rho[s], t0[s]);
 }
 
 // The SST ghost pair: k antimirrored like nu~; omega a DIRICHLET image of the
@@ -89,9 +90,8 @@ __global__ void kChannelWallSst(GpuGrid g, Real coef, const Real* rho, Real* t0,
     bool hi;
     std::size_t c, s;
     if (!internal::yGhostPair(g, t, i, k, hi, c, s)) return;
-    t0[c] = -rho[c] * t0[s] / rho[s];
-    const Real ww = coef / (Real(0.5) * (rho[c] + rho[s]));
-    t1[c] = rho[c] * (Real(2) * ww - t1[s] / rho[s]);
+    t0[c] = internal::saGhost(rho[c], rho[s], t0[s]);
+    t1[c] = internal::sstOmegaGhost(coef, rho[c], rho[s], t1[s]);
 }
 
 // The 5 + nT field pointers of a state, DeviceCompState order.

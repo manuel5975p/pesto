@@ -11,8 +11,10 @@
 #include "dns/gpu/internal/derived_remap.hpp"
 #include "dns/gpu/internal/frame_scratch.hpp"
 #include "dns/gpu/internal/run_loop.hpp"
+#include "dns/gpu/internal/steady_march.hpp"
 #include "dns/gpu/reductions.hpp"
 #include "dns/pseudo_time.hpp"
+#include "dns/rans_label.hpp"
 #include "dns/remap.hpp"
 #include "dns/steady_stop.hpp"
 
@@ -24,6 +26,7 @@
 #include <cmath>
 #include <cstdio>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
@@ -66,8 +69,8 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     // is exactly 0 on the wall faces (docs/rans.md).
     if (rans && !dev->enableRans({.model = r.rans,
                                   .wallDist = r.wallDist,
-                                  .mirrorYLo = true,
-                                  .mirrorYHi = true}))
+                                  .mutHook = mutMirrorYHook(gg, true, true),
+                                  .fluidMask = rowMask(g, 1, g.ny - 2)}))
         return fail(6, "GPU allocation failed (RANS)");
     if (explicitSteady && !dev->enableCompensation())
         return fail(6, "GPU allocation failed (compensated state)");
@@ -248,8 +251,7 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     int sinceDt = 1 << 30;
     internal::ProfileSchedule prof(r.profileDt);
     const auto wall0 = std::chrono::steady_clock::now();
-    const std::string ransLabel = rans ? "RANS " + std::string(ransName(r.rans))
-                                       : std::string();
+    const std::string ransLabel = rans ? ransModelLabel(r.rans) : std::string();
 
     if (implicitSteady)
     {
@@ -341,7 +343,7 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
             const auto g0 = std::chrono::steady_clock::now();
             if (upload(q) != hipSuccess)
                 return fail(6, "implicit column upload failed");
-            const ResidualNorms n = dev->residual(*ds, jLo, jHi, *red);
+            const ResidualNorms n = dev->residual(*ds, *red);
             if (channelGatherColumn(gg, dev->residualField(), xfer, Rf) !=
                 hipSuccess)
                 return fail(6, "implicit residual download failed");
@@ -455,84 +457,78 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
         // their fixed point, not on the residual: the FP32 residual floors
         // above the slow mode's (docs/rans.md, "Stopping on the integrals").
         // t accumulates dtRef and is NOT a physical time.
-        dev->setLts(true);
-        bool converged = false;
-        double resid = HUGE_VAL, remaining = HUGE_VAL;
-        SteadyStop stop(sst ? 4 : 3);
         // Residual in wall units: L = delta = 1, U = u_tau = 1, and the
-        // energy scaled by the bulk estimate (docs/rans.md, D11).
-        auto statsRow = [&](double dt) -> std::expected<void, RunError> {
-            const ResidualNorms n = dev->residual(*ds, jLo, jHi, *red);
-            auto w = measure();
-            if (!w) return std::unexpected(w.error());
+        // energy scaled by the bulk estimate (docs/rans.md, D11). The sample
+        // keeps what its row prints.
+        std::optional<WallState> w;
+        double resid = HUGE_VAL, resU = 0, resE = 0, resT = 0, tBulk = 0;
+        internal::SteadyMarchIo io;
+        io.afterStep = [&](DeviceCompState& s) { wall->apply(s); };
+        io.sample = [&](long) -> std::expected<std::vector<double>, RunError> {
+            const ResidualNorms n = dev->residual(*ds, *red);
+            auto m = measure();
+            if (!m) return std::unexpected(m.error());
             if (auto h = internal::checkDevice("a stats row", &*red); !h)
                 return std::unexpected(h.error());
+            w = *m;
             // SST: k and ln(omega) rates, the larger of the two.
-            const double resU = n.mom, resE = n.E / ubEst,
-                         resT = sst ? std::max(n.t[0], n.t[1]) : n.t[0];
+            resU = n.mom;
+            resE = n.E / ubEst;
+            resT = sst ? std::max(n.t[0], n.t[1]) : n.t[0];
             resid = std::max({resU, resE, resT});
             if (!std::isfinite(resid))
                 return fail(7, "the residual is not finite (the state "
                                "diverged)");
             // Bulk T, not T - Twall: the excess is a 0.6% difference of two
             // FP32-resolved numbers, its relative noise is 5e-6, not 3e-8.
-            const double tBulk = r.Twall + w->tExcess;
-            // Equally spaced samples only: the cap row is off the cadence.
-            if (st.steps % cad.every == 0)
-            {
-                const double q[4] = {w->ubulk, tBulk, w->turb[0], w->turb[1]};
-                stop.push(std::span(q, sst ? 4 : 3));
-                remaining = stop.remaining(r.steadyTol);
-            }
+            tBulk = r.Twall + w->tExcess;
+            std::vector<double> q = {w->ubulk, tBulk, w->turb[0]};
+            if (sst) q.push_back(w->turb[1]);
+            return q;
+        };
+        io.row = [&](const internal::SteadyRow& sr) {
             const double retau = 0.5 * (w->utauBot + w->utauTop) * r.delta / nu;
-            std::vector<double> row = {t, dt, w->ubulk, w->utauBot, w->utauTop,
-                                       retau, w->ke, w->mutMax};
+            std::vector<double> row = {sr.t,       sr.dtRef,   w->ubulk,
+                                       w->utauBot, w->utauTop, retau,
+                                       w->ke,      w->mutMax};
             if (sst) row.push_back(double(dev->floorHits()));
-            row.insert(row.end(), {double(st.steps), resid, resU, resE, resT,
-                                   tBulk, remaining});
+            row.insert(row.end(), {double(sr.iter), resid, resU, resE, resT,
+                                   tBulk, sr.remaining});
             out.row("stats", row);
-            converged = remaining < r.steadyTol;
-            if (converged || st.steps >= r.steadySteps ||
-                st.steps - cad.lastPrint >= 10 * cad.every)
+            if (sr.print)
             {
                 std::printf("iter=%ld ub=%.4f Re_tau=%.2f mutMax=%.2f "
                             "dtRef=%.2e %s remaining=%.2e resid=%.3e "
                             "(U %.2e E %.2e T %.2e)\n",
-                            st.steps, w->ubulk, retau, w->mutMax, dt,
-                            ransLabel.c_str(), remaining, resid, resU, resE,
-                            resT);
+                            sr.iter, w->ubulk, retau, w->mutMax, sr.dtRef,
+                            ransLabel.c_str(), sr.remaining, resid, resU,
+                            resE, resT);
                 std::fflush(stdout);
-                cad.printed(st.steps);
             }
-            cad.logged(st.steps);
-            if (converged || st.steps >= r.steadySteps) emitProfiles(t, *w);
-            return {};
+            if (sr.last) emitProfiles(sr.t, *w);
         };
-        while (!converged && st.steps < r.steadySteps)
-        {
-            if (stopRequested()) break;
-            if (auto e = internal::recomputeDt(
-                    sinceDt, dtStab, r.dtRecompute, r.dtMargin, 1e-9,
-                    [&] { return dev->localDt(*ds, *red, r.cfl); });
-                !e)
-                return fail(7, e.error());
-            dev->step(*ds, Real(dtStab));
-            wall->apply(*ds);
-            t += dtStab;
-            ++st.steps;
-            if (st.steps - cad.lastLog >= cad.every || st.steps >= r.steadySteps)
-                if (auto e = statsRow(dtStab); !e)
-                    return std::unexpected(e.error());
-        }
+        // 1e-9: the channel's own collapse threshold (wall units).
+        const internal::SteadyMarchParams sp{.cfl = r.cfl,
+                                             .dtMargin = r.dtMargin,
+                                             .collapse = 1e-9,
+                                             .tol = r.steadyTol,
+                                             .dtRecompute = r.dtRecompute,
+                                             .cap = r.steadySteps,
+                                             .statsEvery = r.statsEvery,
+                                             .series = sst ? 4 : 3};
+        auto res = internal::explicitSteadyMarch(*dev, *ds, *red, sp, io);
+        if (!res) return std::unexpected(res.error());
+        st.steps = res->steps;
         if (auto h = internal::checkDevice("the end of the run", &*red); !h)
             return std::unexpected(h.error());
         finishTiming(st, wall0, out);
-        if (!converged && !stopRequested())
+        if (!res->converged && !stopRequested())
             return fail(8, std::format("steady state not reached in {} "
                                        "iterations (remaining change {:.3e} "
                                        "> {:.3g})",
-                                       st.steps, remaining, r.steadyTol));
-        st.converged = converged;
+                                       res->steps, res->remaining,
+                                       r.steadyTol));
+        st.converged = res->converged;
         return st;
     }
 

@@ -143,6 +143,23 @@ public:
     auxBinary(std::string_view kind, int index, std::string_view ext,
               std::span<const float> data);
 
+    // The whole <prefix>_surface.csv (Emit::Surface), written once at the
+    // end of a run: "# <comment>" (the run label), the header, the rows.
+    // make() created and truncated it (phase 3c). No-op success when the
+    // kind is not emitted. Pre: every row has cols.size() entries.
+    [[nodiscard]] std::expected<void, std::string>
+    writeSurface(std::string_view comment, std::span<const std::string> cols,
+                 std::span<const std::vector<double>> rows);
+    bool wantsSurface() const;
+
+    // `--emit mesh`: the whole <prefix>_<which>.bin, which = "mesh" (written
+    // in phase 3, before the first device allocation) or "final" (at the
+    // end). make() created and truncated both. No-op success when the kind
+    // is not emitted. Pre: which is "mesh" or "final".
+    [[nodiscard]] std::expected<void, std::string>
+    writeMeshArtefact(std::string_view which, std::span<const char> bytes);
+    bool wantsMesh() const;
+
     [[nodiscard]] std::expected<void, std::string> flush();
 
     // The end of a run's output contract: closes every stream checked (a

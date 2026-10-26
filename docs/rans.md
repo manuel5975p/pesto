@@ -1,8 +1,9 @@
-# RANS — SA-neg and SST on the compressible channel
+# RANS — SA-neg and SST on the compressible channel and `dns flow`
 
 A RANS field is an ensemble-mean MODEL output: never a grounder, never DNS.
 Every artefact says which closure and which mode (`--dry-run` label, RunMeta
-`"rans"`, the stats header, the progress line):
+`"rans"`, the stats header, the progress line). `dns/rans_label` is the ONE
+producer of every label string (`ransRunLabel`, `ransModelLabel`):
 
 | label | closure |
 |---|---|
@@ -12,16 +13,28 @@ Every artefact says which closure and which mode (`--dry-run` label, RunMeta
 
 Mode suffix: `-- steady (local time stepping: pseudo-time, not time-accurate)`
 with `--steady` (explicit scheme), `-- steady (implicit Newton pseudo-time:
-not time-accurate)` with `--steady --steady-scheme implicit`, `-- URANS
-(time-accurate)` without. A RANS 1D/2D run never carries the DNS label's "2D:
-qualitative only" suffix — the mean really is 1D.
+not time-accurate)` with `--steady --steady-scheme implicit` on the channel,
+`-- steady (implicit Newton-Krylov pseudo-time: not time-accurate)` with it on
+`dns flow`, `-- URANS (time-accurate)` without. A RANS 1D/2D run never
+carries the DNS label's "2D: qualitative only" suffix — the mean really is
+1D. Geometry suffixes: `[axisymmetric wedge DEG deg: ensemble mean, no
+swirl, no 3D wake modes]` on the revolved O-grid, `[immersed ghost wall:
+first-order wall position, NOT body-fitted]` without `--ogrid`.
 
-Built (this round): `dns channel --rans none|sa-neg|sst-2003m|sst-vm`, plus
-`--steady TOL` / `--steady-steps N` / `--steady-scheme explicit|implicit`.
-Not built: `dns flow` (O-grid, plate,
-immersed bodies), wall models, the incompressible branch, MUSCL scalar
-convection. `--rans` is registered only on `dns channel`, only with the
-closures that exist.
+Built: `dns channel --rans none|sa-neg|sst-2003m|sst-vm`, plus
+`--steady TOL` / `--steady-steps N` / `--steady-scheme explicit|implicit`;
+`dns flow --physics compressible --rans ...` on the body-fitted O-grid
+(2D/z-extruded and the revolved sphere wedge) and on the immersed ghost wall
+(uniform or `--focal`), URANS and the explicit local-time-stepping steady
+march -- whose integral stop does NOT certify on external flows (section
+"dns flow" below) -- plus the laminar compressible `--steady` on `--ogrid`,
+and the flow Newton-Krylov march (`--steady-scheme implicit`, O-grid at
+`--nz 1` or the wedge), which reaches the same plateau but failed its stop
+gate B0 too. A laminar steady run is labelled `DNS -- steady (local time
+stepping: pseudo-time, not time-accurate)`. Not built: the full-revolution
+3D sphere, dual-time URANS, wall models, the incompressible branch, MUSCL
+scalar convection. `--rans` is registered only where it is built
+(`ransBuilt(Subcommand)`), only with the closures that exist.
 
 Sources: TMR `spalart.html`, `sst.html` (read 2026-10-24); MKM chan180 /
 chan395 `.means` (Re_τ 178.12 / 392.24; ub⁺ by trapezoid over the published
@@ -360,6 +373,341 @@ Rejected alternatives (masterplan, reviewer reruns of the prototype):
 - **An unarmed stop**: certified ub 1.1% off after rejections (a1 F5), and a
   damped stall (a3).
 
+## `dns flow` on the body-fitted O-grid (built 2026-10-25)
+
+`dns flow --physics compressible --ogrid --rans sa-neg|sst-2003m|sst-vm
+[--steady TOL]`, cylinder / lens / cube / z-invariant mesh (masterplan_flowrans
+P1). Wall-resolved only: the validator warns when the first-cell y⁺ estimate
+(h1/D)·Re·0.38·Re^-0.1 (a bluff-body PEAK u_τ, calibrated on OpenFOAM's
+0.137 U for the sphere at Re 1e4) is above 1; the run measures y⁺ (stats
+`yplusMax`, `yplusMean`). Rejected by name: incompressible, `--les`/`--sgs`,
+any `--rotor-*`, `--scene`, `--penalize`, `--cut-flux`, `--pot`, `--seq`,
+`--noslip`, wall-mounted bodies, and immersed (non-`--ogrid`) bodies.
+
+**Plumbing (P0, bit-identical).** `RansSetup` carries a `mutHook` (the mesh
+family's μt/F1 image rows, run after μt is formed on every cell and before
+any flux reads it) and a `fluidMask` (1 = real fluid cell: the SST guard
+counts only these, `residual()` norms only these) in place of the channel's
+y-mirror flags; `testSource` (TEST ONLY, compile-time) enters R before the
+point-implicit quotient. `residualInto(s, out)` writes the pure rhs into a
+caller buffer. `enableSteady(mask)` gives the laminar march its local-dt
+buffers (`rans::LaminarDiffDt`, μt = 0, a separate functor so the RANS
+functor's code is untouched). The ghost scalar algebra is
+`gpu/internal/rans_wall.hpp` (moved verbatim from the channel); the explicit
+steady driver is `gpu/internal/steady_march.hpp`, the channel migrated onto it
+— all byte-identical to 2eb06ba (the masterplan's 15-case protocol).
+
+**Wall row** (j = 0): ν̃_g = −ρ_g ν̃₁/ρ₁ (SA) and k the same; SST ω_g the
+Dirichlet image of ω_w = 60 μ(T_f)/(β1 d1²)/ρ_f **per wall face** (i, k): the
+face table holds 60 μ_ref/(β1 d1²) and Sutherland scales it by μ(T_f)/μ_ref
+on the face temperature (the channel's constant-μ ω_w under Sutherland is a
+recorded channel limitation, not changed). μt odd (the wall face is exactly
+0.0, so the molecular-only tally is the full wall stress and κ_t = 0 there),
+F1 even. **Far row** (j = ny−1): φ_g = w φ₁ + (1 − w) φ∞ with the mean-flow
+row's own tanh weight w — a convex combination (positive), and the upwind
+flux of an inflow face carries φ∞ exactly; NOT a reflection. μt and F1 an
+EVEN copy of row ny−2 (SST's centre gradient on row ny−1 wraps to row 0).
+Both rows zero their cells' Kahan low words on a compensated state.
+
+**Wall distance**: exact distance to the DISCRETE wall polyline (node row
+j = 1) at the node-mean centroid, `ogridWallDistance` (threaded, bitwise
+thread-count independent); ghosts take their source row's d. On a circle it
+sits within the polyline's sagitta R(1 − cos(π/nx)) of r − R.
+
+**Freestream** (decision 4), in FREESTREAM units so a Mach study keeps the
+inflow turbulence: SA `--rans-nutinf` ν̃∞/ν∞ (3, TMR); SST `--rans-kinf`
+k∞/U∞² (2.25e-7: TMR's 9e-9 c∞² at M 0.2, Tu 0.0387%) and `--rans-mutinf`
+μt∞/μ∞ (0.009) → ω∞ = ρ∞k∞/(R μ∞) (0.25 U/D at Re 1e4).
+
+**Stats** append `cdp, cdf, mutMax, yplusMax, yplusMean, floorHits` (RANS) and
+`iter, resid, resU, resE, resT, remaining` (compressible steady); residual
+norms in freestream units (ρ∞, U∞, D: momentum D/U², energy D/U³, SA
+1/U², SST k D/U³ and ln ω D/U). `--emit surface` writes `<out>_surface.csv`
+once at the end (`docs/viewer-format.md`). RunMeta adds `"ransMode"`,
+`"ransInflow"` on flow RANS / compressible steady runs only.
+
+**Verification**: `gpu_rans_ogrid` (a)–(g) and the residual MMS
+`gpu_rans_mms`: on the annulus (32×24, 64×48, 128×96, β 1) the scalar
+residual converges at order 1.85 (SA, u = 0: diffusion, sources, cb2, ∇ρ),
+1.88/1.85 (SST k/ω, u = 0, F1 = F2 = 1 branch), 0.91 / 0.97 (SA full /
+convection-isolated: the first-order upwind) and 0.92/0.90 (SST full); the
+FP64 reference's own error is ≤ 1e-7 of the finest.
+
+### The explicit steady march does not certify on the O-grid (G1b, U1/U2)
+
+Measured 2026-10-25 (gfx1100), cylinder Re 40, `--n 256 --ny 96`, M 0.2,
+`--steady 1e-4`, cap 1e6:
+
+| run | cd at the plateau | settles to 1e-4 / 1e-5 (all three series) | ms/iteration | stop |
+|---|---|---|---|---|
+| laminar (`DNS -- steady`) | 1.56656 | 18600 / 27400 it | 0.10 | never certifies (exit 8 at 1e6) |
+| RANS SA-neg | 1.57012 | 18000 / 25400 it | 0.24 | never certifies |
+| RANS SST-2003m | 1.56656 | 18600 / 27800 it | 0.25 | never certifies |
+| RANS SA-neg, lens `--aspect 4` Re 1e5, 256×128 β 5.5 | 0.084–0.088 | — (cd p-p 7%, cl −0.013 to −0.017, resid ~18) | 0.25 | never: no steady state reached |
+
+The cylinder integrals converge, then JITTER at the FP32 floor: cd, cdf and
+the wake deficit W reverse by 2.1e-6, 2.5e-6 and 3.3e-6 RELATIVE inside the
+stop's window (sd 3–6e-7) — above kSteadyFlat = 2^-20 = 9.5e-7, so the
+window is never "monotone to the sampling noise" and the flat branch never
+fires. The turbulence integrals are flat (1e-8). Cause: the FP32 residual
+floor moves the compensated state by ~1 ulp per cell, and a pressure-
+integrated coefficient amplifies p's ulp by p/q∞ = 2/(γM²) ≈ 36 at M 0.2
+(the channel's ub and bulk T are not amplified: 1.4e-7 there). The proposed
+U2 remedy measured NOT sufficient: the mean of the last 8 iterates jitters
+the same (the noise is correlated over hundreds of iterations); a 200-
+iterate mean certifies cd and cdf but W still reverses by 1.9e-6. The lens
+at Re 1e5 does not reach a steady state at all (non-geometric oscillation).
+Per the masterplan this is the G1b stop clause: reported, no constant
+loosened, nothing flipped — a decision (U1/U2) for the user. Until then a
+compressible `--steady` run on the O-grid ends at its cap with exit 8, the
+honest non-convergence report, and the settled plateau is read from the
+stats.
+
+**URANS** (G1c, cylinder Re 1e4, `--n 384 --ny 192 --ogrid-beta 4
+--ogrid-far 30`, quiet start, 5 D/U): finite, 0 guard hits, y⁺max 0.65–0.66;
+0.117 ms/step laminar, 0.275 SA-neg (2.3×), 0.325 SST-2003m (2.8×); μt/μ max
+178 (SA) / 6.2 (SST) at t = 5 D/U.
+
+## Axisymmetric wedge and the revolved O-grid (built 2026-10-26)
+
+`dns flow --physics compressible --body sphere --ogrid --nz 1 [--ogrid-wedge
+DEG]` (masterplan_flowrans P2a/P2b): the O-grid REVOLVED about x
+(`buildRevolvedOGrid`), i = θ from the UPSTREAM axis (`--n` meridional
+cells over [0, π], grid nx = n + 2), j = r (two ghost rows), k = φ: the
+WEDGE of DEG (default 5) degrees, one real cell plane between two ghost
+planes (internal nz 3). Labelled `[axisymmetric wedge DEG deg: ensemble
+mean, no swirl, no 3D wake modes]` (a DNS run: no "ensemble mean"; a
+time-accurate one adds `; axisymmetric unsteadiness only -- NOT the
+sphere's physical shedding`). The full revolution (`--nz N`) is P4, not built.
+
+**Axisymmetry is a mesh plus a ghost hook, never a kernel branch.**
+
+- **Axis faces are exactly degenerate**: the axis node columns sit at ρ = 0
+  to the bit (θ evaluated on the half nearer 0 and reflected), so the +i
+  face S of columns 0 and nTheta is (0, 0, 0) and NO flux of any kind
+  crosses the axis (`faceFluxCurv` multiplies every term by S).
+  `CurvMetrics::build` requires it and stores the analytic LIMIT metric there:
+  rows j, k of dξ/dx are 0 (read only times S = 0), row i is (t_j × e_φ)/(c_i ·
+  (t_j × e_φ)), c_i = ±2ρ_F ρ̂_F the vector from the fluid cell's centroid to
+  its across-axis continuation — ŷ/(2ρ_F) on the real plane (test `ogrid`,
+  2e-16). The axis cell's centre gradient is then the across-axis central
+  difference (the Mohseni–Colonius r → −r treatment) on a finite metric.
+- **Ghost columns hold the across-axis CONTINUATION** (`gpu/axis_bc`, after
+  the O-grid rows): (i_g, j, 1) = R_x(π) of (i_s, j, 1), every row; then the
+  ghost planes (i, j, 0/2) = R_x(∓Δφ) of plane 1, every column (rotations
+  about x commute). Bit-exact against a host recomputation (explicit fmas).
+- **The ghost-column GEOMETRY is a placeholder.** The masterplan's point
+  reflection node(0) = 2 node(1) − node(2) has the WRONG handedness — an
+  across-axis continuation runs its azimuth backwards in index space, so the
+  placeholder's volume and its j/k face Jacobians are negative (measured:
+  `degenerate face Jacobian at cell (0, 0, 0) axis 1`). The nodes are kept,
+  and `build()` gives the placeholder columns their real neighbour's volume
+  and j-/k-face tables; no real cell reads them.
+- **`AxisWrap::MirrorZ`**: node planes 0..2 at φ = −3/2, −1/2, +1/2 Δφ are
+  written as exact z-mirrors, node(3) is the mirror of node(0), so the two
+  side faces of the real plane are exact mirrors (bitwise).
+- **The wedge's azimuthal CFL width is ρ, not ρΔφ** (a deviation from the
+  masterplan's "no change"): the ghost planes are slaved rotations, no
+  azimuthal mode exists, and the side faces carry only hoop terms whose
+  rates go as 1/ρ. `build()` scales aov[2] by Δφ on a MirrorZ axis. With the
+  1/(ρΔφ) width the axis cells' diffusive dt fell below the 1e-6 collapse
+  guard at 256×192×5° and 128×96×2.5° (measured, exit 7 on the first
+  iterations); with ρ the same runs march, and L1/L2 reach the same plateau
+  as before (cd to 6 digits) in fewer iterations (cd settled to 1e-4: L1
+  31400 → 16000, L2 45200 → 32200).
+- **Far row**: the same LODI algebra on each far face's own 3D normal (from
+  the metrics), the tangential deviation blended by the same tanh weight.
+- **Tallies** over the real faces only (i ∈ [1, nTheta], plane 1) times
+  2π/Δφ; the lateral forces and the torque are 0 by symmetry. qRef on πD²/4.
+  Archimedes on a linear pressure: the scaled tally within 0.5% (test
+  `gpu_axisym` (g); the residual is the first-cell face pressure).
+- **Wall distance**: exact, unsigned BVH distance to the real wall quads (4
+  triangles each through the centroid; the axis quads' degenerate triangle
+  dropped), `revolvedWallDistance`.
+- **Stats** add `lr` (the recirculation length on the downstream axis
+  column); the run prints θ_s (first cf sign change from the front) and L_r
+  at the end.
+
+Laminar sphere Re 100, M 0.2, wedge 5°, rFar 20 D, β 3 (G2a.2, gfx1100; the
+integral stop does not certify, so these are the settled plateaus at the cap;
+cd settles to 1e-4 in ~16k / 32k iterations at L1 / L2):
+
+| level (n × ny) | cd | θ_s | L_r / D | ms/iteration |
+|---|---|---|---|---|
+| L1 64×48 | 1.09280 | 126.27° | 0.898 | 0.120 |
+| L2 128×96 | 1.09492 | 126.43° | 0.890 | 0.145 |
+| L2, wedge 2.5° | 1.09556 (+5.8e-4) | 126.38° | 0.892 | 0.148 |
+
+Literature context only (Johnson & Patel 1999): cd ≈ 1.09, θ_s ≈ 127°, L_r
+≈ 0.88 D. G2a.3 (Δφ 2.5° vs 5° cd within 1e-3): +5.8e-4, pass. L3 (256×192):
+cd 1.09543, θ_s 126.47°, L_r 0.889 D (0.266 ms/it, 47k iterations to 1e-4).
+
+**OpenFOAM parity on the identical mesh (`sph100`, docs/validation.md)**:
+`--emit mesh` → `tools/parity/dnsmesh.py` → `simpleFoam`; tier B (dns cd0 =
+(4 cd(M 0.1) − cd(M 0.2))/3 vs the incompressible solver): −0.49% / −0.095% /
+−0.013% at L1 / L2 / L3 — gate |ΔCd| ≤ 0.5% at L2 passes and the gap closes
+monotonically; θ_s within 0.2°, L_r within 0.3% at L3.
+
+**RANS on the wedge, sphere Re 1e4 (G2b, gfx1100): the explicit march does
+not reach a steady state.** M 0.2, 5°, rFar 20 D, β 4.5, cap 2e6:
+
+| run | ms/it | outcome |
+|---|---|---|
+| SA-neg L1 64×48 | 0.24 | exit 8: cd oscillates between −5.5 and +6.2 with a period ~1.5e6 iterations, resid ~800 (y⁺max 0.77, μt/μ max 108, 0 hits) |
+| SST-2003m L1 | 0.45 | exit 7 at 4.5e5 (diverged; 0 guard hits before) |
+| SA-neg L2 128×96 | 0.31 | stopped at 5.8e5: cd between −2.3 and +7.3 |
+
+Before the azimuthal-CFL-width change above (the 1/(ρΔφ) width, i.e. a
+smaller axis dt) the same march gave L1 SA garbage (θ_s 3.7°), L1 SST exit 7
+at 4.8e4, but L2 SA settled near cd 0.4248 (θ_s 87.4°, L_r 1.22 D, resid
+0.045) and L2 SST near 0.4098 (θ_s 86.7°, L_r 1.25 D, resid 1.08) — against
+a3's OpenFOAM SA (a different 128-cell mesh) 0.4149. Whether the width change
+or the pseudo-time path is responsible is not isolated; the masterplan's
+answer to a non-geometric oscillation is "stop and report" (R3/U1), and the
+Newton-Krylov march that was to fix it does not converge here either (next
+section). The OpenFOAM half of `sph1e4` is built (`tools/parity/sph1e4.py
+case <mesh> <dir> sa|sst 1e4`); the comparison waits for a dns steady state.
+
+## Newton–Krylov pseudo-time on `dns flow` (built 2026-10-26; stop gate B0 FAILED)
+
+`--steady TOL --steady-scheme implicit` on `--ogrid` at `--nz 1` or the
+revolved wedge (`gpu/nk`, `gpu/internal/nk_march.hpp`; masterplan_flowrans
+4.7). Per Newton step `(diag(1/Δτ_c) − ∂R/∂q) Δq = R(q)`, Δτ_c = CFL dt_c:
+
+- an FP64 master iterate; the kernels see its FP32 rounding, hooked. R is
+  ALWAYS `residualInto` — the central KG stage, no added dissipation — so
+  the fixed point is the explicit march's (measured: the same cd to 6
+  digits, below).
+- JFNK: J v = [R(q + ε D v) − R(q)]/ε on the scaled unknowns (ρ∞, ρ∞(U+c),
+  ρ∞c², SA ρ∞ max(ν̃∞, ν), SST ρ∞U², ρω per cell). GMRES(40), CGS2 with FP64
+  masked dots, forcing 0.1, ≤ 200 Krylov per step.
+- P = diag(1/Δτ) − J₁, J₁ the FP64 dual-number derivative (`dns/dual.hpp`,
+  `dns/nk_precond.hpp`) of a first-order Rusanov + compact-viscous flux, with
+  the wall mirror and the wedge rotations folded into the diagonal; the
+  scalars block-diagonal (upwind on the frozen KG mass flux, compact
+  diffusion, the point-implicit source rate). Applied by a symmetric
+  LEXICOGRAPHIC line Gauss–Seidel along the wall-normal lines (one 32-lane
+  workgroup per line: the block-Thomas chain per row is one 5×5 product,
+  lane-parallel).
+- Continuation: CFL 10, ×2 per undamped step to 1e8, rejection (residual
+  growth > 3×, non-finite, singular line pivot, GMRES breakdown) restores and
+  cuts ×0.1, exit 7 below 0.1; the step length keeps ρ and E within 20%, SST
+  ρω above −50% and ρk above −90% (whole-step scaling). The stop hears the
+  integrals ONLY on an armed step (undamped, at the cap).
+
+| constant | value | bracket |
+|---|---|---|
+| `kNkCfl0`, growth, cap, min | 10, ×2, 1e8, 0.1 | a2 prototype |
+| `kNkRejectGrowth` | 3 | plan |
+| `kNkRestart`, `kNkMaxKrylov`, `kNkForcing` | 40, 200, 0.1 | a2: 1e-2 stalled at the cap, 0.1 converged |
+| `kNkFdStep` | **2⁻¹⁴** (the plan's 2⁻¹⁰ FAILED N1) | N1 sweep below |
+
+Gates (gfx1100; test `gpu_nk` for N1–N3):
+
+- **N1 (J v)**: forward ε vs central 2ε, per field, 16×12 cylinder Re 40.
+  2⁻¹⁰: mean flow ≤ 4.6e-3 but SA's ν̃ 2.3e-2 (mid-transient) / 7.2e-2 (near
+  the plateau) — FAIL; 2⁻¹² 3.0e-3 / 2.8e-2; **2⁻¹⁴ 1.1e-3 / 5.7e-3 (mean flow
+  ≤ 3.4e-3) — PASS**, adopted per the plan's sweep rule.
+- **N2 (assembly)**: the dual blocks equal a 4th-order central difference of
+  F_P to 5e-12; the GPU's FP32-stored blocks equal a host FP64 restatement
+  built from those central differences to 5.7e-8 of the block scale, every
+  real cell, laminar and SA (the plan's 1e-10 is unreachable with FP32 block
+  storage, which the plan also prescribes — the duals are what is checked at
+  1e-10).
+- **N3 (line-SGS)**: the GPU application equals a host dense block
+  Gauss–Seidel on the downloaded P, same order, to 1.4e-7 (laminar) / 9.5e-8
+  (SA).
+- 2D: ρw stays exactly 0 through Newton iterations.
+- **B0 (stop jitter) — FAILED.** Cylinder Re 40, 256×96, β 3, M 0.2, the
+  last 30 armed iterations at CFL 1e8, (max − min)/mean, gate 2⁻²¹ = 4.8e-7:
+
+  | case | cd | cdf | wake W | ∫ρν̃ | Krylov/step at the cap |
+  |---|---|---|---|---|---|
+  | laminar | 7.4e-6 | 3.8e-6 | 4.2e-5 | — | 5–8 |
+  | SA-neg | 9.9e-6 | 2.6e-6 | 2.9e-5 | 2.4e-7 | 5–7 |
+  | wedge laminar Re 100 L1 | 8.0e-6 | 6.5e-6 | 1.6e-3 | — | ≤ 34 |
+
+  The march sits at the FP32 residual floor (scaled RMS ~6e-5, the explicit
+  compensated march's resid in freestream units, 2.7e-3 vs 2.1e-3), and a
+  Newton step at CFL 1e8 is J⁻¹ of that floor: the integrals jitter at
+  ~1e-5, as the explicit march's do (2–3e-6), so `--steady` never certifies
+  (`remaining` stays inf). Per the plan: STOP, report, U2 (the stop on the
+  mean of the last m armed iterates; measured on the explicit march as
+  insufficient at m = 8, section "dns flow").
+- **N5 (fixed point)**: NK and explicit plateaus agree — cd 1.565558 vs
+  1.56656 (laminar), 1.570117 vs 1.57012 (SA), wedge 1.092797 vs 1.09280.
+  Neither certifies at TOL 1e-5, so the gate's stop-to-stop form is moot.
+- **Not converged**: SST-2003m on the same cylinder (60 iterations: 25
+  rejections, CFL bouncing 27–5e3, cd 1.5696 vs explicit 1.56656, rn 7e-4),
+  the wedge sphere Re 1e4 SA (80 iterations, rn ~1, cd 0.46 ± 36%) and SST
+  (α → 0 from the first step: the ω step bound against the ω_w wall jump;
+  rn 1e7). G3-scale and G3-time were therefore not reached.
+- Cost: 2 s per Newton step at 256×96 (the lexicographic sweep is 2 × 256
+  sequential line launches per Krylov iteration); the laminar cylinder
+  reaches its plateau in ~21 steps (40 s) — the explicit LTS march settles cd
+  to 1e-4 in ~2 s. Red-black lines (measured, then removed — the plan
+  forbids them): every step at the cap ran the full 200 Krylov with GMRES
+  stalled (rel 0.99), jitter 1.4e-4.
+
+## Immersed-wall RANS (built 2026-10-26; labelled; two P5 gates FAILED)
+
+`dns flow --physics compressible --rans ...` WITHOUT `--ogrid`: the body is
+the compressible sharp ghost wall on the uniform or `--focal` box. Labelled
+`[immersed ghost wall: first-order wall position, NOT body-fitted]`
+everywhere — a staircase wall, never a code-to-code number when
+under-resolved (the validator's y⁺ estimate uses h_fine/2).
+
+- The closure lives on the curvilinear path: without `--focal` the solver
+  runs on `CurvMesh::uniform` (RANS only; RANS-off keeps the Cartesian
+  solver bit for bit). Measured cylinder Re 1000, 384², gfx1100: RANS-off
+  Cartesian 0.37 ms/step, SA 0.70, SST 0.75 (1.9–2.0×, curvilinear + RANS).
+- d = |sdf| at the physical cell centre (`immersedWallDistance`; exact for
+  sphere/cylinder/cube/mesh, the lens warns).
+- Ghost images through the velocity's own linear image (`DeviceCompGhost::
+  applyTurb`, after `apply`): ν̃_g = −a Σw ν̃_s, k_g = −a Σw k_s, ω_g = (1 +
+  a)ω_w − a Σw ω_s with ω_w = 60ν_w/(β1 d_s²), d_s = d_w/a, ν_w from the
+  thermo sample — **an UNVERIFIED sub-cell choice**; deep cells ν̃ = k = 0,
+  ω = ω∞; μt_g = −a Σw μt_s and F1_g = Σw F1_s (`mirrorMut`); a compensated
+  state's ghost and deep low words zeroed.
+- Open domain faces (x always, y/z with `--open`): `ScalarBoundary`, a
+  compile-time branch of the scalar kernels — mdot = ρ_c u_c·S of the
+  boundary cell, φ∞ in, φ_c out, no diffusion. The sponge/strip relaxes the
+  scalars to ρφ∞ with the density's strength; the free-slip mirror rows copy
+  scalars, μt and F1 even. NSCBC and the sink stay mean-flow only.
+- The body tally carries μt through the solver's own curvilinear flux; stats
+  add `mutMax, yplusMax, yplusMean, floorHits` (y⁺ the linear-sublayer
+  estimate sqrt(|u_c| d_c/ν_c) per interface face); immersed `--steady` (with
+  `--rans` only) runs the explicit LTS march on the compensated state,
+  stopped on cd and the turbulence integrals.
+
+Gates (`gpu_rans_immersed`, gfx1100):
+
+- **G2-flow — PASS**: focal + ghost wall + NSCBC, SA ν̃ ≡ 0 and SST k ≡ 0:
+  mean flow AND body tally bit for bit the RANS-off run's over 50 steps.
+- **Wall-linear image — PASS**: a plane tilted 30° at a 0.37-cell offset,
+  ν̃ = k = μt = c·d: every ghost reproduces c·sdf to 2.6e-7 (c h); the ω image
+  is ω_w-anchored.
+- **G3-flow — boundary clause FAILED**: a uniform 2⁻¹³ specific scalar rides
+  a non-uniform flow EXACTLY (0 ulp) in the interior, but the NSCBC columns
+  drift 1.36e4 ulp (8e-4 relative) in 100 steps (plan: ≤ 2 ulp) and the
+  drift convects downstream. Cause: NSCBC overwrites the boundary cells'
+  continuity rhs with the characteristic form, which no scalar FLUX — the
+  plan's ρ_c u_c·S included — can match. A consistent form would put the
+  scalar's boundary rhs on φ R_ρ(NSCBC) (non-conservative there); not built
+  without a decision. Pinned in the test as a measured ceiling, not a pass.
+- **SST guard — FAILED (open finding)**: SST trips the COUNTED k guard in a
+  few fluid cells beside the staircase (710 hits in 200 steps on a 128²
+  cylinder, 4 cells; 2.6e4 over 8600 steps at 384² Re 1000). The interface
+  faces carry a nonzero mass flux (the face-average velocity is not the
+  wall's), which upwinds the antimirrored ghost k into the fluid. SA-neg
+  takes ν̃ < 0 by design: 0 hits. Reported in `floorHits`, never silent.
+- Not run (the phase stopped): the immersed channel oracle (heavy tier), the
+  uniform-curvilinear/focal/sinusoidal MMS levels, the momentum-budget tally
+  test (only its ν̃ ≡ 0 bitwise form above).
+- Measured: immersed cylinder Re 40 SA `--steady` (384²): exit 8 at 4e4
+  iterations, cd 2.09 → 2.12 still drifting, resid 0.45 — the uniform mesh
+  gives local time stepping no leverage.
+
 ## dt with RANS (D12)
 
 RANS-only per-cell diffusive bound (`RansDiffDt`): 0.25/(D_c amax_c²),
@@ -407,7 +755,7 @@ Laminar limit: 2nd order to the exact compressible Poiseuille (u and T).
 
 | test | what |
 |---|---|
-| `rans` | SA/SST closed forms: fv1, fw, cw1, r cap, S̃ limiter, the log-layer identity (cw1; γ1 derived vs 5/9: 0 vs 0.43%), SA-neg branch continuity, J ≥ 0, positive branch == standard SA, point-implicit fixed point (and its increment form, exactly 0 there), float/double, F1/F2 limits, limiters, μt branches, wall distance |
+| `rans` | SA/SST closed forms: fv1, fw, cw1, r cap, S̃ limiter, the log-layer identity (cw1; γ1 derived vs 5/9: 0 vs 0.43%), SA-neg branch continuity, J ≥ 0, positive branch == standard SA, point-implicit fixed point (and its increment form, exactly 0 there), float/double, F1/F2 limits, limiters, μt branches, wall distance (channel; O-grid polyline within the sagitta, ghosts, thread-count bitwise), the `ransRunLabel` strings (the channel's exactly) and `ransBuilt` |
 | `rans_channel1d` | the oracle: laminar order, MKM band (5% provisional ceiling, values pinned to 1e-6), log slope, ub order (SA 2nd, SST 1st), Newton < 2 s |
 | `gpu_rans` | G1 lts = 1.0f bitwise; G2 ν̃ ≡ 0 (and SST k ≡ 0) bitwise to RANS off; G3 uniform scalar exact; G4 wall face μt == 0, ghost algebra (SST: ω_w on the face); G5 residual at the oracle at the FP32 floor; G6/G7 oracle fixed point (uniform / random lts); G8 SA-neg ν̃ < 0 patch; G9 (SA, SST-2003m) march onto the oracle; G10 compensated state (TwoSum exact, pair upload/download, plateau ≤ ½ plain, oracle fixed point, perturbed march); SST rough-field positivity, 0 guard hits |
 | `channel_config` | every `--rans`/`--steady`/`--steady-scheme` rule (TOL ∈ [1e-6, 1); implicit rejects `--cfl`/`--dt-recompute`, cap 500, a given `--steady-steps` honoured), labels and describe lines of both schemes, explicit given == defaulted byte for byte, json `"steady"` only on implicit, RANS-off describe unchanged |
@@ -416,7 +764,15 @@ Laminar limit: 2nd order to the exact compressible Poiseuille (u and T).
 | `channel_line` | (a) R at the oracle (tol 1e-11) ≤ 1e-10 momentum/k, ω 1e-13 relative, E ≤ max(1e-7, its 1-ulp floor); (b) band EXACTLY K, ghosts included; (c) J δ vs central FD ≤ 1e-6 (measured 1.5e-7); (d) host Newton from Reichardt: SA/2003m/Vm Re_τ 180 ny 64, SA/2003m Re_τ 1e4 ny 128 in 27–28 iterations, ub ≤ 7e-10 off, mass 1e-12; (e) a damped march never certified (an unarmed stop does); (f) projection: 2 ulp, mass 1e-15; host timings |
 | `pseudo_time` | CFL 100·2^n to the cap at n = 20; α < 1 holds and disarms; rejection ×0.1, false below 1; armed only after an undamped step at the cap; R-b ramp/reject/regrow never arms below the cap; each step bound binds alone, SA has none |
 | `gpu_rans_implicit` | I1 GPU vs line residual per equation (10× measured: ρ 2e-6, mx 3e-4, my 1e-3, E 2e-4, t 5e-4 / 7e-5); I2 line J vs GPU FP32 central FD ≤ 2e-2 (measured ≤ 1.8e-2); I3 one iteration at the oracle: dub ≤ 1.2e-10, mass exact, resid 0.016–0.031; I4 Re_τ 180 cold starts via the binary (27–28 it, ub ≤ 8e-8 off, 0 rejects / hits) + R_mz, w ≡ 0 and bitwise column-uniform state every iteration; I5 Re_τ 1e4 ny 128 (27 it, ≤ 3e-8, 0.1 s); I6 IC residual column-uniform, nx 6 nz 2 iterate == nx 4 nz 1 bitwise; I7 TOL 1e-6 |
-| `gpu_runners` | `--steady 1e-3 --steady-scheme explicit` SA-neg end to end: exit 0, > 1e5 iterations (not at ub's dip), ub within 1.5e-3 of the oracle (TOL + the mass-drift offset); `--steady 1e-4 --steady-scheme implicit`: exit 0, ≤ 60 iterations (27), ub within 1e-5 of the oracle, < 2 s |
+| `gpu_runners` | `--steady 1e-3 --steady-scheme explicit` SA-neg end to end: exit 0, > 1e5 iterations (not at ub's dip), ub within 1.5e-3 of the oracle (TOL + the mass-drift offset); `--steady 1e-4 --steady-scheme implicit`: exit 0, ≤ 60 iterations (27), ub within 1e-5 of the oracle, < 2 s; O-grid SA URANS (RANS columns finite, 0 hits) and the O-grid SA explicit steady march to a 2000-iteration cap (exit 8, a row every 200, finite, 0 hits) |
+| `gpu_rans_mask` | the P0 plumbing on the channel: masked residual == row-range residual bitwise (every norm), `residualInto` == `residualField`, the channel mutHook odd μt / even F1, the SST guard counts only masked cells (0 vs 120 with every cell), `testSource` enters R as one FP32 add, laminar `localDt` == SST's at k ≡ 0 bitwise and the nT = 0 compensated LTS march |
+| `gpu_rans_ogrid` | (a) RANS tables on a RANS-off solver change no bit; (b) ν̃ ≡ 0 / k ≡ 0 mean flow == RANS off bitwise over 50 fixed-dt steps; (c) far row φ∞ to 0.4/0.8 ulp, outer rows after 100 steps; (d) wall-face μt == 0.0, far ghost even copy, F1 even, ω_w per face to 1e-5; (e) a uniform 2^-13 scalar rides ρ exactly (0 ulp) everywhere; (f) SA/SST 200-step URANS on 256×96 finite, 0 hits; (g) compensated LTS: rows 0 and ny−1 low words 0 after every apply |
+| `gpu_rans_mms` | residual MMS on the O-grid annulus, 3 levels: SA u = 0 order 1.85, SST u = 0 1.88/1.85, SA full 0.91, SA convection 0.97, SST full 0.92/0.90 (bands [p − 0.25, p + 0.5]); FP64 reference error ≤ 1e-3 of the finest; the revolved WEDGE ladder with axisymmetric fields (hoop terms): SA u = 0 1.94, SA full 0.97, SST u = 0 1.92/1.93, SST full 0.97/0.89 |
+| `gpu_axisym` | the revolved wedge: (a) uniform x-freestream fixed point (3.4 ulp, outer rows 3.0); (b) side-face mass flux of a random axisymmetric state 0.02 ulp·ρvA; (c) ghost-column R_x(π) / plane R_x(±Δφ) bit-exact vs host; (d) w ≡ 0 kept (2e-10 U over 200 steps); (e) laminar Re 100 smoke; (f) SA/SST 200-step smoke, 0 hits, μt 0 on the wall faces; (g) Archimedes on a linear pressure within 0.5% (×2π/Δφ) |
+| `flow_rans_config` | every `dns flow --rans` / compressible `--steady` accept, reject (by flag, exit 2) and warning; the label/turbulence/wall/y⁺/run describe lines; RANS-off describes byte-identical to HEAD's strings; explicit given == defaulted; RunMeta keys only on flow RANS/steady |
+| `gpu_determinism` | + the O-grid SA URANS run twice, stats byte-identical |
+| `gpu_nk` | the flow Newton–Krylov pieces: dual blocks == 4th-order FD of F_P (5e-12); N2 GPU P blocks == host FD restatement (5.7e-8, FP32 storage); N3 line-SGS == host dense block GS (1.4e-7); N1 forward vs central J v per field at 2⁻¹⁴ (the 2⁻¹⁰/2⁻¹² sweep printed); ρw ≡ 0 and the residual falls through 6 Newton steps (laminar, SA) |
+| `gpu_rans_immersed` | (a) G2-flow: focal + ghost + NSCBC, ν̃ ≡ 0 / k ≡ 0 mean flow and tally == RANS off bitwise; (b) G3-flow: a uniform scalar exact (0 ulp) in the interior, the NSCBC band's drift pinned as a CEILING (the plan's 2 ulp FAILED); (c) the 30° wall-linear image exact to FP32 (ν̃, k, μt) and the ω_w-anchored ω image; (d) SA/SST 200-step immersed URANS finite, μt 0 on deep cells, SA 0 hits (SST's staircase hits counted: an open finding) |
 
 Manual cold starts, `dns channel --n 4 --nz 1 --ny 64 --rans <m> --steady
 1e-6 --steady-steps N`, Re_τ 180, measured 2026-10-24 (gfx1100), BEFORE the

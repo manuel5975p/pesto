@@ -103,7 +103,8 @@ std::unique_ptr<GpuRig> makeGpuRig(const Channel1dCase& cc, int nx, int nz,
     r->wall = std::make_unique<gpu::DeviceChannelWall>(std::move(*wall));
     r->red = std::make_unique<gpu::ReduceScratch>(std::move(*red));
     if (!r->dev->enableRans({.model = cc.model, .wallDist = L.d,
-                             .mirrorYLo = true, .mirrorYHi = true}))
+                             .mutHook = gpu::mutMirrorYHook(r->gg, true, true),
+                             .fluidMask = gpu::rowMask(L.g, 1, L.g.ny - 2)}))
         return nullptr;
     GpuRig* p = r.get();
     p->dev->setStageHook([p](gpu::DeviceCompState& s) { p->wall->apply(s); });

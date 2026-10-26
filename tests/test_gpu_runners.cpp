@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <string>
 
 #ifndef DNS_BIN
@@ -213,6 +214,144 @@ void testChannelSteadyImplicit()
     cleanup(prefix);
 }
 
+// runner_ogrid with RANS (docs/rans.md, "dns flow"): a short SA URANS run on
+// the coarse O-grid cylinder writes the RANS columns, finite, 0 guard hits.
+void testOGridRansUrans()
+{
+    const std::string prefix = "runner_ogrid_sa_urans";
+    const int rc = runDns("flow --physics compressible --body cylinder --ogrid "
+                          "--n 256 --ny 96 --re 40 --rans sa-neg --ramp 0 "
+                          "--ft 0.0006 --emit stats --out " + prefix);
+    check(rc == 0, "runner_ogrid --rans sa-neg URANS: exits 0");
+    if (rc == 0)
+    {
+        check(rowCount(prefix) >= 1, "runner_ogrid RANS: stats rows written");
+        for (const char* c : {"cd", "cdp", "cdf", "mutMax", "yplusMax"})
+            check(allFinite(prefix, c),
+                  std::string("runner_ogrid RANS: ") + c + " finite");
+        check(maxOf(prefix, "floorHits") == 0, "runner_ogrid RANS: 0 hits");
+    }
+    cleanup(prefix);
+}
+
+// runner_ogrid's explicit steady march (SA, Re 40). Measured 2026-10-25
+// (gfx1100): the integrals reach their FP32 plateau within ~5e4 iterations
+// but jitter there by ~2e-6 relative (pressure-integrated cd amplifies the
+// FP32 residual floor by p/q ~ 36 at M 0.2), above kSteadyFlat = 2^-20, so
+// the stop never certifies and the march ends at its cap with exit 8 -- the
+// honest non-convergence report (masterplan_flowrans U1/U2, docs/rans.md).
+// The smoke checks the march, the columns and the cap's exit code.
+void testOGridRansSteadyCap()
+{
+    const std::string prefix = "runner_ogrid_sa_steady";
+    const int rc = runDns("flow --physics compressible --body cylinder --ogrid "
+                          "--n 256 --ny 96 --re 40 --rans sa-neg --steady 1e-4 "
+                          "--steady-steps 2000 --out " + prefix);
+    check(rc == 8, "runner_ogrid --steady at a 2000-iteration cap: exit 8");
+    const auto tbl = valtest::loadCsv(prefix + "_stats.csv");
+    check(tbl.has_value(), "runner_ogrid --steady: stats readable");
+    if (tbl)
+    {
+        check(tbl->col("iter").size() == 10 && tbl->col("iter").back() == 2000,
+              "runner_ogrid --steady: a row every 200 iterations to the cap");
+        for (const char* c : {"cd", "cdf", "resid", "resU", "resT"})
+            check(allFinite(prefix, c),
+                  std::string("runner_ogrid --steady: ") + c + " finite");
+        check(maxOf(prefix, "floorHits") == 0, "runner_ogrid --steady: 0 hits");
+    }
+    cleanup(prefix);
+}
+
+// The revolved sphere's axisymmetric wedge through the binary: the steady
+// march to a short cap (exit 8 by the G1b finding), one surface row per real
+// wall face under the wedge label, and the --emit mesh artefacts at their
+// exact sizes (dns/meshio.hpp: 84-byte header + 3 n nodes + nx nz d1;
+// 28 + 16 names + n per field).
+void testWedgeArtefacts()
+{
+    const std::string prefix = "runner_ogrid_wedge";
+    const int rc = runDns("flow --physics compressible --body sphere --ogrid "
+                          "--nz 1 --n 64 --ny 48 --re 100 --steady 1e-4 "
+                          "--steady-steps 1000 --emit stats --emit surface "
+                          "--emit mesh --out " + prefix);
+    check(rc == 8, "wedge --steady at a 1000-iteration cap: exit 8");
+    std::size_t rows = 0;
+    std::string head;
+    {
+        std::ifstream f(prefix + "_surface.csv");
+        std::getline(f, head);
+        for (std::string l; std::getline(f, l);) ++rows;
+    }
+    check(head.find("[axisymmetric wedge 5 deg") != std::string::npos,
+          "wedge surface CSV: the label comment carries the wedge suffix");
+    check(rows == 65, "wedge surface CSV: header + one row per real wall face "
+                      "(64)");
+    const std::size_t n = 66 * 48 * 3;
+    std::error_code ec;
+    check(std::filesystem::file_size(prefix + "_mesh.bin", ec) ==
+              84 + 24 * n + 8 * 66 * 3,
+          "wedge _mesh.bin at its exact size");
+    check(std::filesystem::file_size(prefix + "_final.bin", ec) ==
+              28 + 8 * 16 + 8 * 8 * n,
+          "wedge _final.bin (8 laminar fields) at its exact size");
+    const double cd = maxOf(prefix, "cd", 0.0);
+    check(std::isfinite(cd) && cd > 0, "wedge: cd finite and positive");
+    for (const char* s : {"_surface.csv", "_mesh.bin", "_final.bin"})
+        std::filesystem::remove(prefix + s, ec);
+    cleanup(prefix);
+}
+
+// The flow Newton-Krylov march through the binary (cylinder Re 40 laminar,
+// 256 x 96): a short cap (exit 8 -- gate B0 failed, the stop cannot certify,
+// docs/rans.md), one row per accepted Newton step with the NK columns, the
+// residual falling. Measured (gfx1100): 12 steps take ~24 s, cd 1.5975 at
+// step 12 on its way to the plateau 1.56656.
+void testOGridNk()
+{
+    const std::string prefix = "runner_ogrid_nk";
+    const int rc = runDns("flow --physics compressible --body cylinder --ogrid "
+                          "--n 256 --ny 96 --re 40 --steady 1e-4 "
+                          "--steady-scheme implicit --steady-steps 12 --out " +
+                          prefix);
+    check(rc == 8, "runner_ogrid --steady-scheme implicit at a 12-step cap: "
+                   "exit 8");
+    const auto tbl = valtest::loadCsv(prefix + "_stats.csv");
+    check(tbl.has_value(), "runner_ogrid NK: stats readable");
+    if (tbl)
+    {
+        const auto& it = tbl->col("iter");
+        const auto& res = tbl->col("resid");
+        check(it.size() >= 10 && it.back() == 12,
+              "runner_ogrid NK: a row per accepted Newton step");
+        check(!res.empty() && res.back() < 0.05 * res.front(),
+              "runner_ogrid NK: the residual falls 20x in 12 steps");
+        for (const char* c : {"cd", "cfl", "alpha", "krylov"})
+            check(allFinite(prefix, c),
+                  std::string("runner_ogrid NK: ") + c + " finite");
+    }
+    cleanup(prefix);
+}
+
+// runner_comp with --rans on the immersed ghost wall (P5): exit 0, the RANS
+// columns finite, SA 0 hits.
+void testImmersedRansUrans()
+{
+    const std::string prefix = "runner_comp_sa_urans";
+    const int rc = runDns("flow --physics compressible --body cylinder --nz 1 "
+                          "--n 192 --re 1000 --rans sa-neg --ramp 0 --ft 0.05 "
+                          "--emit stats --out " + prefix);
+    check(rc == 0, "runner_comp --rans sa-neg (immersed) URANS: exits 0");
+    if (rc == 0)
+    {
+        check(rowCount(prefix) >= 1, "runner_comp RANS: stats rows written");
+        for (const char* c : {"cd", "mutMax", "yplusMax", "yplusMean"})
+            check(allFinite(prefix, c),
+                  std::string("runner_comp RANS: ") + c + " finite");
+        check(maxOf(prefix, "floorHits") == 0, "runner_comp RANS: 0 hits");
+    }
+    cleanup(prefix);
+}
+
 } // namespace
 
 int main()
@@ -229,5 +368,10 @@ int main()
     testChannel();
     testChannelSteady();
     testChannelSteadyImplicit();
+    testOGridRansUrans();
+    testOGridRansSteadyCap();
+    testWedgeArtefacts();
+    testOGridNk();
+    testImmersedRansUrans();
     return dnstest::finish();
 }

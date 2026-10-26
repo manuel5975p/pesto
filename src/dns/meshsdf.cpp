@@ -272,6 +272,13 @@ double MeshSdf::operator()(double x, double y, double z) const
     return dot(sub(p, h.cp), n) < 0 ? -d : d;
 }
 
+double MeshSdf::distance(double x, double y, double z) const
+{
+    Hit h{std::numeric_limits<double>::max(), -1, {}, 6};
+    nearest(0, A3{x, y, z}, h);
+    return std::sqrt(h.d2);
+}
+
 double MeshSdf::winding(double x, double y, double z) const
 {
     const A3 p{x, y, z};

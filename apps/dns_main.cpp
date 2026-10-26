@@ -17,12 +17,14 @@
 #include "dns/geometry.hpp"
 #include "dns/hit_ic.hpp"
 #include "dns/interrupt.hpp"
+#include "dns/meshio.hpp"
 #include "dns/meshsdf.hpp"
 #include "dns/ogrid.hpp"
 #include "dns/operators.hpp"
 #include "dns/output.hpp"
 #include "dns/prop/bemt.hpp"
 #include "dns/prop/liftline.hpp"
+#include "dns/rans_label.hpp"
 #include "dns/remap.hpp"
 #include "dns/scene.hpp"
 #include "dns/taylor_green.hpp"
@@ -324,7 +326,10 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
                          .rFar = c.ogridRFar,
                          .beta = c.ogridBeta,
                          .span = c.ogridSpan};
-    auto og = buildOGrid(g, geo.sdf, spec);
+    const RevolvedSpec rev{.wedge = true,
+                           .dphi = c.ogridWedgeDeg * pi / 180.0};
+    auto og = c.ogridRevolved ? buildRevolvedOGrid(g, geo.sdf, spec, rev)
+                              : buildOGrid(g, geo.sdf, spec);
     if (!og) return die(exitInput, "o-grid: " + og.error());
     std::printf("# o-grid: rWall %.4f..%.4f  h1 %.5g (%.1f cells in D/sqrt(Re))"
                 "  growth %.4f  wall-normal dev %.3g deg\n",
@@ -358,7 +363,10 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
     rr.rotor = c.rotor;
     rr.rotorMrf = c.rotorMrf;
     rr.D = geo.D;
-    rr.qRef = 0.5 * rhoInf * c.uInf * c.uInf * geo.D;
+    // Per unit span on a z-extruded mesh (the runner divides by the span);
+    // the frontal disc pi D^2/4 on a revolved one (a whole body).
+    rr.qRef = 0.5 * rhoInf * c.uInf * c.uInf *
+              (c.ogridRevolved ? 0.25 * pi * geo.D * geo.D : geo.D);
     rr.les = c.cs;
     rr.sgs = c.sgsModel;
     rr.cfl = c.cfl;
@@ -370,9 +378,44 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
     rr.vortAsinh = c.vortAsinh;
     rr.speedDelta = c.speedDelta;
     rr.tempFrames = c.tempFrames;
+    rr.cx = c.placement.cx;
+    rr.cy = c.placement.cy;
+    rr.cz = c.placement.cz;
+
+    // RANS / steady (docs/rans.md, "dns flow"): the exact distance to the
+    // DISCRETE wall polyline, the freestream scalars, the run label. The
+    // wall distance also feeds d1 and y+ of a laminar steady or --emit
+    // surface run.
+    const bool rans = c.rans != RansModel::None;
+    rr.rans = c.rans;
+    rr.phiInf[0] = c.ransPhiInf[0];
+    rr.phiInf[1] = c.ransPhiInf[1];
+    rr.steadyTol = c.compSteady ? c.steadyTol : 0.0;
+    rr.steadySteps = c.steadySteps;
+    rr.steadyImplicit =
+        c.compSteady && c.steadyScheme == SteadyScheme::Implicit;
+    rr.label = flowRunLabel(c);
+    if (rans || c.compSteady || c.emit.contains(Emit::Surface) ||
+        c.emit.contains(Emit::Mesh))
+        rr.wallDist = c.ogridRevolved
+                          ? revolvedWallDistance(og->mesh, og->nTheta, true)
+                          : ogridWallDistance(og->mesh);
+    // --emit mesh: the mesh and its d1 now, before any device allocation.
+    if (out->wantsMesh())
+    {
+        const double centre[3] = {c.placement.cx, c.placement.cy,
+                                  c.placement.cz};
+        const auto bytes =
+            encodeMesh(*og, centre, wallFirstCellDistance(g, rr.wallDist));
+        if (auto e = out->writeMeshArtefact("mesh", bytes); !e)
+            return die(exitOutput, e.error());
+    }
+    if (!rr.label.empty()) std::printf("# %s\n", rr.label.c_str());
 
     // Quiet start: the IC is at REST, exactly consistent with the no-slip wall
-    // (--ramp 0 starts it in the freestream instead).
+    // (--ramp 0 starts it in the freestream instead; a steady march always
+    // does, impulsively -- pseudo-time has no ramp). RANS scalars start at
+    // their freestream value everywhere (the wall row images them).
     auto ic = CompState::zeros(g);
     const double u0 = c.ramp > 0 ? 0.0 : c.uInf;
     for (std::size_t q = 0; q < g.size(); ++q)
@@ -381,6 +424,8 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
         ic.mx[q] = rhoInf * u0;
         ic.E[q] = pInf / (gamma - 1.0) + 0.5 * rhoInf * u0 * u0;
     }
+    for (int i = 0; i < ransScalars(c.rans); ++i)
+        rr.icTurb[i].assign(g.size(), rhoInf * c.ransPhiInf[i]);
 
     const auto res = gpu::runOGrid(g, *og, ic, rr, *out);
     if (!res) return die(res.error().code, res.error().message);
@@ -501,6 +546,19 @@ int runFlowCompressible(const Case& c, CaseGeometry& geo)
     rr.rotor = c.rotor;
     rr.rotorMrf = c.rotorMrf;
     rr.hFine = hFine(c);
+    // RANS on the immersed ghost wall (docs/rans.md, "Immersed-wall RANS"):
+    // d = |sdf| at the physical centres, the freestream scalars, the label.
+    if (c.rans != RansModel::None)
+    {
+        rr.rans = c.rans;
+        rr.wallDist = immersedWallDistance(g, geo.sdf, fRemap);
+        rr.phiInf[0] = c.ransPhiInf[0];
+        rr.phiInf[1] = c.ransPhiInf[1];
+        rr.steadyTol = c.compSteady ? c.steadyTol : 0.0;
+        rr.steadySteps = c.steadySteps;
+        rr.label = flowRunLabel(c);
+        std::printf("# %s\n", rr.label.c_str());
+    }
 
     auto res = gpu::runCompressible(g, host, geo.sdf,
                                     geo.hasBbox ? &geo.bbox : nullptr, rr, *out);

@@ -106,20 +106,25 @@ struct RunOutput::Impl
     std::string json() const
     {
         // "rans" and "steady" are appended fields, present only on a RANS run
-        // / an implicit steady run, so every other run's .json reads exactly
-        // as it did.
+        // / an implicit steady run, and the flow-RANS keys only on a flow
+        // RANS or compressible steady run, so every other run's .json reads
+        // exactly as it did.
+        auto key = [](const char* k, const std::string& v) {
+            return v.empty() ? std::string()
+                             : std::format(",\"{}\":\"{}\"", k, v);
+        };
         return std::format(
             "{{\"nx\":{},\"ny\":{},\"nz\":{},\"frames\":{},\"frameDt\":{},"
             "\"D\":{},\"re\":{},\"mach\":{},\"cs\":{},\"les\":{},\"sgs\":\"{}\","
             "\"body\":\"{}\",\"far\":\"{}\",\"physics\":\"{}\",\"kick\":{},"
-            "\"msPerStep\":{}{}{}}}\n",
+            "\"msPerStep\":{}{}{}{}{}{}}}\n",
             meta.nx, meta.ny, meta.nz, frames, meta.frameDt, meta.D, meta.re,
             meta.mach, meta.cs, meta.les ? 1 : 0, meta.sgs, meta.body,
             meta.farField, meta.physics, meta.kick, msPerStep,
-            meta.rans.empty() ? std::string()
-                              : ",\"rans\":\"" + meta.rans + "\"",
-            meta.steady.empty() ? std::string()
-                                : ",\"steady\":\"" + meta.steady + "\"");
+            key("rans", meta.rans), key("steady", meta.steady),
+            key("ransMode", meta.ransMode), key("ransInflow", meta.ransInflow),
+            meta.wedgeDeg > 0 ? std::format(",\"wedgeDeg\":{}", meta.wedgeDeg)
+                              : std::string());
     }
 
     void writeJson() const
@@ -351,6 +356,21 @@ RunOutput::make(Config cfg, RunMeta meta, const Grid& g, FrameGeometry geo)
         if (auto r = closeChecked(mf, path); !r) return std::unexpected(r.error());
     }
 
+    if (has(p.cfg.kinds, Emit::Surface))
+    {
+        const std::string path = p.cfg.prefix + "_surface.csv";
+        std::ofstream sf(path);
+        if (auto r = closeChecked(sf, path); !r) return std::unexpected(r.error());
+    }
+    if (has(p.cfg.kinds, Emit::Mesh))
+        for (const char* w : {"_mesh.bin", "_final.bin"})
+        {
+            const std::string path = p.cfg.prefix + w;
+            std::ofstream mf(path, std::ios::binary);
+            if (auto r = closeChecked(mf, path); !r)
+                return std::unexpected(r.error());
+        }
+
     if (has(p.cfg.kinds, Emit::Png))
     {
         p.pngDir = tagPrefix("png_", p.cfg.prefix);
@@ -392,6 +412,43 @@ RunOutput::auxBinary(std::string_view kind, int index, std::string_view ext,
     f.write(reinterpret_cast<const char*>(data.data()),
             std::streamsize(data.size() * sizeof(float)));
     return closeChecked(f, path);
+}
+
+bool RunOutput::wantsSurface() const { return has(p_->cfg.kinds, Emit::Surface); }
+bool RunOutput::wantsMesh() const { return has(p_->cfg.kinds, Emit::Mesh); }
+
+std::expected<void, std::string>
+RunOutput::writeMeshArtefact(std::string_view which, std::span<const char> bytes)
+{
+    assert(which == "mesh" || which == "final");
+    if (!wantsMesh()) return {};
+    const std::string path = p_->cfg.prefix + "_" + std::string(which) + ".bin";
+    std::ofstream f(path, std::ios::binary);
+    f.write(bytes.data(), std::streamsize(bytes.size()));
+    auto res = closeChecked(f, path);
+    if (!res) p_->record(res.error());
+    return res;
+}
+
+std::expected<void, std::string>
+RunOutput::writeSurface(std::string_view comment,
+                        std::span<const std::string> cols,
+                        std::span<const std::vector<double>> rows)
+{
+    if (!wantsSurface()) return {};
+    const std::string path = p_->cfg.prefix + "_surface.csv";
+    std::ofstream f(path);
+    f << "# " << comment << '\n';
+    for (std::size_t i = 0; i < cols.size(); ++i) f << (i ? "," : "") << cols[i];
+    f << '\n';
+    for (const auto& r : rows) {
+        assert(r.size() == cols.size());
+        for (std::size_t i = 0; i < r.size(); ++i) f << (i ? "," : "") << r[i];
+        f << '\n';
+    }
+    auto res = closeChecked(f, path);
+    if (!res) p_->record(res.error());
+    return res;
 }
 
 std::expected<void, std::string>
