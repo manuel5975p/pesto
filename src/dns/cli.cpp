@@ -189,6 +189,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--blade-thicken", &c.bladeThicken},
              {"--ogrid-far", &c.ogridFar}, {"--ogrid-beta", &c.ogridBeta},
              {"--ogrid-wedge", &c.ogridWedge}, {"--ogrid-trip", &c.ogridTrip},
+             {"--init-from", &c.initFrom},
              {"--ramp", &c.ramp}, {"--kick", &c.kick}, {"--tol", &c.tol},
              {"--max-iters", &c.maxIters}, {"--dt-recompute", &c.dtRecompute},
              {"--steady", &c.steady}, {"--seq", &c.seq},
@@ -866,8 +867,19 @@ BODY-FITTED O-GRID (compressible)
                      under a rotation by pi about the axis, so the odd
                      azimuthal modes (the m = 1 lift mode) cannot grow
                      from rounding; this seeds them. A stable steady
-                     state is unchanged. 0 = none (warned at Re >= 200
-                     or with --rans).                                 [0]
+                     state is unchanged. 0 = none, exactly the
+                     untripped symmetric march (warned at Re >= 200 or
+                     with --rans). Printed in the label.            [0.05]
+  --init-from PREFIX full revolution only: start from the converged
+                     WEDGE run PREFIX (its PREFIX_final.bin, from --emit
+                     mesh), revolved over the N planes (velocity rotated
+                     per plane), then the trip. PREFIX_mesh.bin must
+                     carry the same meridional mesh (--n, --ny,
+                     --ogrid-beta, --ogrid-far) and the file the same
+                     closure scalars and freestream pressure (--mach):
+                     a mismatch is an input error (exit 3) by name.
+                     Implies --ramp 0. Labelled "started from the
+                     wedge PREFIX".                                [none]
 
 RANS (compressible; an ensemble-mean MODEL, never a DNS; labelled
 "RANS <variant> -- <mode>" everywhere, docs/rans.md "dns flow")

@@ -1060,6 +1060,10 @@ std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
             return err(2, "--ogrid-trip", "seeds the odd azimuthal modes of "
                                           "the full-revolution sphere O-grid "
                                           "(--body sphere --nz N > 1) only");
+        if (!(revolved && nzI > 1) && r.given.contains("--init-from"))
+            return err(2, "--init-from", "starts the full-revolution sphere "
+                                         "O-grid (--body sphere --nz N > 1) "
+                                         "from a converged wedge only");
         if (revolved && nzI > 1)
         {
             // The FULL revolution: N azimuthal cells, Cyclic k, the axis
@@ -1083,7 +1087,23 @@ std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
                                               "be in [0, 0.5]");
             c.ogridRevolved = true;
             c.ogridNphi = nzI;
-            c.ogridTrip = r.ogridTrip;
+            c.ogridTrip = r.given.contains("--ogrid-trip") ? r.ogridTrip
+                                                           : kOgridTripDefault;
+            if (r.given.contains("--init-from")) {
+                // The file is read by main (phase 3); here only its shape.
+                if (r.initFrom.empty() ||
+                    r.initFrom.find_first_of("\"\\\n\r\t") != std::string::npos)
+                    return err(2, "--init-from", "a wedge run's --out prefix "
+                                                 "(its _final.bin and "
+                                                 "_mesh.bin); not empty, no "
+                                                 "quotes or control "
+                                                 "characters");
+                if (r.given.contains("--ramp"))
+                    return err(2, "--ramp", "with --init-from: the run "
+                                            "starts from the wedge's state, "
+                                            "not from rest");
+                c.ogridInitFrom = r.initFrom; // flowRans zeroes the ramp
+            }
             c.ogridWedgeDeg = 0;
             c.ogridSpan = 1.0;
             c.grid = ogridRevolvedGrid(
@@ -1142,6 +1162,10 @@ std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
         return err(2, "--ogrid-trip", "seeds the odd azimuthal modes of the "
                                       "full-revolution sphere O-grid (--ogrid "
                                       "--body sphere --nz N > 1) only");
+    else if (r.given.contains("--init-from"))
+        return err(2, "--init-from", "starts the full-revolution sphere O-grid "
+                                     "(--ogrid --body sphere --nz N > 1) from "
+                                     "a converged wedge only");
     else if (comp)
     {
         // D = pi/4 fixed, h scales with ny AND --dr: box = dr*D in y
@@ -2496,13 +2520,17 @@ std::optional<ConfigError> flowRans(const RawConfig& r, Case& c)
     // The laminar sphere wake leaves axisymmetry at Re ~ 210 through the m = 1
     // mode, which the exactly pi-symmetric full revolution cannot grow from
     // rounding (measured: cl == cs == 0.0 and the k / k + N/2 states equal
-    // bit for bit).
+    // bit for bit). The trip is on by default; an explicit 0 is warned where
+    // the symmetric state has been measured unstable.
     if (c.ogridNphi > 0 && c.ogridTrip == 0 && (rans || c.re >= 200))
         c.warnings.emplace_back(
-            "the full-revolution O-grid and its axisymmetric start are exactly "
-            "symmetric under a rotation by pi about the axis: the odd azimuthal "
-            "modes (the m = 1 lift mode) cannot arise; --ogrid-trip A seeds "
-            "them");
+            "--ogrid-trip 0: the full-revolution O-grid and its axisymmetric "
+            "start are exactly symmetric under a rotation by pi about the "
+            "axis, so the odd azimuthal modes (the m = 1 lift mode) cannot "
+            "arise and an m = 1-unstable symmetric state can certify (measured: "
+            "laminar Re 250, RANS SA-neg Re 1e3)");
+    // A wedge start is a state, not a rest: no quiet-start ramp.
+    if (!c.ogridInitFrom.empty()) c.ramp = 0;
     if (c.ogridRevolved && c.ogridNphi == 0) c.meta.wedgeDeg = c.ogridWedgeDeg;
     if (!rans && !c.compSteady) return std::nullopt;
     c.meta.rans = rans ? std::string(ransName(c.rans)) : std::string();
@@ -2801,11 +2829,22 @@ double channelPRef(double reTau, double mach)
 std::string flowRunLabel(const Case& c)
 {
     const bool rans = c.rans != RansModel::None;
-    // The wedge only: the full revolution resolves swirl and 3D wake modes,
-    // so it carries the z-extruded O-grid's labels.
+    // The wedge's suffix says what it cannot resolve; the full revolution's
+    // says its resolved odd-mode trip (and wedge start), which change what a
+    // run can converge to, so they are never silent.
     const bool wedge = c.ogridRevolved && c.ogridNphi == 0;
-    const std::string geo =
-        wedge ? ransWedgeSuffix(c.ogridWedgeDeg, rans) : std::string();
+    const bool full = c.ogridRevolved && c.ogridNphi > 0;
+    std::string geo;
+    if (wedge) geo = ransWedgeSuffix(c.ogridWedgeDeg, rans);
+    if (full)
+        geo = std::format(
+            " [full revolution {}: {}{}]", c.ogridNphi,
+            c.ogridTrip > 0
+                ? std::format("odd-mode trip {:g} U", c.ogridTrip)
+                : std::string("untripped, exactly pi-symmetric"),
+            c.ogridInitFrom.empty() ? std::string()
+                                    : ", started from the wedge " +
+                                          c.ogridInitFrom);
     if (rans || c.compSteady)
     {
         const RansMode mode =
@@ -2820,6 +2859,7 @@ std::string flowRunLabel(const Case& c)
         return l;
     }
     if (wedge) return "DNS" + geo + std::string(kAxisymUnsteady);
+    if (full) return "DNS" + geo;
     return {};
 }
 
@@ -3082,14 +3122,25 @@ std::string Case::describe() const
             "{:.4f} of the circle's\n"
             "             axis faces degenerate (S = 0, limit metric); qRef on "
             "pi D^2/4\n"
-            "             odd-mode trip {}\n",
+            "             odd-mode trip {}\n"
+            "             initial state {}\n",
             grid.nx - 2, grid.ny, ogridNphi, dphi * 180.0 / std::numbers::pi,
             ogridNphi / 2, std::sin(dphi) / dphi,
             ogridTrip > 0 ? std::format("{:g} U (solenoidal, 1 D behind the "
-                                        "body)",
-                                        ogridTrip)
+                                        "body{})",
+                                        ogridTrip,
+                                        ogridTrip == kOgridTripDefault
+                                            ? "; the default"
+                                            : "")
                           : std::string("none (exactly pi-symmetric: no odd "
-                                        "azimuthal modes)"));
+                                        "azimuthal modes)"),
+            ogridInitFrom.empty()
+                ? std::string(ramp > 0 ? "rest (quiet-start ramp)"
+                                       : "the uniform freestream")
+                : std::format("the converged wedge {}_final.bin revolved over "
+                              "the {} planes (mesh checked against "
+                              "{}_mesh.bin), then the trip",
+                              ogridInitFrom, ogridNphi, ogridInitFrom));
     }
     else if (ogridRevolved)
     {

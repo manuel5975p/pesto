@@ -80,6 +80,19 @@ struct RevolvedSpec
     int nphi = 0;      // full revolution: even, >= 4
 };
 
+// The full revolution's default odd-mode trip amplitude (/ U; --ogrid-trip,
+// the solenoidal vortex of runFlowOGrid). The mesh and an axisymmetric start
+// are exactly pi-symmetric, so without a seed the m = 1 mode never arises.
+// Bracket (64 x 48 x 32, M 0.2, TOL 1e-4, measured 2026-10-26): laminar Re
+// 250 reaches the same steady m = 1 wake (cd 0.70690, cl -0.0647) from 0.005,
+// 0.01, 0.02 and 0.05, |cl| passing 1e-2 at 29400 / 27000 / 24600 / 21400
+// iterations -- against the untripped run's certification of the symmetric
+// state at 36200, so 0.05 leaves the widest margin (the stop does not watch
+// cl). Where m = 1 is stable it decays and costs nothing measurable: Re 100
+// cd 1.08930 both ways (cl 1e-6, 23400 vs 22200 iterations), Re 200 cl 4e-5,
+// SST-2003m Re 1e3 cd 0.49511 both ways (95000 vs 95200).
+inline constexpr double kOgridTripDefault = 0.05;
+
 struct OGrid
 {
     CurvMesh mesh;

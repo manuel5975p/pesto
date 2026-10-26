@@ -254,7 +254,10 @@ the wedge at the same (nθ, ny)):
 
 **Small RANS and the m = 1 mode, L1 64×48, N 32** (β 4.5 for RANS, β 3
 laminar; TOL 1e-4, every run exit 0, 0 guard hits; "trip" = `--ogrid-trip
-0.05`):
+0.05`, the default since 2026-10-26; "3D N 32" = `--ogrid-trip 0`; measured
+before the stop's lateral observables -- with them the tripped SA-neg run
+certifies at 128400, the SST-2003m one at 146600, the Re 250 one at 108800,
+same values):
 
 | case | wedge 5° | 3D N 32 | 3D N 32, trip |
 |---|---|---|---|
@@ -282,15 +285,23 @@ laminar; TOL 1e-4, every run exit 0, 0 guard hits; "trip" = `--ogrid-trip
   symmetric SA-neg 3D number at Re 1e3 is therefore an UNSTABLE fixed point
   the exact symmetry protects -- report the tripped one.
 
-**G4.3, RANS SA-neg Re 1e4 on G1** (128×96×96, 1.2M cells, β 4.5, trip
-0.05, explicit LTS, 10-minute cap): exit 8 at 170000 iterations, 581 s,
-3.41 ms/iteration. cd 0.42519 ± 1.2e-4 (last 2e4 iterations) against the
-wedge's certified 0.42480 (+0.09%, inside the 0.5% gate as a settled value,
-NOT a certified one), θ_s 86.9–87.8° (wedge 87.40°), L_r 1.2214 D (1.2206),
-y⁺max 0.33, 0 hits. The march is not converging: an m = 1 lateral force
-grows in pseudo-time (|cl| 1e-3 → 1.5e-2 between 5e4 and 1.6e5 iterations),
-so the stop's W jitter (4.3e-3) stays above 2⁻¹⁰. Reported as found, not
-damped (docs/rans.md "The full revolution", issues.md 11).
+**G4.3, RANS SA-neg Re 1e4 on G1** (128×96×96, 1.2M cells, β 4.5,
+explicit LTS, 10-minute cap, 3.41 ms/iteration):
+
+| start | trip | outcome | cd | lateral force |
+|---|---|---|---|---|
+| cold | 0.05 | exit 8 at 170000 / 581 s | 0.42519 ± 1.2e-4 (+0.09%) | \|cl\| 1e-3 → 1.5e-2 (5e4 → 1.6e5 it), growing |
+| the certified 5° wedge (`--init-from`) | 0 | **exit 0 at 38800 / 135 s** | 0.42520 (+0.094%) | 0 (π-symmetric) |
+| the certified 5° wedge | 0.05 | exit 8 at 170000 / 584 s | 0.42520 | ±1e-3 → 8.7e-3 at 1.7e5, growing |
+
+θ_s 87.38–87.42° (wedge 87.40°), L_r 1.2214 D (1.2206), y⁺max 0.33, 0 hits
+on every row. The wedge start puts the certified number inside the
+5-minute target (323 s with the wedge's own 188 s), but the tripped runs
+show that number is an m = 1-UNSTABLE axisymmetric state: G4.3 has no
+certified stable 3D steady state. cd is blind to it (cd is even in m = 1);
+the full revolution's stop now carries `cd+cl` / `cd+cs` so the tripped run
+is exit 8, not a certificate (docs/rans.md "The full revolution",
+issues.md 11). Reported as found, not damped.
 
 ## Tolerance adjustments vs the original plan
 

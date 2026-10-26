@@ -201,6 +201,8 @@ struct RawConfig
     double ogridBeta = 3.0;  // radial tanh clustering toward the wall
     double ogridWedge = 5.0; // revolved --nz 1: the wedge angle, degrees
     double ogridTrip = 0.0;  // full revolution: odd-mode trip amplitude, / U
+                             // (not given: kOgridTripDefault)
+    std::string initFrom;    // full revolution: a converged wedge's prefix
 
     // start-up (compressible)
     double ramp = 2.0, kick = 0.05;
@@ -373,8 +375,14 @@ public:
     // Full revolution only: the amplitude (/ U) of the solenoidal trip in the
     // initial state (steady: the initial guess) that breaks the mesh's EXACT
     // symmetry under a rotation by pi about the axis -- without it the odd
-    // azimuthal modes (the m = 1 lift mode) cannot arise. 0 = none.
+    // azimuthal modes (the m = 1 lift mode) cannot arise. 0 = none; the
+    // full revolution defaults to kOgridTripDefault.
     double ogridTrip = 0;
+    // Full revolution only (--init-from PREFIX): the initial state is the
+    // converged wedge PREFIX_final.bin (meridional mesh checked against
+    // PREFIX_mesh.bin) revolved over the N planes, then the trip. Read by
+    // main (phase 3), never by the validator. Empty = the freestream start.
+    std::string ogridInitFrom;
     // First fluid cell height on the nominal circle (ogridNominalH1): what the
     // validator can know without the sdf; exact for a cylinder.
     double ogridH1 = 0;

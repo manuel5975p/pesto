@@ -6,6 +6,7 @@
 
 #include "dns/ogrid.hpp"
 
+#include <expected>
 #include <string>
 #include <vector>
 
@@ -29,5 +30,28 @@ std::vector<char> encodeMesh(const OGrid& og, const double centre[3],
 std::vector<char> encodeFinal(const Grid& g,
                               const std::vector<std::string>& names,
                               const std::vector<std::vector<double>>& fields);
+
+// A full revolution's initial state from a converged WEDGE run (--init-from):
+// primitives per cell of the target grid and the specific RANS scalars.
+struct WedgeStart
+{
+    std::vector<double> rho, u, v, w, p;
+    std::vector<std::vector<double>> phi; // scalars, in `scalars` order
+};
+
+// Revolve the wedge's real plane (k = 1, centred on phi = 0) over the target
+// full revolution: cell (i, j, k) takes (i, j, 1) with (v, w) rotated by
+// R_x(2 pi (k + 1/2) / N) -- the cell's centroid azimuth -- and rho, u, p and
+// the scalars copied; ghost rows/columns too (the hooks overwrite them).
+// mesh / fin: the wedge's _mesh.bin / _final.bin bytes. Errors, by name: not
+// a revolved-wedge file, another (nx, ny, nTheta), meridional nodes that
+// differ from og's beyond 1e-9 of the domain size (another --ogrid-beta,
+// --ogrid-far or body), a closure-scalar set that is not `scalars`, a
+// far-row mean pressure more than 2% off pInf (another --mach), non-finite
+// or non-positive rho / p. Pre: og is a full revolution (og.rev.wedge false).
+std::expected<WedgeStart, std::string>
+revolveWedgeState(const std::vector<char>& mesh, const std::vector<char>& fin,
+                  const OGrid& og, const double centre[3],
+                  const std::vector<std::string>& scalars, double pInf);
 
 } // namespace dns

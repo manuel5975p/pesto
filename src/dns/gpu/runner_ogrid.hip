@@ -683,6 +683,8 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
         // ln omega D/U. Reported, never the stop: the stop is on cd, cdf, the
         // wake deficit and the turbulence integrals (decision 13).
         const double tU = r.D / r.uInf; // the time scale D/U
+        // The full revolution's two lateral observables (cd + cl, cd + cs).
+        const int lateral = rev && !wedge ? 2 : 0;
         double resid = HUGE_VAL, resU = 0, resE = 0, resT = 0;
         DeviceOGridBc::Surface F{};
         Extra x;
@@ -707,7 +709,17 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
             if (!std::isfinite(resid) || !std::isfinite(st.cd))
                 return fail(7, "the residual is not finite (the state "
                                "diverged)");
-            std::vector<double> q = {st.cd, x.cdf, x.wake};
+            std::vector<double> q = {st.cd, x.cdf};
+            // The full revolution also watches its lateral forces: cd is
+            // even in the m = 1 mode, so a growing m = 1 oscillation leaves
+            // cd flat while cl swings (measured: G1 SA-neg Re 1e4 from the
+            // wedge certified at 46600 iterations with cl swinging +-1e-3
+            // and growing to 1e-2 by 1.5e5). cl and cs have no scale of
+            // their own (they are 0 at a symmetric state), so they ride on
+            // cd's: the observables cd + cl and cd + cs.
+            if (rev && !wedge)
+                q.insert(q.end(), {st.cd + st.cl, st.cd + st.cs});
+            q.push_back(x.wake);
             for (int i = 0; i < ds->nT; ++i) q.push_back(x.turb[i]);
             return q;
         };
@@ -791,19 +803,22 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
                                              .dtRecompute = r.dtRecompute,
                                              .cap = r.steadySteps,
                                              .statsEvery = r.statsEvery,
-                                             .series = 3 + ds->nT,
-                                             .observables = 2};
+                                             .series = 3 + ds->nT + lateral,
+                                             .observables = 2 + lateral};
         auto res = implicit ? nkMarch(sp, io)
                             : internal::explicitSteadyMarch(*dev, *ds, *red,
                                                             sp, io);
         if (!res) return std::unexpected(res.error());
         {
-            const char* names[5] = {"cd", "cdf", "W", sst ? "int rho k"
-                                                          : "int rho nu~",
-                                    "int rho omega"};
+            const char* tn = sst ? "int rho k" : "int rho nu~";
+            const char* names3[5] = {"cd", "cdf", "W", tn, "int rho omega"};
+            const char* names7[7] = {"cd",     "cdf", "cd+cl", "cd+cs",
+                                     "W",      tn,    "int rho omega"};
             std::fputs(internal::steadyFloorReport(
                            res->floors,
-                           std::span<const char* const>(names, 3 + ds->nT))
+                           std::span<const char* const>(
+                               lateral ? names7 : names3,
+                               3 + ds->nT + lateral))
                            .c_str(),
                        stdout);
             std::fflush(stdout);

@@ -110,46 +110,48 @@ uncommitted).
     modes never arise on their own** (measured 2026-10-26). The mesh maps
     onto itself under a rotation by π about the axis to the bit, and the
     FP32 kernels are sign-symmetric: an axisymmetric start keeps planes k
-    and k + N/2 bitwise equal (cl == cs == 0.0) for ever, so the m = 1 lift
-    mode is locked out. Measured consequence, L1 × 32: laminar Re 250
-    untripped certifies the symmetric state (cd 0.69099), tripped the
-    physical steady m = 1 wake (cd 0.70690, cl −0.0647; JP99 ≈ 0.70 /
-    0.062); SA-neg Re 1e3 likewise (0.48229 vs 0.49196, cl −0.0585) --
-    while SST-2003m Re 1e3 is stable (the trip decays to cl 1e-5). Built:
-    `--ogrid-trip A` (default 0) and a validator warning at Re ≥ 200 or
-    with `--rans`. DECISION NEEDED: keep the trip opt-in (today: an
-    untripped run is exactly the wedge, the warning names the risk), or
-    make a small trip the full revolution's default (an untripped run at
-    Re ≳ 200 can certify an unstable fixed point).
-11. **G4.3: explicit LTS on G1 cannot meet the 5-minute target, and the
-    tripped SA-neg Re 1e4 state is not steady** (measured 2026-10-26, G1 =
-    128×96×96, 1.2M cells, β 4.5, M 0.2). 3.41 ms/iteration (SA-neg; the
-    5° wedge 0.28, laminar 3D 1.65 µs per kilo-cell). With `--ogrid-trip
-    0.05`, capped at 170000 iterations (581 s): exit 8; cd 0.42519 ± 1.2e-4
-    over the last 2e4 iterations (+0.09% of the wedge's 0.42480), settled
-    to 0.2% from 4e4 iterations (150 s), but an m = 1 cl oscillation GROWS
-    in pseudo-time (amplitude 1e-3 → 1.5e-2 from 5e4 to 1.6e5 iterations,
-    residual 0.48 → 5.6, W jitter 4.3e-3 > 2⁻¹⁰): the axisymmetric SA-neg
-    state is m = 1-unstable there. Its end state (steady asymmetric, as at
-    Re 1e3, or none) is open; a G1 URANS is not run (~1e3 s per D/U, item
-    12). Untripped, G1 IS the 3.75° wedge: ~6e5 iterations
-    to certify, ~35 min, 7× the target (5 min = 8.8e4 iterations). Levers,
-    none built: the converged wedge replicated in φ as the initial guess
-    (only the 3D stability left to march), Newton-Krylov with 3D lines
-    (G4.1; NK is slower than explicit on the wedge, item 3), multigrid.
-    No `val_rans_sphere_3d` heavy test: there is no certified G1 number to
-    pin.
+    and k + N/2 bitwise equal (cl == cs == 0.0) for ever. DECIDED
+    2026-10-26: the trip is ON by default (`kOgridTripDefault` 0.05 U, the
+    bracket in docs/rans.md "The full revolution"); `--ogrid-trip 0` is the
+    untripped march bit for bit and is warned at Re ≥ 200 or with `--rans`.
+    Remaining risk: the stop does not watch cl, so a seed that grows slowly
+    can still be outrun by the stop (at Re 250 the 0.05 trip leaves m = 1 at
+    21400 iterations against a symmetric stop at 36200; a slower instability
+    has less margin). A cl/cs monitor in the stop (absolute, cl has no
+    scale) is not built.
+11. **G4.3: SA-neg Re 1e4 on G1 has no certified STABLE steady state inside
+    10 minutes; from the wedge the symmetric one certifies in 135 s**
+    (measured 2026-10-26, G1 = 128×96×96, 1.2M cells, β 4.5, M 0.2, 3.41
+    ms/iteration). Cold start, trip 0.05: exit 8 at 170000 (581 s), cd
+    0.42519 ± 1.2e-4 (+0.09% of the wedge's 0.42480), an m = 1 cl
+    oscillation growing (1e-3 → 1.5e-2 from 5e4 to 1.6e5 iterations).
+    `--init-from` the certified 5° wedge (188 s to make): untripped exit 0
+    at 38800 iterations / 135 s, cd 0.42520 -- inside the 5-minute target
+    (323 s with the wedge) -- but tripped the same m = 1 growth appears
+    (cl 8.7e-3 at 1.7e5, residual 0.13 → 4.0, exit 8 at 584 s), so that
+    certified number is the π-symmetry-protected axisymmetric state, not a
+    stable 3D one. Its end state (steady asymmetric, as SA-neg at Re 1e3, or
+    unsteady) is open; following the m = 1 mode (e-folding ~4e4 iterations)
+    to saturation is tens of minutes at G1. No `val_rans_sphere_3d` heavy
+    test: there is no certified stable G1 number to pin.
 12. **The DNS time march of the full revolution is 150× slower in dt than
-    the wedge's** (measured 2026-10-26, laminar Re 100, 128×96, `--ramp
-    0`): dt 2.55e-4 on the 5° wedge, 1.70e-6 at N 64. The axis cells'
-    azimuthal width ½ R Δθ Δφ (4.7e-4 at N 64) enters the DNS/LES
-    `stableDt`'s GLOBAL viscous bound 0.25 h_min² / ν_max (the
-    over-conservative bound already recorded under "Older open items"); the
-    wedge's time march uses the width ρ there. URANS is NOT penalized (its
-    diffusive bound is per cell): SA-neg Re 1e4 dt 3.99e-6 at N 64 vs
-    2.18e-6 on the wedge. A per-cell DNS viscous bound would remove it; the
-    steady march's local dt is unaffected. A G1 URANS costs ~1e3 s per D/U
-    (2.6e5 steps at ~3.7 ms), so a URANS mean for item 11 is hours.
+    the wedge's, and a per-cell bound does not help** (measured
+    2026-10-26, laminar Re 100, `--ramp 0`): dt 2.55e-4 on the 5° wedge at
+    128×96, 1.70e-6 at N 64 (3.6e-6 at the start). The binding term is
+    the viscous bound at the axis cells' azimuthal width ½ R Δθ Δφ. The
+    per-cell form (`rans::LaminarDiffDt`) gives the same dt to 0.8%
+    (64×48×64: 1.4210e-5 both at the start, 1.1844e-5 vs 1.1934e-5 after
+    2000 steps; 128×96×64 equal to 5 digits) -- with constant μ the h_min
+    cell binds either way -- and the limit is real: at 1.5× and 2× the bound
+    the march runs 3000 steps, at 3× it diverges within 200 (64×48×64). So
+    the approved "per-cell bound on the full revolution" was NOT built: it
+    would change nothing (the premise -- the global-extreme pairing -- was
+    mine and wrong). URANS at Re 1e4 is not penalized because ν is 100×
+    smaller (3.99e-6 vs the wedge's 2.18e-6, the wall's RANS term binding
+    both). What would: an implicit azimuthal diffusion on the axis ring, or
+    azimuthally coarser axis cells (a mesh change); the inviscid acoustic
+    bound still sees the axis width (6.2e-5 vs 6.3e-4 at 64×48). A G1 URANS
+    costs ~1e3 s per D/U (2.6e5 steps at ~3.7 ms).
 
 ## Older open items (details in CLAUDE.md)
 

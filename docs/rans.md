@@ -534,6 +534,9 @@ samples, twelve sub-blocks):
   the stated floor: above the largest FP32 jitter measured, 4.2e-4 for W on
   the Re 1e4 wedge; below the SST limit cycle's 4e-3 / 3e-2).
 
+The full revolution adds two observables, `cd+cl` and `cd+cs` (section "The
+full revolution": cd is blind to a growing m = 1 mode).
+
 What it does not do: an oscillation of a MONITOR below 2⁻¹⁰ is not told
 from FP32 jitter; an observable's undamped swing of amplitude A is
 certified iff trend + A < TOL (every sample is then inside TOL); a single
@@ -769,9 +772,11 @@ machinery, unchanged and unbranched:
   the k-mean of the downstream axis ring; the end line prints θ_s per
   meridian (mean and range) and the largest azimuthal spread of u over the
   real (i, j) rings (`# revolved wall (full revolution, N meridians): ...`).
-- **Labels**: the z-extruded O-grid's -- no `[axisymmetric wedge ...]`
-  suffix, no axisymmetric-unsteadiness tail; a DNS time march carries no
-  label. RunMeta has no `wedgeDeg`. `--emit mesh` / `surface` work unchanged
+- **Labels**: no `[axisymmetric wedge ...]` suffix, no
+  axisymmetric-unsteadiness tail; instead ` [full revolution N: odd-mode
+  trip A U]` (or `untripped, exactly pi-symmetric`; plus `, started from the
+  wedge PREFIX` with `--init-from`) on every run, the DNS time march
+  included (`DNS [full revolution ...]`). RunMeta has no `wedgeDeg`. `--emit mesh` / `surface` work unchanged
   (the mesh file's flags have bit 3 without bit 2, wrap[2] = Cyclic, dphi =
   2π/N: no version bump); `tools/parity/dnsmesh.py` reads the wedge only.
 - **Rejected by name**: odd N or N < 4 (`--nz`), `--ogrid-wedge`, `--les`
@@ -790,11 +795,21 @@ iterations and 200 URANS steps; cl == cs == 0.0). Rotations by 2π/N are NOT
 exact, so the EVEN azimuthal modes do see rounding; the ODD ones -- the
 m = 1 lift mode the laminar sphere wake bifurcates through at Re ≈ 210
 (Johnson & Patel 1999) -- cannot arise at all. `--ogrid-trip A` (full
-revolution only, default 0, ≤ 0.5) adds a solenoidal Gaussian vortex (axis
-z, strength A U, width D/4, at (cx + D, cy + D/4, cz)) to the initial state
--- with `--steady`, to the initial guess: a stable fixed point is unchanged,
-an m = 1-unstable one is left. The validator warns without it at Re ≥ 200
-and with `--rans`.
+revolution only, ≤ 0.5, **default `kOgridTripDefault` = 0.05**, on since
+2026-10-26) adds a solenoidal Gaussian vortex (axis z, strength A U, width
+D/4, at (cx + D, cy + D/4, cz)) to the initial state -- with `--steady`, to
+the initial guess: a stable fixed point is unchanged, an m = 1-unstable one
+is left. `--ogrid-trip 0` is the untripped march bit for bit; it is warned at
+Re ≥ 200 and with `--rans`. The resolved trip is in the describe block and
+the label. Why 0.05 (64×48×32, TOL 1e-4): at laminar Re 250 the trips 0.005,
+0.01, 0.02 and 0.05 all reach the same m = 1 wake (cd 0.70690, cl −0.0647),
+|cl| passing 1e-2 at 29400 / 27000 / 24600 / 21400 iterations, against the
+untripped run's certification of the symmetric state at 36200 -- the stop
+does not watch cl, so the larger seed leaves the larger margin (41% of the
+symmetric stop vs 19% at 0.005). Where m = 1 is stable the trip decays and
+costs nothing measured: laminar Re 100 cd 1.08930 with and without (|cl|
+1.3e-6 at the stop, 23400 vs 22200 iterations), Re 200 |cl| 4e-5 (cd
+0.77170), SST-2003m Re 1e3 cd 0.49511 both ways (95000 vs 95200).
 
 Measured (gfx1100, 2026-10-26, M 0.2, rFar 20 D, explicit LTS, TOL 1e-4,
 every run exit 0 unless stated; full tables in docs/validation.md "The full
@@ -822,7 +837,7 @@ revolution vs the wedge"):
   untripped), **cl −0.0585**, θ_s 98.7–101.0° around the body (N 64:
   0.49557, cl +0.0598 -- the lift's sign is the transient's). The untripped
   SA run certifies the unstable symmetric state: that is what the exact
-  π-symmetry does, and why the validator warns.
+  π-symmetry does, and why the trip is now the default.
 - **Laminar Re 250** (L1 N 32): untripped the symmetric state (cd 0.69099,
   wedge 0.69343); tripped the steady m = 1 wake, certified: cd 0.70690,
   **cl −0.0647**, θ_s 110.8–114.4° (N 64: 0.70999, −0.0652) -- Johnson &
@@ -834,34 +849,73 @@ revolution vs the wedge"):
   stagnation point and flipped SA-neg Re 1e3 N 64 between 1.269 D and 0).
   An off-axis (m = 1) recirculation reads short or 0 there; θ_s is reported
   per meridian for the same reason.
-- **The DNS time march pays the axis width**: the DNS/LES `stableDt`'s global
-  viscous bound reads h_min, which is the axis cells' azimuthal width ½ R Δθ
-  Δφ -- dt 1.70e-6 at 128×96×64 laminar Re 100 against the wedge's 2.55e-4.
-  URANS (per-cell diffusive bound) is not penalized: 3.99e-6 vs 2.18e-6
-  (SA-neg Re 1e4). The steady march's local dt is unaffected (issues.md 12).
+- **The DNS time march pays the axis width, and that is the scheme's real
+  limit** (corrected 2026-10-26). The viscous dt of a laminar Re 100 run is
+  set by the axis cells' azimuthal width ½ R Δθ Δφ: 1.42e-5 at 64×48×64
+  (wedge: acoustic 6.33e-4, viscous 1.48e-3), 3.6e-6 at 128×96×64 (1.70e-6
+  later in the run; wedge 2.55e-4). A PER-CELL bound
+  (`rans::LaminarDiffDt`, the steady march's) gives the same number to 0.8%:
+  with constant μ the cell holding h_min is the binding cell either way, so
+  the global-extreme pairing costs nothing here. And it is a true stability
+  limit: the explicit march at 1.5× and 2× the bound runs 3000 steps, at 3×
+  it diverges within 200 (64×48×64 Re 100; the acoustic bound there is
+  6.2e-5, 4.4× the viscous one). A URANS at Re 1e4 is not penalized: ν is
+  100× smaller, and the RANS per-cell diffusive term at the wall binds both
+  meshes alike (3.99e-6 at 128×96×64 vs the wedge's 2.18e-6); the
+  inviscid acoustic bound alone is 6.2e-5 vs the wedge's 6.3e-4 at 64×48
+  (the axis width again, 10×). Curing it needs the axis ring's azimuthal diffusion
+  treated implicitly, or azimuthally coarser axis cells -- not a dt bound
+  (issues.md 12). The steady march's local dt is unaffected.
 
-**G4.3, RANS SA-neg Re 1e4 on G1** (128×96×96 = 1.2M cells, β 4.5, the
-trip 0.05, capped at 170000 iterations = 10 min): **exit 8, 581 s, 3.41
-ms/iteration** (the 5° wedge 0.28). cd settles early -- within 0.2% of its
-final value from 4e4 iterations (150 s), 0.42519 ± 1.2e-4 over the last 2e4
-(+0.09% of the wedge's certified 0.42480), θ_s 86.9–87.8° (wedge 87.40°), L_r
-1.2214 D (1.2206), y⁺max 0.33, μt/μ max 108, 0 hits -- but the state is NOT
-steady: an m = 1 lateral force oscillates and GROWS in pseudo-time (|cl|
-1e-3 at 5e4 iterations, 4e-3 at 1e5, 1.5e-2 at 1.56e5; residual 0.48 →
-5.6), the azimuthal spread of u reaches 1.3e-2 U, and the stop reads cd
-trend 3.5e-4 / jitter 7.1e-4, W jitter 4.3e-3 > 2⁻¹⁰. The axisymmetric
-SA-neg state at Re 1e4 is m = 1-unstable on G1 (as SA-neg's is at Re 1e3,
-where it lands on a STEADY asymmetric wake); whether this one ends steady
-and asymmetric or has no steady state (the wedge's SST-2003m case) is not
-decided inside the 10-minute budget. A URANS comparison at G1 is not run:
-its dt (4e-6, the RANS per-cell bound; measured at 128×96×64) makes it ~1e3
-s per D/U (issues.md 12). An UNTRIPPED
-G1 run is the 3.75° wedge to rounding; the wedge needs 6.06e5 iterations to
-certify, i.e. ~35 min at 3.41 ms -- 7× the 5-minute target (5 min = 8.8e4
-iterations). What would meet it: a coarser start (the converged wedge
-replicated in φ as the initial guess -- not built -- leaves only the 3D
-stability question to march), Newton–Krylov with 3D lines (not built; on
-the wedge NK is slower than explicit, issues.md 3), or multigrid.
+**The stop watches the lateral forces** (full revolution only, 2026-10-26).
+cd is even in the m = 1 mode, so a growing m = 1 oscillation leaves cd
+flat: G1 from the wedge (below) certified at 46600 iterations with cl
+swinging ±1e-3 -- and cl kept growing to 1e-2 by 1.5e5. cl and cs have no
+scale of their own (0 at a symmetric state), so they ride on cd's: two more
+OBSERVABLES, `cd+cl` and `cd+cs` (trend + √2 J < TOL), in the
+`# steady stop` line. An untripped run (cl ≡ 0) reads them as copies of cd:
+its stop iteration is unchanged. The decaying trip transient costs where m
+= 1 is stable: SST-2003m Re 1e3 64×48×32 146600 iterations (95000 before),
+laminar Re 100 unchanged (23400), the steady m = 1 wakes certify as before
+(laminar Re 250 108800, SA-neg Re 1e3 128400).
+
+**Starting from the wedge** (`--init-from PREFIX`, full revolution only):
+the converged wedge run's `PREFIX_final.bin` (`--emit mesh`), its real plane
+revolved over the N planes ((v, w) rotated to each cell's centroid azimuth
+2π(k + ½)/N; ρ, u, p, the specific scalars copied), then the trip.
+`PREFIX_mesh.bin` must carry this run's meridional nodes to 1e-9 of the
+domain (so --n, --ny, --ogrid-beta, --ogrid-far and the body match), the
+file this run's closure scalars, and its far-row pressure this run's p∞ to
+2% (--mach); every mismatch, and a missing file, is exit 3 by name
+(`dns/meshio` `revolveWedgeState`). Implies `--ramp 0`; labelled `, started
+from the wedge PREFIX`. Measured (M 0.2, TOL 1e-4):
+
+| case | cold start | from the wedge, trip 0.05 | from the wedge, untripped |
+|---|---|---|---|
+| laminar Re 100 64×48×64 | 47800 it, cd 1.09257 | 30800 it, 1.09256 | 10800 it (the stop's minimum history), 1.09256 |
+| laminar Re 100 128×96×64 | 62000 it / 131 s, 1.09470 | 34400 it / 48 s, 1.09469 | -- |
+| RANS SA-neg Re 1e4 G1 128×96×96 | exit 8 at 170000 / 581 s (m = 1 growing) | **exit 8 at 170000 / 584 s**: cd 0.42520, cl ±1e-3 → 8.7e-3, residual 0.13 → 4.0 | **exit 0 at 38800 it / 135 s**, cd 0.42520 |
+
+**G4.3, RANS SA-neg Re 1e4 on G1** (128×96×96 = 1.2M cells, β 4.5, 3.41
+ms/iteration; the 5° wedge 0.28). From a cold start (trip 0.05, 10-minute
+cap): exit 8; cd settles within 0.2% from 4e4 iterations (150 s), 0.42519 ±
+1.2e-4 over the last 2e4 (+0.09% of the wedge's certified 0.42480), θ_s
+86.9–87.8°, L_r 1.2214 D, y⁺max 0.33, μt/μ max 108, 0 hits -- but an m = 1
+lateral force GROWS in pseudo-time (|cl| 1e-3 at 5e4 iterations, 4e-3 at
+1e5, 1.5e-2 at 1.56e5). From the certified 5° wedge (188 s to produce):
+untripped, it certifies in **38800 iterations, 135 s** -- inside the
+5-minute target, 323 s with the wedge -- at cd 0.42520 (+0.094%: the 3.75°
+polygon); tripped, the same m = 1 growth (cl 8.7e-3 at 1.7e5), so the
+untripped number is the axisymmetric state the exact symmetry protects, NOT
+a stable 3D steady state. SA-neg at Re 1e4 on G1 has no certified stable
+steady state inside the budget; its end state (steady asymmetric, as at Re
+1e3, or unsteady) is open. A URANS comparison is not run (~1e3 s per D/U,
+issues.md 12). An untripped COLD G1 is the 3.75° wedge to rounding: ~6e5
+iterations, ~35 min. The remaining lever for the 3D question itself is
+time: the m = 1 e-folding is ~4e4 iterations (2.3 min), so following it to
+saturation is tens of minutes; Newton–Krylov with 3D lines (not built; NK is
+slower than explicit on the wedge, issues.md 3) or multigrid would shorten
+the march, not the physics.
 
 ## Newton–Krylov pseudo-time on `dns flow` (built 2026-10-26; slower than explicit)
 
@@ -1093,8 +1147,8 @@ Laminar limit: 2nd order to the exact compressible Poiseuille (u and T).
 | `gpu_rans_mms` | residual MMS on the O-grid annulus, 3 levels: SA u = 0 order 1.85, SST u = 0 1.88/1.85, SA full 0.91, SA convection 0.97, SST full 0.92/0.90 (bands [p − 0.25, p + 0.5]); FP64 reference error ≤ 1e-3 of the finest; the revolved WEDGE ladder with axisymmetric fields (hoop terms): SA u = 0 1.94, SA full 0.97, SST u = 0 1.92/1.93, SST full 0.97/0.89 |
 | `gpu_axisym` | the revolved wedge: (a) uniform x-freestream fixed point (3.4 ulp, outer rows 3.0); (b) side-face mass flux of a random axisymmetric state 0.02 ulp·ρvA; (c) ghost-column R_x(π) / plane R_x(±Δφ) bit-exact vs host; (d) w ≡ 0 kept (2e-10 U over 200 steps); (e) laminar Re 100 smoke; (f) SA/SST 200-step smoke, 0 hits, μt 0 on the wall faces; (g) Archimedes on a linear pressure within 0.5% (×2π/Δφ) |
 | `gpu_axisym3d` | the full revolution, 32×24 (6 s): (a) uniform freestream along, 30° to and ACROSS the axis (the mesh rotated): residual 4.0–4.9 ulp of the largest face flux on every real cell, axis rings 0.7–3.4; the outer third after 100 steps 4.5–4.9 ulp (5° wedge baseline 6.0); (b) axisymmetric start, laminar Re 100, N 16: the azimuthal spread random-walks (×2.1 from 300 to 1200 steps; ρ 37, u 54, v_r 62, p 18 ulp, swirl 5e-6 U) and saturates in an 8000-iteration steady march (×1.7 from 2000; swirl 1.3e-5 U); exactly π-symmetric bitwise; (c) N 16 vs the 22.5° wedge, same march: cd ≤ 4.3e-5 apart at every sample, every plane == the wedge's rotated to 1.4e-5; (d) cross-flow sphere (axis ⟂ flow), N 32: cd +0.97% of the axial-flow cd (64×48×64: +0.14%), lateral force 5e-6 cd, a quadratic fit extrapolates ONTO the axis ring better than one ring out (2.7% vs 5.0% of the range); (e) a bump across the axis and the seam: Σ V ΔR telescopes to 2.6e-6 of the flux activity (3.0e-7 at 4× the amplitude: FP32 cancellation of p∞\|S\| in the small axis cells, not a leak; off both 1.2e-8); (f) SA/SST 200-step URANS, 0 hits, μt 0 on every wall face, π-symmetric; (g) the tally on a linear pressure along / across the axis == −Σ p₁ S (1.1e-6 / 2.1e-8), Archimedes of the faceted body within 1.4%, no off-gradient force |
-| `gpu_axisym3d_run` | the full revolution through the binary (38 s): (a) laminar Re 100 32×24, `--nz 36` vs the 10° wedge at TOL 1e-4: both exit 0, cd 1.08139 / 1.08141 (band 1e-4), θ_s 125.61° both (0.02°), L_r 0.9224 D both (0.1%), 1152 surface rows, cl == cs == 0.0 on every row; (b) laminar Re 250 64×48×32: untripped exit 0 at cd 0.69099, cl == 0.0 on every row; `--ogrid-trip 0.05` exit 0 at the steady m = 1 wake, cd 0.70690 (0.2%), \|cl\| 0.0647 (5%), \|cs\| < 1e-3 \|cl\| |
-| `flow_rans_config` | every `dns flow --rans` / compressible `--steady` accept, reject (by flag, exit 2) and warning (the full revolution's `--nz`, `--ogrid-wedge`, `--les`, implicit, `--ogrid-trip` rules, the facet and π-symmetry warnings); the label/turbulence/wall/y⁺/run describe lines; RANS-off describes byte-identical to HEAD's strings; explicit given == defaulted; RunMeta keys only on flow RANS/steady |
+| `gpu_axisym3d_run` | the full revolution through the binary (~50 s): (a) laminar Re 100 32×24, `--nz 36` vs the 10° wedge at TOL 1e-4: the DEFAULT trip decays (cd within 1e-4 of the wedge, θ_s 0.02°, L_r 0.1%, \|cl\|, \|cs\| < 1e-4 at the stop), `--ogrid-trip 0` keeps cl == cs == 0.0 on every row, 1152 surface rows, the log names the resolved trip; (b) laminar Re 250 64×48×32: `--ogrid-trip 0` certifies the symmetric state (cd 0.69099, cl == 0.0 on every row), the default trip the steady m = 1 wake (cd 0.70690 within 0.2%, \|cl\| 0.0647 within 5%, \|cs\| < 1e-3 \|cl\|); (c) `--init-from` the 10° wedge: exit 0 at the cold start's cd (1e-4) in fewer iterations, the start reported and labelled; a wedge of another `--ny` / `--mach` / closure / `--ogrid-beta` and a missing prefix are exit 3 with the named reason |
+| `flow_rans_config` | every `dns flow --rans` / compressible `--steady` accept, reject (by flag, exit 2) and warning (the full revolution's `--nz`, `--ogrid-wedge`, `--les`, implicit, `--ogrid-trip` (default 0.05, an explicit 0 warned at Re ≥ 200 / RANS) and `--init-from` rules, the facet warning, the full-revolution label suffix); the label/turbulence/wall/y⁺/run describe lines; RANS-off describes byte-identical to HEAD's strings; explicit given == defaulted; RunMeta keys only on flow RANS/steady |
 | `gpu_determinism` | + the O-grid SA URANS run twice, stats byte-identical |
 | `gpu_nk` | the flow Newton–Krylov pieces: dual blocks == 4th-order FD of F_P (5e-12); N2 GPU P blocks == host FD restatement (5.7e-8, FP32 storage); N3 the single-launch FP32 line-SGS == host dense block GS (≤ 1e-5; measured ~1e-7); N1 forward vs central J v per field at 2⁻¹⁴ (the 2⁻¹⁰/2⁻¹² sweep printed); ρw ≡ 0 and the residual falls through 6 Newton steps (laminar, SA) |
 | `gpu_rans_immersed` | (a) G2-flow: focal + ghost + NSCBC, ν̃ ≡ 0 / k ≡ 0 mean flow and tally == RANS off bitwise; (b) G3-flow: a uniform scalar exact (0 ulp) in the interior AND ≤ 2 ulp in the NSCBC band (measured 0; 1.36e4 at 75f39db); (c) the 30° wall image: ν̃, μt = c·d exact to FP32, k = c·d² to its interpolation error with k_g ≥ 0, the ω_w-anchored ω image; (d) SA/SST 200-step immersed URANS on 128² finite, μt 0 on deep cells, 0 guard hits with and without the wall-value convection (SST: 710 at 75f39db) |

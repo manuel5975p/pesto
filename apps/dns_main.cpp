@@ -58,6 +58,7 @@
 #include <cstdio>
 #include <format>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <numbers>
 #include <optional>
@@ -340,6 +341,38 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
                 og->h1 > 0 ? geo.D / std::sqrt(c.re) / og->h1 : 0.0,
                 og->growth, og->normalDevMax * 180.0 / pi);
 
+    // --init-from (full revolution): the converged wedge, read and checked
+    // against this mesh before any output exists.
+    std::optional<WedgeStart> wedgeStart;
+    if (!c.ogridInitFrom.empty())
+    {
+        auto slurp = [](const std::string& p) -> std::optional<std::vector<char>> {
+            std::ifstream f(p, std::ios::binary);
+            if (!f) return std::nullopt;
+            return std::vector<char>(std::istreambuf_iterator<char>(f), {});
+        };
+        const std::string mp = c.ogridInitFrom + "_mesh.bin",
+                          fp = c.ogridInitFrom + "_final.bin";
+        const auto mb = slurp(mp), fb = slurp(fp);
+        if (!mb || !fb)
+            return die(exitInput, std::format("--init-from: cannot read {} (a "
+                                              "wedge run with --emit mesh "
+                                              "writes it)",
+                                              !mb ? mp : fp));
+        std::vector<std::string> names;
+        if (c.rans == RansModel::SaNeg) names = {"nutilde"};
+        else if (ransSst(c.rans)) names = {"k", "omega"};
+        const double centre[3] = {c.placement.cx, c.placement.cy,
+                                  c.placement.cz};
+        auto ws = revolveWedgeState(*mb, *fb, *og, centre, names, pInf);
+        if (!ws)
+            return die(exitInput, "--init-from " + c.ogridInitFrom + ": " +
+                                      ws.error());
+        wedgeStart = std::move(*ws);
+        std::printf("# initial state: the wedge %s revolved over %d planes\n",
+                    c.ogridInitFrom.c_str(), g.nz);
+    }
+
     // Frames are the index-space raster of the annulus (runner_ogrid.hpp says
     // why), so the render grid IS the logical grid and there is no mask: every
     // cell is fluid.
@@ -430,12 +463,48 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
     }
     for (int i = 0; i < ransScalars(c.rans); ++i)
         rr.icTurb[i].assign(g.size(), rhoInf * c.ransPhiInf[i]);
+    // The full revolution's primitives: the wedge start or the uniform
+    // state above, so the trip below adds to whichever it is.
+    std::vector<double> pr, pu, pv, pw, pp;
+    if (c.ogridNphi > 0)
+    {
+        if (wedgeStart)
+        {
+            pr = std::move(wedgeStart->rho);
+            pu = std::move(wedgeStart->u);
+            pv = std::move(wedgeStart->v);
+            pw = std::move(wedgeStart->w);
+            pp = std::move(wedgeStart->p);
+            for (std::size_t q = 0; q < g.size(); ++q)
+            {
+                ic.rho[q] = pr[q];
+                ic.mx[q] = pr[q] * pu[q];
+                ic.my[q] = pr[q] * pv[q];
+                ic.mz[q] = pr[q] * pw[q];
+                ic.E[q] = pp[q] / (gamma - 1.0) +
+                          0.5 * pr[q] *
+                              (pu[q] * pu[q] + pv[q] * pv[q] + pw[q] * pw[q]);
+            }
+            for (int i = 0; i < ransScalars(c.rans); ++i)
+                for (std::size_t q = 0; q < g.size(); ++q)
+                    rr.icTurb[i][q] = pr[q] * wedgeStart->phi[i][q];
+        }
+        else
+        {
+            pr.assign(g.size(), rhoInf);
+            pu.assign(g.size(), u0);
+            pv.assign(g.size(), 0.0);
+            pw.assign(g.size(), 0.0);
+            pp.assign(g.size(), pInf);
+        }
+    }
     // --ogrid-trip (full revolution only): a solenoidal Gaussian vortex, axis
     // along z, at (cx + D, cy + D/4, cz), width w = D/4, strength A U --
     // u += 2 (y - y0)/w e, v -= 2 (x - x0)/w e, e = A U exp(-|x - x0|^2/w^2):
     // divergence-free (w == 0, and e's z factor multiplies both), so
     // acoustically silent. It breaks the exact pi-rotation symmetry about the
-    // axis that otherwise locks out the odd azimuthal modes.
+    // axis that otherwise locks out the odd azimuthal modes. On the uniform
+    // start it is bit for bit the aeb53b9 trip (adding v = w = 0 is exact).
     if (c.ogridNphi > 0 && c.ogridTrip > 0)
     {
         const double A = c.ogridTrip * c.uInf, w = 0.25 * geo.D;
@@ -458,12 +527,13 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
                     const double e =
                         A * std::exp(-(dx * dx + dy * dy + dz * dz) / (w * w));
                     const std::size_t q = g.idx(i, j, k);
-                    const double uu = u0 + 2.0 * dy / w * e,
-                                 vv = -2.0 * dx / w * e;
-                    ic.mx[q] = rhoInf * uu;
-                    ic.my[q] = rhoInf * vv;
-                    ic.E[q] = pInf / (gamma - 1.0) +
-                              0.5 * rhoInf * (uu * uu + vv * vv);
+                    const double uu = pu[q] + 2.0 * dy / w * e,
+                                 vv = pv[q] + -2.0 * dx / w * e, ww = pw[q];
+                    ic.mx[q] = pr[q] * uu;
+                    ic.my[q] = pr[q] * vv;
+                    ic.mz[q] = pr[q] * ww;
+                    ic.E[q] = pp[q] / (gamma - 1.0) +
+                              0.5 * pr[q] * (uu * uu + vv * vv + ww * ww);
                 }
     }
 

@@ -4,6 +4,7 @@
 // explicit-given == defaulted, and the RunMeta keys only on flow RANS/steady.
 // Host-only, milliseconds.
 #include "dns/config.hpp"
+#include "dns/ogrid.hpp"
 #include "dns/pseudo_time.hpp"
 #include "dns/rans.hpp"
 #include "check.hpp"
@@ -402,12 +403,20 @@ void revolved()
         const std::string d = f->describe();
         check(d.find("FULL revolution 32 azimuthal cells") != std::string::npos &&
                   d.find("axisymmetric WEDGE") == std::string::npos &&
-                  d.find("  label ") == std::string::npos,
-              "full revolution describe: its block, no wedge, a DNS time "
-              "march carries no label");
+                  d.find("  label      DNS [full revolution 32: odd-mode trip "
+                         "0.05 U]\n") != std::string::npos,
+              "full revolution describe: its block, no wedge, the DNS time "
+              "march labelled with its resolved trip");
+        check(f->ogridTrip == dns::kOgridTripDefault && dns::kOgridTripDefault == 0.05 &&
+                  d.find("odd-mode trip 0.05 U (solenoidal, 1 D behind the "
+                         "body; the default)") != std::string::npos &&
+                  d.find("initial state rest (quiet-start ramp)") !=
+                      std::string::npos,
+              "the trip is ON by default (0.05 U), printed as the default; the "
+              "initial state line");
         check(!hasWarning(*f, "polygon") && !hasWarning(*f, "pi about the axis"),
               "--nz 32 at Re 100: no facet warning (0.64% < 1%), no "
-              "symmetry warning (Re < 200)");
+              "symmetry warning (tripped)");
     }
     auto fd = runCli(sph);
     check(fd && fd->ogridNphi == 64 && fd->grid.nz == 64,
@@ -416,23 +425,67 @@ void revolved()
                            "1e-4", "--re", "1e4"}));
     check(fr && fr->describe().find("  label      RANS SA-neg -- steady "
                                     "(local time stepping: pseudo-time, not "
-                                    "time-accurate)\n") != std::string::npos,
-          "full revolution RANS steady label: no wedge suffix");
+                                    "time-accurate) [full revolution 16: "
+                                    "odd-mode trip 0.05 U]\n") !=
+                    std::string::npos,
+          "full revolution RANS steady label: the full-revolution suffix, no "
+          "wedge suffix");
     check(fr && hasWarning(*fr, "polygon about the axis, its frontal area "
                                 "2.55% below"),
           "--nz 16 warns: a 16-gon, frontal area 2.55% below the circle's");
-    check(fr && hasWarning(*fr, "exactly symmetric under a rotation by pi"),
-          "full revolution RANS without --ogrid-trip warns: no odd modes");
+    check(fr && !hasWarning(*fr, "rotation by pi"),
+          "full revolution RANS with the default trip: no symmetry warning");
+    auto f0 = runCli(with({"--nz", "16", "--rans", "sa-neg", "--steady",
+                           "1e-4", "--re", "1e4", "--ogrid-trip", "0"}));
+    check(f0 && f0->ogridTrip == 0 &&
+              hasWarning(*f0, "--ogrid-trip 0: the full-revolution O-grid") &&
+              f0->describe().find("[full revolution 16: untripped, exactly "
+                                  "pi-symmetric]") != std::string::npos,
+          "an explicit --ogrid-trip 0 under RANS: warned, labelled untripped");
+    auto f0l = runCli(with({"--nz", "16", "--ogrid-trip", "0"}));
+    check(f0l && !hasWarning(*f0l, "--ogrid-trip 0"),
+          "an explicit --ogrid-trip 0 at laminar Re 100: no warning (stable)");
+    auto f0h = runCli(with({"--nz", "16", "--ogrid-trip", "0", "--re", "200"}));
+    check(f0h && hasWarning(*f0h, "--ogrid-trip 0"),
+          "an explicit --ogrid-trip 0 at Re 200: warned");
     auto ft = runCli(with({"--nz", "16", "--re", "300", "--ogrid-trip",
-                           "0.05"}));
-    check(ft && ft->ogridTrip == 0.05 &&
+                           "0.02"}));
+    check(ft && ft->ogridTrip == 0.02 &&
               !hasWarning(*ft, "rotation by pi") &&
-              ft->describe().find("odd-mode trip 0.05 U") != std::string::npos,
-          "--ogrid-trip 0.05: resolved, described, no symmetry warning");
+              ft->describe().find("odd-mode trip 0.02 U (solenoidal, 1 D "
+                                  "behind the body)\n") != std::string::npos,
+          "--ogrid-trip 0.02: resolved, described (not the default), no "
+          "symmetry warning");
     auto fu = runCli(with({"--nz", "16", "--rans", "sst-2003m", "--re", "1e4"}));
     check(fu && fu->describe().find("  label      RANS SST-2003m -- URANS "
-                                    "(time-accurate)\n") != std::string::npos,
+                                    "(time-accurate) [full revolution 16: "
+                                    "odd-mode trip 0.05 U]\n") !=
+                    std::string::npos,
           "full revolution URANS label: no axisymmetric-unsteadiness tail");
+    // --init-from: the wedge start (the file is main's, phase 3).
+    auto fi = runCli(with({"--nz", "16", "--steady", "1e-4", "--init-from",
+                           "runs/w5"}));
+    check(fi && fi->ogridInitFrom == "runs/w5" && fi->ramp == 0 &&
+              fi->describe().find("initial state the converged wedge "
+                                  "runs/w5_final.bin revolved over the 16 "
+                                  "planes") != std::string::npos &&
+              fi->describe().find("started from the wedge runs/w5]") !=
+                  std::string::npos,
+          "--init-from: resolved, ramp 0, described and labelled");
+    auto fit = runCli(with({"--nz", "16", "--init-from", "runs/w5"}));
+    check(fit && fit->ramp == 0 && fit->compSteady == false,
+          "--init-from on a time march: impulsive from the wedge's state");
+    rejectedAt(with({"--nz", "16", "--init-from", "w", "--ramp", "1"}),
+               "--ramp", "--ramp with --init-from");
+    rejectedAt(with({"--nz", "1", "--init-from", "w"}), "--init-from",
+               "--init-from on the wedge");
+    rejectedAt(og({"--init-from", "w"}), "--init-from",
+               "--init-from on an extruded O-grid");
+    rejectedAt({"flow", "--physics", "compressible", "--body", "sphere",
+                "--n", "64", "--init-from", "w", "--out", "x"},
+               "--init-from", "--init-from without --ogrid");
+    rejectedAt(with({"--nz", "16", "--init-from", "a\"b"}), "--init-from",
+               "--init-from with a quote");
     rejectedAt(with({"--nz", "7"}), "--nz", "an odd azimuthal count");
     rejectedAt(with({"--nz", "2"}), "--nz", "--nz 2 (below 4)");
     rejectedAt(with({"--nz", "8", "--ogrid-wedge", "5"}), "--ogrid-wedge",
