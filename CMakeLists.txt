@@ -503,6 +503,9 @@ if(BUILD_TESTING)
         # Smoke coverage for the three runners, incl. --far tunnel WITH walls
         # (the incompressible default) and runner_comp, which had none.
         dns_gpu_bin_test(gpu_runners 600)
+        # SST small cases: the freestream decay ODE and the L1 sphere-wedge
+        # Re 1e3 certification against OpenFOAM on the identical mesh (~35 s).
+        dns_gpu_bin_test(gpu_sst 180)
         # Sponge-free open tunnel: library-level freestream cycles + a short
         # end-to-end run of the built binary.
         dns_gpu_bin_test(gpu_tunnel_open 600)

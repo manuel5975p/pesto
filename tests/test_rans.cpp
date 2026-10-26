@@ -9,6 +9,7 @@
 #include "dns/ogrid.hpp"
 #include "dns/rans_label.hpp"
 #include "dns/remap.hpp"
+#include "dns/sgs.hpp"
 #include "dns/walldist.hpp"
 #include "check.hpp"
 
@@ -419,11 +420,190 @@ void labels()
           "ransBuilt: conv/tgv register no --rans");
 }
 
+// TMR sst.html (SST-2003, SST-V, the "m" variants), restated in FP64 from the
+// velocity-gradient TENSOR and the scalar gradient VECTORS, independently of
+// rans.hpp's factoring: S_ij, W_ij built here, the min/max chains written
+// with std::min/std::max, the omega production as gamma/nu_t * P~ (2003m) or
+// gamma/nu_t * P (Vm) literally, not the gamma rho R^2 form.
+struct SstRef
+{
+    double F1, F2, mut, Sk, Sw; // sources per unit volume
+};
+SstRef tmrSst(RansModel m, double rho, double k, double om, const double g[3][3],
+              const double gk[3], const double gw[3], double d, double nu)
+{
+    double s2 = 0, w2 = 0;
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) {
+            const double sij = 0.5 * (g[i][j] + g[j][i]);
+            const double wij = 0.5 * (g[i][j] - g[j][i]);
+            s2 += 2 * sij * sij;
+            w2 += 2 * wij * wij;
+        }
+    const double S = std::sqrt(s2), W = std::sqrt(w2);
+    const bool m03 = m == RansModel::Sst2003m;
+    const double bs = 0.09, s_w2 = 0.856, a1 = 0.31;
+    const double dkw = gk[0] * gw[0] + gk[1] * gw[1] + gk[2] * gw[2];
+    const double CD = std::max(2 * rho * s_w2 * dkw / om, m03 ? 1e-10 : 1e-20);
+    const double t1 = std::sqrt(k) / (bs * om * d), t2 = 500 * nu / (d * d * om);
+    const double arg1 = std::min(std::max(t1, t2), 4 * rho * s_w2 * k / (CD * d * d));
+    const double arg2 = std::max(2 * t1, t2);
+    const double F1 = std::tanh(std::pow(arg1, 4)), F2 = std::tanh(arg2 * arg2);
+    const double R = m03 ? S : W; // mu_t's and P's rate (TMR table)
+    const double mut = rho * a1 * k / std::max(a1 * om, R * F2);
+    const double P = mut * R * R;
+    const double Pk = std::min(P, (m03 ? 10.0 : 20.0) * bs * rho * om * k);
+    const double g1 = m03 ? 5.0 / 9.0 : 0.075 / bs - 0.5 * 0.41 * 0.41 / std::sqrt(bs);
+    const double g2 = m03 ? 0.44 : 0.0828 / bs - 0.856 * 0.41 * 0.41 / std::sqrt(bs);
+    const double gam = F1 * g1 + (1 - F1) * g2, beta = F1 * 0.075 + (1 - F1) * 0.0828;
+    const double Pw = gam / (mut / rho) * (m03 ? Pk : P); // 2003: limited in BOTH
+    return {F1, F2, mut, Pk - bs * rho * om * k,
+            Pw - beta * rho * om * om + 2 * (1 - F1) * rho * s_w2 / om * dkw};
+}
+
+// The rans.hpp pipeline as the kernels call it (kSstMutCurv + sstSource):
+// sstCd -> sstBlend -> sstMut, the rate from the tensor the kernel's way.
+template <class T>
+SstRef dnsSst(RansModel m, T rho, T k, T om, const T g[3][3], const T gk[3],
+              const T gw[3], T d, T nu)
+{
+    T R;
+    if (m == RansModel::SstVm) {
+        const T w0 = g[2][1] - g[1][2], w1 = g[0][2] - g[2][0], w2 = g[1][0] - g[0][1];
+        R = std::sqrt(w0 * w0 + w1 * w1 + w2 * w2);
+    } else {
+        R = sgsRate(0, g);
+    }
+    const T gkw = gk[0] * gw[0] + gk[1] * gw[1] + gk[2] * gw[2];
+    const T cd = sstCd(rho, gkw, om, T(sstCdFloor(m)));
+    const SstBlend<T> b = sstBlend(k, om, d, nu, rho, cd);
+    const T mut = sstMut(rho, k, om, R, b.F2);
+    const SstPoint<T> P = sstSource(m, rho, k, om, R, mut, b.F1, gkw);
+    return {double(b.F1), double(b.F2), double(mut), double(P.Rk), double(P.Rw)};
+}
+
+// Random states over six decades of omega and k, plus states placed ON the
+// switches: F1 ~ 0.5 (arg1 = 0.84), the 2003m/Vm production limiter at
+// 0.5x..2x its threshold, CDkw within a factor 2 of its floor (both signs),
+// and the mu_t limiter (a1 omega vs R F2) at 0.5x..2x. Sources compared
+// against their own term scale (|P| + |destruction| + |cross|): the two
+// codes order the cancelling sums differently.
+void sstRestatement()
+{
+    std::mt19937_64 rng(20261026);
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    auto logu = [&](double lo, double hi) {
+        return std::exp(std::log(lo) + (std::log(hi) - std::log(lo)) * u01(rng));
+    };
+    auto sgn = [&] { return u01(rng) < 0.5 ? -1.0 : 1.0; };
+    double worst[2][5] = {};
+    long placed[4] = {};
+    for (RansModel m : {RansModel::Sst2003m, RansModel::SstVm}) {
+        const int mi = m == RansModel::SstVm;
+        for (int n = 0; n < 40000; ++n) {
+            const int kind = n % 5; // 0 random, 1 F1~0.5, 2 limiter, 3 CD floor, 4 mu_t switch
+            const double rho = logu(0.5, 2.0), nu = logu(1e-6, 1e-3);
+            double d = logu(1e-4, 1.0), om = logu(1e-1, 1e6), k = logu(1e-10, 1e-1);
+            double g[3][3], gk[3], gw[3];
+            for (auto& r : g)
+                for (double& x : r) x = sgn() * logu(1e-3, 1e3) * (u01(rng) < 0.2 ? 0 : 1);
+            for (int i = 0; i < 3; ++i) {
+                gk[i] = sgn() * logu(1e-8, 1e2);
+                gw[i] = sgn() * logu(1e-2, 1e8);
+            }
+            double S2 = 0, W2 = 0;
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j) {
+                    S2 += 0.5 * (g[i][j] + g[j][i]) * (g[i][j] + g[j][i]);
+                    W2 += 0.5 * (g[i][j] - g[j][i]) * (g[i][j] - g[j][i]);
+                }
+            const double R = std::sqrt(mi ? W2 : S2);
+            if (kind == 1) { // arg1 = 0.84 (F1 = 0.42) through the sqrt(k) branch
+                // 500 nu/(d^2 om) = 500 nu (0.09 x 0.84)^2 om / k: keep it
+                // below 0.84 by capping omega, then place d on the knee.
+                const double c = 500 * nu * (0.09 * 0.84) * (0.09 * 0.84) / k;
+                om = std::min(om, 0.5 * 0.84 / c);
+                d = std::sqrt(k) / (0.09 * om * 0.84);
+                for (double& x : gw) x = 0; // CD at its floor: arg1's third term huge
+                ++placed[0];
+            } else if (kind == 2 && R > 0) { // P / lim in [0.5, 2] (a1 omega branch)
+                const double c = (mi ? 20.0 : 10.0) * 0.09;
+                om = R / std::sqrt(c * logu(0.5, 2.0));
+                d = 1.0; // F2 -> small: mu_t = rho k/omega, P/lim = R^2/(c omega^2)
+                ++placed[1];
+            } else if (kind == 3) { // 2 rho s_w2 gkw/om ~ floor x [0.5, 2], both signs
+                const double fl = m == RansModel::Sst2003m ? 1e-10 : 1e-20;
+                const double want = sgn() * fl * logu(0.5, 2.0);
+                for (int i = 0; i < 3; ++i) gk[i] = gw[i] = 0;
+                gk[0] = 1.0;
+                gw[0] = want * om / (2 * rho * 0.856);
+                ++placed[2];
+            } else if (kind == 4 && R > 0) { // a1 omega / (R F2) in [0.5, 2], F2 ~ 1
+                d = std::min(d, 1e-3);
+                k = std::max(k, 1e-4);
+                om = R * logu(0.5, 2.0) / 0.31;
+                ++placed[3];
+            }
+            const SstRef a = tmrSst(m, rho, k, om, g, gk, gw, d, nu);
+            const SstRef b = dnsSst<double>(m, rho, k, om, g, gk, gw, d, nu);
+            float gf[3][3], gkf[3], gwf[3];
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) gf[i][j] = float(g[i][j]);
+                gkf[i] = float(gk[i]);
+                gwf[i] = float(gw[i]);
+            }
+            const SstRef f = dnsSst<float>(m, float(rho), float(k), float(om), gf, gkf,
+                                           gwf, float(d), float(nu));
+            const double bs = 0.09;
+            const double scK = std::abs(b.mut * R * R) + bs * rho * om * k;
+            const double dkw = gk[0] * gw[0] + gk[1] * gw[1] + gk[2] * gw[2];
+            const double scW = std::abs(rho * 0.6 * R * R) + 0.0828 * rho * om * om +
+                               std::abs(2 * rho * 0.856 * dkw / om);
+            const double e[5] = {std::abs(a.F1 - b.F1), std::abs(a.F2 - b.F2),
+                                 std::abs(a.mut - b.mut) / a.mut,
+                                 std::abs(a.Sk - b.Sk) / scK, std::abs(a.Sw - b.Sw) / scW};
+            for (int x = 0; x < 5; ++x) worst[mi][x] = std::max(worst[mi][x], e[x]);
+            if (!(e[0] < 1e-12 && e[1] < 1e-12 && e[2] < 1e-12 && e[3] < 1e-12 &&
+                  e[4] < 1e-12)) {
+                check(false, std::format("SST restatement {} kind {} n {}: dF1 {:.2e} dF2 "
+                                         "{:.2e} dmut {:.2e} dSk {:.2e} dSw {:.2e}",
+                                         ransName(m), kind, n, e[0], e[1], e[2], e[3],
+                                         e[4]));
+                return;
+            }
+            // FP32 (the kernels' precision) against the FP64 restatement: the
+            // sources to 1e-4 of their term scale, F1/F2 to 1e-4 (tanh of a
+            // 4th power amplifies arg1's rounding by 4 arg1^4 near the knee).
+            const double ef[5] = {std::abs(a.F1 - f.F1), std::abs(a.F2 - f.F2),
+                                  std::abs(a.mut - f.mut) / a.mut,
+                                  std::abs(a.Sk - f.Sk) / scK, std::abs(a.Sw - f.Sw) / scW};
+            const bool fin = std::isfinite(f.Sk) && std::isfinite(f.Sw) && std::isfinite(f.mut);
+            // FP32 overflows om^2 rho beyond ~1e19: none of these states do.
+            if (!(fin && ef[0] < 1e-4 && ef[1] < 1e-4 && ef[2] < 1e-4 && ef[3] < 1e-4 &&
+                  ef[4] < 1e-4)) {
+                check(false, std::format("SST float {} kind {} n {}: dF1 {:.2e} dF2 {:.2e} "
+                                         "dmut {:.2e} dSk {:.2e} dSw {:.2e}",
+                                         ransName(m), kind, n, ef[0], ef[1], ef[2], ef[3],
+                                         ef[4]));
+                return;
+            }
+        }
+    }
+    for (int mi = 0; mi < 2; ++mi)
+        std::printf("SST restatement %s: worst dF1 %.1e dF2 %.1e dmut %.1e dSk %.1e "
+                    "dSw %.1e\n",
+                    mi ? "Vm" : "2003m", worst[mi][0], worst[mi][1], worst[mi][2],
+                    worst[mi][3], worst[mi][4]);
+    check(placed[0] > 1000 && placed[1] > 1000 && placed[2] > 1000 && placed[3] > 1000,
+          "SST restatement: every switch region sampled");
+}
+
 } // namespace
 
 int main()
 {
     constants();
+    sstRestatement();
     limiter();
     logLayer();
     negative();

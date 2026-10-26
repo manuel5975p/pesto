@@ -130,7 +130,8 @@ manual check there (ub within 0.06% of the oracle after 3–4e5 iterations).
 ### Sphere Re 100 on the revolved wedge vs OpenFOAM (`sph100`, identical mesh)
 
 Code-to-code, not literature: OpenFOAM v2606 `simpleFoam` (incompressible,
-`linearUpwind` on U, SIMPLE consistent) run ON THE dns MESH — `dns flow
+`linearUpwind` on U -- measured before central U became the parity
+reference, see `sph1e4` below; SIMPLE consistent) run ON THE dns MESH — `dns flow
 --emit mesh` writes `_mesh.bin`, `tools/parity/dnsmesh.py` turns it into a
 `constant/polyMesh` (axis cells become prisms, `checkMesh` OK), and
 `tools/parity/sph1e4.py case|run|read|dns` drives and reads both sides. Tier
@@ -183,6 +184,36 @@ wall distance does not decompose), 3000 iterations, settled to 1e-4 within
   184 s to the certified stop (TOL 1e-4, explicit LTS, 0.30 ms/iteration).
   OpenFOAM: 59 s serial for 3000 iterations, settled to 1e-4 in 413.
 - SST and L1: no dns steady state (docs/rans.md, issues.md 1-2).
+
+**The reference depends on OpenFOAM's U scheme** (measured 2026-10-26,
+`sph1e4.py case ... --u-scheme linear`: central `Gauss linear` on U, the
+scheme that matches dns's dissipation-free KG; everything else identical).
+OpenFOAM SIMPLE converges with it on every case below (settled to 1e-4 in
+555–911 iterations):
+
+| case (identical mesh) | OpenFOAM linearUpwind cd / θ_s / L_r | OpenFOAM central cd / θ_s / L_r | dns |
+|---|---|---|---|
+| SA L2 Re 1e4 | 0.41285 / 87.59° / 1.2566 D | 0.41911 / 87.82° / 1.1576 D | cd0 0.41764: **−0.35%** (vs +1.16% against linearUpwind); θ_s 87.64° (M 0.1); L_r 1.2018 (+3.8%) |
+| SST-2003m L2 Re 1e4 | 0.39496 / 86.69° / 1.4005 D | 0.40589 / 87.14° / 1.2014 D | no steady state; URANS M 0.2 time mean 0.4115 (t 8–14.6 D_box/U, band 0.404–0.424), θ_s 86.82° / L_r 1.264 D at the final instant |
+| SST-2003m L1 Re 1e4 | 0.39964 / 87.18° / 1.2578 D | 0.43000 / 87.53° / 0.9095 D | no steady state (closure-independent at L1, issues.md 1) |
+| SST-2003m L1 Re 3e3 | -- | 0.43739 / 93.54° / 0.9530 D | M 0.2 0.44261 at the 2e5 cap (remaining 1.7e-4), θ_s 93.00°, L_r 1.0139 D |
+| SST-2003m L1 Re 1e3 | 0.47129 / 100.02° / 1.4890 D | 0.48872 / 100.77° / 1.0674 D | **cd0 0.49070: +0.41%** (M 0.2 0.49851 exit 0 in 114600 it / 28 s; M 0.1 0.49265 settled, exit 8 by the M 0.1 floor); θ_s 100.30° / 100.51°; L_r 1.1656 / 1.1498 D (+7.7% at M 0.1) |
+
+The SST-2003m L1 Re 1e3 row is the small gate `gpu_sst` (b). The
+"OpenFOAM SST near-wake k 2.3× below dns" seen against linearUpwind is the
+scheme: with central U the two agree within 10–30% near the body. A parity
+number names the U scheme from now on; the SA row's +1.16% above stands
+for the linearUpwind reference it was measured against.
+
+**Decisions (2026-10-26).** The gate reference is OpenFOAM with CENTRAL U
+(`sph1e4.py` default `--u-scheme linear`); linearUpwind is kept only to
+reproduce the rows measured against it. SA L2 tier B: −0.35%, PASS.
+SST-2003m at Re 1e4 L2 has no stable steady state (the URANS is unsteady in
+the same band as the pseudo-time cycle), so it is compared on the URANS TIME
+MEAN, labelled `RANS SST-2003m -- URANS (time-accurate)`: tier A at M 0.2
+0.4115 vs OpenFOAM central 0.40589 = +1.4% (the M 0.1 URANS leg for tier B,
+~22 min, not run). The coarse wedges' exit 8 (issues.md 1) is accepted as
+the honest outcome: the only cure measured is dissipation.
 
 ## Tolerance adjustments vs the original plan
 

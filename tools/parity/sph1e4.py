@@ -4,7 +4,7 @@ and sph100 (laminar, Re 100). masterplan_flowrans section 8; docs/rans.md
 "OpenFOAM parity".
 
     sph1e4.py case  <dns>_mesh.bin CASEDIR MODEL RE [--ft2 true|false]
-                    [--np N] [--iters N]
+                    [--np N] [--iters N] [--u-scheme linear|linearUpwind]
     sph1e4.py run   CASEDIR [--np N]
     sph1e4.py read  CASEDIR            # the OpenFOAM observables, JSON
     sph1e4.py dns   <dns-out-prefix>   # the dns observables, JSON
@@ -20,8 +20,13 @@ NONUNIFORM fixedValue 60 nu/(beta1 d1^2) from dns's own d1 (the same
 face-Dirichlet image dns uses; not omegaWallFunction); far U
 freestreamVelocity, p freestreamPressure, scalars inletOutlet at the
 freestream units of decision 4 (nuTilda 3 nu; k 2.25e-7 U^2, omega =
-k/(0.009 nu)). Prt 0.9 (OpenFOAM's default is 1.0). Schemes: linearUpwind
-for U, first-order upwind for the turbulence (as dns), SIMPLE consistent,
+k/(0.009 nu)). Prt 0.9 (OpenFOAM's default is 1.0). Schemes: central Gauss
+linear for U (default since 2026-10-26: the parity reference, it matches
+dns's dissipation-free KG mean flow) or, with --u-scheme linearUpwind, the
+original reference; MEASURED, the choice moves
+OpenFOAM's own SST cd by +3.7% (L1, Re 1e3) / +2.8% (L2, Re 1e4) and L_r
+by -28% / -14%, so a parity number names its scheme (docs/validation.md).
+First-order upwind for the turbulence (as dns), SIMPLE consistent,
 relaxation U 0.9 / turbulence 0.8. Wall distance exactDistance.
 """
 import json
@@ -52,7 +57,12 @@ def write(case, path, text):
         f.write(text)
 
 
-def make_case(meshbin, case, model, re_, ft2=True, iters=8000):
+U_SCHEMES = {"linearUpwind": "bounded Gauss linearUpwind grad(U)",
+             "linear": "bounded Gauss linear"}
+
+
+def make_case(meshbin, case, model, re_, ft2=True, iters=8000,
+              uscheme="linear"):
     m = dnsmesh.read_mesh(meshbin)
     cellij, d1 = dnsmesh.write_polymesh(case, m)
     nu = 1.0 / re_
@@ -88,7 +98,7 @@ gradSchemes { default Gauss linear; }
 divSchemes
 {
     default none;
-    div(phi,U) bounded Gauss linearUpwind grad(U);
+    div(phi,U) @USCHEME@;
     div(phi,nuTilda) bounded Gauss upwind;
     div(phi,k) bounded Gauss upwind;
     div(phi,omega) bounded Gauss upwind;
@@ -98,7 +108,7 @@ laplacianSchemes { default Gauss linear corrected; }
 interpolationSchemes { default linear; }
 snGradSchemes { default corrected; }
 wallDist { method exactDistance; }
-""")
+""".replace("@USCHEME@", U_SCHEMES[uscheme]))
     write(case, "system/fvSolution", hdr("dictionary", "fvSolution", "system") + """
 solvers
 {
@@ -345,7 +355,7 @@ if __name__ == "__main__":
     opt = lambda k, d: a[a.index(k) + 1] if k in a else d
     if a[0] == "case":
         make_case(a[1], a[2], a[3], float(a[4]), opt("--ft2", "true") == "true",
-                  int(opt("--iters", "8000")))
+                  int(opt("--iters", "8000")), opt("--u-scheme", "linear"))
     elif a[0] == "run":
         sys.exit(run_case(a[1], int(opt("--np", "1"))))
     elif a[0] == "read":

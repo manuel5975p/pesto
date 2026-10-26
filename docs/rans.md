@@ -80,6 +80,61 @@ eddy-viscosity slot of `faceFluxCurv` with `kPrim`/`faceFlux` untouched.
 k ≥ 0 and ω ≥ floor·ρ are a **counted** guard (stats `floorHits`); every
 pinned test requires zero hits.
 
+### SST audit: TMR vs dns vs OpenFOAM v2606 `kOmegaSST` (2026-10-26)
+
+TMR `sst.html` re-read 2026-10-26; OpenFOAM from
+`src/TurbulenceModels/turbulenceModels/Base/kOmegaSST/kOmegaSSTBase.C`. The
+pointwise dns algebra is pinned against an independent FP64 restatement of
+TMR (test `rans`, `sstRestatement`: 4e4 random states per closure plus
+states placed ON every switch -- F1 ≈ 0.42, P/limiter ∈ [½, 2], CDkω within
+2× of its floor of either sign, a1ω/(R F2) ∈ [½, 2]): FP64 worst 7e-16
+(F1, F2, μt, both sources), FP32 within 1e-4 of the term scale.
+
+| term | TMR SST-2003m | dns `sst-2003m` | OpenFOAM `kOmegaSST` (v2606 defaults) |
+|---|---|---|---|
+| F1 | tanh(arg1⁴), arg1 = min(max(√k/(β*ωd), 500ν/(d²ω)), 4ρσω2k/(CDkω d²)) | same; arg1 clamped at 10 (exact) | same; clamp 10; CDkω+ per unit ρ (incompressible) |
+| CDkω | max(2ρσω2∇k·∇ω/ω, 1e-10) | same (Vm: 1e-20, TMR's 1994 value) | same, 1e-10 |
+| F2 | tanh(arg2²), arg2 = max(2√k/(β*ωd), 500ν/(d²ω)) | same, clamp 10 | same, clamp 100 (equivalent) |
+| F3 | -- | -- | `F3 false` (default; matches) |
+| μt | ρa1k/max(a1ω, S F2), S = √(2SᵢⱼSᵢⱼ) | same | a1k/max(a1ω, b1F2√S2), b1 = 1 (same) |
+| P (k eq.) | min(P, 10β*ρωk); "m": P ≈ μt S² | min(μt S², 10β*ρωk) | min(νt ∇U:dev(2S), c1β*kω), c1 = 10 = νt(S² − ⅔(∇·u)²), plus −⅔k∇·u (SuSp); ∇·u ≈ 0 in simpleFoam |
+| ω production | (γ/νt) P̃ (TMR: the paper's αρS² was a typo) | γρ min(S², lim/μt) ≡ (γ/νt)P̃ | γ min(∇U:dev(2S), (c1/a1)β*ω max(a1ω, b1F2√S2)) ≡ (γ/νt)P̃, plus −⅔γω∇·u |
+| γ1, γ2 | 5/9, 0.44 | same | same |
+| β1, β2, β*, σk1, σk2, σω1, σω2, a1 | 0.075, 0.0828, 0.09, 0.85, 1, 0.5, 0.856, 0.31 | same | same |
+| cross diffusion | 2(1−F1)ρσω2∇k·∇ω/ω | same, unfloored; its negative part point-implicit | same, unfloored; SuSp (implicit when negative) |
+| ⅔ρk in τᵢⱼ | dropped ("m") | dropped | absorbed in the kinematic pressure (incompressible) |
+| wall ω | 60ν/(β1 d1²) | face Dirichlet image per wall face, d1 = first cell-centre distance | parity case: `fixedValue` per face from dns's own d1 (NOT `omegaWallFunction`) |
+| wall k, μt | 0 | antimirror (face 0) / odd (face 0.0) | `fixedValue 0` / `fixedValue 0` |
+| freestream | U∞/L < ω < 10U∞/L, μt∞/μ 1e-5..1e-2 | k∞ 2.25e-7 U², μt∞/μ 0.009 (ω∞ 0.25 U/D at Re 1e4) | `inletOutlet` at the same values |
+| decay control | only in SST-sust | none | `decayControl false` (default; matches) |
+| positivity | -- | counted guard (0 hits in every pinned run) | `bound(k, kMin)`, `bound(ω, ωMin)`: SILENT clipping (central-U runs print `bounding k, min: 0` every iteration) |
+| Pr_t | 0.9 (air) | 0.9 | `Prt 0.9` set in the parity case (default 1.0) |
+| scalar convection | -- | first-order upwind | `bounded Gauss upwind` (matches) |
+| mean-flow convection | -- | KG central, no added dissipation | parity default central `linear` (the reference since 2026-10-26); `--u-scheme linearUpwind` = the original (below) |
+| wall distance | exact | exact to the wall polyline at the node-mean centroid | `exactDistance` |
+
+SST-Vm vs TMR SST-V / SSTm: μt with ΩF2, P = μt Ω², k limiter 20β*ρωk
+only, ω production γρΩ² unlimited, γᵢ derived (0.5532, 0.4404), CDkω floor
+1e-20 -- all as TMR; OpenFOAM has no Vm switch (its G and μt are strain-based
+by construction), so Vm has no matched OpenFOAM reference.
+
+**No model mismatch.** The only material difference is the mean-flow
+scheme of the parity case: `linearUpwind` on U (2nd-order upwind, numerical
+dissipation) against dns's dissipation-free central KG. MEASURED on the
+identical meshes: OpenFOAM's own SST cd moves +3.7% (L1 Re 1e3, 0.47129 →
+0.48872), +2.8% (L2 Re 1e4, 0.39496 → 0.40589), +7.6% (L1 Re 1e4, 0.39964 →
+0.43000) and L_r −28% / −14% / −28% when U goes central; SA L2 Re 1e4 +1.5%
+(0.41285 → 0.41911). With `linearUpwind`, OpenFOAM's near-wake k is ~2.3× BELOW
+dns's (L1 Re 1e3); with central U it is within 10–30% near the body. The
+parity reference therefore names its U scheme; `central` is the one that
+matches dns's discretization (docs/validation.md).
+
+**Time accuracy of the scalar sources** (test `gpu_sst` (a)): the
+point-implicit quotient (D13) is FIRST order in dt for the stiff sources even
+inside SSP-RK3 -- the closed-form freestream decay converges at order 1.00
+(ω) / 0.91–0.98 (k). The steady fixed point is unaffected; a URANS run's
+turbulence scalars are first-order in time where β*ω dt is not small.
+
 ## Discretization (`gpu/rans.{hpp,hip}`, oracle `dns/rans_channel1d`)
 
 - **State** (D1): the scalars live in `DeviceCompState::t[2]` (`nT` 0/1/2) —
@@ -612,13 +667,76 @@ LTS, 5°, rFar 20 D, β 4.5, the restored ρΔφ azimuthal width:
 |---|---|---|
 | SA-neg L2 128×96, M 0.2, TOL 1e-4 | 0.30 | **exit 0 at 606000 iterations, 184 s**: cd 0.42480, cdf 0.03496, θ_s 87.40°, L_r 1.2206 D, y⁺max 0.33, μt/μ max 108, 0 hits (cd within 1e-3 of it from 2.6e5 iterations, 79 s) |
 | — M 0.1 | 0.31 | exit 8 at 2.5e6 (766 s), settled: cd 0.41943 (to 1e-3 from 5.0e5), θ_s 87.64°, L_r 1.2065 D. Its jitter is above TOL 1e-4 (cd 1.6e-4) and its W jitter above the monitor floor (4.7e-3 > 2⁻¹⁰): the p/q∞ amplification is 4× M 0.2's |
-| SST-2003m L2, M 0.2 | 0.34 | exit 8 at 1e6: a pseudo-time LIMIT CYCLE in the near wake (θ 125–145°, j 38–50; u swings 0.28 in 100 iterations), cd 0.4088–0.4136 |
+| SST-2003m L2, M 0.2 | 0.34 | exit 8 at 1e6: a LIMIT CYCLE in the near wake (θ 125–145°, j 38–50; u swings 0.28 in 100 iterations), cd 0.4088–0.4136 -- the time-accurate URANS is unsteady in the same band (section "SST: small-case verification"): no stable steady state |
+| SST-Vm L2, M 0.2 | -- | steady: cd 0.41882, jitter 6.5e-5, θ_s 87.29°, L_r 1.1786 D; remaining 1.1e-4 at the 3e5 cap (213 s wall, host shared with OpenFOAM runs) |
 | SA-neg L1 64×48, M 0.2 / 0.1 | 0.22 | exit 8 at 2.5e6: no steady state -- cd 0.4197 / 0.4264 with a 1.1% / 0.8% jitter, θ_s 12.9°: a spurious front recirculation (cp 0.58 at the stagnation point) |
-| SST-2003m L1 | -- | exit 7 at 4.8e4 (both widths) |
+| SST-2003m L1 | -- | exit 7 at 4.8e4 (both widths): the closure-independent L1 front failure of the LTS march (laminar is worse; issues.md 1) |
 
 The 75f39db azimuthal width ρ (see "Axisymmetric wedge") is what turned the
 SA L2 cold start into the cd −6.5..7.0 limit cycle of the G2b report.
-`sph1e4` against OpenFOAM: docs/validation.md (tier B at L2 +1.16%).
+`sph1e4` against OpenFOAM: docs/validation.md (SA tier B at L2 −0.35% vs the central-U reference; +1.16% vs linearUpwind).
+
+### SST: small-case verification (2026-10-26)
+
+The SST closure is verified pointwise (test `rans` `sstRestatement`, the
+audit table under "SST"), as an ODE (`gpu_sst` (a), the freestream decay),
+on the channel against the FP64 oracle (G9) and by residual MMS (the wedge
+ladder above). No SST defect was found; nothing in `src/` changed. What
+fails on the sphere wedge is the mean flow's steady state, measured on a
+ladder (explicit LTS, M 0.2, `--ogrid-beta 4.5`, rFar 20 D, 2e5 cap; 1e5 for
+the laminar/SA/Vm columns):
+
+| mesh, Re | SST-2003m | laminar | SA-neg | SST-Vm |
+|---|---|---|---|---|
+| 32×24, 100 | exit 0, cd 1.07749 | | | |
+| 32×24, 300 | cd 0.67777 settled (remaining inf: W jitter 6.4e-4) | | | |
+| 32×24, 1e3 | cd jitter 18%, resid 4.4 | jitter 20%, resid 6.5 | jitter 21%, resid 4.8 | jitter 11%, resid 1.8 |
+| 32×24, 3e3 | resid 210, θ_s 10° | resid 150 | exit 7 at 2.8e4 | |
+| 32×24, 1e4 | exit 7 at 9.6e4 | | | |
+| 64×48, 100 | exit 0, cd 1.09080 | | | |
+| 64×48, 300 | settled, resid 5.9e-3 (exit 8) | | | |
+| 64×48, 1e3 | **exit 0, 114600 it, 28 s, cd 0.49851** | | | |
+| 64×48, 3e3 | remaining 1.7e-4 at 2e5, cd 0.44261 | resid 53 | resid 0.025 | resid 0.035 |
+| 64×48, 1e4 | exit 7 at 4.8e4 (13.6 s) | resid 261 | resid 0.46 | resid 30 |
+| 128×96, 1e4 | limit cycle, cd 0.409–0.414 | | exit 0 (606000 it) | steady, cd 0.41882 (remaining 1.1e-4 at 3e5) |
+
+Two mechanisms, neither in the closure:
+
+- **No stable steady state of the discrete model.** At L2 the SST-2003m
+  TIME-ACCURATE URANS is unsteady in the band the LTS march cycles in (cd
+  0.404–0.424, mean 0.4115 over t = 8–14.6 D_box/U, no decay; the LTS cycle
+  0.4088–0.4136), the cycle sits at the separated shear layer's edge (θ
+  125–145°, j 38–50, k ±40% there, μt/μ 4–40 against SA's 13–80 at the same
+  cells), it survives `--dt-recompute 1` and gets worse at `--cfl 0.2`. SST-Vm
+  (vorticity production and μt limiter, the 1994 production limiter) is
+  steady on the same mesh, SA too; which of the three differences carries
+  the stability is not isolated. An explicit march cannot converge onto an unstable
+  fixed point; OpenFOAM's SIMPLE does not need stability, which is why it
+  reports a steady SST solution there.
+- **LTS focuses the radiation of an unsteady wake into the front.** Where
+  the wake has no steady state (laminar from Re ~1e3 on the coarse meshes,
+  every closure at L1 Re 1e4), the march's front stagnation region breaks
+  into a period-2 θ sawtooth from the axis outward, for every closure --
+  laminar worst (L1 Re 1e4 wall cp 0.33, 1.48, 2.07, 1.09, −2.48 on i =
+  1..5). Capping the LTS ratio dt_c/dtRef at 1 (a global dt) keeps the front
+  clean (laminar L1 Re 3e3: cp 1.21, 1.19, 1.17, 1.12, ...), at 8 it is
+  already broken, and smoothing dt_c by a neighbour minimum (1 or 3 passes)
+  does NOT fix it -- the dt CONTRAST between the coarse outer cells and the
+  fine front cells, not the cell-to-cell jump, is what matters. (Debug
+  knobs, measured then removed.) The time-accurate laminar L1 Re 3e3 run has
+  a clean front (cp 1.15, 1.13, 1.08, ...) and a shedding wake. SST-2003m at
+  L1 Re 1e4 diverges through this route (its URANS is unsteady: cd
+  0.29–0.47).
+
+The pointwise algebra, the ODE and the oracle say the closure is right; the
+small-case parity says the same once the reference uses the matched mean-flow
+scheme: L1 Re 1e3, the smallest separated case that certifies, tier B cd0
+0.49070 against OpenFOAM kOmegaSST with central U 0.48872 (**+0.41%**), θ_s
+100.51° vs 100.77°, L_r 1.150 vs 1.067 D (gate `gpu_sst` (b);
+docs/validation.md). The Newton–Krylov march reaches the same plateau there
+(cd 0.49852 at 500 Newton steps, resid 2.3e-3 against the explicit 0.17)
+but does not certify within its 500-step cap (173 s): the stop's monitors
+jitter (W 9.5e-4 at the 2⁻¹⁰ floor; issues.md 3).
 
 ## Newton–Krylov pseudo-time on `dns flow` (built 2026-10-26; slower than explicit)
 
@@ -834,7 +952,8 @@ Laminar limit: 2nd order to the exact compressible Poiseuille (u and T).
 
 | test | what |
 |---|---|
-| `rans` | SA/SST closed forms: fv1, fw, cw1, r cap, S̃ limiter, the log-layer identity (cw1; γ1 derived vs 5/9: 0 vs 0.43%), SA-neg branch continuity, J ≥ 0, positive branch == standard SA, point-implicit fixed point (and its increment form, exactly 0 there), float/double, F1/F2 limits, limiters, μt branches, wall distance (channel; O-grid polyline within the sagitta, ghosts, thread-count bitwise), the `ransRunLabel` strings (the channel's exactly) and `ransBuilt` |
+| `rans` | SA/SST closed forms: fv1, fw, cw1, r cap, S̃ limiter, the log-layer identity (cw1; γ1 derived vs 5/9: 0 vs 0.43%), SA-neg branch continuity, J ≥ 0, positive branch == standard SA, point-implicit fixed point (and its increment form, exactly 0 there), float/double, F1/F2 limits, limiters, μt branches, wall distance (channel; O-grid polyline within the sagitta, ghosts, thread-count bitwise), the `ransRunLabel` strings (the channel's exactly) and `ransBuilt`; `sstRestatement`: the whole pointwise SST-2003m / SST-Vm pipeline (sstCd → sstBlend → sstMut → sstSource, the rate from the gradient tensor) vs an independent FP64 TMR restatement on 4e4 random states per closure and on every switch (F1 knee, production limiter, CDkω floor of both signs, μt limiter): FP64 ≤ 1e-12 (measured 7e-16), FP32 ≤ 1e-4 of the term scale |
+| `gpu_sst` | (a) freestream decay on a periodic uniform box: k, ω vs the closed form, both closures, F1 = 0 and 1, TMR freestream and a stiff ω0 = 1e3; exactly uniform, 0 hits, first order in dt (ω 1.00–1.01, k 0.91–0.98), finest errors ≤ 1.25× measured; (b) the L1 sphere wedge Re 1e3 SST-2003m `--steady 1e-4` through the binary: exit 0 within 1.5e5 iterations (114600), cd / L_r / θ_s at their measured values (5e-4 / 5e-3 / 0.1°), cd0 within 1% and θ_s within 1° of OpenFOAM kOmegaSST (central U) on the identical mesh, 0 hits |
 | `rans_channel1d` | the oracle: laminar order, MKM band (5% provisional ceiling, values pinned to 1e-6), log slope, ub order (SA 2nd, SST 1st), Newton < 2 s |
 | `gpu_rans` | G1 lts = 1.0f bitwise; G2 ν̃ ≡ 0 (and SST k ≡ 0) bitwise to RANS off; G3 uniform scalar exact; G4 wall face μt == 0, ghost algebra (SST: ω_w on the face); G5 residual at the oracle at the FP32 floor; G6/G7 oracle fixed point (uniform / random lts); G8 SA-neg ν̃ < 0 patch; G9 (SA, SST-2003m) march onto the oracle; G10 compensated state (TwoSum exact, pair upload/download, plateau ≤ ½ plain, oracle fixed point, perturbed march); SST rough-field positivity, 0 guard hits |
 | `channel_config` | every `--rans`/`--steady`/`--steady-scheme` rule (TOL ∈ [1e-6, 1); implicit rejects `--cfl`/`--dt-recompute`, cap 500, a given `--steady-steps` honoured), labels and describe lines of both schemes, explicit given == defaulted byte for byte, json `"steady"` only on implicit, RANS-off describe unchanged |
