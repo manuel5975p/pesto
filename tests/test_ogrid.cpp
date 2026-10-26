@@ -7,6 +7,7 @@
 
 #include "dns/bodies.hpp"
 #include "dns/curvmesh.hpp"
+#include "dns/walldist.hpp"
 #include "check.hpp"
 #include "cli_test_util.hpp"
 
@@ -526,8 +527,164 @@ void revolvedWedge()
           "a non-axisymmetric sdf is rejected by name");
 }
 
+// The full revolution (P4): Cyclic k, node planes k and k + N/2 exact
+// negations in (y, z) -- the across-axis partner of a cell is a cell, to the
+// bit -- degenerate axis faces with the limit row along each cell's own
+// rho^, positive volumes, per-cell closure, the true azimuthal width (no
+// aovSteadyZ), and the wall distance: the exact BVH distance to the faceted
+// wall, equal to the wedge's at the same dphi (a point on a column's
+// bisector projects into that column of the convex faceted wall) and
+// bracketed by the analytic sphere distance and its sagitta.
+void revolvedFull()
+{
+    std::printf("--- revolved full revolution ---\n");
+    const int nT = 32, ny = 20;
+    const double R = 0.5, rFar = 6.0;
+    const Sdf sphere = [=](double x, double y, double z) {
+        return std::sqrt(x * x + y * y + z * z) - R;
+    };
+    for (const int N : {8, 16}) {
+        const double dphi = 2 * pi / N;
+        const RevolvedSpec rv{.wedge = false, .dphi = dphi, .nphi = N};
+        const Grid g = ogridRevolvedGrid(nT, ny, rv, R, rFar);
+        auto og = buildRevolvedOGrid(g, sphere, {.rFar = rFar, .beta = 2.0}, rv);
+        const std::string tag = std::format("N {}: ", N);
+        if (!og) { check(false, tag + "build: " + og.error()); return; }
+        const auto& m = og->mesh;
+        check(g.nx == nT + 2 && g.nz == N && m.wrap[2] == AxisWrap::Cyclic &&
+                  std::abs(g.hz - dphi) < 1e-15,
+              tag + "grid nx = nTheta + 2, nz = N, Cyclic k, hz = 2 pi/N");
+        bool cyc = true, pair = true, onAxis = true;
+        for (int j = 0; j <= ny; ++j)
+            for (int i = 0; i <= g.nx; ++i) {
+                const auto a = m.node(i, j, 0), b = m.node(i, j, N);
+                cyc = cyc && a == b;
+                for (int k = 0; k < N / 2; ++k) {
+                    const auto p = m.node(i, j, k), q = m.node(i, j, k + N / 2);
+                    pair = pair && p[0] == q[0] && p[1] == -q[1] && p[2] == -q[2];
+                }
+            }
+        for (int k = 0; k < N; ++k)
+            for (int j = 0; j < ny; ++j)
+                for (const int i : {1, nT + 1}) {
+                    const auto p = m.node(i, j, k);
+                    onAxis = onAxis && p[1] == 0.0 && p[2] == 0.0;
+                }
+        check(cyc, tag + "Cyclic closes the azimuth: node(N) == node(0)");
+        check(pair, tag + "node planes k and k + N/2 are exact (y, z) "
+                          "negations (the across-axis partner, bitwise)");
+        check(onAxis, tag + "axis node columns at rho == 0 exactly");
+        auto mt = CurvMetrics::build(m);
+        if (!mt) { check(false, tag + "metrics: " + mt.error()); return; }
+        bool zeroS = true, rows = true, pos = true;
+        double worstLim = 0, worstClose = 0;
+        auto centroid = [&](int i, int j, int k) {
+            std::array<double, 3> c{0, 0, 0};
+            for (int dk = 0; dk < 2; ++dk)
+                for (int dj = 0; dj < 2; ++dj)
+                    for (int di = 0; di < 2; ++di) {
+                        const auto p = m.node(i + di, j + dj, k + dk);
+                        for (int a = 0; a < 3; ++a) c[a] += 0.125 * p[a];
+                    }
+            return c;
+        };
+        for (int k = 0; k < N; ++k)
+            for (int j = 0; j < ny; ++j) {
+                for (const int i : {0, nT}) {
+                    const std::size_t c = g.idx(i, j, k);
+                    zeroS = zeroS && mt->S[0][0][c] == 0.0 &&
+                            mt->S[0][1][c] == 0.0 && mt->S[0][2][c] == 0.0;
+                    for (int e = 3; e < 9; ++e)
+                        rows = rows && mt->Ji[0][e][c] == 0.0;
+                    if (j == 0 || j == ny - 1) continue;
+                    // Row i: +-rho^_F/(2 rho_F), rho^_F off the fluid cell's
+                    // own centroid (every azimuth, not just phi = 0).
+                    const auto F = centroid(i == 0 ? 1 : nT, j, k);
+                    const double rf = std::hypot(F[1], F[2]);
+                    const double s = (i == 0 ? 1.0 : -1.0) / (2.0 * rf * rf);
+                    const double want[3] = {0.0, s * F[1], s * F[2]};
+                    for (int a = 0; a < 3; ++a)
+                        worstLim = std::max(worstLim,
+                                            std::abs(mt->Ji[0][a][c] - want[a]) *
+                                                2.0 * rf);
+                }
+                for (int i = 0; i < g.nx; ++i) {
+                    const std::size_t c = g.idx(i, j, k);
+                    pos = pos && mt->vol[c] > 0.0;
+                    if (i < 1 || i > nT || j < 1 || j > ny - 2) continue;
+                    // Per-cell closure: sum of the six outward area vectors.
+                    for (int a = 0; a < 3; ++a) {
+                        double sum = 0, mag = 0;
+                        for (int ax = 0; ax < 3; ++ax) {
+                            const int li = i - (ax == 0), lj = j - (ax == 1),
+                                      lk = (k - (ax == 2) + N) % N;
+                            const double hi = mt->S[ax][a][c],
+                                         lo = mt->S[ax][a][g.idx(li, lj, lk)];
+                            sum += hi - lo;
+                            mag += std::abs(hi) + std::abs(lo);
+                        }
+                        worstClose = std::max(worstClose, std::abs(sum) / mag);
+                    }
+                }
+            }
+        std::printf("N %d: axis limit row worst rel %.2e, closure worst rel "
+                    "%.2e\n",
+                    N, worstLim, worstClose);
+        check(zeroS, tag + "axis faces: S == (0, 0, 0) exactly, every k");
+        check(rows, tag + "axis faces: Ji rows j and k == 0");
+        check(worstLim < 1e-12, tag + "axis faces: row i is +-rho^_F/(2 "
+                                      "rho_F) on every meridian");
+        check(pos, tag + "every volume > 0, placeholder columns included");
+        check(worstClose < 1e-14, tag + "per-cell closure sum S == 0 on the "
+                                        "real cells, axis cells included");
+        check(mt->aovSteadyZ.empty(),
+              tag + "no wedge width: the azimuth is a resolved direction");
+        // Wall distance: the 3D BVH vs the wedge at the same dphi, and the
+        // analytic bracket on the real cells.
+        const auto d3 = revolvedWallDistance(m, nT, false);
+        const RevolvedSpec wv{.wedge = true, .dphi = dphi};
+        const Grid gw = ogridRevolvedGrid(nT, ny, wv, R, rFar);
+        auto ow = buildRevolvedOGrid(gw, sphere, {.rFar = rFar, .beta = 2.0}, wv);
+        if (!ow) { check(false, tag + "wedge build"); return; }
+        const auto dw = revolvedWallDistance(ow->mesh, nT, true);
+        const double sag = R * (1 - std::cos(0.5 * pi / nT) * std::cos(0.5 * dphi));
+        double worstW = 0;
+        bool bracket = true, ghosts = true, positive = true;
+        for (int k = 0; k < N; ++k)
+            for (int j = 0; j < ny; ++j)
+                for (int i = 0; i < g.nx; ++i) {
+                    const double v = d3[g.idx(i, j, k)];
+                    positive = positive && v > 0.0;
+                    if (i == 0 || i == nT + 1) {
+                        const int is = i == 0 ? 1 : nT;
+                        ghosts = ghosts &&
+                                 v == d3[g.idx(is, j, (k + N / 2) % N)];
+                        continue;
+                    }
+                    worstW = std::max(worstW, std::abs(v - dw[gw.idx(i, j, 1)]) / v);
+                    if (j < 1 || j > ny - 2) continue;
+                    const auto c = centroid(i, j, k);
+                    const double r = std::hypot(c[0], c[1], c[2]) - R;
+                    bracket = bracket && v >= r - 1e-12 && v <= r + sag + 1e-12;
+                }
+        std::printf("N %d: 3D wall distance vs the wedge at dphi: worst rel "
+                    "%.2e\n",
+                    N, worstW);
+        check(positive, tag + "wall distance > 0 everywhere");
+        check(ghosts, tag + "ghost columns take the across-axis cell's d");
+        check(worstW < 1e-12, tag + "3D BVH distance == the wedge's at the "
+                                    "same dphi (1e-12)");
+        check(bracket, tag + "r - R <= d <= r - R + sagitta on the real cells");
+    }
+    const RevolvedSpec odd{.wedge = false, .dphi = 2 * pi / 7, .nphi = 7};
+    const Grid g7 = Grid::make(34, 20, 7, 34 * pi / 32, 1, 2 * pi);
+    check(!buildRevolvedOGrid(g7, sphere, {.rFar = rFar, .beta = 2.0}, odd),
+          "an odd azimuthal count is rejected by the builder");
+}
+
 int main()
 {
+    revolvedFull();
     revolvedWedge();
     axisWrapModes();
     circleExact();

@@ -75,7 +75,8 @@ struct OGridSpec
 struct RevolvedSpec
 {
     bool wedge = true;
-    double dphi = 0;   // wedge angle, radians, in (0, 10 deg]
+    double dphi = 0;   // wedge angle, radians, in (0, 10 deg]; full: 2 pi/nphi
+                       // (read only by the mesh export there)
     int nphi = 0;      // full revolution: even, >= 4
 };
 

@@ -200,6 +200,7 @@ struct RawConfig
     double ogridFar = 20.0;  // far-boundary radius, in diameters
     double ogridBeta = 3.0;  // radial tanh clustering toward the wall
     double ogridWedge = 5.0; // revolved --nz 1: the wedge angle, degrees
+    double ogridTrip = 0.0;  // full revolution: odd-mode trip amplitude, / U
 
     // start-up (compressible)
     double ramp = 2.0, kick = 0.05;
@@ -363,10 +364,17 @@ public:
     // REVOLVED O-grid (a body of revolution, `--body sphere`; dns/ogrid.hpp
     // buildRevolvedOGrid): --n meridional cells over theta in [0, pi], grid
     // nx = n + 2 (a ghost column past each axis). --nz 1 is the axisymmetric
-    // WEDGE of ogridWedgeDeg (internal nz 3); the full revolution (--nz N)
-    // is not built yet (P4).
+    // WEDGE of ogridWedgeDeg (internal nz 3, ogridNphi 0); --nz N > 1 is the
+    // FULL revolution of ogridNphi = N azimuthal cells (Cyclic k, N even,
+    // ogridWedgeDeg 0).
     bool ogridRevolved = false;
     double ogridWedgeDeg = 0;
+    int ogridNphi = 0;
+    // Full revolution only: the amplitude (/ U) of the solenoidal trip in the
+    // initial state (steady: the initial guess) that breaks the mesh's EXACT
+    // symmetry under a rotation by pi about the axis -- without it the odd
+    // azimuthal modes (the m = 1 lift mode) cannot arise. 0 = none.
+    double ogridTrip = 0;
     // First fluid cell height on the nominal circle (ogridNominalH1): what the
     // validator can know without the sdf; exact for a cylinder.
     double ogridH1 = 0;

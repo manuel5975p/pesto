@@ -432,7 +432,7 @@ if(BUILD_TESTING)
                   gpu_les_smag gpu_derived
                   gpu_poisson_wally gpu_rotor_wall gpu_rotor_table gpu_mrf
                   gpu_channel gpu_cutflux gpu_ogrid gpu_rans gpu_rans_mask
-                  gpu_rans_ogrid gpu_rans_mms gpu_axisym gpu_nk
+                  gpu_rans_ogrid gpu_rans_mms gpu_axisym gpu_axisym3d gpu_nk
                   gpu_rans_immersed
                   index_offsets_wrap stats_cadence
                   gpu_tally_couette_torque gpu_tally_conduction
@@ -457,7 +457,7 @@ if(BUILD_TESTING)
             gpu_comp_ghost_couette_exact gpu_rotor_comoving_fixed_point
             gpu_comp_scale_invariance gpu_ghost_translate gpu_comp_axis_permute
             gpu_comp_curv_axis_permute comp_time_order gpu_comp_viscous_modes
-            gpu_rans_mask gpu_rans_ogrid gpu_rans_mms gpu_axisym
+            gpu_rans_mask gpu_rans_ogrid gpu_rans_mms gpu_axisym gpu_axisym3d
             gpu_rans_immersed
             PROPERTIES TIMEOUT 60)
         set_tests_properties(gpu_nk PROPERTIES TIMEOUT 120)
@@ -506,6 +506,9 @@ if(BUILD_TESTING)
         # SST small cases: the freestream decay ODE and the L1 sphere-wedge
         # Re 1e3 certification against OpenFOAM on the identical mesh (~35 s).
         dns_gpu_bin_test(gpu_sst 180)
+        # The sphere's full revolution end to end: N 36 == the 10-deg wedge,
+        # and the m = 1 bifurcation at Re 250 with --ogrid-trip (~40 s).
+        dns_gpu_bin_test(gpu_axisym3d_run 180)
         # Sponge-free open tunnel: library-level freestream cycles + a short
         # end-to-end run of the built binary.
         dns_gpu_bin_test(gpu_tunnel_open 600)

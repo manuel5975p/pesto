@@ -5,7 +5,8 @@ invariants; this file holds what is broken, unproven or undecided NOW.
 Remove an entry when it is fixed (the fix lands in the commit message and,
 if it creates an invariant, in CLAUDE.md). Numbers are measured, gfx1100.
 
-As of the SST small-case pass on 85eaa8f (2026-10-26, uncommitted).
+As of the P4 (full-revolution sphere) pass on 3133831 (2026-10-26,
+uncommitted).
 
 ## Flow RANS (masterplan `plans/flowrans/masterplan_flowrans.md`)
 
@@ -90,7 +91,12 @@ As of the SST small-case pass on 85eaa8f (2026-10-26, uncommitted).
    +1.16%; OpenFOAM's own SST cd moves +2.8–7.6% between the two schemes.)
    SST: URANS mean only (2); small SST parity L1 Re 1e3 +0.41% (`gpu_sst`).
 8. **Not built:** heavy immersed channel oracle, focal/sinusoidal MMS,
-   momentum-budget tally test; multigrid / alternating lines (U5); P4; P6.
+   momentum-budget tally test; multigrid / alternating lines (U5); P6. P4
+   (the full revolution) is built for the explicit march and time-accurate
+   runs; not built there: Newton-Krylov (3D wavefront line ordering, G4.1),
+   `--les` (the axis cells' filter width), the 3D OpenFOAM export
+   (`tools/parity/dnsmesh.py` reads the wedge only), and the heavy
+   `val_rans_sphere_3d` test (G1 does not certify inside 10 min, item 11).
 9. **URANS turbulence scalars are first order in time.** The point-implicit
    stage quotient (D13) degrades SSP-RK3 to first order in the stiff
    sources: the closed-form SST freestream decay converges at order 1.00 (ω)
@@ -99,6 +105,51 @@ As of the SST small-case pass on 85eaa8f (2026-10-26, uncommitted).
    whose β*ω dt is not small carries this error. DEFERRED 2026-10-26: a
    second-order implicit source update (and its byte-identity break) is not
    built for now; URANS results state the first-order source error.
+
+10. **The full revolution is EXACTLY π-symmetric, so its odd azimuthal
+    modes never arise on their own** (measured 2026-10-26). The mesh maps
+    onto itself under a rotation by π about the axis to the bit, and the
+    FP32 kernels are sign-symmetric: an axisymmetric start keeps planes k
+    and k + N/2 bitwise equal (cl == cs == 0.0) for ever, so the m = 1 lift
+    mode is locked out. Measured consequence, L1 × 32: laminar Re 250
+    untripped certifies the symmetric state (cd 0.69099), tripped the
+    physical steady m = 1 wake (cd 0.70690, cl −0.0647; JP99 ≈ 0.70 /
+    0.062); SA-neg Re 1e3 likewise (0.48229 vs 0.49196, cl −0.0585) --
+    while SST-2003m Re 1e3 is stable (the trip decays to cl 1e-5). Built:
+    `--ogrid-trip A` (default 0) and a validator warning at Re ≥ 200 or
+    with `--rans`. DECISION NEEDED: keep the trip opt-in (today: an
+    untripped run is exactly the wedge, the warning names the risk), or
+    make a small trip the full revolution's default (an untripped run at
+    Re ≳ 200 can certify an unstable fixed point).
+11. **G4.3: explicit LTS on G1 cannot meet the 5-minute target, and the
+    tripped SA-neg Re 1e4 state is not steady** (measured 2026-10-26, G1 =
+    128×96×96, 1.2M cells, β 4.5, M 0.2). 3.41 ms/iteration (SA-neg; the
+    5° wedge 0.28, laminar 3D 1.65 µs per kilo-cell). With `--ogrid-trip
+    0.05`, capped at 170000 iterations (581 s): exit 8; cd 0.42519 ± 1.2e-4
+    over the last 2e4 iterations (+0.09% of the wedge's 0.42480), settled
+    to 0.2% from 4e4 iterations (150 s), but an m = 1 cl oscillation GROWS
+    in pseudo-time (amplitude 1e-3 → 1.5e-2 from 5e4 to 1.6e5 iterations,
+    residual 0.48 → 5.6, W jitter 4.3e-3 > 2⁻¹⁰): the axisymmetric SA-neg
+    state is m = 1-unstable there. Its end state (steady asymmetric, as at
+    Re 1e3, or none) is open; a G1 URANS is not run (~1e3 s per D/U, item
+    12). Untripped, G1 IS the 3.75° wedge: ~6e5 iterations
+    to certify, ~35 min, 7× the target (5 min = 8.8e4 iterations). Levers,
+    none built: the converged wedge replicated in φ as the initial guess
+    (only the 3D stability left to march), Newton-Krylov with 3D lines
+    (G4.1; NK is slower than explicit on the wedge, item 3), multigrid.
+    No `val_rans_sphere_3d` heavy test: there is no certified G1 number to
+    pin.
+12. **The DNS time march of the full revolution is 150× slower in dt than
+    the wedge's** (measured 2026-10-26, laminar Re 100, 128×96, `--ramp
+    0`): dt 2.55e-4 on the 5° wedge, 1.70e-6 at N 64. The axis cells'
+    azimuthal width ½ R Δθ Δφ (4.7e-4 at N 64) enters the DNS/LES
+    `stableDt`'s GLOBAL viscous bound 0.25 h_min² / ν_max (the
+    over-conservative bound already recorded under "Older open items"); the
+    wedge's time march uses the width ρ there. URANS is NOT penalized (its
+    diffusive bound is per cell): SA-neg Re 1e4 dt 3.99e-6 at N 64 vs
+    2.18e-6 on the wedge. A per-cell DNS viscous bound would remove it; the
+    steady march's local dt is unaffected. A G1 URANS costs ~1e3 s per D/U
+    (2.6e5 steps at ~3.7 ms), so a URANS mean for item 11 is hours.
 
 ## Older open items (details in CLAUDE.md)
 

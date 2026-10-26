@@ -1056,14 +1056,58 @@ std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
         if (!revolved && r.given.contains("--ogrid-wedge"))
             return err(2, "--ogrid-wedge", "is the revolved (--body sphere) "
                                            "O-grid's axisymmetric wedge angle");
-        if (revolved)
+        if (!(revolved && nzI > 1) && r.given.contains("--ogrid-trip"))
+            return err(2, "--ogrid-trip", "seeds the odd azimuthal modes of "
+                                          "the full-revolution sphere O-grid "
+                                          "(--body sphere --nz N > 1) only");
+        if (revolved && nzI > 1)
+        {
+            // The FULL revolution: N azimuthal cells, Cyclic k, the axis
+            // ghost columns copied from k + N/2 (gpu/axis_bc.hpp). N even so
+            // every cell has its partner across the axis; N >= 4 so that
+            // partner is not a k neighbour (buildRevolvedOGrid's own floor).
+            if (r.given.contains("--ogrid-wedge"))
+                return err(2, "--ogrid-wedge", "is the axisymmetric wedge's "
+                                               "angle (--nz 1); --nz N > 1 is "
+                                               "the full revolution");
+            if (nzI % 2 != 0 || nzI < 4)
+                return err(2, "--nz", std::format(
+                                          "is the full revolution's azimuthal "
+                                          "cell count: it must be even and "
+                                          ">= 4 (every cell has its partner "
+                                          "across the axis, k + N/2); got {}",
+                                          nzI));
+            if (!(std::isfinite(r.ogridTrip) && r.ogridTrip >= 0 &&
+                  r.ogridTrip <= 0.5))
+                return err(2, "--ogrid-trip", "the trip amplitude, / U: must "
+                                              "be in [0, 0.5]");
+            c.ogridRevolved = true;
+            c.ogridNphi = nzI;
+            c.ogridTrip = r.ogridTrip;
+            c.ogridWedgeDeg = 0;
+            c.ogridSpan = 1.0;
+            c.grid = ogridRevolvedGrid(
+                r.n, ny,
+                RevolvedSpec{.wedge = false, .dphi = 2.0 * pi / nzI,
+                             .nphi = nzI},
+                0.5 * D, c.ogridRFar);
+            c.nzInterior = nzI;
+            // The polygonal body: N planar facets about the axis, frontal
+            // area sin(dphi)/dphi of the circle's (qRef stays pi D^2/4).
+            const double dphi = 2.0 * pi / nzI;
+            const double facet = 1.0 - std::sin(dphi) / dphi;
+            if (facet > 1e-2)
+                c.warnings.push_back(std::format(
+                    "--nz {}: the revolved body is a {}-sided polygon about "
+                    "the axis, its frontal area {:.2f}% below the circle's "
+                    "(qRef is the circle's); --nz 32 brings it to 0.64%, 64 "
+                    "to 0.16%",
+                    nzI, nzI, 100.0 * facet));
+        }
+        else if (revolved)
         {
             // A body of revolution: the O-grid revolved about x. Axisymmetry
             // is a mesh plus a ghost hook (dns/ogrid.hpp, gpu/axis_bc.hpp).
-            if (nzI > 1)
-                return err(2, "--nz", "the full-revolution sphere O-grid is "
-                                      "not built yet (P4); --nz 1 is the "
-                                      "axisymmetric wedge");
             if (!(std::isfinite(r.ogridWedge) && r.ogridWedge > 0 &&
                   r.ogridWedge <= 10))
                 return err(2, "--ogrid-wedge", "the wedge angle in degrees, "
@@ -1094,6 +1138,10 @@ std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
     else if (r.given.contains("--ogrid-wedge"))
         return err(2, "--ogrid-wedge", "is the revolved (--body sphere) "
                                        "O-grid's axisymmetric wedge angle");
+    else if (r.given.contains("--ogrid-trip"))
+        return err(2, "--ogrid-trip", "seeds the odd azimuthal modes of the "
+                                      "full-revolution sphere O-grid (--ogrid "
+                                      "--body sphere --nz N > 1) only");
     else if (comp)
     {
         // D = pi/4 fixed, h scales with ny AND --dr: box = dr*D in y
@@ -2270,9 +2318,13 @@ std::optional<ConfigError> flowRans(const RawConfig& r, Case& c)
     c.rans = RansModel(r.rans);
     const bool rans = c.rans != RansModel::None;
     const bool sa = c.rans == RansModel::SaNeg, sst = ransSst(c.rans);
-    if (c.ogridRevolved && c.cs > 0)
+    if (c.ogridRevolved && c.ogridNphi == 0 && c.cs > 0)
         return err(2, "--les", "an axisymmetric wedge has no resolved 3D "
                                "turbulence to filter");
+    if (c.ogridRevolved && c.ogridNphi > 0 && c.cs > 0)
+        return err(2, "--les", "on the full-revolution O-grid is not built: "
+                               "the filter width of the axis cells is "
+                               "unverified");
     if (r.given.contains("--rans-nutinf") && !sa)
         return err(2, "--rans-nutinf", "is the SA freestream nu~/nu; it needs "
                                        "--rans sa-neg");
@@ -2376,6 +2428,11 @@ std::optional<ConfigError> flowRans(const RawConfig& r, Case& c)
                 return err(2, "--steady-scheme",
                            "implicit (Newton-Krylov) on an extruded 3D O-grid "
                            "is not built yet (P4); use --nz 1 or explicit");
+            if (c.ogridRevolved && c.ogridNphi > 0)
+                return err(2, "--steady-scheme",
+                           "implicit (Newton-Krylov) on the full-revolution "
+                           "O-grid is not built (3D line ordering); use the "
+                           "explicit march or the wedge (--nz 1)");
             // Measured stops are tens of Newton iterations: the explicit
             // march's 1000000 would let a stalled run spin before exit 8.
             if (!r.given.contains("--steady-steps"))
@@ -2436,7 +2493,17 @@ std::optional<ConfigError> flowRans(const RawConfig& r, Case& c)
                 "distance d = |sdf| the closure reads is approximate");
     }
 
-    if (c.ogridRevolved) c.meta.wedgeDeg = c.ogridWedgeDeg;
+    // The laminar sphere wake leaves axisymmetry at Re ~ 210 through the m = 1
+    // mode, which the exactly pi-symmetric full revolution cannot grow from
+    // rounding (measured: cl == cs == 0.0 and the k / k + N/2 states equal
+    // bit for bit).
+    if (c.ogridNphi > 0 && c.ogridTrip == 0 && (rans || c.re >= 200))
+        c.warnings.emplace_back(
+            "the full-revolution O-grid and its axisymmetric start are exactly "
+            "symmetric under a rotation by pi about the axis: the odd azimuthal "
+            "modes (the m = 1 lift mode) cannot arise; --ogrid-trip A seeds "
+            "them");
+    if (c.ogridRevolved && c.ogridNphi == 0) c.meta.wedgeDeg = c.ogridWedgeDeg;
     if (!rans && !c.compSteady) return std::nullopt;
     c.meta.rans = rans ? std::string(ransName(c.rans)) : std::string();
     c.meta.steady = "";
@@ -2734,8 +2801,11 @@ double channelPRef(double reTau, double mach)
 std::string flowRunLabel(const Case& c)
 {
     const bool rans = c.rans != RansModel::None;
+    // The wedge only: the full revolution resolves swirl and 3D wake modes,
+    // so it carries the z-extruded O-grid's labels.
+    const bool wedge = c.ogridRevolved && c.ogridNphi == 0;
     const std::string geo =
-        c.ogridRevolved ? ransWedgeSuffix(c.ogridWedgeDeg, rans) : std::string();
+        wedge ? ransWedgeSuffix(c.ogridWedgeDeg, rans) : std::string();
     if (rans || c.compSteady)
     {
         const RansMode mode =
@@ -2746,10 +2816,10 @@ std::string flowRunLabel(const Case& c)
         const std::string where =
             rans && !c.ogrid ? std::string(kImmersedSuffix) : geo;
         std::string l = ransRunLabel(c.rans, mode, 0, where);
-        if (c.ogridRevolved && !c.compSteady) l += kAxisymUnsteady;
+        if (wedge && !c.compSteady) l += kAxisymUnsteady;
         return l;
     }
-    if (c.ogridRevolved) return "DNS" + geo + std::string(kAxisymUnsteady);
+    if (wedge) return "DNS" + geo + std::string(kAxisymUnsteady);
     return {};
 }
 
@@ -3000,7 +3070,28 @@ std::string Case::describe() const
             placement.D > 0 ? ogridRFar / placement.D : 0.0, ogridBeta,
             ogridSpan, ogridH1, ogridBeta);
     }
-    if (ogridRevolved)
+    if (ogridRevolved && ogridNphi > 0)
+    {
+        const double dphi = 2.0 * std::numbers::pi / ogridNphi;
+        s += std::format(
+            "  o-grid     REVOLVED about x: {} meridional (theta 0..pi, + 2 "
+            "ghost columns past the axis) x {} radial\n"
+            "             (2 ghost rows), FULL revolution {} azimuthal cells "
+            "({:.4g} deg; the axis ghosts\n"
+            "             copy k + {}); polygonal body, frontal area "
+            "{:.4f} of the circle's\n"
+            "             axis faces degenerate (S = 0, limit metric); qRef on "
+            "pi D^2/4\n"
+            "             odd-mode trip {}\n",
+            grid.nx - 2, grid.ny, ogridNphi, dphi * 180.0 / std::numbers::pi,
+            ogridNphi / 2, std::sin(dphi) / dphi,
+            ogridTrip > 0 ? std::format("{:g} U (solenoidal, 1 D behind the "
+                                        "body)",
+                                        ogridTrip)
+                          : std::string("none (exactly pi-symmetric: no odd "
+                                        "azimuthal modes)"));
+    }
+    else if (ogridRevolved)
     {
         s += std::format(
             "  o-grid     REVOLVED about x: {} meridional (theta 0..pi, + 2 "

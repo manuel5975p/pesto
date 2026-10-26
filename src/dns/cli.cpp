@@ -188,7 +188,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--rotor-span", &c.rotorSpan},
              {"--blade-thicken", &c.bladeThicken},
              {"--ogrid-far", &c.ogridFar}, {"--ogrid-beta", &c.ogridBeta},
-             {"--ogrid-wedge", &c.ogridWedge},
+             {"--ogrid-wedge", &c.ogridWedge}, {"--ogrid-trip", &c.ogridTrip},
              {"--ramp", &c.ramp}, {"--kick", &c.kick}, {"--tol", &c.tol},
              {"--max-iters", &c.maxIters}, {"--dt-recompute", &c.dtRecompute},
              {"--steady", &c.steady}, {"--seq", &c.seq},
@@ -846,11 +846,28 @@ BODY-FITTED O-GRID (compressible)
                      axis faces are degenerate, the cells beside them
                      read the across-axis continuation). Labelled
                      "[axisymmetric wedge ...]": no swirl, no 3D wake
-                     modes. The full revolution (--nz N) is not built.
+                     modes. --nz N > 1 is the FULL REVOLUTION: N
+                     azimuthal cells (even, >= 4; the axis ghosts copy
+                     the cell across the axis, k + N/2), a polygonal
+                     body of frontal area sin(2pi/N)/(2pi/N) of the
+                     circle's (warned when 1% or more short), explicit
+                     steady or time-accurate (no --steady-scheme
+                     implicit, no --les). Default --nz for a sphere is
+                     --n.
   --ogrid-far R      far-boundary radius, in diameters.               [20]
   --ogrid-beta B     radial tanh clustering toward the wall; 0 =
                      uniform. Higher = thinner first cell.             [3]
   --ogrid-wedge DEG  the revolved sphere's wedge angle, (0, 10].      [5]
+  --ogrid-trip A     full revolution only: a solenoidal Gaussian vortex
+                     trip (strength A U, width D/4, 1 D behind the body,
+                     D/4 off the axis) in the initial state -- with
+                     --steady, in the initial guess. The full-revolution
+                     mesh and an axisymmetric start are EXACTLY symmetric
+                     under a rotation by pi about the axis, so the odd
+                     azimuthal modes (the m = 1 lift mode) cannot grow
+                     from rounding; this seeds them. A stable steady
+                     state is unchanged. 0 = none (warned at Re >= 200
+                     or with --rans).                                 [0]
 
 RANS (compressible; an ensemble-mean MODEL, never a DNS; labelled
 "RANS <variant> -- <mode>" everywhere, docs/rans.md "dns flow")
@@ -957,7 +974,8 @@ RUN LENGTH
   --steady-scheme explicit|implicit
                      compressible --steady pseudo-time scheme: explicit
                      local time stepping, or implicit Newton-Krylov
-                     (--ogrid at --nz 1 or the revolved wedge only: JFNK
+                     (--ogrid at --nz 1 or the revolved wedge only, not
+                     the full revolution: JFNK
                      GMRES(40) with a line Gauss-Seidel first-order
                      Rusanov preconditioner, CFL 10 x2 -> 1e8; cap
                      default 500). Same fixed point; certifies the

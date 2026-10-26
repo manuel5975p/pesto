@@ -121,6 +121,9 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
                                     steady && !implicit);
     auto red = ReduceScratch::make();
     if (!dev || !ds || !red) return fail(6, "GPU allocation failed");
+    if (implicit && og.revolved && !og.rev.wedge)
+        return fail(2, "Newton-Krylov on the full-revolution O-grid is not "
+                       "built (the validator enforces this)");
 
     if (r.rotor.active() && !r.rotorMrf)
         return fail(2, "the O-grid has no moving-geometry rotor: spinning the "
@@ -508,9 +511,22 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
             return s / nk;
         };
         const double xRear = og.mesh.node(og.nTheta + 1, 1, kLo)[0];
-        double x0 = 0, u0 = at(1, x0);
+        // The wedge demands reversed flow in the first cell (verbatim). The
+        // full revolution starts at the first reversed cell instead: the
+        // k-mean of the first cell sits within jitter of 0 at the rear
+        // stagnation point and flipped L_r between its value and 0
+        // (measured, SA-neg Re 1e3 64 x 48 x 64).
+        int jStart = 1;
+        if (!wedge)
+            while (jStart < g.ny - 2)
+            {
+                double xs = 0;
+                if (at(jStart, xs) < 0) break;
+                ++jStart;
+            }
+        double x0 = 0, u0 = at(jStart, x0);
         if (!(u0 < 0)) return 0.0;
-        for (int j = 2; j <= g.ny - 2; ++j)
+        for (int j = jStart + 1; j <= g.ny - 2; ++j)
         {
             double x1 = 0;
             const double u1 = at(j, x1);
@@ -524,12 +540,12 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
     // The separation angle: the first sign change of cf from the front
     // (revolved: along the k = kLo meridian; z-extruded: the upper side),
     // linearly interpolated; 0 when the flow never separates.
-    auto separationDeg = [&](const std::vector<WallFace>& fs) {
+    auto separationAt = [&](const std::vector<WallFace>& fs, int kMer) {
         const WallFace* prev = nullptr;
         // Faces in increasing theta along one meridian / the upper side.
         std::vector<const WallFace*> line;
         for (const auto& w : fs)
-            if ((rev && w.k == (wedge ? 1 : 0)) ||
+            if ((rev && w.k == kMer) ||
                 (!rev && w.k == 0 && w.thetaDeg >= 0))
                 line.push_back(&w);
         std::ranges::sort(line, {}, [](const WallFace* w) { return w->thetaDeg; });
@@ -548,12 +564,48 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
         const auto fs = wallFaces();
         if (auto h = internal::checkDevice("the surface tally", &*red); !h)
             return std::unexpected(h.error());
-        if (rev)
+        if (wedge)
         {
             const double lr = recircLength();
             std::printf("# axisymmetric wall: separation theta_s %.2f deg "
                         "from the front, recirculation L_r %.4f D\n",
-                        separationDeg(fs), lr);
+                        separationAt(fs, 1), lr);
+            std::fflush(stdout);
+        }
+        else if (rev)
+        {
+            // The full revolution: theta_s on every meridian (mean, range),
+            // L_r on the k-mean of the downstream axis ring, and how far the
+            // state is from axisymmetric -- the largest azimuthal spread of
+            // u over the real (i, j) rings, in U.
+            double sMean = 0, sMin = HUGE_VAL, sMax = -HUGE_VAL;
+            for (int k = 0; k < g.nz; ++k)
+            {
+                const double s = separationAt(fs, k);
+                sMean += s / g.nz;
+                sMin = std::min(sMin, s);
+                sMax = std::max(sMax, s);
+            }
+            const double lr = recircLength(); // leaves u in dev->u()
+            std::vector<Real> u(g.size());
+            double spread = 0;
+            if (dev->u().download(u.data()) == hipSuccess)
+                for (int j = 1; j <= g.ny - 2; ++j)
+                    for (int i = 1; i <= og.nTheta; ++i)
+                    {
+                        double lo = HUGE_VAL, hi = -HUGE_VAL;
+                        for (int k = 0; k < g.nz; ++k)
+                        {
+                            lo = std::min(lo, double(u[g.idx(i, j, k)]));
+                            hi = std::max(hi, double(u[g.idx(i, j, k)]));
+                        }
+                        spread = std::max(spread, hi - lo);
+                    }
+            std::printf("# revolved wall (full revolution, %d meridians): "
+                        "separation theta_s %.2f deg (range %.2f..%.2f), "
+                        "recirculation L_r %.4f D (k-mean), azimuthal spread "
+                        "max |du| %.3e U\n",
+                        g.nz, sMean, sMin, sMax, lr, spread / r.uInf);
             std::fflush(stdout);
         }
         if (!out.wantsSurface()) return {};

@@ -14,7 +14,9 @@ namespace dns {
 // <prefix>_mesh.bin: "DNSMESH1", u32 version 1, u32 nx ny nz, u32 wrap[3]
 // (AxisWrap: 0 Translate, 1 Cyclic, 2 Extend, 3 MirrorZ), u32 flags (bit 0
 // ghost rows j = 0 and ny-1; bit 1 ghost columns i = 0 and nx-1; bit 2
-// wedge; bit 3 revolved), u32 nTheta, f64 dphi, f64 centre[3], f64 mirrorZ0,
+// wedge; bit 3 revolved: a revolved mesh without bit 2 is the FULL
+// revolution, wrap[2] Cyclic), u32 nTheta, f64 dphi (the wedge angle, or
+// 2 pi / nz on the full revolution), f64 centre[3], f64 mirrorZ0,
 // then f64 x[n], y[n], z[n] of the STORED nodes (Grid::idx order; the reader
 // applies the wrap rules for node(n)), then f64 d1[nx*nz] (i fastest).
 // Pre: d1 empty or nx*nz entries (empty writes zeros).

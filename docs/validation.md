@@ -215,6 +215,83 @@ MEAN, labelled `RANS SST-2003m -- URANS (time-accurate)`: tier A at M 0.2
 ~22 min, not run). The coarse wedges' exit 8 (issues.md 1) is accepted as
 the honest outcome: the only cure measured is dissipation.
 
+### The full revolution vs the wedge (P4, `docs/rans.md` "The full revolution")
+
+Code-to-itself: the full-revolution O-grid (`--nz N`) against the 5° wedge
+at the SAME meridional mesh, both the explicit LTS march stopped by the
+jitter-floored rule, M 0.2, rFar 20 D (gfx1100, 2026-10-26). In exact
+arithmetic an axisymmetric 3D state IS the wedge of Δφ = 2π/N (`gpu_axisym3d`
+(c): N 16 vs a 22.5° wedge agree to 4e-5 in cd, 1.4e-5 per plane), so the
+N ladder is the wedge's own Δφ convergence -- the polygonal body's frontal
+area is sin(Δφ)/Δφ of the circle's -- and G4.2 (|Δcd| ≤ 0.5%) is a statement
+about which N is fine enough.
+
+**G4.2, laminar Re 100, β 3, TOL 1e-4** (every run exit 0; cd relative to
+the wedge at the same (nθ, ny)):
+
+| mesh | wedge 5° | N 16 | N 32 | N 64 | N 128 |
+|---|---|---|---|---|---|
+| L1 64×48 cd | 1.09281 | 1.07635 (−1.51%) | 1.08930 (−0.32%) | 1.09257 (−0.022%) | 1.09339 (+0.053%) |
+| L1 θ_s / L_r | 126.27° / 0.898 D | 127.65° / 0.855 | 126.56° / 0.889 | 126.29° / 0.898 | 126.22° / 0.900 |
+| L1 iterations / wall | 57400 / 6.8 s | 25400 / 4.2 s | 22200 / 4.2 s | 47600 / 13 s | 139000 / 84 s |
+| L2 128×96 cd | 1.09493 | | 1.09143 (−0.32%) | 1.09470 (−0.021%) | |
+| L2 θ_s / L_r | 126.43° / 0.890 D | | 126.72° / 0.881 | 126.45° / 0.890 | |
+| L2 iterations / wall | 75800 / 41 s | | 37200 / 69 s | 62000 / 131 s | |
+
+- **G4.2 PASS** at L1 and L2 for N ≥ 32 (−0.32%); at N 64 the 3D cd is
+  within 0.022% of the wedge, θ_s within 0.03°, L_r within 0.1%.
+- **nφ convergence is second order in Δφ**: L1 successive differences
+  +0.01295, +0.00327, +0.00082 (ratios 3.96, 3.99). Richardson from N 32 / 64
+  at L2: cd(Δφ → 0) = 1.09579, against the wedge's own 5° / 2.5° Richardson
+  1.09577 (2.5° wedge 1.09556) -- the two limits agree to 2e-5.
+- The N 16 body loses 2.55% of its frontal area and 1.51% of its drag: cd is
+  not proportional to the polygon's area.
+- Cost: 0.118 ms/iteration on the wedge (launch-bound), 1.65 µs per thousand
+  cells and iteration in 3D from 2e5 cells up (L1 N 64 0.270 ms, L2 N 64
+  1.35 ms at 8.0e5 cells). The stop certifies after a number of iterations
+  set by the monitors' jitter (W, the limiting series: averaging N planes
+  lowers it, so N 32 stops before the wedge).
+
+**Small RANS and the m = 1 mode, L1 64×48, N 32** (β 4.5 for RANS, β 3
+laminar; TOL 1e-4, every run exit 0, 0 guard hits; "trip" = `--ogrid-trip
+0.05`):
+
+| case | wedge 5° | 3D N 32 | 3D N 32, trip |
+|---|---|---|---|
+| RANS SA-neg Re 1e3 cd / cl | 0.48541 / 0 | 0.48229 (−0.64%) / 0 | **0.49196 / −0.0585** (steady m = 1) |
+| — θ_s / L_r | 99.50° / 1.2691 D | 99.63° / 1.2650 | 98.66–101.00° / (off-axis) |
+| — iterations, ms/it | 136600, 0.215 | 119200, 0.393 | 116800, 0.395 |
+| RANS SST-2003m Re 1e3 cd / cl | 0.49851 / 0 | 0.49511 (−0.68%) / 0 | 0.49511 / 1.2e-5 (decays) |
+| — θ_s / L_r | 100.30° / 1.1656 D | 100.45° / 1.1623 | 100.45° / 1.1623 |
+| — iterations, ms/it | 114600, 0.239 | 95200, 0.463 | 95000, 0.466 |
+| laminar Re 250 cd / cl | 0.69343 / 0 | 0.69099 (−0.35%) / 0 | **0.70690 / −0.0647** (steady m = 1) |
+| — θ_s / L_r | 112.31° / 1.5644 D | 112.55° / 1.5546 | 110.83–114.36° / 1.3825 |
+
+- At N 64: SA-neg Re 1e3 untripped 0.48518 (−0.047% of the wedge; L_r
+  1.2690 D, θ_s 99.51°), tripped 0.49557 with cl +0.0598 (N 32: −0.0585 --
+  the sign of the lift is the transient's choice, its plane the trip's);
+  laminar Re 250 tripped 0.70999, cl −0.0652 (N 32: 0.70690 / −0.0647).
+- The untripped 3D state is the wedge's (to the polygon), for every closure:
+  it is exactly π-symmetric and so cannot leave axisymmetry through m = 1.
+- Tripped, the laminar Re 250 sphere takes the steady planar-symmetric wake
+  of Johnson & Patel 1999 (context only: cd ≈ 0.70, cl ≈ 0.062 there;
+  here 0.707 / 0.065 on L1 × 32): the 3D solver reproduces the first
+  bifurcation of the sphere wake, which no wedge can.
+- RANS SA-neg at Re 1e3 is m = 1-unstable on this mesh (it takes the same
+  kind of asymmetric steady wake, cl −0.0585), SST-2003m is stable. A
+  symmetric SA-neg 3D number at Re 1e3 is therefore an UNSTABLE fixed point
+  the exact symmetry protects -- report the tripped one.
+
+**G4.3, RANS SA-neg Re 1e4 on G1** (128×96×96, 1.2M cells, β 4.5, trip
+0.05, explicit LTS, 10-minute cap): exit 8 at 170000 iterations, 581 s,
+3.41 ms/iteration. cd 0.42519 ± 1.2e-4 (last 2e4 iterations) against the
+wedge's certified 0.42480 (+0.09%, inside the 0.5% gate as a settled value,
+NOT a certified one), θ_s 86.9–87.8° (wedge 87.40°), L_r 1.2214 D (1.2206),
+y⁺max 0.33, 0 hits. The march is not converging: an m = 1 lateral force
+grows in pseudo-time (|cl| 1e-3 → 1.5e-2 between 5e4 and 1.6e5 iterations),
+so the stop's W jitter (4.3e-3) stays above 2⁻¹⁰. Reported as found, not
+damped (docs/rans.md "The full revolution", issues.md 11).
+
 ## Tolerance adjustments vs the original plan
 
 Recorded per the rule "widen only with written justification":

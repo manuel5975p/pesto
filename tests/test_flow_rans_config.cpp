@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <numbers>
 #include <string>
 #include <vector>
 
@@ -390,8 +391,66 @@ void revolved()
           "wedge RANS steady label with its angle");
     check(r && !hasWarning(*r, "--nz 1 is the same answer"),
           "no z-invariance warning on the wedge (nz 3 is internal)");
-    rejectedAt(with({"--nz", "8"}), "--nz",
-               "the full revolution is not built yet (P4)");
+    // The full revolution (P4): --nz N > 1, N even and >= 4.
+    auto f = runCli(with({"--nz", "32"}));
+    check(f && f->ogridRevolved && f->ogridNphi == 32 && f->grid.nx == 66 &&
+              f->grid.ny == 48 && f->grid.nz == 32 && f->nzInterior == 32 &&
+              f->ogridWedgeDeg == 0 && f->meta.wedgeDeg == 0 &&
+              std::abs(f->grid.hz - 2 * std::numbers::pi / 32) < 1e-15,
+          "sphere --ogrid --nz 32: the full revolution, grid 66 x 48 x 32");
+    if (f) {
+        const std::string d = f->describe();
+        check(d.find("FULL revolution 32 azimuthal cells") != std::string::npos &&
+                  d.find("axisymmetric WEDGE") == std::string::npos &&
+                  d.find("  label ") == std::string::npos,
+              "full revolution describe: its block, no wedge, a DNS time "
+              "march carries no label");
+        check(!hasWarning(*f, "polygon") && !hasWarning(*f, "pi about the axis"),
+              "--nz 32 at Re 100: no facet warning (0.64% < 1%), no "
+              "symmetry warning (Re < 200)");
+    }
+    auto fd = runCli(sph);
+    check(fd && fd->ogridNphi == 64 && fd->grid.nz == 64,
+          "sphere --ogrid without --nz: the full revolution, N = --n");
+    auto fr = runCli(with({"--nz", "16", "--rans", "sa-neg", "--steady",
+                           "1e-4", "--re", "1e4"}));
+    check(fr && fr->describe().find("  label      RANS SA-neg -- steady "
+                                    "(local time stepping: pseudo-time, not "
+                                    "time-accurate)\n") != std::string::npos,
+          "full revolution RANS steady label: no wedge suffix");
+    check(fr && hasWarning(*fr, "polygon about the axis, its frontal area "
+                                "2.55% below"),
+          "--nz 16 warns: a 16-gon, frontal area 2.55% below the circle's");
+    check(fr && hasWarning(*fr, "exactly symmetric under a rotation by pi"),
+          "full revolution RANS without --ogrid-trip warns: no odd modes");
+    auto ft = runCli(with({"--nz", "16", "--re", "300", "--ogrid-trip",
+                           "0.05"}));
+    check(ft && ft->ogridTrip == 0.05 &&
+              !hasWarning(*ft, "rotation by pi") &&
+              ft->describe().find("odd-mode trip 0.05 U") != std::string::npos,
+          "--ogrid-trip 0.05: resolved, described, no symmetry warning");
+    auto fu = runCli(with({"--nz", "16", "--rans", "sst-2003m", "--re", "1e4"}));
+    check(fu && fu->describe().find("  label      RANS SST-2003m -- URANS "
+                                    "(time-accurate)\n") != std::string::npos,
+          "full revolution URANS label: no axisymmetric-unsteadiness tail");
+    rejectedAt(with({"--nz", "7"}), "--nz", "an odd azimuthal count");
+    rejectedAt(with({"--nz", "2"}), "--nz", "--nz 2 (below 4)");
+    rejectedAt(with({"--nz", "8", "--ogrid-wedge", "5"}), "--ogrid-wedge",
+               "--ogrid-wedge on the full revolution");
+    rejectedAt(with({"--nz", "8", "--les", "0.1"}), "--les",
+               "--les on the full revolution");
+    rejectedAt(with({"--nz", "8", "--steady", "1e-4", "--steady-scheme",
+                     "implicit"}),
+               "--steady-scheme", "Newton-Krylov on the full revolution");
+    rejectedAt(with({"--nz", "8", "--ogrid-trip", "0.6"}), "--ogrid-trip",
+               "--ogrid-trip > 0.5");
+    rejectedAt(with({"--nz", "1", "--ogrid-trip", "0.1"}), "--ogrid-trip",
+               "--ogrid-trip on the wedge");
+    rejectedAt(og({"--ogrid-trip", "0.1"}), "--ogrid-trip",
+               "--ogrid-trip on an extruded O-grid");
+    rejectedAt({"flow", "--physics", "compressible", "--body", "sphere",
+                "--n", "64", "--ogrid-trip", "0.1", "--out", "x"},
+               "--ogrid-trip", "--ogrid-trip without --ogrid");
     rejectedAt(with({"--nz", "1", "--ogrid-wedge", "12"}), "--ogrid-wedge",
                "--ogrid-wedge > 10");
     rejectedAt(with({"--nz", "1", "--ogrid-wedge", "0"}), "--ogrid-wedge",

@@ -183,7 +183,8 @@ replace the positional. Explicit CLI flags override the file.
   run ends with a `# steady stop (jitter-floored, relative): ... trend ...
   jitter ...` line. `--steady-scheme explicit` (default; local time stepping
   on the compensated state, cap 1000000) or `implicit` (Newton–Krylov,
-  `--ogrid` at `--nz 1` or the wedge, cap 500; slower than explicit wherever
+  `--ogrid` at `--nz 1` or the wedge -- not the sphere's full revolution --
+  cap 500; slower than explicit wherever
   measured, and it does not converge from a cold start on the Re 1e4
   wedge).
 * **RANS** (`--physics compressible`; `docs/rans.md` "dns flow"): `--rans
@@ -1227,7 +1228,8 @@ path never saw it. Pinned structurally in `test_gpu_comp_ghost_focal`.
 ### 12.2 Body-fitted O-grid — `--ogrid` (the wall IS a mesh face)
 
 `src/dns/ogrid.*` (mesh), `src/dns/gpu/ogrid_bc.*` (boundary rows),
-`src/dns/gpu/runner_ogrid.*` (time loop); tests `ogrid`, `gpu_ogrid`.
+`src/dns/gpu/runner_ogrid.*` (time loop); tests `ogrid`, `gpu_ogrid`, and for
+the revolved sphere `gpu_axisym` (wedge) and `gpu_axisym3d` (full revolution).
 
 `--focal` clusters a Cartesian box around an immersed body. `--ogrid` removes
 the immersion entirely: the domain becomes the **disc** of radius
@@ -1272,11 +1274,23 @@ for every `w` and the mesh is the **exact polar annulus** (measured: node error
 1.3e-13, face closure 1.4e-17).
 
 Scope: bodies with a **z-invariant cross-section** — cylinder, lens, cube,
-z-invariant mesh — extruded in z. `--body sphere` is **rejected**: a 3D O-grid
-around a closed surface has polar singularities (cells collapse on the axis,
-det → 0), which is a different mesh topology, not a parameter. A general wing
-needs a section that is star-shaped about the given centre; the builder reports
-the failing angle by name if it is not.
+z-invariant mesh — extruded in z; and `--body sphere`, whose O-grid is
+**revolved** about x (`buildRevolvedOGrid`, `docs/rans.md` "Axisymmetric
+wedge and the revolved O-grid"): `--n` meridional cells over θ ∈ [0, π], the
+axis faces exactly degenerate (S = 0, an analytic limit metric), the ghost
+columns past the axis holding the across-axis continuation (`gpu/axis_bc`).
+`--nz 1` is the axisymmetric WEDGE (`--ogrid-wedge DEG`, labelled
+`[axisymmetric wedge ...]`); `--nz N > 1` (default `--n`) is the FULL
+REVOLUTION: N azimuthal cells (even, ≥ 4; the axis ghosts copy the cell
+across the axis, k + N/2, Cartesian components unrotated), a polygonal body
+whose frontal area is sin(2π/N)/(2π/N) of the circle's (warned above 1%),
+explicit steady or time-accurate (no `--steady-scheme implicit`, no `--les`).
+The full-revolution mesh is EXACTLY symmetric under a rotation by π about the
+axis and so is an axisymmetric start: the odd azimuthal modes (the m = 1
+lift mode) cannot grow from rounding — `--ogrid-trip A` seeds them (warned
+at Re ≥ 200 and with `--rans`). A general wing needs a section that is
+star-shaped about the given centre; the builder reports the failing angle by
+name if it is not.
 
 `--ogrid` rejects `--focal`, `--stretch`, `--cut-flux`, `--penalize`, `--open`,
 `--far`, `--dr` and `--seq`: all of those describe a box with a body immersed in
@@ -1631,5 +1645,7 @@ gfx1100 (RX 7900 XTX) and tagged so; older ones are not rescaled.
 | O-grid cyl Re1e4 M0.2 384×192 β4 URANS, 5 D/U (gfx1100) | 0.117 (DNS) / 0.275 (SA-neg) / 0.325 (SST-2003m) ms/step, y⁺max 0.66, 0 guard hits |
 | Sphere Re100 M0.2 revolved wedge 5°, β3, explicit LTS plateau (gfx1100) | cd 1.09280 / 1.09492 / 1.09543 at 64×48 / 128×96 / 256×192 (M 0.1: 1.08709 / 1.08918 / 1.08967); tier B cd0 vs OpenFOAM simpleFoam on the SAME mesh −0.49% / −0.095% / −0.013%; θ_s 126.7° (OF 126.8°), L_r 0.867 D (OF 0.865) at L3 (`docs/validation.md` sph100) |
 | Sphere wedge RANS, explicit LTS, β4.5 (gfx1100, `docs/validation.md` sph1e4) | SST-2003m 64×48 Re 1e3: certified 114600 it / 28 s, tier B cd0 0.49070 vs OpenFOAM kOmegaSST (central U, SAME mesh) 0.48872 = +0.41%; SA-neg 128×96 Re 1e4: cd0 0.41764, −0.35% vs OpenFOAM central U (+1.16% vs linearUpwind); SST-2003m 128×96 Re 1e4: no stable steady state (URANS unsteady, mean 0.4115 at M 0.2) |
+| Sphere Re100 M0.2 FULL revolution (`--nz N`), β3, explicit LTS TOL 1e-4 (gfx1100, `docs/validation.md` "The full revolution vs the wedge") | vs the 5° wedge at the same (nθ, ny): −0.32% / −0.022% at N 32 / 64 (64×48 and 128×96), +0.053% at N 128 (64×48), second order in Δφ; Δφ → 0 at 128×96 1.09579 vs the wedge's 1.09577; 1.65 µs per kilo-cell and iteration (128×96×64: 62000 it, 131 s) |
+| Sphere full revolution, the m = 1 mode (64×48×32, `--ogrid-trip 0.05`) | laminar Re 250: steady planar-symmetric wake, cd 0.70690, cl −0.0647 (JP99 ≈ 0.70 / 0.062; untripped: the symmetric 0.69099); RANS SA-neg Re 1e3: cd 0.49196, cl −0.0585 (untripped 0.48229, wedge 0.48541); RANS SST-2003m Re 1e3: 0.49511, trip decays (wedge 0.49851) |
 | O-grid cyl Re40 256×96 Newton–Krylov (gfx1100) | certified (TOL 1e-4) cd 1.56656 (DNS, 78 steps, 28 s) / 1.57012 (SA-neg, 73, 30 s) / 1.56656 (SST-2003m, 174, 55 s) = the explicit march's; line-SGS 13 ms per application (59 ms at 75f39db) |
 | Immersed cyl Re1000 M0.2 384² URANS (gfx1100) | 0.37 (RANS-off, Cartesian) / 0.70 (SA-neg) / 0.75 (SST-2003m, curvilinear) ms/step; SST counts staircase k-guard hits (open finding) |

@@ -326,8 +326,11 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
                          .rFar = c.ogridRFar,
                          .beta = c.ogridBeta,
                          .span = c.ogridSpan};
-    const RevolvedSpec rev{.wedge = true,
-                           .dphi = c.ogridWedgeDeg * pi / 180.0};
+    const RevolvedSpec rev =
+        c.ogridNphi > 0
+            ? RevolvedSpec{.wedge = false, .dphi = 2.0 * pi / c.ogridNphi,
+                           .nphi = c.ogridNphi}
+            : RevolvedSpec{.wedge = true, .dphi = c.ogridWedgeDeg * pi / 180.0};
     auto og = c.ogridRevolved ? buildRevolvedOGrid(g, geo.sdf, spec, rev)
                               : buildOGrid(g, geo.sdf, spec);
     if (!og) return die(exitInput, "o-grid: " + og.error());
@@ -398,7 +401,8 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
     if (rans || c.compSteady || c.emit.contains(Emit::Surface) ||
         c.emit.contains(Emit::Mesh))
         rr.wallDist = c.ogridRevolved
-                          ? revolvedWallDistance(og->mesh, og->nTheta, true)
+                          ? revolvedWallDistance(og->mesh, og->nTheta,
+                                                 og->rev.wedge)
                           : ogridWallDistance(og->mesh);
     // --emit mesh: the mesh and its d1 now, before any device allocation.
     if (out->wantsMesh())
@@ -426,6 +430,42 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
     }
     for (int i = 0; i < ransScalars(c.rans); ++i)
         rr.icTurb[i].assign(g.size(), rhoInf * c.ransPhiInf[i]);
+    // --ogrid-trip (full revolution only): a solenoidal Gaussian vortex, axis
+    // along z, at (cx + D, cy + D/4, cz), width w = D/4, strength A U --
+    // u += 2 (y - y0)/w e, v -= 2 (x - x0)/w e, e = A U exp(-|x - x0|^2/w^2):
+    // divergence-free (w == 0, and e's z factor multiplies both), so
+    // acoustically silent. It breaks the exact pi-rotation symmetry about the
+    // axis that otherwise locks out the odd azimuthal modes.
+    if (c.ogridNphi > 0 && c.ogridTrip > 0)
+    {
+        const double A = c.ogridTrip * c.uInf, w = 0.25 * geo.D;
+        const double x0 = c.placement.cx + geo.D,
+                     y0 = c.placement.cy + 0.25 * geo.D, z0 = c.placement.cz;
+        for (int k = 0; k < g.nz; ++k)
+            for (int j = 0; j < g.ny; ++j)
+                for (int i = 0; i < g.nx; ++i)
+                {
+                    double x[3] = {0, 0, 0};
+                    for (int dk = 0; dk < 2; ++dk)
+                        for (int dj = 0; dj < 2; ++dj)
+                            for (int di = 0; di < 2; ++di)
+                            {
+                                const auto p = og->mesh.node(i + di, j + dj,
+                                                             k + dk);
+                                for (int a = 0; a < 3; ++a) x[a] += 0.125 * p[a];
+                            }
+                    const double dx = x[0] - x0, dy = x[1] - y0, dz = x[2] - z0;
+                    const double e =
+                        A * std::exp(-(dx * dx + dy * dy + dz * dz) / (w * w));
+                    const std::size_t q = g.idx(i, j, k);
+                    const double uu = u0 + 2.0 * dy / w * e,
+                                 vv = -2.0 * dx / w * e;
+                    ic.mx[q] = rhoInf * uu;
+                    ic.my[q] = rhoInf * vv;
+                    ic.E[q] = pInf / (gamma - 1.0) +
+                              0.5 * rhoInf * (uu * uu + vv * vv);
+                }
+    }
 
     const auto res = gpu::runOGrid(g, *og, ic, rr, *out);
     if (!res) return die(res.error().code, res.error().message);
