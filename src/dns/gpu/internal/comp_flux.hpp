@@ -48,6 +48,25 @@ struct PrimView
     const Real *rho, *u, *v, *w, *e, *p, *T;
 };
 
+// The primitives of cell c off the conserved state: kPrim's body, shared with
+// the fused SA primitive + mu_t kernel (rans.hip) so both write the same bits.
+__device__ inline void primitivesAt(std::size_t c, Real gamma, Real Rgas,
+                                    const Real* rho, const Real* mx,
+                                    const Real* my, const Real* mz,
+                                    const Real* E, Real* u, Real* v, Real* w,
+                                    Real* e, Real* p, Real* T)
+{
+    const Real r = rho[c];
+    u[c] = mx[c] / r;
+    v[c] = my[c] / r;
+    w[c] = mz[c] / r;
+    e[c] = E[c] / r;
+    const Real pr = (gamma - Real(1)) *
+        (E[c] - Real(0.5) * (mx[c] * mx[c] + my[c] * my[c] + mz[c] * mz[c]) / r);
+    p[c] = pr;
+    T[c] = pr / (r * Rgas);
+}
+
 // Rotating-reference-frame zone (--rotor-frame mrf): the frozen-rotor
 // approximation solved on the STATIC azimuth-0 geometry. Inside the zone the
 // equations are the rotating-frame ones in absolute-velocity form: convective
@@ -216,11 +235,10 @@ __device__ inline Real mrfFaceQNode(const MrfView& z, const GpuGrid& g, int i,
 // therefore serve both of its faces on every axis, which is what removes the
 // per-access gidx from the hot loop. Pre: b == a + o.p[axis].
 //
-// nut (optional, per-cell dynamic eddy viscosity for LES): when non-null the
+// nut (optional, per-cell eddy viscosity mu_t, LES or RANS): when non-null the
 // face-averaged value is added to mu and, scaled by kapScale = cp/Pr_t, to
-// kappa. nut==nullptr reproduces the molecular DNS flux bit-for-bit, so the
-// solver rhs (LES off) and the ghost-wall force tally (molecular stress only)
-// are unchanged.
+// kappa. nut==nullptr reproduces the molecular DNS flux bit-for-bit. The
+// surface tallies pass the same nut the rhs used, wall image included.
 // wf (optional): frame velocity at this face (--rotor-frame mrf, MrfView).
 // Non-null switches the ADVECTING normal velocity to un - wf[axis] in every
 // transport term while the pressure work in the energy flux stays on the
@@ -409,7 +427,7 @@ __host__ __device__ inline Real curvDelta2(const GpuGrid& g, Real invVol)
 // Curvilinear counterpart of faceFlux: Un = u_avg . S, viscous gradients in
 // index space mapped through the face inverse Jacobian, flux carries the
 // face area (the rhs divides by the cell volume, not the spacing).
-// nut (optional, per-cell dynamic eddy viscosity for LES) enters exactly as in
+// nut (optional, per-cell eddy viscosity mu_t, LES or RANS) enters exactly as in
 // faceFlux: face-averaged into mu, and scaled by kapScale = cp/Pr_t into
 // kappa. nut == nullptr reproduces the molecular curvilinear flux bit-for-bit.
 // wf: as in faceFlux -- advecting normal area flux Un - wf.S, pressure work on

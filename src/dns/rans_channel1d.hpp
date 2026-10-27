@@ -48,7 +48,8 @@ struct Channel1dSolution
 
 // The case's grid (nx x (ny+2) x nz, the validator's box): the oracle's own
 // discretization uses nx = 2, nz = 1 (every y-face quantity is x/z-free).
-// Pre: c valid (ny >= 8, reTau > 0, 0 < mach < 1), nx >= 2, nz >= 1.
+// Pre: c valid (ny >= 8, reTau > 0, mach > 0: supersonic is legal, the
+// validator's steady RANS channel), nx >= 2, nz >= 1.
 Grid channel1dGrid(const Channel1dCase& c, int nx, int nz, double lx, double lz);
 
 // Steady FP64 solution; an error (never an assert) when Newton fails.

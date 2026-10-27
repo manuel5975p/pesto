@@ -90,9 +90,11 @@ public:
     // Declares a CSV series. `name` is the file suffix ("stats" ->
     // <prefix>_stats.csv); cols is the header line, written verbatim. Fails
     // when the file cannot be created (the caller exits 4); a no-op success
-    // when stats are not emitted.
+    // when stats are not emitted. A non-empty `comment` (the run label) goes
+    // first as "# <comment>"; empty writes the file exactly as before.
     [[nodiscard]] std::expected<void, std::string>
-    declareSeries(std::string_view name, std::span<const std::string> cols);
+    declareSeries(std::string_view name, std::span<const std::string> cols,
+                  std::string_view comment = {});
     // Appends one row; false when the write failed. The failure is RECORDED
     // and finish() reports it, so a caller in a time loop may ignore this.
     bool row(std::string_view series, std::span<const double>);
@@ -146,10 +148,12 @@ public:
     // The whole <prefix>_surface.csv (Emit::Surface), written once at the
     // end of a run: "# <comment>" (the run label), the header, the rows.
     // make() created and truncated it (phase 3c). No-op success when the
-    // kind is not emitted. Pre: every row has cols.size() entries.
+    // kind is not emitted. digits: significant digits per value (the stream
+    // default 6 unless a table needs more, e.g. gauge forces summed over many
+    // faces). Pre: every row has cols.size() entries, digits > 0.
     [[nodiscard]] std::expected<void, std::string>
     writeSurface(std::string_view comment, std::span<const std::string> cols,
-                 std::span<const std::vector<double>> rows);
+                 std::span<const std::vector<double>> rows, int digits = 6);
     bool wantsSurface() const;
 
     // `--emit mesh`: the whole <prefix>_<which>.bin, which = "mesh" (written

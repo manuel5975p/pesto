@@ -8,6 +8,7 @@
 //       in process: the device state stays column-uniform bit for bit, R_mz
 //       and w stay exactly 0 at every iteration
 //   I5  cold starts Re_tau 1e4 ny 128 (SA, SST-2003m) through the binary
+//   I5b SA Re_tau 1e5 ny 2048 stretch 4 through the binary == the oracle
 //   I6  the residual is bitwise column-uniform at the IC on nx 6 x nz 2, and
 //       that grid's iterate equals the nx 4 x nz 1 one
 //   I7  TOL 1e-6 certifies (Re_tau 180 SA)
@@ -548,6 +549,11 @@ int main(int argc, char** argv)
     }
     for (RansModel m : {RansModel::SaNeg, RansModel::Sst2003m})
         coldStart(caseOf(m, 1e4, 128, 4), 1e-4, 5e-6, 40, 2.0, "I5");
+    // I5b: the CFL3D-comparison regime (rans_channel1d O5) through the binary,
+    // Re_tau 1e5 ny 2048 stretch 4: the binary IS the oracle on its grid.
+    // Measured (gfx1100, 2026-10-27, TOL 1e-6): 27 iterations, ub -2.5e-8
+    // off, 0.23 s.
+    coldStart(caseOf(RansModel::SaNeg, 1e5, 2048, 4), 1e-6, 1e-6, 40, 2.0, "I5b");
     homogeneity();
     coldStart(caseOf(RansModel::SaNeg, 180, 64, 2), 1e-6, 2e-6, 40, 0, "I7");
     return dnstest::finish();

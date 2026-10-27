@@ -198,7 +198,7 @@ __global__ void kGhostTurb(int sst, ViscView vv, Real gamma, Real Rgas,
     const Real Ts = pt / (Rgas * rt);
     const Real muw = vv.sutherland ? vv.mu * vv.ratio(Ts) : vv.mu;
     const Real ds = gdw[q] / a;
-    const Real omw = Real(60) * (muw / rt) / (Real(sst::beta1) * ds * ds);
+    const Real omw = Real(sst::omegaWallFactor) * (muw / rt) / (ds * ds);
     t1[c] = rg * ((Real(1) + a) * omw - a * s1);
 }
 
@@ -227,9 +227,32 @@ __global__ void kZeroLow(const int* cells, int m, LowWords L)
     for (int f = 0; f < L.n; ++f) L.lo[f][c] = Real(0);
 }
 
+// kZeroLow over the ghost and the deep cells: what the ghost passes wrote.
+// Pre: s.compensated().
+void zeroLow(DeviceCompState& s, const int* gcell, int nGhost, const int* deep,
+             int nDeep)
+{
+    LowWords L{{}, 5 + s.nT};
+    for (int f = 0; f < 5; ++f) L.lo[f] = s.lo[f].data();
+    for (int i = 0; i < s.nT; ++i) L.lo[5 + i] = s.tlo[i].data();
+    if (nGhost > 0)
+        kZeroLow<<<launchBlocks(nGhost), blockSize>>>(gcell, nGhost, L);
+    if (nDeep > 0) kZeroLow<<<launchBlocks(nDeep), blockSize>>>(deep, nDeep, L);
+    checkLastKernel("kZeroLow");
+}
+
 // mu_t odd and F1 even through the ghost image (mirrorMut); deep: 0 and 1.
+// The odd image extrapolates the wall-linear mu_t through a sub-cell wall:
+// where the ghost lies deeper than its fluid neighbour is far (dw > d_c) the
+// face average mu_t is NEGATIVE, and under-resolved it beats mu (measured,
+// gpu_rans_immersed (e): -41 mu on a law-of-the-wall layer at y+ ~ 50). So
+// the image is clamped by the smallest fluid face neighbour's mu_t: every
+// staircase face keeps 0.5 (mu_t_g + mu_t_c) >= 0. Strict < so an unbound
+// ghost is the old -a sum w mu_t_s bit for bit. The fluid neighbours are
+// never ghosts, so no thread reads a cell another one writes.
 __global__ void kGhostMut(const int* gcell, const int* gnbr, const Real* gw,
-                          const Real* gscale, int m, Real* nut, Real* f1)
+                          const Real* gscale, const int* gfnb, int m, Real* nut,
+                          Real* f1)
 {
     const int q = blockIdx.x * blockDim.x + threadIdx.x;
     if (q >= m) return;
@@ -241,8 +264,14 @@ __global__ void kGhostMut(const int* gcell, const int* gnbr, const Real* gw,
         sm += w * nut[c];
         if (f1) sf += w * f1[c];
     }
+    Real lim = gscale[q] * sm;
+    for (int s = 0; s < CompGhostTables::kFaceNbr; ++s) {
+        const int f = gfnb[CompGhostTables::kFaceNbr * q + s];
+        if (f < 0) break;
+        if (nut[f] < lim) lim = nut[f];
+    }
     const int c = gcell[q];
-    nut[c] = -gscale[q] * sm;
+    nut[c] = -lim;
     if (f1) f1[c] = sf;
 }
 __global__ void kDeepMut(const int* cells, int m, Real* nut, Real* f1)
@@ -295,14 +324,25 @@ __global__ void kQuiescent(const int* cells, int m, Real rhoInf, Real EInf,
 // they do not vanish on an adiabatic wall (measured; they made the adiabatic
 // column read a spurious nonzero rate). mu == 0 makes kappa == 0, so the
 // inviscid early-out of faceFlux is reproduced without a branch.
+// nut (LES/RANS, else null): the face-averaged eddy conductivity
+// nut_f * kapScale the flux adds, exactly as faceFlux adds it.
+__device__ inline Real eddyKappa(Real kapf, const Real* nut, Real kapScale,
+                                 std::size_t a, std::size_t b)
+{
+    if (!nut) return kapf;
+    return kapf + Real(0.5) * (nut[a] + nut[b]) * kapScale;
+}
+
 __device__ inline Real faceConduction(const GpuGrid& g, ViscView vv, PrimView q,
-                                      int i, int j, int k, int axis)
+                                      int i, int j, int k, int axis,
+                                      const Real* nut, Real kapScale)
 {
     const Offsets o = offsetsAt(g, i, j, k);
     const std::size_t a = gidx(g, i, j, k), b = a + o.p[axis];
     const Real h = axis == 0 ? g.hx : axis == 1 ? g.hy : g.hz;
     Real kapf = vv.kappa;
     if (vv.sutherland) kapf *= vv.ratio(Real(0.5) * (q.T[a] + q.T[b]));
+    kapf = eddyKappa(kapf, nut, kapScale, a, b);
     return -kapf * (q.T[b] - q.T[a]) / h;
 }
 
@@ -311,7 +351,8 @@ __device__ inline Real faceConduction(const GpuGrid& g, ViscView vv, PrimView q,
 // faceFluxCurv builds its Fourier term (so the result already carries area).
 __device__ inline Real faceConductionCurv(const GpuGrid& g, ViscView vv,
                                           PrimView q, CurvView m, int i, int j,
-                                          int k, int axis)
+                                          int k, int axis, const Real* nut,
+                                          Real kapScale)
 {
     const Offsets o = offsetsAt(g, i, j, k);
     const std::size_t a = gidx(g, i, j, k), b = a + o.p[axis];
@@ -329,6 +370,7 @@ __device__ inline Real faceConductionCurv(const GpuGrid& g, ViscView vv,
                 dxi[2] * m.Ji[axis][6 + c][a];
     Real kapf = vv.kappa;
     if (vv.sutherland) kapf *= vv.ratio(Real(0.5) * (q.T[a] + q.T[b]));
+    kapf = eddyKappa(kapf, nut, kapScale, a, b);
     return -kapf * (gT[0] * Sv[0] + gT[1] * Sv[1] + gT[2] * Sv[2]);
 }
 
@@ -352,9 +394,49 @@ __device__ inline Real faceConductionCurv(const GpuGrid& g, ViscView vv,
 // momentum flux is exactly the solver's -- the interface faces sit deep in
 // the f = 1 core, where the advecting normal velocity is the wall-relative
 // one and vanishes on the resolved surface.
+//
+// kSplit (DeviceCompGhost::surfaceFaces) additionally stages the parts, in
+// spans 7..16 of a 17-span buffer: [7] the KG face pressure minus pRef,
+// [8..10] its force p s, [11..13] the convective flux rho u_a u, [14..16] the
+// oriented face vector s -- re-evaluated from the face values with the flux's
+// own FP32 expressions and promoted, never shared with the total. A COMPILE-
+// TIME switch on purpose: the default instantiation is the unchanged kernel,
+// because a shared subexpression or a runtime branch can change the FMA
+// contraction of the total (the NSCBC lesson), and force() must stay bit-
+// for-bit the tally it always was.
+// The split's spans for face t. ua is the advecting normal velocity (an area
+// flux on the focal mesh) and cs the factor that turns rho ua u into the
+// oriented face flux: sign * area (Cartesian), sign (focal, area in ua).
+__device__ inline void stageSplit(double* acc, int m, int t, Real pm, Real rm,
+                                  Real ua, const Real* um, double cs,
+                                  const double* s, double pRef)
+{
+    const double p = double(pm) - pRef;
+    acc[7 * m + t] = p;
+    for (int c = 0; c < 3; ++c) {
+        acc[(8 + c) * m + t] = p * s[c];
+        acc[(11 + c) * m + t] = double(rm) * double(ua) * double(um[c]) * cs;
+        acc[(14 + c) * m + t] = s[c];
+    }
+}
+
+// Face values of the KG flux at a-b, as faceFlux/faceFluxCurv form them.
+struct FaceMeans
+{
+    Real rm, pm, um[3];
+};
+__device__ inline FaceMeans faceMeans(PrimView q, std::size_t a, std::size_t b)
+{
+    return {Real(0.5) * (q.rho[a] + q.rho[b]), Real(0.5) * (q.p[a] + q.p[b]),
+            {Real(0.5) * (q.u[a] + q.u[b]), Real(0.5) * (q.v[a] + q.v[b]),
+             Real(0.5) * (q.w[a] + q.w[b])}};
+}
+
+template <bool kSplit>
 __global__ void kBodyFlux(GpuGrid g, ViscView vv, int iso, PrimView q,
                           const int* fcell, const int* fdir, int m, double* acc,
-                          MrfView mz, const Real* nut, Real kapScale)
+                          MrfView mz, const Real* nut, Real kapScale,
+                          double pRef)
 {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= m) return;
@@ -380,16 +462,34 @@ __global__ void kBodyFlux(GpuGrid g, ViscView vv, int iso, PrimView q,
     acc[m + t] = double(sgn * f.my * area);
     acc[2 * m + t] = double(sgn * f.mz * area);
     acc[3 * m + t] =
-        iso ? double(sgn * faceConduction(g, vv, q, fi, fj, fk, axis) * area)
+        iso ? double(sgn *
+                     faceConduction(g, vv, q, fi, fj, fk, axis, nut, kapScale) *
+                     area)
             : 0.0;
+    if constexpr (kSplit) {
+        const std::size_t a = gidx(g, fi, fj, fk);
+        const FaceMeans fm =
+            faceMeans(q, a, a + offsetsAt(g, fi, fj, fk).p[axis]);
+        Real ua = fm.um[axis];
+        if (mz.active) {
+            Real w[3];
+            mrfFaceVel(mz, fi, fj, fk, axis, w);
+            ua = ua - w[axis];
+        }
+        const double cs = double(sgn) * double(area);
+        double s[3] = {0.0, 0.0, 0.0};
+        s[axis] = cs;
+        stageSplit(acc, m, t, fm.pm, fm.rm, ua, fm.um, cs, s, pRef);
+    }
 }
 
 // Curvilinear counterpart: faceFluxCurv already integrates over the exact
 // face area vector S, so there is no separate area multiply here.
+template <bool kSplit>
 __global__ void kBodyFluxCurv(GpuGrid g, ViscView vv, int iso, PrimView q,
                               CurvView m, const int* fcell, const int* fdir,
                               int n, double* acc, MrfView mz, const Real* nut,
-                              Real kapScale)
+                              Real kapScale, double pRef)
 {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n) return;
@@ -408,8 +508,32 @@ __global__ void kBodyFluxCurv(GpuGrid g, ViscView vv, int iso, PrimView q,
     acc[n + t] = double(sgn * f.my);
     acc[2 * n + t] = double(sgn * f.mz);
     acc[3 * n + t] =
-        iso ? double(sgn * faceConductionCurv(g, vv, q, m, fi, fj, fk, axis))
+        iso ? double(sgn * faceConductionCurv(g, vv, q, m, fi, fj, fk, axis,
+                                              nut, kapScale))
             : 0.0;
+    if constexpr (kSplit) {
+        const std::size_t a = gidx(g, fi, fj, fk);
+        const FaceMeans fm =
+            faceMeans(q, a, a + offsetsAt(g, fi, fj, fk).p[axis]);
+        const Real Sv[3] = {m.S[axis][0][a], m.S[axis][1][a], m.S[axis][2][a]};
+        // The advecting area flux exactly as faceFluxCurv's (i,j,k) form
+        // picks it: node-psi correction, else the pointwise frame velocity.
+        const Real Un = fm.um[0] * Sv[0] + fm.um[1] * Sv[1] + fm.um[2] * Sv[2];
+        Real ua = Un;
+        if (mz.active) {
+            if (mz.psi) {
+                ua = Un - mrfFaceQNode(mz, g, fi, fj, axis);
+            } else {
+                Real w[3];
+                mrfFaceVel(mz, fi, fj, fk, axis, w);
+                ua = Un - (w[0] * Sv[0] + w[1] * Sv[1] + w[2] * Sv[2]);
+            }
+        }
+        const double s[3] = {double(sgn) * double(Sv[0]),
+                             double(sgn) * double(Sv[1]),
+                             double(sgn) * double(Sv[2])};
+        stageSplit(acc, n, t, fm.pm, fm.rm, ua, fm.um, double(sgn), s, pRef);
+    }
 }
 
 // Moment of the force already staged by kBodyFlux/kBodyFluxCurv, about `pivot`:
@@ -812,6 +936,14 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
     const int dijk[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
                             {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
     const int ndir = nz == 1 ? 4 : 6;
+    // ... and, per ghost, the fluid cells across its faces (the mu_t clamp).
+    // Each (fluid cell, direction) pair names one ghost face, so a ghost has
+    // at most ndir of them.
+    constexpr int nfn = CompGhostTables::kFaceNbr;
+    std::vector<int> ghostOf(g.size(), -1);
+    for (int q = 0; q < T.nGhost(); ++q) ghostOf[std::size_t(gcell[q])] = q;
+    T.gfnb.assign(std::size_t(nfn) * gcell.size(), -1);
+    std::vector<int> nfnb(gcell.size(), 0);
     for (int k = 0; k < nz; ++k)
         for (int j = 0; j < ny; ++j)
             for (int i = 0; i < nx; ++i) {
@@ -823,6 +955,9 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                     if (isGhost[nc]) {
                         fcell.push_back(int(c));
                         fdir.push_back(d);
+                        const int q = ghostOf[nc];
+                        assert(q >= 0 && nfnb[q] < ndir);
+                        T.gfnb[std::size_t(nfn) * q + nfnb[q]++] = int(c);
                         // Physical centre of the shared face: the cell centre
                         // stepped half a REFERENCE cell along the axis, then
                         // mapped. On the identity remap this is the Cartesian
@@ -898,6 +1033,9 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::fromTables(
     if (auto e = alloc(out.tw_, 8 * ng); e != hipSuccess) return std::unexpected(e);
     if (auto e = alloc(out.gscale_, ng); e != hipSuccess) return std::unexpected(e);
     if (auto e = alloc(out.gdw_, ng); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.gfnb_, std::size_t(CompGhostTables::kFaceNbr) * ng);
+        e != hipSuccess)
+        return std::unexpected(e);
     if (auto e = alloc(out.uwall_, t.uwall.empty() ? 0 : 3 * ng);
         e != hipSuccess)
         return std::unexpected(e);
@@ -928,7 +1066,8 @@ hipError_t DeviceCompGhost::load(const CompGhostTables& t)
     // whose velocities were dropped would silently freeze the surface.
     if (t.uwall.empty() != (uwall_.data() == nullptr)
         || t.aspan.size() * 3 != t.uwall.size()
-        || t.tnbr.size() != t.gnbr.size() || t.tw.size() != t.gw.size())
+        || t.tnbr.size() != t.gnbr.size() || t.tw.size() != t.gw.size()
+        || t.gfnb.size() != std::size_t(CompGhostTables::kFaceNbr) * t.gcell.size())
         return hipErrorInvalidValue;
     auto put = [](auto& dst, const auto& src) -> hipError_t {
         if (src.empty()) return hipSuccess;
@@ -942,6 +1081,7 @@ hipError_t DeviceCompGhost::load(const CompGhostTables& t)
     if (auto e = put(tw_, t.tw); e != hipSuccess) return e;
     if (auto e = put(gscale_, t.gscale); e != hipSuccess) return e;
     if (auto e = put(gdw_, t.gdw); e != hipSuccess) return e;
+    if (auto e = put(gfnb_, t.gfnb); e != hipSuccess) return e;
     if (auto e = put(uwall_, t.uwall); e != hipSuccess) return e;
     if (auto e = put(aspan_, t.aspan); e != hipSuccess) return e;
     if (auto e = put(deep_, t.deep); e != hipSuccess) return e;
@@ -982,6 +1122,11 @@ void DeviceCompGhost::apply(DeviceCompState& s)
             s.mx.data(), s.my.data(), s.mz.data(), s.E.data());
         checkLastKernel("kGhostFill");
     }
+    // A compensated time march without RANS (--compensated): the overwritten
+    // cells' low words go here. With RANS applyTurb follows and zeroes every
+    // field's, so the steady march keeps its launch sequence.
+    if (s.compensated() && s.nT == 0)
+        zeroLow(s, gcell_.data(), nGhost_, deep_.data(), nDeep_);
 }
 
 void DeviceCompGhost::applyTurb(DeviceCompState& s, RansModel model,
@@ -1005,24 +1150,16 @@ void DeviceCompGhost::applyTurb(DeviceCompState& s, RansModel model,
             s.t[0].data(), t1);
         checkLastKernel("kDeepTurb");
     }
-    if (!s.compensated()) return;
-    LowWords L{{}, 5 + s.nT};
-    for (int f = 0; f < 5; ++f) L.lo[f] = s.lo[f].data();
-    for (int i = 0; i < s.nT; ++i) L.lo[5 + i] = s.tlo[i].data();
-    if (nGhost_ > 0)
-        kZeroLow<<<launchBlocks(nGhost_), blockSize>>>(gcell_.data(), nGhost_,
-                                                       L);
-    if (nDeep_ > 0)
-        kZeroLow<<<launchBlocks(nDeep_), blockSize>>>(deep_.data(), nDeep_, L);
-    checkLastKernel("kZeroLow");
+    if (s.compensated())
+        zeroLow(s, gcell_.data(), nGhost_, deep_.data(), nDeep_);
 }
 
 void DeviceCompGhost::mirrorMut(Real* nut, Real* f1) const
 {
     if (nGhost_ > 0) {
         kGhostMut<<<launchBlocks(nGhost_), blockSize>>>(
-            gcell_.data(), gnbr_.data(), gw_.data(), gscale_.data(), nGhost_,
-            nut, f1);
+            gcell_.data(), gnbr_.data(), gw_.data(), gscale_.data(),
+            gfnb_.data(), nGhost_, nut, f1);
         checkLastKernel("kGhostMut");
     }
     if (nDeep_ > 0) {
@@ -1051,40 +1188,54 @@ DeviceCompGhost::YPlus DeviceCompGhost::wallYplus(DeviceComp& solver,
     return {mx, sumDouble(facc_.data(), m, red_) / double(m)};
 }
 
-DeviceCompGhost::Force DeviceCompGhost::force(DeviceComp& solver,
-                                              const DeviceCompState& s,
-                                              const std::array<double, 3>& pivot)
+template <bool kSplit>
+bool DeviceCompGhost::stageFlux(DeviceComp& solver, const DeviceCompState& s,
+                                double* acc, double pRef)
 {
-    if (nFace_ == 0) return {};
     solver.primitives(s);
     const PrimView q{s.rho.data(),      solver.u().data(), solver.v().data(),
                      solver.w().data(), solver.e().data(), solver.p().data(),
                      solver.T().data()};
     const MrfView mz = solver.mrfActive() ? solver.mrfView() : MrfView{};
-    // RANS: mu_t of the state (updateMut refreshes primitives too) on the
-    // solver's own curvilinear flux; otherwise null, today's tally.
+    // RANS / LES: mu_t of the state with its wall image (updateMut and
+    // updateSgsNut refresh the primitives too) on the solver's own flux, so
+    // the tally is the budget of the solved equations; otherwise null, the
+    // molecular tally bit for bit.
     const Real* nut = nullptr;
     Real kap = Real(0);
     if (solver.rans()) {
         solver.updateMut(s);
         nut = solver.mut().data();
         kap = solver.eddyKapScale();
+    } else if (solver.les()) {
+        solver.updateSgsNut(s);
+        nut = solver.mut().data();
+        kap = solver.eddyKapScale();
     }
     if (curv_ || solver.rans()) {
         const DeviceCurv* t = solver.curvTables();
         assert(t && "focal ghost force needs the curvilinear DeviceComp");
-        if (!t) return {};
+        if (!t) return false;
         const CurvView cv = t->view();
-        kBodyFluxCurv<<<launchBlocks(nFace_), blockSize>>>(
+        kBodyFluxCurv<kSplit><<<launchBlocks(nFace_), blockSize>>>(
             g_, viscView(solver.transport()), iso_, q, cv, fcell_.data(),
-            fdir_.data(), nFace_, facc_.data(), mz, nut, kap);
+            fdir_.data(), nFace_, acc, mz, nut, kap, pRef);
         checkLastKernel("kBodyFluxCurv");
     } else {
-        kBodyFlux<<<launchBlocks(nFace_), blockSize>>>(
+        kBodyFlux<kSplit><<<launchBlocks(nFace_), blockSize>>>(
             g_, viscView(solver.transport()), iso_, q, fcell_.data(),
-            fdir_.data(), nFace_, facc_.data(), mz, nut, kap);
+            fdir_.data(), nFace_, acc, mz, nut, kap, pRef);
         checkLastKernel("kBodyFlux");
     }
+    return true;
+}
+
+DeviceCompGhost::Force DeviceCompGhost::force(DeviceComp& solver,
+                                              const DeviceCompState& s,
+                                              const std::array<double, 3>& pivot)
+{
+    if (nFace_ == 0) return {};
+    if (!stageFlux<false>(solver, s, facc_.data(), 0.0)) return {};
     kBodyMoment<<<launchBlocks(nFace_), blockSize>>>(
         fpos_.data(), pivot[0], pivot[1], pivot[2], nFace_, facc_.data());
     checkLastKernel("kBodyMoment");
@@ -1096,6 +1247,56 @@ DeviceCompGhost::Force DeviceCompGhost::force(DeviceComp& solver,
         f[c] = sumDouble(facc_.data() + c * m, m, red_);
     return {.fx = f[0], .fy = f[1], .fz = f[2], .heat = f[3],
             .qx = f[4], .qy = f[5], .qz = f[6]};
+}
+
+std::expected<std::vector<DeviceCompGhost::SurfaceFace>, hipError_t>
+DeviceCompGhost::surfaceFaces(DeviceComp& solver, const DeviceCompState& s,
+                              double pRef)
+{
+    std::vector<SurfaceFace> rows;
+    if (nFace_ == 0) return rows;
+    const std::size_t m = std::size_t(nFace_);
+    // Its own scratch, once per run: the split costs nothing on a run that
+    // does not ask for it, and force()'s staging buffer keeps its size.
+    auto acc = DeviceBuffer<double>::make(17 * m);
+    if (!acc) return std::unexpected(acc.error());
+    if (!stageFlux<true>(solver, s, acc->data(), pRef))
+        return std::unexpected(hipErrorInvalidValue);
+    std::vector<double> h(17 * m);
+    std::vector<Real> pos(3 * m);
+    std::vector<int> dir(m);
+    if (auto e = acc->download(h.data()); e != hipSuccess)
+        return std::unexpected(e);
+    if (auto e = hipMemcpy(pos.data(), fpos_.data(), pos.size() * sizeof(Real),
+                           hipMemcpyDeviceToHost);
+        e != hipSuccess)
+        return std::unexpected(e);
+    if (auto e = hipMemcpy(dir.data(), fdir_.data(), dir.size() * sizeof(int),
+                           hipMemcpyDeviceToHost);
+        e != hipSuccess)
+        return std::unexpected(e);
+    rows.resize(m);
+    for (std::size_t t = 0; t < m; ++t) {
+        SurfaceFace& r = rows[t];
+        auto at = [&](int span) { return h[std::size_t(span) * m + t]; };
+        r.axis = dir[t] / 2;
+        r.sign = (dir[t] & 1) ? -1 : 1;
+        r.p = at(7);
+        double a2 = 0.0;
+        for (int c = 0; c < 3; ++c) {
+            r.x[c] = double(pos[3 * t + c]);
+            // + 0.0: a sign times a zero component is -0, which a reader
+            // should not have to see.
+            r.s[c] = at(14 + c) + 0.0;
+            a2 += r.s[c] * r.s[c];
+            r.f[c] = at(c) - pRef * r.s[c];
+            r.fp[c] = at(8 + c) + 0.0;
+            r.fc[c] = at(11 + c);
+            r.fv[c] = r.f[c] - r.fp[c] - r.fc[c];
+        }
+        r.area = std::sqrt(a2);
+    }
+    return rows;
 }
 
 } // namespace dns::gpu

@@ -9,6 +9,10 @@
 //   M4  testSource enters R exactly (one FP32 add) and touches nothing else
 //   M5  laminar --steady: localDt without RANS equals SST's at k == 0 bitwise
 //       (mu_t = 0 there), and the residual/compensated LTS march run at nT 0
+//   M6  an SA-neg cell at chi = -5 takes RansDiffDt's 0.25 sigma/(K a^2),
+//       K = nu + nu~ fn > nu (fn < 0 there)
+//   M7  RansDiffDt stability probe: a T checkerboard under uniform mu_t,
+//       stepped at the bound -- decays in 2D; the 3D growth is printed (open)
 // Seconds.
 #include "dns/comp.hpp"
 #include "dns/config.hpp"
@@ -16,6 +20,7 @@
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_channel.hpp"
 #include "dns/gpu/reductions.hpp"
+#include "dns/rans.hpp"
 #include "dns/rans_channel1d.hpp"
 #include "dns/walldist.hpp"
 #include "check.hpp"
@@ -26,6 +31,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <numbers>
 #include <vector>
 
 using namespace dns;
@@ -290,6 +296,146 @@ void laminarSteady()
           "M5: the laminar fixed point holds under the compensated LTS march");
 }
 
+// A periodic uniform box under RANS, every cell real (no walls: d = 1e3).
+struct BoxRig
+{
+    Grid g{1, 1, 1, 1, 1, 1};
+    std::unique_ptr<CurvMetrics> m;
+    std::unique_ptr<gpu::DeviceComp> dev;
+    std::unique_ptr<gpu::DeviceCompState> ds;
+    std::unique_ptr<gpu::ReduceScratch> red;
+};
+
+std::unique_ptr<BoxRig> makeBox(int n, int nz, RansModel model, double mu)
+{
+    auto r = std::make_unique<BoxRig>();
+    const double L = 2.0 * std::numbers::pi;
+    r->g = Grid::make(n, n, nz, L, L, nz > 1 ? L : 1.0);
+    auto m = CurvMetrics::build(CurvMesh::uniform(r->g));
+    if (!m) return nullptr;
+    r->m = std::make_unique<CurvMetrics>(std::move(*m));
+    auto dev = gpu::DeviceComp::make(*r->m, kGamma, mu);
+    auto ds = gpu::DeviceCompState::make(r->g.size(), ransScalars(model));
+    auto red = gpu::ReduceScratch::make();
+    if (!dev || !ds || !red) return nullptr;
+    r->dev = std::make_unique<gpu::DeviceComp>(std::move(*dev));
+    r->ds = std::make_unique<gpu::DeviceCompState>(std::move(*ds));
+    r->red = std::make_unique<gpu::ReduceScratch>(std::move(*red));
+    gpu::RansSetup rs{.model = model,
+                      .wallDist = std::vector<double>(r->g.size(), 1e3)};
+    if (!r->dev->enableRans(rs)) return nullptr;
+    return r;
+}
+
+// At rest, p = 1/gamma (c = 1), T = T0 (1 + eps (-1)^(i+j+k)) at uniform p,
+// specific scalars phi0, phi1 (SA: nu~ = phi0, phi1 unused).
+void uploadBox(BoxRig& r, double eps, double phi0, double phi1)
+{
+    const double p0 = 1.0 / kGamma, T0 = p0; // rho0 = 1, R = 1
+    auto h = CompState::zeros(r.g);
+    std::vector<double> t0(r.g.size()), t1(r.g.size());
+    for (int k = 0; k < r.g.nz; ++k)
+        for (int j = 0; j < r.g.ny; ++j)
+            for (int i = 0; i < r.g.nx; ++i) {
+                const std::size_t q = r.g.idx(i, j, k);
+                const double s = (i + j + k) % 2 ? -1.0 : 1.0;
+                const double rho = p0 / (T0 * (1.0 + eps * s));
+                h.rho[q] = rho;
+                h.E[q] = p0 / (kGamma - 1.0);
+                t0[q] = rho * phi0;
+                t1[q] = rho * phi1;
+            }
+    (void)r.ds->upload(h);
+    (void)r.ds->uploadTurb(0, t0);
+    if (r.ds->nT > 1) (void)r.ds->uploadTurb(1, t1);
+}
+
+// |sum (-1)^(i+j+k) T| / (N T0): the checkerboard's amplitude.
+double checkerAmp(const BoxRig& r)
+{
+    CompState h = CompState::zeros(r.g);
+    (void)r.ds->download(h);
+    double a = 0;
+    for (int k = 0; k < r.g.nz; ++k)
+        for (int j = 0; j < r.g.ny; ++j)
+            for (int i = 0; i < r.g.nx; ++i) {
+                const std::size_t q = r.g.idx(i, j, k);
+                const double s = (i + j + k) % 2 ? -1.0 : 1.0;
+                const double u2 = (h.mx[q] * h.mx[q] + h.my[q] * h.my[q] +
+                                   h.mz[q] * h.mz[q]) / (h.rho[q] * h.rho[q]);
+                const double p =
+                    (kGamma - 1.0) * (h.E[q] - 0.5 * h.rho[q] * u2);
+                a += s * p / h.rho[q];
+            }
+    return std::abs(a) / (double(r.g.size()) * (1.0 / kGamma));
+}
+
+// M6 (W4 d): an SA-neg cell at chi = -5 has fn < 0, so nu~'s own coefficient
+// K = nu + nu~ fn = 4.87 nu exceeds nu: RansDiffDt's bound is 0.25 sigma /
+// (K a^2), not the old nu-only one.
+void saNegativeDt()
+{
+    const double mu = 1e-3;
+    auto r = makeBox(16, 1, RansModel::SaNeg, mu);
+    if (!r) { check(false, "M6 rig"); return; }
+    uploadBox(*r, 0.0, -5.0 * mu, 0.0); // rho = 1: nu~ = -5 nu
+    const double dt = r->dev->stableDt(*r->ds, *r->red, 1e6);
+    const double a = double(r->g.nx) / (2.0 * std::numbers::pi);
+    const double K = mu + (-5.0 * mu) * saFn(-5.0);
+    const double want = 0.25 * sa::sigma / (K * a * a);
+    std::printf("M6: SA chi -5 dt %.9e, 0.25 sigma/(K a^2) %.9e, old %.9e\n",
+                dt, want, 0.25 * sa::sigma / (mu * a * a));
+    check(std::abs(dt - want) <= 1e-6 * want,
+          "M6: chi = -5 cell: dt = 0.25 sigma/(K a^2), K = nu + nu~ fn");
+}
+
+// M7 (W4 g): the RansDiffDt bound's stability. Uniform mu_t = rho k/omega
+// (at rest S = 0, so the SST limiter is inactive) dominating the acoustic
+// bound, a grid-scale T checkerboard at uniform p, stepped at exactly the
+// RansDiffDt dt (stableDt each step) for 2000 steps. The checkerboard is the
+// stiffest mode of the compact face Laplacian: lambda dt = -4 sum_a a_a^2 *
+// 0.25/amax^2 = -2 (2D) or -3 (3D isotropic), against SSP-RK3's real-axis
+// limit -2.51. f scales the dt taken. Returns the final/initial amplitude.
+double diffDtProbe(int nz, double f = 1.0)
+{
+    const double mu = 1e-3, kSp = 0.1, wSp = 0.1, eps = 1e-3;
+    auto r = makeBox(16, nz, RansModel::Sst2003m, mu);
+    if (!r) { check(false, "M7 rig"); return NAN; }
+    uploadBox(*r, eps, kSp, wSp);
+    const double a0 = checkerAmp(*r);
+    const double h = 2.0 * std::numbers::pi / 16.0;
+    const double dt0 = r->dev->stableDt(*r->ds, *r->red, 0.4);
+    // The host RansDiffDt on the hot (lighter) cell: D = gamma (mu/Pr +
+    // mu_t/Pr_t)/rho with mu_t = rho k/omega, Pr_t = 0.9.
+    const double rhoMin = 1.0 / (1.0 + eps);
+    const double D = kGamma * (mu / 0.72 + rhoMin * kSp / wSp / 0.9) / rhoMin;
+    const double want = 0.25 * h * h / D;
+    bool limited = true;
+    double amax = a0;
+    int tenfold = -1; // first step the amplitude passed 10 a0
+    for (int s = 0; s < 2000; ++s) {
+        const double dt = r->dev->stableDt(*r->ds, *r->red, 0.4);
+        // The diffusive bound alone (acoustic cfl 1e6) is the dt taken.
+        limited = limited && dt == r->dev->stableDt(*r->ds, *r->red, 1e6);
+        r->dev->step(*r->ds, gpu::Real(f * dt));
+        if (s < 200 || s % 100 == 99) {
+            const double a = checkerAmp(*r);
+            if (!(a < 1e30)) { amax = INFINITY; break; }
+            amax = std::max(amax, a);
+            if (tenfold < 0 && a > 10 * a0) tenfold = s + 1;
+        }
+    }
+    const double a1 = checkerAmp(*r);
+    std::printf("M7 %s x%.2f: dt %.6e (host RansDiffDt %.6e, acoustic %.6e), "
+                "checkerboard %.3e -> %.3e (max %.3e, 10x at step %d)\n",
+                nz > 1 ? "3D" : "2D", f, dt0, want, 0.4 * h, a0, a1, amax,
+                tenfold);
+    check(std::abs(dt0 - want) <= 1e-5 * want && limited,
+          std::string("M7 ") + (nz > 1 ? "3D" : "2D") +
+              ": stepped at the RansDiffDt dt, under the acoustic bound");
+    return std::isfinite(a1) ? a1 / a0 : INFINITY;
+}
+
 } // namespace
 
 int main()
@@ -300,5 +446,15 @@ int main()
     guardMask();
     testSourceExact();
     laminarSteady();
+    saNegativeDt();
+    // 2D (lambda dt = -2) decays to the FP32 floor: pinned. 3D isotropic
+    // (lambda dt = -3) GROWS at the bound (measured 2026-10-27: 10x in 4
+    // steps; stable only below 0.84 of it, the predicted 2.51/3) -- an open
+    // issue (issues.md, RansDiffDt), printed here, not pinned: the fix (a
+    // sum_a a_a^2 bound) changes RANS dt bits and is a user decision.
+    const double g2 = diffDtProbe(1), g3 = diffDtProbe(16);
+    std::printf("M7 growth over 2000 steps: 2D %.3e, 3D %.3e (open issue)\n",
+                g2, g3);
+    check(g2 < 1e-3, "M7 2D: the checkerboard decays at the RansDiffDt dt");
     return dnstest::finish();
 }

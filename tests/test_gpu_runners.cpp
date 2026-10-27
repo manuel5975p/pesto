@@ -15,9 +15,10 @@
 // nothing here is quarantine-shaped: exit 0, finite coefficients, a healthy
 // projection where there is one, and enough stats rows to prove the loop ran.
 // A band belongs in the val_* tier, behind the regeneration procedure.
+#include "dns/config.hpp"
+#include "dns/rans_channel1d.hpp"
 #include "validation_util.hpp"
 
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -139,22 +140,32 @@ void testChannel()
 }
 
 // runner_channel's EXPLICIT steady RANS march and its stop rule
-// (dns/steady_stop): exit 0 at TOL 1e-3, with ub where the rule claims.
-// Measured 2026-10-25: stops at 177800 iterations (~28 s), ub 15.8196. ub
-// ALONE would certify at 3400 iterations, 2.8% low (its dip); the companion
-// integrals are what hold the stop off, so the iteration count is checked as
-// well as ub. The FP64 oracle (rans_channel1d, Re_tau 180, ny 64) is 15.8300;
-// the march's own fixed point sits +3.3e-4 above it -- MASS DRIFT: local time
-// stepping conserves sum V rho / lts, not sum V rho, while v != 0, and the
-// steady equations are a one-parameter family in mass (docs/rans.md) -- so
-// the band is TOL plus that offset, rounded up. The scheme is spelled out so
-// a future default flip cannot silently retarget this test.
+// (dns/steady_stop): exit 0 at TOL 1e-3, with ub where the rule claims, on
+// the ny 32, stretch 2.6 grid (the production --steady path: compensated
+// state, geometric stop). Measured 2026-10-27 (gfx1100): stops at 64000
+// iterations (~10 s), ub 15.6855, -0.041% off the FP64 oracle 15.6920 that
+// solveChannel1d computes in process for the SAME case. ub ALONE would
+// certify at 1600 iterations (its early dip; replayed offline through
+// steadyRemaining on the recorded series -- the ny 64 replay reproduces the
+// documented 3400), so the iteration count is checked as well as ub: the
+// floor is half the measured stop, 20x past the dip. The band is TOL plus
+// the fixed point's MASS DRIFT offset (local time stepping conserves
+// sum V rho / lts, not sum V rho, while v != 0; docs/rans.md), as before:
+// 1.5e-3, 3.6x the measured error. The scheme is spelled out so a future
+// default flip cannot silently retarget this test. The implicit march's
+// runner path is gpu_rans_implicit I4/I5/I7.
 void testChannelSteady()
 {
+    dns::Channel1dCase cc;
+    cc.ny = 32;
+    cc.beta = 2.6;
+    const auto oracle = dns::solveChannel1d(cc);
+    check(oracle.has_value(), "runner_channel --steady: the FP64 oracle solves");
+    if (!oracle) return;
     const std::string prefix = "runner_channel_steady";
-    const int rc = runDns("channel --n 4 --nz 1 --ny 64 --rans sa-neg "
-                          "--steady 1e-3 --steady-scheme explicit --out " +
-                          prefix);
+    const int rc = runDns("channel --n 4 --nz 1 --ny 32 --stretch 2.6 "
+                          "--rans sa-neg --steady 1e-3 --steady-scheme "
+                          "explicit --out " + prefix);
     check(rc == 0, "runner_channel --steady 1e-3: converges, exits 0");
     if (rc == 0)
     {
@@ -165,50 +176,15 @@ void testChannelSteady()
             const double it = tbl->col("iter").back(),
                          ub = tbl->col("ubulk").back(),
                          rem = tbl->col("remaining").back();
-            std::printf("  channel steady: iter %.0f ub %.6g remaining %.3g\n",
-                        it, ub, rem);
+            std::printf("  channel steady: iter %.0f ub %.6g (oracle %.7g, "
+                        "%+.3f%%) remaining %.3g\n",
+                        it, ub, oracle->ub, 100 * (ub / oracle->ub - 1), rem);
             check(rem < 1e-3, "runner_channel --steady: last row certifies");
-            check(it > 1e5, "runner_channel --steady: not stopped at ub's "
-                            "early dip");
-            check(std::abs(ub / 15.8300 - 1) < 1.5e-3,
+            check(it > 32000, "runner_channel --steady: not stopped at ub's "
+                              "early dip");
+            check(std::abs(ub / oracle->ub - 1) < 1.5e-3,
                   "runner_channel --steady: ub within TOL of the oracle "
                   "(+ the fixed point's offset)");
-        }
-    }
-    cleanup(prefix);
-}
-
-// The IMPLICIT steady march (--steady-scheme implicit, docs/rans.md): the
-// Newton line solve, mass pinned, so it lands ON the oracle (15.8299695),
-// not on the explicit march's drifted fixed point. Measured 2026-10-25: 27
-// iterations, ub 15.8299691, 0.1 s.
-void testChannelSteadyImplicit()
-{
-    const std::string prefix = "runner_channel_steady_implicit";
-    const auto t0 = std::chrono::steady_clock::now();
-    const int rc = runDns("channel --n 4 --nz 1 --ny 64 --rans sa-neg "
-                          "--steady 1e-4 --steady-scheme implicit --out " +
-                          prefix);
-    const double secs = std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - t0).count();
-    check(rc == 0, "runner_channel --steady-scheme implicit: converges, exits 0");
-    if (rc == 0)
-    {
-        const auto tbl = valtest::loadCsv(prefix + "_stats.csv");
-        check(tbl.has_value(), "runner_channel implicit: stats readable");
-        if (tbl)
-        {
-            const double it = tbl->col("iter").back(),
-                         ub = tbl->col("ubulk").back(),
-                         rem = tbl->col("remaining").back();
-            std::printf("  channel steady implicit: iter %.0f ub %.6g remaining "
-                        "%.3g, %.2f s\n",
-                        it, ub, rem, secs);
-            check(rem < 1e-4, "runner_channel implicit: last row certifies");
-            check(it <= 60, "runner_channel implicit: <= 60 iterations");
-            check(std::abs(ub / 15.82997 - 1) < 1e-5,
-                  "runner_channel implicit: ub within 1e-5 of the oracle");
-            check(secs < 2.0, "runner_channel implicit: < 2 s");
         }
     }
     cleanup(prefix);
@@ -390,6 +366,33 @@ void testImmersedRansUrans()
     cleanup(sst);
 }
 
+// runner_comp LES on the immersed ghost wall with --emit surface: the
+// surface artefact carries the LES label, not DNS (only a RANS run sets
+// the runner's label, so the table must form the LES one itself).
+void testImmersedLesSurface()
+{
+    const std::string prefix = "runner_comp_les_surface";
+    const int rc = runDns("flow --physics compressible --body cylinder --nz 1 "
+                          "--n 128 --re 1000 --les 0.17 --ft 0.05 "
+                          "--emit stats --emit surface --out " + prefix);
+    check(rc == 0, "runner_comp --les (immersed) --emit surface: exits 0");
+    if (rc == 0)
+    {
+        std::ifstream f(prefix + "_surface.csv");
+        std::string head;
+        std::getline(f, head);
+        const std::string want =
+            "# " + dns::lesRunLabel(dns::SgsModel::Smagorinsky, 0.17, true) +
+            " | immersed ghost wall";
+        std::printf("  les surface header: %s\n", head.c_str());
+        check(head.starts_with(want),
+              "runner_comp LES: the surface header carries the LES label");
+    }
+    cleanup(prefix);
+    std::error_code ec;
+    std::filesystem::remove(prefix + "_surface.csv", ec);
+}
+
 } // namespace
 
 int main()
@@ -405,11 +408,11 @@ int main()
     testCompNscbc();
     testChannel();
     testChannelSteady();
-    testChannelSteadyImplicit();
     testOGridRansUrans();
     testOGridRansSteadyCap();
     testWedgeArtefacts();
     testOGridNk();
     testImmersedRansUrans();
+    testImmersedLesSurface();
     return dnstest::finish();
 }

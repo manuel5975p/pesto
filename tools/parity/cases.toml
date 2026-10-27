@@ -1,0 +1,199 @@
+# dns vs OpenFOAM parity suite -- the ONE case spec (tools/parity/DESIGN.md).
+# Units: time caps in convective units L/U (L = D; section: chord c).
+# dns levels: --ny (box height cells); rotor: [ny, focal ratio, focal blend].
+# foam levels: cylinder [NQ cells/quarter, NR radial]; section [cells per
+# O-ring square half-side, n radial, first cell / c]; rotor [cells/D, Lmin,
+# Lmax, Lzone, Lwake].
+# est_*: calibrated wall-time estimates (s) per level (to the cap), used by
+# `run` to refuse a run over budget.
+# u_scheme: foam div(phi,U), "linear" (central: the CLAUDE.md parity rule) or
+# "linearUpwind". u_scheme_note: printed with every row of the case.
+# Tiers: A rhoPimpleFoam (same method), B simpleFoam (steady, M -> 0 leg),
+# Bc rhoSimpleFoam (steady at the dns Mach); dns_scored_in: the tier whose
+# foam reference scores dns (default: every tier with dns rows).
+
+[suite]
+lock = "/tmp/claude-1000/-home-manuel-Documents-pesto/a7e9ad49-6f98-4680-9776-0517d830eefd/scratchpad/gpu.lock"
+foam_bashrc = "/opt/OpenFOAM/OpenFOAM-v2606/etc/bashrc"
+np = 6
+np_scaling = 12
+run_cap_s = 600
+ref_cap_s = 3600
+suite_cap_s = 7200
+settle_tol = 1e-3
+prandtl = 0.72          # dns --prandtl default
+
+[cases.cyl40]
+kind = "cylinder"
+u_scheme = "linearUpwind"
+u_scheme_note = "linearUpwind, stale: regenerate before citing"
+re = 40
+mach = 0.2
+b_mach = 0.1            # tier B dns mode: compressible ghost wall at M 0.1
+regime = "steady"
+observables = ["cd", "Lw"]
+tiers = ["A", "B"]
+dr = 16                 # dns --dr: 16 D x 16 D box, free-slip y walls, NSCBC x
+aspect = 1.0
+ramp = 2.0              # dns --ramp default (box time)
+kick = 0.05             # dns --kick default
+t_cap = 80.0
+lw_every = 1.0
+b_lw_every = 50
+dns_levels = [256, 362, 512]
+foam_levels = [[24, 30], [34, 42], [48, 60]]
+foam_ref = [96, 120]
+b_iters = [800, 1500, 2500]
+b_iters_ref = 6000
+b_simple = { consistent = "yes", p = 1, U = 0.9 }
+
+[cases.cyl100]
+kind = "cylinder"
+u_scheme = "linearUpwind"
+u_scheme_note = "linearUpwind, stale: regenerate before citing"
+re = 100
+mach = 0.2
+regime = "periodic"
+observables = ["St", "cd", "cl_rms"]
+tiers = ["A"]
+dr = 16
+aspect = 1.0
+ramp = 2.0
+kick = 0.05
+t_cap = 200.0
+dns_levels = [256, 362, 512]
+foam_levels = [[24, 30], [34, 42], [48, 60]]
+foam_ref = [96, 120]
+
+[cases.sect]
+kind = "section"
+u_scheme = "linearUpwind"
+u_scheme_note = "linearUpwind, stale: regenerate before citing"
+re = 93.1408            # Re_c (dns --re = 2 Re_c: its D is the STL z extent 2 c)
+mach = 0.3183           # section relative Mach W/c
+b_mach = 0.1
+b_t_cap = 100.0         # tier B dns (M 0.1: 2.6x the steps of M 0.318)
+foam_maxco = 0.5        # Co 1 diverges (SIGFPE in the p solve) at t = 0.004 c/U on L3
+aoa = 3.78
+thickness = 0.55
+crest = 0.35
+regime = "steady"
+observables = ["cd", "cl"]
+scale_by = { cl = "cd" }   # cl ~ 0.01: tolerance and error on the cd scale
+tiers = ["A", "B"]
+dr = 8.01               # 16 c x 24 c box, body 8 c from the inlet (L3)
+aspect = 1.5
+ramp = 2.0
+kick = 0.05
+t_cap = 150.0
+dns_levels = [308, 436, 615]
+foam_levels = [[12, 30, 0.008], [17, 42, 0.005657], [24, 60, 0.004]]
+foam_ref = [34, 85, 0.002828]
+b_iters = [3000, 5000, 8000]
+b_iters_ref = 16000
+b_simple = { consistent = "no", p = 0.3, U = 0.7 }
+
+[cases.rotor]
+kind = "rotor"
+re = 220                # Re_D on the freestream
+J = 0.63
+tip_mach = 0.41
+mach = 0.082219         # freestream = J tip_mach / pi
+blade = ["--blades", "1", "--root-chord", "0.30", "--tip-chord", "0.20", "--thickness", "0.35"]
+regime = "steady"
+observables = ["CT", "CQ"]
+tiers = ["A", "B", "Bc"]
+b_dns = "reuse_A"       # tiers B and Bc re-score the tier A dns runs
+dns_scored_in = "Bc"    # dns is compressible: scored against rhoSimpleFoam; B = M -> 0 leg
+u_scheme = "linear"     # central U (CLAUDE.md parity rule); pre-W5 rotor runs were linearUpwind
+foam_maxco = 5.0
+foam_nouter = 2
+dr = 6
+aspect = 1.5            # 9 D x 6 D x 6 D, shaft 3.0 D from the inlet (dns lx/3 placement)
+ramp = 2.0
+kick = 0.0
+t_cap = 4.5             # CT at 4.6 D/U is within 0.5% of its 9 D/U value (W5 audit)
+dns_levels = [[140, 8, 1], [200, 8, 1], [280, 8, 1]]
+foam_levels = [[5.657, 4, 4, 2, 1], [4, 5, 5, 3, 2], [5.657, 5, 5, 3, 2]]
+foam_ref = [4, 6, 6, 4, 3]
+ref_fallback_finest = true   # no central foam_ref run yet: score against the finest ladder level
+# measured at 80f147f: L1 dns 4.1 M cells 9.26 ms/step, 14.1 k steps / 4.58 D/U
+# (131 s + setup); L2/L3 = the 9 D/U estimates halved
+est_dns_A = [140, 550, 2100]
+zone_r = 0.62           # foam MRF zone = dns' blended zone at f = 1/2 (80f147f run log:
+zone_margin = 0.12      # f=1 to r 0.555 D, 0 past 0.705 D; axial 0.169/0.319 D)
+wake_len = 2.0
+b_iters = [800, 800, 800]
+b_iters_ref = 1500
+b_simple = { consistent = "yes", p = 1, U = 0.7 }
+bc_iters = [1500, 1500, 1500]
+# SIMPLEC (consistent yes, p 1) limit-cycles on L3 (U residual stuck at 0.04,
+# CT swinging -0.007..-0.09; also at U = e = 0.5); classic SIMPLE converges (W5)
+bc_simple = { consistent = "no", p = 0.3, U = 0.7, e = 0.7 }
+# printed under the case in report.md (W5, 2026-10-27)
+notes = [
+  "U scheme: every pre-W5 rotor foam row was linearUpwind and is retired (`*_stale`); linearUpwind put foam's own L1 CT 22% above its reference, central L1 is 5% off and L2/L3 agree to 0.1%.",
+  "dns is scored against tier Bc (rhoSimpleFoam, freestream M 0.0822, tip 0.41): Bc/B - 1 = +4.2% CT, +1.5% CQ at L3, so tier B is the M -> 0 leg only.",
+  "Tier Bc runs classic SIMPLE (consistent no, p 0.3, U 0.7, e 0.7, transonic no). SIMPLEC (consistent yes, p 1) limit-cycles on L3 (U residual stuck at 0.04, CT -0.007..-0.09; U = e = 0.5 does not cure it); on L1/L2 both give the same converged CT/CQ to 6 digits.",
+  "dns L1 is the adopted 80f147f W5-audit run (4.58 D/U, --ft 0.2264): timing = steps x ms/step from its log, setup not measured; grid from the same-argv dry run of the retired L1. dns L2/L3 are not regenerated (~550 / 2100 s at 4.5 D/U, over the 300 s run cap).",
+  "MRF zone sensitivity exceeds 2% in CT: the sharp foam zone moved across dns' blend band (0.555 D = dns f = 1, 0.705 D = f = 0), refinement fixed, moves CT +16.2% / -9.4% and CQ -2.6% / +1.1%. The single-blade frozen rotor is not zone-independent, but the shift is smaller than the dns gap (+28.2% vs Bc, +33.6% vs B): with the foam zone at dns' f = 1 radius (largest foam CT) dns L1 is still +15.1% above simpleFoam L2 (about +10.6% est. vs Bc), so at least about half of the CT gap is not the zone and needs attribution (W6). Cell counts differ (96k / 103k / 113k, surface-refinement buffer); L2 -> L3 moves CT 0.1% for scale.",
+  "Every cached rotor mesh fails one checkMesh test (1-2 faces of skewness 5-6); used as before.",
+  "W6 split (2026-10-27, dns L1 re-run at 4.5 D/U with --emit surface: CT -0.02390, the adopted run's mean -0.02392): the CT gap vs Bc (-0.00525) is the BLADE's (+112%; hub -12%, dns hub -0.00843 vs foam -0.00905). CQ -0.40% vs Bc is a cancellation: the convective wall flux (zero on a real wall) is +9.8% of CQ, and without it dns CQ is -10.2%.",
+]
+
+# The routine MRF ladder that fits the 300 s run cap (W7): a wider two-blade
+# rotor, so c/h and t/h are resolved at a third of rotor's cells. Same flow
+# (J, Re_D, tip Mach, box) as `rotor`; only the blade differs.
+[cases.rotor2]
+kind = "rotor"
+re = 220
+J = 0.63
+tip_mach = 0.41
+mach = 0.082219
+blade = ["--blades", "2", "--root-chord", "0.40", "--tip-chord", "0.30", "--thickness", "0.35", "--pitch", "1.0"]
+regime = "steady"
+observables = ["CT", "CQ"]
+tiers = ["A", "B", "Bc"]
+b_dns = "reuse_A"
+dns_scored_in = "Bc"
+# parity verdict (report.py dns_ladder), fixed BEFORE measuring (W7): the
+# finest dns level, or its Richardson value when the ladder is monotone,
+# within these of foam Bc. Never widen after measuring.
+parity_bands = { CT = 0.05, CQ = 0.02 }
+u_scheme = "linear"
+foam_maxco = 5.0
+foam_nouter = 2
+dr = 6
+aspect = 1.5
+ramp = 2.0
+kick = 0.0
+t_cap = 4.5
+# L3 was planned as ny 170 (7.37 M cells, est ~300 s: over the 280 s target);
+# 164 is the largest ratio-8 grid under it (W7)
+dns_levels = [[100, 5, 1], [132, 7, 1], [164, 8, 1]]
+foam_levels = [[5.657, 4, 4, 2, 1], [4, 5, 5, 3, 2], [5.657, 5, 5, 3, 2]]
+foam_ref = [4, 6, 6, 4, 3]
+ref_fallback_finest = true
+# measured at W7 (gfx1100): L1 1.50 M cells 34.9 s, L2 3.45 M 112.7 s; L3 6.62 M
+# estimated from L2's loop rate (1.98 ns/cell/step) + setup scaled by cells
+est_dns_A = [35, 113, 265]
+# foam zone = dns' blended zone at f = 1/2 on the FINEST dns level (W7 L3 log:
+# f=1 to r 0.554 D, 0 past 0.704 D; axial 0.222/0.372 D, blade half 0.1665 D).
+# dns' zone margins are max(fraction of D, cells of h_fine), so its zone
+# SHRINKS with refinement: f = 1/2 at 0.694 / 0.646 / 0.629 D on L1/L2/L3.
+zone_r = 0.629
+zone_margin = 0.130
+wake_len = 2.0
+b_iters = [800, 800, 800]
+b_iters_ref = 1500
+b_simple = { consistent = "yes", p = 1, U = 0.7 }
+bc_iters = [1500, 1500, 1500]
+bc_simple = { consistent = "no", p = 0.3, U = 0.7, e = 0.7 }
+notes = [
+  "W7 (2026-10-27): dns ladder D/h_fine,x 39.1 / 58.5 / 74.9, BL 2.6 / 3.9 / 5.0 cells, deep-solid cells 12 / 283 / 1209. L1 is the gpu_mrf_rotor2 grid (pinned there at 1 D/U).",
+  "Settling at 4.5 D/U: over the last 1 D/U the dns CT mean moves <= 1% and oscillates +-2.6% (L3); CQ +-0.2%. The 1e-3 settle rule is not met at any level (t_settle = the cap).",
+  "dns' MRF zone margins are max(fraction of D, cells of h_fine), so the dns zone shrinks with refinement (f = 1/2 at 0.694 / 0.646 / 0.629 D). foam's zone is set to L3's. Moving foam's zone from L3's to L1's radius (B L2, zone 0.694 D) moves CT -5.5% and CQ +0.6%: the zone drift is a <= 6% CT / < 1% CQ confound on the dns ladder, far below its CT spread (+80% L1 -> L3).",
+  "foam L2/L3: CT 3.2% (Bc) / 3.7% (B) apart, CQ 0.4% / 0.5%; CT Richardson order 4.7 (outside the report's [0.5, 4] window, so the fine level is the CT reference; its Richardson value is 0.8% below L3). Bc/B - 1 at L3: CT +18.4%, CQ +1.0%.",
+  "Every rotor2 foam mesh fails one checkMesh test (3-9 faces of skewness 7-18); used as is.",
+  "W6 split (2026-10-27, split table above): the CT gap is the BLADE's on every level (106 / 114 / 109% of it; the dns hub CT is 22 / 21 / 11% smaller than foam's: less drag). The verdict stays NOT AT PARITY. CQ's apparent approach to foam (+9.5 / +1.2 / -1.9%) is a convective momentum flux through the moving staircase wall (zero on a real wall; 24 / 9.4 / 6.7% of CQ, decaying between first and second order: observed order 2.3 from L1 to L2, 1.4 from L2 to L3): CQ - CQ_c is -14.6 / -8.2 / -8.6%, flat over L2 and L3, so the total CQ is expected to tend to about -8.5% as CQ_c goes to 0 (an extrapolation; the measured L3 figure is -1.9%).",
+]

@@ -76,7 +76,7 @@ confinement excess plus margin. The tight literature claims live at dr = 16
 
 Measured on gfx1100, 2026-07-17. "runtime" = full ctest wall time.
 
-### Tier A (default; total ~163 s GPU)
+### Tier A (default; total ~190 s GPU)
 
 | test | truth source | expected | asserted | why this tolerance | runtime |
 |------|--------------|----------|----------|--------------------|---------|
@@ -84,6 +84,7 @@ Measured on gfx1100, 2026-07-17. "runtime" = full ctest wall time.
 | `val_cyl_re60` | Williamson (1988) St(60) = 0.1358; Tritton/Henderson cd floor 1.42 | St 0.1521, cd 1.818 | St in [0.130, 0.156]; cd in [1.42, 1.90]; cl_rms > 0.01; >= 5 periods | ceiling +15% per the confinement table above (measured +12%); floor -4% discretization; run-to-run repeat was bit-identical | 87 s |
 | `val_cyl_re100` | Williamson (1988) St = 0.164; Henderson cd 1.33-1.35 | St 0.1963, cd 1.730 | St in [0.157, 0.205]; cd in [1.33, 1.82] | ceilings +25%/+35% per the confinement table (measured +20%/+29%, excess grows with Re); floors = unbounded values | 69 s |
 | `val_tgv3d_64` | anchor: repo curve `ours_tgv64.csv`; literature: 512^3 spectral reference `spectral_Re1600_512.gdiag` (dissipation peak 0.01286 at t = 8.97) | K/eps curves; peak 0.01182 at t = 8.34 (-8.1%) | curves within 2e-3 / 2e-2; peak time [8.0, 10.0]; value [-40%, +5%] | same binary => near-bitwise vs own curve (measured 6.6e-6 / 1.0e-5; slack for compiler/ROCm drift); 64^3 under-resolves the peak => trend band only, tight claim at 128^3 | 0.3 s |
+| `val_ogrid_cyl` (2026-10-27, gfx1100) | (a) Williamson (1988) St(100) 0.164-0.166, 2D DNS cd 1.33-1.40, cl' 0.32-0.34; (b) Dennis & Chang (1970) cd(40) 1.522 | (a) 192x96 `--ogrid-trip 0.05`, window t [82, 121.4] (7 periods, scatter 2e-4): St 0.1679, cd 1.3800, cl' 0.3333; (b) 256x96 `--steady 1e-4`: cd 1.56656 (exit 0, 31200 it), offset-corrected 1.5089 | (a) St in [0.160, 0.172], cd in [1.33, 1.42], cl' in [0.30, 0.36], >= 6 periods, first/last-period cl' within 2%; (b) cd / 1.0382 within 2% of 1.522, cd within 1e-3 of 1.56656 | (a) the masterplan's bands, set before measuring; body-fitted wall, 20 D far row, 15.7 cells in D/sqrt(Re): St +1.2..2.2%, no blockage excess to admit; (b) 1.0382 = the MEASURED M 0.2 / 20 D factor ("O-grid cylinder" below), 2% = the literature spread (Fornberg 1.498); the 1e-3 pin is 25x the run's cd jitter (3.6e-5) | 27 s |
 | `val_comp_cyl_re60` | anchor only (comp cd has no clean unbounded literature value at this confinement) | cd 1.9441 (dead steady: flat to 1.5e-5 in the window, repeat run bit-identical); cd_comp - cd_incomp = +0.1255 | cd vs `comp_re60_n256_cd` +-1%; cd_comp - cd_incomp in [0.06, 0.20] | anchors regenerated 2026-07-29, so the test runs; the offset band is the measured value +-50% and is a CROSS-BRANCH check, not an M^2 correction (adjustment 6 below) | 21 s |
 
 ### Tier B (`-DDNS_HEAVY_VALIDATION=ON`; total 1362 s GPU)
@@ -100,7 +101,8 @@ Measured on gfx1100, 2026-07-17. "runtime" = full ctest wall time.
 TGV dissipation-peak convergence (repo curves vs spectral 0.012858 at t = 8.97):
 64^3 0.011820 (-8.1%), 128^3 0.013580 (+5.6%), 256^3 0.012298 (-4.3%),
 512^3 0.013010 (+1.2%) -- oscillatory, not monotone from below.
-| `hit_mini` (extended, CPU, label `slow;validation;literature`, not `heavy`) | Kolmogorov constant ~1.5 (Pope 2000), corrected by Pope's model spectrum for this resolution | C = 0.942 (8 samples) | C = <E(k) k^(5/3) eps^(-2/3)>, k in [4,10], in [0.7, 1.6] | at 64^3 with h = 1.5 eta the band reaches k*eta = 0.26..0.65 (dissipation rolloff): the model spectrum (C = 1.5, beta = 5.2, c_eta = 0.4, f_L for L = k^1.5/eps) predicts a band mean of 0.78; bottleneck lifts the measured value to ~0.94. Band = [0.9x, 2x] model | 45 s |
+| `hit_mini` (extended, CPU, label `slow;validation;literature;les`, not `heavy`) | Kolmogorov constant ~1.5 (Pope 2000), corrected by Pope's model spectrum for this resolution | C = 0.938 (8 samples, 3 + 3 Te; 0.942 at the former 6 + 6) | C = <E(k) k^(5/3) eps^(-2/3)>, k in [4,10], in [0.7, 1.6] | at 64^3 with h = 1.5 eta the band reaches k*eta = 0.26..0.65 (dissipation rolloff): the model spectrum (C = 1.5, beta = 5.2, c_eta = 0.4, f_L for L = k^1.5/eps) predicts a band mean of 0.78; bottleneck lifts the measured value to ~0.94. Band = [0.9x, 2x] model | ~22 s |
+| `gpu_hit_mini` (GPU twin through `dns hit`, FP32, labels `les;fast`) | as `hit_mini` | C = 0.947 (24 spectra, 6 + 6 Te, seed 7); eps/eps_f 0.978, u' 0.972, maxDiv 8.5e-6 | the same eps / u' / C bands; maxDiv < 1e-4 (FP32) | same case as the CPU test, the binary's own forcing and averaging; eps_f, T_e recomputed in box units by the test | ~2 s |
 
 ### RANS channel vs MKM (a MODEL vs DNS comparison; `rans_channel1d`)
 
@@ -110,17 +112,33 @@ the oracle (`gpu_rans`) rather than to MKM. Truth: MKM `chan180.means` /
 `chan395.means`, ub⁺ by trapezoid over the published profile (15.679 at
 Re_τ 178.12, 17.545 at 392.24; the headers carry no Re_b).
 
-| closure | Re_τ 178.12, ny 64 | Re_τ 392.24, ny 96 | asserted |
-|---|---|---|---|
-| SA-neg | 15.8069 (+0.82%) | 17.5596 (+0.08%) | within 5% (provisional ceiling); own value pinned 1e-6 |
-| SST-2003m | 15.6332 (−0.29%) | 17.8881 (+1.96%) | same |
-| SST-Vm | 15.5986 (−0.51%) | 17.8455 (+1.71%) | same |
+| closure | Re_τ 178.12, ny 64 | continuum | Re_τ 392.24, ny 96 | continuum | asserted |
+|---|---|---|---|---|---|
+| SA-neg | 15.8069 (+0.82%) | 15.8403 (+1.03%) | 17.5596 (+0.08%) | 17.6226 (+0.44%) | within 5% (provisional ceiling); own value pinned 1e-6 |
+| SST-2003m | 15.6332 (−0.29%) | 15.1289 (−3.51%) | 17.8881 (+1.96%) | 17.2213 (−1.84%) | same |
+| SST-Vm | 15.5986 (−0.51%) | 15.0941 (−3.73%) | 17.8455 (+1.71%) | 17.1785 (−2.09%) | same |
 
-SA-neg is grid-converged at these resolutions to ~0.2% (2nd order). SST is
-FIRST order in ny (the TMR wall ω moves with the first cell): its limit is
-15.13 (−3.5%) at Re_τ 178.12, so the ny-64 agreement is partly grid error —
-cite the limit. The 5% band is a ceiling on model error, not a calibration;
-a DNS grounder on this solver (docs/channel.md) has not been run.
+"continuum" = the Richardson limit of ny 192/384/768 (stretch 2,
+2026-10-27); THE MODEL-vs-DNS NUMBERS TO CITE. SA-neg is 2nd order and its
+test grids are within 0.2–0.4% of the limit. SST is FIRST order in ny (the
+TMR wall ω = 60ν/(β1 d1²) moves with the first cell; ladder pinned in
+`rans_channel1d`, docs/rans.md "The FP64 oracle"): at the test grids the
+wall-ω error (+3.3% at ny 64, +3.9% at ny 96) has the opposite sign to the
+model's, so the "SST agrees with MKM to 0.3–2%" reading of the first table
+columns is retracted: SST-2003m is −3.5% / −1.8% below MKM, SST-Vm −3.7% /
+−2.1%. The 5% band is a ceiling on model error, not a calibration; a DNS
+grounder on this solver (docs/channel.md) has not been run.
+
+### RANS channel vs CFL3D (code to code; `rans_channel1d` O5)
+
+SA-neg against NASA TMR's CFL3D SA solution of the 2D fully-developed
+channel (2DFDC, file `sa_u+y+KM_cfl3d.dat`), oracle at Re_τ 1e5, ny 1024,
+stretch 5: u⁺ at y⁺ 30/100/300/1000 is +0.73..+0.77% raw and
+−0.44..−0.48% after removing the file's own sublayer slope 0.988 (u⁺/y⁺ ≠ 1
+in its sublayer: a ~0.6% u_τ offset in its wall units); flat (spread 0.04%)
+and grid-independent (ny 512 / 2048 within 0.06%). Asserted: normalized ≤
+0.75%, raw ≤ 1.2%, spread ≤ 0.1%. The GPU binary equals the oracle there to
+2.5e-8 in ub (`gpu_rans_implicit` I5b). Table in docs/rans.md.
 
 The planned `val_rans_channel` (CLI cold start `--steady TOL` → exit 0) is NOT
 in ctest: the FP32 steady march cannot reach any TOL that certifies the mean
@@ -198,8 +216,12 @@ OpenFOAM SIMPLE converges with it on every case below (settled to 1e-4 in
 | SST-2003m L1 Re 1e4 | 0.39964 / 87.18° / 1.2578 D | 0.43000 / 87.53° / 0.9095 D | no steady state (closure-independent at L1, issues.md 1) |
 | SST-2003m L1 Re 3e3 | -- | 0.43739 / 93.54° / 0.9530 D | M 0.2 0.44261 at the 2e5 cap (remaining 1.7e-4), θ_s 93.00°, L_r 1.0139 D |
 | SST-2003m L1 Re 1e3 | 0.47129 / 100.02° / 1.4890 D | 0.48872 / 100.77° / 1.0674 D | **cd0 0.49070: +0.41%** (M 0.2 0.49851 exit 0 in 114600 it / 28 s; M 0.1 0.49265 settled, exit 8 by the M 0.1 floor); θ_s 100.30° / 100.51°; L_r 1.1656 / 1.1498 D (+7.7% at M 0.1) |
+| SA L1 Re 1e3 (2026-10-27) | -- | 0.48419 / 100.24° / 1.1407 D (3000 it, settled 1e-4 in 327, 13 s) | **cd0 0.47901: −1.07%** (M 0.2 0.48541 exit 0 in 136600 it / 29 s; M 0.1 0.48061 settled, exit 8 by the M 0.1 floor); θ_s 99.50° / 99.68°; L_r 1.2691 / 1.2391 D (cd0-extrap 1.2291: +7.8%) |
 
-The SST-2003m L1 Re 1e3 row is the small gate `gpu_sst` (b). The
+The SST-2003m L1 Re 1e3 row is the small gate `gpu_sst` (b); the SA row is
+`gpu_sa_wedge`, which pins the dns state and PRINTS the OpenFOAM comparison
+without gating it: −1.07% is outside the 1% the masterplan (W13) set for that
+gate before measuring (issues.md 21). The
 "OpenFOAM SST near-wake k 2.3× below dns" seen against linearUpwind is the
 scheme: with central U the two agree within 10–30% near the body. A parity
 number names the U scheme from now on; the SA row's +1.16% above stands
@@ -214,6 +236,109 @@ MEAN, labelled `RANS SST-2003m -- URANS (time-accurate)`: tier A at M 0.2
 0.4115 vs OpenFOAM central 0.40589 = +1.4% (the M 0.1 URANS leg for tier B,
 ~22 min, not run). The coarse wedges' exit 8 (issues.md 1) is accepted as
 the honest outcome: the only cure measured is dissipation.
+
+### O-grid cylinder: literature (`val_ogrid_cyl`) and the Re 40 offset (W12)
+
+`dns flow --physics compressible --body cylinder --ogrid --mach 0.2`, far row
+20 D (default β 3), gfx1100, 2026-10-27. **Re 100** (192×96, h1 = D/157,
+15.7 cells in D/√Re, `--ogrid-trip 0.05`, the run to t 121.4 box = 155 D/U
+in 21 s): St 0.1679, cd 1.3800, cl' 0.3333 over t ∈ [82, 121.4] (7 periods,
+period scatter 2e-4); against Williamson's St 0.164-0.166 that is +1.2..2.2%,
+inside the masterplan's bands (set before measuring). The envelope is within
+0.5% of its limit from t ≈ 80 (issues.md 16: 99% at 71.6).
+
+**Re 40 steady** (explicit `--steady 1e-4`, every run exit 0), the offset
+the test removes before reading Dennis & Chang:
+
+| study | runs | cd | reading |
+|---|---|---|---|
+| grid, 20 D, M 0.2 | 192×72 / **256×96** / 384×144 | 1.5663 / **1.56656** / 1.5668 | converged (0.03%) |
+| Mach, 256×96, 20 D | M 0.2 / 0.1 / 0.05 | 1.5666 / 1.5580 / 1.5579 | M 0.2 is +0.55% over M → 0 |
+| far row, M 0.2, h1 matched (≈ 5e-3 box) | 20 D / 40 D (ny 124, β 3.25) / 80 D (ny 150, β 3.55) | 1.5666 / 1.5354 / 1.5240 | Richardson order 1.45, R → ∞ 1.5174 |
+
+So cd(20 D, M 0.2) = 1.0382 × cd(R → ∞, M → 0) = 1.0382 × 1.5090, and
+1.5090 is −0.86% from Dennis & Chang 1.522 (Fornberg 1.498: +0.7%). The
+20 D far row is a +3.3% blockage on cd at Re 40, the largest of the three
+offsets; the test gates the corrected value at 2% (the literature spread) and
+pins the raw 1.56656 at 1e-3. Runs: 2-9 s each.
+
+### O-grid cylinder URANS shedding vs OpenFOAM (`ocyl1e4`, identical mesh, W12)
+
+Code to code, same method (tier A): dns `flow --physics compressible --body
+cylinder --ogrid --n 256 --ny 96 --ogrid-beta 4 --ogrid-far 20 --re 1e4
+--mach 0.2 --ogrid-trip 0.05 --rans sst-2003m|sa-neg --compensated --ft 1.6`
+(66.5 D/U including the ramp; labels `RANS SST-2003m -- URANS
+(time-accurate) [O-grid trip 0.05 U]`, `RANS SA-neg -- URANS ...`), against
+OpenFOAM v2606 `rhoPimpleFoam` `kOmegaSST` / `SpalartAllmaras { ft2 true }`
+(Prt 0.9 both, TMR inflow k = 2.25e-7 U², μt/μ 0.009, ν̃ = 3ν; wall ω =
+60ν/(β1 d1²) from dns's d1) ON THE dns MESH (`tools/parity/dnsmesh.py`'s 2D
+O-grid layout, `checkMesh` OK, non-orthogonality 1.7e-6°). OpenFOAM: backward
+in time, central `Gauss linear` U, maxCo 0.5, PIMPLE nOuter 2, 6 MPI ranks
+(wall distance meshWave: exactDistance fails in parallel), impulsive start
+from the freestream plus dns's trip vortex at the same cell centres;
+`tools/parity/ocyl1e4.py case|run|read|dns`. Both read by the same
+`stats()`: the window starts at the first period after which the per-period
+cl swing changes < 2% between consecutive periods for good (≥ 4 periods, else
+"not saturated"); values are batch means over whole periods, SE = std /
+√n. y⁺ max 0.93-1.12 (dns), 0 SST guard hits; OpenFOAM bounds k ≥ 0 every
+step (min 0) and ν̃ ≥ 0 (SA-neg does not).
+
+| | dns window (periods) | OpenFOAM window | cd | cl_rms | St | cl swing |
+|---|---|---|---|---|---|---|
+| SST-2003m dns | 27.7-62.3 D/U (8) | | 1.6985 ± 0.0069 | 1.2164 ± 0.0084 | 0.2314 ± 0.0019 | 1.7166 ± 0.0078 |
+| kOmegaSST OpenFOAM | | 45.7-63.5 (4) | 1.6945 ± 0.0130 | 1.2084 ± 0.0020 | 0.2249 ± 0.0035 | 1.7048 ± 0.0025 |
+| Δ (SE) | | | +0.24% (+0.27) | +0.66% (+0.91) | +2.92% (+1.64) | +0.69% (+1.44) |
+| SA-neg dns | 45.2-66.0 (5) | | 1.7383 ± 0.0054 | 1.3581 ± 0.0047 | 0.2406 ± 0.0003 | 1.9013 ± 0.0063 |
+| SpalartAllmaras OpenFOAM | | 49.6-66.4 (4) | 1.7372 ± 0.0043 | 1.3626 ± 0.0028 | 0.2391 ± 0.0015 | 1.8936 ± 0.0058 |
+| Δ (SE) | | | +0.06% (+0.16) | −0.33% (−0.82) | +0.63% (+1.00) | +0.40% (+0.89) |
+
+**On the windows of the rule, no disagreement exceeds 3 SE.** The largest is
+the SST St (+1.6 SE), and it is window-sensitive: the dns SST cycle
+overshoots (swing 1.757 at 32-36 D/U) and then lengthens its period (4.18 →
+4.39 D/U), which the 2% swing rule admits. Over a COMMON late window (t ≥ 45
+D/U; dns 3 periods, OpenFOAM 4) the SST row reads dns cd 1.6882 ± 0.0014,
+cl_rms 1.1994 ± 0.0008, St 0.2276 ± 0.0008 against the OpenFOAM values above:
+−0.37% / **−0.74%** / +1.2% (−0.5 / **−4.2** / +0.7 SE). That cl_rms gap is
+small but resolved by the late window's tight SEs, so it is OPEN (issues.md
+24), not banded away; SA is unchanged (its window already starts at 45). The SE are batch means of 4-8 correlated
+periods: an estimate, not a confidence interval. Saturation takes 28 D/U
+(dns SST), 45 (dns SA), 46-50 (OpenFOAM, from its impulsive start): the
+plan's 40 D/U would have held 3 saturated SST periods (the first 40-D/U run
+read "not saturated", swing still 1.738 → 1.757 → 1.728).
+
+**OpenFOAM settings matter more than the closure here** (measured: restarts of
+the SST case at 30 D/U, 1.5 D/U each, `ocyl1e4.py` docstring). PIMPLE
+nOuter 1 at maxCo 0.5 rings a 10-step cd sawtooth (HF rms 0.34 against a
+mean 1.19) that biases the window-mean cd by +5% (1.192 vs 1.133); maxCo
+0.25 (0.22) or CrankNicolson 0.9 (0.28) do not cure it, nOuter 2 or 3 do
+(0.063, cd 1.133, identical) and Euler does (0.011) at first order. The
+first serial nOuter-1 run (32 D/U in 285 s) is discarded. Cost: OpenFOAM 6
+ranks 195 s (SST) / 176 s (SA) for 66.5 D/U, 24400 steps at maxCo 0.5
+(dt ≈ 2.7e-3 D/U); dns 191 s / 195 s for 7.8e5 acoustic steps (0.244 /
+0.220 ms/step, compensated) -- at `--cfl 0.8` (below) 96 s.
+
+**URANS dt and cost on this case** (SST-2003m, compensated, same argv):
+
+| run | steps | ms/step | wall | cd | cl_rms | St | paired max \|Δcd\| / \|Δcl\| vs cfl 0.4 |
+|---|---|---|---|---|---|---|---|
+| cfl 0.4 (default) | 781682 | 0.244 | 191 s | 1.6985 ± 0.0069 | 1.2164 ± 0.0084 | 0.2314 ± 0.0019 | -- |
+| cfl 0.6 | 521122 | 0.245 | 128 s | 1.6986 ± 0.0069 | 1.2174 ± 0.0085 | 0.2314 ± 0.0019 | 3.9e-4 / 1.3e-3 |
+| cfl 0.8 | 390842 | 0.245 | 96 s | 1.6989 ± 0.0068 | 1.2190 ± 0.0083 | 0.2314 ± 0.0019 | 1.2e-3 / 3.5e-3 |
+| cfl 0.4, `--dt-recompute 1` | 781682 | 0.313 | 245 s | 1.6985 ± 0.0069 | 1.2164 ± 0.0084 | 0.2314 ± 0.0019 | 3.5e-4 / 1.4e-3 |
+| cfl 0.4, plain state | 781729 | 0.217 | 170 s | 1.6952 ± 0.0037 (window 40.3-62.1, 5) | 1.2016 ± 0.0025 | 0.2286 ± 0.0005 | trajectory decorrelates: rms Δcl 0.17 over the window |
+
+The means move by ≤ 0.2% of cl_rms and 0.02% of cd from cfl 0.4 to 0.8, far
+inside the SE, and the paired trajectories stay within 3.5e-3 in cl (a
+swing of 1.7). **Recommended URANS `--cfl 0.8` on the O-grid cylinder**
+(half the cost); the default stays 0.4 (a default change is a user
+decision). `--dt-recompute 16` IS already the default on the compressible
+cylinder O-grid (the plan's probe "at 16" is the default run); its opt-out
+`--dt-recompute 1` costs 1.28× per step and moves nothing beyond the paired
+1.4e-3. The plain FP32 state (issues.md 20) decorrelates from the
+compensated trajectory during the growth phase; over the common late window
+(t ≥ 45) it reads cd 1.6924 ± 0.0017 / cl_rms 1.2012 ± 0.0018 / St 0.2287 ±
+0.0009 against compensated 1.6882 / 1.1994 / 0.2276 (+0.25% / +0.15% /
++0.5%, ≤ 1.9 SE): on this statistic the floor is below the window SE.
 
 ### The full revolution vs the wedge (P4, `docs/rans.md` "The full revolution")
 
@@ -302,6 +427,88 @@ certified stable 3D steady state. cd is blind to it (cd is even in m = 1);
 the full revolution's stop now carries `cd+cl` / `cd+cs` so the tripped run
 is exit 8, not a certificate (docs/rans.md "The full revolution",
 issues.md 11). Reported as found, not damped.
+
+### LES known answers (`gpu_les_smag` (8), `gpu_les_tgv_comp`; masterplan W10)
+
+Measured 2026-10-27, gfx1100. Labels: LES smag Cs 0.17 / LES sigma Cσ 1.35;
+the TGV rows at 32³ are under-resolved by design (that is the regime an SGS
+model exists for), so they are model behaviour, not a converged LES.
+
+**Model magnitude** (`gpu_les_smag`, < 1 s). On linear fields the FP32
+central gradient is exact, so νt is pinned to its closed form. The code's
+convention, now test-pinned: `|S| = sqrt(2 S_ij S_ij)` (u = a·y gives
+|S| = a, not a/√2), `Δ² = (hx hy hz)^(2/3)` (hx·hy at nz == 1), and on a
+curvilinear mesh the cell's own `vol^(2/3)` (`vol/hz` in 2D); the
+compressible slot holds μt = ρ·νt.
+
+| case | grid | worst error |
+|---|---|---|
+| incomp smag, u = 3y | 32² ; 16×32×8 (anisotropic) | 0.02 ulp |
+| incomp sigma, fixed rank-3 G (D_σ = 0.017803) | 16×32×8 | 1.10 ulp vs FP64 `sigmaDsigma` |
+| comp smag, checkerboard ρ ∈ {1, 2} | 32² ; 16×32×8 | 0.98 ulp |
+| comp sigma, same G | 16×32×8 | 0.10 ulp vs FP64 |
+| comp focal smag (x[/z] ratio 3, vol ratio 3 / 9) | 32×16×1 ; 32×16×32 | 1.97 / 1.92 ulp |
+| comp focal sigma (on the FP64 discrete gradient) | 32×16×32 | 37 ulp = 2.7e-6 rel (band 3e-5) |
+
+Bands: 4 ulp; focal sigma 3e-5 relative, because the mapped gradient is
+formed in FP32 and D_σ amplifies its rounding where σ2 ≈ σ3. A host FP32
+replica of `sigmaDsigma` is 13 ulp off the device (contraction and rounding
+order) while the device sits within 0.1–1.1 ulp of FP64, so FP64 is the
+reference. The Smagorinsky ε_sgs/ε_visc band of the original plan
+([1.6, 2.4]) encoded one |S| convention and was replaced by these pins.
+
+**Compressible TGV** (`gpu_les_tgv_comp`, ~2 s): M 0.1, Re 1600, 32³,
+cfl 0.4, t = 12, against the incompressible 512³ DNS
+(`data/validation/tgv3d_512.csv`, peak −dK/dt 0.012994 at t 9.03).
+
+| run | steps | peak −dK/dt | t_peak | vs 512³ (band ±3 pp) | max\|K − K512\| | K(12) |
+|---|---|---|---|---|---|---|
+| DNS | 1715 | 0.009380 | 10.74 | −27.8% | 0.0146 | 0.0685 |
+| LES smag 0.17 | 1680 | 0.011813 | 6.42 | −9.1% | 0.0250 | 0.0415 |
+| LES sigma 1.35 | 1680 | 0.011632 | 6.86 | −10.5% | 0.0229 | 0.0432 |
+
+- σ μt ≡ 0.0 at t = 0 (exact: w = 0 makes det g = 0 in FP32).
+- Smagorinsky ε_sgs/ε_visc(0) = 1.97759, device vs host FP64 closed form
+  3.9e-8 relative (band 1e-3). ε = Σ m |S_dev|², m = μ or μt.
+- **Not true, not pinned:** "σ stays quiet for t < 3" — the TGV is 3D from
+  the first step (w ∝ t) and (Cσ h)²/ν = 112 at 32³, so σ's ε_sgs/ε_visc is
+  1.35 at t 0.5, 2.01 at t 1, 2.60 at t 3 (smag 1.99 / 2.07 / 2.91); both
+  peak at t 5.4 (smag 4.52, σ 3.94). Also not true: "σ's K is closer to 512³
+  than DNS's" — both models over-dissipate early and peak ~2.5 time units
+  before the reference; DNS under-dissipates and peaks late, so its
+  max|K − K512| is the smallest. The models fix the peak VALUE (−28% → −9 to
+  −11%), not the curve.
+- The incompressible 32³ DNS peaks 30.6% low (LES audit, `dns tgv --n 32`);
+  the compressible M 0.1 DNS 27.8% low.
+
+**LES dt bound** (same test, every sample of every LES run): the LES
+`stableDt` equals the `stableDt` of a DNS DeviceComp on the same state
+exactly (121/121 samples, uniform smag and σ, and a ratio-3 focal box with
+smag), and the diffusive bound clears the dt taken by ≥ 102× (smag),
+79× (σ), 36× (focal). See issues.md "LES known answers".
+
+**LES dt bound cost (W15, `gpu_comp_les`).** Since 2026-10-27 the bound reads
+the max of the solver's own FP32 μt of the state (`updateSgsNut`, images
+included). Before, an FP64 functor re-derived the model in the reduction. On a
+32³ 3D TGV state (w and ρ modulated), the FP32 max agrees with the host FP64
+evaluation of the deleted functor to 5.7e-8 (smag 0.17), 4.3e-8 (σ 1.35),
+1.05e-7 (smag 5) and 3.2e-8 (σ 40) relative. At the non-binding Cs the LES
+dt equals the DNS twin's exactly. At Cs 5 / 40 it binds and equals the
+formula on the FP32 max to 1e-14; the FP64-functor dt differs by that
+rounding. Every LES run byte-compared is identical: 128³ sphere smag and σ,
+open-box smag, ratio-2 focal σ, and channel smag and σ. Step cost on the 128³
+sphere, Re 1e4, NSCBC, `--ft 0.05`, gfx1100, in ms/step:
+
+| run | before | after |
+|---|---|---|
+| DNS | 4.26 | 4.24 |
+| smag 0.17 | 5.83 | 4.74 |
+| σ 1.35 | 7.12 | 4.93 |
+| focal ratio 2 smag | 7.43 | 6.06 |
+| focal ratio 2 σ | 8.71 | 6.22 |
+
+The plan's targets were ≤ 4.5 (smag) and ≤ 4.8 (σ); both are missed (issues.md
+item 26).
 
 ## Tolerance adjustments vs the original plan
 

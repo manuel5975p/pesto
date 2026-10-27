@@ -26,8 +26,9 @@ uncommitted).
    TIME-ACCURATE laminar L1 Re 3e3 run keeps a clean front (cp 1.15, 1.13,
    1.08, …; its wake sheds, cd 0.18–0.60), and OpenFOAM (SIMPLE, central or
    linearUpwind U) converges on the same meshes (SST L1 Re 1e4: 0.430
-   central). L1 SST certifies at Re 1e3 (gate `gpu_sst`) and nearly at Re
-   3e3 (remaining 1.7e-4 at 2e5). LTS-ratio cap test: see below. Not an SST
+   central). L1 SST certifies at Re 1e3 (gate `gpu_sst`), and so does L1
+   SA-neg (136600 iterations, 29 s, gate `gpu_sa_wedge`, 2026-10-27), and
+   SST nearly at Re 3e3 (remaining 1.7e-4 at 2e5). LTS-ratio cap test: see below. Not an SST
    defect; cause in the LTS march not isolated further. Dissipation is the
    obvious cure and is not allowed (CLAUDE.md). DECIDED 2026-10-26: exit 8
    on the coarse wedges is accepted as the honest outcome; kept here as a
@@ -89,7 +90,8 @@ uncommitted).
    OpenFOAM with central U (DECIDED 2026-10-26, now the `sph1e4.py`
    default): SA tier B −0.35%, θ_s −0.18°, L_r +3.8%. (linearUpwind read
    +1.16%; OpenFOAM's own SST cd moves +2.8–7.6% between the two schemes.)
-   SST: URANS mean only (2); small SST parity L1 Re 1e3 +0.41% (`gpu_sst`).
+   SST: URANS mean only (2); small SST parity L1 Re 1e3 +0.41% (`gpu_sst`);
+   small SA parity L1 Re 1e3 −1.07% (item 21).
 8. **Not built:** heavy immersed channel oracle, focal/sinusoidal MMS,
    momentum-budget tally test; multigrid / alternating lines (U5); P6. P4
    (the full revolution) is built for the explicit march and time-accurate
@@ -153,6 +155,445 @@ uncommitted).
     bound still sees the axis width (6.2e-5 vs 6.3e-4 at 64×48). A G1 URANS
     costs ~1e3 s per D/U (2.6e5 steps at ~3.7 ms).
 
+## Test tier (masterplan `plans/verify/masterplan_verify.md` W14)
+
+13. **The RANS/LES/MRF subset misses its 200 s budget: 250.8 s serial,
+    225.6 s in one `ctest -L 'rans|les|mrf' -j4` call** (measured
+    2026-10-27, gfx1100, 41 tests, all pass; baseline 314.7 s for 40). Every
+    test is <= 56 s (`gpu_rans` 55.7, `gpu_axisym3d_run` 40.0, `gpu_rans_sst`
+    32.2, `gpu_runners` 31.7, `gpu_sst` 28.9, `hit_mini` 21.8). The plan's
+    200 assumed `gpu_rans` G9's plain march dropped and the CPU `hit_mini`
+    moved behind `DNS_VALIDATION_BASELINE`; by user decision both stay, made
+    cheaper (G9 15.3 s on ny 32, `hit_mini` 3 + 3 eddy turnovers, 21.8 s):
+    37 s of the gap. The rest is the plan's arithmetic (it predicted ~185 s
+    from the same removals). Later W items add ~115 s (masterplan W14
+    "end-state budget"), which puts the serial subset near 365 s; the
+    plan's trim order applies then. Remaining levers, not taken: G10's
+    perturbed compensated 2.2e5 march on ny 32 (est. ~-13 s if 1.2e5
+    iterations suffice there as they do for the plain march; unmeasured; the
+    plan keeps it on ny 64), SST-G9 perturbation 5% -> 1% (user decision 7,
+    ~-27 s).
+    **End state (re-measured 2026-10-27 after the last item, W16): 251.1 s
+    serial, inside the 300 s end-state budget; no trim taken.** 47 tests,
+    all pass, two gpurun calls (`-R 'gpu_rans|gpu_sst|gpu_sa_wedge'` 121.9 s,
+    the rest 129.2 s). The predicted ~365 s did not happen: W8/W9 made the
+    RANS tests cheaper (`gpu_rans` 55.7 -> 44.7, `gpu_axisym3d_run` 40.0 ->
+    32.4, `gpu_runners` 31.7 -> 26.2, `gpu_sst` 28.9 -> 21.2, `gpu_rans_sst`
+    32.2 -> 29.4) and the added tests cost ~37 s (`gpu_sa_wedge` 21.3,
+    `gpu_mrf_rotor2` 11.0, the rest < 2 s each). Largest test `gpu_rans`
+    44.7 s (<= 75). The 200 s figure stays missed (the overrides above).
+
+## Correctness hygiene (masterplan `plans/verify/masterplan_verify.md` W4)
+
+15. **`RansDiffDt` is unstable on isotropic 3D cells where it binds**
+    (measured 2026-10-27, `gpu_rans_mask` M7). The bound is 0.25/(D amax²);
+    the compact face Laplacian's checkerboard needs Σ_a a_a². A periodic
+    16³ box with uniform μt = ρk/ω (k = ω = 0.1, at rest, so the bound
+    binds 6× under the acoustic one) and a 1e-3 T checkerboard at uniform p,
+    stepped AT the bound: 2D decays to the FP32 floor (1e-3 -> 3.0e-8 in
+    2000 steps, λΔt = −2); 3D grows 10× in 4 steps and saturates at O(1)
+    (λΔt = −3 against SSP-RK3's −2.51). Ladder in 3D: 0.5×/0.8×/0.83× the
+    bound stable (3.0e-8/3.0e-8/7.0e-7), 0.85× and 0.9× grow (10× at steps 39
+    and 8): the threshold is the predicted 2.51/3 = 0.837. Where it bites:
+    cells near-isotropic in ≥ 2 axes with a large μt -- 3D immersed RANS
+    wakes, the full revolution's outer cells, an extruded O-grid's wake;
+    wall-clustered cells have amax² ≈ Σa². No run has been seen to diverge
+    from it (the protocol-P cases are byte-identical and stable). NOT fixed
+    by decision of the plan (W4 g): the Σ_a a_a² form changes every RANS dt
+    and LTS bit and the steady certifications would need re-pinning -- a
+    USER DECISION (masterplan §5 item 6).
+16. **`--ogrid-trip 0.05` on the 2D cylinder O-grid saturates 1.8× earlier
+    than untripped, not the planned 2×** (measured 2026-10-27, laminar Re
+    100, 192×96, M 0.2, quiet start, t 143, ~28 s each). |cl| envelope
+    reaches 0.068 at t 30.3 vs 73.3 (2.4×), 90% of saturation at 52.7 vs 95.8
+    (1.82×), 99% at 71.6 vs 114.6 (1.60×). 0.2 / 0.5 give 90% at 41.2 / 35.1
+    (2.3× / 2.7×); every trip reaches the same limit cycle (envelope 0.333,
+    cd 1.380). The trip moves the linear growth phase only; the ~40 time
+    units of nonlinear approach stay. The trip is opt-in (default 0 on the
+    cylinder O-grids), so nothing default moved. W12 kept 0.05: `val_ogrid_cyl`
+    averages from t 82 and fits in 27 s, so the 2× was not needed.
+
+## LES wall closure (masterplan `plans/verify/masterplan_verify.md` W1)
+
+17. **Fixed 2026-10-27: LES μt had no wall image and the tallies omitted
+    SGS.** μt now takes the RANS images (`setMutHook`; O-grid wall face
+    exactly 0.0, was ~0.1 ν; immersed odd image; `--noslip` rows odd, mirror
+    rows even), and every compressible tally passes μt (momentum closure
+    4e-9..9e-9 relative, was 0.17-0.51 -- `gpu_les_wall`); the incompressible
+    SGS tally gained z links and fz (`gpu_les_tally3d`). Every LES run with a
+    wall or a closed lateral row moved (no LES anchor exists): 128³ smag
+    sphere Re 1e4 cd 0.609 -> 0.734 at t 2.31, 3D incompressible sphere
+    0.643 -> 0.675, 2D focal Re 3900 mean 1.228 -> 1.247 (2D LES,
+    qualitative). Still open, deferred by decision (masterplan §5 item 8):
+    the NSCBC x rows' μt is the raw wrap-differenced value (the hook is the
+    natural fix if a measured LES outflow shows it). The immersed image's
+    negative staircase-face μt is fixed by W3 (item 19). The LES `stableDt`
+    bound reads the solver's own imaged μt since W15 (item 26).
+
+## Immersed μt image (masterplan `plans/verify/masterplan_verify.md` W3)
+
+19. **Fixed 2026-10-27: the immersed μt ghost image made staircase faces
+    anti-diffusive.** The odd image μt_g = −a Σw μt_s drove the face total
+    μ + ½(μt_g + μt_c) NEGATIVE on 51/128 faces (SA, down to −39 μ) and
+    21/128 (SST, −16.5 μ) of a 128² Re 1e5 cylinder with a law-of-the-wall
+    layer (y⁺ 30–80); unclamped SST's dt fell to 2e-9 within 200 steps. Now
+    μt_g = −min(image, min μt of its fluid face neighbours): 0 faces below μ
+    (`gpu_rans_immersed` (e)). It binds on any staircase (41 of 101 ghosts on
+    a resolved tilted plane), so every immersed RANS/LES run moved, by
+    little: P immersed SA cd −3.3e-5 rel., SST < 2e-6; URANS Re 1000 384²
+    mean cd SA |Δ| < 1e-5, SST −1.1e-4; 128³ smag sphere LES −1.2e-3. No
+    anchor. Still open, NOT caused or cured by the image: immersed URANS on
+    the uniform 256² box diverges at t ≈ 2.6 at Re 1e4 and earlier at Re 1e5
+    (exit 7, at the same t with and without the clamp, `--rans sa-neg|sst-2003m
+    --ft 10`) -- an under-resolved central scheme with no added dissipation,
+    by design; `--focal` or a larger `--n` is the lever.
+
+## LES known answers (masterplan `plans/verify/masterplan_verify.md` W10)
+
+18. **Closed 2026-10-27: the LES `stableDt` bound does not bind where
+    measured (the "over-conservative on clustered meshes" older item).**
+    The bound IS over-conservative by construction (it pairs the largest
+    μt, a coarse cell, with h_min), but it never decided a dt.
+    `gpu_les_tgv_comp` compares the LES `stableDt` with a DNS DeviceComp's on
+    the SAME state at every sample: identical on 121/121 samples for smag
+    0.17 and σ 1.35 on the uniform 32³ TGV and for smag on a ratio-3 focal
+    box; the diffusive bound clears the dt taken by ≥ 102× / 79× / 36×.
+    Threshold, from `comp.hip` `stableDt`: it binds iff
+    (ν + νt,max)·γ/Pr > 0.25·h_min²·w_ac/cfl, i.e. for νt,max =
+    (Cs·R·h_min)²|S| at a cell R× coarser than h_min, iff
+    |S|·h_min > 0.25 (|u| + c)/(cfl·(γ/Pr)·Cs²·R²) = 66.7 U/R² at M 0.2
+    (|u| + c = 6U), cfl 0.4, Cs 0.17, w_ac ≈ (|u| + c)/h_min (the LES audit's
+    "66.9/R"). The audit's own evidence
+    (dt·wmax = 0.01309 in all 27 rows of the focal Re 3900 LES and DNS runs)
+    is a TAUTOLOGY and proves nothing: the stats `wmax` is defined as
+    cfl·min(h)/dtStab (`runner_comp.hip:788`). For that case the threshold
+    in the fine cells is |S| > 1600 U/D (h_min = D/24) against a boundary
+    layer |S| ~ U/δ ≈ 60–200 U/D at Re 3900 -- an estimate, not a
+    measurement. Reopen if a run's LES dt ever drops below its DNS twin's.
+    Also measured by W10 and NOT true (recorded, not pinned): σ is not
+    quiet on the TGV for t < 3 (ε_sgs/ε_visc 1.35 at t 0.5, 2.60 at t 3 --
+    the TGV is 3D at once and (Cσ h)²/ν = 112 at 32³), and σ's K is not
+    closer to 512³ than DNS's (max|K − K512| 0.0229 vs 0.0146). Numbers:
+    docs/validation.md "LES known answers".
+
+## Rotor MRF parity (masterplan `plans/verify/masterplan_verify.md` W5-W7)
+
+14. **Rotor MRF parity is open. dns L1 CT is −0.02392 against central
+    simpleFoam −0.01790 (+33.6%) and central rhoSimpleFoam −0.01865
+    (+28.2%). CQ is +1.0% and −0.45% against the same two references. The
+    OpenFOAM reference is itself
+    MRF-zone-sensitive by the same order as the gap but less than it
+    (+16.2% / −9.4% CT across dns' blend band); at most about half of the
+    gap can be the zone. The refinable two-blade `rotor2` (W7) is NOT AT
+    PARITY either, and its dns ladder does not approach foam in CT: L3 is
+    +67% above rhoSimpleFoam (Richardson +59%), and CQ crosses foam (−1.7% at
+    L3) heading for −7.3% (Richardson). The W6 split ATTRIBUTES the CT gap
+    to the BLADE (106–114% of it on every level of both rotors; the hub
+    agrees with foam within 6–22% and carries slightly LESS drag), and
+    shows that the CQ "agreement" is a cancellation: a convective momentum
+    flux through the moving staircase wall (zero on a real wall) is +6.7 to
+    +24% of CQ; CQ − CQ_c is 8–15% LOW on every level, so the total CQ is
+    EXPECTED (an extrapolation, not a measurement) to fall to about −8.5% as
+    that flux vanishes.**
+    Measured 2026-10-27 by
+    `tools/parity` (`runs/parity/report.md`), laminar Re_D 220, J 0.63, tip
+    Mach 0.41, central U everywhere (the parity rule). The pre-W5 rows used
+    linearUpwind and are retired as stale.
+    - **dns (rotor).** L1 is the 80f147f run (4.58 D/U, D/h_fine 59.5, 4.1M cells,
+      131 s). L2/L3 are not run: they cost ~550 and ~2100 s, over the cap.
+      rotor1 cannot be grid-refined under 300 s, which is why W7 makes
+      rotor2.
+    - **rotor2 (W7)**: `--blades 2 --root-chord 0.40 --tip-chord 0.30
+      --thickness 0.35 --pitch 1.0`, same flow and box; 4.5 D/U per run.
+      Verdict bands fixed before measuring (`cases.toml` `parity_bands`):
+      CT 5%, CQ 2% against Bc, on the finest level or its Richardson value
+      when the ladder is monotone.
+
+      | | D/h_fine,x | BL cells | cells | wall s | CT | CQ |
+      |---|---|---|---|---|---|---|
+      | dns L1 (ny 100, ratio 5) | 39.1 | 2.6 | 1.50M | 35 | −0.05223 | 0.09167 |
+      | dns L2 (ny 132, ratio 7) | 58.5 | 3.9 | 3.45M | 113 | −0.03180 | 0.08465 |
+      | dns L3 (ny 164, ratio 8) | 74.9 | 5.0 | 6.62M | 260 | −0.02891 | 0.08208 |
+      | dns Richardson (h_fine,max) | | | | | −0.02756 (p 4.3) | 0.07743 (p 1.7) |
+      | Bc L1 / L2 / L3 | | | 115k / 145k / 321k | 50 / 67 / 181 | −0.02065 / −0.01785 / −0.01729 | 0.08502 / 0.08406 / 0.08371 |
+      | B L1 / L2 / L3 | | | same | 26 / 34 / 89 | −0.01783 / −0.01514 / −0.01460 | 0.08426 / 0.08322 / 0.08285 |
+
+      Against Bc (CT fine L3, CQ Richardson 0.08351): dns CT +202 / +84 /
+      +67%, CQ +9.8 / +1.4 / −1.7%. Two acceptance items fail and are
+      recorded, not re-banded: foam L2/L3 CT agree to 3.2% (Bc) / 3.7% (B),
+      not 1% (CQ 0.4%; foam's CT Richardson order is 4.7 and puts L3 0.8%
+      from its limit); and the verdict. Confounds, both measured smaller
+      than the CT gap: dns' zone margins are in h_fine cells, so its zone
+      shrinks with refinement (f = 1/2 at 0.694 / 0.646 / 0.629 D; foam's
+      is set to L3's), and foam moved from L3's to L1's radius shifts CT
+      −5.5%, CQ +0.6%; and 4.5 D/U is not settled to 1e-3 (L3 CT ±2.6%
+      oscillation, mean drift ≤ 1% over the last D/U). dns L1 sits at
+      t/h 3.6–4.4 with 12 deep-solid cells. The CT gap shrinks with D/h
+      (+202 → +67%) but extrapolates to +59%, so it is not a resolution
+      artefact of the ladder alone; the W6 split below attributes it. The
+      bladed L1 is pinned in ctest as `gpu_mrf_rotor2` (1 D/U, ct/cq and the
+      split's pressure / convective / viscous CT at 1%, ~11 s).
+      **Verdict after the W6 split: still NOT AT PARITY** (CT +67% at L3,
+      CQ −1.9% at L3, with CQ − CQ_c at −8.6%, i.e. the total expected to
+      fall toward −8.5% as the convective wall flux vanishes -- an
+      extrapolation; the bands are unchanged).
+    - **W6 split (2026-10-27): `--emit surface` on the immersed ghost wall
+      writes the tally per interface face, split into pressure p s,
+      convective ρ u_a,n u and viscous; `tools/parity/split_dns.py` sorts
+      faces into hub (r ≤ r_hub + T, |x| ≤ hub half-length + T) and blade
+      for dns AND for the per-face forces of the converged foam L3, with ONE
+      T per case (the coarsest dns level's √median face area: 0.0160 D
+      rotor, 0.0267 D rotor2).** dns runs at 4.5 D/U, final state; foam Bc
+      (rhoSimpleFoam) L3, the scored reference (B within 0.01 on the hub).
+      Hub-only runs (masterplan step 5) were not triggered: the dns hub is
+      within 30% of foam's.
+
+      | | CT total | hub | blade | blade p | blade c | blade v | CQ | CQ_c |
+      |---|---|---|---|---|---|---|---|---|
+      | rotor dns L1 | −0.02390 | −0.00843 | −0.01547 | −0.00179 | −0.00065 | −0.01303 | 0.03205 | 0.00316 |
+      | rotor foam Bc L3 | −0.01865 | −0.00905 | −0.00960 | +0.00890 | 0 | −0.01850 | 0.03218 | 0 |
+      | rotor2 dns L1 | −0.05221 | −0.00747 | −0.04474 | −0.00488 | −0.00574 | −0.03412 | 0.09168 | 0.02018 |
+      | rotor2 dns L2 | −0.03188 | −0.00752 | −0.02437 | +0.01886 | −0.00263 | −0.04059 | 0.08472 | 0.00789 |
+      | rotor2 dns L3 | −0.02900 | −0.00851 | −0.02048 | +0.02297 | −0.00147 | −0.04198 | 0.08215 | 0.00560 |
+      | rotor2 foam Bc L3 | −0.01729 | −0.00956 | −0.00774 | +0.04840 | 0 | −0.05613 | 0.08371 | 0 |
+
+      Share of the CT gap (dns − Bc): rotor L1 −0.00525 = hub −12% + blade
+      +112%; rotor2 L1/L2/L3 −0.03491 / −0.01459 / −0.01170 = hub −6 / −14
+      / −9% + blade +106 / +114 / +109%. Robust to T (0.5–1.5×: rotor hub
+      −0.0079..−0.0087 dns vs −0.0087..−0.0092 foam). Within the blade the
+      pressure deficit is about twice the gap (rotor2 L3 −0.0254) and is
+      partly offset by LESS viscous drag (+0.0142); both shrink with D/h
+      (blade p −0.0049 → +0.0189 → +0.0230 vs +0.0484), but on a staircase
+      the p/v division of a sloped surface's stress is not the body-fitted
+      one, so only the per-part totals are a like-for-like comparison. The
+      convective part is a discretization error of the immersed moving wall
+      (the mirror's residual normal mass flux, carrying the wall-speed
+      momentum through the face; foam's is exactly 0). It decays between
+      first and second order (rotor2 CQ_c 0.0202 / 0.0079 / 0.0056 at D/h
+      39.1 / 58.5 / 74.9: observed order 2.3 from L1 to L2, 1.4 from L2 to
+      L3) and is 12–18% of the CT gap. CQ − CQ_c against Bc is −14.6 / −8.2
+      / −8.6% (rotor2) and −10.2% (rotor L1); it is flat over L2 and L3, so
+      the total CQ is EXPECTED to tend to about −8.5% as CQ_c goes to 0.
+      That is an extrapolation (it assumes CQ − CQ_c stays flat while CQ_c
+      vanishes), not a measured number -- the measured parity figure at L3
+      is −1.9% -- but it says the CQ ladder's apparent convergence to foam
+      is the artefact shrinking. Radially (the split's
+      0.05 D bins, `split_dns.py` prints them) the CT gap sits MID-SPAN: dns
+      is more negative by 0.0009–0.0014 per bin at r 0.15–0.35 D (rotor L1)
+      and 0.0017–0.0033 at 0.2–0.4 D (rotor2 L3), small at the root and of
+      either sign at the tip; the torque deficit (without the convective
+      part) sits at the TIP bin 0.45–0.5 D: −27% (rotor), −18% (rotor2 L3),
+      within a few % inboard. Next attribution steps, none built: (a) the
+      section force direction vs radius against foam (a lower effective
+      pitch or a thicker effective staircase section both tilt it this way);
+      (b) a sub-cell wall treatment that zeroes the interface mass flux on
+      a moving wall; (c) `--mrf-zone` (zone confound). Recipe: `dns flow
+      ... --emit stats --emit surface` (the rotor argv), then
+      `python3 tools/parity/split_dns.py dns CASE RUN_surface.csv --tol T
+      --json runs/parity/split/CASE/dns_Lk.json` and, inside gpurun, `...
+      foam CASE runs/parity/Bc/CASE/foam_L3 --work DIR --tol T --json
+      runs/parity/split/CASE/foam_Bc_L3.json`; `suite.py report` renders
+      the tables.
+    - **simpleFoam (tier B, M → 0).** L1/L2/L3 CT −0.01883 / −0.01788 /
+      −0.01790, CQ 0.03222 / 0.03169 / 0.03171. These are the audit's
+      central runs, reproduced to ≤ 0.02%.
+    - **rhoSimpleFoam (new tier Bc, at the dns Mach).** L1/L2/L3 CT
+      −0.01959 / −0.01862 / −0.01865, CQ 0.03265 / 0.03214 / 0.03218. L2
+      and L3 agree to 0.18% / 0.14%. The compressibility increment is Bc/B
+      − 1 = +4.2% CT and +1.5% CQ. Bc needs classic SIMPLE: SIMPLEC
+      limit-cycles on L3.
+    - **Zone sensitivity: |ΔCT| > 2%, so the masterplan's `--mrf-zone`
+      follow-up (§5/§6) is triggered.** It is not built. On central
+      simpleFoam L2, refinement fixed, the sharp zone moved to dns' f = 1
+      radius (0.555 D) gives CT +16.2% and CQ −2.6%. Moved to the f = 0
+      radius (0.705 D) it gives CT −9.4% and CQ +1.1%. The single-blade
+      frozen rotor is not zone-independent. dns' blended zone (0.555–0.705
+      D) and foam's sharp 0.62 D zone are different approximations. But
+      the zone shift is smaller than the gap: even with the foam zone at
+      dns' f = 1 radius (0.555 D, the setting with the largest foam CT),
+      dns L1 is still +15.1% above simpleFoam L2 (−0.0239167 / −0.0207808),
+      about +10.6% est. against Bc (scaled by Bc/B at L2). So at least
+      about half of the CT gap (log share 52% vs B L2) is not the zone,
+      and W6 attribution stays needed. CQ is robust. Ways to close the
+      zone part, none built: (a) dns `--mrf-zone` to set the
+      zone radius and blend; (b) a zone-independent reference
+      (time-accurate rotating mesh / AMI, or `--rotor-frame moving` against
+      it).
+    - **Recipe** (each run ≤ 300 s): `gpurun -t 300 -m 16G -- env
+      PARITY_LOCK_HELD=1 python3 tools/parity/suite.py run rotor --tier
+      B|Bc --solver foam --level k` and `... --tier B --level 2 --zone-r R
+      --tag zrR`; rotor2 dns `... run rotor2 --tier A --solver dns --level
+      k` (`-m 14G` at L3).
+
+## URANS time accuracy (masterplan `plans/verify/masterplan_verify.md` W2)
+
+20. **Found and given an opt-in fix 2026-10-27: the plain FP32 time march
+    does not converge in dt -- FP32 update stagnation, the steady march's
+    floor ulp(q)/(2 dt) on a time march.** O-grid cylinder SST-2003m URANS
+    Re 1e4 (256×96, beta 4, far 20, `--ramp 1 --ft 0.04`), RMS over
+    t ∈ [0.05, 0.6] of cd between adjacent cfl rungs 0.4/0.2/0.1/0.05:
+    plain 6.5e-4 / 3.0e-3 / 1.03e-2 (DIVERGES: ratios 0.22 / 0.29),
+    `--compensated` 2.9e-4 / 7.8e-5 / 2.4e-5 (ratios 3.75 / 3.30, order
+    ~1.8; cdf ratios 2.01 / 1.99 = the first-order source quotient). The
+    windows [0.6, 1.3] and [1.3, 2.2] agree. Plain final cd 1.7261 →
+    1.7288 scattered over 1.726–1.742, compensated 1.7255 → 1.7254; plain
+    max |cl| 1e-3 → 4.7e-3 off a symmetric start, compensated < 2e-6.
+    `--compensated` (flow compressible incl. O-grid/focal/MRF/rotor, and
+    channel) is built and OFF by default, so every default run is bit for
+    bit (protocol P + 6 time-march cases cmp-identical, docs/rans.md "Time
+    accuracy"); 1.16–1.21× per step on the gate case. **Open:** (a) whether
+    it becomes the URANS default (it changes bits) is a user decision
+    (masterplan §5 item 2); (b) every plain FP32 URANS/DNS dt study cited so
+    far is suspect where |R| dt nears ulp(q)/2 -- none of the measured
+    anchors is a dt study. W12's URANS shedding against OpenFOAM (item 24)
+    ran `--compensated` with a converging cfl ladder; the plain state on
+    the same case moves the late-window means by ≤ 0.5% (≤ 1.9 SE).
+
+## RANS code-to-code references (masterplan `plans/verify/masterplan_verify.md` W13)
+
+21. **The small SA wedge parity misses its planned 1% gate: tier B −1.07%**
+    (measured 2026-10-27, L1 64×48 Re 1e3, β 4.5, rFar 20). dns SA-neg M 0.2
+    certifies (exit 0, 136600 iterations, 29 s, cd 0.48541, θ_s 99.50°, L_r
+    1.2691 D); M 0.1 ends at the 4e5 cap (exit 8, item 4) settled at cd
+    0.48061 ± 0.06%; cd0 0.47901. OpenFOAM v2606 SpalartAllmaras (ft2 true,
+    Prt 0.9, central U) on the identical mesh: 0.48419, θ_s 100.24°, L_r
+    1.1407 D. So cd0 −1.07% (tier A at M 0.2 would read +0.25%), θ_s −0.56°
+    (M 0.1), L_r +7.8% (SST's is +7.7% on this mesh). The masterplan set
+    "cd0 within 1%" before measuring; the band was NOT widened: `gpu_sa_wedge`
+    pins the dns state (cd 5e-4, L_r 5e-3, θ_s 0.1°) and prints the
+    comparison ungated. Not attributed: OpenFOAM's SA bounds ν̃ ≥ 0 (dns
+    SA-neg does not) and the two codes' discretizations differ at L1 (laminar
+    `sph100` L1 is −0.49% on the same mesh family, and SA L2 Re 1e4 is
+    −0.35%); an L2 Re 1e3 pair (dns ~4× the iterations at 4× the cells,
+    over the 1-minute target) would separate grid from model. Open.
+22. **The TMR flat plate, bump-in-channel and NACA 0012 cases cannot be
+    expressed today** (recorded 2026-10-27, not scheduled). The O-grid is
+    uniform in polar angle (`ogrid.hpp`: theta_i = −2π i/nx), so no
+    arc-length clustering at a sharp trailing edge or a plate leading edge,
+    and `--rans` rejects box walls (`--body floor|fence|none`, `--noslip`:
+    "need the ghost-row adapter, which is not built"). Needs an arc-length
+    O-grid and the wall-row adapter -- a feature (masterplan §6), not a
+    verification step. The RANS code-to-code references today are the
+    CFL3D 2DFDC channel (`rans_channel1d` O5, SA within 0.5% sublayer-
+    normalized) and the OpenFOAM wedge (items 7, 21).
+23. **A supersonic `--mach` is now accepted on the implicit steady RANS
+    channel only** (2026-10-27, for the Coleman-Kim-Moser M_b 1.5
+    scenario, docs/rans.md). Everywhere else the (0, 1) bound stands
+    (the KG flux has no shock capturing). The explicit steady march and
+    URANS stay rejected at M ≥ 1: their pseudo-time / time transients
+    carry y-acoustics that were not measured there. The channel has no
+    viscosity law (constant μ against CKM's μ ∝ T^0.7), so the scenario is
+    a model-label comparison: Tc/Tw 1.382 vs CKM ≈ 1.38.
+
+## O-grid cylinder (masterplan `plans/verify/masterplan_verify.md` W12)
+
+24. **URANS shedding vs OpenFOAM agrees within 3 SE on the protocol's
+    windows; one late-window reading does not: SST-2003m cl_rms −0.74% at
+    −4.2 SE** (measured 2026-10-27, 2D cylinder O-grid 256×96, β 4, 20 D,
+    Re 1e4, M 0.2, `--ogrid-trip 0.05 --compensated`, 66.5 D/U; OpenFOAM
+    v2606 rhoPimpleFoam on the identical mesh, central U, backward, PIMPLE
+    nOuter 2, `tools/parity/ocyl1e4.py`; docs/validation.md "O-grid
+    cylinder URANS shedding vs OpenFOAM"). Window of the 2% swing rule:
+    SST cd / cl_rms / St +0.24% / +0.66% / +2.9% (+0.27 / +0.91 / +1.64
+    SE), SA-neg vs SpalartAllmaras +0.06% / −0.33% / +0.63% (≤ 1.0 SE).
+    Common late window t ≥ 45 D/U (dns 3 periods, OpenFOAM 4): SST cd
+    −0.37% (−0.5 SE), St +1.2% (+0.7 SE), cl_rms 1.1994 ± 0.0008 vs
+    1.2084 ± 0.0020 (−0.74%, −4.2 SE). Not attributed; candidates, none
+    measured: OpenFOAM's backward/PIMPLE at maxCo 0.5 (its own dt ladder
+    was not run: 2 chunks per model), meshWave vs dns's exact wall
+    distance, OpenFOAM's k ≥ 0 bounding (active every step), the
+    different start (impulsive vs ramped) leaving the dns SST cycle still
+    lengthening its period (4.18 → 4.39 D/U over the run), and SEs from 3-4
+    correlated periods. A longer common window (≥ 100 D/U on both sides,
+    over the 300 s cap for OpenFOAM in one chunk) would separate a real
+    gap from window noise. Also recorded: (a) OpenFOAM PIMPLE nOuter 1 is
+    NOT a usable reference here (a 10-step cd sawtooth biasing mean cd +5%;
+    nOuter ≥ 2 cures it, maxCo 0.25 and CrankNicolson do not); (b) the
+    plan's 40 D/U run length reads "not saturated" for SST (3 saturated
+    periods), 64 D/U is needed; (c) `--dt-recompute 16` is already the
+    O-grid cylinder default (the plan's probe is the default run; its
+    opt-out 1 costs 1.28× and moves nothing); (d) `--cfl 0.8` reproduces
+    cfl 0.4's statistics within 0.2% at half the cost -- a default change
+    is a user decision, not made.
+
+## Channel LES (masterplan `plans/verify/masterplan_verify.md` W11)
+
+25. **Built 2026-10-27: `dns channel --les CS --sgs smag|sigma`; no channel
+    LES statistic is converged or banded.** μt takes the RANS odd image on
+    both ghost rows (wall face 0.0 exactly, `gpu_channel_les`); `--les 0` is
+    byte-identical. Measured at 32×48×32, β 1.6, M 0.3, Re_τ 180, 40 δ/u_τ
+    (≤ 82 s per run), ub⁺ over t 25–40 vs MKM 15.68: no model 16.65 (+6.2%),
+    smag 0.17 RELAMINARIZED (u_rms⁺ peak 0.20; first-cell ν_t/ν 3.85, its
+    largest anywhere: no wall damping), σ 1.35 18.10 (+15.5%, turbulent,
+    first-cell ν_t/ν 1.4e-5). All three windows fail the stationarity rule
+    (trend 4.7–7.0 batch SE; the 3 δ/u_τ batch SE is itself optimistic).
+    Open: σ's +15% (model vs transient vs Δx⁺ 70 is unseparated), a grid
+    where the rule passes (longer runs exceed the 300 s cap on this box),
+    and the smag wall damping the channel does not have (van Driest or
+    dynamic: not built, a model change). docs/channel.md "LES".
+
+## LES step cost (masterplan `plans/verify/masterplan_verify.md` W15)
+
+26. **Partly fixed 2026-10-27: the compressible LES `stableDt` re-derived the
+    whole SGS model in FP64 every step.** Now its viscous bound reads the max
+    of the solver's own FP32 μt of the same state (`updateSgsNut`, images
+    included). 128³ sphere Re 1e4 NSCBC `--ft 0.05`, gfx1100, ms/step: smag
+    5.83 → 4.74, σ 7.12 → 4.93 (DNS 4.26; focal ratio 2 σ 8.71 → 6.22, smag
+    7.43 → 6.06). Every LES test case is byte-identical (the bound never binds
+    there); where it binds, dt moves by the FP32 rounding of μt,max: 1.05e-7
+    (smag) / 3.2e-8 (σ) relative on the `gpu_comp_les` rig. **Acceptance
+    missed: smag ≤ 4.5 and σ ≤ 4.8.** The rest of the LES gap is the dt
+    pass's own kPrim + μt launch (0.11 / 0.15 ms) and the three stage μt
+    launches. Reusing the dt pass's μt in stage 1 (planned) needs the
+    entry hook to be the identity on the state, and the Cartesian
+    compressible hook runs `kFarSponge` and `--penalize`. So it is
+    deferred to W9's `Idempotent` stage hook (built, item 28, but claimed
+    only by the O-grid and channel runners: the Cartesian hook is still
+    uncertified, so the reuse stays open). Merging the
+    stableDt host copies into one was measured at −0.03 ms (0.6%) and
+    dropped. The DNS part is mostly the FP64 acoustic reduction
+    (`WavePerDt` 0.34 ms/step, 8%), which is bit-fixed by the anchors.
+
+## RANS stage cost (masterplan `plans/verify/masterplan_verify.md` W8)
+
+27. **Partly fixed 2026-10-27: the scalar stage kernels re-derived t/ρ per
+    face and neighbour, and SST recomputed `sstCellGrads`.** The μt kernel
+    now writes a per-cell cache (`rans::RansCellCache`: φ = t/ρ, SST also
+    R and ∇k·∇ω) that the stage reads; `kSstStageCurv` carries
+    `__launch_bounds__(blockSize)` (without it the cache version hit the
+    192-VGPR cap and spilled 9). Every protocol-P output (17 cases, 61 files)
+    is byte-identical. Stage per launch, gfx1100: SST −28…−60%, SA −40%
+    (immersed 384²), −27…−43% (3D), but **SA on the small 2D grids only
+    −16…−18%** (wedge 20.6 → 17.1 µs, O-grid 18.6 → 15.2 µs): the
+    acceptance (≥ 20%) is missed there. Those grids put ~6 waves on a SIMD,
+    so the kernel is latency-bound. What is left is face work (ν_f, χ_f
+    divisions, computed twice per face) and the pointwise source. Neither
+    is a per-cell value, so a cache cannot remove them bit-identically. SST
+    immersed ms/it 0.931 → 0.750 (−19.5%, acceptance met). docs/rans.md
+    "Stage-kernel cost". The small-grid remainder was then cut by launch
+    count instead (item 28).
+
+## Launch count (masterplan `plans/verify/masterplan_verify.md` W9)
+
+28. **Fixed 2026-10-27: the small 2D RANS grids were launch-bound.** The
+    wedge ran 45.6 kernels per iteration (39 tiny, ~2.8 µs each) and its
+    stage kernels formed all three planes, two of which the hook discards.
+    Now: the stage kernels run on the wedge's real plane only
+    (`DeviceComp::setStageRange`); `step()` no longer re-applies a stage
+    hook that the runner certifies idempotent (`Idempotent::yes`: O-grid
+    rows + axis, channel wall); the O-grid rows and the channel wall are one
+    launch each (`kOGridRows`, `kChannelRows`); SA's kPrim + μt are one
+    (`kPrimSaMutCurv`). Launches/it: wedge 45.6 → 27.6, O-grid 31.5 → 15.5,
+    channel 30.4 → 18.4. ms/it: wedge SA 0.270 → 0.192, O-grid SA 0.198 →
+    0.149, channel 4×66 SA 0.154 → 0.121 (acceptance ≤ 0.24 / 0.18 / 0.135
+    met). Byte-identical: protocol P + extras (31 cases, 113 files) and
+    `gpu_axisym` (h). Still open, not built: the immersed/Cartesian runner
+    does not claim `Idempotent::yes` (its hook is the ghost fill plus
+    `comp_far`, which may be the in-place sponge; the ghost fill's
+    idempotence is unproven), so its entry hook and the LES stage-1 μt reuse
+    of item 26 remain. HIP graphs measured −4% per launch and are not used.
+    docs/rans.md "Launch reduction".
+
 ## Older open items (details in CLAUDE.md)
 
 - Re800 compressible anchors and `sphere_re300_n160_cd`: deferred, need
@@ -161,5 +602,4 @@ uncommitted).
 - `gpu/comp_far.hip` domain y walls hardcoded adiabatic.
 - Rotors: no table cache, no incompressible branch, no dns-ui support.
 - dns-ui: a stop issued before a run reaches its time loop is not clean.
-- DNS/LES `stableDt` LES bound over-conservative on clustered meshes.
 - README names gfx1201; this machine is gfx1100.

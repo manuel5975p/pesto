@@ -77,11 +77,16 @@ __global__ void kBodyFriction(GpuGrid g, Real nu, const Real* ax, const Real* ay
 
 // SGS counterpart of kBodyFriction: the eddy-diffusion substep drains momentum
 // through the same closed links, but with the local nut and its exact per-link
-// weights (x: cell-centre nut; y: corner-averaged n4). Same A/d normalisation
-// (nu -> nut), so this folds straight into cd. 2D only, like the model itself.
+// weights -- term by term those of kEddyDiffuse (les.hip): the normal link
+// takes a cell-centre nut, a tangential link the edge average (nxy, nxz, nyz).
+// Same A/d normalisation (nu -> nut), so this folds straight into cd/cl/cs.
+// At nz == 1 both z neighbours ARE this cell, whose aperture passed the guard,
+// so no z link is taken: the u/v sums keep their 2D bits and w (exactly 0
+// there) drains an exact zero.
 __global__ void kBodySgsFriction(GpuGrid g, const Real* nut, const Real* ax,
-                                 const Real* ay, const Real* u, const Real* v,
-                                 BodyBox b, Real* fx, Real* fy)
+                                 const Real* ay, const Real* az, const Real* u,
+                                 const Real* v, const Real* w, BodyBox b,
+                                 Real* fx, Real* fy, Real* fz)
 {
     constexpr Real openTol = Real(CutGeometry::openTol);
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -90,13 +95,25 @@ __global__ void kBodySgsFriction(GpuGrid g, const Real* nut, const Real* ax,
     decompose(g, c, i, j, k);
     fx[c] = 0;
     fy[c] = 0;
+    fz[c] = 0;
     if (i < b.i0 || i > b.i1 || j < b.j0 || j > b.j1 || k < b.k0 || k > b.k1) return;
     const Real lx = g.hy * g.hz / g.hx;
     const Real ly = g.hx * g.hz / g.hy;
+    const Real lz = g.hx * g.hy / g.hz;
     auto n4 = [&](int a, int bb) { // nut at the (a,bb) cell corner
         return Real(0.25)
              * (nut[gidx(g, a, bb, k)] + nut[gidx(g, a - 1, bb, k)]
                 + nut[gidx(g, a, bb - 1, k)] + nut[gidx(g, a - 1, bb - 1, k)]);
+    };
+    auto nxz = [&](int a, int q) { // nut on the (a,q) cell edge in the xz plane
+        return Real(0.25)
+             * (nut[gidx(g, a, j, q)] + nut[gidx(g, a - 1, j, q)]
+                + nut[gidx(g, a, j, q - 1)] + nut[gidx(g, a - 1, j, q - 1)]);
+    };
+    auto nyz = [&](int bb, int q) { // nut on the (bb,q) cell edge in the yz plane
+        return Real(0.25)
+             * (nut[gidx(g, i, bb, q)] + nut[gidx(g, i, bb - 1, q)]
+                + nut[gidx(g, i, bb, q - 1)] + nut[gidx(g, i, bb - 1, q - 1)]);
     };
     if (ax[c] > openTol)
     {
@@ -108,6 +125,8 @@ __global__ void kBodySgsFriction(GpuGrid g, const Real* nut, const Real* ax,
         link(gidx(g, i + 1, j, k), nut[c] * lx);
         link(gidx(g, i, j - 1, k), n4(i, j) * ly);
         link(gidx(g, i, j + 1, k), n4(i, j + 1) * ly);
+        link(gidx(g, i, j, k - 1), nxz(i, k) * lz);
+        link(gidx(g, i, j, k + 1), nxz(i, k + 1) * lz);
         fx[c] = s;
     }
     if (ay[c] > openTol)
@@ -120,7 +139,23 @@ __global__ void kBodySgsFriction(GpuGrid g, const Real* nut, const Real* ax,
         link(gidx(g, i, j + 1, k), nut[c] * ly);
         link(gidx(g, i - 1, j, k), n4(i, j) * lx);
         link(gidx(g, i + 1, j, k), n4(i + 1, j) * lx);
+        link(gidx(g, i, j, k - 1), nyz(j, k) * lz);
+        link(gidx(g, i, j, k + 1), nyz(j, k + 1) * lz);
         fy[c] = s;
+    }
+    if (az[c] > openTol)
+    {
+        Real s = 0;
+        auto link = [&](std::size_t nb, Real nl) {
+            if (az[nb] <= openTol) s += nl * (w[c] - w[nb]);
+        };
+        link(gidx(g, i, j, k - 1), nut[gidx(g, i, j, k - 1)] * lz);
+        link(gidx(g, i, j, k + 1), nut[c] * lz);
+        link(gidx(g, i - 1, j, k), nxz(i, k) * lx);
+        link(gidx(g, i + 1, j, k), nxz(i + 1, k) * lx);
+        link(gidx(g, i, j - 1, k), nyz(j, k) * ly);
+        link(gidx(g, i, j + 1, k), nyz(j + 1, k) * ly);
+        fz[c] = s;
     }
 }
 
@@ -198,14 +233,18 @@ DeviceBodyForce::measure(const DeviceCutGeometry& cut, const DeviceScalar& phi,
     c.cs += sumScalar(fz_, red) / qRef;
 
     if (nut)
-    {   // Folds into cd/cl only; cdf stays nu-only by project convention.
-        kBodySgsFriction<<<blocks, blockSize>>>(g_, nut->data(), cut.ax.data(),
-                                                cut.ay.data(), ghosted.u.data(),
-                                                ghosted.v.data(), box_, fx_.data(),
-                                                fy_.data());
+    {   // Folds into cd/cl/cs; cdf stays nu-only by project convention.
+        kBodySgsFriction<<<blocks, blockSize>>>(
+            g_, nut->data(), cut.ax.data(), cut.ay.data(), cut.az.data(),
+            ghosted.u.data(), ghosted.v.data(), ghosted.w.data(), box_,
+            fx_.data(), fy_.data(), fz_.data());
         checkLastKernel("bodySgsFriction");
         c.cd += sumScalar(fx_, red) / qRef;
         c.cl += sumScalar(fy_, red) / qRef;
+        // An exact-zero sum (every 2D run) is not added: -0.0 + 0.0 would
+        // flip a 2D cs of -0.0 to +0.0, and 2D stays bit for bit.
+        const double sz = sumScalar(fz_, red);
+        if (sz != 0.0) c.cs += sz / qRef;
     }
     return c;
 }

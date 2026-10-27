@@ -91,7 +91,11 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     }
     auto dev = mtr ? DeviceComp::make(*mtr, r.tr, r.les, r.sgs)
                    : DeviceComp::make(g, r.tr, r.les, r.sgs);
-    auto ds = DeviceCompState::make(g.size(), ransScalars(r.rans), steady);
+    // The compensated state: always on the steady march, opt-in on a time
+    // march (--compensated). --penalize, a plain-state edit, is rejected
+    // with it by the validator.
+    const bool compensated = steady || r.compensated;
+    auto ds = DeviceCompState::make(g.size(), ransScalars(r.rans), compensated);
     auto red = ReduceScratch::make();
     if (!dev || !ds || !red) return fail(6, "GPU allocation failed");
 
@@ -291,7 +295,10 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                                               r.pInf, focal, wallBc);
         if (!gh) return fail(6, "ghost wall init failed");
         // The deep-solid verdict the table path reports per bin, measured on
-        // the one frozen azimuth.
+        // the one frozen azimuth: the count the dry-run's thin-blade warning
+        // promises, and what gpu_mrf_rotor2 asserts is nonzero.
+        std::printf("rotor: frozen azimuth: %d ghosts, %d deep, %d faces\n",
+                    tbls.nGhost(), tbls.nDeep(), tbls.nFace());
         if (gh->deepCells().empty())
             std::printf("rotor: WARNING no deep-solid cells -- the body is "
                         "nowhere thicker than the mirror band. Thicken it "
@@ -433,9 +440,21 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                               .bnd = bnd,
                               .solidMask = std::move(solid)}))
             return fail(6, "GPU allocation failed (RANS)");
-        if (steady && !dev->enableCompensation())
-            return fail(6, "GPU allocation failed (compensated state)");
     }
+    // LES: the SGS mu_t takes the SAME images, so the body face carries the
+    // molecular stress (up to the staircase) and the y/z mirror rows hold a
+    // copy of their neighbour, not a gradient wrapped across the box.
+    else if (r.les > 0)
+    {
+        DeviceCompGhost* gp = ghost;
+        DeviceCompFar* fp = &*far;
+        dev->setMutHook([gp, fp](Real* nut, Real* f1) {
+            gp->mirrorMut(nut, f1);
+            fp->applyMut(nut, f1);
+        });
+    }
+    if (compensated && !dev->enableCompensation())
+        return fail(6, "GPU allocation failed (compensated state)");
 
     // --penalize: the band decay rides the stage hook (runs once per RK
     // stage, so each application carries dt/3; penDt is set per step below).
@@ -616,6 +635,54 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     };
     const double span = g.nz > 1 ? g.nz * g.hz : 1.0;
 
+    // --emit surface on the immersed ghost wall, once at the end: the tally
+    // per interface face, split into pressure / convective / viscous
+    // (DeviceCompGhost::surfaceFaces), gauge on pInf. The header line carries
+    // what a reader needs to normalize: the moment pivot, qRef * span and the
+    // propeller denominators. Reads the state only, so the run is unchanged.
+    // Its label is the run's: the RANS label when there is one, else the LES
+    // label or DNS, plus the frozen-rotor note on an MRF run (r.label is set
+    // only on a RANS run -- the progress line of a DNS/LES run is unchanged).
+    auto surfaceLabel = [&] {
+        std::string l = !r.label.empty() ? r.label
+                        : r.les > 0      ? lesRunLabel(r.sgs, r.les, g.nz == 1)
+                                         : std::string("DNS");
+        if (r.rotor.active() && r.rotorMrf)
+            l += " [MRF frozen rotor: an APPROXIMATION]";
+        return l;
+    };
+    auto writeSurface = [&]() -> std::expected<void, RunError> {
+        if (!out.wantsSurface()) return {};
+        auto fs = ghost->surfaceFaces(*dev, *ds, r.pInf);
+        if (!fs) return fail(6, "the surface tally split failed");
+        if (auto h = internal::checkDevice("the surface tally", &*red); !h)
+            return std::unexpected(h.error());
+        std::vector<std::vector<double>> rows;
+        rows.reserve(fs->size());
+        for (const auto& f : *fs)
+            rows.push_back({f.x[0],  f.x[1],  f.x[2],  double(f.axis),
+                            double(f.sign), f.area, f.s[0], f.s[1], f.s[2],
+                            f.p,     f.f[0],  f.f[1],  f.f[2],  f.fp[0],
+                            f.fp[1], f.fp[2], f.fc[0], f.fc[1], f.fc[2],
+                            f.fv[0], f.fv[1], f.fv[2]});
+        const std::string cs[] = {"x",   "y",   "z",   "axis", "sign", "area",
+                                  "sx",  "sy",  "sz",  "p",    "fx",   "fy",
+                                  "fz",  "fpx", "fpy", "fpz",  "fcx",  "fcy",
+                                  "fcz", "fvx", "fvy", "fvz"};
+        const auto& pv = r.rotor.shaft;
+        const std::string comment = std::format(
+            "{} | immersed ghost wall: one row per interface face, flux fluid "
+            "-> body in solver units, gauge on pInf {:.10g} | pivot {:.10g} "
+            "{:.10g} {:.10g} | qRef*span {:.10g} | ctDen {:.10g} | cqDen "
+            "{:.10g} | shaft {}",
+            surfaceLabel(), r.pInf, pv[0],
+            pv[1], pv[2], r.qRef * span, ctDen, cqDen,
+            r.rotor.active() ? shaftAxis : -1);
+        if (auto e = out.writeSurface(comment, cs, rows, 10); !e)
+            return fail(4, e.error());
+        return {};
+    };
+
     if (steady)
     {
         // The pseudo-time march (docs/rans.md, "Immersed-wall RANS"): the
@@ -692,6 +759,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         st.tStop = res->t;
         if (auto h = internal::checkDevice("the end of the run", &*red); !h)
             return std::unexpected(h.error());
+        if (auto e = writeSurface(); !e) return std::unexpected(e.error());
         finishTiming(st, wall0, out);
         if (!res->converged && !stopRequested())
             return fail(8, std::format("steady state not reached in {} "
@@ -863,6 +931,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                     "%.1f revolutions)\n",
                     rotorSwaps, st.steps, double(rotorSwaps) / double(st.steps),
                     std::abs(r.rotor.omega) * t / (2.0 * std::numbers::pi));
+    if (auto e = writeSurface(); !e) return std::unexpected(e.error());
     finishTiming(st, wall0, out);
     return st;
 }

@@ -117,8 +117,8 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
     // O-grid rows zero the low words they overwrite. The Newton-Krylov march
     // keeps its own FP64 iterate and hands the kernels a plain state.
     const bool implicit = steady && r.steadyImplicit;
-    auto ds = DeviceCompState::make(g.size(), ransScalars(r.rans),
-                                    steady && !implicit);
+    const bool compensated = (steady && !implicit) || r.compensated;
+    auto ds = DeviceCompState::make(g.size(), ransScalars(r.rans), compensated);
     auto red = ReduceScratch::make();
     if (!dev || !ds || !red) return fail(6, "GPU allocation failed");
     if (implicit && og.revolved && !og.rev.wedge)
@@ -253,19 +253,39 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
                                   .mutHook = mutHook,
                                   .fluidMask = fluid}))
         return fail(6, "GPU allocation failed (RANS)");
+    // LES: the same rows image the SGS mu_t -- odd on the wall row, so the
+    // wall face carries the molecular stress exactly (the wall tally then
+    // needs no mu_t), and an even far row instead of row 0's centre gradient
+    // differenced across the j-wrap.
+    if (r.les > 0) dev->setMutHook(mutHook);
     if (steady && !rans && !dev->enableSteady(fluid))
         return fail(6, "GPU allocation failed (steady)");
-    if (steady && !implicit && !dev->enableCompensation())
+    if (compensated && !dev->enableCompensation())
         return fail(6, "GPU allocation failed (compensated state)");
 
     // Both boundary rows ride the stage hook: they carry no solution, so the
     // rhs computed on them is discarded and re-derived every stage. The axis
     // ghosts follow the rows (they copy the rows' ghost cells too).
+    // Idempotent: the rows read only real cells (rows 1 and ny-2) and their
+    // own column's ghosts; the axis then rewrites its ghost columns (and the
+    // wedge its ghost planes) from plane 1's cells alone -- so the hooked
+    // state depends on no cell the hook writes. Every state this runner hands
+    // step() comes straight from applyBc: after the upload below, after every
+    // step (the time march's loop tail, SteadyMarchIo::afterStep), with only
+    // reads (tallies, frames, residual, dt) in between. The NK march never
+    // calls step().
     auto applyBc = [&](DeviceCompState& s) {
         wall->apply(s);
         if (axis) axis->apply(s);
     };
-    dev->setStageHook(applyBc);
+    dev->setStageHook(applyBc, Idempotent::yes);
+    // The wedge's ghost planes k = 0, 2 are kWedgePlanes' rotated copies of
+    // plane 1 -- every field and low word, rewritten by the hook before any
+    // read -- so the stage kernels form plane 1 alone (2/3 of their cells
+    // were discarded work).
+    if (wedge)
+        dev->setStageRange({std::size_t(g.nx) * g.ny,
+                            2 * std::size_t(g.nx) * g.ny});
 
     bool upOk = ds->upload(ic) == hipSuccess;
     for (int i = 0; i < ds->nT; ++i)

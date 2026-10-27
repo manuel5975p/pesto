@@ -79,6 +79,11 @@ struct CompGhostTables
     // Wall distance of each ghost centre (-sdf): the RANS omega image needs
     // the sample's wall distance d_s = dw / a (dns/rans.hpp, applyTurb).
     std::vector<Real> gdw;
+    // The FLUID face neighbours of each ghost, kFaceNbr per ghost, -1 padded
+    // (the cells across its interface faces, in face order): the mu_t image
+    // is clamped against them (mirrorMut).
+    static constexpr int kFaceNbr = 6;
+    std::vector<int> gfnb;
     std::vector<Real> uwall; // wall velocity per ghost, xyz; empty = at rest
     // Per ghost, a_wall . (x_sample - x_ghost): the pressure image's increment
     // per unit sample density, p_ghost = p_sample + rho_sample * aspan. Present
@@ -191,9 +196,11 @@ public:
     // and deep cell (all fields) zeroed. Pre: s.nT == ransScalars(model).
     void applyTurb(DeviceCompState& s, RansModel model, const Transport& tr,
                    double omegaInf) const;
-    // mu_t / F1 images for the mutHook: mu_t_g = -a sum w mu_t_s (the wall
-    // face average ~ 0, never computed from ghost scalars), F1_g = sum w F1_s;
-    // deep cells mu_t = 0, F1 = 1. f1 may be null (SA).
+    // mu_t / F1 images for the mutHook: mu_t_g = -min(a sum w mu_t_s, min of
+    // its fluid face neighbours' mu_t) -- the odd image (wall face average ~ 0,
+    // never computed from ghost scalars), clamped so every staircase face
+    // keeps mu + mu_t >= mu; F1_g = sum w F1_s; deep cells mu_t = 0, F1 = 1.
+    // f1 may be null (SA). Pre: the fluid mu_t is final.
     void mirrorMut(Real* nut, Real* f1) const;
     // The first-cell y+ the immersed wall resolves, per interface face from
     // its FLUID cell c: y+ = sqrt(|u_c| d_c / nu_c), the linear-sublayer
@@ -212,7 +219,7 @@ public:
     //
     // heat is the CONDUCTION alone -- the Fourier term kappa dT/dn of those
     // same faces, with kappa the face-averaged, Sutherland-scaled value the
-    // flux itself uses. The convective and viscous-work parts of the face
+    // flux itself uses (plus the eddy conductivity under RANS/LES). The convective and viscous-work parts of the face
     // energy flux are deliberately excluded: on a staircase no-slip wall the
     // face velocity is the average of a fluid cell and its mirror ghost, so
     // those terms are the mirror's imperfection rather than heat, and they do
@@ -236,12 +243,34 @@ public:
     // Momentum flux, wall heat and moment fluid -> body through the interface
     // (calls solver.primitives(s); state must be ghost-filled, i.e. after
     // apply). `pivot` is the world point the moment is taken about.
-    // Under RANS (solver.rans()) the viscous part carries the face mu_t with
-    // the solver's eddy conductivity, through the curvilinear flux the solver
-    // itself uses, so drag is the budget of the solved equations; without
-    // RANS, today's tally bit for bit.
+    // Under RANS or LES the viscous part (and heat's conduction) carries the
+    // face mu_t -- with its wall image, mirrorMut -- and the solver's eddy
+    // conductivity, through the flux the solver itself uses, so drag, torque
+    // and heat are the budget of the solved equations (gpu_les_wall pins the
+    // momentum closure); without either, the molecular tally bit for bit.
     Force force(DeviceComp& solver, const DeviceCompState& s,
                 const std::array<double, 3>& pivot = {});
+
+    // One interface face of the same tally, split (--emit surface on the
+    // ghost wall: which part of the body carries which part of the force).
+    // s = the face area vector oriented into the body (Cartesian: sign * area
+    // along `axis`; focal: the metric S); p = the KG face pressure the flux
+    // uses, minus pRef. f = the face's full momentum flux minus pRef s (gauge:
+    // the closed surface has sum s == 0, so sum f == force() to round-off),
+    // fp = p s its pressure part, fc its convective part (rho u_rel u at the
+    // face: the mirror's imperfection on a no-slip wall, not a stress), and
+    // fv = f - fp - fc the viscous stress. Parts in FP64 from the same FP32
+    // face values; f is the default tally's own expression.
+    struct SurfaceFace
+    {
+        double x[3];
+        int axis, sign;
+        double area, s[3], p, f[3], fp[3], fc[3], fv[3];
+    };
+    // Same preconditions and mu_t as force(); one row per resident face, in
+    // table order. Fails only on a device error (allocation, copy).
+    std::expected<std::vector<SurfaceFace>, hipError_t>
+    surfaceFaces(DeviceComp& solver, const DeviceCompState& s, double pRef);
 
     // True when make() was given an active focal remap: the force tally then
     // integrates the curvilinear face flux (area carried by S) instead of the
@@ -264,6 +293,12 @@ public:
 
 private:
     DeviceCompGhost() = default;
+    // force()/surfaceFaces() shared front half: primitives, mu_t, and the
+    // face-flux kernel into acc (kSplit stages the parts, see kBodyFlux).
+    // False on the focal-without-curvilinear-solver programmer error.
+    template <bool kSplit>
+    bool stageFlux(DeviceComp& solver, const DeviceCompState& s, double* acc,
+                   double pRef);
 
     GpuGrid g_{};
     Real gamma_ = Real(1.4), rhoInf_ = Real(1), pInf_ = Real(1);
@@ -279,6 +314,7 @@ private:
     DeviceBuffer<Real> tw_;      // and their weights
     DeviceBuffer<Real> gscale_;  // velocity extrapolation factor dw/ds
     DeviceBuffer<Real> gdw_;     // ghost wall distance (RANS omega image)
+    DeviceBuffer<int> gfnb_;     // fluid face neighbours per ghost (mu_t clamp)
     // Wall velocity at each ghost's own wall point, xyz interleaved; empty on a
     // resting wall, which is what selects the untouched arithmetic in kGhostFill.
     DeviceBuffer<Real> uwall_;

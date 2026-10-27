@@ -9,6 +9,10 @@
 //       the real plane, bit-exact against a host recomputation
 //   (d) w == 0 in the real plane is preserved over 200 steps (|w| <= 1e-6 U)
 //   (e) a 200-step laminar Re 100 wedge smoke: finite, positive drag
+//   (f) 200 wedge URANS steps: finite, no guard hits, mu_t 0 on the wall
+//   (g) the scaled wedge tally is Archimedes' force
+//   (h) the real-plane stage range plus the skipped entry hook is the
+//       whole-grid march byte for byte (SA plain, SST compensated LTS)
 // Seconds.
 #include "dns/comp.hpp"
 #include "dns/curvmesh.hpp"
@@ -25,6 +29,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <numbers>
 #include <random>
@@ -427,6 +432,76 @@ void tallyScaling()
     check(rel < 2e-2, "(g) the scaled wedge tally is Archimedes' force (2%)");
 }
 
+// (h) the wedge's launch reduction is bit-identical: the stage kernels on the
+// real plane only (setStageRange) and no step()-entry hook (Idempotent::yes)
+// leave every field of every cell -- ghost planes, ghost columns and low words
+// included -- byte-equal to the whole-grid run. SA: a plain URANS march; SST:
+// the compensated local-time-stepping march of --steady.
+void launchReduction()
+{
+    for (RansModel m : {RansModel::SaNeg, RansModel::Sst2003m}) {
+        const std::string n(ransName(m));
+        const bool comp = ransSst(m);
+        std::vector<std::vector<float>> f[2];
+        unsigned long long hits[2] = {0, 0};
+        for (int v = 0; v < 2; ++v) {
+            auto r = makeRig(64, 48, 1e4, m);
+            if (!r) { check(false, n + " (h) rig"); return; }
+            if (comp) {
+                auto cs = gpu::DeviceCompState::make(r->g.size(), r->ds->nT, true);
+                if (!cs || !r->dev->enableCompensation()) {
+                    check(false, n + " (h) compensated alloc");
+                    return;
+                }
+                *r->ds = std::move(*cs);
+            }
+            uniformState(*r);
+            apply(*r);
+            if (v == 1) {
+                const std::size_t pl = std::size_t(r->g.nx) * r->g.ny;
+                r->dev->setStageRange({pl, 2 * pl});
+                Rig* p = r.get();
+                r->dev->setStageHook(
+                    [p](gpu::DeviceCompState& s) {
+                        p->bc->apply(s);
+                        p->axis->apply(s);
+                    },
+                    gpu::Idempotent::yes);
+            }
+            double dt = 0;
+            for (int s = 0; s < 120; ++s) {
+                if (s % 16 == 0) {
+                    dt = comp ? 0.95 * r->dev->localDt(*r->ds, *r->red, 0.4)
+                              : 0.9 * r->dev->stableDt(*r->ds, *r->red, 0.4);
+                    if (comp) r->dev->setLts(true);
+                }
+                r->dev->step(*r->ds, gpu::Real(dt));
+                apply(*r);
+            }
+            const gpu::DeviceCompState& q = *r->ds;
+            for (const gpu::DeviceScalar* b :
+                 {&q.rho, &q.mx, &q.my, &q.mz, &q.E, &q.t[0]})
+                f[v].push_back(down(*b));
+            if (comp) {
+                f[v].push_back(down(q.t[1]));
+                for (const auto& lo : q.lo) f[v].push_back(down(lo));
+                for (const auto& lo : q.tlo) f[v].push_back(down(lo));
+            }
+            hits[v] = r->dev->floorHits();
+        }
+        bool same = f[0].size() == f[1].size();
+        for (std::size_t b = 0; same && b < f[0].size(); ++b)
+            same = f[0][b].size() == f[1][b].size() &&
+                   std::memcmp(f[0][b].data(), f[1][b].data(),
+                               f[0][b].size() * sizeof(float)) == 0;
+        std::printf("(h) %s: %zu fields after 120 steps, whole-grid vs "
+                    "real-plane stage + no entry hook: %s\n",
+                    n.c_str(), f[0].size(), same ? "byte-equal" : "DIFFER");
+        check(same && hits[0] == hits[1],
+              n + " (h): the launch reduction is bit-identical");
+    }
+}
+
 } // namespace
 
 int main()
@@ -439,5 +514,6 @@ int main()
     smoke();
     ransSmoke();
     tallyScaling();
+    launchReduction();
     return dnstest::finish();
 }

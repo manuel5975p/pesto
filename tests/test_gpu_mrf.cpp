@@ -29,11 +29,18 @@
 
 #include "gpu_test_util.hpp"
 #include "check.hpp"
+#include "validation_util.hpp"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <numbers>
+#include <regex>
+#include <string>
+#include <string_view>
 
 using namespace dns;
 using std::numbers::pi;
@@ -104,8 +111,9 @@ void testTransparency()
     const double devEnd = deviation();
     std::printf("transparency: %d steps to t=2, max deviation %.3e (t=1: "
                 "%.3e)\n", steps, devEnd, devMid);
-    // Band: measured 2026-07-31 on gfx1201, 64^3: 6.4e-6 at t=1, 1.1e-5 at
-    // t=2 (FP32 roundoff of the corner-potential telescoping). The pointwise
+    // Band: measured 2026-10-27 on gfx1100, 64^3: 5.5e-6 at t=1, 8.9e-6 at
+    // t=2 (gfx1201 2026-07-31: 6.4e-6 / 1.1e-5; FP32 roundoff of the
+    // corner-potential telescoping). The pointwise
     // blend this replaced measured 3.2e-2 on the same rig -- a formulation
     // regression lands 3 orders above this band.
     check(devEnd < 1e-4, "uniform axial flow passes the zone");
@@ -176,6 +184,26 @@ SpinResult spinUp(bool mrf, double tEnd)
     }
     gh->apply(*ds);
     const auto F = gh->force(*dev, *ds, rot.shaft);
+    // The per-face split (--emit surface) on a MOVING wall, both frames: its
+    // rows' moment is the tallied torque, and the parts say where it lives.
+    if (const auto rows = gh->surfaceFaces(*dev, *ds, pInf); rows) {
+        double q = 0, qp = 0, qc = 0, qv = 0, gross = 0;
+        for (const auto& r : *rows) {
+            const double dx = r.x[0] - cx, dy = r.x[1] - cy;
+            q += dx * r.f[1] - dy * r.f[0];
+            qp += dx * r.fp[1] - dy * r.fp[0];
+            qc += dx * r.fc[1] - dy * r.fc[0];
+            qv += dx * r.fv[1] - dy * r.fv[0];
+            gross += std::abs(dx * r.f[1] - dy * r.f[0]);
+        }
+        std::printf("%s split: torque rows %.6e vs tally %.6e; pressure %.3e "
+                    "convective %.3e viscous %.3e\n",
+                    mrf ? "mrf" : "direct", q, F.qz, qp, qc, qv);
+        check(std::abs(q - F.qz) < 1e-6 * gross,
+              "split rows' torque == the tally's (moving wall)");
+    } else {
+        check(false, "surfaceFaces on the spinning cylinder");
+    }
     (void)ds->download(host);
 
     SpinResult out{.torque = F.qz};
@@ -206,15 +234,19 @@ void testFrameParity(const SpinResult& direct)
     check(direct.torque < 0.0 && mrf.torque < 0.0,
           "both frames report a torque opposing the spin");
     // Axisymmetric outer conditions: frozen rotor is exact, so the two runs
-    // differ only at truncation level. Measured 2026-07-31 on gfx1201:
-    // torque -8.9619e-2 direct vs -8.9628e-2 mrf (1.0e-4 relative), uTheta
-    // gap 3.7e-5 relative. Banded ~200x.
+    // differ only at truncation level. Measured 2026-10-27 on gfx1100: torque
+    // -8.94427e-2 direct vs -8.94411e-2 mrf (1.8e-5 relative), uTheta gap
+    // 1.7e-5 relative (2026-07-31 gfx1201, before the wall-acceleration
+    // pressure image: 1.0e-4 / 3.7e-5). Banded 1e-3: >= 10x either record.
+    std::printf("parity: torque gap %.2e, uTheta gap %.2e (relative)\n",
+                std::abs(mrf.torque / direct.torque - 1),
+                std::abs(mrf.uTheta / direct.uTheta - 1));
     check(std::abs(mrf.torque - direct.torque) <
-              0.02 * std::abs(direct.torque),
-          "torque agrees between the frames (axisymmetric rig)");
+              1e-3 * std::abs(direct.torque),
+          "torque agrees between the frames (axisymmetric rig, 1e-3)");
     check(std::abs(mrf.uTheta - direct.uTheta) <
-              0.04 * std::abs(direct.uTheta),
-          "driven swirl agrees between the frames");
+              1e-3 * std::abs(direct.uTheta),
+          "driven swirl agrees between the frames (1e-3)");
 }
 
 // --- 3. the node-psi zone on the body-fitted O-grid (setMrfCurv) ------------
@@ -393,17 +425,149 @@ void testOGridFrameParity(const SpinResult& direct)
           "the O-grid MRF torque opposes the spin");
     // Two wall discretizations (mesh-face row vs ghost staircase), two
     // frames, one flow: agreement is truncation-level, not roundoff.
-    check(std::abs(og.torque - direct.torque) < 0.10 * std::abs(direct.torque),
-          "O-grid MRF torque matches the Cartesian direct run");
-    check(std::abs(og.uTheta - direct.uTheta) < 0.10 * std::abs(direct.uTheta),
-          "O-grid MRF driven swirl matches the Cartesian direct run");
+    // Measured 2026-10-27 on gfx1100: torque 0.224%, uTheta 0.626%; banded
+    // >= 3x (a correct wall fix may legitimately move them).
+    std::printf("ogrid parity: torque gap %.3f%%, uTheta gap %.3f%%\n",
+                100 * std::abs(og.torque / direct.torque - 1),
+                100 * std::abs(og.uTheta / direct.uTheta - 1));
+    check(std::abs(og.torque - direct.torque) < 0.01 * std::abs(direct.torque),
+          "O-grid MRF torque matches the Cartesian direct run (1%)");
+    check(std::abs(og.uTheta - direct.uTheta) < 0.02 * std::abs(direct.uTheta),
+          "O-grid MRF driven swirl matches the Cartesian direct run (2%)");
 }
+
+// --- 4. bladed MRF end to end: the rotor2 L1 regression pin -----------------
+//
+// Nothing else pins bladed thrust and torque, so a tally or wall change that
+// moves them (78860e3 moved CT -2.4%) passed unseen. This runs the BUILT
+// binary on the parity suite's rotor2 L1 grid (tools/parity/cases.toml,
+// D/h_fine 39.1 on x) for 1 D/U and pins ct/cq to the values it measured.
+// A REGRESSION PIN, not a literature band: CT at 1 D/U is unsettled (the
+// 4.5 D/U L1 run is 8% lower), which is fine for a pin. The grid is the
+// coarsest that keeps a deep-solid core (blade t/h 3.6..4.4: below that the
+// two surfaces read through each other), and the test asserts that core.
+// Fixture: tests/data/rotor2.stl = tools/parity/geom.py write_rotor_stl with
+// propeller.py `--blades 2 --root-chord 0.40 --tip-chord 0.30 --thickness
+// 0.35 --pitch 1.0` (swept diameter scaled to 1).
+#if defined(DNS_BIN) && defined(DNS_ROTOR2_STL)
+void testRotor2Pin()
+{
+    const std::string prefix = "gpu_mrf_rotor2";
+    const std::string out = prefix + "_stdout.txt";
+    // --ramp 0.4 + ft 0.054512: tEnd = 0.4 + 0.054512 * 7.06858 = pi/4 = 1 D/U.
+    const int rc = valtest::runBinaryTo(
+        "\"" DNS_BIN "\" flow --physics compressible --body \"" DNS_ROTOR2_STL
+        "\" --robust --n 150 --ny 100 --nz 100 --dr 6 --focal auto "
+        "--focal-ratio 5 --focal-blend 1 --rotor-mach 0.41 --rotor-axis x "
+        "--rotor-frame mrf --mach 0.082219 --re 220 --kick 0 --ramp 0.4 "
+        "--ft 0.054512 --emit stats --emit surface --out " + prefix, out);
+    check(rc == 0, "rotor2 L1 MRF run exits 0");
+    if (rc != 0) return;
+
+    std::ifstream f(out);
+    const std::string log((std::istreambuf_iterator<char>(f)), {});
+    check(log.find("frozen rotor -- an APPROXIMATION") != std::string::npos,
+          "the run labels MRF a frozen-rotor approximation");
+    std::smatch m;
+    const std::regex re(R"(frozen azimuth: (\d+) ghosts, (\d+) deep, (\d+) faces)");
+    const bool found = std::regex_search(log, m, re);
+    check(found, "the run reports the measured deep-solid count");
+    if (found) {
+        std::printf("rotor2: %s ghosts, %s deep, %s faces\n", m[1].str().c_str(),
+                    m[2].str().c_str(), m[3].str().c_str());
+        check(std::stoi(m[2].str()) > 0,
+              "the blade keeps a deep-solid core (both surfaces mirror)");
+    }
+
+    const auto st = valtest::loadCsv(prefix + "_stats.csv");
+    check(st.has_value() && !st->col("t").empty(), "rotor2 stats rows written");
+    if (!st || st->col("t").empty()) return;
+    const double t = st->col("t").back(), ct = st->col("ct").back(),
+                 cq = st->col("cq").back();
+    std::printf("rotor2 L1 at t %.6f (1 D/U = %.6f): ct %.6g cq %.6g\n", t,
+                pi / 4, ct, cq);
+    check(std::abs(t - pi / 4) < 1e-4, "run reaches 1 D/U");
+    // Measured 2026-10-27 on gfx1100 (W7): ct 0.0565675, cq -0.0911887,
+    // bit-identical across two builds. Banded 1%: a regression pin.
+    constexpr double ctPin = 0.0565675, cqPin = -0.0911887;
+    std::printf("rotor2 pin: ct %+.3f%%, cq %+.3f%%\n", 100 * (ct / ctPin - 1),
+                100 * (cq / cqPin - 1));
+    check(std::abs(ct / ctPin - 1) < 0.01, "rotor2 L1 ct at 1 D/U pinned (1%)");
+    check(std::abs(cq / cqPin - 1) < 0.01, "rotor2 L1 cq at 1 D/U pinned (1%)");
+
+    // The ghost-wall split (--emit surface, W6): one row per interface face,
+    // summing to the tallied thrust and torque (the stats file's 6 digits),
+    // pressure + convective + viscous == total, and the parts pinned.
+    std::ifstream sf(prefix + "_surface.csv");
+    std::string head;
+    std::getline(sf, head);
+    std::smatch pm;
+    const bool hasPivot = std::regex_search(
+        head, pm, std::regex(R"(pivot (\S+) (\S+) (\S+))"));
+    check(hasPivot, "surface header carries the moment pivot");
+    check(head.starts_with("# DNS [MRF frozen rotor: an APPROXIMATION] |"),
+          "surface header labels MRF a frozen-rotor approximation");
+    const auto sv = valtest::loadCsv(prefix + "_surface.csv");
+    check(sv.has_value() && found &&
+              sv->rows() == std::size_t(std::stoi(m[3].str())),
+          "one surface row per interface face");
+    if (sv && hasPivot) {
+        const double py = std::stod(pm[2].str()), pz = std::stod(pm[3].str());
+        const double thrust = st->col("thrust").back(),
+                     torque = st->col("torque").back();
+        const double ctDen = thrust / ct, cqDen = torque / cq;
+        const auto& y = sv->col("y");
+        const auto& z = sv->col("z");
+        double fx[4] = {0, 0, 0, 0}, mx[4] = {0, 0, 0, 0}, gross = 0;
+        const char* part[4] = {"f", "fp", "fc", "fv"};
+        for (std::size_t i = 0; i < sv->rows(); ++i)
+            for (int p = 0; p < 4; ++p) {
+                const std::string s = part[p];
+                const double fxi = sv->col(s + "x")[i];
+                fx[p] += fxi;
+                mx[p] += (y[i] - py) * sv->col(s + "z")[i] -
+                         (z[i] - pz) * sv->col(s + "y")[i];
+                if (p == 0) gross += std::abs(fxi);
+            }
+        std::printf("rotor2 split: ct %.6g = p %.6g + c %.6g + v %.6g; cq %.6g "
+                    "= p %.6g + c %.6g + v %.6g\n",
+                    fx[0] / ctDen, fx[1] / ctDen, fx[2] / ctDen, fx[3] / ctDen,
+                    mx[0] / cqDen, mx[1] / cqDen, mx[2] / cqDen, mx[3] / cqDen);
+        check(std::abs(fx[0] / thrust - 1) < 1e-5,
+              "surface rows sum to the tallied thrust");
+        check(std::abs(mx[0] / torque - 1) < 1e-5,
+              "surface rows' moment is the tallied torque");
+        check(std::abs(fx[1] + fx[2] + fx[3] - fx[0]) < 1e-8 * gross,
+              "pressure + convective + viscous == total");
+        // Measured 2026-10-27 on gfx1100 (W6), same run as the ct/cq pin.
+        constexpr double ctP = 0.0138105, ctC = 0.00556694, ctV = 0.0371901;
+        check(std::abs(fx[1] / ctDen / ctP - 1) < 0.01, "rotor2 ct pressure part pinned (1%)");
+        check(std::abs(fx[2] / ctDen / ctC - 1) < 0.01, "rotor2 ct convective part pinned (1%)");
+        check(std::abs(fx[3] / ctDen / ctV - 1) < 0.01, "rotor2 ct viscous part pinned (1%)");
+    }
+
+    std::error_code ec;
+    for (const char* suf : {"_stdout.txt", "_stats.csv", ".json", "_mask.bin",
+                            "_surface.csv"})
+        std::filesystem::remove(prefix + suf, ec);
+}
+#endif
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     test::requireDeviceOrSkip();
+    // `rotor2`: the bladed end-to-end pin alone (its own ctest entry,
+    // gpu_mrf_rotor2), so the solver-level rigs keep their own budget.
+    if (argc > 1 && std::string_view(argv[1]) == "rotor2") {
+#if defined(DNS_BIN) && defined(DNS_ROTOR2_STL)
+        testRotor2Pin();
+#else
+        check(false, "rotor2 needs DNS_BIN and DNS_ROTOR2_STL");
+#endif
+        return dnstest::finish();
+    }
     testTransparency();
     const auto direct = spinUp(false, 3.0);
     testFrameParity(direct);

@@ -45,7 +45,7 @@ enum class OGridThermal
     // the channel's adiabatic branch.
     Adiabatic,
     // T0 = 2 Twall - T1 (floored positive), p0 = p1, rho0 = p0 / (R T0), E0
-    // rebuilt on the antimirrored velocity: the channel's kChannelWallY
+    // rebuilt on the antimirrored velocity: the channel's kChannelRows
     // arithmetic, which applies here UNCHANGED because the O-grid puts the
     // ghost row at the exact geometric reflection of the first fluid row about
     // the wall face, so the reflection factor is exactly 1.
@@ -162,7 +162,8 @@ public:
     // On a compensated state every written cell's low words are zeroed.
     void apply(DeviceCompState& s) const;
 
-    // The mu_t images of the two rows (RansSetup::mutHook): row 0 odd (the
+    // The mu_t images of the two rows (DeviceComp::setMutHook, RANS or
+    // LES): row 0 odd (the
     // wall face holds exactly 0.0) with F1 even; row ny-1 an EVEN copy of row
     // ny-2 for both -- SST's centre gradient on row ny-1 wraps to row 0, so
     // the far ghost must hold a finite neighbour value, never a reflection.
@@ -218,8 +219,10 @@ public:
     // the closed surface they form sums to zero identically (a uniform state
     // gives exactly zero force), and no geometry is approximated anywhere.
     //
-    // Molecular stress only, like the ghost tally -- the SGS eddy viscosity is
-    // deliberately not added, so `cdf` means the same thing on both paths.
+    // Molecular stress only, and that IS the solved budget under RANS and LES
+    // alike: mutHook() makes mu_t odd across the wall row, so the wall-face
+    // average the flux adds is exactly 0.0 (gpu_les_wall (a), gpu_rans_ogrid
+    // (d)) and passing mu_t here would add +0.0 to mu and kappa.
     // Pre: the state is wall-filled (call apply first); calls solver.primitives.
     Surface surface(DeviceComp& solver, const DeviceCompState& s);
 

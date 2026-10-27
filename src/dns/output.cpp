@@ -106,9 +106,9 @@ struct RunOutput::Impl
     std::string json() const
     {
         // "rans" and "steady" are appended fields, present only on a RANS run
-        // / an implicit steady run, and the flow-RANS keys only on a flow
-        // RANS or compressible steady run, so every other run's .json reads
-        // exactly as it did.
+        // / an implicit steady run, the flow-RANS keys only on a flow RANS or
+        // compressible steady run, and "state" only on a --compensated time
+        // march, so every other run's .json reads exactly as it did.
         auto key = [](const char* k, const std::string& v) {
             return v.empty() ? std::string()
                              : std::format(",\"{}\":\"{}\"", k, v);
@@ -117,14 +117,15 @@ struct RunOutput::Impl
             "{{\"nx\":{},\"ny\":{},\"nz\":{},\"frames\":{},\"frameDt\":{},"
             "\"D\":{},\"re\":{},\"mach\":{},\"cs\":{},\"les\":{},\"sgs\":\"{}\","
             "\"body\":\"{}\",\"far\":\"{}\",\"physics\":\"{}\",\"kick\":{},"
-            "\"msPerStep\":{}{}{}{}{}{}}}\n",
+            "\"msPerStep\":{}{}{}{}{}{}{}}}\n",
             meta.nx, meta.ny, meta.nz, frames, meta.frameDt, meta.D, meta.re,
             meta.mach, meta.cs, meta.les ? 1 : 0, meta.sgs, meta.body,
             meta.farField, meta.physics, meta.kick, msPerStep,
             key("rans", meta.rans), key("steady", meta.steady),
             key("ransMode", meta.ransMode), key("ransInflow", meta.ransInflow),
             meta.wedgeDeg > 0 ? std::format(",\"wedgeDeg\":{}", meta.wedgeDeg)
-                              : std::string());
+                              : std::string(),
+            key("state", meta.state));
     }
 
     void writeJson() const
@@ -433,11 +434,13 @@ RunOutput::writeMeshArtefact(std::string_view which, std::span<const char> bytes
 std::expected<void, std::string>
 RunOutput::writeSurface(std::string_view comment,
                         std::span<const std::string> cols,
-                        std::span<const std::vector<double>> rows)
+                        std::span<const std::vector<double>> rows, int digits)
 {
+    assert(digits > 0);
     if (!wantsSurface()) return {};
     const std::string path = p_->cfg.prefix + "_surface.csv";
     std::ofstream f(path);
+    f.precision(digits);
     f << "# " << comment << '\n';
     for (std::size_t i = 0; i < cols.size(); ++i) f << (i ? "," : "") << cols[i];
     f << '\n';
@@ -452,7 +455,8 @@ RunOutput::writeSurface(std::string_view comment,
 }
 
 std::expected<void, std::string>
-RunOutput::declareSeries(std::string_view name, std::span<const std::string> cols)
+RunOutput::declareSeries(std::string_view name, std::span<const std::string> cols,
+                         std::string_view comment)
 {
     if (!has(p_->cfg.kinds, Emit::Stats)) return {};
     const std::string key(name);
@@ -464,6 +468,7 @@ RunOutput::declareSeries(std::string_view name, std::span<const std::string> col
     f.clear();
     f.open(path);
     if (!f) return std::unexpected(std::format("cannot write '{}'", path));
+    if (!comment.empty()) f << "# " << comment << '\n';
     for (std::size_t i = 0; i < cols.size(); ++i)
         f << (i ? "," : "") << cols[i];
     f << '\n';

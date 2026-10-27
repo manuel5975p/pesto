@@ -28,6 +28,14 @@ OpenFOAM's own SST cd by +3.7% (L1, Re 1e3) / +2.8% (L2, Re 1e4) and L_r
 by -28% / -14%, so a parity number names its scheme (docs/validation.md).
 First-order upwind for the turbulence (as dns), SIMPLE consistent,
 relaxation U 0.9 / turbulence 0.8. Wall distance exactDistance.
+
+The small L1 Re 1e3 legs (the references of gates gpu_sst (b) and
+gpu_sa_wedge; docs/validation.md): dns `flow --physics compressible --body
+sphere --ogrid --nz 1 --n 64 --ny 48 --re 1e3 --mach 0.2 --ogrid-far 20
+--ogrid-beta 4.5 --rans sa-neg|sst-2003m --steady 1e-4 --emit mesh ...`
+(a 10-iteration run is enough for the mesh), then `case <out>_mesh.bin DIR
+sa|sst 1000 --iters 3000` and `run DIR` (serial, ~13-15 s). Measured
+2026-10-26/27, central U: SST cd 0.48872, SA cd 0.48419.
 """
 import json
 import math
@@ -164,6 +172,8 @@ boundaryField
         k = 2.25e-7
         w = k / (0.009 * nu)
         # float(): numpy 2 reprs np.float64 as "np.float64(...)".
+        # 60 must equal dns's sst::omegaWallFactor * beta1 (src/dns/rans.hpp,
+        # the one home of the TMR wall value 60 nu / (beta1 d1^2)).
         ww = "\n".join(f"{float(60 * nu / (BETA1 * d * d))!r}" for d in d1)
         field("k", "volScalarField", "[0 2 -2 0 0 0 0]", f"{k!r}",
               "type fixedValue; value uniform 0;",

@@ -110,3 +110,36 @@ per real wall face (i fastest, then k):
 | `yplus` | d1 u_τ/ν_f, u_τ from the TANGENTIAL viscous traction, ρ_f, ν_f on the face |
 | `d1` | the first fluid cell's wall distance (exact, to the discrete wall) |
 | `qw` | energy flux into the body per area (conduction at a resting wall) |
+
+## `<prefix>_surface.csv` (`--emit surface`, compressible immersed body)
+
+The same file name and the same "written once, at the end" contract, for the
+compressible IMMERSED ghost wall (no `--ogrid`): the surface tally
+(`DeviceCompGhost::force`, which every cd / cl / thrust / torque in the stats
+file comes from) per interface face, split (`DeviceCompGhost::surfaceFaces`).
+It reads the final state only, so a run with the flag writes stats
+bit-identical to one without. 10 significant digits (the parts are gauge
+forces summed over thousands of faces). Line 1 is `# ` + the run label (the
+RANS label, else the LES label `LES <model> Cs=...`, else `DNS`; an
+`--rotor-frame mrf` run appends `[MRF frozen rotor: an APPROXIMATION]`), then
+`|`-separated fields: `immersed ghost wall: ...`, `gauge on pInf P`,
+`pivot X Y Z` (the moment point: the rotor shaft, else the origin),
+`qRef*span Q` (cd = fx / Q), `ctDen` = ρn²D⁴ and `cqDen` = ρn²D⁵ (0 without a
+rotor; D = cqDen / ctDen), `shaft A` (axis index, −1 without a rotor). Line 2
+is the header, then one row per interface face in table order. All forces are
+the flux from the FLUID into the BODY (the force on the body), solver units:
+
+| column | meaning |
+|---|---|
+| `x`, `y`, `z` | face centre (physical; the focal remap of the reference face) |
+| `axis`, `sign` | the face normal's axis (0/1/2) and the side the ghost is on (+1/−1) |
+| `area` | \|s\| |
+| `sx`, `sy`, `sz` | area vector oriented into the body: sign·area along `axis` (Cartesian), the oriented metric S (focal). Σ s = 0 (closed surface) |
+| `p` | the KG face pressure the flux uses, ½(p_fluid + p_ghost), minus pInf |
+| `fx`, `fy`, `fz` | the full face momentum flux minus pInf s (gauge); Σ = the tally to round-off |
+| `fpx`, `fpy`, `fpz` | its pressure part p s |
+| `fcx`, `fcy`, `fcz` | its convective part ρ_f u_a,n u_f (u_a the advecting velocity: wall-relative in the MRF zone). Zero on an exact no-penetration face when u_a is wall-relative (a resting wall, or MRF); on the staircase it is the mirror's imperfection carried through the wall, not a stress, and it scales with the wall speed. On a DIRECT moving rotor (`--rotor-bins`) u_a is the absolute velocity on a fixed face the wall sweeps through, so `fc` also carries the wall's own normal motion ρ u_w,n u |
+| `fvx`, `fvy`, `fvz` | the viscous stress, f − fp − fc |
+
+`tools/parity/split_dns.py` sorts a rotor's rows into hub and blade and
+prints CT / CQ per part against the same sort of an OpenFOAM case.

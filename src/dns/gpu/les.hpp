@@ -53,8 +53,9 @@ public:
     // edge-averaged nut. Explicitly stable: dt*nut/h^2 ~ Cs^2 * CFL << 1.
     void addEddyDiffusion(const DeviceField& U, Real scale, DeviceField& out) const;
 
-    // The SGS viscosity field, for the body SGS-friction tally. Never enters
-    // the cdf column.
+    // The SGS viscosity field (zero before the first computeNut), for the
+    // body SGS-friction tally and the runner's diffusive dt bound. Never
+    // enters the cdf column.
     const DeviceScalar& nut() const { return nut_; }
 
 private:

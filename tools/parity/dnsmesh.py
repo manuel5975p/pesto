@@ -6,13 +6,20 @@ and OpenFOAM on identical meshes, never regenerated: this reads
 <out>_mesh.bin (dns/meshio.hpp, docs/viewer-format.md) and writes
 constant/polyMesh/{points,faces,owner,neighbour,boundary} directly.
 
-Revolved WEDGE (the only layout in this plan): the real cells i = 1..nTheta,
-j = 1..ny-2 of plane k = 1. The degenerate axis faces are dropped and the
-coincident axis points merged, so the axis-adjacent cells become prisms
-(their j-faces triangles). Patches: sphere (wall), farfield (patch), wedge0 /
-wedge1 (wedge, node planes 1 and 2: the wedge is symmetric about z = 0 with
-the axis along x, OpenFOAM's convention). Lengths are divided by the dns
-diameter D = pi/4 (box units) so the OpenFOAM case has D = 1.
+Two layouts:
+- Revolved WEDGE: the real cells i = 1..nTheta, j = 1..ny-2 of plane k = 1.
+  The degenerate axis faces are dropped and the coincident axis points
+  merged, so the axis-adjacent cells become prisms (their j-faces
+  triangles). Patches: sphere (wall), farfield (patch), wedge0 / wedge1
+  (wedge, node planes 1 and 2: the wedge is symmetric about z = 0 with the
+  axis along x, OpenFOAM's convention).
+- 2D O-grid (nz == 1, i Cyclic, ghost rows; masterplan_verify W12): the
+  real cells i = 0..nx-1 (cyclic: node column nx is column 0), j = 1..ny-2,
+  extruded one layer of span 1 D in z (z = -D/2 .. D/2; the dns span is a
+  Translate image and drops out of every 2D coefficient). Patches: cylinder
+  (wall, node row 1), farfield (patch, node row ny-1), front / back (empty).
+Lengths are divided by the dns diameter D = pi/4 (box units) so the
+OpenFOAM case has D = 1.
 
 Also returns the per-wall-face first-cell distance d1 (in D) for the SST
 omega wall list, and the dns (i, j) of every OpenFOAM cell.
@@ -78,10 +85,98 @@ def newell(pts):
     return 0.5 * n
 
 
+def is_ogrid2d(m):
+    """The 2D O-grid layout: one plane, cyclic i, ghost rows, not revolved."""
+    return (m["nz"] == 1 and m["wrap"][0] == 1 and (m["flags"] & 1)
+            and not (m["flags"] & (2 | 4 | 8)))
+
+
+def build_ogrid2d(m):
+    """points, faces, owner, neighbour, patches, cellij, d1 for the 2D
+    O-grid, one cell layer thick."""
+    nx, ny = m["nx"], m["ny"]
+    nf = ny - 2
+    centre = np.array(m["centre"])
+    # Points (i, j, kk): i in [0, nx-1], j in [1, ny-1], kk 0/1 = z -D/2, +D/2.
+    pid = {}
+    pts = []
+    for kk in (0, 1):
+        for j in range(1, ny):
+            for i in range(nx):
+                pid[(i, j, kk)] = len(pts)
+                p = (node(m, i, j, 0) - centre) / D_BOX
+                p[2] = kk - 0.5
+                pts.append(p)
+    pts = np.array(pts)
+    P = lambda i, j, kk: pid[(i % nx, j, kk)]
+    cell = lambda i, j: (i % nx) + nx * (j - 1)
+    cc = np.zeros((nx * nf, 3))
+    for j in range(1, ny - 1):
+        for i in range(nx):
+            cc[cell(i, j)] = np.mean([pts[P(i + di, j + dj, kk)] for di in (0, 1)
+                                      for dj in (0, 1) for kk in (0, 1)], axis=0)
+
+    def oriented(f, towards):
+        if np.dot(newell(pts[f]), towards) < 0:
+            f = f[::-1]
+        return f
+
+    # Internal faces in upper-triangular order: for each owner (ascending),
+    # its neighbours ascending. The cyclic seam face (i = nx-1 | 0) belongs
+    # to owner cell(0, j) with neighbour cell(nx-1, j).
+    faces, owner, neigh = [], [], []
+    for j in range(1, ny - 1):
+        for i in range(nx):
+            c = cell(i, j)
+            nb = []
+            if i + 1 < nx:  # i-face at node column i+1
+                nb.append((cell(i + 1, j), [P(i + 1, j, 0), P(i + 1, j + 1, 0),
+                                            P(i + 1, j + 1, 1), P(i + 1, j, 1)]))
+            if i == 0:      # the seam, node column 0
+                nb.append((cell(nx - 1, j), [P(0, j, 0), P(0, j + 1, 0),
+                                             P(0, j + 1, 1), P(0, j, 1)]))
+            if j < ny - 2:  # j-face at node row j+1
+                nb.append((cell(i, j + 1), [P(i, j + 1, 0), P(i + 1, j + 1, 0),
+                                            P(i + 1, j + 1, 1), P(i, j + 1, 1)]))
+            for n, f in sorted(nb):
+                faces.append(oriented(f, cc[n] - cc[c]))
+                owner.append(c)
+                neigh.append(n)
+    patches = []
+
+    def patch(name, typ, items):
+        start = len(faces)
+        for c, f in items:
+            fc = pts[f].mean(axis=0)
+            faces.append(oriented(f, fc - cc[c]))
+            owner.append(c)
+        patches.append((name, typ, start, len(faces) - start))
+
+    patch("cylinder", "wall",
+          [(cell(i, 1), [P(i, 1, 0), P(i + 1, 1, 0), P(i + 1, 1, 1), P(i, 1, 1)])
+           for i in range(nx)])
+    patch("farfield", "patch",
+          [(cell(i, ny - 2), [P(i, ny - 1, 0), P(i + 1, ny - 1, 0),
+                              P(i + 1, ny - 1, 1), P(i, ny - 1, 1)])
+           for i in range(nx)])
+    for kk, name in ((0, "back"), (1, "front")):
+        patch(name, "empty",
+              [(cell(i, j), [P(i, j, kk), P(i + 1, j, kk), P(i + 1, j + 1, kk),
+                             P(i, j + 1, kk)])
+               for j in range(1, ny - 1) for i in range(nx)])
+    cellij = [(i, j) for j in range(1, ny - 1) for i in range(nx)]
+    d1 = m["d1"][0, :nx] / D_BOX
+    return pts, faces, owner, neigh, patches, cellij, d1
+
+
 def build(m):
-    """points, faces, owner, neighbour, patches, cellij for the wedge."""
+    """points, faces, owner, neighbour, patches, cellij for the wedge (or,
+    dispatched, the 2D O-grid)."""
+    if is_ogrid2d(m):
+        return build_ogrid2d(m)
     if not (m["flags"] & 4):
-        raise ValueError("only the revolved wedge layout is supported")
+        raise ValueError("only the revolved wedge and the 2D O-grid layouts "
+                         "are supported")
     nT, ny = m["ntheta"], m["ny"]
     nf = ny - 2
     centre = np.array(m["centre"])

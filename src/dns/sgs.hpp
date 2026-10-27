@@ -155,10 +155,10 @@ DNS_HD T sigmaDsigma(const T gd[3][3])
 // model `sigma` selects:  sigma ? D_sigma(gd) : |S| = sqrt(2 S:S).
 //
 // Templated on T to stay bit-identical at every call site: the nut kernels
-// accumulate in Real (float) and the dt-limit reducers in double, and
-// T(0.5) / T(2) / sqrt(T) reproduce each verbatim. Do NOT simplify to
-// double-only -- that changes the float sites' rounding, hence nut, hence dt,
-// hence every trajectory.
+// accumulate in Real (float) and the host FP64 oracles (tests; the LES dt
+// limit reads the float nut since W15) in double, and T(0.5) / T(2) /
+// sqrt(T) reproduce each verbatim. Do NOT simplify to double-only -- that
+// changes the float sites' rounding, hence nut, hence every trajectory.
 template <class T>
 DNS_HD T sgsRate(int sigma, const T gd[3][3])
 {

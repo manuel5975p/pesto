@@ -109,11 +109,14 @@ CompState cpuComp(const Grid& g, const CompState& s0, int steps)
     return s;
 }
 
-bool gpuComp(const Grid& g, const CompState& s0, int steps, CompState& out)
+// compensated: the two-word state (--compensated), else the plain FP32 one.
+bool gpuComp(const Grid& g, const CompState& s0, int steps, CompState& out,
+             bool compensated = false)
 {
     auto dev = gpu::DeviceComp::make(g, kGamma, kMu);
-    auto ds = gpu::DeviceCompState::make(g.size());
+    auto ds = gpu::DeviceCompState::make(g.size(), 0, compensated);
     if (!dev || !ds) return false;
+    if (compensated && !dev->enableCompensation()) return false;
     (void)ds->upload(s0);
     for (int n = 0; n < steps; ++n) dev->step(*ds, gpu::Real(kT / steps));
     out = CompState::zeros(g);
@@ -144,15 +147,39 @@ void compressible(bool device)
         orderCheck("Comp (CPU) SSP-RK3", e);
         return;
     }
-    double eg[3], fl[3];
+    double eg[3], fl[3], ec[3], flc[3];
+    CompState plainFine, compFine;
     for (int m = 0; m < 3; ++m) {
-        CompState s;
-        if (!gpuComp(g, s0, kN0 << m, s)) { check(false, "GPU setup"); return; }
+        CompState s, sc;
+        if (!gpuComp(g, s0, kN0 << m, s) || !gpuComp(g, s0, kN0 << m, sc, true))
+        {
+            check(false, "GPU setup");
+            return;
+        }
         eg[m] = permtest::relState(s, ref);
         fl[m] = permtest::relState(s, host[m]);
+        ec[m] = permtest::relState(sc, ref);
+        flc[m] = permtest::relState(sc, host[m]);
+        if (m == 2) {
+            plainFine = s;
+            compFine = sc;
+        }
     }
     orderCheck("DeviceComp SSP-RK3", eg);
     floorCheck("DeviceComp SSP-RK3", e, fl);
+    // The compensated state (--compensated) is the SAME integrator: same
+    // order, and at the finest dt it differs from the plain run by less than
+    // 1/10 of the time error -- what it removes is accumulation rounding.
+    orderCheck("DeviceComp SSP-RK3 compensated", ec);
+    floorCheck("DeviceComp SSP-RK3 compensated", e, flc);
+    const double dpc = permtest::relState(plainFine, compFine);
+    std::printf("DeviceComp plain vs compensated at dt/4: %.3e (time error "
+                "%.3e, ratio %.3f)\n", dpc, e[2], dpc / e[2]);
+    check(dpc < 0.1 * e[2], "plain - compensated at dt/4 < 1/10 time error");
+    // ...and it does remove it: the plain rounding grows with the step count,
+    // the compensated one does not (measured gfx1100: 1.5e-6 vs 2.8e-7).
+    check(flc[2] < 0.5 * fl[2],
+          "compensated FP32 rounding at dt/4 < 1/2 of the plain run's");
 }
 
 // --- incompressible ------------------------------------------------------

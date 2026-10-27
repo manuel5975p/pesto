@@ -124,6 +124,10 @@ DeviceSmagorinsky::make(const GpuGrid& g, double cs, SgsModel model)
     if (!(cs > 0)) return std::unexpected(hipErrorInvalidValue);
     auto nut = DeviceScalar::make(g.size());
     if (!nut) return std::unexpected(nut.error());
+    // Zero until the first computeNut: the runner's dt bound reads its max.
+    if (auto e = hipMemset(nut->data(), 0, g.size() * sizeof(Real));
+        e != hipSuccess)
+        return std::unexpected(e);
     // Delta^2 = hx*hy at nz == 1 (unit depth carries no filter width; the
     // expression is kept VERBATIM so 2D LES trajectories do not move), else
     // the isotropic (hx hy hz)^(2/3).

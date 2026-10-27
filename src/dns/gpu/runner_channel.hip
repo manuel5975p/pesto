@@ -52,17 +52,23 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     const bool implicitSteady = steady && r.implicitSteady;
     // The explicit steady march: compensated state, local time stepping.
     const bool explicitSteady = steady && !implicitSteady;
+    // LES: a time march only, never with a RANS closure (validateChannel).
+    const bool les = r.les > 0;
+    assert(!(les && (rans || r.steadyTol > 0)));
 
     auto m = CurvMetrics::build(CurvMesh::channelY(g, r.stretchBeta, r.delta));
     if (!m) return fail(2, "channel mesh: " + m.error());
-    auto dev = DeviceComp::make(*m, r.gamma, r.mu);
+    // --les 0 is the DNS make call verbatim (no SGS argument at all).
+    auto dev = les ? DeviceComp::make(*m, r.gamma, r.mu, r.les, r.sgs)
+                   : DeviceComp::make(*m, r.gamma, r.mu);
     // Explicit steady: the compensated state, so pseudo-time updates below
     // ulp(q)/2 still accumulate (docs/rans.md, "The FP32 update floor"). The
     // channel wall is the only state-overwriting hook here, and it keeps the
     // low words. Implicit steady: plain -- the host holds the FP64 iterate and
     // the device only its FP32 rounding, so low words would be dead weight.
-    auto ds = DeviceCompState::make(g.size(), ransScalars(r.rans),
-                                    explicitSteady);
+    // --compensated puts a time march on the same state.
+    const bool compensated = explicitSteady || r.compensated;
+    auto ds = DeviceCompState::make(g.size(), ransScalars(r.rans), compensated);
     auto red = ReduceScratch::make();
     if (!dev || !ds || !red) return fail(6, "GPU allocation failed");
     // Both plates are walls: mu_t is mirrored odd on both ghost rows, so it
@@ -72,7 +78,10 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
                                   .mutHook = mutMirrorYHook(gg, true, true),
                                   .fluidMask = rowMask(g, 1, g.ny - 2)}))
         return fail(6, "GPU allocation failed (RANS)");
-    if (explicitSteady && !dev->enableCompensation())
+    // LES: the SGS mu_t takes the same odd wall image, so the wall face carries
+    // the molecular stress only and its mu_t is exactly 0.0.
+    if (les) dev->setMutHook(mutMirrorYHook(gg, true, true));
+    if (compensated && !dev->enableCompensation())
         return fail(6, "GPU allocation failed (compensated state)");
 
     // SST's wall omega: TMR's 60 nu_w / (beta1 d1^2) with d1 the first cell
@@ -83,7 +92,13 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
         g, {r.gamma, r.Rgas, r.Twall, r.isothermal, omegaCoef});
     if (!wall) return fail(6, "channel wall init failed");
 
-    dev->setStageHook([&](DeviceCompState& s) { wall->apply(s); });
+    // Idempotent: the wall reads only the first fluid rows and the ghost
+    // density each thread just wrote. Every state step() sees comes straight
+    // from wall->apply (after the upload below, after every step: the loop
+    // tail and SteadyMarchIo::afterStep), with only reads in between; the
+    // implicit march never calls step().
+    dev->setStageHook([&](DeviceCompState& s) { wall->apply(s); },
+                      Idempotent::yes);
     // Body force as an RHS term on the live stage primitives: it rides
     // SSP-RK3 exactly, like the NSCBC rhs overwrite (never a state edit).
     dev->setRhsHook([&](const DeviceCompState&, DeviceCompState& out,
@@ -114,18 +129,26 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
                                      "utauTop", "retau",   "KE"};
     if (rans) cols.emplace_back("mutMax");
     if (sst) cols.emplace_back("floorHits");
+    // LES: max mu_t/mu over the fluid rows, and the wall-face plane mean of
+    // mu_t/mu (0.0 by the odd image).
+    if (les) cols.insert(cols.end(), {"nutMax", "nutWall"});
     if (steady)
         cols.insert(cols.end(), {"iter", "resid", "resU", "resE", "resT",
                                  "Tbulk", "remaining"});
     if (implicitSteady) cols.insert(cols.end(), {"cfl", "alpha", "rejects"});
-    if (auto e = out.declareSeries("stats", cols); !e)
+    // An LES field is filtered: its CSVs open with the label line. A DNS or
+    // RANS run's files are exactly what they were.
+    const std::string lesLabel =
+        les ? lesRunLabel(r.sgs, r.les, g.nz == 1) : std::string();
+    if (auto e = out.declareSeries("stats", cols, lesLabel); !e)
         return fail(4, e.error());
     std::vector<std::string> pcols = {"t",    "y",    "yplus", "uplus", "urms",
                                       "vrms", "wrms", "uv",    "rho",   "T"};
     if (rans) pcols.emplace_back("mutRatio");
     if (rans && !sst) pcols.emplace_back("nutilde");
     if (sst) pcols.insert(pcols.end(), {"kplus", "omegaplus"});
-    if (auto e = out.declareSeries("profiles", pcols); !e)
+    if (les) pcols.emplace_back("nutRatio");
+    if (auto e = out.declareSeries("profiles", pcols, lesLabel); !e)
         return fail(4, e.error());
 
     // Log-law bulk-velocity estimate, resolved once in validate() (it also
@@ -159,6 +182,7 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
     struct WallState
     {
         double ubulk = 0, utauBot = 0, utauTop = 0, ke = 0, mutMax = 0;
+        double nutWall = 0; // LES: the larger wall's face-mean mu_t/mu
         // Favre bulk T - Twall and the y-integrated conserved scalars
         // (rho nu~ | rho k, rho omega): the steady stop's other integrals.
         double tExcess = 0, turb[2] = {};
@@ -190,6 +214,24 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
         w.utauTop = std::sqrt(std::max(
             nu * wallGradientPinned(favreU(jHi), favreU(jHi - 1), dTop1, dTop2),
             0.0));
+        if (les)
+        {
+            // The SGS mu_t of THIS state, image rows included. Read-only for
+            // the march: every stage recomputes primitives and mu_t.
+            dev->updateSgsNut(*ds);
+            if (channelPlaneScalarSums(gg, dev->mut(), mutScratch, pmut) !=
+                hipSuccess)
+                return fail(6, "LES plane sums download failed");
+            for (int j = jLo; j <= jHi; ++j)
+                w.mutMax = std::max(w.mutMax, pmut[j * 2 + 1] / r.mu);
+            // Face mean = (ghost row + first row) / 2 per wall; the rows are
+            // summed in the same order, so an exact odd image gives 0.0.
+            const double nxz = double(g.nx) * g.nz;
+            const double fb = 0.5 * (pmut[0] + pmut[2 * jLo]) / nxz;
+            const double ft = 0.5 * (pmut[2 * (g.ny - 1)] + pmut[2 * jHi]) / nxz;
+            w.nutWall = std::max(std::abs(fb), std::abs(ft)) / r.mu;
+            return w;
+        }
         if (!rans) return w;
         // mu_t of THIS state (the stage buffer holds the last stage's input).
         dev->updateMut(*ds);
@@ -234,7 +276,7 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
                                        TM};
             // Plane means of mu_t/mu and nu~/nu = (rho nu~)/mu (constant mu);
             // SST: Favre k+ = k/u_tau^2 and omega+ = omega nu/u_tau^2.
-            if (rans) row.push_back(pmut[j * 2] / nxz / r.mu);
+            if (rans || les) row.push_back(pmut[j * 2] / nxz / r.mu);
             if (rans && !sst) row.push_back(pnt[j * 2] / nxz / r.mu);
             if (sst)
                 row.insert(row.end(),
@@ -570,14 +612,16 @@ runChannel(const Grid& g, const CompState& ic, const ChannelRun& r,
                                            w->ke};
                 if (rans) row.push_back(w->mutMax);
                 if (sst) row.push_back(double(dev->floorHits()));
+                if (les) row.insert(row.end(), {w->mutMax, w->nutWall});
                 out.row("stats", row);
                 if (cad.printDue(st.steps, t, r.tEnd))
                 {
+                    const std::string& label = les ? lesLabel : ransLabel;
                     std::printf("t=%.2f/%.2f ub=%.2f Re_tau=%.1f "
                                 "(bot %.3f top %.3f) dt=%.2e%s%s\n",
                                 t, r.tEnd, w->ubulk, retau, w->utauBot,
-                                w->utauTop, dt, rans ? " " : "",
-                                ransLabel.c_str());
+                                w->utauTop, dt, label.empty() ? "" : " ",
+                                label.c_str());
                     std::fflush(stdout);
                     cad.printed(st.steps);
                 }

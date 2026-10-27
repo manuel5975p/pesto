@@ -36,7 +36,9 @@ public:
                                                         const RevolvedSpec& rev);
 
     // The ghost columns, then (wedge) the ghost planes; the low words of
-    // every written cell zeroed on a compensated state.
+    // every written cell zeroed on a compensated state. The planes rewrite
+    // EVERY field of planes 0 and 2 from plane 1 alone, which is what lets
+    // the wedge's stage kernels skip those planes (DeviceComp::setStageRange).
     void apply(DeviceCompState& s) const;
 
     // mu_t and F1 (may be null) by the same copies: scalars, no rotation.

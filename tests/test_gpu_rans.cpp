@@ -10,11 +10,13 @@
 //   G6  the oracle state is a fixed point of the LTS march
 //   G7  ... with RANDOM lts ratios (an additive hook ignoring lts drifts O(1))
 //   G8  SA-neg stress: a negative nu~ patch stays finite with mu_t == 0
-//   G9  --steady from the perturbed state converges onto the oracle
+//   G9  the PLAIN steady march from the perturbed state lands on the oracle
+//       (ny 32 stretch 2.6) while its residual stays blind
 //   G10 the compensated state: TwoSum exact, upload/download of the pair,
 //       the plateau below the plain march's, the oracle a fixed point, and
 //       the perturbed march onto the oracle
-// docs/rans.md. Seconds.
+// SST (phase B) runs as its own ctest entry, `test_gpu_rans sst`.
+// docs/rans.md. ~56 s (SA) + ~32 s (SST) on gfx1100.
 #include "dns/comp.hpp"
 #include "dns/config.hpp"
 #include "dns/curvmesh.hpp"
@@ -33,6 +35,7 @@
 #include <cstdio>
 #include <memory>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace dns;
@@ -275,12 +278,13 @@ struct OracleRig
 
 std::unique_ptr<OracleRig> oracleRig(RansModel model = RansModel::SaNeg,
                                      int ny = 64, double reTau = 180,
-                                     bool compensated = false)
+                                     bool compensated = false, double beta = 2.0)
 {
     Channel1dCase cc;
     cc.ny = ny;
     cc.reTau = reTau;
     cc.model = model;
+    cc.beta = beta;
     auto s = solveChannel1d(cc);
     if (!s) {
         std::printf("oracle: %s\n", s.error().c_str());
@@ -339,7 +343,7 @@ double fp32Floor(Rig& r, const CompState& h, const std::vector<double>& t,
     return worst;
 }
 
-double g5Floor = 0; // measured in G5, reused by G9's tolerance
+double g5Floor = 0; // measured in G5, printed beside G10's plateaus
 
 // --- G5 -----------------------------------------------------------------------
 void residualAtOracle()
@@ -541,16 +545,28 @@ double steadyMarch(Rig& r, long n, long tail, double ubEst)
 // that floor long before it has converged, so the residual cannot certify it
 // (a cold start sits at the floor with ub 1.6% low). What IS checked: from
 // the perturbed state the march lands on the oracle's discrete solution, and
-// its residual sits on the same plateau as a march started AT the oracle.
+// its residual stalls above the oracle state's own.
+//
+// On the ny 32, stretch 2.6 grid (gpu_runners' production case), not ny 64:
+// the ub e-folding there is ~2.8e4 iterations against ~6e4, so the SAME 5%
+// start lands in 1.2e5 iterations (~15 s) instead of 2.2e5 (~29 s). Measured
+// 2026-10-27 (gfx1100), ub error -2.91/-0.91/-0.31/-0.11/-0.053% at
+// 1e4/4e4/7e4/1e5/1.2e5. The ny 64 form also compared against a 2e4-step
+// march started AT the oracle (plateau 2.03, perturbed 1.93); at ny 32 that
+// march FREEZES (no bit changes from 1e4 to 6e4 iterations, residual 0.4646
+// at every sample: every |R_c| dt_c < ulp(q_c)/2), so the perturbed march
+// stalls on ANOTHER FP32 state, 0.05% off in ub, residual 2.71 against the
+// oracle state's 0.0515. The claim pinned is therefore the residual's
+// blindness: it ends >= 10x the oracle state's own while ub has landed.
 void steadyConverges()
 {
-    auto o = oracleRig();
+    auto o = oracleRig(RansModel::SaNeg, 32, 180, false, 2.6);
     if (!o) { check(false, "G9 oracle rig"); return; }
     Rig& r = *o->rig;
     const auto h = toCompState(o->sol, r.g);
     const auto t = toTurb(o->sol, r.g);
     upload(r, h, t);
-    const double plateau = steadyMarch(r, 20000, 10000, o->sol.ubEst);
+    const double r0 = resid(r, o->sol.ubEst);
     auto hp = h;
     auto tp = t;
     for (std::size_t q = 0; q < hp.rho.size(); ++q) {
@@ -562,9 +578,7 @@ void steadyConverges()
     }
     upload(r, hp, tp);
     const auto t0 = std::chrono::steady_clock::now();
-    // The ub error decays with an e-folding of ~6e4 iterations (measured:
-    // -0.357% at 1.6e5, +0.048% at 4e5); 2.2e5 is ~30 s.
-    const long n = 220000;
+    const long n = 120000;
     const double res = steadyMarch(r, n, 10000, o->sol.ubEst);
     const double sec =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -579,17 +593,17 @@ void steadyConverges()
         du = std::max(du, std::abs(hs.mx[q] / hs.rho[q] - o->sol.u[j - 1]));
     }
     const double ub = mom / mass;
-    std::printf("G9: %ld LTS iterations from the perturbed state, %.1f s: ub "
-                "%.6f vs oracle %.6f (%+.3f%%), U+ Linf %.3f%%; resid %.3e on "
-                "the plateau %.3e (static floor %.3e, 10x = the plan's "
-                "unreachable TOL)\n",
+    std::printf("G9: ny 32 stretch 2.6, %ld LTS iterations from the perturbed "
+                "state, %.1f s: ub %.6f vs oracle %.6f (%+.3f%%), U+ Linf "
+                "%.3f%%; resid %.3e vs the oracle state's %.3e\n",
                 n, sec, ub, o->sol.ub, 100 * (ub - o->sol.ub) / o->sol.ub,
-                100 * du / o->sol.ub, res, plateau, g5Floor);
+                100 * du / o->sol.ub, res, r0);
     check(std::abs(ub - o->sol.ub) <= 3e-3 * o->sol.ub,
           "G9: ub within 0.3% of the oracle");
     check(du <= 1e-2 * o->sol.ub, "G9: U+ within 1% (Linf) of the oracle");
-    check(res <= 2.0 * plateau,
-          "G9: the residual sits on the oracle-start plateau (<= 2x)");
+    check(res >= 10.0 * r0,
+          "G9: the landed march's residual stays >= 10x the oracle state's "
+          "(the residual cannot certify)");
 }
 
 // --- G10: the compensated state (DeviceCompState::lo) ---------------------------
@@ -660,12 +674,16 @@ void compensatedMarch()
     const auto [dup, dnp] = drift(*p->rig, p->sol);
     const auto [duc, dnc] = drift(*c->rig, c->sol);
     std::printf("G10: 2e4 LTS steps from the oracle: plateau plain %.3e, "
-                "compensated %.3e (static floor %.3e); u drift %.2e / %.2e\n",
-                plain, comp, g5Floor, dup, duc);
+                "compensated %.3e (static floor %.3e); u drift %.2e / %.2e, "
+                "nu~ drift %.2e / %.2e\n",
+                plain, comp, g5Floor, dup, duc, dnp, dnc);
     check(comp <= 0.5 * plain,
           "G10: the compensated plateau is <= half the plain one");
-    check(duc < 1e-4 && dnc < 5e-4,
-          "G10: the oracle is a fixed point of the compensated march");
+    // Measured u 3.2e-8, nu~ 8.2e-8 (gfx1100, 2026-10-27): round-off pins,
+    // banded >= 10x. The plain march drifts 6.3e-5 / 5.5e-4 here, so the
+    // bands separate the two.
+    check(duc < 1e-6 && dnc < 1e-6,
+          "G10: the oracle is a fixed point of the compensated march (1e-6)");
 
     // From the perturbed state: G9's march, compensated.
     auto hp = h;
@@ -806,8 +824,14 @@ void sstSuite(RansModel m, bool converge)
     std::printf("%s G6: 2000 LTS steps from the oracle: u drift %.2e, k drift "
                 "%.2e, residual plateau %.3e, %llu guard hits\n",
                 n.c_str(), du, dn, plateau, r.dev->floorHits());
-    check(du < 1e-4 && dn < 1e-3,
-          n + ": the oracle state is a fixed point of the LTS march");
+    // Measured gfx1100 2026-10-26: 2003m u 8.0e-8, k 1.0e-5 -- the rounded
+    // oracle barely moves, so its u is a round-off pin (>= 10x); Vm u 3.9e-5,
+    // k 8.0e-5 -- the plain march's dynamic-floor drift (SA G6: 3.5e-5), which
+    // the 1e-4 / 1e-3 bands already hold at 2.5x / 12x and cannot tighten.
+    const bool m2003 = m == RansModel::Sst2003m;
+    check(du < (m2003 ? 1e-6 : 1e-4) && dn < (m2003 ? 2e-4 : 1e-3),
+          n + ": the oracle state is a fixed point of the LTS march" +
+              (m2003 ? " (u 1e-6, k 2e-4)" : " (u 1e-4, k 1e-3)"));
 
     // Positivity stress: the oracle's k and omega scaled by a random factor
     // in [0.5, 2] per cell (a rough field), 200 LTS steps, ZERO guard hits.
@@ -866,9 +890,16 @@ void sstSuite(RansModel m, bool converge)
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     dns::test::requireDeviceOrSkip();
+    if (argc > 1 && std::string(argv[1]) == "sst") {
+        for (RansModel m : {RansModel::Sst2003m, RansModel::SstVm})
+            sstLaminarLimit(m);
+        sstSuite(RansModel::Sst2003m, true);
+        sstSuite(RansModel::SstVm, false);
+        return dnstest::finish();
+    }
     ltsNull();
     laminarLimit();
     uniformScalar();
@@ -881,10 +912,6 @@ int main()
     word2Exact();
     compensatedIo();
     compensatedMarch();
-    for (RansModel m : {RansModel::Sst2003m, RansModel::SstVm})
-        sstLaminarLimit(m);
-    sstSuite(RansModel::Sst2003m, true);
-    sstSuite(RansModel::SstVm, false);
     return dnstest::finish();
 }
 

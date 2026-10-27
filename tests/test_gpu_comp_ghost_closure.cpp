@@ -24,7 +24,9 @@
 //   - no deep cell inside the flux stencil of any fluid cell (face + edge
 //     neighbours): the deep-solid notion survives only where nothing reads it;
 //   - a uniform gas at rest exerts zero force on the body (device tally);
-//   - a spinning thin body in quiescent gas feels a torque opposing its spin.
+//   - a spinning thin body in quiescent gas feels a torque opposing its spin;
+//   - the per-face split (--emit surface) sums to the tally, and its
+//     pressure part obeys the discrete Archimedes identity.
 //
 // Optional: `test_gpu_comp_ghost_closure <mesh.stl> <n>` runs the census on a
 // rotor mesh about the x shaft (swept diameter pi/4) on an n^3 uniform box --
@@ -281,6 +283,168 @@ Spin spinUp(const Grid& g, const gpu::GhostSdf& sdf, const Rotor& rot,
     return out;
 }
 
+// The per-face split (DeviceCompGhost::surfaceFaces, --emit surface).
+//  (a) Archimedes at rest: p = pInf + G (x - L/2), rho uniform, u = 0, NOT
+//      ghost-filled (the linear field runs through the solid). The interface
+//      is exactly the fluid/solid staircase, so the discrete divergence
+//      theorem makes sum fp = -G V_solid exact up to the FP32 face values,
+//      and with u = 0 the convective part is exactly 0 and the viscous part
+//      is the FP32 rounding of the total only.
+//  (b) A flowing state after one step: the rows' gauge totals sum to force()
+//      (the closed surface has sum s == 0), the moment of the rows about the
+//      pivot is force()'s, and every row is p s + fc + fv == f.
+void splitCartesian(const std::string& name, const Grid& g,
+                    const gpu::GhostSdf& sdf)
+{
+    const double L = g.nx * g.hx, G = 0.1 * pInf / L;
+    auto dev = gpu::DeviceComp::make(g, gamma_, 0.01);
+    auto gh = gpu::DeviceCompGhost::make(g, sdf, gamma_, rhoInf, pInf);
+    auto ds = gpu::DeviceCompState::make(g.size());
+    auto red = gpu::ReduceScratch::make();
+    if (!dev || !gh || !ds || !red) { check(false, name + ": split setup"); return; }
+    auto h = CompState::zeros(g);
+    for (int k = 0; k < g.nz; ++k)
+        for (int j = 0; j < g.ny; ++j)
+            for (int i = 0; i < g.nx; ++i) {
+                const std::size_t c = g.idx(i, j, k);
+                h.rho[c] = rhoInf;
+                h.E[c] = (pInf + G * ((i + 0.5) * g.hx - 0.5 * L)) / (gamma_ - 1.0);
+            }
+    (void)ds->upload(h);
+    auto rows = gh->surfaceFaces(*dev, *ds, pInf);
+    check(rows.has_value(), name + ": surfaceFaces at rest");
+    if (!rows) return;
+    const double V = double(gh->solidCells().size()) * g.hx * g.hy * g.hz;
+    double fp[3] = {0, 0, 0}, fcMax = 0, fvSum = 0, area = 0;
+    for (const auto& r : *rows) {
+        for (int c = 0; c < 3; ++c) fp[c] += r.fp[c];
+        for (int c = 0; c < 3; ++c) {
+            fcMax = std::max(fcMax, std::abs(r.fc[c]));
+            fvSum += r.fv[c];
+        }
+        area += r.area;
+    }
+    std::printf("%s split at rest: sum fp_x %.9e vs -G V %.9e (rel %.2e), "
+                "fp_y %.2e fp_z %.2e, max|fc| %.1e, sum fv %.2e\n",
+                name.c_str(), fp[0], -G * V, std::abs(fp[0] / (-G * V) - 1),
+                fp[1], fp[2], fcMax, fvSum);
+    check(std::abs(fp[0] / (-G * V) - 1) < 1e-5,
+          name + ": Archimedes, sum fp = -G V_solid (1e-5)");
+    check(std::abs(fp[1]) + std::abs(fp[2]) < 1e-5 * G * V,
+          name + ": no transverse pressure force");
+    check(fcMax == 0.0, name + ": no convective part at rest (exact)");
+    check(std::abs(fvSum) < 1e-6 * pInf * area,
+          name + ": viscous part at rest is FP32 rounding only");
+
+    // (b) uniform flow along x with a transverse tilt, ghost-filled, one step.
+    for (std::size_t c = 0; c < g.size(); ++c) {
+        h.rho[c] = rhoInf;
+        h.mx[c] = 0.8;
+        h.my[c] = 0.3;
+        h.mz[c] = g.nz > 1 ? -0.2 : 0.0;
+        const double ke = 0.5 * (h.mx[c] * h.mx[c] + h.my[c] * h.my[c]
+                                 + h.mz[c] * h.mz[c]) / rhoInf;
+        h.E[c] = pInf / (gamma_ - 1.0) + ke;
+    }
+    (void)ds->upload(h);
+    dev->setStageHook([&](gpu::DeviceCompState& s) { gh->apply(s); });
+    gh->apply(*ds);
+    dev->step(*ds, gpu::Real(dev->stableDt(*ds, *red)));
+    gh->apply(*ds);
+    const std::array<double, 3> pv{0.4 * L, 0.55 * L, 0.45 * L};
+    const auto F = gh->force(*dev, *ds, pv);
+    rows = gh->surfaceFaces(*dev, *ds, pInf);
+    check(rows.has_value(), name + ": surfaceFaces after a step");
+    if (!rows) return;
+    double f[3] = {0, 0, 0}, q[3] = {0, 0, 0}, gross = 0, gq = 0, row = 0;
+    for (const auto& r : *rows) {
+        const double d[3] = {r.x[0] - pv[0], r.x[1] - pv[1], r.x[2] - pv[2]};
+        const double m[3] = {d[1] * r.f[2] - d[2] * r.f[1],
+                             d[2] * r.f[0] - d[0] * r.f[2],
+                             d[0] * r.f[1] - d[1] * r.f[0]};
+        for (int c = 0; c < 3; ++c) {
+            f[c] += r.f[c];
+            q[c] += m[c];
+            gross += std::abs(r.f[c]);
+            gq += std::abs(m[c]);
+            row = std::max(row, std::abs(r.fp[c] + r.fc[c] + r.fv[c] - r.f[c]));
+        }
+    }
+    const double Ff[3] = {F.fx, F.fy, F.fz}, Fq[3] = {F.qx, F.qy, F.qz};
+    double ef = 0, eq = 0;
+    for (int c = 0; c < 3; ++c) {
+        ef = std::max(ef, std::abs(f[c] - Ff[c]));
+        eq = std::max(eq, std::abs(q[c] - Fq[c]));
+    }
+    std::printf("%s split flowing: %zu rows, F (%.6e %.6e %.6e) rows-F %.2e "
+                "(gross %.3e), moment rows-F %.2e (gross %.3e), max row "
+                "residual %.1e\n",
+                name.c_str(), rows->size(), F.fx, F.fy, F.fz, ef, gross, eq, gq,
+                row);
+    check(!rows->empty(), name + ": the split has rows");
+    check(ef < 1e-6 * gross, name + ": row sums == force() (1e-6 of gross)");
+    check(eq < 1e-6 * gq, name + ": row moments == force() moment");
+    check(row <= 1e-12 * gross, name + ": p s + fc + fv == f per row");
+}
+
+// (c) The convective column is the flux's OWN advecting part, which (b)
+//     cannot see: fv is defined as f - fp - fc. At mu = 0 the face flux is
+//     p s + rho u_a u and nothing else, so fv must be FP32 rounding of the
+//     gross ABSOLUTE face flux. Run on the moving wall of a spinning body
+//     inside an MRF zone, where u_a = u - f omega x r: a split that used the
+//     absolute u_n would leave rho (f omega x r).s u in fv, ~1e-2 of the gross.
+void splitInviscidMrf(const std::string& name, const Grid& g,
+                      const gpu::GhostSdf& sdf, const Rotor& rot)
+{
+    const gpu::GhostWallMotion uw = gpu::rotorWallMotion(rot);
+    auto dev = gpu::DeviceComp::make(g, gamma_, 0.0);
+    auto gh = gpu::DeviceCompGhost::make(g, sdf, gamma_, rhoInf, pInf, nullptr,
+                                         {}, &uw);
+    auto ds = gpu::DeviceCompState::make(g.size());
+    auto red = gpu::ReduceScratch::make();
+    if (!dev || !gh || !ds || !red) { check(false, name + ": setup"); return; }
+    gpu::MrfZone z;
+    z.axis = rotorAxisIndex(rot.axis);
+    z.omega = rot.omega;
+    for (int c = 0; c < 3; ++c) z.center[c] = rot.shaft[c];
+    z.r1 = 1.3 * rot.radius;
+    z.r2 = 1.9 * rot.radius;
+    z.a1 = g.nz > 1 ? 1.3 * rot.radius : 1e30;
+    z.a2 = g.nz > 1 ? 1.9 * rot.radius : 2e30;
+    check(dev->setMrf(z, identityRemap(g)) == hipSuccess, name + ": setMrf");
+    auto h = CompState::zeros(g);
+    for (std::size_t c = 0; c < g.size(); ++c) {
+        h.rho[c] = rhoInf;
+        h.mx[c] = 0.8;
+        h.my[c] = 0.3;
+        h.mz[c] = g.nz > 1 ? -0.2 : 0.0;
+        h.E[c] = pInf / (gamma_ - 1.0)
+                 + 0.5 * (h.mx[c] * h.mx[c] + h.my[c] * h.my[c]
+                          + h.mz[c] * h.mz[c]) / rhoInf;
+    }
+    (void)ds->upload(h);
+    dev->setStageHook([&](gpu::DeviceCompState& s) { gh->apply(s); });
+    gh->apply(*ds);
+    dev->step(*ds, gpu::Real(dev->stableDt(*ds, *red)));
+    gh->apply(*ds);
+    const auto rows = gh->surfaceFaces(*dev, *ds, pInf);
+    check(rows.has_value() && !rows->empty(), name + ": surfaceFaces");
+    if (!rows) return;
+    double fv = 0, fc = 0, gross = 0;
+    for (const auto& r : *rows)
+        for (int c = 0; c < 3; ++c) {
+            fv += std::abs(r.fv[c]);
+            fc += std::abs(r.fc[c]);
+            gross += std::abs(r.f[c] + pInf * r.s[c]);
+        }
+    std::printf("%s inviscid split: sum|fv| %.3e, sum|fc| %.3e, gross %.3e "
+                "(fv/gross %.2e)\n",
+                name.c_str(), fv, fc, gross, fv / gross);
+    check(fc > 1e-3 * gross, name + ": the convective part is not vacuous");
+    check(fv < 1e-6 * gross,
+          name + ": mu = 0 leaves no viscous part (FP32 rounding of the gross)");
+}
+
 // Measurement mode: a rotor mesh about the x shaft, swept diameter pi/4, on an
 // n^3 uniform box 1.3 D wide. Census only, no device.
 int meshCensus(const std::string& path, int n)
@@ -372,6 +536,33 @@ int main(int argc, char** argv)
                                           L / 2 + off[o][2] * h},
                                          L / 6, L / 6));
         }
+    }
+
+    // The per-face split of the tally (--emit surface on the ghost wall).
+    {
+        const auto g = Grid::make(64, 64, 64, L, L, L);
+        const double h = g.hx;
+        const double cx = L / 2 + 0.37 * h, cy = L / 2 + 0.61 * h,
+                     cz = L / 2 + 0.23 * h, R = L / 6;
+        const gpu::GhostSdf sph = [=](double x, double y, double z) {
+            return std::sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy)
+                             + (z - cz) * (z - cz)) - R;
+        };
+        splitCartesian("split sphere 3D", g, sph);
+        splitInviscidMrf("split sphere 3D", g, sph,
+                         Rotor{.axis = RotorAxis::X, .shaft = {cx, cy, cz},
+                               .omega = 0.5 / R, .radius = R, .bins = 1,
+                               .thicken = 0.0});
+    }
+    {
+        const auto g = Grid::make(64, 64, 1, L, L, 1.0);
+        const double h = g.hx;
+        const double cx = L / 2 + 0.37 * h, cy = L / 2 + 0.61 * h;
+        splitCartesian("split lens 2D", g, thinLens(cx, cy, L / 4, 3.0 * h, 0.35));
+        splitInviscidMrf("split lens 2D", g, thinLens(cx, cy, L / 4, 3.0 * h, 0.35),
+                         Rotor{.axis = RotorAxis::Z, .shaft = {cx, cy, 0.5},
+                               .omega = 0.5 / (L / 4), .radius = L / 4,
+                               .bins = 1, .thicken = 0.0});
     }
 
     // A MOVING thin body. The wall faces that used to fall back to a deep cell

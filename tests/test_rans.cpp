@@ -136,6 +136,43 @@ void negative()
     check(same, "positive branch == standard SA incl. ft2 (1e-14)");
 }
 
+// The explicit dt bound's nu~ diffusivity (gpu::rans::RansDiffDt): the old
+// nu + max(nu~, 0) bit for bit wherever chi >= -cn1^(1/3), and the real
+// coefficient nu + nu~ fn below it, where fn < 0 makes it exceed nu.
+void dtDiffusivity()
+{
+    const double nu = 2.5e-4;
+    const double k5 = nu + (-5 * nu) * saFn(-5.0);
+    std::printf("SA dt diffusivity at chi -5: %.6g nu (fn %.6g)\n",
+                saDtDiffusivity(nu, -5 * nu) / nu, saFn(-5.0));
+    check(saFn(-5.0) < 0 && k5 > 4.8 * nu &&
+              saDtDiffusivity(nu, -5 * nu) == k5,
+          "chi = -5: K = nu + nu~ fn = 4.87 nu");
+    // dt = 0.25 sigma / (K a^2) on that cell, against the old nu-only bound.
+    const double a = 32.0, dtNew = 0.25 / (saDtDiffusivity(nu, -5 * nu) /
+                                           sa::sigma * a * a);
+    check(std::abs(dtNew - 0.25 * sa::sigma / (k5 * a * a)) <=
+                  1e-15 * dtNew &&
+              dtNew < 0.25 * sa::sigma / (nu * a * a) / 4.8,
+          "chi = -5: dt = 0.25 sigma/(K a^2), 4.87x under the old nu~ term's");
+    std::mt19937_64 rng(11);
+    std::uniform_real_distribution<double> U(0, 1);
+    bool old = true, mono = true;
+    for (int i = 0; i < 100000; ++i) {
+        const double nuv = std::pow(10.0, -6 + 4 * U(rng));
+        const double chi = U(rng) < 0.5 ? std::pow(10.0, 6 * U(rng) - 3)
+                                        : -std::cbrt(sa::cn1) * U(rng);
+        const double s0 = chi * nuv;
+        const double ref = nuv + (s0 > 0.0 ? s0 : 0.0);
+        old = old && saDtDiffusivity(nuv, s0) == ref;
+        const double c2 = -std::cbrt(sa::cn1) * (1 + 10 * U(rng)) - 1e-9;
+        mono = mono && saDtDiffusivity(nuv, c2 * nuv) > nuv;
+    }
+    check(old && saDtDiffusivity(nu, 0.0) == nu,
+          "chi in [-cn1^(1/3), inf): the old nu + max(nu~, 0), bit for bit");
+    check(mono, "chi < -cn1^(1/3): K > nu (fn < 0)");
+}
+
 void pointImplicitForm()
 {
     std::mt19937_64 rng(3);
@@ -607,6 +644,7 @@ int main()
     limiter();
     logLayer();
     negative();
+    dtDiffusivity();
     pointImplicitForm();
     floatDouble();
     sstLogLayer();

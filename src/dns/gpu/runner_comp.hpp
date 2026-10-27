@@ -154,6 +154,9 @@ struct CompRun
     // not read then.
     double steadyTol = 0;
     long steadySteps = 0;
+    // --compensated: the time march on the compensated state too (the
+    // steady march always has it). Pre: penalize == 0.
+    bool compensated = false;
     // The run label (dns/rans_label): the progress line's tail. Empty on a
     // DNS/LES run, whose line is unchanged.
     std::string label;

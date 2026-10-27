@@ -56,6 +56,11 @@ const char* name(SteadyScheme);
 // The inverses the parsers need; nullopt when `s` is not a keyword.
 std::optional<Subcommand> subcommandFromName(std::string_view s);
 std::optional<SgsModel> sgsModelFromName(std::string_view s);
+// The channel's LES run label, "LES <model> Cs=<cs> (filtered: grid- and
+// Cs-dependent)" (sigma: "Csigma="; twoD appends the 2D qualitative-only
+// note): the ONE text the dry-run, progress line and CSV headers carry.
+// Pre: cs > 0.
+std::string lesRunLabel(SgsModel m, double cs, bool twoD);
 
 // The far-field rules of `dns flow`, the ONE definition the validator and the
 // editor both read. Sponge is never a default, in any physics (CLAUDE.md).
@@ -215,6 +220,7 @@ struct RawConfig
     double ft = 0.0;
     double steady = 0.0;   // >0: stop at this steady residual instead of tEnd
     int seq = 1;           // grid-sequencing levels; 1 = solve on --n directly
+    bool compensated = false; // --compensated: two-word state on a time march
 
     // output
     std::set<Emit> emit;
@@ -299,6 +305,10 @@ public:
     double re = 0, mach = 0, nu = 0, cfl = 0, tol = 0, ft = 0, tEnd = 0;
     double steadyTol = 0;   // 0 = time-march to tEnd; >0 = stationary solve
     int seqLevels = 1;      // grid-sequencing levels (1 = off)
+    // --compensated: the compressible state carries a Kahan low word per
+    // field (gpu/comp.hpp DeviceCompState::lo) on a TIME march too. The
+    // explicit --steady march always has it; off = the plain FP32 state.
+    bool compensated = false;
     double cs = 0, dr = 0, aspect = 0;
     SgsModel sgsModel = SgsModel::Smagorinsky;
 

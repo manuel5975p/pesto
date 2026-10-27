@@ -88,7 +88,6 @@ int main()
     rejected({"channel", "--ft", "5"}, 2, "--ft rejected (use --tt)");
     rejected({"channel", "--body", "cylinder"}, 1, "--body is not a channel flag");
     rejected({"channel", "--far", "nscbc"}, 1, "--far is not a channel flag");
-    rejected({"channel", "--les", "0.1"}, 1, "--les is not a channel flag");
     rejected({"channel", "--re-tau", "0"}, 2, "re-tau must be positive");
     rejected({"channel", "--re-tau", "nan"}, 1, "re-tau nan rejected by the parser");
     rejected({"channel", "--mach", "1.5"}, 2, "mach must be under 1");
@@ -102,6 +101,72 @@ int main()
         check(c.has_value(), "png allowed in 3D (centre z-plane)");
     }
     rejected({"channel", "--wall", "slippery"}, 1, "unknown wall kind");
+
+    // --- LES (docs/channel.md, "LES") ---------------------------------------
+    {
+        auto c = runCli({"channel", "--les", "0.17"});
+        check(c.has_value() && c->lesLabel && c->cs == 0.17 &&
+                  c->sgsModel == dns::SgsModel::Smagorinsky,
+              "--les 0.17 validates: smag, labelled LES");
+        if (c)
+        {
+            check(c->meta.les && c->meta.cs == 0.17 && c->meta.sgs == "smag",
+                  "meta: les, cs, sgs");
+            check(c->describe().contains(
+                      "  label      LES smag Cs=0.17 (filtered: grid- and "
+                      "Cs-dependent)\n"),
+                  "describe: LES label");
+            check(c->describe().contains("mu_t = 0 on the wall face; smag: no "
+                                         "wall damping"),
+                  "describe: sgs line names the wall image and smag's damping");
+        }
+    }
+    {
+        auto c = runCli({"channel", "--les", "1.35", "--sgs", "sigma"});
+        check(c.has_value() && c->sgsModel == dns::SgsModel::Sigma &&
+                  c->meta.sgs == "sigma",
+              "--les 1.35 --sgs sigma validates");
+        if (c)
+            check(c->describe().contains("label      LES sigma Csigma=1.35 "),
+                  "describe: sigma label names Csigma");
+    }
+    {
+        auto c = runCli({"channel", "--nz", "1", "--les", "0.17"});
+        check(c.has_value() &&
+                  c->describe().contains(
+                      "LES smag Cs=0.17 (filtered: grid- and Cs-dependent) "
+                      "(2D: qualitative only, no vortex stretching)"),
+              "2D smag LES validates, label carries the 2D note");
+    }
+    {
+        auto c = runCli({"channel", "--les", "0"});
+        auto d = runCli({"channel"});
+        check(c && d && !c->lesLabel && c->cs == 0 && !c->meta.les &&
+                  c->meta.sgs.empty() && c->describe() == d->describe(),
+              "--les 0 is the DNS case (same describe, no LES meta)");
+    }
+    {
+        auto fieldOf = [](std::vector<std::string> a) {
+            auto c = runCli(std::move(a));
+            return c ? std::string("(accepted)") : c.error().field;
+        };
+        check(fieldOf({"channel", "--les", "0.17", "--rans", "sa-neg"}) == "--les",
+              "--les with --rans rejected on --les");
+        check(fieldOf({"channel", "--les", "0.17", "--steady", "1e-4"}) == "--les",
+              "--les with --steady rejected on --les (time-accurate)");
+        check(fieldOf({"channel", "--les", "0.17", "--rans", "sa-neg", "--steady",
+                       "1e-4"}) == "--les",
+              "--les with --rans --steady rejected on --les");
+        check(fieldOf({"channel", "--nz", "1", "--les", "1.35", "--sgs",
+                       "sigma"}) == "--sgs",
+              "sigma at nz 1 rejected on --sgs");
+        check(fieldOf({"channel", "--sgs", "sigma"}) == "--sgs",
+              "--sgs without --les rejected");
+        check(fieldOf({"channel", "--les", "-0.1"}) == "--les",
+              "negative --les rejected");
+    }
+    rejected({"channel", "--les", "inf"}, 1, "infinite --les rejected by the parser");
+    rejected({"channel", "--sgs", "dynamic"}, 1, "unknown --sgs model");
 
     // --- RANS (docs/rans.md) ------------------------------------------------
     auto fieldIs = [](std::vector<std::string> a, const char* f) {
@@ -225,6 +290,24 @@ int main()
     rejected(with({"--rans", "sa-neg", "--steady", "1e-4", "--steady-scheme",
                    "newton"}),
              1, "unknown --steady-scheme value");
+    // Supersonic bulk Mach: only the implicit steady RANS channel (one
+    // broadcast column, v = 0), the CKM M_b 1.5 scenario (docs/rans.md).
+    {
+        auto c = runCli(with({"--re-tau", "220", "--mach", "1.5", "--rans", "sa-neg",
+                              "--steady", "1e-6", "--steady-scheme", "implicit"}));
+        check(c.has_value() && c->mach == 1.5 && c->meta.mach == 1.5,
+              "--mach 1.5 accepted on the implicit steady RANS channel");
+    }
+    check(fieldIs(with({"--mach", "1.5", "--rans", "sa-neg", "--steady", "1e-4"}),
+                  "--mach"),
+          "--mach 1.5 rejected on the explicit steady march");
+    check(fieldIs(with({"--mach", "1.5", "--rans", "sa-neg"}), "--mach"),
+          "--mach 1.5 rejected on URANS");
+    check(fieldIs(with({"--mach", "1.5"}), "--mach"), "--mach 1.5 rejected on DNS");
+    check(fieldIs(with({"--mach", "0", "--rans", "sa-neg", "--steady", "1e-4",
+                        "--steady-scheme", "implicit"}),
+                  "--mach"),
+          "--mach 0 rejected on the implicit steady RANS channel");
     {
         auto c = runCli(with({"--rans", "sa-neg", "--steady", "1e-4",
                               "--steady-scheme", "explicit", "--cfl", "0.3"}));

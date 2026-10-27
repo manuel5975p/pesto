@@ -57,7 +57,8 @@ public:
     //   zero: the 3D form IS the 2D form, with no mode switch to get wrong.
     // ghosted = the ghost-filled view the viscous term actually saw, NOT the
     //   state (feeding mirror values to convection injects energy).
-    // nut != nullptr adds the SGS wall drain to cd/cl but NOT to cdf.
+    // nut != nullptr adds the SGS wall drain (all three link directions, the
+    // eddy-diffusion substep's own weights) to cd/cl/cs but NOT to cdf.
     // Pre: geometry sanitized; phi is the FIRST RK stage's pressure.
     Coeffs measure(const DeviceCutGeometry&, const DeviceScalar& phi,
                    const DeviceField& ghosted, double nu, double qRef,

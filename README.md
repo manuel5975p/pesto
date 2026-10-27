@@ -4,7 +4,8 @@ One binary: `build/dns <flow|tgv|hit|channel|conv|bench> [flags]`. The 15 old ap
 (recomposed 2026-07-20); every capability is reachable from `dns`. `dns --help`
 and `dns <sub> --help` are authoritative and kept in sync with behaviour — read
 them rather than guessing flags. Historical plan/analysis documents live in
-`docs/archive/`.
+`docs/archive/`. Cheap runnable scenarios (exact argv, wall time, label,
+measured numbers against their references): `docs/scenarios.md`.
 
 ---
 
@@ -102,7 +103,7 @@ outlines come from `hb-draw`), no widget toolkit. Full description: `docs/ui.md`
 | `flow` | a body in a uniform free stream: drag/lift, wake, slices |
 | `tgv` | Taylor-Green vortex — 2D analytic check or 3D Re1600 benchmark |
 | `hit` | forced homogeneous isotropic turbulence (SI-configured) |
-| `channel` | wall-resolved turbulent channel flow (compressible, forced; spec: `docs/channel.md`); `--rans` SA-neg / SST mean (`docs/rans.md`) |
+| `channel` | wall-resolved turbulent channel flow (compressible, forced; spec: `docs/channel.md`); `--rans` SA-neg / SST mean (`docs/rans.md`); `--les` smag / σ (filtered) |
 | `conv` | Rayleigh-Bénard convection: heated floor, cooled lid, gravity |
 | `bench` | step-time and throughput benchmark |
 | `prop` | propeller thrust curve by BEMT or lifting line — host-only, never a GPU |
@@ -170,7 +171,8 @@ replace the positional. Explicit CLI flags override the file.
   1 = full res, e.g. 2048×1024 `--png-down 2` → 1024×512).
 * **Grid** `--n` 512, `--ny` (=n), `--nz` 1, `--dr` 8. **Run length** `--ft` 20,
   `--steady TOL` 0, `--seq LEVELS` 1. **Compressible start-up** `--ramp` 2.0,
-  `--kick` 0.05.
+  `--kick` 0.05 (rejected with `--ogrid`, which never applied it; the O-grid's
+  trip is `--ogrid-trip A`, default 0 on the cylinder O-grids).
 * **`--steady` means two things.** Incompressible: march until the velocity
   residual R = max|du/dt|·D/U² < TOL, `--ft` the give-up cap. Compressible
   (`--ogrid` with or without `--rans`, or an immersed body with `--rans`):
@@ -187,6 +189,13 @@ replace the positional. Explicit CLI flags override the file.
   cap 500; slower than explicit wherever
   measured, and it does not converge from a cold start on the Re 1e4
   wedge).
+* **`--compensated`** (compressible; also `dns channel`): the time march on
+  the steady march's compensated (Kahan hi + lo) state. Off by default (the
+  default is bit for bit). Measured: the plain FP32 URANS dt ladder DIVERGES
+  as dt → 0 (an update below ulp(q)/2 rounds away), the compensated one
+  converges; 1.16–1.21× per step. Use it for any dt-convergence claim;
+  rejects `--steady-scheme implicit` and `--penalize` (`docs/rans.md` "Time
+  accuracy").
 * **RANS** (`--physics compressible`; `docs/rans.md` "dns flow"): `--rans
   none|sa-neg|sst-2003m|sst-vm` on the O-grid or on the immersed ghost wall
   (labelled `[immersed ghost wall: first-order wall position, NOT
@@ -198,7 +207,10 @@ replace the positional. Explicit CLI flags override the file.
   (time-accurate)` or `-- steady (...)`. O-grid stats append `cdp,cdf,mutMax,
   yplusMax,yplusMean,floorHits` (immersed: `mutMax,yplusMax,yplusMean,
   floorHits`); `--emit surface` writes the per-face wall table
-  `<out>_surface.csv` (`docs/viewer-format.md`).
+  `<out>_surface.csv` (`docs/viewer-format.md`) -- on the O-grid cp/cf/y+,
+  on the compressible immersed ghost wall the tally per interface face split
+  into pressure / convective / viscous (`tools/parity/split_dns.py` sorts a
+  rotor's into hub and blade).
 
 Grid conventions differ by physics and are deliberately **not** unified:
 * incompressible: `L = 2π`, `h = L/n`, `D = L/--dr` (box scales with n).
@@ -241,8 +253,20 @@ Newton line solve on one FP64 host column (the GPU supplies the residual),
 CFL 100 ×2 → 1e8, total mass pinned, cap 500, rejects `--cfl` and
 `--dt-recompute`: 27–28 iterations and 0.10–0.13 s from Re_τ 180 to 1e4,
 within 8e-8 of the FP64 oracle.
-Measured: ub⁺ vs MKM 15.679 at Re_τ 178 — SA-neg +0.82%, SST-2003m −0.29%
-(ny 64; SST is first order in ny, limit −3.5%). `docs/rans.md`.
+Measured, grid-converged: ub⁺ vs MKM 15.679 at Re_τ 178 — SA-neg +1.0%,
+SST-2003m −3.5% (SST is first order in ny through the TMR wall ω, so its
+ny-64 −0.29% is wall-BC error, not agreement); SA-neg u⁺ vs CFL3D's TMR
+channel within 0.5% (sublayer-normalized). `--mach` ≥ 1 is accepted on the
+implicit RANS channel only (the CKM M_b 1.5 scenario). `docs/rans.md`.
+
+LES (spec `docs/channel.md`, "LES"): `--les CS` + `--sgs smag|sigma` (default
+smag; σ rejected at `--nz 1`), time march only (rejects `--rans`, `--steady`).
+μt is imaged odd across both wall ghost rows, so the wall face carries the
+molecular stress only (μt = 0.0 exactly). Labelled `LES <model> Cs=<CS>
+(filtered: grid- and Cs-dependent)` (σ: `Csigma=`) in `--dry-run`, the
+progress line, a `# ...` first line of both CSVs, and the `.json`
+(`les`, `cs`, `sgs`). Stats append `nutMax, nutWall`, profiles `nutRatio`.
+`--les 0` is the DNS channel byte for byte (`gpu_channel_les`).
 
 ### `conv` — Rayleigh-Bénard convection
 
@@ -741,7 +765,8 @@ residuals: radial pulse all faces 2.4%, lateral-skimming vortex 2.9%,
 vortex-on-face 2.6-2.8%; 3D freestream fixed point exact. NOT yet validated:
 3D/mesh app, long-window saturated Re60 shedding; anchors remain sponge-era.
 Deferred: FP64 gauge-p differencing, wall-aware transverse stencil, LES nut at
-boundary rows, betaLat split, long-window open validation campaign.
+the NSCBC x rows (the y/z mirror rows and walls take the image since W1, §11),
+betaLat split, long-window open validation campaign.
 
 ### `--nscbc-strip N` — the Re2000 limit and the production hybrid
 Pure NSCBC diverges at Re2000 2048² (t = 63.6) — residual outflow reflection pumps
@@ -1014,9 +1039,30 @@ historical 2D-only kernel (the old `--nz 1` rejection is gone). Compressible LES
 `DeviceComp::make(g, γ, μ, csLes)` adds a full-3D Smagorinsky stress via an
 optional per-cell eddy viscosity `μ_t = ρ(CsΔ)²|S|` face-averaged into
 `faceFlux`'s μ (and `μ_t·cp/Pr_t`, Pr_t = 0.9, into κ); `Δ² = (hxhyhz)^⅔`
-(hxhy at nz == 1); `stableDt` folds max μ_t into the viscous limit (SmagMax
-reduction). `csLes == 0` is bit-for-bit molecular DNS; the ghost force tally calls
-`faceFlux` with `nut = nullptr` so `cdf` stays ν-only.
+(hxhy at nz == 1); `stableDt` folds max μ_t into the viscous limit — since
+W15 (2026-10-27) the max of the solver's own FP32 μ_t of that state
+(`updateSgsNut`, images included), not an FP64 re-derivation of the model,
+which cost 1.5 ms (smag) / 2.5 ms (σ) of a 5.8 / 7.1 ms 128³ step.
+`csLes == 0` is bit-for-bit molecular DNS.
+
+**Walls (2026-10-27, W1).** μ_t is formed on every cell, ghosts included, and
+then takes the SAME image RANS uses (`DeviceComp::setMutHook`): odd through the
+immersed ghost image (`mirrorMut`, deep cells 0) and across the O-grid wall row,
+odd on `--noslip` y rows, an even copy on free-slip mirror rows and the O-grid
+far row. So a wall face carries the molecular stress only — exactly 0.0 face
+μ_t on the O-grid, up to the staircase on the immersed wall (W3 bounds that
+image) — and no ghost row differences its gradient across the periodic wrap
+(the O-grid wall row did, against the far row: +0.1 ν at the wall face,
+measured). Every compressible tally (cd/cl/cs, torque, wall heat) now passes
+the solver's own μ_t and eddy conductivity, so it is the budget of the solved
+equations: `gpu_les_wall` closes Σ_fluid rhs·vol = −tally to ≤ 1e-8 relative
+(immersed, focal, 3D sphere), where the old ν-only tally missed by 0.17–0.51.
+The incompressible tally (`kBodySgsFriction`) now takes the z links and fz too
+(`gpu_les_tally3d`, 1e-7), and its LES dt bound carries `ν + max νt`. Not
+imaged: the NSCBC x rows (deferred, `issues.md`). Smagorinsky still puts
+`νt/ν ≈ Cs² Δ+² ≈ 0.03 Δ+²` in the FIRST fluid cell (|S| is the wall shear
+there; no wall damping) — prefer `--sgs sigma` for wall-bounded LES; the
+validator warns on smag + body + nz > 1.
 
 `--sgs smag|sigma` (default smag) selects the νt operator, same plumbing in both
 physics. `sigma` is the σ-model (Nicoud et al., Phys. Fluids 23, 085106, 2011):
@@ -1037,7 +1083,8 @@ Consequences — never blur these:
   νt ∝ Δ²). This is not a discretization error; do not present LES numbers as
   converged predictions.
 * Dissipation at the body is model-supplied, so cd/St/separation carry model
-  error. The `cdf` friction column uses ν only (no νt in the surface stress).
+  error. cd/cl/cs include the SGS stress in both physics; the incompressible
+  `cdf` friction column uses ν only (no νt in that diagnostic).
 * 2D caveat: Smagorinsky models a 3D forward ENERGY cascade; 2D cascades energy
   up and enstrophy down (no vortex stretching), so 2D + `--les` = stabilized /
   regularized 2D Euler, qualitative only.
@@ -1046,7 +1093,12 @@ Consequences — never blur these:
 artifacts, memory) and state Cs; use the DNS label only when `--les 0` and
 BL ≥ ~3 cells. `--dry-run` prints the resolved DNS/LES label.
 Tests: `gpu_comp_les` (Cs = 0 bit-identical, conserves mass/momentum/E,
-KE < DNS in 3D).
+KE < DNS in 3D), `gpu_les_wall` (wall-face μ_t 0.0, momentum closure),
+`gpu_les_tally3d`, `gpu_les_smag` (8) (νt magnitude and convention to 4 ulp:
+`|S| = sqrt(2 S:S)`, `Δ² = vol^(2/3)`), `gpu_les_tgv_comp` (compressible
+32³ TGV DNS / smag / σ vs the 512³ reference: peak −dK/dt −27.8 / −9.1 /
+−10.5%; σ μt ≡ 0 at t = 0; the LES dt bound never binds;
+docs/validation.md "LES known answers").
 
 **RANS** (`dns channel --rans`, `dns flow --physics compressible
 --rans`, `docs/rans.md`) is a third label and a third
@@ -1087,7 +1139,12 @@ gradient assembled from the mesh metrics (`curvVelGradCentre`: index-space
 central differences contracted with the cell-centre inverse Jacobian, averaged
 from the two faces normal to each axis) and the filter width the cell's OWN
 `Delta² = vol^(2/3)` (`vol/hz` at `nz == 1`), so a clustered mesh filters at
-the local spacing instead of a box average. Measured degeneracy: on the
+the local spacing instead of a box average. That isotropic `vol^(1/3)` is
+deliberately NOT anisotropy-corrected (Scotti, Meneveau & Lilly 1993:
+`Delta_eff = vol^(1/3) cosh(sqrt(4/27 (ln²a1 - ln a1 ln a2 + ln²a2)))`): it
+under-predicts Delta² — hence νt — by 1.07× at 2:1:1, 1.31× at 4:1:1 and 2.6×
+at 16:1:1 or 16:16:1 (documented, not changed; convention test-pinned in
+`gpu_les_smag` (8)). Measured degeneracy: on the
 identity map both operators match the Cartesian LES path to 1e-6 rel Linf over
 10 steps, and the LES viscous dt limit matches to 1e-4 (the ACOUSTIC halves of
 the two `stableDt`s are not comparable by construction — see the `|u|` vs
@@ -1289,7 +1346,10 @@ The full-revolution mesh is EXACTLY symmetric under a rotation by π about the
 axis and so is an axisymmetric start: the odd azimuthal modes (the m = 1
 lift mode) cannot grow from rounding — `--ogrid-trip A` seeds them, ON by
 default at 0.05 U and named in the label (`--ogrid-trip 0` is the untripped
-march bit for bit, warned at Re ≥ 200 and with `--rans`). `--init-from
+march bit for bit, warned at Re ≥ 200 and with `--rans`). The same trip is
+valid on the cylinder O-grids (2D and extruded; default 0 there, labelled
+`[O-grid trip A U]` when given) and starts shedding earlier; only the
+axisymmetric wedge rejects it. `--init-from
 PREFIX` starts the full revolution from a converged wedge run's
 `PREFIX_final.bin` (written by `--emit mesh`), revolved over the N planes,
 its meridional mesh, closure and Mach checked against `PREFIX_mesh.bin` (a
@@ -1443,7 +1503,8 @@ Three things carry the implementation:
 
 What it is worth: MRF is EXACT when the outer conditions are axisymmetric
 about the shaft (pinned in `gpu_mrf`: a spinning cylinder in a quiescent box
-agrees with the direct moving-wall run to 1e-4 in torque) and an
+agrees with the direct moving-wall run to 1.8e-5 in torque on gfx1100,
+banded 1e-3; 1e-4 on gfx1201 before the 2026-10-24 wall pressure image) and an
 APPROXIMATION otherwise — it co-rotates whatever the far field imposes, which
 is precisely the frozen-rotor error. An axial-flow propeller in a uniform
 freestream is the good case. Measured 2026-07-31 on the single-blade prop of
@@ -1480,7 +1541,9 @@ small). The surface tally passes the same view and adds the shaft moment on
 the same wall faces, so the stats gain `thrust,torque,ct,cq` exactly as the
 immersed rotor's. Measured (`gpu_mrf`, spinning cylinder, quiescent, Re 20 on
 the tip): O-grid MRF torque agrees with the Cartesian DIRECT moving-wall run
-to 0.07% and the driven swirl to 0.5% — two wall discretizations, two frames,
+to 0.22% and the driven swirl to 0.63% (gfx1100, 2026-10-27; banded 1% / 2%;
+0.07% / 0.5% before the 2026-10-24 wall pressure image moved the Cartesian
+direct torque) — two wall discretizations, two frames,
 one flow; the node-psi transparency residual is 6e-8 against the corner
 form's 1e-5.
 
@@ -1547,7 +1610,8 @@ green.
   COLUMN NAME from the header row, never by index:
   * incompressible `flow`: `t, dt, K, cd, cl, cdf, cfl, maxDiv, pcgIters, resid`
   * compressible `flow`: `t, dt, cd, cl, cs, wmax`
-  * `channel`: `t, dt, ubulk, utauBot, utauTop, retau, KE`
+  * `channel`: `t, dt, ubulk, utauBot, utauTop, retau, KE` (RANS / LES
+    append columns; an LES file opens with a `# LES ...` label line)
   * `conv` compressible: `t, dt, nuBot, nuTop, nuFlux, urms, KE`
   * `conv` incompressible: `t, dt, nuBot, nuTop, nuFlux, urms, KE, maxDiv`
 * `bin` — `<out>_{vort,speed,mask}.bin`, float32 mid-plane, one frame per `--fdt`.

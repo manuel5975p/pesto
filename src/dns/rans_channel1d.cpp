@@ -446,7 +446,7 @@ Grid channel1dGrid(const Channel1dCase& c, int nx, int nz, double lx, double lz)
 
 std::expected<Channel1dSolution, std::string> solveChannel1d(const Channel1dCase& cs)
 {
-    assert(cs.ny >= 8 && cs.reTau > 0 && cs.mach > 0 && cs.mach < 1);
+    assert(cs.ny >= 8 && cs.reTau > 0 && cs.mach > 0);
     const bool sst = ransSst(cs.model);
     const Grid g = channel1dGrid(cs, 2, 1, 1.0, 1.0);
     const CurvMesh mesh = CurvMesh::channelY(g, cs.beta, 1.0);

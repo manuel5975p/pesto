@@ -3,7 +3,9 @@
 // wall + interior scheme), SA-neg against the MKM DNS bulk velocities at
 // Re_tau 178.12 and 392.24 (a MODEL vs DNS comparison, banded provisionally
 // and the measured value pinned), the log-layer slope, the grid order of ub,
-// and Newton's convergence. Host-only, seconds.
+// the SST wall-omega ladder (first order, Richardson limit), SA-neg against
+// TMR's CFL3D 2DFDC log layer (code to code), and Newton's convergence.
+// Host-only, seconds.
 #include "dns/rans_channel1d.hpp"
 
 #include "check.hpp"
@@ -120,27 +122,94 @@ void mkm()
 // SST's grid convergence is FIRST order, and that is the TMR wall value's:
 // omega_w = 60 nu / (beta1 d1^2) changes with the first cell, an O(d1)
 // boundary error (measured with d1 = the first centre AND with d1 = the first
-// cell height: both first order, to the same limit ~15.13). Pinned so a change
-// in the wall treatment shows up as a change in order.
+// cell height: both first order, to the same limit ~15.13). The ladder is
+// pinned so a change in the wall treatment shows up as a change in order or
+// limit. Measured (2026-10-27): ub 15.776441287 / 15.463959275 / 15.292007660
+// / 15.206956290 at ny 48/96/192/384, order 0.86 / 1.02, Richardson limit
+// 15.124 (ny 768 adds 15.166241752: order 1.06, limit 15.129). The limit is
+// -3.5% against MKM's 15.679 -- the ny-64 -0.29% of mkm() is wall-BC error.
 void sstOrder()
 {
-    double ub[3];
-    const int nys[3] = {192, 384, 768};
-    for (int q = 0; q < 3; ++q) {
-        auto s = solve(nys[q], 178.12, RansModel::Sst2003m, 2.0, 1e-9);
-        check(s.has_value(), std::format("SST-2003m ny {} converges", nys[q]));
+    struct Rung
+    {
+        int ny;
+        double ub;
+    };
+    const Rung rungs[4] = {{48, 15.776441287}, {96, 15.463959275},
+                           {192, 15.292007660}, {384, 15.206956290}};
+    double ub[4];
+    for (int q = 0; q < 4; ++q) {
+        auto s = solve(rungs[q].ny, 178.12, RansModel::Sst2003m, 2.0, 1e-9);
+        check(s.has_value(), std::format("SST-2003m ny {} converges", rungs[q].ny));
         if (!s) {
             std::printf("  %s\n", s.error().c_str());
             return;
         }
         ub[q] = s->ub;
-        std::printf("SST-2003m ub ny %3d: %.8f\n", nys[q], ub[q]);
+        std::printf("SST-2003m ub ny %3d: %.9f (pinned %.9f)\n", rungs[q].ny, ub[q],
+                    rungs[q].ub);
+        check(std::abs(ub[q] / rungs[q].ub - 1) <= 1e-6,
+              std::format("SST-2003m ny {}: ub ladder pin (1e-6 rel)", rungs[q].ny));
     }
-    const double order = std::log2((ub[0] - ub[1]) / (ub[1] - ub[2]));
-    std::printf("SST-2003m ub apparent order %.3f (Richardson limit %.4f)\n",
-                order, ub[2] + (ub[2] - ub[1]) / (std::pow(2.0, order) - 1));
-    check(order > 0.7 && order < 1.4, "SST ub converges at first order (the "
-                                      "wall-omega BC)");
+    const double coarse = std::log2((ub[0] - ub[1]) / (ub[1] - ub[2]));
+    const double order = std::log2((ub[1] - ub[2]) / (ub[2] - ub[3]));
+    const double limit = ub[3] + (ub[3] - ub[2]) / (std::pow(2.0, order) - 1);
+    std::printf("SST-2003m ub apparent order %.3f (48/96/192) %.3f (96/192/384), "
+                "Richardson limit %.4f (%+.2f%% vs MKM 15.679)\n",
+                coarse, order, limit, 100 * (limit / 15.679 - 1));
+    check(order >= 0.8 && order <= 1.3, "SST ub converges at first order (the "
+                                        "wall-omega BC), 96/192/384 in [0.8, 1.3]");
+    check(std::abs(limit - 15.13) <= 0.02, "SST-2003m Richardson limit 15.13 +- 0.02");
+}
+
+// O5: SA-neg code to code against NASA TMR's CFL3D SA solution of the 2D
+// fully-developed channel (2DFDC), file sa_u+y+KM_cfl3d.dat ("CFL3D high Re
+// channel, SA"). u+ at y+ 30/100/300/1000, linear in y+ between the file's
+// points: 13.2582 / 16.1767 / 18.8002 / 21.6989. The file's own sublayer
+// slope u+/y+ is 0.988 (0.9877-0.9883 over y+ 0.6-1.7, where it must be 1):
+// its wall units carry a ~0.6% u_tau offset, so the comparison is made both
+// raw and sublayer-normalized (u+ * 0.988). Measured (Re_tau 1e5, ny 1024,
+// stretch 5; 2026-10-27): raw +0.73..+0.77%, normalized -0.44..-0.48%,
+// spread 0.04%; ny 512 / 2048 move it by < 0.06% (grid-independent).
+void cfl3dSa()
+{
+    const double reTau = 1e5;
+    // ny 1024's FP64 residual floors at ~1.3e-9 (eps / dy^2): tol 1e-8.
+    auto s = solve(1024, reTau, RansModel::SaNeg, 5.0, 1e-8);
+    check(s.has_value(), "SA-neg Re_tau 1e5 ny 1024 converges");
+    if (!s) {
+        std::printf("  %s\n", s.error().c_str());
+        return;
+    }
+    const double ref[4][2] = {{30, 13.2582}, {100, 16.1767}, {300, 18.8002}, {1000, 21.6989}};
+    const double sublayer = 0.988;
+    double rawMax = 0, normMax = 0, lo = HUGE_VAL, hi = -HUGE_VAL;
+    int found = 0;
+    const std::size_t h = s->u.size() / 2;
+    for (const auto& r : ref)
+        for (std::size_t j = 0; j + 1 < h; ++j) {
+            const double a = s->d[j] * reTau, b = s->d[j + 1] * reTau;
+            if (!(a <= r[0] && r[0] <= b)) continue;
+            const double u = s->u[j] + (r[0] - a) / (b - a) * (s->u[j + 1] - s->u[j]);
+            const double raw = u / r[1] - 1, norm = u * sublayer / r[1] - 1;
+            std::printf("CFL3D SA y+ %5g: u+ %.5f CFL3D %.4f raw %+.3f%% "
+                        "sublayer-normalized %+.3f%%\n",
+                        r[0], u, r[1], 100 * raw, 100 * norm);
+            rawMax = std::max(rawMax, std::abs(raw));
+            normMax = std::max(normMax, std::abs(norm));
+            lo = std::min(lo, raw);
+            hi = std::max(hi, raw);
+            ++found;
+            break;
+        }
+    check(found == 4, "CFL3D SA: all four y+ stations inside the half channel");
+    std::printf("CFL3D SA: |raw| <= %.3f%%, |normalized| <= %.3f%%, spread %.3f%% "
+                "(ub+ %.6f, y+_1 %.3f, %d its)\n",
+                100 * rawMax, 100 * normMax, 100 * (hi - lo), s->ub, s->d[0] * reTau,
+                s->iters);
+    check(normMax <= 0.0075, "CFL3D SA: sublayer-normalized u+ within 0.75%");
+    check(rawMax <= 0.012, "CFL3D SA: raw u+ within 1.2%");
+    check(hi - lo <= 0.001, "CFL3D SA: deviation flat over the log layer (spread <= 0.1%)");
 }
 
 // O3a: the log-layer slope du+/d ln y+ = 1/kappa, least squares over the
@@ -175,7 +244,8 @@ void logSlope()
                 "y+_1 %.3f\n",
                 n, slope, 1 / 0.41, 100 * (slope * 0.41 - 1), s->d[0] * reTau);
     check(n >= 8, "log band holds >= 8 cells");
-    check(std::abs(slope * 0.41 - 1) < 0.03, "log slope is 1/kappa within 3%");
+    // Measured +0.32% (2026-10-26); banded >= 3x, a truncation-level pin.
+    check(std::abs(slope * 0.41 - 1) < 0.01, "log slope is 1/kappa within 1%");
 }
 
 // O3b: grid convergence of ub (apparent order). ny 48/96/192 is still
@@ -229,6 +299,7 @@ int main()
     logSlope();
     ubOrder();
     sstOrder();
+    cfl3dSa();
     newton();
     return dnstest::finish();
 }

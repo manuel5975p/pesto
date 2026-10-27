@@ -15,6 +15,7 @@ std::size_t RotorTable::bytes() const
         n += t.gcell.size() * sizeof(int) + t.gnbr.size() * sizeof(int)
              + t.gw.size() * sizeof(Real) + t.gscale.size() * sizeof(Real)
              + t.tnbr.size() * sizeof(int) + t.tw.size() * sizeof(Real)
+             + t.gfnb.size() * sizeof(int)
              + t.uwall.size() * sizeof(Real) + t.aspan.size() * sizeof(Real)
              + t.deep.size() * sizeof(int)
              + t.fcell.size() * sizeof(int) + t.fdir.size() * sizeof(int)

@@ -117,6 +117,15 @@ int main()
         const std::string csv = slurp("a_stats.csv");
         check(csv.starts_with("t,dt,K,cd,cl,cdf,cfl,maxDiv,pcgIters\n"),
               "stats header is verbatim");
+        // A labelled series (channel LES) opens with "# <label>".
+        const std::string lc[] = {"t", "nutMax"};
+        check(o->declareSeries("lab", lc, "LES smag Cs=0.17").has_value(),
+              "labelled series declared");
+        const double lr[] = {1.0, 2.0};
+        check(o->row("lab", lr), "labelled row writes");
+        check(o->flush().has_value(), "flush after labelled series");
+        check(slurp("a_lab.csv") == "# LES smag Cs=0.17\nt,nutMax\n1,2\n",
+              "label line, then the header, then the rows");
 
         o->setMsPerStep(1.25);
     }

@@ -9,6 +9,10 @@
 // mean of ~0.78 here; the bottleneck bump pushes the measured value above
 // that (0.98 on 2026-07-17). Band = [0.9x, 2x] the model prediction -- a
 // factor-2 normalization error still fails loudly.
+// Window 3 + 3 eddy turnovers (was 6 + 6, 43.7 s): the same bands, half the
+// steps. Measured 2026-10-27: 746 steps, eps/eps_f 0.963, u' 0.920, C 0.938
+// (8 samples) against 1507 steps, 0.979 / 0.971 / 0.942 at 6 + 6. The GPU
+// twin (gpu_hit_mini) runs the binary's FP32 path at the full 6 + 6.
 #include "dns/diagnostics.hpp"
 #include "dns/forcing.hpp"
 #include "dns/hit_ic.hpp"
@@ -38,7 +42,7 @@ int main()
     dns::TimeStepper ts(g, {nu, 0.9});
     const dns::LinearForcing forcing{epsF, 1.5 * uTarget * uTarget / 5.0};
 
-    const double tSpin = 6.0 * tEddy, tEnd = 12.0 * tEddy;
+    const double tSpin = 3.0 * tEddy, tEnd = 6.0 * tEddy;
     double t = 0.0;
     double epsSum = 0.0, kSum = 0.0, wSum = 0.0;
     long steps = 0;
@@ -59,7 +63,7 @@ int main()
             epsSum += dt * nu * dns::velocityGradientSq(g, U);
             kSum += dt * dns::fluctuationEnergy(g, U);
             wSum += dt;
-            if (steps % 100 == 0) // plans per call: sample sparingly
+            if (steps % 50 == 0) // plans per call: sample sparingly
             {
                 const auto E = dns::energySpectrum(g, U);
                 if (specSum.empty()) specSum.assign(E.size(), 0.0);

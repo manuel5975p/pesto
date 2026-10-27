@@ -274,7 +274,12 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
                     conv = dFlag ? maxCourantPerDtCut(gg, *dU, dCut->ax, dCut->ay,
                                                       dCut->az, dCut->lambda, *red)
                                  : maxCourantPerDt(gg, *dU, *red);
-                    const double diff = r.nu > 0 ? 6.0 * r.nu / (h * h) : 0.0;
+                    // LES: the eddy-diffusion substep is explicit too, so the
+                    // diffusive bound carries nu + max nut (the last stage's
+                    // nut; 0 before the first). No LES = the bound verbatim.
+                    const double nuEff =
+                        les ? r.nu + maxAbsScalar(les->nut(), *red) : r.nu;
+                    const double diff = nuEff > 0 ? 6.0 * nuEff / (h * h) : 0.0;
                     return r.cfl / std::max(conv, diff);
                 });
             !e)

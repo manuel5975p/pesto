@@ -13,11 +13,32 @@ namespace dns::gpu {
 
 namespace {
 
-// The two plates. Both ghost states are the shared no-slip wall
-// (internal/wall_ghost.hpp); this kernel only picks which one.
-__global__ void kChannelWallY(GpuGrid g, int isothermal, Real gam, Real Rgas,
-                              Real Twall, Real* rho, Real* mx, Real* my,
-                              Real* mz, Real* E)
+// The 5 + nT low words of a state; n == 0 for a plain one.
+struct GhostLo
+{
+    Real* p[7];
+    int n;
+};
+
+// The two plates, one launch per stage-hook call: each thread owns one ghost
+// cell c (mirroring the first fluid cell s) and, in order, writes its mean
+// flow, zeroes its low words and images its scalars. It reads only the real
+// cell s and the ghost density it has just written itself, so the one launch
+// is the former three (wall, low words, scalars) bit for bit.
+//
+// Mean flow: both ghost states are the shared no-slip wall
+// (internal/wall_ghost.hpp); this kernel only picks which one. Low words: the
+// wall's ghost cells are SET, not accumulated, so the compensated pair holds
+// exactly the value the wall wrote. Scalars (nT 1 SA, 2 SST): mirror the
+// SPECIFIC nu~ / k odd and rebuild the conserved value with the ghost's OWN
+// density (the isothermal ghost has rho_g != rho_1), as the momentum mirror
+// does; SST omega a DIRICHLET image of the TMR wall value, omega_g = 2
+// omega_w - omega_1, so the wall face holds omega_w = coef / rho_w (nu_w = mu
+// / rho_w on the face).
+__global__ void kChannelRows(GpuGrid g, int isothermal, Real gam, Real Rgas,
+                             Real Twall, Real* rho, Real* mx, Real* my,
+                             Real* mz, Real* E, GhostLo lo, int nT, Real coef,
+                             Real* t0, Real* t1)
 {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     int i, k;
@@ -28,6 +49,10 @@ __global__ void kChannelWallY(GpuGrid g, int isothermal, Real gam, Real Rgas,
     // The driving force is along x, tangential to both plates: f . n == 0.
     else internal::isothermalGhost(c, s, gam, Rgas, Twall, Real(0), rho, mx, my,
                                    mz, E);
+    for (int v = 0; v < lo.n; ++v) lo.p[v][c] = Real(0);
+    if (nT == 0) return;
+    t0[c] = internal::saGhost(rho[c], rho[s], t0[s]);
+    if (nT == 2) t1[c] = internal::sstOmegaGhost(coef, rho[c], rho[s], t1[s]);
 }
 
 // Additive rhs contribution: the stage kernel already wrote the interior
@@ -46,52 +71,6 @@ __global__ void kBodyForceX(GpuGrid g, Real f, StageCombine cmb, const Real* u,
     const Real cr = cmb.crAt(c);
     internal::stageAdd<Comp>(cmb, 1, c, cr, f, omx);
     internal::stageAdd<Comp>(cmb, 4, c, cr * f, u[c], oE);
-}
-
-// The wall's ghost cells are SET, not accumulated: their low words are zero,
-// so the compensated pair holds exactly the value the wall wrote.
-struct GhostLo
-{
-    Real* p[7];
-    int n;
-};
-
-__global__ void kChannelGhostLo(GpuGrid g, GhostLo lo)
-{
-    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    int i, k;
-    bool hi;
-    std::size_t c, s;
-    if (!internal::yGhostPair(g, t, i, k, hi, c, s)) return;
-    for (int v = 0; v < lo.n; ++v) lo.p[v][c] = Real(0);
-}
-
-// The SA ghost scalar on both plates: mirror the SPECIFIC nu~ odd and rebuild
-// the conserved value with the ghost's OWN density (the isothermal ghost has
-// rho_g != rho_1), as the momentum mirror does. Runs after kChannelWallY.
-__global__ void kChannelWallTurb(GpuGrid g, const Real* rho, Real* t0)
-{
-    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    int i, k;
-    bool hi;
-    std::size_t c, s;
-    if (!internal::yGhostPair(g, t, i, k, hi, c, s)) return;
-    t0[c] = internal::saGhost(rho[c], rho[s], t0[s]);
-}
-
-// The SST ghost pair: k antimirrored like nu~; omega a DIRICHLET image of the
-// TMR wall value, omega_g = 2 omega_w - omega_1, so the wall face holds
-// omega_w = coef / rho_w (nu_w = mu / rho_w on the face).
-__global__ void kChannelWallSst(GpuGrid g, Real coef, const Real* rho, Real* t0,
-                                Real* t1)
-{
-    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    int i, k;
-    bool hi;
-    std::size_t c, s;
-    if (!internal::yGhostPair(g, t, i, k, hi, c, s)) return;
-    t0[c] = internal::saGhost(rho[c], rho[s], t0[s]);
-    t1[c] = internal::sstOmegaGhost(coef, rho[c], rho[s], t1[s]);
 }
 
 // The 5 + nT field pointers of a state, DeviceCompState order.
@@ -197,28 +176,19 @@ std::expected<DeviceChannelWall, hipError_t> DeviceChannelWall::make(const Grid&
 
 void DeviceChannelWall::apply(DeviceCompState& s) const
 {
-    kChannelWallY<<<launchBlocks(2 * std::size_t(g_.nx) * g_.nz), blockSize>>>(
-        g_, int(c_.isothermal), Real(c_.gamma), Real(c_.Rgas), Real(c_.Twall),
-        s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(), s.E.data());
-    checkLastKernel("kChannelWallY");
-    const std::size_t nb = launchBlocks(2 * std::size_t(g_.nx) * g_.nz);
+    assert(s.nT <= 1 || (s.nT == 2 && c_.sstOmegaCoef > 0));
+    GhostLo lo{{}, 0};
     if (s.compensated()) {
-        GhostLo lo{{}, 5 + s.nT};
+        lo.n = 5 + s.nT;
         for (int v = 0; v < 5; ++v) lo.p[v] = s.lo[v].data();
         for (int i = 0; i < s.nT; ++i) lo.p[5 + i] = s.tlo[i].data();
-        kChannelGhostLo<<<nb, blockSize>>>(g_, lo);
-        checkLastKernel("kChannelGhostLo");
     }
-    if (s.nT == 0) return;
-    if (s.nT == 1) {
-        kChannelWallTurb<<<nb, blockSize>>>(g_, s.rho.data(), s.t[0].data());
-        checkLastKernel("kChannelWallTurb");
-        return;
-    }
-    assert(s.nT == 2 && c_.sstOmegaCoef > 0);
-    kChannelWallSst<<<nb, blockSize>>>(g_, Real(c_.sstOmegaCoef), s.rho.data(),
-                                       s.t[0].data(), s.t[1].data());
-    checkLastKernel("kChannelWallSst");
+    kChannelRows<<<launchBlocks(2 * std::size_t(g_.nx) * g_.nz), blockSize>>>(
+        g_, int(c_.isothermal), Real(c_.gamma), Real(c_.Rgas), Real(c_.Twall),
+        s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(), s.E.data(), lo,
+        s.nT, Real(c_.sstOmegaCoef), s.nT > 0 ? s.t[0].data() : nullptr,
+        s.nT > 1 ? s.t[1].data() : nullptr);
+    checkLastKernel("kChannelRows");
 }
 
 void addBodyForceX(const GpuGrid& g, double f, const StageCombine& cmb,

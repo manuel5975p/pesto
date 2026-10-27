@@ -158,6 +158,122 @@ double restForce(const Grid& g, const CurvMetrics& m,
            / (pInf * std::max(area, 1e-300));
 }
 
+// The per-face split (surfaceFaces, --emit surface) on the curvilinear tally:
+// after one step of a flowing state, each row's s is the oriented metric face
+// vector (|s| == area, sum s == 0 over the closed surface), the rows' gauge
+// totals sum to force(), and p s + fc + fv == f per row.
+void splitFocal(const std::string& name, const Grid& g, const CurvMetrics& m,
+                const gpu::CompGhostTables& t)
+{
+    auto dev = gpu::DeviceComp::make(m, gamma_, 0.01);
+    gpu::CompGhostCapacity cap;
+    cap.cover(t);
+    auto gh = gpu::DeviceCompGhost::fromTables(g, t, cap, gamma_, rhoInf, pInf,
+                                               true);
+    auto ds = gpu::DeviceCompState::make(g.size());
+    auto red = gpu::ReduceScratch::make();
+    if (!dev || !gh || !ds || !red) { check(false, name + ": split setup"); return; }
+    auto h = CompState::zeros(g);
+    for (std::size_t c = 0; c < g.size(); ++c) {
+        h.rho[c] = rhoInf;
+        h.mx[c] = 0.8;
+        h.my[c] = -0.3;
+        h.mz[c] = g.nz > 1 ? 0.2 : 0.0;
+        h.E[c] = pInf / (gamma_ - 1.0)
+                 + 0.5 * (h.mx[c] * h.mx[c] + h.my[c] * h.my[c]
+                          + h.mz[c] * h.mz[c]) / rhoInf;
+    }
+    (void)ds->upload(h);
+    dev->setStageHook([&](gpu::DeviceCompState& s) { gh->apply(s); });
+    gh->apply(*ds);
+    dev->step(*ds, gpu::Real(dev->stableDt(*ds, *red)));
+    gh->apply(*ds);
+    const auto F = gh->force(*dev, *ds);
+    const auto rows = gh->surfaceFaces(*dev, *ds, pInf);
+    check(rows.has_value() && int(rows->size()) == t.nFace(),
+          name + ": one split row per interface face");
+    if (!rows) return;
+    double f[3] = {0, 0, 0}, s[3] = {0, 0, 0}, gross = 0, area = 0, row = 0;
+    for (const auto& r : *rows) {
+        for (int c = 0; c < 3; ++c) {
+            f[c] += r.f[c];
+            s[c] += r.s[c];
+            gross += std::abs(r.f[c]);
+            row = std::max(row, std::abs(r.fp[c] + r.fc[c] + r.fv[c] - r.f[c]));
+        }
+        area += r.area;
+    }
+    const double Ff[3] = {F.fx, F.fy, F.fz};
+    double ef = 0;
+    for (int c = 0; c < 3; ++c) ef = std::max(ef, std::abs(f[c] - Ff[c]));
+    const double closure = std::sqrt(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]) / area;
+    std::printf("%s split: F (%.6e %.6e %.6e) rows-F %.2e (gross %.3e), "
+                "|sum s|/A %.1e, max row residual %.1e\n",
+                name.c_str(), F.fx, F.fy, F.fz, ef, gross, closure, row);
+    check(closure < 1e-12, name + ": split s is the closed metric surface");
+    check(ef < 1e-6 * gross, name + ": split row sums == force() (1e-6 of gross)");
+    check(row <= 1e-12 * gross, name + ": p s + fc + fv == f per row");
+}
+
+// The focal (faceFluxCurv) counterpart of the Cartesian inviscid check: at
+// mu = 0 the face flux is p S + rho u_a u only, so fv must be FP32 rounding
+// of the gross absolute flux -- inside an MRF zone (pointwise frame velocity
+// on the remapped mesh, the rotor runner's path), where u_a = U.S - w.S.
+void splitFocalInviscidMrf(const std::string& name, const Grid& g,
+                           const CurvMetrics& m, const gpu::CompGhostTables& t,
+                           const AxisRemap3& R, const double ctr[3],
+                           const double hw[3])
+{
+    auto dev = gpu::DeviceComp::make(m, gamma_, 0.0);
+    gpu::CompGhostCapacity cap;
+    cap.cover(t);
+    auto gh = gpu::DeviceCompGhost::fromTables(g, t, cap, gamma_, rhoInf, pInf,
+                                               true);
+    auto ds = gpu::DeviceCompState::make(g.size());
+    auto red = gpu::ReduceScratch::make();
+    if (!dev || !gh || !ds || !red) { check(false, name + ": setup"); return; }
+    gpu::MrfZone z;
+    z.axis = 0;
+    z.omega = 0.5 / hw[1];
+    for (int c = 0; c < 3; ++c) z.center[c] = ctr[c];
+    z.r1 = hw[1];
+    z.r2 = 2.0 * hw[1];
+    z.a1 = hw[0];
+    z.a2 = 2.0 * hw[0];
+    check(dev->setMrf(z, R) == hipSuccess, name + ": setMrf");
+    auto h = CompState::zeros(g);
+    for (std::size_t c = 0; c < g.size(); ++c) {
+        h.rho[c] = rhoInf;
+        h.mx[c] = 0.8;
+        h.my[c] = -0.3;
+        h.mz[c] = g.nz > 1 ? 0.2 : 0.0;
+        h.E[c] = pInf / (gamma_ - 1.0)
+                 + 0.5 * (h.mx[c] * h.mx[c] + h.my[c] * h.my[c]
+                          + h.mz[c] * h.mz[c]) / rhoInf;
+    }
+    (void)ds->upload(h);
+    dev->setStageHook([&](gpu::DeviceCompState& s) { gh->apply(s); });
+    gh->apply(*ds);
+    dev->step(*ds, gpu::Real(dev->stableDt(*ds, *red)));
+    gh->apply(*ds);
+    const auto rows = gh->surfaceFaces(*dev, *ds, pInf);
+    check(rows.has_value() && !rows->empty(), name + ": inviscid surfaceFaces");
+    if (!rows) return;
+    double fv = 0, fc = 0, gross = 0;
+    for (const auto& r : *rows)
+        for (int c = 0; c < 3; ++c) {
+            fv += std::abs(r.fv[c]);
+            fc += std::abs(r.fc[c]);
+            gross += std::abs(r.f[c] + pInf * r.s[c]);
+        }
+    std::printf("%s inviscid MRF split: sum|fv| %.3e, sum|fc| %.3e, gross %.3e "
+                "(fv/gross %.2e)\n",
+                name.c_str(), fv, fc, gross, fv / gross);
+    check(fc > 1e-3 * gross, name + ": the convective part is not vacuous");
+    check(fv < 1e-6 * gross,
+          name + ": mu = 0 leaves no viscous part (FP32 rounding of the gross)");
+}
+
 void closedBody(const std::string& name, const Grid& g, const gpu::GhostSdf& sdf,
                 const double ctr[3], const double hw[3])
 {
@@ -193,6 +309,10 @@ void closedBody(const std::string& name, const Grid& g, const gpu::GhostSdf& sdf
     check(c.closure() < 1e-12, name + ": sum(S) == 0 over the metric faces");
     check(c.reach == 0, name + ": no deep cell inside a fluid flux stencil");
     check(fr < 1e-5, name + ": uniform gas at rest exerts no net force");
+    if (name.starts_with("sphere 3D")) {
+        splitFocal(name, g, *m, t);
+        splitFocalInviscidMrf(name, g, *m, t, R, ctr, hw);
+    }
 }
 
 gpu::GhostSdf overlappingShells(std::array<double, 3> c, double r, double sep)

@@ -124,6 +124,9 @@ struct OGridRun
     // The Newton-Krylov march (gpu/nk) instead of the explicit LTS one.
     // Pre: nz == 1 or the revolved wedge.
     bool steadyImplicit = false;
+    // --compensated: the time march on the compensated state too (the
+    // explicit steady march always has it). Pre: !steadyImplicit.
+    bool compensated = false;
 
     // The run label (dns/rans_label): the progress line's tail and the
     // surface CSV's header comment. Empty on a DNS/LES time march.

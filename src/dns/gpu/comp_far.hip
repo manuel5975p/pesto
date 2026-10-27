@@ -158,8 +158,12 @@ __global__ void kFarWallTurb(GpuGrid g, int axis, Fields f)
         for (int v = 0; v < f.n; ++v) f.lo[v][c] = Real(0);
 }
 
-// mu_t / F1 even on the mirror rows.
-__global__ void kFarWallMut(GpuGrid g, int axis, Real* nut, Real* f1)
+// mu_t / F1 even on the mirror rows; mu_t ODD on a no-slip y row (noslip),
+// so that wall face carries the molecular stress only (exactly 0.0 face
+// average). RANS never runs with no-slip y walls (validator), so its rows stay
+// the even copy.
+__global__ void kFarWallMut(GpuGrid g, int axis, int noslip, Real* nut,
+                            Real* f1)
 {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     bool hi;
@@ -170,7 +174,7 @@ __global__ void kFarWallMut(GpuGrid g, int axis, Real* nut, Real* f1)
     } else if (!internal::sideGhostPair(g, 2, t, hi, c, s)) {
         return;
     }
-    nut[c] = nut[s];
+    nut[c] = noslip ? -nut[s] : nut[s];
     if (f1) f1[c] = f1[s];
 }
 
@@ -233,12 +237,12 @@ void DeviceCompFar::applyMut(Real* nut, Real* f1) const
 {
     if (!c_.openY) {
         kFarWallMut<<<launchBlocks(2 * std::size_t(g_.nx) * g_.nz),
-                      blockSize>>>(g_, 1, nut, f1);
+                      blockSize>>>(g_, 1, int(c_.noslipY), nut, f1);
         checkLastKernel("kFarWallMut");
     }
     if (!c_.openZ && g_.nz > 1) {
         kFarWallMut<<<launchBlocks(2 * std::size_t(g_.nx) * g_.ny),
-                      blockSize>>>(g_, 2, nut, f1);
+                      blockSize>>>(g_, 2, 0, nut, f1);
         checkLastKernel("kFarWallMut");
     }
 }

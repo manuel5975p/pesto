@@ -42,15 +42,18 @@ namespace {
 // The resting branch (a_wall = 0: the copy, the same condition) is kept
 // VERBATIM under the null check rather than folded into the general form:
 // -m and 2*rho*uw - m are not the same float at uw == 0.
-__global__ void kOGridWall(GpuGrid g, int isothermal, Real gam, Real Rgas,
-                           Real Twall, const Real* uwx, const Real* uwy,
-                           const Real* as, Real* rho, Real* mx, Real* my,
-                           Real* mz, Real* E)
+//
+// Every row pass below is one (i, k) column's work, run by kOGridRows in the
+// order wall, far, scalars, low words. A pass reads only real cells (rows 1
+// and ny-2, which no pass writes) and the ghost cells of its OWN column that
+// an earlier pass wrote -- never another thread's -- so one launch is the four
+// former launches bit for bit.
+__device__ inline void wallRowCell(GpuGrid g, int i, int k, int isothermal,
+                                   Real gam, Real Rgas, Real Twall,
+                                   const Real* uwx, const Real* uwy,
+                                   const Real* as, Real* rho, Real* mx,
+                                   Real* my, Real* mz, Real* E)
 {
-    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t nxz = std::size_t(g.nx) * g.nz;
-    if (t >= nxz) return;
-    const int i = int(t % g.nx), k = int(t / g.nx);
     const std::size_t c = gidx(g, i, 0, k);
     const std::size_t s = gidx(g, i, 1, k);
     if (!uwx) {
@@ -117,15 +120,12 @@ __global__ void kOGridWall(GpuGrid g, int isothermal, Real gam, Real Rgas,
 // Rotating back and reflecting (ghost = 2 boundary - interior) puts the
 // boundary state exactly on the far face, which is the +1 face of cell ny-2 and
 // the exact circle of radius rFar.
-__global__ void kOGridFar(GpuGrid g, Real gam, Real rhoI, Real uI, Real pI,
-                          Real cI, Real sigma, Real band, const Real* cosT,
-                          const Real* sinT, Real* rho, Real* mx, Real* my,
-                          Real* mz, Real* E)
+__device__ inline void farRowCell(GpuGrid g, int i, int k, Real gam,
+                                  Real rhoI, Real uI, Real pI, Real cI,
+                                  Real sigma, Real band, const Real* cosT,
+                                  const Real* sinT, Real* rho, Real* mx,
+                                  Real* my, Real* mz, Real* E)
 {
-    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t nxz = std::size_t(g.nx) * g.nz;
-    if (t >= nxz) return;
-    const int i = int(t % g.nx), k = int(t / g.nx);
     const std::size_t c = gidx(g, i, g.ny - 1, k);
     const std::size_t s = gidx(g, i, g.ny - 2, k);
 
@@ -180,18 +180,17 @@ __global__ void kOGridFar(GpuGrid g, Real gam, Real rhoI, Real uI, Real pI,
            Real(0.5) * r0 * (u0 * u0 + v0 * v0 + w0 * w0);
 }
 
-// The same far row on a REVOLVED mesh: the LODI algebra of kOGridFar in
+// The same far row on a REVOLVED mesh: the LODI algebra of farRowCell in
 // vector form about the far face's own unit normal n (3 per face, from the
 // metrics), the tangential deviation du - (du . n) n blended by the same
 // tanh weight. Both forms vanish at the freestream, so it is a fixed point.
-__global__ void kOGridFar3(GpuGrid g, Real gam, Real rhoI, Real uI, Real pI,
-                           Real cI, Real sigma, Real band, const Real* nrm,
-                           Real* rho, Real* mx, Real* my, Real* mz, Real* E)
+// t: the face index i + nx k of the normal table.
+__device__ inline void farRowCell3(GpuGrid g, std::size_t t, int i, int k,
+                                   Real gam, Real rhoI, Real uI, Real pI,
+                                   Real cI, Real sigma, Real band,
+                                   const Real* nrm, Real* rho, Real* mx,
+                                   Real* my, Real* mz, Real* E)
 {
-    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t nxz = std::size_t(g.nx) * g.nz;
-    if (t >= nxz) return;
-    const int i = int(t % g.nx), k = int(t / g.nx);
     const std::size_t c = gidx(g, i, g.ny - 1, k);
     const std::size_t s = gidx(g, i, g.ny - 2, k);
     const Real n[3] = {nrm[3 * t], nrm[3 * t + 1], nrm[3 * t + 2]};
@@ -245,7 +244,7 @@ __global__ void kTallyMask(GpuGrid g, int spans, int iLo, int iHi, int kLo,
 
 // --- RANS scalars on both rows ------------------------------------------------
 //
-// Runs after kOGridWall and kOGridFar (it reads their ghost densities). The
+// Runs after the wall and far passes (it reads their ghost densities). The
 // wall row takes the shared no-slip images (gpu/internal/rans_wall.hpp): SA
 // nu~ and SST k antimirrored on the specific value, SST omega the Dirichlet
 // image of omega_w = 60 mu(T_f)/(beta1 d1^2 rho_f) per wall face -- wcoef
@@ -254,17 +253,16 @@ __global__ void kTallyMask(GpuGrid g, int spans, int iLo, int iHi, int kLo,
 // The far row takes phi_b = w phi_1 + (1 - w) phi_inf, w the far kernel's
 // tanh weight recomputed from the same interior cell: positive, and the
 // upwind flux of an inflow face then carries phi_inf exactly.
-__global__ void kOGridTurb(GpuGrid g, ViscView vv, int sst, Real gam,
-                           Real Rgas, Real uI, Real band, Real phi0,
-                           Real phi1, const Real* cosT, const Real* sinT,
-                           const Real* nrm, const Real* wcoef,
-                           const Real* rho, const Real* mx, const Real* my,
-                           const Real* mz, const Real* E, Real* t0, Real* t1)
+// t: the face index i + nx k (wcoef, the revolved normal table).
+__device__ inline void turbRowsCell(GpuGrid g, std::size_t t, int i, int k,
+                                    ViscView vv, int sst, Real gam, Real Rgas,
+                                    Real uI, Real band, Real phi0, Real phi1,
+                                    const Real* cosT, const Real* sinT,
+                                    const Real* nrm, const Real* wcoef,
+                                    const Real* rho, const Real* mx,
+                                    const Real* my, const Real* mz,
+                                    const Real* E, Real* t0, Real* t1)
 {
-    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t nxz = std::size_t(g.nx) * g.nz;
-    if (t >= nxz) return;
-    const int i = int(t % g.nx), k = int(t / g.nx);
     // Wall row.
     {
         const std::size_t c = gidx(g, i, 0, k), s = gidx(g, i, 1, k);
@@ -328,15 +326,44 @@ struct RowLo
     int n;
 };
 
-__global__ void kOGridGhostLo(GpuGrid g, RowLo lo)
+// Everything one stage-hook call of the rows needs (DeviceOGridBc::apply).
+struct RowArgs
+{
+    int isothermal;
+    Real gam, Rgas, Twall;
+    const Real *uwx, *uwy, *as;          // moving wall; null = at rest
+    Real rhoI, uI, pI, cI, sigma, band;  // far row
+    const Real *cosT, *sinT, *nrm;       // nrm: revolved far normals
+    ViscView vv;                         // scalar rows (t0 null = none)
+    int sst;
+    Real phi0, phi1;
+    const Real* wcoef;
+    Real *rho, *mx, *my, *mz, *E, *t0, *t1;
+    RowLo lo;                            // lo.n == 0: a plain state
+};
+
+// Both rows of one (i, k) column: wall, far (the revolved form when Far3),
+// scalars, low words -- the former four launches' order (see wallRowCell).
+template <bool Far3> __global__ void kOGridRows(GpuGrid g, RowArgs a)
 {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t nxz = std::size_t(g.nx) * g.nz;
-    if (t >= 2 * nxz) return;
-    const std::size_t r = t % nxz;
-    const int i = int(r % g.nx), k = int(r / g.nx);
-    const std::size_t c = gidx(g, i, t < nxz ? 0 : g.ny - 1, k);
-    for (int v = 0; v < lo.n; ++v) lo.p[v][c] = Real(0);
+    if (t >= nxz) return;
+    const int i = int(t % g.nx), k = int(t / g.nx);
+    wallRowCell(g, i, k, a.isothermal, a.gam, a.Rgas, a.Twall, a.uwx, a.uwy,
+                a.as, a.rho, a.mx, a.my, a.mz, a.E);
+    if constexpr (Far3)
+        farRowCell3(g, t, i, k, a.gam, a.rhoI, a.uI, a.pI, a.cI, a.sigma,
+                    a.band, a.nrm, a.rho, a.mx, a.my, a.mz, a.E);
+    else
+        farRowCell(g, i, k, a.gam, a.rhoI, a.uI, a.pI, a.cI, a.sigma, a.band,
+                   a.cosT, a.sinT, a.rho, a.mx, a.my, a.mz, a.E);
+    if (a.t0)
+        turbRowsCell(g, t, i, k, a.vv, a.sst, a.gam, a.Rgas, a.uI, a.band,
+                     a.phi0, a.phi1, a.cosT, a.sinT, a.nrm, a.wcoef, a.rho,
+                     a.mx, a.my, a.mz, a.E, a.t0, a.t1);
+    const std::size_t w = gidx(g, i, 0, k), f = gidx(g, i, g.ny - 1, k);
+    for (int v = 0; v < a.lo.n; ++v) a.lo.p[v][w] = a.lo.p[v][f] = Real(0);
 }
 
 // --- wall surface tally ------------------------------------------------------
@@ -554,48 +581,47 @@ std::expected<DeviceOGridBc, hipError_t> DeviceOGridBc::make(const Grid& g,
 
 void DeviceOGridBc::apply(DeviceCompState& s) const
 {
-    const std::size_t nxz = std::size_t(g_.nx) * g_.nz;
-    kOGridWall<<<launchBlocks(nxz), blockSize>>>(
-        g_, c_.thermal == OGridThermal::Isothermal ? 1 : 0, Real(c_.gamma),
-        Real(c_.Rgas), Real(c_.Twall), uwx_.data(), uwy_.data(),
-        aspan_.data(), s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
-        s.E.data());
-    checkLastKernel("kOGridWall");
-    if (farN_.size() == 0)
+    assert(s.nT == 0 ||
+           (c_.rans != RansModel::None && s.nT == ransScalars(c_.rans)));
+    RowArgs a{};
+    a.isothermal = c_.thermal == OGridThermal::Isothermal ? 1 : 0;
+    a.gam = Real(c_.gamma);
+    a.Rgas = Real(c_.Rgas);
+    a.Twall = Real(c_.Twall);
+    a.uwx = uwx_.data();
+    a.uwy = uwy_.data();
+    a.as = aspan_.data();
+    a.rhoI = Real(c_.rhoInf);
+    a.uI = Real(u_);
+    a.pI = Real(c_.pInf);
+    a.cI = Real(cInf_);
+    a.sigma = Real(c_.sigma);
+    a.band = Real(c_.band);
+    a.cosT = cosT_.data();
+    a.sinT = sinT_.data();
+    a.nrm = farN_.data();
+    a.vv = viscView(c_.tr);
+    a.sst = ransSst(c_.rans) ? 1 : 0;
+    a.phi0 = Real(c_.phiInf[0]);
+    a.phi1 = Real(c_.phiInf[1]);
+    a.wcoef = wcoef_.data();
+    a.rho = s.rho.data();
+    a.mx = s.mx.data();
+    a.my = s.my.data();
+    a.mz = s.mz.data();
+    a.E = s.E.data();
+    a.t0 = s.nT > 0 ? s.t[0].data() : nullptr;
+    a.t1 = s.nT > 1 ? s.t[1].data() : nullptr;
+    if (s.compensated())
     {
-        kOGridFar<<<launchBlocks(nxz), blockSize>>>(
-            g_, Real(c_.gamma), Real(c_.rhoInf), Real(u_), Real(c_.pInf),
-            Real(cInf_), Real(c_.sigma), Real(c_.band), cosT_.data(),
-            sinT_.data(), s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
-            s.E.data());
-        checkLastKernel("kOGridFar");
+        a.lo.n = 5 + s.nT;
+        for (int v = 0; v < 5; ++v) a.lo.p[v] = s.lo[v].data();
+        for (int i = 0; i < s.nT; ++i) a.lo.p[5 + i] = s.tlo[i].data();
     }
-    else
-    {
-        kOGridFar3<<<launchBlocks(nxz), blockSize>>>(
-            g_, Real(c_.gamma), Real(c_.rhoInf), Real(u_), Real(c_.pInf),
-            Real(cInf_), Real(c_.sigma), Real(c_.band), farN_.data(),
-            s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(), s.E.data());
-        checkLastKernel("kOGridFar3");
-    }
-    if (s.nT > 0)
-    {
-        assert(c_.rans != RansModel::None && s.nT == ransScalars(c_.rans));
-        kOGridTurb<<<launchBlocks(nxz), blockSize>>>(
-            g_, viscView(c_.tr), ransSst(c_.rans) ? 1 : 0, Real(c_.gamma),
-            Real(c_.Rgas), Real(u_), Real(c_.band), Real(c_.phiInf[0]),
-            Real(c_.phiInf[1]), cosT_.data(), sinT_.data(), farN_.data(),
-            wcoef_.data(),
-            s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(), s.E.data(),
-            s.t[0].data(), s.nT > 1 ? s.t[1].data() : nullptr);
-        checkLastKernel("kOGridTurb");
-    }
-    if (!s.compensated()) return;
-    RowLo lo{{}, 5 + s.nT};
-    for (int v = 0; v < 5; ++v) lo.p[v] = s.lo[v].data();
-    for (int i = 0; i < s.nT; ++i) lo.p[5 + i] = s.tlo[i].data();
-    kOGridGhostLo<<<launchBlocks(2 * nxz), blockSize>>>(g_, lo);
-    checkLastKernel("kOGridGhostLo");
+    const unsigned nb = launchBlocks(std::size_t(g_.nx) * g_.nz);
+    if (farN_.size() == 0) kOGridRows<false><<<nb, blockSize>>>(g_, a);
+    else kOGridRows<true><<<nb, blockSize>>>(g_, a);
+    checkLastKernel("kOGridRows");
 }
 
 DeviceOGridBc::Surface DeviceOGridBc::surface(DeviceComp& solver,

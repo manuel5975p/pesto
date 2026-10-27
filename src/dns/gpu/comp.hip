@@ -31,15 +31,7 @@ __global__ void kPrim(GpuGrid g, Real gamma, Real Rgas, const Real* rho,
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
-    const Real r = rho[c];
-    u[c] = mx[c] / r;
-    v[c] = my[c] / r;
-    w[c] = mz[c] / r;
-    e[c] = E[c] / r;
-    const Real pr = (gamma - Real(1)) *
-        (E[c] - Real(0.5) * (mx[c] * mx[c] + my[c] * my[c] + mz[c] * mz[c]) / r);
-    p[c] = pr;
-    T[c] = pr / (r * Rgas);
+    primitivesAt(c, gamma, Rgas, rho, mx, my, mz, E, u, v, w, e, p, T);
 }
 
 // Dynamic eddy viscosity mu_t = rho (C Delta)^2 op(grad u) at cell centres
@@ -171,14 +163,17 @@ __global__ void kCompSmagNutCurv(GpuGrid g, Real cs2, int sigma, CurvView m,
     nut[c] = rho[c] * cd * sgsRate(sigma, gd);
 }
 
+// cells: the run of cells written (DeviceComp::setStageRange).
 template <bool Comp>
 __global__ void kCompStageCurv(GpuGrid g, ViscView vv, PrimView q,
                                CurvView m, StageCombine cmb, Real* orho,
                                Real* omx, Real* omy, Real* omz, Real* oE,
-                               const Real* nut, Real kapScale, MrfView mz)
+                               const Real* nut, Real kapScale, MrfView mz,
+                               CellRange cells)
 {
-    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (c >= g.size()) return;
+    const std::size_t c =
+        cells.first + std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= cells.end) return;
     int i, j, k;
     decompose(g, c, i, j, k);
     const Offsets o = offsetsAt(g, i, j, k);
@@ -334,64 +329,18 @@ struct MaxT
     }
 };
 
-// Dynamic eddy viscosity mu_t = rho (C Delta)^2 op(grad u) at cell c (op as in
-// kCompSmagNut), computed straight from the conserved state (no primitive
-// scratch) so it can feed the const stableDt viscous limit. smagCd = C^2 Delta^2.
-struct SmagMax
+// The solver's own per-cell SGS mu_t (sgsNut), widened for the max-reduction
+// of the LES viscous dt limit. It used to be an FP64 functor re-deriving the
+// whole model per cell (sigma's singular values included): 1.5 / 2.5 ms of a
+// 5.8 / 7.1 ms step on a 128^3 sphere (W15), for a bound that differs from
+// this one only by the FP32 rounding of mu_t.
+struct MaxNut
 {
-    GpuGrid g;
-    double smagCd;
-    int sigma;
-    const Real *rho, *mx, *my, *mz;
-    __host__ __device__ double vel(int c, int comp) const
-    {
-        const Real m = comp == 0 ? mx[c] : comp == 1 ? my[c] : mz[c];
-        return double(m) / double(rho[c]);
-    }
+    const Real* nut;
     __host__ __device__ double operator()(int c) const
     {
-        int i, j, k;
-        decompose(g, std::size_t(c), i, j, k);
-        const Offsets o = offsetsAt(g, i, j, k);
-        const double inv[3] = {0.5 / g.hx, 0.5 / g.hy, 0.5 / g.hz};
-        double gd[3][3];
-        for (int cc = 0; cc < 3; ++cc)
-            for (int d = 0; d < 3; ++d)
-                gd[cc][d] = (vel(int(c + o.p[d]), cc) -
-                             vel(int(c + o.m[d]), cc)) * inv[d];
-        const double nut = double(rho[c]) * smagCd * sgsRate(sigma, gd);
-        return isfinite(nut) ? nut : HUGE_VAL;   // never dropped by the max
-    }
-};
-
-// Curvilinear twin of SmagMax: same operator, mesh-metric gradients and the
-// per-cell filter width (kCompSmagNutCurv). cs2 = C^2; Delta^2 is per cell.
-struct SmagMaxCurv
-{
-    GpuGrid g;
-    double cs2;
-    int sigma;
-    CurvView m;
-    const Real *rho, *mx, *my, *mz;
-    __host__ __device__ double vel(std::size_t c, int comp) const
-    {
-        const Real q = comp == 0 ? mx[c] : comp == 1 ? my[c] : mz[c];
-        return double(q) / double(rho[c]);
-    }
-    __host__ __device__ double operator()(int c) const
-    {
-        int i, j, k;
-        decompose(g, std::size_t(c), i, j, k);
-        const Offsets o = offsetsAt(g, i, j, k);
-        double gd[3][3];
-        curvVelGradCentre(m, o, std::size_t(c),
-                          [&](std::size_t cell, int comp) {
-                              return vel(cell, comp);
-                          },
-                          gd);
-        const double cd = cs2 * double(curvDelta2(g, m.invVol[c]));
-        const double nut = double(rho[c]) * cd * sgsRate(sigma, gd);
-        return isfinite(nut) ? nut : HUGE_VAL;   // never dropped by the max
+        const double v = nut[c];
+        return isfinite(v) ? v : HUGE_VAL;   // never dropped by the max
     }
 };
 
@@ -407,14 +356,35 @@ __global__ void kBoostX(std::size_t n, Real du, const Real* rho, Real* mx,
     mx[c] += rho[c] * du;
 }
 
+// kBoostX on the compensated pair (--compensated): the same increments off
+// the hi words, accumulated into (hi, lo) so a ramp step below ulp(q)/2 is
+// kept. A separate kernel, so the plain one stays the pre-compensation code.
+__global__ void kBoostXPair(std::size_t n, Real du, const Real* rho, Real* mx,
+                            Real* mxl, Real* E, Real* El)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    const Word2 e = addWord2(E[c], El[c], mx[c] * du + Real(0.5) * rho[c] * du * du);
+    const Word2 m = addWord2(mx[c], mxl[c], rho[c] * du);
+    E[c] = e.hi;
+    El[c] = e.lo;
+    mx[c] = m.hi;
+    mxl[c] = m.lo;
+}
+
 } // namespace
 
 void boostX(const GpuGrid& g, DeviceCompState& s, double du)
 {
-    // A frame change of the plain state; the compensated (steady) state never
-    // takes one, and the boost would need its own pair arithmetic.
-    assert(!s.compensated());
     if (du == 0.0) return;
+    if (s.compensated())
+    {
+        kBoostXPair<<<launchBlocks(g.size()), blockSize>>>(
+            g.size(), Real(du), s.rho.data(), s.mx.data(), s.lo[1].data(),
+            s.E.data(), s.lo[4].data());
+        checkLastKernel("kBoostXPair");
+        return;
+    }
     kBoostX<<<launchBlocks(g.size()), blockSize>>>(g.size(), Real(du),
                                                    s.rho.data(), s.mx.data(),
                                                    s.E.data());
@@ -742,7 +712,7 @@ MrfView DeviceComp::mrfView() const
 
 DeviceComp::DeviceComp(const GpuGrid& g, const Transport& tr, Real csLes,
                        SgsModel sgs)
-    : g_(g), tr_(tr), csLes_(csLes), sgs_(sgs)
+    : g_(g), tr_(tr), csLes_(csLes), sgs_(sgs), stageRange_{0, g.size()}
 {
     // Delta^2 = (hx hy hz)^(2/3) in 3D; hx hy when nz == 1 (unit z-depth).
     const double d2 = g.nz > 1
@@ -761,20 +731,28 @@ void DeviceComp::primitives(const DeviceCompState& s)
     checkLastKernel("kPrim");
 }
 
-void DeviceComp::ransMut(const DeviceCompState& s)
+void DeviceComp::primitivesAndMut(const DeviceCompState& s)
 {
     assert(rans());
     const bool sst = ransSst(ransModel_);
-    if (sst) {
+    if (sst) { // F1 and mu_t read the primitives' stencil: two launches
+        primitives(s);
         const PrimView q{s.rho.data(), u_.data(), v_.data(), w_.data(),
                          e_.data(), p_.data(), T_.data()};
+        const rans::RansCellCache cache{
+            {ransPhi_[0].data(), ransPhi_[1].data()}, ransRate_.data(),
+            ransGkw_.data()};
         rans::sstMutCurv(g_, viscView(tr_), q, curvView(), ransModel_,
                          s.t[0].data(), s.t[1].data(), wd_.data(), nut_.data(),
-                         f1_.data());
+                         f1_.data(), cache);
     } else {
-        rans::mutCurv(g_, viscView(tr_), s.rho.data(), T_.data(),
-                      s.t[0].data(), nut_.data());
+        rans::primMutCurv(g_, viscView(tr_), Real(tr_.gamma), Real(tr_.Rgas),
+                          s.rho.data(), s.mx.data(), s.my.data(),
+                          s.mz.data(), s.E.data(), s.t[0].data(), u_.data(),
+                          v_.data(), w_.data(), e_.data(), p_.data(),
+                          T_.data(), nut_.data(), ransPhi_[0].data());
     }
+    cacheOf_ = s.t[0].data();
     if (mutHook_) mutHook_(nut_.data(), sst ? f1_.data() : nullptr);
 }
 
@@ -805,14 +783,48 @@ unsigned long long DeviceComp::floorHits() const
 
 void DeviceComp::updateMut(const DeviceCompState& s)
 {
+    primitivesAndMut(s);
+}
+
+void DeviceComp::sgsNut(const DeviceCompState& s)
+{
+    assert(les());
+    const std::size_t n = g_.size();
+    const int sig = sgs_ == SgsModel::Sigma ? 1 : 0;
+    if (curv_) {
+        kCompSmagNutCurv<<<launchBlocks(n), blockSize>>>(
+            g_, csLes_ * csLes_, sig, curvView(), s.rho.data(), u_.data(),
+            v_.data(), w_.data(), nut_.data());
+        checkLastKernel("kCompSmagNutCurv");
+    } else {
+        kCompSmagNut<<<launchBlocks(n), blockSize>>>(
+            g_, smagCd_, sig, s.rho.data(), u_.data(), v_.data(), w_.data(),
+            nut_.data());
+        checkLastKernel("kCompSmagNut");
+    }
+    // The wall image (LES has no F1), exactly where RANS takes it.
+    if (mutHook_) mutHook_(nut_.data(), nullptr);
+}
+
+void DeviceComp::updateSgsNut(const DeviceCompState& s)
+{
     primitives(s);
-    ransMut(s);
+    sgsNut(s);
+}
+
+void DeviceComp::setStageRange(CellRange r)
+{
+    assert(curvilinear() && r.first < r.end && r.end <= g_.size());
+    stageRange_ = r;
 }
 
 void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
                        DeviceCompState& out, bool residualMode)
 {
-    primitives(s);
+    // RANS: mu_t lagged within the stage exactly like LES -- from the stage
+    // input, through the SAME nut slot of the mean-flow flux.
+    if (rans()) primitivesAndMut(s);
+    else primitives(s);
     const ViscView vv = viscView(tr_);
     const PrimView q{s.rho.data(), u_.data(), v_.data(), w_.data(), e_.data(),
                      p_.data(), T_.data()};
@@ -824,35 +836,41 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
     assert(!cmb.ol[0] || cmb.ca == Real(1) - cmb.cb); // the increment form
     if (curv_) {
         const CurvView cv = curvView();
+        const CellRange cells = stageRange_;
         auto curvStage = [&] {
             internal::withCompensation(cmb, [&](auto comp) {
                 kCompStageCurv<decltype(comp)::value>
-                    <<<launchBlocks(n), blockSize>>>(
+                    <<<launchBlocks(cells.size()), blockSize>>>(
                         g_, vv, q, cv, cmb, out.rho.data(), out.mx.data(),
                         out.my.data(), out.mz.data(), out.E.data(), nutp,
-                        kapScale, mz);
+                        kapScale, mz, cells);
             });
             checkLastKernel("kCompStageCurv");
         };
         if (rans()) {
-            // mu_t lagged within the stage exactly like LES: from the stage
-            // input, through the SAME nut slot of the mean-flow flux.
-            ransMut(s);
             nutp = nut_.data();
             kapScale = kapLes;
             curvStage();
+            // The scalar stage reads primitivesAndMut's cache: of s, never
+            // stale (out aliases neither s nor cmb.a, so curvStage left s
+            // untouched).
+            assert(cacheOf_ == s.t[0].data());
             if (ransSst(ransModel_)) {
                 const rans::SstStageArgs a{
                     ransModel_,     s.t[0].data(),     s.t[1].data(),
                     nut_.data(),    f1_.data(),        wd_.data(),
                     out.rho.data(), Real(omegaFloor_), mask_.data(),
-                    hits_.data(),   testSrc_[0],       testSrc_[1]};
+                    hits_.data(),   testSrc_[0],       testSrc_[1],
+                    {{ransPhi_[0].data(), ransPhi_[1].data()},
+                     ransRate_.data(), ransGkw_.data()}};
                 rans::sstStageCurv(g_, vv, q, cv, mz, cmb, a, residualMode,
-                                   out.t[0].data(), out.t[1].data(), bnd_);
+                                   out.t[0].data(), out.t[1].data(), cells,
+                                   bnd_);
             } else {
                 rans::saStageCurv(g_, vv, q, cv, mz, cmb, s.t[0].data(),
-                                  wd_.data(), residualMode, ransTransport_,
-                                  testSrc_[0], out.t[0].data(), bnd_);
+                                  ransPhi_[0].data(), wd_.data(), residualMode,
+                                  ransTransport_, testSrc_[0], out.t[0].data(),
+                                  cells, bnd_);
             }
             if (rhsHook_) rhsHook_(s, out, cmb);
             if (bnd_.any())
@@ -860,11 +878,8 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
                                             s, out);
             return;
         }
-        if (csLes_ > Real(0)) {
-            kCompSmagNutCurv<<<launchBlocks(n), blockSize>>>(
-                g_, csLes_ * csLes_, sgs_ == SgsModel::Sigma ? 1 : 0, cv,
-                s.rho.data(), u_.data(), v_.data(), w_.data(), nut_.data());
-            checkLastKernel("kCompSmagNutCurv");
+        if (les()) {
+            sgsNut(s);
             nutp = nut_.data();
             kapScale = kapLes;
         }
@@ -872,11 +887,8 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
         if (rhsHook_) rhsHook_(s, out, cmb);
         return;
     }
-    if (csLes_ > Real(0)) {
-        kCompSmagNut<<<launchBlocks(n), blockSize>>>(
-            g_, smagCd_, sgs_ == SgsModel::Sigma ? 1 : 0, s.rho.data(),
-            u_.data(), v_.data(), w_.data(), nut_.data());
-        checkLastKernel("kCompSmagNut");
+    if (les()) {
+        sgsNut(s);
         nutp = nut_.data();
         kapScale = kapLes;
     }
@@ -957,7 +969,8 @@ void DeviceComp::step(DeviceCompState& s, Real dt)
         }
         return k;
     };
-    if (hook_) hook_(s);
+    // Idempotent::yes: s is already the hook's output (setStageHook).
+    if (hook_ && hookAtEntry_) hook_(s);
     stage(s, cmb(s, Real(1), s, Real(0), dt, q1_), q1_);
     if (hook_) hook_(q1_);
     stage(q1_, cmb(s, Real(0.75), q1_, Real(0.25), Real(0.25) * dt, q2_), q2_);
@@ -973,7 +986,7 @@ void DeviceComp::step(DeviceCompState& s, Real dt)
 }
 
 double DeviceComp::stableDt(const DeviceCompState& s, ReduceScratch& r,
-                            double cfl) const
+                            double cfl)
 {
     const MrfView mz = mrf_ ? mrfView() : MrfView{};
     const double wmax = curv_
@@ -1010,19 +1023,12 @@ double DeviceComp::stableDt(const DeviceCompState& s, ReduceScratch& r,
                                    s.mz.data(), s.E.data(), double(tr_.gamma),
                                    double(tr_.Rgas)},
                               rocprim::maximum<double>(), 0.0));
-    if (csLes_ > Real(0)) {
-        const int sig = sgs_ == SgsModel::Sigma ? 1 : 0;
-        const double nutMax = curv_
-            ? reduce(r, g_.size(),
-                     SmagMaxCurv{g_, double(csLes_) * double(csLes_), sig,
-                                 curvView(), s.rho.data(), s.mx.data(),
-                                 s.my.data(), s.mz.data()},
-                     rocprim::maximum<double>(), 0.0)
-            : reduce(r, g_.size(),
-                     SmagMax{g_, double(smagCd_), sig, s.rho.data(),
-                             s.mx.data(), s.my.data(), s.mz.data()},
-                     rocprim::maximum<double>(), 0.0);
-        muEff += nutMax;
+    if (les()) {
+        // The mu_t the fluxes of a stage on s would read, image rows
+        // included (the mutHook images are odd or even: never above the max).
+        updateSgsNut(s);
+        muEff += reduce(r, g_.size(), MaxNut{nut_.data()},
+                        rocprim::maximum<double>(), 0.0);
     }
     if (muEff > 0.0) {
         const double rhomin = reduce(r, g_.size(), MinRho{s.rho.data()},
@@ -1159,6 +1165,15 @@ std::expected<void, hipError_t> DeviceComp::enableRans(const RansSetup& rs)
     if (!d) return std::unexpected(d.error());
     wd_ = std::move(*d);
     if (auto e = allocSteady(rs.fluidMask); !e) return e;
+    // The scalar stage's cell cache (rans::RansCellCache): phi0 always, SST
+    // also phi1, the rate and grad k . grad omega.
+    DeviceScalar* cache[4] = {&ransPhi_[0], &ransPhi_[1], &ransRate_,
+                              &ransGkw_};
+    for (int b = 0; b < (ransSst(rs.model) ? 4 : 1); ++b) {
+        auto e = DeviceScalar::make(n);
+        if (!e) return std::unexpected(e.error());
+        *cache[b] = std::move(*e);
+    }
     if (ransSst(rs.model)) {
         auto f = DeviceScalar::make(n);
         auto h = DeviceBuffer<unsigned long long>::make(1);
@@ -1172,7 +1187,7 @@ std::expected<void, hipError_t> DeviceComp::enableRans(const RansSetup& rs)
     }
     omegaFloor_ = rs.omegaFloor;
     ransModel_ = rs.model;
-    mutHook_ = rs.mutHook;
+    setMutHook(rs.mutHook);
     testSrc_[0] = rs.testSource[0];
     testSrc_[1] = rs.testSource[1];
     ransTransport_ = rs.transportOnly;
@@ -1263,7 +1278,7 @@ hipError_t DeviceComp::uploadLts(const std::vector<Real>& ratios)
 
 void DeviceComp::residualInto(const DeviceCompState& s, DeviceCompState& out)
 {
-    assert(curvilinear() && s.nT == nTurb() && out.nT == s.nT && &out != &s);
+    assert(s.nT == nTurb() && out.nT == s.nT && &out != &s);
     // ca = cb = 0, cr = 1, no lts: the mean-flow kernel and every hook then
     // write the pure rhs (0 a + 0 b + 1 R == R exactly); the scalar kernel
     // needs its explicit mode, because the point-implicit form would return

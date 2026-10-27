@@ -215,7 +215,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--profile-dt", &c.profileDt},
              {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
              {"--planes", &c.planes}, {"--png-down", &c.pngDown},
-             {"--steady", &c.steady}, {"--steady-steps", &c.steadySteps}});
+             {"--steady", &c.steady}, {"--steady-steps", &c.steadySteps},
+             {"--les", &c.les}});
     if (c.sub == Subcommand::Conv)
         add({{"--ny", &c.ny}, {"--rayleigh", &c.rayleigh},
              {"--dtemp", &c.dtemp}, {"--aspect", &c.convAspect},
@@ -256,7 +257,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench
         || c.sub == Subcommand::Conv)
         enums.push_back({"--physics", enumValues(physicsNames()), &physicsSel});
-    if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench)
+    if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench
+        || c.sub == Subcommand::Channel)
         enums.push_back({"--sgs", enumValues(sgsModelNames()), &sgsSel});
     if (c.sub == Subcommand::Flow)
     {
@@ -307,6 +309,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         flags.push_back({"--ogrid", &c.ogrid});
         flags.push_back({"--temp", &c.tempFrames});
     }
+    if (c.sub == Subcommand::Flow || c.sub == Subcommand::Channel)
+        flags.push_back({"--compensated", &c.compensated});
     if (c.sub == Subcommand::Prop) flags.push_back({"--selftest", &c.selftest});
 
     std::vector<string> known;
@@ -859,17 +863,22 @@ BODY-FITTED O-GRID (compressible)
   --ogrid-beta B     radial tanh clustering toward the wall; 0 =
                      uniform. Higher = thinner first cell.             [3]
   --ogrid-wedge DEG  the revolved sphere's wedge angle, (0, 10].      [5]
-  --ogrid-trip A     full revolution only: a solenoidal Gaussian vortex
-                     trip (strength A U, width D/4, 1 D behind the body,
-                     D/4 off the axis) in the initial state -- with
-                     --steady, in the initial guess. The full-revolution
-                     mesh and an axisymmetric start are EXACTLY symmetric
-                     under a rotation by pi about the axis, so the odd
-                     azimuthal modes (the m = 1 lift mode) cannot grow
-                     from rounding; this seeds them. A stable steady
-                     state is unchanged. 0 = none, exactly the
-                     untripped symmetric march (warned at Re >= 200 or
-                     with --rans). Printed in the label.            [0.05]
+  --ogrid-trip A     every O-grid but the axisymmetric wedge: a solenoidal
+                     Gaussian vortex trip (strength A U, width D/4, 1 D
+                     behind the body, D/4 off the axis; extruded: centred
+                     in the span) in the initial state -- with --steady,
+                     in the initial guess. The O-grid's own --kick: the
+                     uniform start is exactly up-down symmetric, so a
+                     cylinder sheds only once rounding has grown the
+                     mode; this starts it. The full-revolution mesh and
+                     an axisymmetric start are EXACTLY symmetric under a
+                     rotation by pi about the axis, so the odd azimuthal
+                     modes (the m = 1 lift mode) cannot grow from
+                     rounding at all; this seeds them. A stable steady
+                     state is unchanged. 0 = none, exactly the untripped
+                     march (on the full revolution warned at Re >= 200
+                     or with --rans). Printed in the label.
+                                     [0.05 full revolution / 0 otherwise]
   --init-from PREFIX full revolution only: start from the converged
                      WEDGE run PREFIX (its PREFIX_final.bin, from --emit
                      mesh), revolved over the N planes (velocity rotated
@@ -944,7 +953,8 @@ START-UP
   --kick A           deterministic solenoidal Gaussian trip 1 D behind
                      the body. Divergence-free, hence acoustically
                      silent; the quiet start is too symmetric to shed
-                     without it.                                   [0.05]
+                     without it. Rejected with --ogrid (never applied
+                     there): use --ogrid-trip.                     [0.05]
 
 SOLVER
   --tol RMS          CG per-cell RMS residual target (incomp)      [1e-4]
@@ -995,6 +1005,15 @@ RUN LENGTH
                      slower than explicit, and does not converge from a
                      cold start on the Re 1e4 wedge (docs/rans.md).
                                                                [explicit]
+  --compensated      compressible time march on the compensated state
+                     (FP32 hi + lo per field, the explicit --steady
+                     march's), so an update below ulp(q)/2 is kept
+                     instead of rounded away. Measured: the plain URANS
+                     dt ladder DIVERGES as dt -> 0 (FP32 stagnation),
+                     the compensated one converges. Changes the bits;
+                     ~1.15-1.2x per step. A no-op on explicit --steady;
+                     rejects --steady-scheme implicit and --penalize.
+                     (docs/rans.md, "Time accuracy")             [off]
   --seq LEVELS       grid sequencing (requires --steady): converge on a
                      ladder of grids n/2^(LEVELS-1) .. n, prolonging each
                      solution as the next level's initial guess. Only the
@@ -1034,11 +1053,16 @@ OUTPUT (--emit is repeatable; default = stats,bin)
                      w, p, T, the RANS scalars, mu_t, d at the end);
                      --ogrid only (docs/viewer-format.md). The OpenFOAM
                      parity tools build an identical polyMesh from it.
-  --emit surface     <out>_surface.csv once at the end (--ogrid): one
+  --emit surface     <out>_surface.csv once at the end. --ogrid: one
                      row per wall face, i,k,x,y,z,theta_deg,area,cp,cf,
                      tau_x,tau_y,tau_z,yplus,d1,qw; theta from the
                      upstream axis, cf signed along the downstream
-                     surface tangent. Header comment: the run label.
+                     surface tangent. Compressible immersed body: one
+                     row per ghost-wall interface face, x,y,z,axis,sign,
+                     area,s,p,f,fp,fc,fv (area vector into the body,
+                     gauge pressure, total / pressure / convective /
+                     viscous force, solver units). Header comment: the
+                     run label (docs/viewer-format.md).
   --emit none        diagnostics only
 
   --fdt DT           .bin / volume frame interval                  [0.15]
@@ -1125,7 +1149,10 @@ PHYSICS
   --mach M           BULK Mach number: sets the background pressure
                      from the log-law bulk-velocity estimate. Above
                      ~0.3 compressibility contaminates comparison
-                     with incompressible references.                [0.2]
+                     with incompressible references. In (0,1),
+                     except --rans --steady-scheme implicit: any
+                     M > 0 (one broadcast column, v = 0: no shock
+                     can form).                                     [0.2]
   --wall isothermal|adiabatic                              [isothermal]
                      isothermal walls conduct the body-force power
                      out; adiabatic has NO heat sink (T climbs until
@@ -1173,6 +1200,26 @@ everywhere, docs/rans.md)
                      (~26 iterations, Re_tau 180-1e4); rejects --cfl
                      and --dt-recompute; --steady-steps defaults to 500.
                      Requires --steady.                       [explicit]
+  --compensated      time march on the compensated state (FP32 hi + lo
+                     per field, the explicit --steady march's), so an
+                     update below ulp(q)/2 is kept instead of rounded
+                     away. Changes the bits; ~1.1x per step. A no-op
+                     on explicit --steady; rejects --steady-scheme
+                     implicit. (docs/rans.md, "Time accuracy")   [off]
+
+LES (a FILTERED field: statistics depend on grid AND Cs; labelled
+"LES <model> Cs=..." everywhere, docs/channel.md "LES")
+  --les CS           SGS model constant; 0 = DNS, bit for bit. mu_t is
+                     imaged ODD across both wall ghost rows, so it is
+                     exactly 0 on the wall faces. Time-accurate only:
+                     rejects --rans and --steady. Stats append nutMax
+                     (max mu_t/mu, fluid rows) and nutWall (wall-face
+                     mean mu_t/mu, 0 by construction), profiles
+                     nutRatio.                                       [0]
+  --sgs smag|sigma   SGS model, used with --les. smag carries
+                     nu_t/nu ~ Cs^2 Delta+^2 into the first cell (no
+                     wall damping); sigma (C ~ 1.35) vanishes in pure
+                     shear; rejected at --nz 1 (zero in 2D)       [smag]
 
 RUN LENGTH
   --tt N             eddy turnovers (delta/u_tau = 1) to integrate   [30]
@@ -1184,11 +1231,12 @@ OUTPUT
                      and --steady iter,resid,resU,resE,resT,
                      Tbulk,remaining; implicit also cfl,alpha,
                      rejects, one row per iteration, t and dt in
-                     pseudo-time)                                [on]
+                     pseudo-time; LES appends nutMax,nutWall and
+                     opens with a "# LES ..." label line)        [on]
   --profile-dt DT    <out>_profiles.csv y-profile dump interval
                      (t,y,yplus,uplus,urms,vrms,wrms,uv,rho,T; RANS
                      appends mutRatio and SA nutilde | SST kplus,
-                     omegaplus),
+                     omegaplus; LES appends nutRatio),
                      Favre-averaged over x,z; 0 = off               [1.0]
   --emit png|web|bin mid-plane frames (png renders the centre z-plane,
                      2D or 3D)

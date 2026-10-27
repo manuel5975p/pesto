@@ -14,6 +14,9 @@
 //   (d) 200-step SA and SST URANS smoke on an immersed cylinder: finite,
 //       mu_t == 0 on deep cells, SA 0 guard hits (SST's staircase hits are
 //       an open finding, counted)
+//   (e) the clamped mu_t image: an under-resolved Re 1e5 law-of-the-wall
+//       layer, SA and SST, where the plain odd image takes faces to -41 mu:
+//       every staircase face keeps mu + mu_t >= mu
 // Seconds.
 #include "dns/comp.hpp"
 #include "dns/curvmesh.hpp"
@@ -66,6 +69,16 @@ struct Rig
     std::vector<std::uint8_t> fluid;
     std::function<void(gpu::DeviceCompState&)> bc;   // the stage hook
 };
+
+// The rig's body: a circle of D = L/4 at (0.4 L, 0.5 L), L = 2 pi.
+Sdf rigCircle()
+{
+    const double L = 2 * std::numbers::pi;
+    const double D = 0.25 * L, cx = 0.4 * L, cy = 0.5 * L;
+    return [=](double x, double y, double) {
+        return std::hypot(x - cx, y - cy) - 0.5 * D;
+    };
+}
 
 struct Opt
 {
@@ -126,9 +139,7 @@ std::unique_ptr<Rig> makeRig(const Opt& o)
     r->far = std::make_unique<gpu::DeviceCompFar>(std::move(*far));
     r->nsc = std::make_unique<gpu::DeviceCompNscbc>(std::move(*nsc));
     r->red = std::make_unique<gpu::ReduceScratch>(std::move(*red));
-    const Sdf circle = [=](double x, double y, double) {
-        return std::hypot(x - cx, y - cy) - 0.5 * D;
-    };
+    const Sdf circle = rigCircle();
     if (o.body) {
         auto gh = gpu::DeviceCompGhost::make(r->g, circle, kGam, kRhoInf,
                                              kPInf, nullptr, r->remap);
@@ -395,16 +406,35 @@ void wallLinear()
         (void)nut->upload(hn.data());
         gh->mirrorMut(nut->data(), nullptr);
         const auto mn = down(*nut);
+        // The image is clamped by the ghost's fluid face neighbours (a ghost
+        // deeper than its nearest fluid neighbour is far would make that face
+        // mu_t negative): c sdf where it is not, -min(nbr) where it is.
+        const auto tb = gpu::classifyCompGhost(g, plane, nullptr, id, nullptr);
+        std::vector<double> clampAt(g.size(), -1e30);
+        for (int q = 0; q < tb.nGhost(); ++q)
+            for (int s = 0; s < gpu::CompGhostTables::kFaceNbr; ++s) {
+                const int f = tb.gfnb[gpu::CompGhostTables::kFaceNbr * q + s];
+                if (f < 0) break;
+                double& v = clampAt[std::size_t(tb.gcell[q])];
+                v = std::max(v, -double(hn[f]));
+            }
         double emu = 0;
+        int bound = 0, free = 0;
         for (int j = 3; j < n - 3; ++j)
             for (int i = 3; i < n - 3; ++i) {
+                const std::size_t c = g.idx(i, j, 0);
                 const double s = plane((i + 0.5) * g.hx, (j + 0.5) * g.hy, 0);
                 if (s >= 0 || s < -1.5 * g.hx) continue;
-                emu = std::max(emu, std::abs(mn[g.idx(i, j, 0)] - cc * s));
+                const bool b = clampAt[c] > cc * s;
+                (b ? bound : free) += 1;
+                emu = std::max(emu, std::abs(mn[c] - (b ? clampAt[c] : cc * s)));
             }
-        check(emu <= 1e-5 * scale, "(c) " + nm + ": mu_t_g = -a sum w mu_t_s "
-                                                 "reproduces c d (face average "
-                                                 "~ c sdf at the face)");
+        std::printf("  (c) %s mu_t image: %d ghosts reproduce c d, %d clamped to "
+                    "-min(nbr)\n",
+                    nm.c_str(), free, bound);
+        check(emu <= 1e-5 * scale && bound > 0 && free > 0,
+              "(c) " + nm + ": mu_t_g = -min(a sum w mu_t_s, min fluid face-"
+                            "neighbour mu_t) -- c d where unclamped");
         if (m != RansModel::Sst2003m) continue;
         // omega_g: (1 + a) omega_w - a omega with omega_w = 60 nu/(b1 d_s^2):
         // every ghost holds a value above omega_w (omega_w >> omega here).
@@ -471,6 +501,126 @@ void smoke()
     }
 }
 
+// (e) the bounded mu_t image on an under-resolved immersed URANS (128^2,
+// D = 32 cells, Re 1e5, y+ ~ 30-80, 200 steps). On every staircase face
+// (fluid c | ghost g) the face viscosity mu + 0.5 (mu_t_g + mu_t_c) must stay
+// >= mu. The unclamped odd image -a sum w mu_t_s is recomputed on the host
+// from the same tables and must drive some face NEGATIVE here -- the rig
+// exercises the clamp -- and every ghost must be -min(image, min over its
+// fluid face neighbours' mu_t).
+void boundedMut()
+{
+    const int dijk[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
+                            {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+    for (RansModel m : {RansModel::SaNeg, RansModel::Sst2003m}) {
+        const double re = 1e5;
+        const double mu = kRhoInf * kUInf * (0.25 * 2 * std::numbers::pi) / re;
+        double phi[2] = {nuTildaInf(kRansNutInfRatio, mu / kRhoInf), 0};
+        if (ransSst(m)) {
+            phi[0] = kInf(kRansKInf, kUInf);
+            phi[1] = omegaInf(phi[0], kRansMutInfRatio, mu / kRhoInf);
+        }
+        auto r = makeRig({.model = m, .rans = true, .focal = false,
+                          .phi = {phi[0], phi[1]}, .re = re, .n = 128});
+        if (!r) { check(false, "(e) rig"); return; }
+        upload(*r, phi[0], phi[1]);
+        // A developed wall layer, so the image sees a law-of-the-wall mu_t
+        // from the first step (from a freestream start 200 steps grow next to
+        // none: 56 SA / 51 SST faces below mu, none negative, measured):
+        // nu_t = kappa u_tau d e^(-d/2delta), u_tau = 0.38 Re^-0.1 U (the
+        // validator's bluff-body estimate), delta = D/20. SA: nu~ = that
+        // (fv1 ~ 1 at chi ~ kappa y+); SST: the log-layer equilibrium pair
+        // k = u_tau^2/sqrt(beta*) e^(-d/delta), omega = sqrt(k)/(beta*^1/4
+        // kappa d). Freestream values are floors.
+        const auto rho = down(r->ds->rho);
+        const double ut = 0.38 * std::pow(re, -0.1) * kUInf, kap = 0.41;
+        const double delta = 0.05 * 0.25 * 2 * std::numbers::pi;
+        std::vector<double> t0(r->g.size()), t1(r->g.size());
+        const Sdf sdf = rigCircle();
+        for (int j = 0; j < r->g.ny; ++j)
+            for (int i = 0; i < r->g.nx; ++i) {
+                const std::size_t c = r->g.idx(i, j, 0);
+                const double d = std::max(
+                    sdf((i + 0.5) * r->g.hx, (j + 0.5) * r->g.hy, 0), 0.0);
+                const double k = ut * ut / 0.3 * std::exp(-d / delta);
+                const double nut = kap * ut * d * std::exp(-0.5 * d / delta);
+                const double om = std::sqrt(k) / (std::sqrt(0.3) * kap *
+                                                  std::max(d, 1e-3 * r->g.hx));
+                t0[c] = rho[c] * std::max(ransSst(m) ? k : nut, phi[0]);
+                t1[c] = rho[c] * std::max(om, phi[1]);
+            }
+        (void)r->ds->uploadTurb(0, t0);
+        if (ransSst(m)) (void)r->ds->uploadTurb(1, t1);
+        r->bc(*r->ds);
+        for (int s = 0; s < 200; ++s) {
+            const double dt = 0.9 * r->dev->stableDt(*r->ds, *r->red, 0.4);
+            r->dev->step(*r->ds, gpu::Real(dt));
+            r->bc(*r->ds);
+        }
+        r->dev->updateMut(*r->ds);
+        const auto mut = down(r->dev->mut());
+        const auto yp = r->ghost->wallYplus(*r->dev, *r->ds);
+        const Grid& g = r->g;
+        const auto T =
+            gpu::classifyCompGhost(g, rigCircle(), nullptr, r->remap, nullptr);
+        const std::string n = m == RansModel::SaNeg ? "SA" : "SST";
+        check(T.solid == r->ghost->solidCells(),
+              "(e) " + n + ": the host tables are the solver's");
+        std::vector<int> ghostOf(g.size(), -1);
+        std::vector<double> img(std::size_t(T.nGhost())), lim;
+        for (int q = 0; q < T.nGhost(); ++q) {
+            ghostOf[std::size_t(T.gcell[q])] = q;
+            double s = 0;
+            for (int k = 0; k < 8; ++k)
+                s += double(T.gw[8 * q + k]) * mut[T.gnbr[8 * q + k]];
+            img[q] = double(T.gscale[q]) * s;
+        }
+        lim = img;
+        int below = 0, negative = 0, wouldBelow = 0, wouldNeg = 0;
+        double minTot = 1e30;
+        for (int f = 0; f < T.nFace(); ++f) {
+            const int c = T.fcell[f], d = T.fdir[f];
+            const int i = c % g.nx, j = (c / g.nx) % g.ny, k = c / (g.nx * g.ny);
+            const std::size_t gc =
+                g.idx(i + dijk[d][0], j + dijk[d][1], k + dijk[d][2]);
+            const int q = ghostOf[gc];
+            if (q < 0) { check(false, "(e) face without a ghost"); return; }
+            lim[q] = std::min(lim[q], double(mut[c]));
+            const double tot = mu + 0.5 * (double(mut[gc]) + mut[c]);
+            const double would = mu + 0.5 * (-img[q] + mut[c]);
+            below += tot < mu;
+            negative += tot < 0;
+            wouldBelow += would < mu;
+            wouldNeg += would < 0;
+            minTot = std::min(minTot, tot / mu);
+        }
+        double eLim = 0;
+        for (int q = 0; q < T.nGhost(); ++q)
+            eLim = std::max(eLim, std::abs(mut[T.gcell[q]] + lim[q])
+                                      / (std::abs(lim[q]) + 1e-3 * mu));
+        const double dtEnd = r->dev->stableDt(*r->ds, *r->red, 0.4);
+        const auto F = r->ghost->force(*r->dev, *r->ds);
+        std::printf("  (e) %s Re 1e5 128^2 200 steps: y+ max %.1f mean %.1f, "
+                    "%d faces; unclamped image: %d below mu, %d negative; "
+                    "solver: %d below mu, %d negative, min (mu+mu_t)/mu %.4f, "
+                    "max |mu_t_g + min(img, nbr)| rel %.2e, fx %.4f, dt %.3g, "
+                    "hits %llu\n",
+                    n.c_str(), yp.max, yp.mean, T.nFace(), wouldBelow, wouldNeg,
+                    below, negative, minTot, eLim, F.fx, dtEnd,
+                    r->dev->floorHits());
+        // Unclamped, this rig blew up: SST's dt fell to 1.8e-9 by step 200
+        // (SA ran on with faces down to -39 mu); clamped both hold dt ~2e-3.
+        check(std::isfinite(F.fx) && dtEnd > 1e-4,
+              "(e) " + n + ": the run is finite with a healthy dt");
+        check(wouldNeg > 0, "(e) " + n + ": the unclamped odd image makes some "
+                                         "face's total viscosity NEGATIVE here");
+        check(below == 0 && negative == 0,
+              "(e) " + n + ": every staircase face keeps mu + mu_t >= mu");
+        check(eLim <= 1e-5, "(e) " + n + ": mu_t_g = -min(a sum w mu_t_s, "
+                                         "min fluid face-neighbour mu_t)");
+    }
+}
+
 } // namespace
 
 int main()
@@ -480,5 +630,6 @@ int main()
     uniformTransport();
     wallLinear();
     smoke();
+    boundedMut();
     return dnstest::finish();
 }

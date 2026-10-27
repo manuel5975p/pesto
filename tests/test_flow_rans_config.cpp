@@ -215,10 +215,63 @@ void accepts()
                              "--emit surface");
     }
     {
-        auto c = runCli(og({"--rans", "sa-neg", "--ramp", "1", "--kick",
-                            "0.1"}));
-        check(c.has_value(), "accepted: --ramp/--kick with URANS");
+        // The immersed ghost wall's split tally (W6): compressible, no --ogrid.
+        auto c = runCli({"flow", "--physics", "compressible", "--body",
+                         "cylinder", "--n", "256", "--emit", "surface",
+                         "--emit", "stats", "--out", "x"});
+        check(c.has_value(), "accepted: --emit surface on the compressible "
+                             "immersed ghost wall");
     }
+    {
+        auto c = runCli(og({"--rans", "sa-neg", "--ramp", "1"}));
+        check(c.has_value(), "accepted: --ramp with URANS");
+    }
+}
+
+// The O-grid's own start (W4): --kick is never applied there, --ogrid-trip is
+// its trip on every O-grid but the wedge, and the Cartesian D < 4h guard
+// never reads the O-grid's nominal radial h.
+void ogridStart()
+{
+    for (const char* k : {"0.1", "0"})
+        rejectedAt(og({"--kick", k}), "--kick",
+                   std::string("--kick ") + k + " on the O-grid");
+    rejectedAt(og({"--rans", "sa-neg", "--kick", "0.1"}), "--kick",
+               "--kick with O-grid URANS");
+    auto d = runCli(og());
+    check(d && d->kick == 0 && d->meta.kick == 0 && d->ogridTrip == 0 &&
+              d->meta.farField == "ogrid" && dns::flowRunLabel(*d).empty(),
+          "O-grid default: kick 0 applied and recorded, far = ogrid, untripped, "
+          "no label");
+    auto t = runCli(og({"--ogrid-trip", "0.05"}));
+    check(t && t->ogridTrip == 0.05 &&
+              dns::flowRunLabel(*t) == "DNS [O-grid trip 0.05 U]" &&
+              t->describe().find("             trip 0.05 U (solenoidal vortex, "
+                                 "1 D behind the body, D/4 off the axis)\n") !=
+                  std::string::npos,
+          "--ogrid-trip on the 2D O-grid: accepted, labelled, described");
+    auto t3 = runCli(og({"--nz", "8", "--ogrid-trip", "0.02", "--rans",
+                         "sa-neg"}));
+    check(t3 && t3->ogridTrip == 0.02 &&
+              dns::flowRunLabel(*t3) == "RANS SA-neg -- URANS (time-accurate) "
+                                        "[O-grid trip 0.02 U]" &&
+              t3->describe().find("centred in the span") != std::string::npos,
+          "--ogrid-trip on the extruded O-grid under URANS: labelled");
+    auto t0 = runCli(og({"--ogrid-trip", "0"}));
+    check(t0 && d && t0->describe() == d->describe(),
+          "--ogrid-trip 0 given == defaulted on the 2D O-grid");
+    rejectedAt(og({"--ogrid-trip", "0.6"}), "--ogrid-trip",
+               "--ogrid-trip > 0.5 on the 2D O-grid");
+    rejectedAt(og({"--ogrid-trip", "-0.1"}), "--ogrid-trip",
+               "--ogrid-trip < 0 on the 2D O-grid");
+    auto c = runCli({"flow", "--physics", "compressible", "--body", "cylinder",
+                     "--ogrid", "--n", "128", "--ny", "64", "--out", "o"});
+    check(c && c->grid.nx == 128 && c->grid.ny == 64,
+          "--ogrid --n 128 --ny 64: accepted (no Cartesian D < 4h guard)");
+    // The Cartesian guard itself still holds.
+    rejectedAt({"flow", "--physics", "compressible", "--body", "cylinder",
+                "--n", "64", "--ny", "16", "--out", "x"},
+               "--dr", "Cartesian D under 4 cells");
 }
 
 void rejects()
@@ -291,9 +344,12 @@ void rejects()
     rejectedAt(og({"--steady", "1e-4", "--steady-scheme", "implicit", "--cfl",
                    "0.3"}),
                "--cfl", "implicit + --cfl");
-    rejectedAt({"flow", "--physics", "compressible", "--body", "cylinder",
-                "--n", "256", "--emit", "surface", "--out", "x"},
-               "--emit", "--emit surface without --ogrid");
+    rejectedAt({"flow", "--body", "cylinder", "--n", "256", "--emit",
+                "surface", "--out", "x"},
+               "--emit", "--emit surface on the incompressible cut-cell wall");
+    rejectedAt({"flow", "--physics", "compressible", "--body", "none", "--n",
+                "128", "--emit", "surface", "--out", "x"},
+               "--emit", "--emit surface with --body none");
     rejected({"channel", "--emit", "surface"}, 2, "--emit surface on channel");
 }
 
@@ -325,8 +381,9 @@ void builtLater()
     check(ic && dns::flowRunLabel(*ic) ==
                     "RANS SST-2003m -- URANS (time-accurate) [immersed ghost "
                     "wall: first-order wall position, NOT body-fitted]" &&
-              ic->describe().find("immersed ghost wall, the velocity's linear "
-                                  "image") != std::string::npos &&
+              ic->describe().find("immersed ghost wall: k_g = a^2 k_s") !=
+                  std::string::npos &&
+              ic->describe().find("mu_t_g = -min(a mu_t_s") != std::string::npos &&
               hasWarning(*ic, "refine --n or cluster with --focal"),
           "immersed RANS: label suffix, wall line, y+ warning from h_fine");
     Args b = imm;
@@ -499,8 +556,6 @@ void revolved()
                "--ogrid-trip > 0.5");
     rejectedAt(with({"--nz", "1", "--ogrid-trip", "0.1"}), "--ogrid-trip",
                "--ogrid-trip on the wedge");
-    rejectedAt(og({"--ogrid-trip", "0.1"}), "--ogrid-trip",
-               "--ogrid-trip on an extruded O-grid");
     rejectedAt({"flow", "--physics", "compressible", "--body", "sphere",
                 "--n", "64", "--ogrid-trip", "0.1", "--out", "x"},
                "--ogrid-trip", "--ogrid-trip without --ogrid");
@@ -519,13 +574,66 @@ void revolved()
 
 } // namespace
 
+// --compensated (docs/rans.md, "Time accuracy"): the explicit steady march's
+// two-word state on a time march. Opt-in, labelled, rejected where a plain
+// state is load-bearing.
+void compensated()
+{
+    const std::string note = "[compensated state: FP32 hi + lo per field]";
+    auto off = runCli(og({"--rans", "sst-2003m"}));
+    check(off && !off->compensated && off->meta.state.empty() &&
+              off->describe().find(note) == std::string::npos,
+          "--compensated absent: plain state, no state key, describe as before");
+    auto on = runCli(og({"--rans", "sst-2003m", "--compensated"}));
+    check(on && on->compensated && on->meta.state == "compensated" &&
+              on->describe().find(note) != std::string::npos,
+          "--compensated on O-grid URANS: on, state key, describe tail");
+    auto cart = runCli({"flow", "--physics", "compressible", "--body",
+                        "cylinder", "--n", "256", "--compensated", "--out", "x"});
+    check(cart && cart->compensated, "--compensated on a Cartesian DNS");
+    auto mrf = runCli({"flow", "--physics", "compressible", "--body", "cylinder",
+                       "--n", "256", "--rotor-mach", "0.2", "--rotor-frame",
+                       "mrf", "--rotor-axis", "z", "--compensated", "--out", "x"});
+    check(mrf && mrf->compensated, "--compensated with --rotor-frame mrf");
+    // On an explicit --steady the state already is compensated: a no-op.
+    auto st = runCli(og({"--steady", "1e-4", "--compensated"}));
+    check(st && !st->compensated && st->meta.state.empty(),
+          "--compensated on explicit --steady: accepted, nothing changes");
+    rejectedAt(og({"--steady", "1e-4", "--steady-scheme", "implicit",
+                   "--compensated"}),
+               "--compensated", "--compensated + --steady-scheme implicit");
+    rejectedAt({"flow", "--body", "cylinder", "--compensated", "--out", "x"},
+               "--compensated", "--compensated on incompressible flow");
+    rejectedAt({"flow", "--physics", "compressible", "--body", "cylinder",
+                "--n", "256", "--penalize", "0.01", "--compensated", "--out",
+                "x"},
+               "--compensated", "--compensated + --penalize");
+    // channel: a time march takes it, the implicit march rejects it.
+    auto ch = runCli({"channel", "--compensated"});
+    check(ch && ch->compensated && ch->meta.state == "compensated" &&
+              ch->describe().find(note) != std::string::npos,
+          "channel --compensated: on, state key, describe tail");
+    auto chs = runCli({"channel", "--rans", "sa-neg", "--n", "4", "--nz", "1",
+                       "--steady", "1e-4", "--compensated"});
+    check(chs && !chs->compensated,
+          "channel --compensated on explicit --steady: a no-op");
+    rejectedAt({"channel", "--rans", "sa-neg", "--n", "4", "--nz", "1",
+                "--steady", "1e-4", "--steady-scheme", "implicit",
+                "--compensated"},
+               "--compensated", "channel --compensated + implicit");
+    rejected({"conv", "--compensated"}, 1, "conv --compensated: unknown flag");
+    rejected({"hit", "--compensated"}, 1, "hit --compensated: unknown flag");
+}
+
 int main()
 {
     revolved();
     headDescribes();
     accepts();
+    ogridStart();
     rejects();
     builtLater();
     warnings();
+    compensated();
     return dnstest::finish();
 }

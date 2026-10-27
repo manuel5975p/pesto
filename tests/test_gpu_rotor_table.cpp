@@ -62,7 +62,7 @@ bool sameTables(const gpu::CompGhostTables& a, const gpu::CompGhostTables& b)
 {
     return a.gcell == b.gcell && a.gnbr == b.gnbr && a.gw == b.gw
            && a.tnbr == b.tnbr && a.tw == b.tw
-           && a.gscale == b.gscale && a.uwall == b.uwall && a.aspan == b.aspan
+           && a.gscale == b.gscale && a.gfnb == b.gfnb && a.uwall == b.uwall && a.aspan == b.aspan
            && a.deep == b.deep
            && a.fcell == b.fcell && a.fdir == b.fdir && a.fpos == b.fpos
            && a.solid == b.solid;
@@ -249,6 +249,7 @@ int main()
         big.tnbr.resize(big.tnbr.size() + 8, 0);
         big.tw.resize(big.tw.size() + 8, gpu::Real(0));
         big.gscale.push_back(gpu::Real(0));
+        big.gfnb.resize(big.gfnb.size() + gpu::CompGhostTables::kFaceNbr, -1);
         big.uwall.resize(big.uwall.size() + 3, gpu::Real(0));
         big.aspan.push_back(gpu::Real(0));
         check(gh->load(big) != hipSuccess,

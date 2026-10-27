@@ -52,6 +52,14 @@ struct ChannelRun
     // --steady-scheme implicit: the Newton line march (dns/channel_line,
     // dns/pseudo_time; docs/rans.md). Pre: steadyTol > 0.
     bool implicitSteady = false;
+    // --compensated: the time march on the compensated state too (the
+    // explicit steady march always has it). Pre: !implicitSteady.
+    bool compensated = false;
+    // LES (docs/channel.md, "LES"): SGS constant, 0 = the DNS channel bit for
+    // bit (no make argument, no mu_t hook). Pre: les > 0 implies rans == None
+    // and steadyTol == 0; sgs == Sigma implies nz > 1.
+    double les = 0;
+    SgsModel sgs = SgsModel::Smagorinsky;
     std::vector<double> wallDist;  // g.size(), the model's d (rans only)
     // Conserved scalars, g.size() each, the first ransScalars(rans) used:
     // rho nu~ (SA) or rho k, rho omega (SST).

@@ -39,8 +39,9 @@ public:
     // Neither exists without RANS, so that path is today's bit for bit.
     void apply(DeviceCompState& s) const;
 
-    // mu_t and F1 EVEN onto the mirror rows (the RANS mutHook's far part);
-    // f1 may be null. Nothing on an open axis.
+    // mu_t and F1 EVEN onto the mirror rows (the RANS/LES mutHook's far
+    // part), mu_t ODD on no-slip y rows (a wall face); f1 may be null.
+    // Nothing on an open axis.
     void applyMut(Real* nut, Real* f1) const;
 
     // Exact Galilean x-boost of the whole state by du (silent by construction);

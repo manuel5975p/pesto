@@ -417,10 +417,15 @@ if(BUILD_TESTING)
     add_test(NAME prop_cli COMMAND test_prop_cli)
     set_tests_properties(prop_cli PROPERTIES TIMEOUT 300)
     if(DNS_WITH_FFTW)
-        set_tests_properties(hit_mini PROPERTIES TIMEOUT 900
+        # 3 + 3 eddy turnovers, ~22 s unloaded (gpu_hit_mini runs 6 + 6).
+        set_tests_properties(hit_mini PROPERTIES TIMEOUT 180
             LABELS "slow;validation;literature")
     endif()
     if(DNS_WITH_GPU)
+        # Every test registered in this block drives the device: they all take
+        # RESOURCE_LOCK gpu (set at the block's end), so `ctest -j` overlaps
+        # host tests with ONE GPU test at a time instead of contending.
+        get_property(dns_tests_before_gpu DIRECTORY PROPERTY TESTS)
         foreach(t gpu_buffer gpu_operators gpu_reductions gpu_poisson
                   gpu_poisson_neumann gpu_poisson2d gpu_projection gpu_tgv
                   gpu_cutcell gpu_cutcell2d gpu_cutcell_sphere gpu_conservation
@@ -429,7 +434,7 @@ if(BUILD_TESTING)
                   gpu_comp_ghost3d gpu_comp_mesh gpu_comp_ghost_closure
                   gpu_comp_far gpu_comp_nscbc gpu_nscbc_absorb gpu_nscbc_order
                   gpu_acoustics gpu_comp_sink
-                  gpu_les_smag gpu_derived
+                  gpu_les_smag gpu_les_wall gpu_derived
                   gpu_poisson_wally gpu_rotor_wall gpu_rotor_table gpu_mrf
                   gpu_channel gpu_cutflux gpu_ogrid gpu_rans gpu_rans_mask
                   gpu_rans_ogrid gpu_rans_mms gpu_axisym gpu_axisym3d gpu_nk
@@ -458,12 +463,42 @@ if(BUILD_TESTING)
             gpu_comp_scale_invariance gpu_ghost_translate gpu_comp_axis_permute
             gpu_comp_curv_axis_permute comp_time_order gpu_comp_viscous_modes
             gpu_rans_mask gpu_rans_ogrid gpu_rans_mms gpu_axisym gpu_axisym3d
-            gpu_rans_immersed
+            gpu_rans_immersed gpu_les_wall
             PROPERTIES TIMEOUT 60)
         set_tests_properties(gpu_nk PROPERTIES TIMEOUT 120)
-        # ~65 s alone (two 2.2e5-iteration marches onto the oracle); 273 s was
-        # measured under ctest -j4 GPU contention, so give it headroom.
-        set_tests_properties(gpu_rans PROPERTIES TIMEOUT 600)
+        # ~56 s alone (G10's 2.2e5-iteration compensated march, G9's 1.2e5
+        # plain one). Its SST half is its own entry, ~32 s (S-G9's 2.2e5).
+        # The 273 s once measured under ctest -j4 was GPU contention, which
+        # RESOURCE_LOCK gpu now rules out.
+        add_test(NAME gpu_rans_sst COMMAND test_gpu_rans sst)
+        set_tests_properties(gpu_rans_sst PROPERTIES SKIP_RETURN_CODE 77)
+        set_tests_properties(gpu_rans gpu_rans_sst PROPERTIES TIMEOUT 180)
+        # gpu_mrf's bladed half: the BUILT binary on the rotor2 L1 grid for
+        # 1 D/U, ct/cq pinned at 1%, deep-solid core asserted (W7; ~11 s).
+        target_compile_definitions(test_gpu_mrf PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>"
+            DNS_ROTOR2_STL="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/rotor2.stl")
+        add_dependencies(test_gpu_mrf dns)
+        add_test(NAME gpu_mrf_rotor2 COMMAND test_gpu_mrf rotor2)
+        set_tests_properties(gpu_mrf_rotor2 PROPERTIES SKIP_RETURN_CODE 77
+            TIMEOUT 60)
+        # The incompressible 3D SGS wall tally against the eddy-diffusion
+        # substep's own momentum drain (W1; ~1 s).
+        add_test(NAME gpu_les_tally3d COMMAND test_gpu_les_smag tally3d)
+        set_tests_properties(gpu_les_tally3d PROPERTIES SKIP_RETURN_CODE 77
+            TIMEOUT 60)
+        # Compressible TGV 32^3 to t = 12, DNS / smag / sigma, against the
+        # 512^3 reference (W10).
+        add_executable(test_gpu_les_tgv_comp tests/test_gpu_les_tgv_comp.cpp)
+        target_link_libraries(test_gpu_les_tgv_comp PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_les_tgv_comp PRIVATE
+            DNS_VALIDATION_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data/validation")
+        add_test(NAME gpu_les_tgv_comp COMMAND test_gpu_les_tgv_comp)
+        set_tests_properties(gpu_les_tgv_comp PROPERTIES SKIP_RETURN_CODE 77
+            TIMEOUT 60)
+        # The RANS / LES / MRF tier caps at 180 s (the val tier keeps its own).
+        set_tests_properties(gpu_tgv gpu_comp_les gpu_les_smag gpu_rotor_wall
+            gpu_rotor_table gpu_mrf gpu_channel PROPERTIES TIMEOUT 180)
 
         # These define their own kernels (the pre-recomposition kernel variants,
         # as identity oracles), so they are HIP TUs rather than plain .cpp --
@@ -501,14 +536,21 @@ if(BUILD_TESTING)
         # Open far-field path is app-local; drive the built binary.
         dns_gpu_bin_test(gpu_open_incomp 600)
         # Smoke coverage for the three runners, incl. --far tunnel WITH walls
-        # (the incompressible default) and runner_comp, which had none.
-        dns_gpu_bin_test(gpu_runners 600)
+        # (the incompressible default) and runner_comp, which had none (~30 s).
+        dns_gpu_bin_test(gpu_runners 180)
         # SST small cases: the freestream decay ODE and the L1 sphere-wedge
         # Re 1e3 certification against OpenFOAM on the identical mesh (~35 s).
         dns_gpu_bin_test(gpu_sst 180)
+        # Its SA-neg twin: the same wedge certified, pinned to its measured
+        # state; the OpenFOAM comparison is printed, not gated (~30 s).
+        dns_gpu_bin_test(gpu_sa_wedge 120)
         # The sphere's full revolution end to end: N 36 == the 10-deg wedge,
         # and the m = 1 bifurcation at Re 250 with --ogrid-trip (~40 s).
         dns_gpu_bin_test(gpu_axisym3d_run 180)
+        # GPU twin of hit_mini: dns hit 64^3, 6 + 6 eddy turnovers (~2 s).
+        if(DNS_WITH_FFTW)
+            dns_gpu_bin_test(gpu_hit_mini 60)
+        endif()
         # Sponge-free open tunnel: library-level freestream cycles + a short
         # end-to-end run of the built binary.
         dns_gpu_bin_test(gpu_tunnel_open 600)
@@ -522,6 +564,9 @@ if(BUILD_TESTING)
         # The implicit steady RANS march: in-process device checks against the
         # host line operator, and the runner through the binary (I4/I5/I7).
         dns_gpu_bin_test(gpu_rans_implicit 60)
+        # Channel LES (W11): the odd mu_t wall image, the label, sigma == 0 on
+        # the laminar state, --les 0 byte-identical (~2 s).
+        dns_gpu_bin_test(gpu_channel_les 60)
 
 
         # --- Physical validation suite (docs/validation.md) -----------------
@@ -601,7 +646,7 @@ if(BUILD_TESTING)
 
         foreach(t val_cyl_re60 val_cyl_re100 val_cyl_re200 val_cyl_blockage
                   val_comp_cyl val_sphere_re300 val_mesh_sphere
-                  val_comp_mesh_sphere)
+                  val_comp_mesh_sphere val_ogrid_cyl)
             dns_val_exe(${t})
         endforeach()
         dns_val_exe(val_tgv3d DEFS
@@ -616,6 +661,9 @@ if(BUILD_TESTING)
             LABELS "validation;anchor")
         dns_add_val(val_comp_mesh_sphere QUARANTINE TIMEOUT 600
             LABELS "validation;analytic")
+        # Default tier (not quarantined): the body-fitted O-grid against the
+        # 2D literature, Re 100 shedding + Re 40 steady, ~28 s (W12).
+        dns_add_val(val_ogrid_cyl TIMEOUT 120 LABELS "validation;literature")
 
         if(DNS_HEAVY_VALIDATION)
             dns_add_val(val_cyl_re200 QUARANTINE SERIAL TIMEOUT 900
@@ -633,5 +681,44 @@ if(BUILD_TESTING)
             dns_add_val(val_mesh_sphere QUARANTINE SERIAL TIMEOUT 1200
                 LABELS "validation;analytic;heavy")
         endif()
+
+        get_property(dns_tests_all DIRECTORY PROPERTY TESTS)
+        set(dns_tests_gpu ${dns_tests_all})
+        list(REMOVE_ITEM dns_tests_gpu ${dns_tests_before_gpu})
+        set_tests_properties(${dns_tests_gpu} PROPERTIES RESOURCE_LOCK gpu)
     endif()
+
+    # Model-subset labels: `ctest -L rans`, `-L 'rans|les|mrf'`, `-L fast`.
+    #   rans  the RANS closures, their oracle, stop rules and runners
+    #   les   the SGS models and the resolved-turbulence references they are
+    #         read against (TGV, forced HIT)
+    #   mrf   rotors: moving wall, azimuth tables, MRF frame, tip guard
+    #   fast  members of those three under ~6 s each (measured, gfx1100)
+    # A name not registered in this configuration (no GPU, no FFTW) is skipped.
+    function(dns_label label)
+        foreach(t IN LISTS ARGN)
+            if(TEST ${t})
+                set_property(TEST ${t} APPEND PROPERTY LABELS ${label})
+            endif()
+        endforeach()
+    endfunction()
+    dns_label(rans channel_config transport rans rans_channel1d steady_stop
+        blockband channel_line pseudo_time flow_rans_config gpu_channel gpu_rans
+        gpu_rans_sst gpu_rans_mask gpu_rans_ogrid gpu_rans_mms gpu_axisym
+        gpu_axisym3d gpu_nk gpu_rans_immersed gpu_runners gpu_sst gpu_sa_wedge
+        gpu_axisym3d_run gpu_determinism gpu_rans_implicit)
+    dns_label(les tgv tgv3d sgs_op hit_mini gpu_tgv gpu_comp_les gpu_les_smag
+        gpu_hit_mini gpu_les_wall gpu_les_tally3d gpu_les_tgv_comp
+        gpu_channel_les)
+    dns_label(mrf rotor gpu_rotor_wall gpu_rotor_table gpu_mrf gpu_mrf_rotor2
+        gpu_mrf_conservation gpu_mrf_stabledt gpu_rotor_comoving_fixed_point
+        gpu_ghost_translate rotor_tip_guard)
+    dns_label(fast channel_config transport rans rans_channel1d steady_stop
+        blockband channel_line pseudo_time flow_rans_config gpu_channel
+        gpu_rans_mask gpu_rans_ogrid gpu_rans_mms gpu_axisym gpu_axisym3d gpu_nk
+        gpu_rans_immersed gpu_determinism gpu_rans_implicit tgv tgv3d sgs_op
+        gpu_tgv gpu_comp_les gpu_les_smag gpu_hit_mini gpu_les_wall
+        gpu_les_tally3d gpu_les_tgv_comp gpu_channel_les rotor gpu_rotor_wall
+        gpu_rotor_table gpu_mrf_conservation gpu_mrf_stabledt
+        gpu_rotor_comoving_fixed_point gpu_ghost_translate rotor_tip_guard)
 endif()

@@ -9,8 +9,10 @@
 #include "dns/scene.hpp"
 #include "dns/steady_stop.hpp"
 #include "dns/transport.hpp"
+#include "dns/units.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <format>
@@ -23,6 +25,11 @@ namespace dns {
 namespace {
 
 using std::numbers::pi;
+
+// The --dry-run tail of a --compensated time march: it changes the bits, so
+// the resolved case says so.
+constexpr const char* kCompensatedNote =
+    " [compensated state: FP32 hi + lo per field]";
 
 bool finitePos(double v) { return std::isfinite(v) && v > 0; }
 
@@ -324,6 +331,15 @@ std::optional<SgsModel> sgsModelFromName(std::string_view s)
     return fromName<SgsModel>(sgsModelNames(), s);
 }
 
+std::string lesRunLabel(SgsModel m, double cs, bool twoD)
+{
+    assert(cs > 0);
+    return std::format("LES {} {}={:g} (filtered: grid- and Cs-dependent){}",
+                       name(m), m == SgsModel::Sigma ? "Csigma" : "Cs", cs,
+                       twoD ? " (2D: qualitative only, no vortex stretching)"
+                            : "");
+}
+
 FarField defaultFar(Physics p)
 {
     return p == Physics::Compressible ? FarField::Nscbc : FarField::Tunnel;
@@ -480,6 +496,10 @@ std::expected<Case, ConfigError> validatePeriodic(const RawConfig& r, Case c)
         if (!(r.spin >= 0 && r.stats > 0))
             return bad(2, "--spin", "--spin >= 0 and --stats > 0 required");
         c.nu = r.given.contains("--nu") ? r.nu : 1.5e-5;
+        // The box is sized from nu (h = 1.5 eta): nu = 0 has no design.
+        if (!finitePos(c.nu))
+            return bad(2, "--nu", "hit sizes the box from nu (h = 1.5 eta): "
+                                  "must be finite and > 0");
     }
     if (c.emit.contains(Emit::Error) && nz != 1)
         return bad(2, "--emit", "--emit error compares against the 2D analytic "
@@ -572,6 +592,14 @@ std::optional<ConfigError> channelRans(const RawConfig& r, Case& c)
                                         "not time; frames/profiles are "
                                         "time-keyed");
     }
+    // --compensated: the explicit steady march's two-word state on a time
+    // march (on --steady it already is the state). The implicit march hands
+    // the kernels a plain state and writes its iterate as a plain-state edit.
+    c.compensated = r.compensated && c.steadyTol <= 0;
+    if (r.compensated && c.steadyScheme == SteadyScheme::Implicit)
+        return err(2, "--compensated", "with --steady-scheme implicit: the "
+                                       "Newton march keeps its own FP64 "
+                                       "iterate and a plain device state");
     if (!rans) return std::nullopt;
     if (std::size_t(c.grid.nx) * c.grid.nz > 4)
         c.warnings.emplace_back(
@@ -581,6 +609,34 @@ std::optional<ConfigError> channelRans(const RawConfig& r, Case& c)
         c.warnings.push_back(std::format(
             "wall-resolved RANS with first-cell y+ {:.3g} > 1",
             c.chanH1 * c.reTau));
+    return std::nullopt;
+}
+
+// The channel's LES knobs (docs/channel.md, "LES"): an SGS stress on the time
+// march. Runs BEFORE channelRans so --les with --rans / --steady is named as
+// the LES conflict. --les 0 / absent leaves the case untouched (cs 0, DNS).
+// Pre: the grid is resolved.
+std::optional<ConfigError> channelLes(const RawConfig& r, Case& c)
+{
+    c.cs = r.les;
+    if (!(std::isfinite(c.cs) && c.cs >= 0))
+        return err(2, "--les", "must be finite and >= 0 (0 = DNS)");
+    c.sgsModel = r.sgs;
+    if (r.given.contains("--sgs") && c.cs == 0)
+        return err(2, "--sgs", "selects the SGS model for --les; give --les CS "
+                               "(> 0) or drop --sgs");
+    c.lesLabel = c.cs > 0;
+    if (!c.lesLabel) return std::nullopt;
+    if (r.rans != int(RansModel::None))
+        return err(2, "--les", "a RANS field is an ensemble mean, an LES field "
+                               "a filtered one; give --rans or --les, not both");
+    if (r.steady > 0)
+        return err(2, "--les", "LES is time-accurate; --steady is the RANS "
+                               "pseudo-time solve");
+    if (c.sgsModel == SgsModel::Sigma && c.grid.nz == 1)
+        return err(2, "--sgs", "sigma: D_sigma is identically ZERO for any 2D "
+                               "flow (that is the model's design); at nz == 1 "
+                               "it is a silent no-op. Use nz > 1 or smag");
     return std::nullopt;
 }
 
@@ -604,7 +660,18 @@ std::expected<Case, ConfigError> validateChannel(const RawConfig& r, Case c)
     c.re = r.reTau;
     c.nu = 1.0 / r.reTau;
     c.mach = r.mach;
-    if (auto e = checkMach(c.mach); e) return std::unexpected(*e);
+    // The implicit steady RANS channel is the one place a supersonic bulk Mach
+    // is shock-free by construction: its iterate is ONE column broadcast
+    // (homogeneous IC, --kick rejected), so v = 0 at the fixed point and the
+    // flux never sees a shock (Coleman, Kim & Moser 1995 run M_b 1.5).
+    const bool supersonicOk = r.rans != 0 && r.steady > 0 &&
+                              SteadyScheme(r.steadyScheme) == SteadyScheme::Implicit;
+    if (supersonicOk)
+    {
+        if (!finitePos(c.mach)) return bad(2, "--mach", "must be finite and > 0");
+    }
+    else if (auto e = checkMach(c.mach); e)
+        return std::unexpected(*e);
     c.stretchBeta = r.stretch;
     if (!(std::isfinite(c.stretchBeta) && c.stretchBeta >= 0
           && c.stretchBeta <= 4))
@@ -645,6 +712,7 @@ std::expected<Case, ConfigError> validateChannel(const RawConfig& r, Case c)
     // --cfl has no channel-specific default: the parser's 0.4 stands.
     if (auto e = validateWallRun(r, c, r.cfl); e) return std::unexpected(*e);
     c.tEnd = r.tt;
+    if (auto e = channelLes(r, c); e) return std::unexpected(*e);
     if (auto e = channelRans(r, c); e) return std::unexpected(*e);
     // PNG is allowed at nz > 1 here: it renders the centre z-plane,
     // which for a channel is exactly the picture you want.
@@ -655,16 +723,19 @@ std::expected<Case, ConfigError> validateChannel(const RawConfig& r, Case c)
               .re = c.reTau,
               .mach = c.mach,
               .frameDt = c.fdt,
+              .cs = c.cs,
+              .les = c.lesLabel,
               .body = "channel",
               .farField = "periodic",
               .physics = "compressible",
               .kick = c.kick,
-              .sgs = "",
+              .sgs = c.lesLabel ? name(c.sgsModel) : "",
               .rans = c.rans == RansModel::None ? std::string()
                                                 : std::string(ransName(c.rans)),
               .steady = c.steadyScheme == SteadyScheme::Implicit
                             ? std::string(name(c.steadyScheme))
                             : std::string()};
+    if (c.compensated) c.meta.state = "compensated";
     c.meta.setGrid(c.grid);
     return c;
 }
@@ -1056,10 +1127,29 @@ std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
         if (!revolved && r.given.contains("--ogrid-wedge"))
             return err(2, "--ogrid-wedge", "is the revolved (--body sphere) "
                                            "O-grid's axisymmetric wedge angle");
-        if (!(revolved && nzI > 1) && r.given.contains("--ogrid-trip"))
-            return err(2, "--ogrid-trip", "seeds the odd azimuthal modes of "
-                                          "the full-revolution sphere O-grid "
-                                          "(--body sphere --nz N > 1) only");
+        // The O-grid start is uniform (or at rest) and never reads --kick;
+        // its trip is --ogrid-trip.
+        if (r.given.contains("--kick"))
+            return err(2, "--kick", "is the Cartesian box's wake trip; the "
+                                    "O-grid start never applies it -- use "
+                                    "--ogrid-trip A");
+        // The axisymmetric wedge has no odd modes to seed, and the planar
+        // vortex is not solenoidal in the meridional plane (v/r).
+        if (revolved && nzI <= 1 && r.given.contains("--ogrid-trip"))
+            return err(2, "--ogrid-trip", "seeds a solenoidal vortex behind "
+                                          "the body; the axisymmetric wedge "
+                                          "(--nz 1) has no mode it could "
+                                          "seed and no planar vortex is "
+                                          "solenoidal there");
+        if (!(std::isfinite(r.ogridTrip) && r.ogridTrip >= 0 &&
+              r.ogridTrip <= 0.5))
+            return err(2, "--ogrid-trip", "the trip amplitude, / U: must "
+                                          "be in [0, 0.5]");
+        // Default 0 (bit for bit the untripped start) except on the full
+        // revolution, whose pi-symmetry locks out the m = 1 mode.
+        c.ogridTrip = r.given.contains("--ogrid-trip") ? r.ogridTrip
+                      : revolved && nzI > 1            ? kOgridTripDefault
+                                                       : 0.0;
         if (!(revolved && nzI > 1) && r.given.contains("--init-from"))
             return err(2, "--init-from", "starts the full-revolution sphere "
                                          "O-grid (--body sphere --nz N > 1) "
@@ -1081,14 +1171,8 @@ std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
                                           ">= 4 (every cell has its partner "
                                           "across the axis, k + N/2); got {}",
                                           nzI));
-            if (!(std::isfinite(r.ogridTrip) && r.ogridTrip >= 0 &&
-                  r.ogridTrip <= 0.5))
-                return err(2, "--ogrid-trip", "the trip amplitude, / U: must "
-                                              "be in [0, 0.5]");
             c.ogridRevolved = true;
             c.ogridNphi = nzI;
-            c.ogridTrip = r.given.contains("--ogrid-trip") ? r.ogridTrip
-                                                           : kOgridTripDefault;
             if (r.given.contains("--init-from")) {
                 // The file is read by main (phase 3); here only its shape.
                 if (r.initFrom.empty() ||
@@ -1220,9 +1304,9 @@ std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
         c.placement = {cx, cy, cz, D};
     }
 
-    // (The revolved O-grid's resolution is its meridional --n >= 16, and its
-    // nominal radial hy measures nothing about D.)
-    if (!c.ogridRevolved && c.placement.D < 4 * c.h)
+    // (An O-grid's resolution is its angular --n >= 16, and its nominal
+    // radial hy measures nothing about D.)
+    if (!c.ogrid && c.placement.D < 4 * c.h)
         return err(2, "--dr", "body diameter is under 4 cells; refine --n or lower "
                               "--dr");
     // The fence is D/8 thick; below 32 cells of D the blocker itself is under
@@ -1337,6 +1421,16 @@ std::optional<ConfigError> flowLes(const RawConfig& r, Case& c)
         return err(2, "--sgs", "sigma: D_sigma is identically ZERO for any 2D "
                                "flow (that is the model's design); at nz == 1 "
                                "it is a silent no-op. Use nz > 1 or smag");
+    // The wall face itself takes the image of nu_t (molecular stress only);
+    // the first fluid cell does not, and |S| is the wall shear there.
+    if (c.cs > 0 && c.sgsModel == SgsModel::Smagorinsky &&
+        c.bodyKind != BodyKind::None && c.grid.nz > 1)
+        c.warnings.push_back(std::format(
+            "--les {:g} --sgs smag next to a wall: |S| does not vanish in "
+            "laminar shear, so the first fluid cell carries nu_t/nu ~ "
+            "Cs^2 Delta+^2 = {:.3g} Delta+^2 (no wall damping). --sgs sigma "
+            "vanishes in pure shear and is the wall-consistent choice",
+            c.cs, c.cs * c.cs));
     c.lesLabel = c.cs > 0;
     return std::nullopt;
 }
@@ -2125,7 +2219,9 @@ std::optional<ConfigError> flowStartup(const RawConfig& r, Case& c)
         return err(2, "--ramp", "the quiet start would re-ramp the developed "
                                 "field each --seq level / fight --steady; "
                                 "use an impulsive start there");
-    c.kick = r.kick;
+    // The O-grid never applies the kick (flowGrid rejects a given one): the
+    // case carries the value the run applies.
+    c.kick = c.ogrid ? 0.0 : r.kick;
     if (!(std::isfinite(c.ramp) && c.ramp >= 0)) return err(2, "--ramp", "must be >= 0");
     if (!std::isfinite(c.kick)) return err(2, "--kick", "must be finite");
     return std::nullopt;
@@ -2292,7 +2388,9 @@ std::optional<ConfigError> flowOutput(const RawConfig& r, Case& c)
               .body = c.bodyKind == BodyKind::Mesh    ? c.meshPath
                       : c.bodyKind == BodyKind::Scene ? "scene:" + c.scenePath
                                                       : name(c.bodyKind),
-              .farField = name(c.far),
+              // The O-grid's far field is its own characteristic outer row;
+              // c.far is the unused Cartesian default there.
+              .farField = c.ogrid ? std::string("ogrid") : name(c.far),
               .physics = name(c.physics),
               .kick = comp ? c.kick : 0.0,
               .sgs = c.lesLabel ? name(c.sgsModel) : "",
@@ -2357,9 +2455,15 @@ std::optional<ConfigError> flowRans(const RawConfig& r, Case& c)
                              "sst-2003m|sst-vm");
         e && !sst)
         return e;
-    if (c.emit.contains(Emit::Surface) && !c.ogrid)
-        return err(2, "--emit", "surface is the body-fitted wall tally, per "
-                                "mesh face; it needs --ogrid");
+    if (c.emit.contains(Emit::Surface) && !c.ogrid && !comp)
+        return err(2, "--emit", "surface is the per-face wall tally of the "
+                                "body-fitted O-grid (--ogrid) or of the "
+                                "compressible immersed ghost wall; the "
+                                "incompressible cut-cell wall has none -- add "
+                                "--physics compressible");
+    if (c.emit.contains(Emit::Surface) && c.bodyKind == BodyKind::None)
+        return err(2, "--emit", "surface tallies the body's wall faces; "
+                                "--body none has none");
     if (c.emit.contains(Emit::Mesh) && !c.ogrid)
         return err(2, "--emit", "mesh exports the body-fitted O-grid; it "
                                 "needs --ogrid");
@@ -2467,6 +2571,28 @@ std::optional<ConfigError> flowRans(const RawConfig& r, Case& c)
             // localDt every 16 iterations unless asked (the O-grid default).
             c.dtRecompute = 16;
         }
+    }
+    // --compensated: the explicit steady march's two-word state on a time
+    // march (on an explicit --steady it already is the state). Every state
+    // overwriter keeps the low words except the two plain-state edits named
+    // below; the moving-rotor ghost swap is covered because the ghost pass
+    // zeroes its cells' low words every stage.
+    if (r.compensated)
+    {
+        if (!comp)
+            return err(2, "--compensated", "is the compressible state's low "
+                                           "word; the incompressible solver "
+                                           "has no such state");
+        if (c.compSteady && c.steadyScheme == SteadyScheme::Implicit)
+            return err(2, "--compensated", "with --steady-scheme implicit: the "
+                                           "Newton march keeps its own FP64 "
+                                           "iterate and a plain device state");
+        if (c.penalize > 0)
+            return err(2, "--compensated", "with --penalize: the Brinkman band "
+                                           "is a plain-state edit with no "
+                                           "low-word form");
+        c.compensated = !c.compSteady;
+        if (c.compensated) c.meta.state = "compensated";
     }
 
     // Freestream turbulence, in freestream units (decision 4).
@@ -2770,6 +2896,39 @@ std::string describeProp(const prop::Case& p)
     return s;
 }
 
+// dns hit: the SI design (h = 1.5 eta) and its box-unit run, as runHit
+// derives them. Pre: c validated by validatePeriodic for Subcommand::Hit.
+std::string describeHit(const Case& c)
+{
+    const auto d = HitDesign::make(c.grid.nx, c.nu, c.urms);
+    std::string emits;
+    for (const auto& [k, n] : {std::pair{Emit::Stats, "stats"},
+                               {Emit::Spectrum, "spectrum"},
+                               {Emit::Snapshot, "snapshot"},
+                               {Emit::Slices, "slices"}})
+        if (c.emit.contains(k)) emits += emits.empty() ? n : std::string(",") + n;
+    return std::format(
+        "case:\n"
+        "  mode       forced homogeneous isotropic turbulence (incompressible, "
+        "periodic box,\n"
+        "             linear forcing at fixed eps, Carroll-Blanquart)\n"
+        "  grid       {} x {} x {}  h={:.6g}  L=2 pi (box units)\n"
+        "  SI design  u'={:.6g} m/s  nu={:.6g} m^2/s  L={:.4e} m  eps={:.4e} "
+        "W/kg\n"
+        "             eta={:.4e} m (h = 1.5 eta)  T_e={:.4e} s  "
+        "Re_lambda={:.1f} (design)\n"
+        "  box units  u'=1  nu={:.6e}  eps_f={:.6e}  T_e={:.4f}\n"
+        "  run        spin {:g} T_e + stats {:g} T_e (tEnd={:.6g} box)  "
+        "seed={}\n"
+        "  label      DNS\n"
+        "  emit       {}\n"
+        "  out        {}\n",
+        c.grid.nx, c.grid.ny, c.grid.nz, c.grid.hx, c.urms, c.nu, d.lBoxSI,
+        d.epsSI, d.etaSI, d.tEddySI, d.reLambda, d.nuBox(), d.epsBox(),
+        d.tEddyBox(), c.spin, c.stats, (c.spin + c.stats) * d.tEddyBox(),
+        c.seed, emits.empty() ? std::string("none") : emits, c.outPrefix);
+}
+
 } // namespace
 
 std::expected<Case, ConfigError> validate(const RawConfig& r)
@@ -2797,8 +2956,8 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
                                "or control characters (it is embedded in JSON)");
 
     if (c.emit.contains(Emit::Surface) && r.sub != Subcommand::Flow)
-        return bad(2, "--emit", "surface is the body-fitted wall tally of dns "
-                                "flow --ogrid");
+        return bad(2, "--emit", "surface is the per-face wall tally of a dns "
+                                "flow body");
     if (c.emit.contains(Emit::Mesh) && r.sub != Subcommand::Flow)
         return bad(2, "--emit", "mesh exports the body-fitted O-grid of dns "
                                 "flow --ogrid");
@@ -2845,6 +3004,9 @@ std::string flowRunLabel(const Case& c)
             c.ogridInitFrom.empty() ? std::string()
                                     : ", started from the wedge " +
                                           c.ogridInitFrom);
+    // A tripped cylinder O-grid starts off the symmetric state: never silent.
+    if (c.ogrid && !c.ogridRevolved && c.ogridTrip > 0)
+        geo = std::format(" [O-grid trip {:g} U]", c.ogridTrip);
     if (rans || c.compSteady)
     {
         const RansMode mode =
@@ -2859,7 +3021,7 @@ std::string flowRunLabel(const Case& c)
         return l;
     }
     if (wedge) return "DNS" + geo + std::string(kAxisymUnsteady);
-    if (full) return "DNS" + geo;
+    if (!geo.empty()) return "DNS" + geo;
     return {};
 }
 
@@ -2875,6 +3037,7 @@ double hFine(const Case& c)
 std::string Case::describe() const
 {
     if (sub == Subcommand::Prop) return describeProp(prop);
+    if (sub == Subcommand::Hit) return describeHit(*this);
     // Shared by both conv branches.
     const std::string patchLabel =
         hotPatch >= 1.0
@@ -2981,28 +3144,39 @@ std::string Case::describe() const
                                                "-> 1e8, total mass pinned)"
                                              : "")
                 : std::format("tt={:.6g} eddy turnovers (tEnd={:.6g})  "
-                              "kick={:.3g}  profile-dt={:.3g}",
-                              ft, tEnd, kick, profileDt);
+                              "kick={:.3g}  profile-dt={:.3g}{}",
+                              ft, tEnd, kick, profileDt,
+                              compensated ? kCompensatedNote : "");
         const RansMode mode = steadyTol <= 0   ? RansMode::Urans
                               : implicitSteady ? RansMode::SteadyImplicitLine
                                                : RansMode::SteadyExplicit;
         const std::string label =
-            !ransOn ? std::string("DNS") +
-                          (grid.nz == 1
-                               ? " (2D: qualitative only, no vortex stretching)"
-                               : "")
-                    : ransRunLabel(rans, mode);
+            ransOn     ? ransRunLabel(rans, mode)
+            : lesLabel ? lesRunLabel(sgsModel, cs, grid.nz == 1)
+                       : std::string("DNS") +
+                             (grid.nz == 1
+                                  ? " (2D: qualitative only, no vortex "
+                                    "stretching)"
+                                  : "");
         const std::string wallScalars =
             ransSst(rans) ? "k_wall = 0 (antimirrored ghost), omega_wall = 60 "
                             "nu/(beta1 d1^2) (TMR; Dirichlet image),\n"
                             "             "
                           : "nu~_wall = 0 (antimirrored ghost), ";
         const std::string turb =
-            !ransOn ? std::string()
-                    : std::format("  turbulence {}mu_t = 0 on the wall face, "
-                                  "Pr_t = {:.3g}, wall-resolved (y+_1 = {:.3g} "
-                                  "est.)\n",
-                                  wallScalars, kPrandtlTurb, chanH1 * reTau);
+            ransOn ? std::format("  turbulence {}mu_t = 0 on the wall face, "
+                                 "Pr_t = {:.3g}, wall-resolved (y+_1 = {:.3g} "
+                                 "est.)\n",
+                                 wallScalars, kPrandtlTurb, chanH1 * reTau)
+            : lesLabel
+                ? std::format("  sgs        mu_t = rho (C Delta)^2 op(grad u), "
+                              "Delta = vol^(1/3) per cell (2D: area^(1/2));\n"
+                              "             odd image on both ghost rows: "
+                              "mu_t = 0 on the wall face{}\n",
+                              sgsModel == SgsModel::Smagorinsky
+                                  ? "; smag: no wall damping"
+                                  : "")
+                : std::string();
         return std::format(
             "case:\n"
             "  mode       compressible turbulent channel (periodic x/z, "
@@ -3064,6 +3238,7 @@ std::string Case::describe() const
         compSteady      ? "steady pseudo-time (stop on the integrals, "
                           "--steady-steps cap)"
         : steadyTol > 0 ? "stationary (stop at steady residual, tEnd = give-up cap)"
+        : compensated   ? std::string("time-march to tEnd") + kCompensatedNote
                         : "time-march to tEnd",
         outPrefix);
     // Derived outflow coefficient: printed only when asked for, so a default
@@ -3109,6 +3284,11 @@ std::string Case::describe() const
             grid.nx, grid.ny, grid.nz, ogridRFar,
             placement.D > 0 ? ogridRFar / placement.D : 0.0, ogridBeta,
             ogridSpan, ogridH1, ogridBeta);
+        if (ogridTrip > 0)
+            s += std::format("             trip {:g} U (solenoidal vortex, 1 D "
+                             "behind the body, D/4 off the axis{})\n",
+                             ogridTrip,
+                             grid.nz > 1 ? ", centred in the span" : "");
     }
     if (ogridRevolved && ogridNphi > 0)
     {
@@ -3166,14 +3346,16 @@ std::string Case::describe() const
                              ransInflowText(*this), kPrandtlTurb);
             if (!ogrid)
                 s += ransSst(rans)
-                         ? "  wall       immersed ghost wall, the velocity's "
-                           "linear image: k_g = -a k_s, omega_g = (1+a)\n"
+                         ? "  wall       immersed ghost wall: k_g = a^2 k_s "
+                           "(even, quadratic), omega_g = (1+a)\n"
                            "             omega_w - a omega_s, omega_w = 60 "
-                           "nu/(beta1 d_s^2) (an UNVERIFIED sub-cell choice), "
-                           "mu_t_g = -a mu_t_s\n"
+                           "nu/(beta1 d_s^2) (an UNVERIFIED sub-cell choice),\n"
+                           "             mu_t_g = -min(a mu_t_s, fluid face "
+                           "neighbours' mu_t) (no face below mu)\n"
                          : "  wall       immersed ghost wall, the velocity's "
-                           "linear image: nu~_g = -a nu~_s, mu_t_g = -a "
-                           "mu_t_s\n";
+                           "linear image: nu~_g = -a nu~_s,\n"
+                           "             mu_t_g = -min(a mu_t_s, fluid face "
+                           "neighbours' mu_t) (no face below mu)\n";
             else
                 s += ransSst(rans)
                          ? "  wall       k_wall = 0 (antimirrored ghost), "

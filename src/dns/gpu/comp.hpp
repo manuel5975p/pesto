@@ -168,6 +168,21 @@ struct StageCombine
     }
 };
 
+// A contiguous run [first, end) of flattened cells (gidx order).
+struct CellRange
+{
+    std::size_t first = 0, end = 0;
+    std::size_t size() const { return end - first; }
+};
+
+// Whether DeviceComp::step may skip its entry call of the stage hook
+// (setStageHook).
+enum class Idempotent : bool
+{
+    no,
+    yes
+};
+
 // The wall/far images of mu_t (and F1 for SST, null for SA) a mesh family
 // writes after mu_t is formed on every cell and before any flux reads it.
 // Eddy-viscosity agnostic: an LES/DES wall image can reuse the slot.
@@ -249,7 +264,9 @@ public:
     // eddy conductivity mu_t cp / Pr_t. op is |S| (Smagorinsky, default) or
     // D_sigma (SgsModel::Sigma; dns/sgs.hpp). csLes == 0 is molecular DNS,
     // bit-for-bit unchanged. Delta^2 = (hx hy hz)^(2/3) in 3D, hx hy when
-    // nz == 1 (the |S| z-shear terms cancel by periodic wrap).
+    // nz == 1 (the |S| z-shear terms cancel by periodic wrap). mu_t is formed
+    // on every cell, ghosts included; a runner with walls installs their image
+    // with setMutHook (no hook = the raw ghost values).
     static std::expected<DeviceComp, hipError_t>
     make(const Grid& g, const Transport& tr, double csLes = 0.0,
          SgsModel sgs = SgsModel::Smagorinsky);
@@ -295,8 +312,10 @@ public:
 
     // Largest stable dt (acoustic CFL + viscous limit), FP64 reduction. With
     // RANS on, the diffusive bound is per cell and carries mu_t (RANS-only
-    // branch); RANS off is the DNS/LES bound byte for byte.
-    double stableDt(const DeviceCompState& s, ReduceScratch& r, double cfl = 0.4) const;
+    // branch); RANS off is the DNS/LES bound byte for byte. LES: the SGS part
+    // is the max of the solver's own mu_t of s (updateSgsNut), so mut() and
+    // the primitives then hold s's -- not const for that reason.
+    double stableDt(const DeviceCompState& s, ReduceScratch& r, double cfl = 0.4);
 
     // --- RANS (dns/rans.hpp, gpu/rans.hpp; docs/rans.md) ---------------------
     // Install the closure: allocates the scalar stage buffers, mu_t, d and
@@ -313,10 +332,19 @@ public:
     bool rans() const { return ransModel_ != RansModel::None; }
     RansModel ransModel() const { return ransModel_; }
     int nTurb() const { return ransScalars(ransModel_); }
-    // Per-cell mu_t of the last stage or updateMut (LES: the SGS mu_t).
+    // Per-cell mu_t of the last stage, updateMut, updateSgsNut or LES
+    // stableDt (LES: the SGS mu_t), image rows included.
     const DeviceScalar& mut() const { return nut_; }
     // mu_t of s into mut() (primitives refreshed). Pre: rans().
     void updateMut(const DeviceCompState& s);
+    // The LES twin of updateMut: the SGS mu_t of s into mut() (primitives
+    // refreshed), image rows included. Pre: les().
+    void updateSgsNut(const DeviceCompState& s);
+    // Install the wall/far image of mu_t (LES or RANS): runs after mu_t is
+    // formed on every cell and before any flux reads it, so a wall face can
+    // carry the molecular stress only. Null = no image rows. Both closures put
+    // mu_t (rho nu_t) in the one slot, and the hooks are odd/even maps anyway.
+    void setMutHook(MutHook h) { mutHook_ = std::move(h); }
     // Pure rhs of every equation at s (hooks included, scalar kernel in
     // explicit mode) into scratch, then FP64 RMS per equation over the
     // installed fluid mask. Not state differencing. Pre: enableRans or
@@ -328,8 +356,9 @@ public:
     ResidualNorms residual(const DeviceCompState& s, int jLo, int jHi,
                            ReduceScratch& r);
     // The pure rhs of every equation at s into `out` (the stage's residual
-    // mode; ghost cells meaningless). Pre: as residual(), &out != &s, out
-    // sized like s with out.nT == nTurb() (low words never written).
+    // mode; ghost cells meaningless), on either mesh. Pre: s stage-hook
+    // consistent, &out != &s, out sized like s with out.nT == nTurb() (low
+    // words never written).
     void residualInto(const DeviceCompState& s, DeviceCompState& out);
     // The pure rhs the last residual() wrote, every equation and cell; ghost
     // rows meaningless. Valid until the next step() or residual().
@@ -402,7 +431,25 @@ public:
 
     // Called on every RK stage input before its rhs (boundary conditions and
     // embedded-boundary fill); the hook may mutate the state in place.
-    void setStageHook(std::function<void(DeviceCompState&)> h) { hook_ = std::move(h); }
+    // Idempotent::yes skips the call on step()'s INPUT, which is then the
+    // caller's job: legal only when (a) the hooked state depends on no cell
+    // the hook writes, so hook(hook(s)) == hook(s) bit for bit -- never an
+    // in-place relaxation such as comp_far's sponge -- and (b) every state the
+    // caller passes to step() already went through the hook, untouched since.
+    void setStageHook(std::function<void(DeviceCompState&)> h,
+                      Idempotent idem = Idempotent::no)
+    {
+        hook_ = std::move(h);
+        hookAtEntry_ = idem == Idempotent::no;
+    }
+
+    // Curvilinear only: the stage kernels (mean flow and RANS scalars) write
+    // cells [r.first, r.end) only -- the wedge's real plane. Primitives, mu_t,
+    // the hooks, localDt and stableDt stay whole-grid. Pre: curvilinear(),
+    // r.first < r.end <= g.size(), and the stage hook rewrites every field and
+    // low word of every cell outside before anything reads it (the stage
+    // output there is never formed). Default: the whole grid.
+    void setStageRange(CellRange r);
 
     // Called after the periodic rhs of every RK stage with the stage state s,
     // the stage OUTPUT state out, and the combination the interior cells were
@@ -428,9 +475,14 @@ private:
     // cr = 1 already).
     void stage(const DeviceCompState& s, const StageCombine& cmb,
                DeviceCompState& out, bool residualMode = false);
-    // mu_t from the live primitives of s into nut_, then the mesh family's
-    // image rows (mutHook_). Pre: rans(), primitives(s) current.
-    void ransMut(const DeviceCompState& s);
+    // The primitives of s, then mu_t from them into nut_, then the mesh
+    // family's image rows (mutHook_); also the scalar stage's per-cell cache
+    // of s. SA fuses the two pointwise kernels into one launch (same bits).
+    // Pre: rans().
+    void primitivesAndMut(const DeviceCompState& s);
+    // The SGS mu_t of s into nut_ on either mesh, then mutHook_. Pre: les(),
+    // primitives(s) current.
+    void sgsNut(const DeviceCompState& s);
     // The per-cell RANS diffusive dt functor over s. Pre: rans().
     rans::RansDiffDt ransDiffDt(const DeviceCompState& s) const;
     // (Re)allocate both stage buffers for nT scalars, low words iff
@@ -462,13 +514,18 @@ private:
     DeviceScalar mrfPsi_, mrfPc_[3];
     DeviceScalar u_, v_, w_, e_, p_, T_;
     DeviceScalar nut_;      // per-cell dynamic eddy viscosity (LES or RANS)
-    // RANS (enableRans): model, wall distance, the mu_t image hook, the lts
-    // ratios and the FP64 per-cell dt scratch localDt reduces.
+    MutHook mutHook_; // the mu_t image rows (setMutHook; LES or RANS)
+    // RANS (enableRans): model, wall distance, the lts ratios and the FP64
+    // per-cell dt scratch localDt reduces.
     RansModel ransModel_ = RansModel::None;
     bool ransTransport_ = false;
-    MutHook mutHook_;
     const Real* testSrc_[2] = {nullptr, nullptr};
     DeviceScalar wd_, lts_, f1_;
+    // rans::RansCellCache storage: specific scalars (phi1 SST only) and SST's
+    // rate / grad k . grad omega, written by primitivesAndMut, read by the
+    // scalar stage. cacheOf_: the t0 they were computed from (stage's assert).
+    DeviceScalar ransPhi_[2], ransRate_, ransGkw_;
+    const Real* cacheOf_ = nullptr;
     DeviceBuffer<double> dtc_;
     // Residual / guard mask (1 = counted); empty = every cell. maskCount_ is
     // the number of counted cells, the residual's RMS denominator.
@@ -480,6 +537,8 @@ private:
     bool ltsOn_ = false;
     bool compensated_ = false;
     std::function<void(DeviceCompState&)> hook_;
+    bool hookAtEntry_ = true; // setStageHook's Idempotent::no
+    CellRange stageRange_{};  // setStageRange; the whole grid by default
     std::function<void(const DeviceCompState&, DeviceCompState&,
                        const StageCombine&)> rhsHook_;
 };

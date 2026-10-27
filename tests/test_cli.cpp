@@ -5,6 +5,7 @@
 #include "check.hpp"
 #include "cli_test_util.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -186,6 +187,19 @@ int main()
     rejects("flow --body cylinder --pitch 10");        // mesh-only flag
     rejects("tgv --emit error --n 64");                // needs --nz 1
     rejects("hit --n 64 --nz 2");
+    rejects("hit --n 64 --nu 0");                       // no h = 1.5 eta design
+    {
+        // dns hit --dry-run describes the HIT design, not a flow Case.
+        auto h = runCli(split("hit --n 64 --urms 60 --spin 2 --stats 3 --out h"));
+        const std::string d = h ? h->describe() : std::string();
+        check(d.find("forced homogeneous isotropic turbulence") !=
+                      std::string::npos &&
+                  d.find("eta=") != std::string::npos &&
+                  d.find("spin 2 T_e + stats 3 T_e") != std::string::npos &&
+                  d.find("body") == std::string::npos &&
+                  d.find("far field") == std::string::npos,
+              "hit describe: the HIT design and run, no flow body/far field");
+    }
     rejects("flow --body cylinder --cfl 0");
     rejects("flow --body cylinder --tol 0");
     rejects("nonsense --n 4");
@@ -396,6 +410,32 @@ int main()
                       hi->warnings.front().starts_with(
                           "o-grid far row is unmeasured above Re 800"),
                   "o-grid Re 801 carries the unmeasured-far-row warning");
+    }
+
+    // W1: smag next to a wall in 3D warns (never rejects) and names sigma;
+    // sigma, 2D and a body-free box do not.
+    {
+        auto smagWarns = [](const std::string& a) {
+            auto c = runCli(split(a));
+            if (!c) return -1;
+            return int(std::ranges::count_if(c->warnings, [](const auto& w) {
+                return w.find("--sgs smag next to a wall") != std::string::npos
+                       && w.find("--sgs sigma") != std::string::npos;
+            }));
+        };
+        check(smagWarns("flow --physics compressible --ogrid --body cylinder "
+                        "--nz 16 --les 0.17") == 1,
+              "3D o-grid smag LES warns about the wall");
+        check(smagWarns("flow --body sphere --n 64 --nz 64 --les 0.17") == 1,
+              "3D incompressible smag LES with a body warns");
+        check(smagWarns("flow --physics compressible --ogrid --body cylinder "
+                        "--nz 16 --les 1.35 --sgs sigma") == 0,
+              "sigma LES does not warn");
+        check(smagWarns("flow --body cylinder --nz 1 --les 0.17") == 0,
+              "2D smag LES does not carry the 3D wall warning");
+        check(smagWarns("flow --physics compressible --body none --n 128 "
+                        "--nz 64 --les 0.17") == 0,
+              "body-free smag LES does not warn");
     }
 
     if (dnstest::gFailures == 0) std::printf("cli: ok\n");

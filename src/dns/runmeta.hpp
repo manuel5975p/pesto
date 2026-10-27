@@ -46,6 +46,8 @@ struct RunMeta
     // describe's freestream turbulence string, the wedge angle in degrees.
     std::string ransMode{}, ransInflow{};
     double wedgeDeg = 0;
+    // "compensated" on a --compensated time march, "" (key absent) otherwise.
+    std::string state{};
 
     // The six grid fields from the grid the artefacts are written on.
     void setGrid(const Grid& g)

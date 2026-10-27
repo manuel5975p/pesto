@@ -100,6 +100,17 @@ template <class T> DNS_HD T saDiffCoef(T nu, T nut)
     return nu + nut * saFn(nut / nu);
 }
 
+// The nu~ diffusivity an explicit dt bound must cover: max(nu, saDiffCoef),
+// which exceeds nu for chi > 0 and again for chi < -cn1^(1/3) ~ -2.52 (fn < 0
+// there). chi >= 0 is the historical nu + max(nu~, 0) verbatim, and chi in
+// [-2.52, 0) returns nu exactly. Pre: nu > 0.
+template <class T> DNS_HD T saDtDiffusivity(T nu, T nut)
+{
+    const T K = nut < T(0) ? saDiffCoef(nu, nut)
+                           : nu + (nut > T(0) ? nut : T(0));
+    return K > nu ? K : nu;
+}
+
 // The modified vorticity S~ with TMR note 1(c)'s limiter (c2 = 0.7, c3 =
 // 0.9): continuous at Sbar = -c2 Omega and > 0 whenever Omega > 0.
 // Pre: Omega >= 0.

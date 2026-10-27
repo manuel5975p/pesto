@@ -11,10 +11,26 @@
 
 namespace dns::gpu::rans {
 
-// nut[c] = saMut(rho, nu~, nu(T)) on every cell, from the live primitives and
-// the conserved t0 = rho nu~.
-void mutCurv(const GpuGrid& g, ViscView vv, const Real* rho, const Real* T,
-             const Real* t0, Real* nut);
+// Per-cell values the mu_t kernel computes anyway and the scalar stage reads
+// back instead of recomputing per face and neighbour (docs/rans.md, "Stage
+// cell cache"). The SAME expressions, so the stage is bit-identical:
+// phi[e] = t_e / rho (phi[1] SST only), and SST's rate R and grad k . grad
+// omega of sstCellGrads. Valid only for the state the mu_t kernel last read.
+struct RansCellCache
+{
+    Real* phi[2] = {nullptr, nullptr};
+    Real *rate = nullptr, *gkw = nullptr; // SST only
+};
+
+// The primitives u..T of the conserved rho..E (kPrim's expression), then
+// nut[c] = saMut(rho, nu~, nu(T)) and phi0[c] = nu~ from them and t0 = rho
+// nu~, on every cell in ONE pointwise launch (each cell reads only its own
+// primitives, so it is bit for bit the two passes in sequence).
+void primMutCurv(const GpuGrid& g, ViscView vv, Real gamma, Real Rgas,
+                 const Real* rho, const Real* mx, const Real* my,
+                 const Real* mz, const Real* E, const Real* t0, Real* u,
+                 Real* v, Real* w, Real* e, Real* p, Real* T, Real* nut,
+                 Real* phi0);
 
 // nut[ghost] = -nut[src] on the y ghost rows named: the wall face average is
 // then exactly 0.0, so the wall tally and the u_tau fit stay the full wall
@@ -24,10 +40,11 @@ void mutMirrorY(const GpuGrid& g, bool lo, bool hi, Real* nut, Real* f1);
 
 // SST: per cell mu_t = sstMut(...) and F1 into nut / f1, from the live
 // primitives, t0 = rho k, t1 = rho omega and the cell-centre gradients
-// (grad k . grad omega for CDkw, S or Omega for mu_t). Every cell.
+// (grad k . grad omega for CDkw, S or Omega for mu_t), and the whole cache.
+// Every cell. Pre: every cache pointer nonnull.
 void sstMutCurv(const GpuGrid& g, ViscView vv, PrimView q, CurvView m,
                 RansModel model, const Real* t0, const Real* t1,
-                const Real* d, Real* nut, Real* f1);
+                const Real* d, Real* nut, Real* f1, const RansCellCache& cache);
 
 // The SST scalar stage (both scalars): upwind convection on the mean mass
 // flux, face diffusion (mu + sigma(F1_f) mu_t,f) grad . S with face-averaged
@@ -45,22 +62,26 @@ struct SstStageArgs
     unsigned long long* hits;
     // TEST ONLY: added to R_k / R_omega before the quotient; null = none.
     const Real *src0, *src1;
+    RansCellCache cache; // sstMutCurv's, of the same t0 / t1 / primitives
 };
-// sb: the open domain faces (ScalarBoundary; none = the kernel verbatim).
+// cells: the cells written (DeviceComp::setStageRange). sb: the open domain
+// faces (ScalarBoundary; none = the kernel verbatim).
 void sstStageCurv(const GpuGrid& g, ViscView vv, PrimView q, CurvView m,
                   MrfView mz, const StageCombine& cmb, const SstStageArgs& a,
-                  bool residual, Real* out0, Real* out1,
+                  bool residual, Real* out0, Real* out1, CellRange cells,
                   const ScalarBoundary& sb = {});
 
 // The SA-neg scalar stage: first-order upwind convection on the mean mass
 // flux, face diffusion with face coefficients, pointwise sources and the
 // cb2 / grad rho cell terms, combined point-implicitly through cmb (or the
-// pure rhs when residual). Writes out0 on every cell. src (TEST ONLY, may be
-// null) is added to R before the quotient.
+// pure rhs when residual). Writes out0 on the cells of `cells`. src (TEST
+// ONLY, may be null) is added to R before the quotient. phi0: primMutCurv's
+// nu~ of this t0.
 void saStageCurv(const GpuGrid& g, ViscView vv, PrimView q, CurvView m,
                  MrfView mz, const StageCombine& cmb, const Real* t0,
-                 const Real* d, bool residual, bool transportOnly,
-                 const Real* src, Real* out0, const ScalarBoundary& sb = {});
+                 const Real* phi0, const Real* d, bool residual,
+                 bool transportOnly, const Real* src, Real* out0,
+                 CellRange cells, const ScalarBoundary& sb = {});
 
 // After the mean flow's boundary rhs hook (NSCBC) on the immersed path: the
 // scalars of every open-face cell are re-carried by the density the mean flow
@@ -76,7 +97,7 @@ void openScalarConsistency(const GpuGrid& g, const ScalarBoundary& sb,
 // conserved state (pointwise -- no gradient):
 //   dt_c = 0.25 / (D_c amax_c^2),  amax_c = max_a aov_a[c],
 //   D_c = max((mu + mu_t)/rho, gamma (mu/Pr + mu_t/Pr_t)/rho,
-//             SA: (nu + max(nu~, 0))/sigma).
+//             SA: max(nu, nu + nu~ fn(nu~/nu))/sigma).
 // SA's mu_t is saMut; SST's needs F2 (a stencil), so its upper bound rho k /
 // omega stands in (mu_t = rho a1 k / max(a1 omega, R F2) <= rho k / omega),
 // and sigma_k, sigma_w <= 1 leave the k/omega diffusivities under (mu+mu_t)/rho.
@@ -103,7 +124,7 @@ struct RansDiffDt
         const double th = tr.gamma * (mu / tr.Pr + mut / prt) / r;
         if (th > D) D = th;
         if (!t1) {
-            const double sa = (nu + (s0 > 0.0 ? s0 : 0.0)) / sa::sigma;
+            const double sa = saDtDiffusivity(nu, s0) / sa::sigma;
             if (sa > D) D = sa;
         }
         if (!(D > 0.0)) return isfinite(D) ? HUGE_VAL : 0.0; // inviscid | NaN

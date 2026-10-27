@@ -430,6 +430,7 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
     rr.steadySteps = c.steadySteps;
     rr.steadyImplicit =
         c.compSteady && c.steadyScheme == SteadyScheme::Implicit;
+    rr.compensated = c.compensated;
     rr.label = flowRunLabel(c);
     if (rans || c.compSteady || c.emit.contains(Emit::Surface) ||
         c.emit.contains(Emit::Mesh))
@@ -463,10 +464,10 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
     }
     for (int i = 0; i < ransScalars(c.rans); ++i)
         rr.icTurb[i].assign(g.size(), rhoInf * c.ransPhiInf[i]);
-    // The full revolution's primitives: the wedge start or the uniform
-    // state above, so the trip below adds to whichever it is.
+    // The primitives the trip below adds to: the full revolution's wedge
+    // start, or the uniform state above.
     std::vector<double> pr, pu, pv, pw, pp;
-    if (c.ogridNphi > 0)
+    if (c.ogridNphi > 0 || c.ogridTrip > 0)
     {
         if (wedgeStart)
         {
@@ -498,14 +499,17 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
             pp.assign(g.size(), pInf);
         }
     }
-    // --ogrid-trip (full revolution only): a solenoidal Gaussian vortex, axis
-    // along z, at (cx + D, cy + D/4, cz), width w = D/4, strength A U --
-    // u += 2 (y - y0)/w e, v -= 2 (x - x0)/w e, e = A U exp(-|x - x0|^2/w^2):
-    // divergence-free (w == 0, and e's z factor multiplies both), so
-    // acoustically silent. It breaks the exact pi-rotation symmetry about the
-    // axis that otherwise locks out the odd azimuthal modes. On the uniform
-    // start it is bit for bit the aeb53b9 trip (adding v = w = 0 is exact).
-    if (c.ogridNphi > 0 && c.ogridTrip > 0)
+    // --ogrid-trip (every O-grid but the wedge, which config rejects): a
+    // solenoidal Gaussian vortex, axis along z, at (cx + D, cy + D/4, cz),
+    // width w = D/4, strength A U -- u += 2 (y - y0)/w e,
+    // v -= 2 (x - x0)/w e, e = A U exp(-|x - x0|^2/w^2): divergence-free
+    // (w == 0, and e's z factor multiplies both), so acoustically silent. On
+    // the full revolution it breaks the exact pi-rotation symmetry about the
+    // axis that otherwise locks out the odd azimuthal modes; on the cylinder
+    // the up-down symmetry that delays shedding. cz is the span's centre, and
+    // the 2D cell centre sits on it. On the uniform start it is bit for bit
+    // the aeb53b9 trip (adding v = w = 0 is exact).
+    if (c.ogridTrip > 0)
     {
         const double A = c.ogridTrip * c.uInf, w = 0.25 * geo.D;
         const double x0 = c.placement.cx + geo.D,
@@ -656,6 +660,7 @@ int runFlowCompressible(const Case& c, CaseGeometry& geo)
     rr.rotor = c.rotor;
     rr.rotorMrf = c.rotorMrf;
     rr.hFine = hFine(c);
+    rr.compensated = c.compensated;
     // RANS on the immersed ghost wall (docs/rans.md, "Immersed-wall RANS"):
     // d = |sdf| at the physical centres, the freestream scalars, the label.
     if (c.rans != RansModel::None)
@@ -817,6 +822,9 @@ int runChannel(const Case& c)
     rr.steadyTol = c.steadyTol;
     rr.steadySteps = c.steadySteps;
     rr.implicitSteady = c.steadyScheme == SteadyScheme::Implicit;
+    rr.compensated = c.compensated;
+    rr.les = c.cs;
+    rr.sgs = c.sgsModel;
     rr.wallDist = std::move(wallDist);
     rr.icTurb = std::move(icTurb);
 
