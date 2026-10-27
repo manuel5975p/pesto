@@ -387,6 +387,26 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                         "neighbours (no usable wall-normal sample: overlapping "
                         "mesh shells, or a body thin or concave at the grid "
                         "scale)\n", fb);
+        // Two-sided faces: a section under ~2 cells thick, whose ghosts the
+        // fluid reads from both surfaces (CompGhostTables::sideFace).
+        int ns = ghost->nSide(), sk = ghost->nSideSkipped();
+        if (rotorTable)
+            for (const auto& t : rotorTable->bins) {
+                ns = std::max(ns, t.nSide());
+                sk = std::max(sk, t.sideSkipped);
+            }
+        if (ns > 0)
+            std::printf("ghost wall: %d two-sided interface faces imaged from "
+                        "the fluid cell's own surface (a section under ~2 "
+                        "cells thick)\n", ns);
+        if (sk > 0)
+            std::printf("ghost wall: WARNING %d two-sided faces left on the "
+                        "other surface's image (no usable sample on their "
+                        "side): the flux there reads the far surface\n", sk);
+        if (ns > 0 && rans)
+            std::printf("ghost wall: WARNING the turbulence scalars' fluxes "
+                        "at the %d two-sided faces still read the shared "
+                        "ghost (mean flow and mu_t use the side image)\n", ns);
     }
     // Bin currently resident on the device. Bin 0 is loaded above, and the
     // index is recomputed from the step's own time (never accumulated), so a
@@ -469,9 +489,12 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         if (rans) ghost->applyTurb(s, r.rans, r.tr, r.phiInf[1]);
     };
     dev->setStageHook(applyBc);
-    if (nsc)
-        dev->setRhsHook([&](const DeviceCompState& s, DeviceCompState& out,
-                            const StageCombine& cmb) {
+    // The wall faces ride the rhs hook (additive, near the body; disjoint
+    // from the boundary rows): impermeable fluid/ghost faces and the
+    // two-sided faces' side images (DeviceCompGhost::applyRhs).
+    dev->setRhsHook([&](const DeviceCompState& s, DeviceCompState& out,
+                        const StageCombine& cmb) {
+        if (nsc) {
             if (stretched) nsc->apply(*dev, s, out, cmb, remap);
             else if (focal) nsc->apply(*dev, s, out, cmb, fremap);
             else nsc->apply(*dev, s, out, cmb);
@@ -479,7 +502,9 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
             // purpose: their mesh-scale content is exactly what the
             // decomposition mishandles (docs/nscbc.md, the hand-off).
             if (snk) snk->apply(s, out, cmb);
-        });
+        }
+        ghost->applyRhs(*dev, s, out, cmb);
+    });
 
     if (ds->upload(ic) != hipSuccess)
         return fail(6, "initial condition upload failed");

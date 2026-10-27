@@ -179,7 +179,14 @@ BodyBox bodyBox(const GpuGrid& g, const std::array<double, 6>& w, int margin)
     const auto [j0, j1] = span(w[1], w[4], g.hy, g.ny);
     // Native 2D has no z ghost ring: the single plane k = 0 is the interior.
     if (g.nz == 1) return {i0, i1, j0, j1, 0, 0};
-    const auto [k0, k1] = span(w[2], w[5], g.hz, g.nz);
+    auto [k0, k1] = span(w[2], w[5], g.hz, g.nz);
+    // A body reaching into a wall-adjacent z layer (k = 1 spans [hz, 2hz],
+    // k = nz-2 spans [(nz-2)hz, (nz-1)hz]) has faces there, and the strict
+    // clamp above would drop them: an overhanging mesh at nz 4 tallied half
+    // its span. Such a body gets the whole layer, as a z-spanning one does;
+    // the box wall then enters cs (only) exactly as it does for those.
+    if (w[2] < 2.0 * g.hz) k0 = g.kInLo();
+    if (w[5] > double(g.nz - 2) * g.hz) k1 = g.kInHi();
     return {i0, i1, j0, j1, k0, k1};
 }
 

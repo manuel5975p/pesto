@@ -93,21 +93,57 @@ struct CompGhostTables
     std::vector<int> fcell;  // fluid cell of an interface face
     std::vector<int> fdir;   // 0:+x 1:-x 2:+y 3:-y 4:+z 5:-z (ghost side)
     std::vector<Real> fpos;  // physical centre of each interface face, xyz
+    // Wall velocity AT each interface face centre, xyz; present exactly when
+    // uwall is. The impermeable face of a moving wall carries u_wall . n.
+    std::vector<Real> fuwall;
     std::vector<int> solid;  // every cell with sdf < 0 (mask / diagnostics)
     // Ghosts imaged from their fluid neighbours because the normal sample was
     // unusable (diagnostic: thin or concave geometry at the grid scale).
     int fallback = 0;
 
+    // TWO-SIDED FACES. Where a section is under ~2 cells thick (sharp edges,
+    // crests) a ghost is face-adjacent to fluid on both surfaces but carries
+    // ONE image, mirrored from the surface nearest its centre. A fluid cell on
+    // the other side would flux against the far surface's pressure and
+    // mirrored velocity. Each such interface face -- its ghost's sdf normal
+    // points away from the fluid cell -- gets its own SIDE image, built like a
+    // ghost's but along the sdf normal at the FLUID cell, about that cell's
+    // wall point. The solver's rhs hook and the tally read it for that face
+    // only; the ghost cell keeps its image for every other face. Per side
+    // face: the face index into fcell, the velocity and thermo stencils (8
+    // each), a = dw/dsmp, and with a moving wall its wall velocity (xyz) and
+    // pressure span, sampled at the side image's own wall point.
+    std::vector<int> sideFace;
+    std::vector<int> sideNbr;
+    std::vector<Real> sideW;
+    std::vector<int> sideTnbr;
+    std::vector<Real> sideTw;
+    std::vector<Real> sideScale;
+    std::vector<Real> sideUwall; // 3 per side face; empty = at rest
+    std::vector<Real> sideAspan; // with sideUwall
+    // The fluid cells carrying side faces, ascending, and each one's run
+    // [sideStart[q], sideStart[q+1]) of side faces (a fluid cell's faces are
+    // contiguous in face order): the rhs pass sums a cell's faces in one
+    // thread, deterministically. sideStart has nSideCell() + 1 entries, or
+    // none when there are no side faces.
+    std::vector<int> sideCell;
+    std::vector<int> sideStart;
+    // Wrong-side faces left on the shared image: no usable sample on the
+    // fluid cell's side (diagnostic, like fallback).
+    int sideSkipped = 0;
+
     int nGhost() const { return int(gcell.size()); }
     int nDeep() const { return int(deep.size()); }
     int nFace() const { return int(fcell.size()); }
+    int nSide() const { return int(sideFace.size()); }
+    int nSideCell() const { return int(sideCell.size()); }
 };
 
 // Largest table a set of azimuths needs; the device buffers are sized once from
 // this so replaying a bin is a copy, never a reallocation.
 struct CompGhostCapacity
 {
-    int nGhost = 0, nDeep = 0, nFace = 0;
+    int nGhost = 0, nDeep = 0, nFace = 0, nSide = 0, nSideCell = 0;
 
     void cover(const CompGhostTables& t);
 };
@@ -118,7 +154,8 @@ struct CompGhostCapacity
 // Post: every solid cell a fluid cell's face flux reads (its face and edge
 // neighbours) is a ghost, never deep -- so the interface faces are EVERY
 // fluid/solid face (a closed surface, sum n A == 0) and the fluid never sees a
-// resting pInf cell. Pre: bbox is null or 6 doubles [lo xyz, hi xyz].
+// resting pInf cell. Every wrong-side face has a side image or is counted in
+// sideSkipped. Pre: bbox is null or 6 doubles [lo xyz, hi xyz].
 CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                                   const double* bbox, const AxisRemap3& remap,
                                   const GhostWallMotion* motion);
@@ -257,9 +294,10 @@ public:
     // along `axis`; focal: the metric S); p = the KG face pressure the flux
     // uses, minus pRef. f = the face's full momentum flux minus pRef s (gauge:
     // the closed surface has sum s == 0, so sum f == force() to round-off),
-    // fp = p s its pressure part, fc its convective part (rho u_rel u at the
-    // face: the mirror's imperfection on a no-slip wall, not a stress), and
-    // fv = f - fp - fc the viscous stress. Parts in FP64 from the same FP32
+    // fp = p s its pressure part, fc its convective part (rho v_a u at the
+    // impermeable face, applyRhs: exactly 0 on a resting or MRF wall, the
+    // momentum the moving wall's face sweeps on a rotor), and fv = f - fp -
+    // fc the viscous stress. Parts in FP64 from the same FP32
     // face values; f is the default tally's own expression.
     struct SurfaceFace
     {
@@ -290,6 +328,26 @@ public:
     const std::vector<int>& deepCells() const { return deepHost_; }
     // Ghosts of the resident tables imaged from their fluid neighbours.
     int nFallback() const { return fallback_; }
+    // Two-sided faces of the resident tables carrying a side image, and the
+    // wrong-side faces left on the shared one (CompGhostTables::sideFace).
+    int nSide() const { return nSide_; }
+    int nSideSkipped() const { return sideSkipped_; }
+    // The rhs half of the wall faces, through stageAdd; install it in the
+    // solver's rhs hook (force() and surfaceFaces() tally the same fluxes).
+    // IMPERMEABLE FACES: every fluid/ghost face carries no advective flux
+    // relative to the wall -- rest: none; MRF: none relative to the frame,
+    // pressure work p w_n; moving: rho u_wall.n {1, u, e} + p u_wall.n -- and
+    // keeps its pressure flux, viscous stress, work and conduction. The face
+    // mean of a fluid cell and its odd linear image does not zero u_n (it goes
+    // as s^2 at a no-slip wall, and the staircase face sits up to h/2 off the
+    // wall), so without this the body was a net mass source of 0.1-1.1%
+    // rho U c (exp_mrfB). TWO-SIDED faces: their flux reads the side image
+    // (the solver's own flux: Cartesian or curvilinear, MRF frame, mu_t with
+    // the odd image clamped as mirrorMut clamps). One thread per fluid cell,
+    // faces in table order: deterministic. Pre: called from the rhs hook (the
+    // stage's primitives and mu_t are of s), s ghost-filled by apply().
+    void applyRhs(const DeviceComp& solver, const DeviceCompState& s,
+                  DeviceCompState& out, const StageCombine& cmb) const;
 
 private:
     DeviceCompGhost() = default;
@@ -307,6 +365,10 @@ private:
     int iso_ = 0;
     Real Twall_ = Real(0), Rgas_ = Real(1);
     int nGhost_ = 0, nDeep_ = 0, nFace_ = 0, fallback_ = 0;
+    int nSide_ = 0, nSideCell_ = 0, sideSkipped_ = 0;
+    // Side images of the two-sided faces (CompGhostTables::side*).
+    DeviceBuffer<int> sideFace_, sideNbr_, sideTnbr_, sideCell_, sideStart_;
+    DeviceBuffer<Real> sideW_, sideTw_, sideScale_, sideUwall_, sideAspan_;
     DeviceBuffer<int> gcell_;    // ghost cell index
     DeviceBuffer<int> gnbr_;     // 8 trilinear source cells per ghost
     DeviceBuffer<Real> gw_;      // 8 renormalized weights per ghost
@@ -322,6 +384,12 @@ private:
     DeviceBuffer<int> deep_;     // deep-solid cell index
     DeviceBuffer<int> fcell_;    // fluid cell of an interface face
     DeviceBuffer<int> fdir_;     // 0:+x 1:-x 2:+y 3:-y 4:+z 5:-z (ghost side)
+    DeviceBuffer<Real> fuw_;     // wall velocity at each face centre; moving
+    // The fluid cells owning interface faces, in face order, and each one's
+    // face run [wstart[q], wstart[q+1]): the impermeable pass's CSR, built by
+    // load() from fcell (a fluid cell's faces are contiguous).
+    DeviceBuffer<int> wcell_, wstart_;
+    int nWallCell_ = 0;
     // Physical centre of each interface face, xyz interleaved. Carried rather
     // than recomputed in the kernel because on a focal mesh the position is the
     // REMAP of the reference face, which the tables know and CurvView does not

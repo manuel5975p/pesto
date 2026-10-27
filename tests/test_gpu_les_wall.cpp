@@ -211,6 +211,13 @@ void budget(const Rig& r)
         auto gh = mkGhost();
         if (!dev || !gh) { check(false, r.name + ": setup"); return; }
         gpu::DeviceCompGhost* gp = &*gh;
+        gpu::DeviceComp* dp = &*dev;
+        // The wall faces' rhs (impermeable faces): the tally reads them.
+        dev->setRhsHook([gp, dp](const gpu::DeviceCompState& s,
+                                 gpu::DeviceCompState& out,
+                                 const gpu::StageCombine& cmb) {
+            gp->applyRhs(*dp, s, out, cmb);
+        });
         if (les)
             dev->setMutHook([gp](Real* nut, Real* f1) { gp->mirrorMut(nut, f1); });
         const Closure c = closure(*dev, *gh, r.g, vol);

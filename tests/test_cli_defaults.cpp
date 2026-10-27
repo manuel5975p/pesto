@@ -179,5 +179,23 @@ int main()
               "compressible --les 1.35 --sgs sigma: label with Cs and model");
     }
 
+    // --- incompressible placement centres on the INTERIOR -------------------
+    // The body sat at y = h + L/2 whatever --ny was: --ny 32 at --n 64 put its
+    // centre above the box. The square box keeps the L/2 form bit for bit.
+    if (auto c = resolve("flow --body cylinder --n 64"))
+        check(c->placement.cy == c->h + c->L / 2.0 + 0.17 * c->h,
+              "ny == n: cy is the square-box h + L/2 + 0.17h, bit for bit");
+    if (auto c = resolve("flow --body cylinder --n 64 --ny 32"))
+    {
+        const double h = c->h, r = 0.5 * c->placement.D;
+        check(c->placement.cy == h + 16.0 * h + 0.17 * h,
+              "--ny 32: cy is the interior centre + 0.17h");
+        check(c->placement.cy - r > h && c->placement.cy + r < 33.0 * h,
+              "--ny 32: the body lies inside the interior");
+    }
+    if (auto c = resolve("flow --body sphere --n 64 --nz 32"))
+        check(c->placement.cz == c->h + 16.0 * c->h + 0.23 * c->h,
+              "sphere --nz 32: cz is the interior centre + 0.23h");
+
     return dnstest::finish();
 }

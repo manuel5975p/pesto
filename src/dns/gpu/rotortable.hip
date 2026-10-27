@@ -19,7 +19,12 @@ std::size_t RotorTable::bytes() const
              + t.uwall.size() * sizeof(Real) + t.aspan.size() * sizeof(Real)
              + t.deep.size() * sizeof(int)
              + t.fcell.size() * sizeof(int) + t.fdir.size() * sizeof(int)
-             + t.fpos.size() * sizeof(Real) + t.solid.size() * sizeof(int);
+             + (t.fpos.size() + t.fuwall.size()) * sizeof(Real)
+             + t.solid.size() * sizeof(int)
+             + (t.sideFace.size() + t.sideNbr.size() + t.sideTnbr.size()
+                + t.sideCell.size() + t.sideStart.size()) * sizeof(int)
+             + (t.sideW.size() + t.sideTw.size() + t.sideScale.size()
+                + t.sideUwall.size() + t.sideAspan.size()) * sizeof(Real);
     return n;
 }
 

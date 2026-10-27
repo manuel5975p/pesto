@@ -36,9 +36,11 @@ int main(int argc, char** argv)
         if (!aCd && !aInc) valtest::skip("all anchor checks deferred");
 
         const std::string prefix = std::string(DNS_VAL_SCRATCH) + "/comp_re60";
-        // Anchor window, not the run end: the run reaches t = 127.7 (2 + 20L),
-        // and cd is steady from t ~ 20 on -- the mean over [30, tWin] and over
-        // the last flow-throughs agree to 6 digits (measured 2026-07-29).
+        // Anchor window, not the run end: the run reaches t = 127.7 (2 + 20L).
+        // The window is a pre-transition plateau, not a steady state: a
+        // shedding mode (St 0.174) grows through it and saturates past
+        // t ~ 100 (measured 2026-10-27 with the impermeable ghost faces;
+        // docs/validation.md).
         const double tWin = 20.0 * pi;
         const int rc = valtest::runBinary(
             std::string(DNS_BIN)
@@ -58,9 +60,9 @@ int main(int argc, char** argv)
         if (aInc)
         {
             // Cross-branch offset at matched Re / box / D-in-cells, NOT a
-            // Mach correction: the compressible ghost-mirror wall drags 6.9%
+            // Mach correction: the compressible ghost-mirror wall drags 7.3%
             // more than the incompressible cut-cell wall. Measured 2026-07-29,
-            // +0.1255. The M^2 reading this check used to assert is REFUTED --
+            // +0.1255; +0.1335 with the impermeable faces (2026-10-27). The M^2 reading this check used to assert is REFUTED --
             // cd FALLS with Mach (1.9441 at M 0.2, 1.9666 at 0.1, 2.0016 at
             // 0.05), so the incompressible limit of this branch sits further
             // above 1.8187, not closer; and the gap does not close with

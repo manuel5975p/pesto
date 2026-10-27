@@ -148,6 +148,36 @@ double unifiedCdf(const Grid& g, const gpu::DeviceCutGeometry& cut,
     return c.cdf;
 }
 
+// cd, cl, cdf from the full tally (pressure + friction) for a given phi.
+gpu::DeviceBodyForce::Coeffs fullCoeffs(const Grid& g,
+                                        const gpu::DeviceCutGeometry& cut,
+                                        const gpu::DeviceField& q,
+                                        const std::vector<Real>& ph,
+                                        const gpu::BodyBox& b, double nu,
+                                        double qRef, gpu::ReduceScratch& red)
+{
+    const auto gg = gpu::GpuGrid::from(g);
+    auto bf = gpu::DeviceBodyForce::make(gg, b);
+    auto phi = gpu::DeviceScalar::make(g.size());
+    if (!bf || !phi) return {std::nan(""), std::nan(""), std::nan(""), std::nan("")};
+    (void)hipMemcpy(phi->data(), ph.data(), ph.size() * sizeof(Real),
+                    hipMemcpyHostToDevice);
+    return bf->measure(cut, *phi, q, nu, qRef, nullptr, red);
+}
+
+// A z-invariant pressure gauge: same random x-y plane in every layer.
+std::vector<Real> zInvariantPhi(const Grid& g, unsigned seed)
+{
+    const std::size_t slab = std::size_t(g.nx) * g.ny;
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<Real> d(-1, 1);
+    std::vector<Real> p(slab), out(g.size());
+    for (auto& x : p) x = d(rng);
+    for (int k = 0; k < g.nz; ++k)
+        for (std::size_t c = 0; c < slab; ++c) out[c + slab * k] = p[c];
+    return out;
+}
+
 } // namespace
 
 int main()
@@ -222,6 +252,56 @@ int main()
         for (int r = 0; r < 4; ++r)
             if (unifiedCdf(c.g, *dCut, *q, box, nu, qRef, *red) != first) same = false;
         check(same, "the tally is bit-reproducible across repeats");
+    }
+
+    // --- 3b) a body overhanging the z box: the tally covers every layer -----
+    // A mesh whose AABB pokes through both z walls (exp_mrfC: an extruded
+    // section at --nz 4) is boxed from its world AABB. The old strict clamp
+    // k in [2, nz-3] dropped the two wall-adjacent layers: cd/cl x0.5 at
+    // nz 4, an EMPTY box at nz 2. Per span it must equal the native-2D tally
+    // of the same section, field and pressure.
+    {
+        auto c2 = makeCylinder(64, 1);
+        auto d2 = gpu::DeviceCutGeometry::make(c2.cut);
+        auto q2 = gpu::DeviceField::make(c2.g.size());
+        if (!(d2 && q2)) return 1;
+        std::vector<Real> u, v, w;
+        fillZInvariant(c2.g, u, v, w, 11);
+        check(upload(*q2, u, v, w), "upload 2d ref");
+        const double D = 2 * pi / 8.0;
+        const auto g2 = gpu::GpuGrid::from(c2.g);
+        const auto ref = fullCoeffs(c2.g, *d2, *q2, zInvariantPhi(c2.g, 12),
+                                    gpu::bodyBox(g2, c2.cyl.cx, c2.cyl.cy, 0, c2.cyl.r),
+                                    nu, 0.5 * D * c2.g.hz, *red);
+        std::printf("overhang nz==1    cd %.12g cl %.12g cdf %.12g\n", ref.cd,
+                    ref.cl, ref.cdf);
+        check(std::isfinite(ref.cd) && ref.cd != 0.0 && ref.cl != 0.0,
+              "overhang: the 2D reference tally is non-trivial");
+        for (const int nzInt : {2, 4, 16})
+        {
+            auto c = makeCylinder(64, nzInt);
+            const auto gg = gpu::GpuGrid::from(c.g);
+            const double r = c.cyl.r, lz = double(c.g.nz) * c.g.hz;
+            const auto box = gpu::bodyBox(
+                gg, {c.cyl.cx - r, c.cyl.cy - r, -c.g.hz, c.cyl.cx + r,
+                     c.cyl.cy + r, lz + c.g.hz});
+            check(box.k0 == gg.kInLo() && box.k1 == gg.kInHi(),
+                  "overhang: the box spans every interior z layer");
+            auto dc = gpu::DeviceCutGeometry::make(c.cut);
+            auto q = gpu::DeviceField::make(c.g.size());
+            if (!(dc && q)) return 1;
+            fillZInvariant(c.g, u, v, w, 11);
+            check(upload(*q, u, v, w), "upload overhang");
+            const auto m = fullCoeffs(c.g, *dc, *q, zInvariantPhi(c.g, 12), box, nu,
+                                      0.5 * D * nzInt * c.g.hz, *red);
+            std::printf("overhang nz=%-2d+2  cd %.12g cl %.12g cdf %.12g\n", nzInt,
+                        m.cd, m.cl, m.cdf);
+            const auto same = [](double a, double b) {
+                return std::abs(a - b) <= 1e-9 * std::abs(b);
+            };
+            check(same(m.cd, ref.cd) && same(m.cl, ref.cl) && same(m.cdf, ref.cdf),
+                  "overhang: per-span cd/cl/cdf equal the 2D tally at every nz");
+        }
     }
 
     // --- 4) argument validation --------------------------------------------

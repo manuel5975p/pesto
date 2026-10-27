@@ -487,9 +487,11 @@ void testRotor2Pin()
     std::printf("rotor2 L1 at t %.6f (1 D/U = %.6f): ct %.6g cq %.6g\n", t,
                 pi / 4, ct, cq);
     check(std::abs(t - pi / 4) < 1e-4, "run reaches 1 D/U");
-    // Measured 2026-10-27 on gfx1100 (W7): ct 0.0565675, cq -0.0911887,
-    // bit-identical across two builds. Banded 1%: a regression pin.
-    constexpr double ctPin = 0.0565675, cqPin = -0.0911887;
+    // Measured 2026-10-27 on gfx1100 with the impermeable interface faces
+    // (DeviceCompGhost::applyRhs; before them, with the two-sided faces: ct
+    // 0.0508646, cq -0.0874821; before those, W7: ct 0.0565675, cq
+    // -0.0911887). Banded 1%: a regression pin.
+    constexpr double ctPin = 0.040455, cqPin = -0.0738025;
     std::printf("rotor2 pin: ct %+.3f%%, cq %+.3f%%\n", 100 * (ct / ctPin - 1),
                 100 * (cq / cqPin - 1));
     check(std::abs(ct / ctPin - 1) < 0.01, "rotor2 L1 ct at 1 D/U pinned (1%)");
@@ -539,10 +541,15 @@ void testRotor2Pin()
               "surface rows' moment is the tallied torque");
         check(std::abs(fx[1] + fx[2] + fx[3] - fx[0]) < 1e-8 * gross,
               "pressure + convective + viscous == total");
-        // Measured 2026-10-27 on gfx1100 (W6), same run as the ct/cq pin.
-        constexpr double ctP = 0.0138105, ctC = 0.00556694, ctV = 0.0371901;
+        // Measured 2026-10-27 on gfx1100, same run as the ct/cq pin, with the
+        // impermeable faces (before: p 0.00993798, c 0.00135217, v 0.0395745
+        // with the two-sided faces; W6: p 0.0138105, c 0.00556694, v
+        // 0.0371901). The MRF wall advects nothing relative to the frame, so
+        // the convective part is exactly zero, not pinned.
+        constexpr double ctP = -0.00550761, ctV = 0.0459626;
         check(std::abs(fx[1] / ctDen / ctP - 1) < 0.01, "rotor2 ct pressure part pinned (1%)");
-        check(std::abs(fx[2] / ctDen / ctC - 1) < 0.01, "rotor2 ct convective part pinned (1%)");
+        check(fx[2] == 0.0 && mx[2] == 0.0,
+              "rotor2 convective part exactly 0 (impermeable relative to the frame)");
         check(std::abs(fx[3] / ctDen / ctV - 1) < 0.01, "rotor2 ct viscous part pinned (1%)");
     }
 

@@ -299,6 +299,272 @@ uncommitted).
     `tools/parity` (`runs/parity/report.md`), laminar Re_D 220, J 0.63, tip
     Mach 0.41, central U everywhere (the parity rule). The pre-W5 rows used
     linearUpwind and are retired as stale.
+    - **(A) FIXED 2026-10-27: two-sided ghost faces** (exp_mrf14b,
+      `plans/verify/impl_mrfA.md`). Where a section is under ~2 cells thick
+      a ghost is face-adjacent to fluid on both surfaces but carried ONE
+      image; the far-side fluid cell fluxed against the other surface's p and
+      mirrored u, and the tally read that face. Now each such face (ghost
+      normal away from the fluid cell AND fluid normal > 60° off it) gets a
+      SIDE image about the fluid cell's own surface (`CompGhostTables::side*`,
+      `kSideRhs` via `DeviceCompGhost::applyRhs` in the rhs hook, `kSideTally`). Always on;
+      bodies without such faces are byte-identical (Re40/60/100 n256 comp
+      cylinders, a spinning MRF and a moving-table sphere, the t/c 0.35
+      ellipse). Test `gpu_comp_ghost_twoside` (membranes holding a pressure
+      jump at rest: pre-fix face p off by 0.5 dp, force 11-18%, flow
+      0.6-1.06 dp/(rho c); fixed 2e-6 / 4e-7 / 7e-6).
+      rotor2 (4.5 D/U, final; Bc L3 CT −0.01729, CQ Richardson 0.08351):
+
+      | | L1 | L2 | L3 | Richardson |
+      |---|---|---|---|---|
+      | CT before | −0.05223 (+202%) | −0.03180 (+84%) | −0.02891 (+67%) | −0.02737 (+58%) |
+      | CT after | −0.04625 (+167%) | −0.03015 (+74%) | −0.02750 (+59%) | −0.02584 (+49%, p 3.9) |
+      | CQ before | 0.09167 (+9.8%) | 0.08465 (+1.4%) | 0.08208 (−1.7%) | |
+      | CQ after | 0.08790 (+5.3%) | 0.08658 (+3.7%) | 0.08330 (−0.25%) | not monotone |
+      | CQ_c before / after | 0.02018 / 0.01298 | 0.00789 / 0.00734 | 0.00560 / 0.00353 | |
+      | blade CT_c before / after | −0.00574 / −0.00149 | −0.00263 / −0.00135 | −0.00147 / −0.00018 | |
+
+      L3 blade p +0.02297 → +0.02586 (foam +0.04840), v −0.04198 → −0.04432
+      (foam −0.05613); CQ − CQ_c −8.6% → −4.5%. Chord frame, L3 blade:
+      normal pressure CT 0.06334 → 0.06648 (foam 0.08318: −23.9% → −20.1%),
+      chordwise pressure −0.04254 → −0.04347 (foam −0.03975). Sections
+      (sect14, vs foam L3): L2 (y .54) Cn −27.6 → −6.5%, Cc −10.0 → −2.7%;
+      L1 Cn +12.8 → +35.2%, Cc −12.9 → −3.3%; y .24 Cn −81.3 → −83.0%, Cc
+      +1.4 → +1.8%. The prototype's y .24 gain (−24%) came from a 5th face per
+      section that is NOT two-sided (ghost 0.06 h inside, fluid upstream at
+      the same height, n_f · n_g 0.75): re-imaging a near-tangent face moves
+      Cn by ~60 points, which is (B), not (A). Not covered: the RANS
+      turbulence scalars' fluxes at side faces still read the shared ghost
+      (mean flow and mu_t use the side image; the run warns); 2–7 wrong-side
+      faces per rotor2 level have no usable sample on their side and stay
+      on the shared image (counted and warned).
+    - **(B) scatter: FIXED 2026-10-27 by impermeable interface faces
+      (`plans/verify/impl_imperm.md`; exp_mrfB, `plans/verify/exp_mrfB.md`;
+      bias resolved by exp_mrfC, `plans/verify/exp_mrfC.md`). rotor2 is
+      still NOT at parity (L3 CT +47%, CQ -5%).**
+      On a smooth t/c 0.35 ellipse vs body-fitted foam, Cn has a placement
+      SCATTER (±30 / ±9 / ±0.7% at c/h 20 / 28 / 40).
+      - **The "−7…−9% bias" was the REFERENCE's (exp_mrfC).** foam's section
+        branch ran `limited corrected 0.33` (laplacian + snGrad) on an O-H
+        mesh at up to 53° non-orthogonality: +9.3% Cn, Cc −0.3%, and it does
+        not refine away. Unlimited, foam is Cn 0.2432 / Cc 0.3851 (L3; L2
+        0.2437 / 0.3854). Against that, the dns offset means are +3.6 / +0.4
+        / −0.0% at c/h 20 / 28 / 40 (c/h 56 +1.9%, one offset), and the
+        impermeable prototype gives +1…+3% with Cc −0.3…0%. Γ(R) falls
+        past R 2 c in foam too (wake), the incompressible cut-cell run
+        (tunnel BCs, 24 c tall box) is +1.6%, M 0.1 moves Cn −0.6%, and the
+        inflow angle and body agree. Fixed in `tools/parity/suite.py`
+        (section `limited = False`). **Every section row scored against
+        limited foam is stale**, including (A)'s sect14 Cn/Cc figures
+        (sect14 re-scored in (D)) (the
+        stored `runs/parity/{A,B}/sect` and `ref/*/sect` foam runs are still
+        the limited ones, 69–72° max non-orthogonality: regenerate). The
+        rotor branch is now unlimited too, and on rotor2 the limiter turned
+        out NOT to be the gap (exp_rotorU, bullet (C) below). Side finding (incompressible, FIXED 2026-10-27,
+        #30 below): `gpu::bodyBox` clamped k to [2, nz−3] (the interior is
+        1..nz−2), and a mesh body overhanging the z box is not `geo.zSpans`
+        (`apps/dns_main.cpp:263`), so its cd/cl missed two layers (×0.5 at
+        nz 4).
+      - It is the FLOW, not the tally: the far-field circulation tracks the
+        tally lift across offsets to 0.003.
+      - Pressure image: sample ±0.5 h moves Cn ≤ 0.004; a centripetal
+        image +0.004 everywhere.
+      - Velocity image: its wall position is worth 0.03 Cn per h.
+      - **The scatter is transpiration through the staircase interface
+        faces.** The KG face mean with the odd linear image does not
+        zero u_n (∝ s² at a no-slip wall), so the body is a net source of
+        0.1–1.1% ρUc depending on the offset, concentrated at the LE.
+        This is the CT_c / CQ_c "flux through a staircase wall" below.
+      - A prototype that zeroes the interface faces' advective flux and
+        pressure work (resting Cartesian only, removed again) cuts the
+        scatter at c/h 28 to ±1% and puts Cc on foam (+0.0…+0.3%, against
+        −1.4…−3.1%); its Cn is +1…+3% on the corrected foam.
+      - **LANDED 2026-10-27: impermeable interface faces**
+        (`plans/verify/impl_imperm.md`, `DeviceCompGhost::applyRhs`,
+        test `gpu_comp_ghost_imperm`). Rest: no advective flux, no
+        pressure work; MRF: none relative to the frame, pressure work
+        p w_n off the same corner stream potential; moving: rho
+        u_wall.n {1, u, e} + p u_wall.n with u_wall at the face centre;
+        Cartesian and focal; side faces end on the side image's
+        impermeable flux; the tally's fc is exactly 0 at rest and under
+        MRF. Fluid mass through a resting/MRF body: 4e-4..1e-5 leak ->
+        FP32 rounding (3e-8..1.5e-7 over 50 steps). Measured (HEAD-state
+        -> new; refs body-fitted):
+        - ellipse c/h 28 (6 offsets) vs unlimited foam Cn 0.2432 / Cc
+          0.3851: Cn +0.5% sd 9.0% -> +1.5% sd 2.9%; Cc -2.1% -> -0.0%.
+          c/h 20: Cn +3.6% sd 30% -> +4.0% sd 6.3%, Cc -3.2 -> -0.6%.
+        - square Re 40 M 0.1 vs simpleFoam 2.184: D/h 24 -0.25% ->
+          -0.07/+0.25% (two offsets), D/h 32 -0.88% -> -0.49/-0.33%.
+        - rotor2 MRF vs Bc unlimited (CT -0.017090, CQ 0.083313), 4.5
+          D/U final: CT +170.6/+77.3/+65.1% -> +120.4/+53.6/+46.9%
+          (L1/L2/L3); CQ +5.5/+2.5/-0.3% -> -11.3/-5.6/-5.1%. The CQ
+          "agreement" was the cancellation this issue predicted: CQ -
+          CQ_c was -10.1/-4.9/-4.3% and the convective part is now 0.
+          L3 blade p +0.02477 -> +0.02875 (foam +0.04837), v -0.04432 ->
+          -0.04498 (foam -0.05592).
+        - Re 60 sponge cylinder (`comp_re60_n256_cd`): the steady state
+          was a slow transient in BOTH; it sheds (St 0.174) from t ~ 100
+          (new) / ~150 (HEAD state). Window cd 1.9441 -> 1.9522, a
+          spurious mean cl -0.0139 on the symmetric cylinder -> 0. The
+          +6.9% cross-branch gap is NOT closed (+7.3%).
+        - Re 40 cylinder vs body-fitted O-grid: see impl_imperm.md (the
+          spurious cl halves; cd within the domain-mismatch band).
+      - The rotor2 CT gap after (A) is still +61% at L3 against the
+        unlimited reference, carried by the blade's normal pressure force
+        (−19.7% vs foam; the limiter was worth 0.4% of it, see (C)).
+    - **(C) MEASURED 2026-10-27: the foam limiter is NOT the rotor2 gap**
+      (`plans/verify/exp_rotorU.md`). snappy rotor2 meshes: max
+      non-orthogonality 65°, but only 0.1–0.3% of faces are above 40°;
+      blade first-layer faces mean 10°, layers 2–3 ≤ 36°; the 3–9
+      "highly skew" faces are all propeller wall faces. foam restarted
+      from the converged limited state with `Gauss linear corrected` /
+      `corrected` / `grad(U) Gauss linear` (nNonOrth 1, stable, flat to
+      ≤ 5e-5 within 200 iterations; a cold Bc L1 matches to 6 digits).
+      |CT| falls 2.2 / 1.5 / 1.2% (Bc L1/L2/L3; B 2.3 / 1.5 / 1.3%) and
+      CQ 0.2–0.3%, mostly viscous (blade v −0.05613 → −0.05592, blade p
+      0.04840 → 0.04837). The new Bc reference is CT −0.017090 (fine L3)
+      and CQ 0.083313 (Richardson). dns post-(A) against it:
+
+      | | L1 | L2 | L3 | Richardson (h_fine,max) |
+      |---|---|---|---|---|
+      | CT vs Bc unlimited (limited) | +170.6% (+167.4) | +76.4% (+74.4) | +60.9% (+59.0) | +52.2% (+50.4) |
+      | CQ vs Bc unlimited (limited) | +5.50% (+5.26) | +3.92% (+3.68) | −0.02% (−0.25) | no fit |
+      | blade chord-normal p vs Bc L3 (foam 0.08282, was 0.08318) | −39.4% | −24.2% | −19.7% (−20.1) | dns 0.0710 vs foam 0.0831: −14.6% |
+      | blade chordwise p vs Bc L3 (foam −0.03947, was −0.03975) | +29.7% | +8.3% | +10.1% | |
+
+      Still NOT AT PARITY. The 1.2–2.3% CT bias is a quarter of the CT
+      band, so `tools/parity/suite.py`'s rotor branch is now `limited =
+      False`. The references are `runs/parity/{B,Bc}/rotor2/foam_L*_unlim`.
+      The old limited dirs stay in place, marked `stale` in their
+      result.json, and `split/rotor2/foam_*_L3_limited.json` keeps the old
+      split. The stored **rotor** (rotor1) B/Bc foam runs and its zone
+      calibrations are still limited, on 65° snappy meshes; they are not
+      rerun, and the expected effect is the same order (1–2% CT).
+    - **(D) MEASURED 2026-10-27: lens re-referenced, and the rotor2 gap
+      localized** (`plans/verify/exp_rotorR.md`).
+      - **sect14 lens vs UNLIMITED foam.**
+        - foam (tier A, unlimited) gives Cn 0.0932 / Cc 0.3765 (L3, restarted
+          from the limited state, 32–42 c/U). L2 cold is 0.0929 / 0.3771. The
+          limited 0.1015 was +8.9% off.
+        - Unlimited L3 carries a 2Δt odd-even cl mode (±0.07); its block means
+          are stable and agree with the clean L2.
+        - dns at HEAD + (A), 100 c/U, mean over offsets: Cn **+43% / −15% /
+          −5%** at c/h 20 / 28 / 40 (3 / 6 / 3 offsets). The SE is 14–32%, so
+          none of the three is distinguishable from zero. Cc is −3.9 / −0.5 /
+          −1.0%.
+        - The absolute Cn scatter is sd 0.052 / 0.032 / 0.022. At c/h 20–28
+          that is the ellipse's (0.075 / 0.022). Unlike the ellipse (0.002 at
+          c/h 40), it does NOT collapse by c/h 40: the sharp edges keep ±20%.
+        - y .24 (near-tangent face) is −81%.
+        - The (A) sect14 figures above are superseded by these.
+      - **rotor2 radial bins (0.05 D, L3, chord frame, total =
+        p + v + convective).**
+        - The blade CT gap (−0.0111) sits MID-TO-OUTER SPAN: 0.20–0.45 D
+          carries 87% of it.
+        - Root, hub (dns −7% less drag, against the gap) and tip bin (8%) are
+          not it.
+        - Per bin it is a near-UNIFORM TOTAL chord-normal force deficit:
+          −6…−15% in every bin 0.10–0.50 D, local ΔCn −0.006…−0.043, all
+          negative. Chordwise is within ±7%.
+        - Blade totals: normal −19.4 / −10.0 / −9.4%, chordwise +11.3 / +4.8 /
+          +1.9% (L1 / L2 / L3). The normal deficit is FLAT from L2 to L3.
+        - The "−19.7% chord-normal pressure" is the staircase's p/v split:
+          dns puts 2.5× foam's normal force into v_n.
+        - Blade CT is a residual of normal (+0.097) against chordwise (−0.105)
+          thrust. So a 9.4% normal-force deficit is 120% of blade CT, and that
+          is the +61%.
+      - **Ruled out.**
+        - **t/h:** L3 has t/h 7.1–9.2 at every radius, and L2's deficit
+          (t/h 5.4–7.1) is the same.
+        - **Zone:** dns f = 1/2 at r 0.629 D, ±0.297 D axial, equals foam's
+          sharp r 0.629 D, ±0.2965 D. The blend starts 0.054 D outside the
+          tip. The STL is identical vertex-for-vertex.
+        - **Leak:** the convective CT is ≤ 1.6e-4 per bin. CQ_c is 42% in
+          the tip bin: that is torque, not thrust.
+        - **Two-sided faces:** they cluster at the root and tip (68 / 70 per
+          bin) against 25–28 mid-span.
+        - **2D placement scatter:** pooled c/h 20 + 28 lens ΔCn is +0.004 ±
+          0.015, against the rotor bins' −0.026 mean.
+      - **Open.** A systematic ~9–10% normal-force deficit of the ROTATING 3D
+        section.
+        - Note: foam's local Cn at r 0.325 D is 0.238, against 0.093 for the
+          2D lens at 7° (rotational augmentation), so the 2D section is not a
+          proxy for it.
+        - Next: rotor2 `--rotor-frame moving` vs mrf (done, (E)); a
+          non-rotating 3D straight lens wing at the rotor's c/h, against
+          foam (not run).
+    - **(E) MEASURED 2026-10-27: discriminators** (`plans/verify/exp_rotorM.md`).
+      - **Settling: ruled out.** MRF L2 to 9 D/U is flat from 4 D/U on:
+        1-D/U block means CT −0.03022…−0.03030, CQ 0.08648…0.08651. Blade
+        total normal −10.0 → −10.3%. The quoted numbers are final snapshots,
+        but they are within 0.7% of the window means.
+      - **Frame: dns MRF ≠ dns moving, by more than the gap, and they
+        bracket foam.**
+        - Moving (natural bins) time-mean CT is +0.0134 / +0.0090 /
+          −0.0009 ± 0.0011 at L1/L2/L3. MRF is −0.0463 / −0.0303 / −0.0273,
+          and foam −0.0171.
+        - The difference is 0.060 / 0.039 / 0.027 (1.6–3.5× foam's |CT|) and
+          shrinks at observed order ~1–1.5.
+        - Moving CQ is −15 / −11 / −5%. Without the convective wall flux,
+          torque agrees across frames (L2 CQ − CQ_c −4.9% MRF, −5.3% moving).
+        - The split is in the normal force. Blade normal p+v: MRF −30.6 /
+          −16.6 / −13.1%; moving −4…−12 / −7.6 / +5.9% (snapshots, ±8%).
+          Moving chordwise is −7…−12%, MRF's −1…−3%.
+        - So the frozen-rotor equivalence fails inside dns at every level.
+          The rotor2 numbers are dominated by an UNCONVERGED frame-dependent
+          error of the immersed moving wall, and the flat L2 → L3 MRF normal
+          deficit is not a converged bias.
+        - The MRF path carries a normal deficit that moving does not, but
+          moving errs as far the other way. It has its own first-order terms:
+          a convective tally of +0.005…+0.034 CT from the staircase sweeping
+          the grid, and swap noise.
+        - p = 1.5 L2/L3 extrapolations put both near CT −0.020 (inside
+          foam's zone span). That is an extrapolation, not a measurement.
+      - **Box, BCs, Re, Mach, gas: matched.**
+        - Box faces agree to 1e-6 D, with slip / free-slip laterals.
+        - NSCBC inlet/outlet vs fixed U / fixed p; the sink is off on
+          `--focal`.
+        - Re_D 220, M 0.082219, tip M 0.41, J 0.63, γ 1.4, Pr 0.72, constant
+          μ, adiabatic walls.
+        - Nothing changed in `tools/parity`.
+      - **Zone, blend vs sharp: ≤ 1/3 of the gap.** foam Bc L2 with the zone
+        at dns' f = 1 / f = 0 radii (0.554 / 0.704 D) gives CT −0.01997 /
+        −0.01639 (+13.6 / −6.8% vs 0.629), CQ −2.6 / +0.8%. dns MRF L3
+        −0.0273 is outside that span.
+      - **Side finding, RESOLVED 2026-10-27 (`plans/verify/exp_corner.md`):
+        thick convex corners are excluded.** Fix A's two tests also fire at
+        a sharp convex edge of a THICK body (one face per corner cell row:
+        square 4 per layer, diamond 2, spun cube 224 / 138).
+        - Measured on a square cylinder (B 10%, 2 sub-cell offsets per D/h)
+          against body-fitted simpleFoam (central U, cd 2.184):
+          - Re 40: the side image is locally better. Corner-face Cp is
+            symmetric, independent of the offset and closer to foam. cd at
+            M 0.1 is −0.3 / −0.9% for HEAD and +0.3 / +0.1% for fix A.
+          - Re 100: it makes the result offset-sensitive. cd spread 0.7% →
+            8.7%, cl_rms spread 3.6% → 48% over a 0.2-cell shift (one offset
+            1.80 → 1.96).
+        - Now a face stays shared when its ghost is in thick solid: the sdf
+          stays negative 2 cells behind it along −n_g, AND a deep cell
+          (phi < −2h) lies within 3 cells. Each condition alone also caught
+          thin-blade faces (rotor2 L1 186 → 142).
+        - Results: thick bodies, square / diamond / cube included, classify 0
+          side faces and are byte-identical to HEAD. Pinned in
+          `gpu_comp_ghost_twoside` (`thickCorners`).
+        - Lens L2 / L1 / y .24 are byte-identical to fix A, and so is rotor2
+          L1 (186 faces; `gpu_mrf_rotor2` not re-pinned).
+        - rotor2 L2 / L3 lose their blade-TIP edge faces (345 → 261, 456 →
+          357; the outer blade is > 4 cells there). CT moves L2 −0.03015 →
+          −0.03030 and L3 −0.02750 → −0.02821, i.e. +63.2% vs Bc: half of
+          fix A's L3 CT gain is given back. CQ L2 0.08541, L3 0.08303. The
+          (A) table above is fix A before this amendment.
+        - Open: tip corners of blades under 4 cells keep their side images
+          (no deep cell near), and the Re 100 sensitivity is not measured
+          there.
+      - **Next, none run:**
+        - an L4 (over the 300 s cap);
+        - an MRF-vs-moving rig where the frozen rotor is exact AND the wall
+          has a normal velocity (`gpu_mrf` frame parity uses an axisymmetric
+          cylinder, where (ω×r)·n = 0, so it never tests that);
+        - a time-averaged `--emit surface` for moving runs.
     - **dns (rotor).** L1 is the 80f147f run (4.58 D/U, D/h_fine 59.5, 4.1M cells,
       131 s). L2/L3 are not run: they cost ~550 and ~2100 s, over the cap.
       rotor1 cannot be grid-refined under 300 s, which is why W7 makes
@@ -451,21 +717,30 @@ uncommitted).
 
 ## RANS code-to-code references (masterplan `plans/verify/masterplan_verify.md` W13)
 
-21. **The small SA wedge parity misses its planned 1% gate: tier B −1.07%**
-    (measured 2026-10-27, L1 64×48 Re 1e3, β 4.5, rFar 20). dns SA-neg M 0.2
-    certifies (exit 0, 136600 iterations, 29 s, cd 0.48541, θ_s 99.50°, L_r
-    1.2691 D); M 0.1 ends at the 4e5 cap (exit 8, item 4) settled at cd
-    0.48061 ± 0.06%; cd0 0.47901. OpenFOAM v2606 SpalartAllmaras (ft2 true,
-    Prt 0.9, central U) on the identical mesh: 0.48419, θ_s 100.24°, L_r
-    1.1407 D. So cd0 −1.07% (tier A at M 0.2 would read +0.25%), θ_s −0.56°
-    (M 0.1), L_r +7.8% (SST's is +7.7% on this mesh). The masterplan set
-    "cd0 within 1%" before measuring; the band was NOT widened: `gpu_sa_wedge`
-    pins the dns state (cd 5e-4, L_r 5e-3, θ_s 0.1°) and prints the
-    comparison ungated. Not attributed: OpenFOAM's SA bounds ν̃ ≥ 0 (dns
-    SA-neg does not) and the two codes' discretizations differ at L1 (laminar
-    `sph100` L1 is −0.49% on the same mesh family, and SA L2 Re 1e4 is
-    −0.35%); an L2 Re 1e3 pair (dns ~4× the iterations at 4× the cells,
-    over the 1-minute target) would separate grid from model. Open.
+21. **SA wedge L1 parity −1.07% is L1 discretization: settled 2026-10-27,
+    L2 MEASURED** (`plans/verify/exp_sa21.md`, `plans/verify/impl_batch.md`).
+    Tier B against OpenFOAM v2606 SpalartAllmaras (ft2 true, Prt 0.9,
+    central U) on the identical β 4.5 rFar 20 mesh, Re 1e3:
+    - L1 64×48: cd0 0.47901 vs 0.48419, **−1.07%** (cdp −0.86, cdf −1.63%),
+      L_r +7.8%.
+    - L2 128×96: dns SA-neg M 0.2 0.494552 (exit 0, 119600 it), M 0.1
+      0.489505 (explicit, cap 1.2e6 it, exit 8: the jitter-floored stop
+      cannot certify M 0.1, item 4; five 2e5-it block means over 2e5–1.2e6
+      agree to 2.5e-6, so the state is settled). cd0 **0.487822 vs
+      0.488432: −0.125%** (cdp0 −0.06%, cdf0 −0.29%). The estimate it
+      replaces was −0.08% (L1's Mach ratio 1.01336; L2 measures 1.01380).
+      θ_s 100.41° (M 0.1) vs 100.56°; L_r0 1.429 vs 1.3745 D (+4.0%; the
+      estimate said ~+2%).
+    - Laminar Re 100, no model, same mesh: −0.49% L1 → −0.10% L2, friction
+      led like SA's (cdf −0.81 → −0.21%). OpenFOAM's S̃ limiter is not the
+      cause (Cs 0.3 → 0.1 moves its cd −0.006%).
+    - dns's L1 → L2 cd0 move (+1.84%) is twice OpenFOAM's (+0.88%): dns
+      carries the larger L1 error on this growth-1.22 mesh.
+    - The implicit scheme does not reach M 0.1 here (L1 exit 7 "CFL < 0.1
+      after 37 rejections"; L2 exit 8 at 500, cd still drifting).
+    `gpu_sa_wedge` keeps pinning the dns L1 state, ungated against
+    OpenFOAM; a 1% gate belongs at L2, where the pair now sits inside it.
+    Explained, not open.
 22. **The TMR flat plate, bump-in-channel and NACA 0012 cases cannot be
     expressed today** (recorded 2026-10-27, not scheduled). The O-grid is
     uniform in polar angle (`ogrid.hpp`: theta_i = −2π i/nx), so no
@@ -487,32 +762,49 @@ uncommitted).
 
 ## O-grid cylinder (masterplan `plans/verify/masterplan_verify.md` W12)
 
-24. **URANS shedding vs OpenFOAM agrees within 3 SE on the protocol's
-    windows; one late-window reading does not: SST-2003m cl_rms −0.74% at
-    −4.2 SE** (measured 2026-10-27, 2D cylinder O-grid 256×96, β 4, 20 D,
-    Re 1e4, M 0.2, `--ogrid-trip 0.05 --compensated`, 66.5 D/U; OpenFOAM
-    v2606 rhoPimpleFoam on the identical mesh, central U, backward, PIMPLE
-    nOuter 2, `tools/parity/ocyl1e4.py`; docs/validation.md "O-grid
-    cylinder URANS shedding vs OpenFOAM"). Window of the 2% swing rule:
-    SST cd / cl_rms / St +0.24% / +0.66% / +2.9% (+0.27 / +0.91 / +1.64
-    SE), SA-neg vs SpalartAllmaras +0.06% / −0.33% / +0.63% (≤ 1.0 SE).
-    Common late window t ≥ 45 D/U (dns 3 periods, OpenFOAM 4): SST cd
-    −0.37% (−0.5 SE), St +1.2% (+0.7 SE), cl_rms 1.1994 ± 0.0008 vs
-    1.2084 ± 0.0020 (−0.74%, −4.2 SE). Not attributed; candidates, none
-    measured: OpenFOAM's backward/PIMPLE at maxCo 0.5 (its own dt ladder
-    was not run: 2 chunks per model), meshWave vs dns's exact wall
-    distance, OpenFOAM's k ≥ 0 bounding (active every step), the
-    different start (impulsive vs ramped) leaving the dns SST cycle still
-    lengthening its period (4.18 → 4.39 D/U over the run), and SEs from 3-4
-    correlated periods. A longer common window (≥ 100 D/U on both sides,
-    over the 300 s cap for OpenFOAM in one chunk) would separate a real
-    gap from window noise. Also recorded: (a) OpenFOAM PIMPLE nOuter 1 is
+24. **URANS SST shedding vs OpenFOAM: the −4.2 SE cl_rms reading was
+    window noise; the residual is OpenFOAM's far-field radius dependence,
+    not dns's -- dns is radius-converged at 40 D, OpenFOAM is not at 80 D**
+    (measured 2026-10-27, plans/verify/exp_sst24.md + exp_sst40.md; 2D
+    cylinder O-grid 256 angular, Re 1e4, M 0.2, `--ogrid-trip 0.05
+    --compensated --cfl 0.6`; OpenFOAM v2606 rhoPimpleFoam on the identical
+    mesh, central U, backward, nOuter 2, np 6 meshWave,
+    `tools/parity/ocyl1e4.py`). (a) Neither W12 series (the old −0.74%
+    / −4.2 SE, t ≥ 45 D/U) was saturated: dns cl_rms 1.1994 (45-66) ->
+    1.2061 ± 0.0006 (75-128, 12 periods); OpenFOAM as configured
+    (freestreamPressure) never becomes stationary (per-period cd sd
+    0.013-0.026). Do not cite a URANS window under ~10 saturated periods.
+    (b) OpenFOAM's scatter and even harmonics are its reflecting far p:
+    `waveTransmissive` (gamma 1.4, lInf = R, U freestreamVelocity kept)
+    gives a clean limit cycle -- the OF reference setting. (c) Far-field
+    ladder, both codes, matched near-body cells (ny/beta 96/4, 105/4.345,
+    114/4.685 at R = 20/40/80 D: cell sizes within 1.2-2.5% over r < 2 D),
+    dns − OF: cd −1.10% / −0.59% / +0.77%, St −1.76% / −0.83% / +0.92%,
+    cl_rms −0.32% / +0.53% / +0.77% -- the gap CHANGES SIGN, it does not
+    close. dns 20->40->80: cd 1.6923 / 1.6759 / 1.6782, St 0.2282 / 0.2281
+    / 0.2293, cl_rms 1.2061 / 1.1947 / 1.1944 (moves ≤ 0.5% past 40 D).
+    OpenFOAM: cd 1.7111 / 1.6859 / 1.6653, St 0.2323 / 0.2300 / 0.2272,
+    cl_rms 1.2100 / 1.1884 / 1.1853 (still ~1.2% per doubling in cd, St).
+    OF lInf 40 -> 20 at R 40 moves ≤ 0.1%, so it is not the transmissive
+    anchoring. OpenFOAM at 80 D grows a symmetry-breaking mode from ~70
+    D/U (cl_mean -> 0.03, a2/a1 -> 0.018, cd@f ×1.1 per period),
+    identical at lInf 20; dns at 80 D has none. Not separated: the tanh
+    law coarsens the mid/outer field with R (cell at 20 D: 0.83 / 1.23 /
+    1.43 D), so OF's drift is radius OR outer resolution; dns is
+    insensitive to both together. dns on the 40/80 D discs carries a slow
+    13.8-16 D/U cd modulation (cd sd 0.004-0.010 vs 0.0025 at 20 D;
+    period R-independent, so not a far-row acoustic round trip); means are
+    stationary under it. Open only as an OpenFOAM-reference question (its
+    R -> ∞ value); nothing here points at dns. Earlier (still valid):
+    halving OF's dt moves OF away from dns (+0.3/+0.4/+0.6%); OF with U
+    also waveTransmissive drifts without a stationary state. Also recorded
+    (W12): (i) OpenFOAM PIMPLE nOuter 1 is
     NOT a usable reference here (a 10-step cd sawtooth biasing mean cd +5%;
-    nOuter ≥ 2 cures it, maxCo 0.25 and CrankNicolson do not); (b) the
+    nOuter ≥ 2 cures it, maxCo 0.25 and CrankNicolson do not); (ii) the
     plan's 40 D/U run length reads "not saturated" for SST (3 saturated
-    periods), 64 D/U is needed; (c) `--dt-recompute 16` is already the
+    periods), 64 D/U is needed; (iii) `--dt-recompute 16` is already the
     O-grid cylinder default (the plan's probe is the default run; its
-    opt-out 1 costs 1.28× and moves nothing); (d) `--cfl 0.8` reproduces
+    opt-out 1 costs 1.28× and moves nothing); (iv) `--cfl 0.8` reproduces
     cfl 0.4's statistics within 0.2% at half the cost -- a default change
     is a user decision, not made.
 
@@ -593,6 +885,46 @@ uncommitted).
     idempotence is unproven), so its entry hook and the LES stage-1 μt reuse
     of item 26 remain. HIP graphs measured −4% per launch and are not used.
     docs/rans.md "Launch reduction".
+
+## Thermal parity (`plans/verify/exp_thermal.md`, `tools/parity/othermal.py`)
+
+29. **Thermal parity vs OpenFOAM: equivalent (2026-10-27); two items open.**
+    Re 40 O-grid cylinder, M 0.2, identical cells, isothermal wall,
+    Sutherland: Nu −0.34% / −0.14% and cd +0.43% / +0.14% against
+    rhoSimpleFoam at Tw/Tinf 1.1 / 2.0 (const μ Pr 0.72: Nu −0.35%).
+    Reproduced end to end by `othermal.py` (impl_batch.md). It holds ONLY
+    with OpenFOAM's missing viscous work added (coded fvOption div(τ·u) on
+    e; stock reads Nu 4.42% high at Ec 0.16) and dns Sutherland at
+    `--prandtl 0.690335` (OpenFOAM's modified-Eucken κ). The residual
+    (Nu 0.1–0.35%, growing to −0.9% at 180°) is unattributed, the size of
+    dns' own 2×-grid move (0.12%). Open:
+    - the M 0.5 adiabatic recovery reference: dns r 0.77, foam + div(τ·u)
+      0.71 and still rising; the foam LTS run is unconverged (cd −3.1%);
+    - RANS Prt heat transfer: not compared.
+
+## Incompressible force box and placement (`plans/verify/exp_mrfC.md`)
+
+30. **Fixed 2026-10-27: the incompressible force tally dropped the
+    wall-adjacent z layers of a body that reaches them, and `--ny ≠ n`
+    put the body off-centre.**
+    - `gpu::bodyBox` clamped k to [2, nz−3] while the interior is
+      1..nz−2. A mesh overhanging the z box is not `zSpans`, so its cd/cl
+      came out ×0.5 at `--nz 4` (×14/16 at nz 16; an EMPTY box at nz 2).
+      Now a world box reaching into layer 1 or nz−2 keeps it (the z-spanning
+      bodies already did, via `zSpans`). The box wall then enters cs only,
+      as it already did for those. `gpu_bodyforce` (3b) pins per-span
+      cd/cl/cdf at nz 2/4/16 equal to the 2D tally, to 1e-9; it fails
+      before the fix (nan / ×0.5 / ×0.875).
+    - The placement put cy = h + L/2 whatever `--ny` was; the compressible
+      box centres on ly. `--n 64 --ny 32` put the body centre above the box
+      without a rejection. The same held for a sphere's cz at `--nz ≠ n`.
+      Now both centre on the interior; the axis with n cells keeps the
+      L/2 form, so every ny == n run is bit-identical (`cli_defaults`).
+    - No anchor moved: nz == 1 and ny == n are untouched; the
+      `cyl_re60_n256_cd` argv at `--ft 0.5` writes a byte-identical stats
+      file before and after. The exp_mrfC incompressible Cn/Cc (×2
+      hand-corrected there, nz 4, ny 449) was taken off-centre: rerun it
+      before citing it.
 
 ## Older open items (details in CLAUDE.md)
 

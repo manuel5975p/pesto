@@ -85,7 +85,7 @@ Measured on gfx1100, 2026-07-17. "runtime" = full ctest wall time.
 | `val_cyl_re100` | Williamson (1988) St = 0.164; Henderson cd 1.33-1.35 | St 0.1963, cd 1.730 | St in [0.157, 0.205]; cd in [1.33, 1.82] | ceilings +25%/+35% per the confinement table (measured +20%/+29%, excess grows with Re); floors = unbounded values | 69 s |
 | `val_tgv3d_64` | anchor: repo curve `ours_tgv64.csv`; literature: 512^3 spectral reference `spectral_Re1600_512.gdiag` (dissipation peak 0.01286 at t = 8.97) | K/eps curves; peak 0.01182 at t = 8.34 (-8.1%) | curves within 2e-3 / 2e-2; peak time [8.0, 10.0]; value [-40%, +5%] | same binary => near-bitwise vs own curve (measured 6.6e-6 / 1.0e-5; slack for compiler/ROCm drift); 64^3 under-resolves the peak => trend band only, tight claim at 128^3 | 0.3 s |
 | `val_ogrid_cyl` (2026-10-27, gfx1100) | (a) Williamson (1988) St(100) 0.164-0.166, 2D DNS cd 1.33-1.40, cl' 0.32-0.34; (b) Dennis & Chang (1970) cd(40) 1.522 | (a) 192x96 `--ogrid-trip 0.05`, window t [82, 121.4] (7 periods, scatter 2e-4): St 0.1679, cd 1.3800, cl' 0.3333; (b) 256x96 `--steady 1e-4`: cd 1.56656 (exit 0, 31200 it), offset-corrected 1.5089 | (a) St in [0.160, 0.172], cd in [1.33, 1.42], cl' in [0.30, 0.36], >= 6 periods, first/last-period cl' within 2%; (b) cd / 1.0382 within 2% of 1.522, cd within 1e-3 of 1.56656 | (a) the masterplan's bands, set before measuring; body-fitted wall, 20 D far row, 15.7 cells in D/sqrt(Re): St +1.2..2.2%, no blockage excess to admit; (b) 1.0382 = the MEASURED M 0.2 / 20 D factor ("O-grid cylinder" below), 2% = the literature spread (Fornberg 1.498); the 1e-3 pin is 25x the run's cd jitter (3.6e-5) | 27 s |
-| `val_comp_cyl_re60` | anchor only (comp cd has no clean unbounded literature value at this confinement) | cd 1.9441 (dead steady: flat to 1.5e-5 in the window, repeat run bit-identical); cd_comp - cd_incomp = +0.1255 | cd vs `comp_re60_n256_cd` +-1%; cd_comp - cd_incomp in [0.06, 0.20] | anchors regenerated 2026-07-29, so the test runs; the offset band is the measured value +-50% and is a CROSS-BRANCH check, not an M^2 correction (adjustment 6 below) | 21 s |
+| `val_comp_cyl_re60` | anchor only (comp cd has no clean unbounded literature value at this confinement) | cd 1.9522 (impermeable faces, 2026-10-27; was 1.9441. NOT steady: a shedding mode grows through the window, repeat run bit-identical); cd_comp - cd_incomp = +0.1335 | cd vs `comp_re60_n256_cd` +-1%; cd_comp - cd_incomp in [0.06, 0.20] | anchors regenerated 2026-07-29, so the test runs; the offset band is the measured value +-50% and is a CROSS-BRANCH check, not an M^2 correction (adjustment 6 below) | 21 s |
 
 ### Tier B (`-DDNS_HEAVY_VALIDATION=ON`; total 1362 s GPU)
 
@@ -631,7 +631,7 @@ tol_rel 0.01 is safe; widen to 0.015 only if drift is observed and note it here.
 | anchor | value | tol_rel | notes |
 |---|---|---|---|
 | `cyl_re60_n256_cd` | 1.818652 | 0.01 | 4.5 min; shedding; reproduces the 2026-07-17 value 1.818 — the recomposition did not move it |
-| `comp_re60_n256_cd` | 1.944129 | 0.01 | 21 s; steady, cd flat to 1.5e-5 over [30, 62.8] and the same value to 6 digits over [95, 127.6] |
+| `comp_re60_n256_cd` | 1.944129 | 0.01 | 21 s; steady-looking, cd flat to 1.5e-5 over [30, 62.8] -- superseded 2026-10-27, below |
 
 Both repeat runs were byte-for-byte identical in `_stats.csv`, so tol_rel 0.01
 stands. `comp_re800_n512_{cd,st}` and `sphere_re300_n160_cd` are still deferred;
@@ -649,6 +649,23 @@ measured directly before flipping: Re60 nscbc cylinder mean cd 1.786575 →
 order below tol_rel. Both are trajectory changes, not new physics; a run
 wanting the old bare boundary bit-for-bit passes `--nscbc-sink 0`
 (`--nscbc-etalat 0.25` restores the old lateral rate).
+
+#### Re-pinned 2026-10-27 (gfx1100): impermeable ghost-wall faces
+
+| anchor | value | tol_rel | notes |
+|---|---|---|---|
+| `comp_re60_n256_cd` | 1.952196 | 0.01 | was 1.944129 (the pre-change tree measured 1.942739); `plans/verify/impl_imperm.md` |
+
+The compressible ghost wall's interface faces became impermeable
+(`DeviceCompGhost::applyRhs`): the leaking wall was a net mass source on the
+body. Two things the old row claimed are retracted. (1) "Steady": the run is
+a slow transient in BOTH wall versions; a shedding mode (St 0.174) grows
+through the window and saturates at cd 1.986, cl_rms 0.14 past t ~ 100
+(impermeable) / ~150 (the leaking wall, whose source delayed it). The window
+value is a pre-transition plateau and is pinned as such. (2) The leaking
+wall carried a spurious mean cl of -0.014 on the symmetric cylinder; it is 0
+now. The cross-branch gap to the incompressible cut-cell value is +7.3%
+(+0.1335, inside the [0.06, 0.20] band): impermeability does not close it.
 
 ### Convergence / blockage sweeps (optional, not automated)
 

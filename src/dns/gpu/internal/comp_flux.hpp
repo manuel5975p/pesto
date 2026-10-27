@@ -225,9 +225,40 @@ __device__ inline Real mrfFaceQNode(const MrfView& z, const GpuGrid& g, int i,
     return z.psi[hi + i] - z.psi[hi + i1];
 }
 
+// The values of ONE of a face's two cells, as the face flux reads them: the
+// primitives plus mu_t (0 when there is no eddy viscosity). A value, not an
+// index, so a wall that images a cell differently per face (the two-sided
+// ghost, comp_ghost.hip) can hand the flux its own state for that face while
+// the tangential stencil keeps reading the grid.
+struct FaceCell
+{
+    Real rho, u[3], e, p, T, nut;
+};
+
+__device__ inline FaceCell faceCell(PrimView q, const Real* nut, std::size_t c)
+{
+    return {q.rho[c], {q.u[c], q.v[c], q.w[c]}, q.e[c], q.p[c], q.T[c],
+            nut ? nut[c] : Real(0)};
+}
+
+// Normal velocities of an IMPERMEABLE wall face (comp_ghost's fluid/ghost
+// interface faces): va replaces the advecting normal velocity, vn the one the
+// pressure works through (both area fluxes on the curvilinear mesh). Rest:
+// 0, 0. MRF: 0 (no flux relative to the frame), the frame's own w_n. A moving
+// wall: u_wall . n for both.
+struct WallNormal
+{
+    Real va, vn;
+};
+
 // Total Kennedy-Gruber convective minus viscous flux through the face between
-// cells a and b (b = a + one step along `axis`); identical expression from
-// both sides of a face keeps the scheme exactly conservative.
+// cells a and b (b = a + one step along `axis`), with the two face cells'
+// values A (of a) and B (of b); identical expression from both sides of a face
+// keeps the scheme exactly conservative.
+// wl (optional): an impermeable wall face -- the advecting and working normal
+// velocities are wl's instead of the face mean's, so the advective flux is
+// exactly rho_f va {1, u_f, e_f} (0 at rest) while the pressure flux and the
+// viscous stress, work and conduction stay the face's own.
 //
 // `o` are the wrap-corrected neighbour offsets (dns/gpu/index.hpp) of ANY cell
 // on the a-b line: the tangential stencil only ever steps along d != axis, and
@@ -235,15 +266,85 @@ __device__ inline Real mrfFaceQNode(const MrfView& z, const GpuGrid& g, int i,
 // therefore serve both of its faces on every axis, which is what removes the
 // per-access gidx from the hot loop. Pre: b == a + o.p[axis].
 //
-// nut (optional, per-cell eddy viscosity mu_t, LES or RANS): when non-null the
-// face-averaged value is added to mu and, scaled by kapScale = cp/Pr_t, to
-// kappa. nut==nullptr reproduces the molecular DNS flux bit-for-bit. The
-// surface tallies pass the same nut the rhs used, wall image included.
+// eddy (LES or RANS): the face-averaged mu_t of A and B is added to mu and,
+// scaled by kapScale = cp/Pr_t, to kappa. false reproduces the molecular DNS
+// flux bit-for-bit. The surface tallies pass the same mu_t the rhs used, wall
+// image included.
 // wf (optional): frame velocity at this face (--rotor-frame mrf, MrfView).
 // Non-null switches the ADVECTING normal velocity to un - wf[axis] in every
 // transport term while the pressure work in the energy flux stays on the
 // absolute un -- the rotating-frame flux in absolute-velocity form. nullptr is
 // the inertial flux bit-for-bit.
+__device__ inline Flux faceFluxOf(const GpuGrid& g, ViscView vv, PrimView q,
+                                  const Offsets& o, std::size_t a,
+                                  std::size_t b, int axis, const FaceCell& A,
+                                  const FaceCell& B, bool eddy, Real kapScale,
+                                  const Real* wf,
+                                  const WallNormal* wl = nullptr)
+{
+    const Real h = axis == 0 ? g.hx : axis == 1 ? g.hy : g.hz;
+
+    const Real rm = Real(0.5) * (A.rho + B.rho);
+    const Real um[3] = {Real(0.5) * (A.u[0] + B.u[0]),
+                        Real(0.5) * (A.u[1] + B.u[1]),
+                        Real(0.5) * (A.u[2] + B.u[2])};
+    const Real em = Real(0.5) * (A.e + B.e);
+    const Real pm = Real(0.5) * (A.p + B.p);
+    const Real un = wl ? wl->vn : um[axis];
+    const Real ua = wl ? wl->va : wf ? un - wf[axis] : un; // advecting
+    Flux f{rm * ua, rm * ua * um[0], rm * ua * um[1], rm * ua * um[2],
+           rm * ua * em + pm * un};
+    (axis == 0 ? f.mx : axis == 1 ? f.my : f.mz) += pm;
+    // Sutherland is evaluated ONCE per face, on the face-average temperature
+    // the Fourier flux already uses -- not per cell -- so mu and kappa stay a
+    // single consistent pair on both sides of the face and the scheme stays
+    // exactly conservative.
+    Real muf = vv.mu, kapf = vv.kappa;
+    if (vv.sutherland) {
+        const Real r = vv.ratio(Real(0.5) * (A.T + B.T));
+        muf *= r;
+        kapf *= r;
+    }
+    if (eddy) {
+        const Real nf = Real(0.5) * (A.nut + B.nut);
+        muf += nf;
+        kapf += nf * kapScale;
+    }
+    if (muf == Real(0)) return f;
+
+    // du[c][d] = d u_c / d x_d at the face: compact along the normal,
+    // averaged central along the tangents.
+    const Real* uc[3] = {q.u, q.v, q.w};
+    Real du[3][3];
+    for (int c = 0; c < 3; ++c) {
+        du[c][axis] = (B.u[c] - A.u[c]) / h;
+        for (int d = 0; d < 3; ++d) {
+            if (d == axis) continue;
+            const Real hd = d == 0 ? g.hx : d == 1 ? g.hy : g.hz;
+            du[c][d] = Real(0.25) *
+                (uc[c][a + o.p[d]] - uc[c][a + o.m[d]] +
+                 uc[c][b + o.p[d]] - uc[c][b + o.m[d]]) / hd;
+        }
+    }
+    const Real divu = du[0][0] + du[1][1] + du[2][2];
+    const Real dTn = (B.T - A.T) / h;
+    Real eflux = kapf * dTn;
+    Real* fm[3] = {&f.mx, &f.my, &f.mz};
+    for (int c = 0; c < 3; ++c) {
+        const Real tau = muf * (du[c][axis] + du[axis][c]) -
+                         (c == axis ? Real(2.0 / 3.0) * muf * divu : Real(0));
+        *fm[c] -= tau;
+        eflux += um[c] * tau;
+    }
+    f.E -= eflux;
+    return f;
+}
+
+// The solver's own flux, both face cells read off the grid. The SAME
+// expression as faceFluxOf, kept as its own body on purpose: the hot stage and
+// the NSCBC rows compile it, and routing them through the value form moved the
+// NSCBC rows' FMA contraction (measured: Re40 stats off HEAD at row 4).
+// nut (optional, per-cell mu_t): non-null switches the eddy terms on.
 __device__ inline Flux faceFlux(const GpuGrid& g, ViscView vv, PrimView q,
                                 const Offsets& o, std::size_t a, std::size_t b,
                                 int axis, const Real* nut = nullptr,
@@ -435,6 +536,82 @@ __host__ __device__ inline Real curvDelta2(const GpuGrid& g, Real invVol)
 // wS: the same correction already dotted with the face area (the node-psi MRF
 // path, mrfFaceQNode); read only when wf is null. 0 is the inertial flux --
 // Un - 0 is Un exactly, so the default changes nothing.
+// A/B, eddy, wl: the face cells' values, the eddy switch and the impermeable
+// wall override (area fluxes here), as in faceFluxOf.
+__device__ inline Flux faceFluxCurvOf(ViscView vv, PrimView q, CurvView m,
+                                      const Offsets& o, std::size_t a,
+                                      std::size_t b, int axis,
+                                      const FaceCell& A, const FaceCell& B,
+                                      bool eddy, Real kapScale,
+                                      const Real* wf, Real wS,
+                                      const WallNormal* wl = nullptr)
+{
+    const Real Sv[3] = {m.S[axis][0][a], m.S[axis][1][a], m.S[axis][2][a]};
+
+    const Real rm = Real(0.5) * (A.rho + B.rho);
+    const Real um[3] = {Real(0.5) * (A.u[0] + B.u[0]),
+                        Real(0.5) * (A.u[1] + B.u[1]),
+                        Real(0.5) * (A.u[2] + B.u[2])};
+    const Real em = Real(0.5) * (A.e + B.e);
+    const Real pm = Real(0.5) * (A.p + B.p);
+    const Real Un =
+        wl ? wl->vn : um[0] * Sv[0] + um[1] * Sv[1] + um[2] * Sv[2];
+    const Real Ua = wl ? wl->va
+                  : wf ? Un - (wf[0] * Sv[0] + wf[1] * Sv[1] + wf[2] * Sv[2])
+                       : Un - wS;
+    Flux f{rm * Ua, rm * Ua * um[0] + pm * Sv[0], rm * Ua * um[1] + pm * Sv[1],
+           rm * Ua * um[2] + pm * Sv[2], rm * Ua * em + pm * Un};
+    Real muf = vv.mu, kapf = vv.kappa;
+    if (vv.sutherland) {
+        const Real r = vv.ratio(Real(0.5) * (A.T + B.T));
+        muf *= r;
+        kapf *= r;
+    }
+    if (eddy) {
+        const Real nf = Real(0.5) * (A.nut + B.nut);
+        muf += nf;
+        kapf += nf * kapScale;
+    }
+    if (muf == Real(0)) return f;
+
+    // d{u,v,w,T}/dxi at the face (dxi = 1): normal compact, tangential the
+    // same two-cell average of central differences as the Cartesian flux.
+    const Real* fld[4] = {q.u, q.v, q.w, q.T};
+    const Real va[4] = {A.u[0], A.u[1], A.u[2], A.T};
+    const Real vb[4] = {B.u[0], B.u[1], B.u[2], B.T};
+    Real dxi[4][3];
+    for (int c = 0; c < 4; ++c) {
+        dxi[c][axis] = vb[c] - va[c];
+        for (int d = 0; d < 3; ++d) {
+            if (d == axis) continue;
+            dxi[c][d] = Real(0.25) *
+                (fld[c][a + o.p[d]] - fld[c][a + o.m[d]] +
+                 fld[c][b + o.p[d]] - fld[c][b + o.m[d]]);
+        }
+    }
+    Real gr[4][3]; // d{u,v,w,T}/dx_c
+    for (int c = 0; c < 4; ++c)
+        for (int cx = 0; cx < 3; ++cx)
+            gr[c][cx] = dxi[c][0] * m.Ji[axis][0 + cx][a] +
+                        dxi[c][1] * m.Ji[axis][3 + cx][a] +
+                        dxi[c][2] * m.Ji[axis][6 + cx][a];
+    const Real divu = gr[0][0] + gr[1][1] + gr[2][2];
+    Real eflux = kapf * (gr[3][0] * Sv[0] + gr[3][1] * Sv[1] + gr[3][2] * Sv[2]);
+    Real* fm[3] = {&f.mx, &f.my, &f.mz};
+    for (int c = 0; c < 3; ++c) {
+        Real ts = Real(0); // (tau . S)_c
+        for (int d = 0; d < 3; ++d)
+            ts += (muf * (gr[c][d] + gr[d][c]) -
+                   (c == d ? Real(2.0 / 3.0) * muf * divu : Real(0))) * Sv[d];
+        *fm[c] -= ts;
+        eflux += um[c] * ts;
+    }
+    f.E -= eflux;
+    return f;
+}
+
+// The solver's curvilinear flux, both face cells off the grid: faceFluxCurvOf's
+// expression in its own body, for the reason faceFlux gives.
 __device__ inline Flux faceFluxCurv(ViscView vv, PrimView q, CurvView m,
                                     const Offsets& o, std::size_t a,
                                     std::size_t b, int axis,

@@ -47,9 +47,37 @@ citing". Tier Bc's energy convection (`bounded Gauss linearUpwind grad(e)`,
 
 Identical-mesh cases live outside the suite, one script each, because their
 mesh is dns's own (`--emit mesh` -> `dnsmesh.py`), never snappy-generated:
-`sph1e4.py` (revolved wedge, steady RANS and laminar, simpleFoam) and
+`sph1e4.py` (revolved wedge, steady RANS and laminar, simpleFoam),
 `ocyl1e4.py` (2D cylinder O-grid, URANS shedding Re 1e4, rhoPimpleFoam;
-masterplan_verify W12).
+masterplan_verify W12) and `othermal.py` (2D cylinder O-grid, Re 40,
+isothermal wall heat transfer, rhoSimpleFoam; below).
+
+## Thermal parity (`othermal.py`)
+
+Laminar steady Re 40 cylinder, M 0.2, O-grid 128 x 64 far 20 D, identical
+cells. dns `--wall isothermal --twall R --visc sutherland --tinf 300
+--prandtl 0.690335 --steady 1e-5 --steady-scheme implicit` (exact argv in
+the script); OpenFOAM rhoSimpleFoam, `sutherland` transport, U/e/Ekp
+`bounded Gauss linear`, laplacian `Gauss linear corrected` (unlimited).
+Observables: Nu (area mean, film, and at 0/45/90/135/180 deg), cd, T1.
+Three traps, each commented in the script:
+
+- **Viscous work.** rhoSimpleFoam/rhoPimpleFoam (v2606) carry no
+  div(tau.u) in the energy equation. The case adds it as a coded fvOption
+  (`scalarCodedSource` on e, `fvc::div((-devRhoReff) & U)`). Without it
+  foam's Nu reads 4.4-4.6% high at Ec 0.16 (Tw/Tinf 1.1) and 0.55% at Ec
+  0.016 (2.0). `--stock` omits the source to reproduce that gap.
+- **Pr.** OpenFOAM's sutherland kappa is modified Eucken, mu cp/0.690335;
+  dns must run `--prandtl 0.690335` (the script refuses another Pr with
+  `--visc suth`). At 0.72 the comparison shows a false 4.3% kappa gap.
+- **Sign.** dns qw is positive into the body, foam wallHeatFlux into the
+  fluid: q_hot = -qw = +wallHeatFlux.
+
+Verdict (exp_thermal.md, reproduced end to end by the script in
+impl_batch.md): equivalent. Nu -0.34% (Tw/Tinf 1.1) and -0.14% (2.0), cd
++0.43% / +0.14%. The dns 2x-grid change is 0.12% in Nu. Open: the M 0.5
+adiabatic recovery reference (foam LTS unconverged, cd -3.1%) and RANS Prt
+heat transfer; neither is codified.
 
 `rotor` is NOT prop1c. prop1c (chord 0.109 D, t/c 0.55) needs c/h >= 10,
 i.e. D/h >= 111 and ~1 h per point (L3: below c/h 10 the result depends on

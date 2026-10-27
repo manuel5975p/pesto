@@ -2,6 +2,7 @@
 
 #include "dns/gpu/internal/comp_flux.hpp"
 #include "dns/gpu/internal/reduce.hpp"
+#include "dns/gpu/internal/stage_write.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/rans.hpp"
 
@@ -52,20 +53,31 @@ namespace {
 // round-off. A pressure-only extrapolation is therefore not offered.
 // The adiabatic image keeps T, not rho: rho_ghost = rho_sample p_g / p_s, so
 // dT/dn stays zero and the gradient lives in the density, as in the gas.
-__global__ void kGhostFill(Real gamma, int iso, Real Twall, Real Rgas,
-                           const int* gcell, const int* gnbr, const Real* gw,
-                           const int* tnbr, const Real* tw, const Real* gscale,
-                           const Real* uw, const Real* as, int m, Real* rho,
-                           Real* mx, Real* my, Real* mz, Real* E)
+//
+// ghostImage is the image itself, as a value: kGhostFill stores it into the
+// ghost cell, and a two-sided face's side image (kSideRhs, kSideTally) is the
+// same arithmetic on its own stencil, so it is exactly what a ghost of that
+// stencil would hold. gnbr/gw/tnbr/tw point at this image's 8 entries; uw at
+// its 3 (null = resting wall), as its pressure span (read iff uw).
+struct GhostCons
 {
-    const int q = blockIdx.x * blockDim.x + threadIdx.x;
-    if (q >= m) return;
+    Real rho, mx, my, mz, E;
+};
+
+__device__ inline GhostCons ghostImage(Real gamma, int iso, Real Twall,
+                                       Real Rgas, const int* gnbr,
+                                       const Real* gw, const int* tnbr,
+                                       const Real* tw, Real a, const Real* uw,
+                                       Real as, const Real* rho, const Real* mx,
+                                       const Real* my, const Real* mz,
+                                       const Real* E)
+{
     // Velocity sample (and its rho, p: the isothermal T image's sample).
     Real ri = 0, ui = 0, vi = 0, wi = 0, pi = 0;
     for (int s = 0; s < 8; ++s) {
-        const Real w = gw[8 * q + s];
+        const Real w = gw[s];
         if (w == Real(0)) continue;
-        const int c = gnbr[8 * q + s];
+        const int c = gnbr[s];
         const Real r = rho[c];
         ri += w * r;
         ui += w * mx[c] / r;
@@ -79,19 +91,17 @@ __global__ void kGhostFill(Real gamma, int iso, Real Twall, Real Rgas,
     // coinciding stencil gives rt == ri and pt == pi bit for bit.
     Real rt = 0, pt = 0;
     for (int s = 0; s < 8; ++s) {
-        const Real w = tw[8 * q + s];
+        const Real w = tw[s];
         if (w == Real(0)) continue;
-        const int c = tnbr[8 * q + s];
+        const int c = tnbr[s];
         const Real r = rho[c];
         rt += w * r;
         pt += w * (gamma - Real(1)) *
               (E[c] -
                Real(0.5) * (mx[c] * mx[c] + my[c] * my[c] + mz[c] * mz[c]) / r);
     }
-    const Real a = gscale[q];
-    const int c = gcell[q];
     if (uw) {
-        const Real pg = pt + rt * as[q];
+        const Real pg = pt + rt * as;
         Real rg = rt * (pg / pt);
         if (iso) {
             // The resting branch's floored temperature image, below.
@@ -99,17 +109,13 @@ __global__ void kGhostFill(Real gamma, int iso, Real Twall, Real Rgas,
             const Real Tg = fmaxf(Twall + a * (Twall - Ts), Real(0.05) * Twall);
             rg = pg / (Rgas * Tg);
         }
-        rho[c] = rg;
         const Real b = Real(1) + a;
-        const Real ug = b * uw[3 * q + 0] - a * ui;
-        const Real vg = b * uw[3 * q + 1] - a * vi;
-        const Real wg = b * uw[3 * q + 2] - a * wi;
-        mx[c] = rg * ug;
-        my[c] = rg * vg;
-        mz[c] = rg * wg;
-        E[c] = pg / (gamma - Real(1)) +
-               Real(0.5) * rg * (ug * ug + vg * vg + wg * wg);
-        return;
+        const Real ug = b * uw[0] - a * ui;
+        const Real vg = b * uw[1] - a * vi;
+        const Real wg = b * uw[2] - a * wi;
+        return {rg, rg * ug, rg * vg, rg * wg,
+                pg / (gamma - Real(1)) +
+                    Real(0.5) * rg * (ug * ug + vg * vg + wg * wg)};
     }
     // Isothermal image of the temperature. Let s be the outward wall-normal
     // coordinate with s = 0 on the wall face: the ghost centre sits at
@@ -140,12 +146,29 @@ __global__ void kGhostFill(Real gamma, int iso, Real Twall, Real Rgas,
         const Real Tg = fmaxf(Twall + a * (Twall - Ts), Real(0.05) * Twall);
         rg = pt / (Rgas * Tg);
     }
-    rho[c] = rg;
-    mx[c] = -a * rg * ui;
-    my[c] = -a * rg * vi;
-    mz[c] = -a * rg * wi;
-    E[c] = pt / (gamma - Real(1)) +
-           Real(0.5) * a * a * rg * (ui * ui + vi * vi + wi * wi);
+    return {rg, -a * rg * ui, -a * rg * vi, -a * rg * wi,
+            pt / (gamma - Real(1)) +
+                Real(0.5) * a * a * rg * (ui * ui + vi * vi + wi * wi)};
+}
+
+__global__ void kGhostFill(Real gamma, int iso, Real Twall, Real Rgas,
+                           const int* gcell, const int* gnbr, const Real* gw,
+                           const int* tnbr, const Real* tw, const Real* gscale,
+                           const Real* uw, const Real* as, int m, Real* rho,
+                           Real* mx, Real* my, Real* mz, Real* E)
+{
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= m) return;
+    const GhostCons G = ghostImage(
+        gamma, iso, Twall, Rgas, gnbr + 8 * q, gw + 8 * q, tnbr + 8 * q,
+        tw + 8 * q, gscale[q], uw ? uw + 3 * q : nullptr, uw ? as[q] : Real(0),
+        rho, mx, my, mz, E);
+    const int c = gcell[q];
+    rho[c] = G.rho;
+    mx[c] = G.mx;
+    my[c] = G.my;
+    mz[c] = G.mz;
+    E[c] = G.E;
 }
 
 // RANS scalar images of the ghosts (DeviceCompGhost::applyTurb): the specific
@@ -326,6 +349,27 @@ __global__ void kQuiescent(const int* cells, int m, Real rhoInf, Real EInf,
 // inviscid early-out of faceFlux is reproduced without a branch.
 // nut (LES/RANS, else null): the face-averaged eddy conductivity
 // nut_f * kapScale the flux adds, exactly as faceFlux adds it.
+// A, B: the face cells' values (FaceCell); eddy: mu_t on, as in faceFluxOf.
+__device__ inline Real faceKappa(ViscView vv, const FaceCell& A,
+                                 const FaceCell& B, bool eddy, Real kapScale)
+{
+    Real kapf = vv.kappa;
+    if (vv.sutherland) kapf *= vv.ratio(Real(0.5) * (A.T + B.T));
+    if (!eddy) return kapf;
+    return kapf + Real(0.5) * (A.nut + B.nut) * kapScale;
+}
+
+__device__ inline Real faceConductionOf(const GpuGrid& g, ViscView vv,
+                                        int axis, const FaceCell& A,
+                                        const FaceCell& B, bool eddy,
+                                        Real kapScale)
+{
+    const Real h = axis == 0 ? g.hx : axis == 1 ? g.hy : g.hz;
+    return -faceKappa(vv, A, B, eddy, kapScale) * (B.T - A.T) / h;
+}
+
+// The tally's own conduction, off the grid: faceConductionOf's expression in
+// its own body, so kBodyFlux compiles exactly what it always did.
 __device__ inline Real eddyKappa(Real kapf, const Real* nut, Real kapScale,
                                  std::size_t a, std::size_t b)
 {
@@ -349,6 +393,29 @@ __device__ inline Real faceConduction(const GpuGrid& g, ViscView vv, PrimView q,
 // Curvilinear twin: the temperature gradient in index space mapped through the
 // face inverse Jacobian and contracted with the face area vector, exactly as
 // faceFluxCurv builds its Fourier term (so the result already carries area).
+__device__ inline Real faceConductionCurvOf(PrimView q, CurvView m,
+                                            ViscView vv, const Offsets& o,
+                                            std::size_t a, std::size_t b,
+                                            int axis, const FaceCell& A,
+                                            const FaceCell& B, bool eddy,
+                                            Real kapScale)
+{
+    const Real Sv[3] = {m.S[axis][0][a], m.S[axis][1][a], m.S[axis][2][a]};
+    Real dxi[3];
+    dxi[axis] = B.T - A.T;
+    for (int d = 0; d < 3; ++d) {
+        if (d == axis) continue;
+        dxi[d] = Real(0.25) * (q.T[a + o.p[d]] - q.T[a + o.m[d]] +
+                               q.T[b + o.p[d]] - q.T[b + o.m[d]]);
+    }
+    Real gT[3];
+    for (int c = 0; c < 3; ++c)
+        gT[c] = dxi[0] * m.Ji[axis][0 + c][a] + dxi[1] * m.Ji[axis][3 + c][a] +
+                dxi[2] * m.Ji[axis][6 + c][a];
+    return -faceKappa(vv, A, B, eddy, kapScale) *
+           (gT[0] * Sv[0] + gT[1] * Sv[1] + gT[2] * Sv[2]);
+}
+
 __device__ inline Real faceConductionCurv(const GpuGrid& g, ViscView vv,
                                           PrimView q, CurvView m, int i, int j,
                                           int k, int axis, const Real* nut,
@@ -404,6 +471,40 @@ __device__ inline Real faceConductionCurv(const GpuGrid& g, ViscView vv,
 // because a shared subexpression or a runtime branch can change the FMA
 // contraction of the total (the NSCBC lesson), and force() must stay bit-
 // for-bit the tally it always was.
+// The wall's normal velocities at interface face t, owned by cell (i, j, k) =
+// a along axis (WallNormal: area fluxes on the curvilinear mesh). MRF: no
+// flux relative to the frame, and the pressure works through the frame's own
+// face velocity -- the SAME corner stream potential the flux subtracts, so a
+// co-rotating fluid cell sees no change and the zone's transport still
+// telescopes. Moving (fuw non-null): the wall velocity at the face centre.
+// Rest: zero.
+template <bool kCurv>
+__device__ inline WallNormal wallNormal(const GpuGrid& g, const CurvView& m,
+                                        const MrfView& mz, int i, int j, int k,
+                                        int axis, std::size_t a,
+                                        const Real* fuw, int t)
+{
+    Real Sv[3] = {Real(0), Real(0), Real(0)};
+    if constexpr (kCurv) {
+        Sv[0] = m.S[axis][0][a];
+        Sv[1] = m.S[axis][1][a];
+        Sv[2] = m.S[axis][2][a];
+    } else {
+        Sv[axis] = Real(1);
+    }
+    if (mz.active) {
+        if (kCurv && mz.psi) return {Real(0), mrfFaceQNode(mz, g, i, j, axis)};
+        Real w[3];
+        mrfFaceVel(mz, i, j, k, axis, w);
+        return {Real(0), kCurv ? w[0] * Sv[0] + w[1] * Sv[1] + w[2] * Sv[2]
+                               : w[axis]};
+    }
+    if (!fuw) return {Real(0), Real(0)};
+    const Real* u = fuw + 3 * t;
+    const Real v = kCurv ? u[0] * Sv[0] + u[1] * Sv[1] + u[2] * Sv[2] : u[axis];
+    return {v, v};
+}
+
 // The split's spans for face t. ua is the advecting normal velocity (an area
 // flux on the focal mesh) and cs the factor that turns rho ua u into the
 // oriented face flux: sign * area (Cartesian), sign (focal, area in ua).
@@ -420,23 +521,51 @@ __device__ inline void stageSplit(double* acc, int m, int t, Real pm, Real rm,
     }
 }
 
-// Face values of the KG flux at a-b, as faceFlux/faceFluxCurv form them.
+// Face values of the KG flux of face cells A, B, as faceFluxOf forms them.
 struct FaceMeans
 {
     Real rm, pm, um[3];
 };
-__device__ inline FaceMeans faceMeans(PrimView q, std::size_t a, std::size_t b)
+__device__ inline FaceMeans faceMeans(const FaceCell& A, const FaceCell& B)
 {
-    return {Real(0.5) * (q.rho[a] + q.rho[b]), Real(0.5) * (q.p[a] + q.p[b]),
-            {Real(0.5) * (q.u[a] + q.u[b]), Real(0.5) * (q.v[a] + q.v[b]),
-             Real(0.5) * (q.w[a] + q.w[b])}};
+    return {Real(0.5) * (A.rho + B.rho), Real(0.5) * (A.p + B.p),
+            {Real(0.5) * (A.u[0] + B.u[0]), Real(0.5) * (A.u[1] + B.u[1]),
+             Real(0.5) * (A.u[2] + B.u[2])}};
 }
 
+// The split of face t (owned by cell a, along axis, sgn its orientation into
+// the body) from its face means and the wall's advecting normal velocity va
+// (wallNormal: 0 on a resting or MRF wall, so the convective part is exactly
+// zero there), then stageSplit. area: the Cartesian face area (unused on
+// focal).
+template <bool kCurv>
+__device__ inline void stageSplitFace(double* acc, int n, int t,
+                                      const CurvView& m, int axis,
+                                      std::size_t a, Real sgn, Real area,
+                                      const FaceMeans& fm, Real va, double pRef)
+{
+    if constexpr (!kCurv) {
+        const double cs = double(sgn) * double(area);
+        double s[3] = {0.0, 0.0, 0.0};
+        s[axis] = cs;
+        stageSplit(acc, n, t, fm.pm, fm.rm, va, fm.um, cs, s, pRef);
+    } else {
+        const Real Sv[3] = {m.S[axis][0][a], m.S[axis][1][a], m.S[axis][2][a]};
+        const double s[3] = {double(sgn) * double(Sv[0]),
+                             double(sgn) * double(Sv[1]),
+                             double(sgn) * double(Sv[2])};
+        stageSplit(acc, n, t, fm.pm, fm.rm, va, fm.um, double(sgn), s, pRef);
+    }
+}
+
+// The tallies read the IMPERMEABLE face flux the rhs applies (applyRhs):
+// faceFluxOf / faceFluxCurvOf with the wall's normal velocities, so the
+// convective part is the wall's own -- exactly zero at rest and under MRF.
 template <bool kSplit>
 __global__ void kBodyFlux(GpuGrid g, ViscView vv, int iso, PrimView q,
                           const int* fcell, const int* fdir, int m, double* acc,
                           MrfView mz, const Real* nut, Real kapScale,
-                          double pRef)
+                          double pRef, const Real* fuw)
 {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= m) return;
@@ -450,8 +579,13 @@ __global__ void kBodyFlux(GpuGrid g, ViscView vv, int iso, PrimView q,
     const int fi = i - (minus ? (axis == 0) : 0),
               fj = j - (minus ? (axis == 1) : 0),
               fk = k - (minus ? (axis == 2) : 0);
-    const Flux f = faceFlux(g, vv, q, fi, fj, fk, axis, nut, kapScale,
-                            mz.active ? &mz : nullptr);
+    const Offsets o = offsetsAt(g, fi, fj, fk);
+    const std::size_t a = gidx(g, fi, fj, fk), b = a + o.p[axis];
+    const FaceCell A = faceCell(q, nut, a), B = faceCell(q, nut, b);
+    const WallNormal wn =
+        wallNormal<false>(g, CurvView{}, mz, fi, fj, fk, axis, a, fuw, t);
+    const Flux f = faceFluxOf(g, vv, q, o, a, b, axis, A, B, nut != nullptr,
+                              kapScale, nullptr, &wn);
     const Real area = axis == 0 ? g.hy * g.hz
                     : axis == 1 ? g.hx * g.hz
                                 : g.hx * g.hy;
@@ -466,30 +600,18 @@ __global__ void kBodyFlux(GpuGrid g, ViscView vv, int iso, PrimView q,
                      faceConduction(g, vv, q, fi, fj, fk, axis, nut, kapScale) *
                      area)
             : 0.0;
-    if constexpr (kSplit) {
-        const std::size_t a = gidx(g, fi, fj, fk);
-        const FaceMeans fm =
-            faceMeans(q, a, a + offsetsAt(g, fi, fj, fk).p[axis]);
-        Real ua = fm.um[axis];
-        if (mz.active) {
-            Real w[3];
-            mrfFaceVel(mz, fi, fj, fk, axis, w);
-            ua = ua - w[axis];
-        }
-        const double cs = double(sgn) * double(area);
-        double s[3] = {0.0, 0.0, 0.0};
-        s[axis] = cs;
-        stageSplit(acc, m, t, fm.pm, fm.rm, ua, fm.um, cs, s, pRef);
-    }
+    if constexpr (kSplit)
+        stageSplitFace<false>(acc, m, t, CurvView{}, axis, a, sgn, area,
+                              faceMeans(A, B), wn.va, pRef);
 }
 
-// Curvilinear counterpart: faceFluxCurv already integrates over the exact
+// Curvilinear counterpart: faceFluxCurvOf already integrates over the exact
 // face area vector S, so there is no separate area multiply here.
 template <bool kSplit>
 __global__ void kBodyFluxCurv(GpuGrid g, ViscView vv, int iso, PrimView q,
                               CurvView m, const int* fcell, const int* fdir,
                               int n, double* acc, MrfView mz, const Real* nut,
-                              Real kapScale, double pRef)
+                              Real kapScale, double pRef, const Real* fuw)
 {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n) return;
@@ -501,8 +623,14 @@ __global__ void kBodyFluxCurv(GpuGrid g, ViscView vv, int iso, PrimView q,
     const int fi = i - (minus ? (axis == 0) : 0),
               fj = j - (minus ? (axis == 1) : 0),
               fk = k - (minus ? (axis == 2) : 0);
-    const Flux f = faceFluxCurv(g, vv, q, m, fi, fj, fk, axis, nut, kapScale,
-                                mz.active ? &mz : nullptr);
+    const Offsets o = offsetsAt(g, fi, fj, fk);
+    const std::size_t a = gidx(g, fi, fj, fk), b = a + o.p[axis];
+    const FaceCell A = faceCell(q, nut, a), B = faceCell(q, nut, b);
+    const WallNormal wn =
+        wallNormal<true>(g, m, mz, fi, fj, fk, axis, a, fuw, t);
+    const Flux f = faceFluxCurvOf(vv, q, m, o, a, b, axis, A, B,
+                                  nut != nullptr, kapScale, nullptr, Real(0),
+                                  &wn);
     const Real sgn = minus ? Real(-1) : Real(1);
     acc[t] = double(sgn * f.mx);
     acc[n + t] = double(sgn * f.my);
@@ -512,27 +640,8 @@ __global__ void kBodyFluxCurv(GpuGrid g, ViscView vv, int iso, PrimView q,
                                               nut, kapScale))
             : 0.0;
     if constexpr (kSplit) {
-        const std::size_t a = gidx(g, fi, fj, fk);
-        const FaceMeans fm =
-            faceMeans(q, a, a + offsetsAt(g, fi, fj, fk).p[axis]);
-        const Real Sv[3] = {m.S[axis][0][a], m.S[axis][1][a], m.S[axis][2][a]};
-        // The advecting area flux exactly as faceFluxCurv's (i,j,k) form
-        // picks it: node-psi correction, else the pointwise frame velocity.
-        const Real Un = fm.um[0] * Sv[0] + fm.um[1] * Sv[1] + fm.um[2] * Sv[2];
-        Real ua = Un;
-        if (mz.active) {
-            if (mz.psi) {
-                ua = Un - mrfFaceQNode(mz, g, fi, fj, axis);
-            } else {
-                Real w[3];
-                mrfFaceVel(mz, fi, fj, fk, axis, w);
-                ua = Un - (w[0] * Sv[0] + w[1] * Sv[1] + w[2] * Sv[2]);
-            }
-        }
-        const double s[3] = {double(sgn) * double(Sv[0]),
-                             double(sgn) * double(Sv[1]),
-                             double(sgn) * double(Sv[2])};
-        stageSplit(acc, n, t, fm.pm, fm.rm, ua, fm.um, double(sgn), s, pRef);
+        stageSplitFace<true>(acc, n, t, m, axis, a, sgn, Real(0),
+                             faceMeans(A, B), wn.va, pRef);
     }
 }
 
@@ -555,6 +664,286 @@ __global__ void kBodyMoment(const Real* fpos, double px, double py, double pz,
     acc[6 * m + t] = rx * fy - ry * fx;
 }
 
+// ---- Two-sided faces (CompGhostTables::sideFace) ---------------------------
+
+// Device view of the resident side tables, plus the face tables they index.
+struct SideView
+{
+    const int *face, *nbr, *tnbr, *cell, *start, *fcell, *fdir;
+    const Real *w, *tw, *scale, *uw, *as;
+    const Real* fuw; // per interface face (wallNormal); null unless moving
+};
+
+// What kGhostFill's image reads besides its stencil, and the gas constant
+// the primitives use (the solver's, which a default thermal wall need not
+// carry).
+struct ImageParams
+{
+    Real gamma;
+    int iso;
+    Real Twall, wallRgas, Rgas;
+};
+
+// The conserved stage input the images sample (ghost-filled; fluid only).
+struct ConsView
+{
+    const Real *rho, *mx, *my, *mz, *E;
+};
+
+// One interface face: its owning cell (i, j, k) = lo, the pair (lo, hi) along
+// axis, the fluid cell c and whether the ghost is the lo cell -- the same
+// decomposition kBodyFlux makes.
+struct Iface
+{
+    int i, j, k, axis;
+    bool minus;
+    std::size_t c, lo, hi;
+    Offsets o;
+};
+
+__device__ inline Iface iface(const GpuGrid& g, int fcell, int fdir)
+{
+    Iface f;
+    f.c = std::size_t(fcell);
+    int i, j, k;
+    decompose(g, f.c, i, j, k);
+    f.axis = fdir / 2;
+    f.minus = fdir & 1;
+    f.i = i - (f.minus ? (f.axis == 0) : 0);
+    f.j = j - (f.minus ? (f.axis == 1) : 0);
+    f.k = k - (f.minus ? (f.axis == 2) : 0);
+    f.o = offsetsAt(g, f.i, f.j, f.k);
+    f.lo = gidx(g, f.i, f.j, f.k);
+    f.hi = f.lo + f.o.p[f.axis];
+    return f;
+}
+
+// Side image of side face t as the flux reads it: ghostImage on the side
+// stencils, turned into primitives with kPrim's arithmetic, and (nut non-null)
+// mu_t as mirrorMut images it -- odd, -a sum w mu_t, clamped by the fluid
+// cell c's mu_t so the face keeps mu + mu_t >= mu.
+__device__ inline FaceCell sideImage(const SideView& sv, int t,
+                                     const ImageParams& ip, ConsView s,
+                                     const Real* nut, std::size_t c)
+{
+    const GhostCons G = ghostImage(
+        ip.gamma, ip.iso, ip.Twall, ip.wallRgas, sv.nbr + 8 * t, sv.w + 8 * t,
+        sv.tnbr + 8 * t, sv.tw + 8 * t, sv.scale[t],
+        sv.uw ? sv.uw + 3 * t : nullptr, sv.uw ? sv.as[t] : Real(0), s.rho,
+        s.mx, s.my, s.mz, s.E);
+    const Real r = G.rho;
+    FaceCell B;
+    B.rho = r;
+    B.u[0] = G.mx / r;
+    B.u[1] = G.my / r;
+    B.u[2] = G.mz / r;
+    B.e = G.E / r;
+    B.p = (ip.gamma - Real(1)) *
+          (G.E - Real(0.5) * (G.mx * G.mx + G.my * G.my + G.mz * G.mz) / r);
+    B.T = B.p / (r * ip.Rgas);
+    B.nut = Real(0);
+    if (nut) {
+        Real sm = 0;
+        for (int q = 0; q < 8; ++q) {
+            const Real w = sv.w[8 * t + q];
+            if (w == Real(0)) continue;
+            sm += w * nut[sv.nbr[8 * t + q]];
+        }
+        Real lim = sv.scale[t] * sm;
+        if (nut[c] < lim) lim = nut[c];
+        B.nut = -lim;
+    }
+    return B;
+}
+
+// The solver's flux through interface face f with face cells A, B: Cartesian
+// or curvilinear, with the MRF frame correction picked exactly as the
+// (i, j, k) faceFlux/faceFluxCurv forms pick it.
+template <bool kCurv>
+__device__ inline Flux ifaceFlux(const GpuGrid& g, ViscView vv, PrimView q,
+                                 const CurvView& m, const MrfView& mz,
+                                 const Iface& f, const FaceCell& A,
+                                 const FaceCell& B, bool eddy, Real kap,
+                                 const WallNormal* wl)
+{
+    Real w[3];
+    const Real* wf = nullptr;
+    Real wS = Real(0);
+    if (mz.active) {
+        if (kCurv && mz.psi) {
+            wS = mrfFaceQNode(mz, g, f.i, f.j, f.axis);
+        } else {
+            mrfFaceVel(mz, f.i, f.j, f.k, f.axis, w);
+            wf = w;
+        }
+    }
+    if constexpr (kCurv)
+        return faceFluxCurvOf(vv, q, m, f.o, f.lo, f.hi, f.axis, A, B, eddy,
+                              kap, wf, wS, wl);
+    else
+        return faceFluxOf(g, vv, q, f.o, f.lo, f.hi, f.axis, A, B, eddy, kap,
+                          wf, wl);
+}
+
+// rhs half: one thread per fluid cell carrying side faces, its faces summed in
+// table order (deterministic; two faces of one cell never race). Each face
+// adds the fluid cell's flux difference F(side image) - F(shared ghost), both
+// impermeable: kWallRhs already turned the stage's shared flux into the
+// impermeable one, so the face ends on the side image's impermeable flux.
+template <bool Comp, bool kCurv>
+__global__ void kSideRhs(GpuGrid g, ViscView vv, PrimView q, CurvView m,
+                         MrfView mz, SideView sv, ImageParams ip, ConsView s,
+                         const Real* nut, Real kap, int ncell, StageCombine cmb,
+                         Real* o0, Real* o1, Real* o2, Real* o3, Real* o4)
+{
+    const int qc = blockIdx.x * blockDim.x + threadIdx.x;
+    if (qc >= ncell) return;
+    const std::size_t c = std::size_t(sv.cell[qc]);
+    Real d[5] = {0, 0, 0, 0, 0};
+    for (int t = sv.start[qc]; t < sv.start[qc + 1]; ++t) {
+        const int face = sv.face[t];
+        const Iface f = iface(g, sv.fcell[face], sv.fdir[face]);
+        assert(f.c == c);
+        FaceCell A = faceCell(q, nut, f.lo), B = faceCell(q, nut, f.hi);
+        const WallNormal wn = wallNormal<kCurv>(g, m, mz, f.i, f.j, f.k,
+                                                f.axis, f.lo, sv.fuw, face);
+        const Flux F0 = ifaceFlux<kCurv>(g, vv, q, m, mz, f, A, B,
+                                         nut != nullptr, kap, &wn);
+        (f.minus ? A : B) = sideImage(sv, t, ip, s, nut, c);
+        const Flux F1 = ifaceFlux<kCurv>(g, vv, q, m, mz, f, A, B,
+                                         nut != nullptr, kap, &wn);
+        const Real h = f.axis == 0 ? g.hx : f.axis == 1 ? g.hy : g.hz;
+        Real sc = kCurv ? m.invVol[c] : Real(1) / h;
+        if (!f.minus) sc = -sc; // the fluid cell's +face: -(F_hi ...)
+        d[0] += sc * (F1.rho - F0.rho);
+        d[1] += sc * (F1.mx - F0.mx);
+        d[2] += sc * (F1.my - F0.my);
+        d[3] += sc * (F1.mz - F0.mz);
+        d[4] += sc * (F1.E - F0.E);
+    }
+    Real* out[5] = {o0, o1, o2, o3, o4};
+    const Real cr = cmb.crAt(c);
+    for (int v = 0; v < 5; ++v)
+        internal::stageAdd<Comp>(cmb, v, c, cr, d[v], out[v]);
+}
+
+// Tally half: OVERWRITES every staged span of each side face -- force, wall
+// heat and (kSplit) the split's pressure/convective parts -- with the side
+// image's, after kBodyFlux/kBodyFluxCurv staged the shared ghost's. The force
+// is then the flux the rhs applied, face for face, and the split still sums
+// to it (fv = f - fp - fc stays the viscous stress alone).
+template <bool kSplit, bool kCurv>
+__global__ void kSideTally(GpuGrid g, ViscView vv, int iso, PrimView q,
+                           CurvView m, MrfView mz, SideView sv, ImageParams ip,
+                           ConsView s, const Real* nut, Real kap, int nside,
+                           int n, double* acc, double pRef)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nside) return;
+    const int face = sv.face[t];
+    const Iface f = iface(g, sv.fcell[face], sv.fdir[face]);
+    FaceCell A = faceCell(q, nut, f.lo), B = faceCell(q, nut, f.hi);
+    (f.minus ? A : B) = sideImage(sv, t, ip, s, nut, f.c);
+    const bool eddy = nut != nullptr;
+    const WallNormal wn = wallNormal<kCurv>(g, m, mz, f.i, f.j, f.k, f.axis,
+                                            f.lo, sv.fuw, face);
+    const Flux F = ifaceFlux<kCurv>(g, vv, q, m, mz, f, A, B, eddy, kap, &wn);
+    const Real sgn = f.minus ? Real(-1) : Real(1);
+    Real area = Real(0);
+    if constexpr (kCurv) {
+        acc[face] = double(sgn * F.mx);
+        acc[n + face] = double(sgn * F.my);
+        acc[2 * n + face] = double(sgn * F.mz);
+        acc[3 * n + face] =
+            iso ? double(sgn * faceConductionCurvOf(q, m, vv, f.o, f.lo, f.hi,
+                                                    f.axis, A, B, eddy, kap))
+                : 0.0;
+    } else {
+        area = f.axis == 0 ? g.hy * g.hz : f.axis == 1 ? g.hx * g.hz
+                                                       : g.hx * g.hy;
+        acc[face] = double(sgn * F.mx * area);
+        acc[n + face] = double(sgn * F.my * area);
+        acc[2 * n + face] = double(sgn * F.mz * area);
+        acc[3 * n + face] =
+            iso ? double(sgn * faceConductionOf(g, vv, f.axis, A, B, eddy, kap) *
+                         area)
+                : 0.0;
+    }
+    if constexpr (kSplit)
+        stageSplitFace<kCurv>(acc, n, face, m, f.axis, f.lo, sgn, area,
+                              faceMeans(A, B), wn.va, pRef);
+}
+
+// Impermeable faces, rhs half: one thread per fluid cell owning interface
+// faces, its faces summed in table order (deterministic; no atomics). The
+// stage kernel wrote the face's full KG flux; this adds back the advective
+// part relative to the wall and the pressure work off the wall's normal
+// velocity, F_wall - F = -(ua - va) rho_f {1, u_f, e_f} - (un - vn) p_f {0, 0,
+// e}, with ua and un exactly as the flux picked them (frame-corrected under
+// MRF; area fluxes on the curvilinear mesh). Pressure flux, viscous stress,
+// work and conduction are not touched, so they need no re-evaluation.
+template <bool Comp, bool kCurv>
+__global__ void kWallRhs(GpuGrid g, PrimView q, CurvView m, MrfView mz,
+                         const int* fcell, const int* fdir, const int* wcell,
+                         const int* wstart, const Real* fuw, int ncell,
+                         StageCombine cmb, Real* o0, Real* o1, Real* o2,
+                         Real* o3, Real* o4)
+{
+    const int qc = blockIdx.x * blockDim.x + threadIdx.x;
+    if (qc >= ncell) return;
+    const std::size_t c = std::size_t(wcell[qc]);
+    Real d[5] = {0, 0, 0, 0, 0};
+    for (int t = wstart[qc]; t < wstart[qc + 1]; ++t) {
+        const Iface f = iface(g, fcell[t], fdir[t]);
+        assert(f.c == c);
+        const FaceMeans fm = faceMeans(faceCell(q, nullptr, f.lo),
+                                       faceCell(q, nullptr, f.hi));
+        const Real em = Real(0.5) * (q.e[f.lo] + q.e[f.hi]);
+        const WallNormal wn =
+            wallNormal<kCurv>(g, m, mz, f.i, f.j, f.k, f.axis, f.lo, fuw, t);
+        Real un, ua;
+        Real sc;
+        if constexpr (kCurv) {
+            const Real Sv[3] = {m.S[f.axis][0][f.lo], m.S[f.axis][1][f.lo],
+                                m.S[f.axis][2][f.lo]};
+            un = fm.um[0] * Sv[0] + fm.um[1] * Sv[1] + fm.um[2] * Sv[2];
+            ua = un;
+            if (mz.active) {
+                if (mz.psi) {
+                    ua = un - mrfFaceQNode(mz, g, f.i, f.j, f.axis);
+                } else {
+                    Real w[3];
+                    mrfFaceVel(mz, f.i, f.j, f.k, f.axis, w);
+                    ua = un - (w[0] * Sv[0] + w[1] * Sv[1] + w[2] * Sv[2]);
+                }
+            }
+            sc = m.invVol[c];
+        } else {
+            un = fm.um[f.axis];
+            ua = un;
+            if (mz.active) {
+                Real w[3];
+                mrfFaceVel(mz, f.i, f.j, f.k, f.axis, w);
+                ua = un - w[f.axis];
+            }
+            sc = Real(1) / (f.axis == 0 ? g.hx : f.axis == 1 ? g.hy : g.hz);
+        }
+        // The fluid cell's +face enters its rhs as -F/h, its -face as +F/h;
+        // the change of flux is F_wall - F = -(r).
+        if (!f.minus) sc = -sc;
+        const Real ra = fm.rm * (ua - wn.va);
+        d[0] -= sc * ra;
+        d[1] -= sc * (ra * fm.um[0]);
+        d[2] -= sc * (ra * fm.um[1]);
+        d[3] -= sc * (ra * fm.um[2]);
+        d[4] -= sc * (ra * em + fm.pm * (un - wn.vn));
+    }
+    Real* out[5] = {o0, o1, o2, o3, o4};
+    const Real cr = cmb.crAt(c);
+    for (int v = 0; v < 5; ++v)
+        internal::stageAdd<Comp>(cmb, v, c, cr, d[v], out[v]);
+}
+
 } // namespace
 
 std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
@@ -573,6 +962,8 @@ void CompGhostCapacity::cover(const CompGhostTables& t)
     nGhost = std::max(nGhost, t.nGhost());
     nDeep = std::max(nDeep, t.nDeep());
     nFace = std::max(nFace, t.nFace());
+    nSide = std::max(nSide, t.nSide());
+    nSideCell = std::max(nSideCell, t.nSideCell());
 }
 
 CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
@@ -692,6 +1083,9 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
     auto& aspan = T.aspan;
     auto& fpos = T.fpos;
     std::vector<char> isGhost(g.size(), 0);
+    // Imaging normal per ghost, xyz (0 for a neighbour-imaged ghost): which
+    // surface its image belongs to, for the two-sided faces below.
+    std::vector<double> gnorm;
 
     // One trilinear stencil: 8 source cells, their weights (fluid cells only;
     // wsum their sum, normalized at push), and the physical point the
@@ -712,6 +1106,7 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
         Stencil v, t;
         double a;
         double wall[3];
+        double n[3] = {0.0, 0.0, 0.0}; // the imaging normal; 0 = none
     };
     const double Lbox[3] = {Lx, Ly, Lz};
     const int nbox[3] = {nx, ny, nz};
@@ -790,31 +1185,28 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
     // none (a concave pocket), it keeps the velocity stencil. Where the
     // velocity stencil is already full the two coincide, and so do the images,
     // bit for bit.
-    auto normalImage = [&](std::size_t c, int i, int j, int k,
-                           const double dloc[3], Image& im) {
-        const double hl = minSpacing(dloc);
-        // The mirror band must be at least two cells deep along EVERY axis:
-        // the interior stencil reaches two cells, and a quiescent deep-solid
-        // cell inside its reach is a hard discontinuity against the fluid.
-        // The threshold therefore follows the WIDEST local spacing -- with
-        // the smallest, an anisotropic fine region leaves the band under two
-        // cells thick along the wide axis (measured on the Re100 cylinder at
-        // aspect 1.7: cd 1.49 -> -7.6, a spurious thrust). Isotropic cells
-        // make the two identical, so the Cartesian construction is untouched.
-        if (phi[c] < -2.0 * maxSpacing(dloc)) return false;
-        const double x = cx(i), y = cy(j), z = cz(k);
+    // Unit sdf gradient at a physical point (central differences at 1e-3 hl;
+    // z dropped at nz == 1). False on a degenerate gradient.
+    auto unitNormal = [&](double x, double y, double z, double hl,
+                          double nv[3]) {
         const double d = 1e-3 * hl;
-        double nv[3] = {(sdf(x + d, y, z) - sdf(x - d, y, z)) / (2 * d),
-                        (sdf(x, y + d, z) - sdf(x, y - d, z)) / (2 * d),
-                        (sdf(x, y, z + d) - sdf(x, y, z - d)) / (2 * d)};
+        nv[0] = (sdf(x + d, y, z) - sdf(x - d, y, z)) / (2 * d);
+        nv[1] = (sdf(x, y + d, z) - sdf(x, y - d, z)) / (2 * d);
+        nv[2] = (sdf(x, y, z + d) - sdf(x, y, z - d)) / (2 * d);
         if (nz == 1) nv[2] = 0.0;
         const double nn =
             std::sqrt(nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2]);
         if (nn < 1e-12) return false;
-        for (double& v : nv) v /= nn;
+        for (int q = 0; q < 3; ++q) nv[q] /= nn;
+        return true;
+    };
+    // The image of a solid point (x, y, z) at depth dw below a wall plane of
+    // unit normal nv: the stencils, a and the wall point. False when the
+    // sample is unusable (lands among solid cells).
+    auto imageAlong = [&](double x, double y, double z, const double nv[3],
+                          double dw, double hl, Image& im) {
         // Sample at ds beyond the wall (>= 0.75 of the finest local spacing so
         // the stencil always reaches fluid, even for cells barely inside).
-        const double dw = -phi[c];
         const double dsmp = std::max(dw, 0.75 * hl);
         stencilAt(x, y, z, nv, dw + dsmp, im.v);
         if (im.v.wsum < 0.05) return false;
@@ -838,7 +1230,25 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
         im.wall[0] = x + dw * nv[0];
         im.wall[1] = y + dw * nv[1];
         im.wall[2] = z + dw * nv[2];
+        for (int q = 0; q < 3; ++q) im.n[q] = nv[q];
         return true;
+    };
+    auto normalImage = [&](std::size_t c, int i, int j, int k,
+                           const double dloc[3], Image& im) {
+        const double hl = minSpacing(dloc);
+        // The mirror band must be at least two cells deep along EVERY axis:
+        // the interior stencil reaches two cells, and a quiescent deep-solid
+        // cell inside its reach is a hard discontinuity against the fluid.
+        // The threshold therefore follows the WIDEST local spacing -- with
+        // the smallest, an anisotropic fine region leaves the band under two
+        // cells thick along the wide axis (measured on the Re100 cylinder at
+        // aspect 1.7: cd 1.49 -> -7.6, a spurious thrust). Isotropic cells
+        // make the two identical, so the Cartesian construction is untouched.
+        if (phi[c] < -2.0 * maxSpacing(dloc)) return false;
+        const double x = cx(i), y = cy(j), z = cz(k);
+        double nv[3];
+        if (!unitNormal(x, y, z, hl, nv)) return false;
+        return imageAlong(x, y, z, nv, -phi[c], hl, im);
     };
 
     // The neighbour image, for a cell the fluid's flux READS but whose normal
@@ -909,6 +1319,7 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                 }
                 gcell.push_back(int(c));
                 isGhost[c] = 1;
+                gnorm.insert(gnorm.end(), im.n, im.n + 3);
                 gscale.push_back(Real(im.a));
                 gdw.push_back(Real(-phi[c]));
                 for (int s = 0; s < 8; ++s) {
@@ -944,6 +1355,122 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
     for (int q = 0; q < T.nGhost(); ++q) ghostOf[std::size_t(gcell[q])] = q;
     T.gfnb.assign(std::size_t(nfn) * gcell.size(), -1);
     std::vector<int> nfnb(gcell.size(), 0);
+
+    // Two-sided faces (CompGhostTables::sideFace). Face (fluid c, direction d,
+    // ghost q) is WRONG-SIDE when q's imaging normal points away from c,
+    // n_g . e_{ghost->fluid} <= 0, AND c's own sdf normal is more than 60 deg
+    // off it, n_f . n_g < 1/2: q was imaged from another surface. On a flat one-sided
+    // wall the first cannot happen -- a step from a ghost along e with
+    // n . e <= 0 does not raise the sdf, so it lands in solid -- and on a
+    // resolved curved one the second rules out the tangent steps. Both also
+    // pass at a sharp convex edge of a THICK body (a square's 90 deg corner:
+    // one face per corner cell row), where the side image is measured to make
+    // the result offset-sensitive (exp_corner: square Re 100 cd spread 0.7% ->
+    // 9%, cl_rms 4% -> 62% over a 0.2-cell shift). So a face whose ghost is
+    // in thick solid -- the body runs on two cells behind it along -n_g AND a
+    // deep cell (phi < -2 h) lies within three cells -- keeps the shared image.
+    // Thin sections (no deep cell near, or the far surface close behind)
+    // keep their side images; a body nowhere under ~2 cells thick, sharp
+    // corners included, classifies none and its tables are what they always
+    // were. The side image is the normal image rebuilt about the FLUID
+    // cell's own surface: the sdf normal at c's centre, the wall at c's foot
+    // point, dw the ghost centre's depth below that plane. A neighbour-imaged
+    // ghost (no normal) is left alone; it is already counted as a fallback.
+    // True when the body runs on for `depth` behind the point x along -n (sdf
+    // sampled every hl/8): no second surface there.
+    auto solidBehind = [&](const double x[3], const double n[3], double depth,
+                           double hl) {
+        const int steps = int(std::ceil(depth / (0.125 * hl)));
+        for (int s = 1; s <= steps; ++s) {
+            const double t = std::min(depth, s * 0.125 * hl);
+            if (sdf(x[0] - t * n[0], x[1] - t * n[1], x[2] - t * n[2]) >= 0.0)
+                return false;
+        }
+        return true;
+    };
+    // True when a cell within three cells of (i, j, k) (Chebyshev; z only
+    // when nz > 1) is deeper than two of its local widest spacings. Three, not
+    // two: along a 90 deg corner's bisector the first deep cell is 2.83 h
+    // from the tip, past a two-cell box once the corner is rotated (diamond).
+    auto deepNear = [&](int i, int j, int k) {
+        const int rz = nz == 1 ? 0 : 3;
+        for (int dk = -rz; dk <= rz; ++dk)
+            for (int dj = -3; dj <= 3; ++dj)
+                for (int di = -3; di <= 3; ++di) {
+                    const int ii = ((i + di) % nx + nx) % nx,
+                              jj = ((j + dj) % ny + ny) % ny,
+                              kk = ((k + dk) % nz + nz) % nz;
+                    double dl[3];
+                    localSpacing(ii, jj, kk, dl);
+                    if (phi[g.idx(ii, jj, kk)] < -2.0 * maxSpacing(dl))
+                        return true;
+                }
+        return false;
+    };
+    auto addSide = [&](std::size_t c, int i, int j, int k, int d, int q,
+                       int face) {
+        const double* ng = &gnorm[3 * std::size_t(q)];
+        if (ng[0] == 0.0 && ng[1] == 0.0 && ng[2] == 0.0) return;
+        if (-(ng[0] * dijk[d][0] + ng[1] * dijk[d][1] + ng[2] * dijk[d][2])
+            > 0.0)
+            return;
+        const int gi = i + dijk[d][0], gj = j + dijk[d][1], gk = k + dijk[d][2];
+        double dloc[3];
+        localSpacing((gi + nx) % nx, (gj + ny) % ny, (gk + nz) % nz, dloc);
+        const double hl = minSpacing(dloc);
+        const double xg[3] = {cx(gi), cy(gj), cz(gk)};
+        const double xf[3] = {cx(i), cy(j), cz(k)};
+        double nf[3];
+        // The fluid cell must see ANOTHER surface: its normal more than 60 deg
+        // off the ghost's (n_f . n_g < 1/2) -- the opposite flank, or the edge
+        // itself for a cell off a sharp tip (measured on the lens LE: n_f .
+        // n_g = 0.2 there, and dropping that face kept Cn at -83%). A tangent
+        // step on a curved wall (n_g . e ~ 0, a coarse sphere's equator) sees
+        // the same surface, n_f . n_g ~ 1 - O(h/R), and keeps the shared
+        // image -- so does every face of a resolved body.
+        if (!unitNormal(xf[0], xf[1], xf[2], hl, nf)
+            || nf[0] * ng[0] + nf[1] * ng[1] + nf[2] * ng[2] >= 0.5)
+            return;
+        // ... and the ghost must not sit in THICK solid: at a convex edge of
+        // a thick body both tests above pass, yet the body runs on behind the
+        // ghost and is deep next to it -- the fluid cell sees the adjacent
+        // face of a corner, not a second surface of a sheet, and keeps the
+        // shared image (exp_corner). Both conditions: either alone also
+        // catches thin-blade faces (rotor2 L1 lost 44 of 186 to the first).
+        if (solidBehind(xg, ng, 2.0 * maxSpacing(dloc), hl)
+            && deepNear((gi + nx) % nx, (gj + ny) % ny, (gk + nz) % nz))
+            return;
+        double dw = 0.0;
+        for (int a = 0; a < 3; ++a)
+            dw += (xf[a] - phi[c] * nf[a] - xg[a]) * nf[a];
+        Image im;
+        if (!(dw > 0.0 && imageAlong(xg[0], xg[1], xg[2], nf, dw, hl, im))) {
+            ++T.sideSkipped;
+            return;
+        }
+        if (T.sideCell.empty() || T.sideCell.back() != int(c)) {
+            T.sideCell.push_back(int(c));
+            T.sideStart.push_back(T.nSide());
+        }
+        T.sideFace.push_back(face);
+        T.sideScale.push_back(Real(im.a));
+        for (int s = 0; s < 8; ++s) {
+            T.sideNbr.push_back(im.v.nb[s]);
+            T.sideW.push_back(Real(im.v.w[s] / im.v.wsum));
+            T.sideTnbr.push_back(im.t.nb[s]);
+            T.sideTw.push_back(Real(im.t.w[s] / im.t.wsum));
+        }
+        if (motion) {
+            // The side image's own wall point: the surface the fluid cell
+            // sees, which on a rotor moves at its own omega x r.
+            const GhostWallKinematics kin =
+                (*motion)(im.wall[0], im.wall[1], im.wall[2]);
+            for (int a = 0; a < 3; ++a) T.sideUwall.push_back(Real(kin.u[a]));
+            T.sideAspan.push_back(Real(kin.a[0] * im.t.span[0]
+                                       + kin.a[1] * im.t.span[1]
+                                       + kin.a[2] * im.t.span[2]));
+        }
+    };
     for (int k = 0; k < nz; ++k)
         for (int j = 0; j < ny; ++j)
             for (int i = 0; i < nx; ++i) {
@@ -969,12 +1496,25 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                         for (int q = 0; q < 3; ++q)
                             ref[q] = (ijk[q] + 0.5 + (q == a ? s : 0.0))
                                      * href[q];
-                        fpos.push_back(Real(R.fx.map(ref[0])));
-                        fpos.push_back(Real(R.fy.map(ref[1])));
-                        fpos.push_back(Real(R.fz.map(ref[2])));
+                        const double xfc[3] = {R.fx.map(ref[0]),
+                                               R.fy.map(ref[1]),
+                                               R.fz.map(ref[2])};
+                        for (int q = 0; q < 3; ++q)
+                            fpos.push_back(Real(xfc[q]));
+                        // The impermeable face moves with the wall material
+                        // AT the face centre: for a rigid motion the closed
+                        // staircase then encloses no net volume change.
+                        if (motion) {
+                            const GhostWallKinematics kin =
+                                (*motion)(xfc[0], xfc[1], xfc[2]);
+                            for (int q = 0; q < 3; ++q)
+                                T.fuwall.push_back(Real(kin.u[q]));
+                        }
+                        addSide(c, i, j, k, d, q, int(fcell.size()) - 1);
                     }
                 }
             }
+    if (!T.sideFace.empty()) T.sideStart.push_back(T.nSide());
 
     return T;
 }
@@ -999,7 +1539,8 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::fromTables(
     if (iso && !(wall.Twall > 0.0 && wall.Rgas > 0.0))
         return std::unexpected(hipErrorInvalidValue);
     if (cap.nGhost < t.nGhost() || cap.nDeep < t.nDeep()
-        || cap.nFace < t.nFace())
+        || cap.nFace < t.nFace() || cap.nSide < t.nSide()
+        || cap.nSideCell < t.nSideCell())
         return std::unexpected(hipErrorInvalidValue);
 
     DeviceCompGhost out;
@@ -1046,6 +1587,30 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::fromTables(
     if (auto e = alloc(out.fcell_, nf); e != hipSuccess) return std::unexpected(e);
     if (auto e = alloc(out.fdir_, nf); e != hipSuccess) return std::unexpected(e);
     if (auto e = alloc(out.fpos_, 3 * nf); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.fuw_, t.uwall.empty() ? 0 : 3 * nf); e != hipSuccess)
+        return std::unexpected(e);
+    if (auto e = alloc(out.wcell_, nf); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.wstart_, nf ? nf + 1 : 0); e != hipSuccess)
+        return std::unexpected(e);
+    // Side images: sized for the capacity like everything else, and the wall
+    // velocity only when the surface moves (a bin's sideUwall is empty
+    // exactly when it has no side faces or the wall rests).
+    const std::size_t ns = std::size_t(cap.nSide);
+    const std::size_t nsc = std::size_t(cap.nSideCell);
+    const bool mv = !t.uwall.empty();
+    if (auto e = alloc(out.sideFace_, ns); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.sideCell_, nsc); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.sideStart_, ns ? nsc + 1 : 0); e != hipSuccess)
+        return std::unexpected(e);
+    if (auto e = alloc(out.sideNbr_, 8 * ns); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.sideW_, 8 * ns); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.sideTnbr_, 8 * ns); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.sideTw_, 8 * ns); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.sideScale_, ns); e != hipSuccess) return std::unexpected(e);
+    if (auto e = alloc(out.sideUwall_, mv ? 3 * ns : 0); e != hipSuccess)
+        return std::unexpected(e);
+    if (auto e = alloc(out.sideAspan_, mv ? ns : 0); e != hipSuccess)
+        return std::unexpected(e);
     auto acc = DeviceBuffer<double>::make(std::max<std::size_t>(nf, 1) * 7);
     if (!acc) return std::unexpected(acc.error());
     out.facc_ = std::move(*acc);
@@ -1059,13 +1624,26 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::fromTables(
 hipError_t DeviceCompGhost::load(const CompGhostTables& t)
 {
     if (cap_.nGhost < t.nGhost() || cap_.nDeep < t.nDeep()
-        || cap_.nFace < t.nFace())
+        || cap_.nFace < t.nFace() || cap_.nSide < t.nSide()
+        || cap_.nSideCell < t.nSideCell())
+        return hipErrorInvalidValue;
+    // The side tables must be whole: a moving wall's side faces carry their
+    // wall velocity (or the side image would rest on a spinning blade), and
+    // the run index closes.
+    const std::size_t ns = std::size_t(t.nSide());
+    if (t.sideNbr.size() != 8 * ns || t.sideW.size() != 8 * ns
+        || t.sideTnbr.size() != 8 * ns || t.sideTw.size() != 8 * ns
+        || t.sideScale.size() != ns
+        || t.sideUwall.size() != (t.uwall.empty() ? 0 : 3 * ns)
+        || t.sideAspan.size() * 3 != t.sideUwall.size()
+        || t.sideStart.size() != (ns ? t.sideCell.size() + 1 : 0))
         return hipErrorInvalidValue;
     // A wall that moves must keep moving and one at rest must stay at rest:
     // the kernel selects its branch on whether the buffer exists, so a bin
     // whose velocities were dropped would silently freeze the surface.
     if (t.uwall.empty() != (uwall_.data() == nullptr)
         || t.aspan.size() * 3 != t.uwall.size()
+        || t.fuwall.size() != (t.uwall.empty() ? 0 : 3 * t.fcell.size())
         || t.tnbr.size() != t.gnbr.size() || t.tw.size() != t.gw.size()
         || t.gfnb.size() != std::size_t(CompGhostTables::kFaceNbr) * t.gcell.size())
         return hipErrorInvalidValue;
@@ -1088,9 +1666,36 @@ hipError_t DeviceCompGhost::load(const CompGhostTables& t)
     if (auto e = put(fcell_, t.fcell); e != hipSuccess) return e;
     if (auto e = put(fdir_, t.fdir); e != hipSuccess) return e;
     if (auto e = put(fpos_, t.fpos); e != hipSuccess) return e;
+    if (auto e = put(fuw_, t.fuwall); e != hipSuccess) return e;
+    // The impermeable pass's CSR over the fluid cells: classifyCompGhost
+    // emits a fluid cell's faces contiguously, in ascending cell order.
+    std::vector<int> wcell, wstart;
+    for (int f = 0; f < t.nFace(); ++f)
+        if (wcell.empty() || wcell.back() != t.fcell[std::size_t(f)]) {
+            assert(wcell.empty() || wcell.back() < t.fcell[std::size_t(f)]);
+            wcell.push_back(t.fcell[std::size_t(f)]);
+            wstart.push_back(f);
+        }
+    if (!wcell.empty()) wstart.push_back(t.nFace());
+    if (auto e = put(wcell_, wcell); e != hipSuccess) return e;
+    if (auto e = put(wstart_, wstart); e != hipSuccess) return e;
+    nWallCell_ = int(wcell.size());
+    if (auto e = put(sideFace_, t.sideFace); e != hipSuccess) return e;
+    if (auto e = put(sideNbr_, t.sideNbr); e != hipSuccess) return e;
+    if (auto e = put(sideW_, t.sideW); e != hipSuccess) return e;
+    if (auto e = put(sideTnbr_, t.sideTnbr); e != hipSuccess) return e;
+    if (auto e = put(sideTw_, t.sideTw); e != hipSuccess) return e;
+    if (auto e = put(sideScale_, t.sideScale); e != hipSuccess) return e;
+    if (auto e = put(sideUwall_, t.sideUwall); e != hipSuccess) return e;
+    if (auto e = put(sideAspan_, t.sideAspan); e != hipSuccess) return e;
+    if (auto e = put(sideCell_, t.sideCell); e != hipSuccess) return e;
+    if (auto e = put(sideStart_, t.sideStart); e != hipSuccess) return e;
     nGhost_ = t.nGhost();
     nDeep_ = t.nDeep();
     nFace_ = t.nFace();
+    nSide_ = t.nSide();
+    nSideCell_ = t.nSideCell();
+    sideSkipped_ = t.sideSkipped;
     fallback_ = t.fallback;
     solid_ = t.solid;
     deepHost_ = t.deep;
@@ -1127,6 +1732,63 @@ void DeviceCompGhost::apply(DeviceCompState& s)
     // field's, so the steady march keeps its launch sequence.
     if (s.compensated() && s.nT == 0)
         zeroLow(s, gcell_.data(), nGhost_, deep_.data(), nDeep_);
+}
+
+void DeviceCompGhost::applyRhs(const DeviceComp& solver,
+                               const DeviceCompState& s, DeviceCompState& out,
+                               const StageCombine& cmb) const
+{
+    if (nWallCell_ == 0) return;
+    const PrimView q{s.rho.data(),      solver.u().data(), solver.v().data(),
+                     solver.w().data(), solver.e().data(), solver.p().data(),
+                     solver.T().data()};
+    const SideView sv{sideFace_.data(),  sideNbr_.data(),   sideTnbr_.data(),
+                      sideCell_.data(),  sideStart_.data(), fcell_.data(),
+                      fdir_.data(),      sideW_.data(),     sideTw_.data(),
+                      sideScale_.data(), sideUwall_.data(), sideAspan_.data(),
+                      fuw_.data()};
+    const ImageParams ip{gamma_, iso_, Twall_, Rgas_,
+                         Real(solver.transport().Rgas)};
+    const ConsView cs{s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
+                      s.E.data()};
+    // mu_t as the stage left it (of s, wall image included), exactly the slot
+    // the stage kernel read.
+    const bool eddy = solver.rans() || solver.les();
+    const Real* nut = eddy ? solver.mut().data() : nullptr;
+    const Real kap = eddy ? solver.eddyKapScale() : Real(0);
+    const MrfView mz = solver.mrfActive() ? solver.mrfView() : MrfView{};
+    const bool curv = solver.curvilinear();
+    const CurvView cv = curv ? solver.curvTables()->view() : CurvView{};
+    const ViscView vv = viscView(solver.transport());
+    Real* o[5] = {out.rho.data(), out.mx.data(), out.my.data(), out.mz.data(),
+                  out.E.data()};
+    internal::withCompensation(cmb, [&](auto comp) {
+        constexpr bool C = decltype(comp)::value;
+        if (curv)
+            kWallRhs<C, true><<<launchBlocks(nWallCell_), blockSize>>>(
+                g_, q, cv, mz, fcell_.data(), fdir_.data(), wcell_.data(),
+                wstart_.data(), fuw_.data(), nWallCell_, cmb, o[0], o[1], o[2],
+                o[3], o[4]);
+        else
+            kWallRhs<C, false><<<launchBlocks(nWallCell_), blockSize>>>(
+                g_, q, cv, mz, fcell_.data(), fdir_.data(), wcell_.data(),
+                wstart_.data(), fuw_.data(), nWallCell_, cmb, o[0], o[1], o[2],
+                o[3], o[4]);
+    });
+    checkLastKernel("kWallRhs");
+    if (nSide_ == 0) return;
+    internal::withCompensation(cmb, [&](auto comp) {
+        constexpr bool C = decltype(comp)::value;
+        if (curv)
+            kSideRhs<C, true><<<launchBlocks(nSideCell_), blockSize>>>(
+                g_, vv, q, cv, mz, sv, ip, cs, nut, kap, nSideCell_, cmb, o[0],
+                o[1], o[2], o[3], o[4]);
+        else
+            kSideRhs<C, false><<<launchBlocks(nSideCell_), blockSize>>>(
+                g_, vv, q, cv, mz, sv, ip, cs, nut, kap, nSideCell_, cmb, o[0],
+                o[1], o[2], o[3], o[4]);
+    });
+    checkLastKernel("kSideRhs");
 }
 
 void DeviceCompGhost::applyTurb(DeviceCompState& s, RansModel model,
@@ -1212,20 +1874,48 @@ bool DeviceCompGhost::stageFlux(DeviceComp& solver, const DeviceCompState& s,
         nut = solver.mut().data();
         kap = solver.eddyKapScale();
     }
-    if (curv_ || solver.rans()) {
+    const bool curv = curv_ || solver.rans();
+    CurvView cv{};
+    if (curv) {
         const DeviceCurv* t = solver.curvTables();
         assert(t && "focal ghost force needs the curvilinear DeviceComp");
         if (!t) return false;
-        const CurvView cv = t->view();
+        cv = t->view();
         kBodyFluxCurv<kSplit><<<launchBlocks(nFace_), blockSize>>>(
             g_, viscView(solver.transport()), iso_, q, cv, fcell_.data(),
-            fdir_.data(), nFace_, acc, mz, nut, kap, pRef);
+            fdir_.data(), nFace_, acc, mz, nut, kap, pRef, fuw_.data());
         checkLastKernel("kBodyFluxCurv");
     } else {
         kBodyFlux<kSplit><<<launchBlocks(nFace_), blockSize>>>(
             g_, viscView(solver.transport()), iso_, q, fcell_.data(),
-            fdir_.data(), nFace_, acc, mz, nut, kap, pRef);
+            fdir_.data(), nFace_, acc, mz, nut, kap, pRef, fuw_.data());
         checkLastKernel("kBodyFlux");
+    }
+    // Two-sided faces: their staged spans become the side image's, the flux
+    // applyRhs gave the rhs. A separate pass, so a body without side faces
+    // launches nothing more.
+    if (nSide_ > 0) {
+        const SideView sv{sideFace_.data(),  sideNbr_.data(),
+                          sideTnbr_.data(),  sideCell_.data(),
+                          sideStart_.data(), fcell_.data(),
+                          fdir_.data(),      sideW_.data(),
+                          sideTw_.data(),    sideScale_.data(),
+                          sideUwall_.data(), sideAspan_.data(),
+                          fuw_.data()};
+        const ImageParams ip{gamma_, iso_, Twall_, Rgas_,
+                             Real(solver.transport().Rgas)};
+        const ConsView cs{s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
+                          s.E.data()};
+        const ViscView vv = viscView(solver.transport());
+        if (curv)
+            kSideTally<kSplit, true><<<launchBlocks(nSide_), blockSize>>>(
+                g_, vv, iso_, q, cv, mz, sv, ip, cs, nut, kap, nSide_, nFace_,
+                acc, pRef);
+        else
+            kSideTally<kSplit, false><<<launchBlocks(nSide_), blockSize>>>(
+                g_, vv, iso_, q, cv, mz, sv, ip, cs, nut, kap, nSide_, nFace_,
+                acc, pRef);
+        checkLastKernel("kSideTally");
     }
     return true;
 }

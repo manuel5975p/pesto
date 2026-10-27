@@ -12,7 +12,8 @@ namespace dns::gpu {
 
 // Index bounding box of the body plus a margin, so the tallies scan O(body)
 // not O(grid). Clamped strictly inside the interior, so lateral boundary faces
-// never count.
+// never count -- except in z, where a body reaching a wall-adjacent layer
+// keeps that layer (its own faces live there).
 struct BodyBox
 {
     int i0, i1, j0, j1, k0, k1;

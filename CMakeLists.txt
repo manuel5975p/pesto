@@ -445,6 +445,7 @@ if(BUILD_TESTING)
                   gpu_mrf_conservation gpu_mrf_stabledt gpu_ogrid_rotation
                   gpu_rb_modes
                   gpu_comp_ghost_closure_focal gpu_comp_ghost_couette_exact
+                  gpu_comp_ghost_twoside gpu_comp_ghost_imperm
                   gpu_rotor_comoving_fixed_point gpu_comp_scale_invariance
                   gpu_ghost_translate
                   gpu_comp_axis_permute gpu_comp_curv_axis_permute
@@ -459,7 +460,8 @@ if(BUILD_TESTING)
             gpu_tally_couette_torque gpu_tally_conduction gpu_tally_archimedes
             gpu_tally_kutta_joukowski gpu_mrf_conservation gpu_mrf_stabledt
             gpu_ogrid_rotation gpu_rb_modes gpu_comp_ghost_closure_focal
-            gpu_comp_ghost_couette_exact gpu_rotor_comoving_fixed_point
+            gpu_comp_ghost_couette_exact gpu_comp_ghost_twoside
+            gpu_comp_ghost_imperm gpu_rotor_comoving_fixed_point
             gpu_comp_scale_invariance gpu_ghost_translate gpu_comp_axis_permute
             gpu_comp_curv_axis_permute comp_time_order gpu_comp_viscous_modes
             gpu_rans_mask gpu_rans_ogrid gpu_rans_mms gpu_axisym gpu_axisym3d

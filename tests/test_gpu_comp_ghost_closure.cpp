@@ -315,6 +315,16 @@ void splitCartesian(const std::string& name, const Grid& g,
     check(rows.has_value(), name + ": surfaceFaces at rest");
     if (!rows) return;
     const double V = double(gh->solidCells().size()) * g.hx * g.hy * g.hz;
+    // Two-sided faces read their SIDE image (comp_ghost.hpp, sideFace), not
+    // the un-filled ghost value: the field's value at a sample point a few
+    // cells from the ghost. The identity holds for every other face; each
+    // side face may move sum fp by at most G * 3h * its area (face pressure
+    // = half the image's, sample within 6 h of the ghost centre).
+    const auto tb = gpu::classifyCompGhost(g, sdf, nullptr, identityRemap(g),
+                                           nullptr);
+    double sideBound = 0.0;
+    for (int f : tb.sideFace)
+        sideBound += G * 3.0 * g.hx * (*rows)[std::size_t(f)].area;
     double fp[3] = {0, 0, 0}, fcMax = 0, fvSum = 0, area = 0;
     for (const auto& r : *rows) {
         for (int c = 0; c < 3; ++c) fp[c] += r.fp[c];
@@ -325,13 +335,14 @@ void splitCartesian(const std::string& name, const Grid& g,
         area += r.area;
     }
     std::printf("%s split at rest: sum fp_x %.9e vs -G V %.9e (rel %.2e), "
-                "fp_y %.2e fp_z %.2e, max|fc| %.1e, sum fv %.2e\n",
+                "fp_y %.2e fp_z %.2e, max|fc| %.1e, sum fv %.2e; %d side "
+                "faces, bound %.2e\n",
                 name.c_str(), fp[0], -G * V, std::abs(fp[0] / (-G * V) - 1),
-                fp[1], fp[2], fcMax, fvSum);
-    check(std::abs(fp[0] / (-G * V) - 1) < 1e-5,
-          name + ": Archimedes, sum fp = -G V_solid (1e-5)");
-    check(std::abs(fp[1]) + std::abs(fp[2]) < 1e-5 * G * V,
-          name + ": no transverse pressure force");
+                fp[1], fp[2], fcMax, fvSum, tb.nSide(), sideBound);
+    check(std::abs(fp[0] + G * V) < 1e-5 * G * V + sideBound,
+          name + ": Archimedes, sum fp = -G V_solid (1e-5 + side faces)");
+    check(std::abs(fp[1]) + std::abs(fp[2]) < 1e-5 * G * V + sideBound,
+          name + ": no transverse pressure force (+ side faces)");
     check(fcMax == 0.0, name + ": no convective part at rest (exact)");
     check(std::abs(fvSum) < 1e-6 * pInf * area,
           name + ": viscous part at rest is FP32 rounding only");
@@ -389,10 +400,10 @@ void splitCartesian(const std::string& name, const Grid& g,
 
 // (c) The convective column is the flux's OWN advecting part, which (b)
 //     cannot see: fv is defined as f - fp - fc. At mu = 0 the face flux is
-//     p s + rho u_a u and nothing else, so fv must be FP32 rounding of the
+//     p s + rho v_a u and nothing else, so fv must be FP32 rounding of the
 //     gross ABSOLUTE face flux. Run on the moving wall of a spinning body
-//     inside an MRF zone, where u_a = u - f omega x r: a split that used the
-//     absolute u_n would leave rho (f omega x r).s u in fv, ~1e-2 of the gross.
+//     inside an MRF zone: the impermeable face advects nothing relative to
+//     the frame (v_a = 0), so fc is exactly 0 and the face flux is p s alone.
 void splitInviscidMrf(const std::string& name, const Grid& g,
                       const gpu::GhostSdf& sdf, const Rotor& rot)
 {
@@ -440,7 +451,8 @@ void splitInviscidMrf(const std::string& name, const Grid& g,
     std::printf("%s inviscid split: sum|fv| %.3e, sum|fc| %.3e, gross %.3e "
                 "(fv/gross %.2e)\n",
                 name.c_str(), fv, fc, gross, fv / gross);
-    check(fc > 1e-3 * gross, name + ": the convective part is not vacuous");
+    // Impermeable faces (applyRhs): no advection relative to the frame.
+    check(fc == 0.0, name + ": no convective part relative to the frame (exact)");
     check(fv < 1e-6 * gross,
           name + ": mu = 0 leaves no viscous part (FP32 rounding of the gross)");
 }

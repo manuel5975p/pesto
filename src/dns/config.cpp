@@ -1293,13 +1293,21 @@ std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
         // (top of the ghost row) and the blocker spans [wall, wall + D], so
         // cy = centre of the blocked strip. Its top edge is off-node through
         // the 0.31h x-offset alone.
+        // y (and a sphere's z) is centred on the INTERIOR, cells*h long, as
+        // the compressible box centres on ly. The square-box form L/2 is kept
+        // verbatim when the axis has n cells -- every ny == n run is
+        // bit-identical -- and is wrong otherwise: --ny 32 at --n 64 put the
+        // body centre outside the box.
+        const auto mid = [&](int cells) {
+            return cells == r.n ? c.L / 2.0 : 0.5 * double(cells) * c.h;
+        };
         const double cx = c.h + c.L / 3.0 + 0.31 * c.h;
         const double cy = c.bodyKind == BodyKind::Fence
                                   || c.bodyKind == BodyKind::Floor
                               ? c.h + D / 2.0
-                              : c.h + c.L / 2.0 + 0.17 * c.h;
+                              : c.h + mid(ny) + 0.17 * c.h;
         const double cz = c.bodyKind == BodyKind::Sphere
-                              ? c.h + c.L / 2.0 + 0.23 * c.h
+                              ? c.h + mid(nzT == 1 ? r.n : nzI) + 0.23 * c.h
                               : (nzT == 1 ? 0.5 * c.h : c.h + nzI * c.h / 2.0);
         c.placement = {cx, cy, cz, D};
     }

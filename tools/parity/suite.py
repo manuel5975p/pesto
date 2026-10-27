@@ -823,9 +823,13 @@ def run_foam(case, tier, idx, ref, force, np_, timeout_s=None):
                         os.path.join(rd, "constant", "polyMesh"))
         meta.update(cells=mmeta["cells"], mesh=mmeta)
         patches = dict(inlet="inlet", outlet="outlet", sides="lateral", propeller="wall")
-        nonorth = 1
-        limited = True
-        body = "propeller"
+        # UNLIMITED non-orthogonal correction (exp_rotorU), as the section branch:
+        # snappy reaches 65 deg (0.1-0.3% of faces > 40 deg, blade first layer
+        # mean 10 deg), and "limited corrected 0.33" + cellLimited grad(U) made
+        # rotor2's |CT| 1.2/1.5/2.2% larger (Bc L3/L2/L1; B 1.3/1.5/2.3%), CQ
+        # +0.2-0.3%, blade chord-normal pressure +0.4%. Unlimited runs stable from
+        # the limited state and cold, nNonOrthogonalCorrectors 1.
+        nonorth, limited, body = 1, False, "propeller"
     elif case.kind == "cylinder":
         nq, nr = lvl
         m = fc.cylinder_mesh(rd, box, nq, nr)
@@ -842,7 +846,11 @@ def run_foam(case, tier, idx, ref, force, np_, timeout_s=None):
         meta.update(cells=m["cells"], mesh=m)
         patches = dict(body="wall", inlet="inlet", outlet="outlet", sides="lateral",
                        frontAndBack="empty")
-        nonorth, limited, body = 2, True, "body"
+        # UNLIMITED non-orthogonal correction (exp_mrfC): the O-H ring reaches
+        # 53 deg, and "limited corrected 0.33" there cost +9.3% Cn on the 7-deg
+        # ellipse (sectE L3: Cn 0.2659 limited, 0.2432 corrected; Cc -0.3%) -- an
+        # error that does not refine away, since the angles are the topology's.
+        nonorth, limited, body = 2, False, "body"
     # physics + control
     fos = fc.fo_forces(body, "rho" if sa else "rhoInf", rho_inf=meta.get("rho", 1.0),
                        p_ref=meta["p"] if tier == "Bc" else None)

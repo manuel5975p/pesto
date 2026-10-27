@@ -269,7 +269,8 @@ void splitFocalInviscidMrf(const std::string& name, const Grid& g,
     std::printf("%s inviscid MRF split: sum|fv| %.3e, sum|fc| %.3e, gross %.3e "
                 "(fv/gross %.2e)\n",
                 name.c_str(), fv, fc, gross, fv / gross);
-    check(fc > 1e-3 * gross, name + ": the convective part is not vacuous");
+    // Impermeable faces (applyRhs): no advection relative to the frame.
+    check(fc == 0.0, name + ": no convective part relative to the frame (exact)");
     check(fv < 1e-6 * gross,
           name + ": mu = 0 leaves no viscous part (FP32 rounding of the gross)");
 }
