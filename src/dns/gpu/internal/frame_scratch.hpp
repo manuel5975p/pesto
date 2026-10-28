@@ -146,7 +146,8 @@ public:
             std::fprintf(stderr, "frame write failed: %s\n", e.error().c_str());
     }
 
-    static constexpr int kMaxChannels = 3;
+    // 4: dns flame --mode diffusion (temp, fuel, oxid, omega).
+    static constexpr int kMaxChannels = 4;
 
 private:
     std::optional<DeviceScalar> u_, v_, w_, vort_, speed_;

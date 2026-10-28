@@ -22,6 +22,7 @@
 #include "dns/remap.hpp"
 
 #include <memory>
+#include <vector>
 
 namespace dns::gpu {
 
@@ -123,6 +124,26 @@ public:
         // the interior rhs. -1 = no floor (bit-identical). Incompatible with
         // openY/openZ (validator-enforced upstream).
         int floorRows = -1;
+        // Per-row x-lo inflow targets (dns flame --mode bunsen), one entry per
+        // (j, k) row at j + ny k: the u target inflowU + pulse * inflowJet
+        // (setInflowPulse), and the entropy target inflowRho -- the density
+        // itself, or with thermalInflow 1/(R T_row) times the LOCAL pressure.
+        // Empty = the uniform uInf/rhoInf (or TInf) targets, in a separate
+        // kernel instantiation: bit for bit. Uniform mesh, !potCorrect only.
+        std::vector<double> inflowU = {}, inflowJet = {}, inflowRho = {};
+        // Gravity along -x (dns flame --mode candle; the source itself is
+        // addGravity, added to every cell AFTER this overwrite): the AMBIENT
+        // column's hydrostatic dp/dx at the x-lo and x-hi rows (<= 0). The
+        // incoming acoustic amplitude carries its hydrostatic value (source-
+        // term LODI, Sutherland & Kennedy 2003): L5 += (u + c) hydroLo at
+        // the inflow, L1 += (u - c) hydroHi at the outflow, so LODI + gravity
+        // is exactly at rest in the ambient column. Without it both rows
+        // accelerate at g/2 there (LODI hands half the hydrostatic gradient
+        // to each wave). AMBIENT, not local, rho g: a plume crossing the
+        // outflow sits at the ambient pressure, and a local-rho term would
+        // offset its p by L (rho_a - rho) g / sigma. Both 0 = the shipped
+        // kernel. Per-row targets, uniform mesh, !openY/!openZ only.
+        double hydroLo = 0, hydroHi = 0;
     };
 
     // Periodic grid, nx >= 4 (ny/nz >= 4 on open axes); subsonic freestream.
@@ -165,6 +186,10 @@ public:
     void setFreestream(double u) { u_ = u; }
     double freestream() const { return u_; }
 
+    // Jet modulation of a per-row inflow: the u target becomes inflowU +
+    // du * inflowJet. 0 = the profile itself. Ignored without a profile.
+    void setInflowPulse(double du) { pulse_ = du; }
+
     // Wake-source strength Q = F_drag / (rhoInf uInf) for the potential
     // correction; caller smooths (EMA) so the shedding oscillation does not
     // feed back. Ignored unless potCorrect. Pre: Q >= 0, finite.
@@ -178,6 +203,10 @@ private:
     Config c_;
     double u_, cInf_;
     double Q_ = 0;
+    double pulse_ = 0;
+    // The per-row inflow targets on the device (Config::inflowU/Jet/Rho);
+    // empty = uniform targets.
+    DeviceScalar inU_, inJ_, inR_;
     // Scratch, rewritten every stage: held by pointer so apply() stays const
     // (it is an rhs producer, not a state owner) and the class stays movable.
     std::unique_ptr<NscbcModalAbc> abc_;

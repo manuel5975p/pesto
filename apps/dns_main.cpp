@@ -11,6 +11,7 @@
 #include "dns/cli.hpp"
 #include "dns/casegeom.hpp"
 #include "dns/config.hpp"
+#include "dns/flame1d.hpp"
 #include "dns/flow_ic.hpp"
 #include "dns/framemap.hpp"
 #include "dns/diagnostics.hpp"
@@ -41,6 +42,8 @@
 #include "dns/gpu/reductions.hpp"
 #include "dns/gpu/runner_channel.hpp"
 #include "dns/gpu/runner_conv.hpp"
+#include "dns/gpu/runner_flame.hpp"
+#include "dns/gpu/runner_chamber.hpp"
 #include "dns/gpu/runner_rb.hpp"
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/runner_comp.hpp"
@@ -959,6 +962,248 @@ int runConv(const Case& c)
 }
 
 
+// --- flame -----------------------------------------------------------------
+
+// --mode chamber (docs/chem.md, "Chamber"): the closed 2D combustion chamber.
+int runChamberCase(const Case& c)
+{
+    if (!haveGpu(c))
+        return die(exitNoGpu, "no GPU device (dns flame is GPU-only)");
+#if DNS_WITH_GPU
+    const auto& g = c.grid;
+    const ChamberSpec& s = c.chamber;
+    const double Tu = c.flameTu, sig = c.flameModel.sigma;
+    gpu::ChamberRun rr;
+    rr.regions = chamberRegions(g, s);
+    CompState host;
+    std::vector<double> rhoY;
+    const FlameEigen& tab = c.flameEig.tab;
+    chamberIC(g, rr.regions, kGammaAir, Tu, sig, c.chamberCoflow,
+              [&](double x) { return flameProfile(tab, x); }, s.xBase(), host,
+              rhoY);
+
+    FrameGeometry fg = FrameGeometry::centred(g, s.Hc);
+    fg.mask.resize(g.size());
+    for (std::size_t i = 0; i < g.size(); ++i)
+        fg.mask[i] = rr.regions[i] == std::uint8_t(ChamberRegion::Solid) ? 0.0f
+                                                                         : 1.0f;
+    auto out = RunOutput::make(
+        outputConfig(c, std::format("{{\"app\":\"dns\",\"flame\":\"chamber\","
+                                    "\"sigma\":{},\"beta\":{},\"Lambda\":{},"
+                                    "\"mach\":{},\"h\":{},\"xe\":{},"
+                                    "\"yc\":{},\"He\":{},\"Hc\":{}",
+                                    sig, c.flameModel.beta, c.flameEig.Lambda,
+                                    c.mach, c.h, s.xe(), s.yc, s.He, s.Hc)),
+        c.meta, g, std::move(fg));
+    if (!out) return die(exitOutput, out.error());
+
+    rr.tr = Transport::air(c.prandtl, Tu, c.tinfK, c.prandtl, kGammaAir,
+                           kRgasBox, c.sutherland);
+    rr.sp.nY = 1;
+    rr.sp.fuel = 0;
+    rr.sp.lnA = c.chamberReaction ? std::log(c.flameEig.Lambda)
+                                  : -std::numeric_limits<double>::infinity();
+    rr.sp.Ta = c.flameModel.theta() * Tu;
+    rr.sp.q = rr.tr.cp() * (sig - 1) * Tu;
+    rr.sp.invPr = 1.0 / c.prandtl;
+    rr.sp.openX = true;
+    rr.sp.yIn[0] = 0.0; // the ambient is inert
+    rr.Tu = Tu;
+    rr.sigma = sig;
+    rr.uCo = c.chamberCoflow;
+    rr.etaIn = c.nscbcEtaIn;
+    rr.thermalInflow = c.nscbcThermalInflow;
+    rr.sinkNb = c.nscbcSink;
+    rr.sinkAmp = c.nscbcSinkAmp;
+    rr.spec = s;
+    rr.mdot = c.chamberMdot;
+    rr.ramp = c.chamberRamp;
+    rr.reaction = c.chamberReaction;
+    rr.cfl = c.cfl;
+    rr.tEnd = c.tEnd;
+    rr.dtRecompute = c.dtRecompute;
+    rr.label = chamberRunLabel(c);
+
+    auto res = gpu::runChamber(g, host, rhoY, rr, *out);
+    if (!res) return die(res.error().code, res.error().message);
+    return reportDone(*res, *out);
+#else
+    return exitNoGpu;
+#endif
+}
+
+int runFlame(const Case& c)
+{
+    if (c.chamberMode) return runChamberCase(c);
+    if (!haveGpu(c))
+        return die(exitNoGpu, "no GPU device (dns flame is GPU-only)");
+#if DNS_WITH_GPU
+    const auto& g = c.grid;
+    CompState host = CompState::zeros(g);
+    std::vector<double> rhoY[2];
+    if (c.flameDiffusion) diffusionIC(c, host, rhoY);
+    else if (c.flameBunsen) bunsenIC(c, host, rhoY[0]);
+    else flameIC(c, host, rhoY[0]);
+
+    FrameGeometry fg = FrameGeometry::centred(g, 1.0);
+    fg.mask.assign(g.size(), 1.0f);
+    auto out = RunOutput::make(
+        outputConfig(
+            c, c.flameCandle
+                   ? std::format("{{\"app\":\"dns\",\"flame\":\"candle\","
+                                 "\"stoich\":{},\"zst\":{},\"sigma\":{},"
+                                 "\"beta\":{},\"Da\":{},\"mach\":{},"
+                                 "\"gravity\":{},\"slot\":{},\"quiescent\":{}",
+                                 c.diff.s, c.diff.zst(), c.diff.sigma,
+                                 c.diff.beta, c.diff.Da, c.mach,
+                                 c.flameGravity, c.bunsen.W,
+                                 c.flameQuiescent)
+               : c.flameDiffusion
+                   ? std::format("{{\"app\":\"dns\",\"flame\":\"diffusion\","
+                                 "\"stoich\":{},\"zst\":{},\"sigma\":{},"
+                                 "\"beta\":{},\"Da\":{},\"mach\":{}",
+                                 c.diff.s, c.diff.zst(), c.diff.sigma,
+                                 c.diff.beta, c.diff.Da, c.mach)
+                   : std::format("{{\"app\":\"dns\",\"flame\":\"premixed\","
+                                 "\"sigma\":{},\"beta\":{},\"Lambda\":{},"
+                                 "\"mach\":{}",
+                                 c.flameModel.sigma, c.flameModel.beta,
+                                 c.flameEig.Lambda, c.mach)),
+        c.meta, g, std::move(fg));
+    if (!out) return die(exitOutput, out.error());
+
+    if (c.flameDiffusion) {
+        // Two reactants (dns/diffusion.hpp): box units rho0 = R = U_jet = 1,
+        // l = D0/U_jet = 1 (mu = Pr), T0 = p0; the bunsen per-row inflow
+        // carrying the Burke-Schumann sheet of the inflow mixture fraction.
+        const DiffusionModel& m = c.diff;
+        const double T0 = c.flameTu;
+        gpu::FlameRun rr;
+        rr.tr = Transport::air(c.prandtl, T0, c.tinfK, c.prandtl, kGammaAir,
+                               kRgasBox, c.sutherland);
+        rr.sp.nY = 2;
+        rr.sp.fuel = 0;
+        rr.sp.ox = 1;
+        rr.sp.stoich = m.s;
+        rr.sp.lnA = m.lnA();
+        rr.sp.Ta = m.theta() * T0;
+        rr.sp.q = rr.tr.cp() * T0 * m.qOverCpT0();
+        rr.sp.invPr = 1.0 / c.prandtl;
+        rr.sp.openX = true;
+        rr.Tu = T0;
+        rr.sigma = m.sigma;
+        rr.uIn = 1.0;
+        rr.pB = T0;
+        rr.etaIn = c.nscbcEtaIn;
+        rr.outSigma = kDiffOutflowSigma;
+        rr.thermalInflow = c.nscbcThermalInflow;
+        rr.sinkNb = c.nscbcSink;
+        rr.sinkAmp = c.nscbcSinkAmp;
+        rr.dth = 1.0; // frame omega scale: the length unit l
+        rr.cfl = c.cfl;
+        rr.tEnd = c.tEnd;
+        rr.dtRecompute = c.dtRecompute;
+        rr.label = flameRunLabel(c);
+        rr.diffusion = true;
+        rr.diff = m;
+        rr.geom = c.bunsen;
+        // Candle: gravity along -x over the isothermal ambient column
+        // p_a(x) (R T0 = p0 = T0): the inflow row's density at p_a(h/2), the
+        // outflow target p_a at the last row, and the column's hydrostatic
+        // dp/dx = -g rho_a there for the NSCBC waves. g == 0: the jet's own
+        // numbers, bit for bit.
+        const double gx = c.flameCandle ? c.flameGravity : 0.0;
+        double pIn = T0;
+        if (gx > 0) {
+            pIn = candleAmbientP(T0, gx, T0, 0.5 * g.hx);
+            const double pOut = candleAmbientP(T0, gx, T0, (g.nx - 0.5) * g.hx);
+            rr.pB = pOut;
+            rr.gravity = gx;
+            rr.hydroLo = -gx * pIn / T0;
+            rr.hydroHi = -gx * pOut / T0;
+            // Air drawn down through the top is the ambient's.
+            rr.sp.ambientHi = true;
+            rr.sp.yHi[0] = 0.0;
+            rr.sp.yHi[1] = m.yO2;
+        }
+        rr.candle = c.flameCandle;
+        rr.quiescent = c.flameQuiescent;
+        for (int j = 0; j < g.ny; ++j) {
+            const DiffusionInflowRow in =
+                c.flameQuiescent ? quiescentInflow(m)
+                                 : diffusionInflow(m, c.bunsen, (j + 0.5) * g.hy);
+            const double T = T0 * in.t;
+            const double rho = gx > 0 ? pIn / T : T0 / T; // p0 = T0, R = 1
+            rr.rowU.push_back(in.u);
+            rr.rowJet.push_back(in.jet);
+            rr.rowTarget.push_back(c.nscbcThermalInflow ? 1.0 / (kRgasBox * T)
+                                                        : rho);
+            rr.rowRho.push_back(rho);
+            rr.rowY.push_back(in.YF);
+            rr.rowYO.push_back(in.YO);
+        }
+        rr.sp.yInRow[0] = rr.rowY;
+        rr.sp.yInRow[1] = rr.rowYO;
+        auto res = gpu::runFlame(g, host, rhoY, rr, *out);
+        if (!res) return die(res.error().code, res.error().message);
+        return reportDone(*res, *out);
+    }
+
+    const double Tu = c.flameTu, sig = c.flameModel.sigma;
+    gpu::FlameRun rr;
+    // mu = Pr at Tref = Tu: lambda_u = mu cp / Pr = cp (delta_D = 1).
+    rr.tr = Transport::air(c.prandtl, Tu, c.tinfK, c.prandtl, kGammaAir,
+                           kRgasBox, c.sutherland);
+    rr.sp.nY = 1;
+    rr.sp.fuel = 0;
+    rr.sp.lnA = std::log(c.flameEig.Lambda);
+    rr.sp.Ta = c.flameModel.theta() * Tu;
+    rr.sp.q = rr.tr.cp() * (sig - 1) * Tu;
+    rr.sp.invPr = 1.0 / c.prandtl;
+    rr.sp.openX = true;
+    rr.sp.yIn[0] = 1.0;
+    rr.Tu = Tu;
+    rr.sigma = sig;
+    rr.uIn = c.flameUIn;
+    rr.pB = Tu - c.flameUIn * c.flameUIn * (sig - 1); // the IC's burnt p
+    rr.etaIn = c.nscbcEtaIn;
+    rr.thermalInflow = c.nscbcThermalInflow;
+    rr.sinkNb = c.nscbcSink;
+    rr.sinkAmp = c.nscbcSinkAmp;
+    rr.dth = c.flameEig.dthOverDD;
+    rr.cfl = c.cfl;
+    rr.tEnd = c.tEnd;
+    rr.dtRecompute = c.dtRecompute;
+    rr.profileDt = c.profileDt;
+    rr.label = flameRunLabel(c);
+    if (c.flameBunsen) {
+        // The slot burner: per-row inflow (dns/bunsen.hpp) and p = p0 at the
+        // outflow (the cone's pressure jump is O(M^2) of p0, not the 1D one).
+        rr.bunsen = true;
+        rr.geom = c.bunsen;
+        rr.pB = Tu;
+        for (int j = 0; j < g.ny; ++j) {
+            const BunsenInflowRow in = bunsenInflow(c.bunsen, (j + 0.5) * g.hy);
+            const double T = Tu * in.t, rho = Tu / T; // p0 = Tu, R = 1
+            rr.rowU.push_back(in.u);
+            rr.rowJet.push_back(in.jet);
+            rr.rowTarget.push_back(c.nscbcThermalInflow ? 1.0 / (kRgasBox * T)
+                                                        : rho);
+            rr.rowRho.push_back(rho);
+            rr.rowY.push_back(in.Y);
+        }
+        rr.sp.yInRow[0] = rr.rowY;
+    }
+
+    auto res = gpu::runFlame(g, host, std::span(rhoY, 1), rr, *out);
+    if (!res) return die(res.error().code, res.error().message);
+    return reportDone(*res, *out);
+#else
+    return exitNoGpu;
+#endif
+}
+
+
 // --- tgv -------------------------------------------------------------------
 
 int runTgv(const Case& c)
@@ -1518,6 +1763,7 @@ int main(int argc, char** argv)
     case Subcommand::Channel: return runChannel(*c);
     case Subcommand::Conv: return runConv(*c);
     case Subcommand::Prop: return runProp(*c);
+    case Subcommand::Flame: return runFlame(*c);
     }
     return 1;
 }

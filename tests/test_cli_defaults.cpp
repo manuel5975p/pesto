@@ -117,6 +117,8 @@ int main()
         "channel",
         "conv",
         "conv --physics incompressible",
+        "flame",
+        "flame --nscbc-sink 0",
     };
     for (const char* cmd : cmds)
     {

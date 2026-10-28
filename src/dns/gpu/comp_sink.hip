@@ -100,6 +100,82 @@ __global__ void kCompSink(GpuGrid g, int nb, Real sgx, Real sgy, Real sgz,
         internal::stageAdd<Comp>(cmb, v, c, cr, add[v], out[v]);
 }
 
+// The species twin of kCompSink (dns flame), plain write: rhoY_k gets
+// Y_k (the cell's own, of the stage input) times the band's continuity term,
+// i.e. the band moves species exactly as it moves mass and never changes Y.
+// The D4 operator applied to rhoY itself was tried first and measured NOT
+// bounded: being a high-pass with mixed-sign weights, it acted on the RATIO
+// rhoY/rho as an anti-diffusion and pushed the fresh Y = 1 to 1 + 2e-5 in the
+// inflow band (c7.5, --inflow-speed 0.98; 0 cells with the band off). The
+// continuity term is a COPY of kCompSink's arithmetic (ramps, ghosts, nested
+// differences, order) on rho alone, so the mean-flow kernel's bits cannot
+// move and a power-of-two uniform Y stays exactly Y rho. Cost: the band
+// conserves species mass only to the extent Y varies across it (it sits in
+// uniform fresh or burnt gas).
+__global__ void kCompSinkSpecies(GpuGrid g, int nb, Real sgx, Real sgy,
+                                 Real sgz, StageCombine cmb, int nY,
+                                 const Real* __restrict__ srho,
+                                 const Real* __restrict__ s0,
+                                 const Real* __restrict__ s1,
+                                 const Real* __restrict__ s2,
+                                 const Real* __restrict__ s3, Real* o0,
+                                 Real* o1, Real* o2, Real* o3)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= g.size()) return;
+    int i, j, k;
+    decompose(g, c, i, j, k);
+    const int ij[3] = {i, j, k}, nn[3] = {g.nx, g.ny, g.nz};
+    const Real sg[3] = {sgx, sgy, sgz};
+    Real addR = Real(0);
+    bool banded = false;
+    for (int a = 0; a < 3; ++a) {
+        if (sg[a] <= Real(0)) continue;
+        const int q = ij[a], n = nn[a];
+        auto faceSig = [&](int m) { // face m+1/2
+            if (m < 0 || m >= n - 1) return Real(0);
+            return Real(0.5) * (bandRamp(m, n, nb) + bandRamp(m + 1, n, nb)) *
+                   sg[a];
+        };
+        const Real shi = faceSig(q), slo = faceSig(q - 1);
+        if (shi <= Real(0) && slo <= Real(0)) continue;
+        banded = true;
+        auto at = [&](const Real* v, int d) {
+            const int t = q + d;
+            int ii = i, jj = j, kk = k;
+            int& m = a == 0 ? ii : a == 1 ? jj : kk;
+            if (t < 0) {
+                m = 0;
+                const Real v0 = v[gidx(g, ii, jj, kk)];
+                m = 1;
+                return Real(2) * v0 - v[gidx(g, ii, jj, kk)];
+            }
+            if (t > n - 1) {
+                m = n - 1;
+                const Real v0 = v[gidx(g, ii, jj, kk)];
+                m = n - 2;
+                return Real(2) * v0 - v[gidx(g, ii, jj, kk)];
+            }
+            m = t;
+            return v[gidx(g, ii, jj, kk)];
+        };
+        auto flux = [&](const Real* v, int m) { // sig * t at face m+1/2
+            const Real qm1 = at(v, m - q - 1), q0 = at(v, m - q);
+            const Real qp1 = at(v, m - q + 1), qp2 = at(v, m - q + 2);
+            return ((qp2 - qp1) - Real(2) * (qp1 - q0) + (q0 - qm1)) *
+                   Real(1.0 / 16.0);
+        };
+        addR -= shi * flux(srho, q) - slo * flux(srho, q - 1);
+    }
+    if (!banded) return;
+    const Real cr = cmb.crAt(c);
+    const Real* sy[4] = {s0, s1, s2, s3};
+    Real* out[4] = {o0, o1, o2, o3};
+    const Real r = srho[c];
+    for (int v = 0; v < nY; ++v)
+        internal::stageAdd<false>(cmb, v, c, cr, sy[v][c] / r * addR, out[v]);
+}
+
 } // namespace
 
 std::expected<DeviceCompSink, hipError_t> DeviceCompSink::make(const Grid& g,
@@ -133,6 +209,21 @@ void DeviceCompSink::apply(const DeviceCompState& s, DeviceCompState& out,
             out.my.data(), out.mz.data(), out.E.data());
     });
     checkLastKernel("kCompSink");
+}
+
+void DeviceCompSink::applySpecies(const DeviceCompState& s,
+                                  DeviceCompState& out,
+                                  const StageCombine& cmb) const
+{
+    static_assert(kMaxY == 4);
+    assert(s.nY >= 1 && out.nY == s.nY && !cmb.ol[0]);
+    const Real a = Real(c_.alpha * c_.cInf);
+    kCompSinkSpecies<<<launchBlocks(g_.size()), blockSize>>>(
+        g_, c_.nb, a / g_.hx, c_.openY ? a / g_.hy : Real(0),
+        c_.openZ ? a / g_.hz : Real(0), cmb, s.nY, s.rho.data(), s.y[0].data(),
+        s.y[1].data(), s.y[2].data(), s.y[3].data(), out.y[0].data(),
+        out.y[1].data(), out.y[2].data(), out.y[3].data());
+    checkLastKernel("kCompSinkSpecies");
 }
 
 } // namespace dns::gpu
