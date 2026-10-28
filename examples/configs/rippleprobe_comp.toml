@@ -2,12 +2,12 @@
 # incompressible: projection solver, --far tunnel (incompressible default),
 # no Mach/ramp. Same model: sigma, Csigma = 1.35 -- FILTERED field.
 #
-#   build/dns --config sphere256sigma_re1e4_incomp.toml
+#   build/dns --config examples/configs/sphere256sigma_re1e4_incomp.toml
 
 subcommand = "flow"
-physics = "incompressible"
+physics = "compressible"
 body = "sphere"
-n = 128
+n = 256
 nz = 256
 dr = 4
 re = 1e4
@@ -20,4 +20,5 @@ vort_map = "asinh"
 vort_max = 60
 speed_map = "delta"
 emit = ["stats", "bin"]
-out = "/tmp/dns/rippleprobe128"
+out = "/tmp/dns/rippleprobe_comp"
+nscbc_strip = 4

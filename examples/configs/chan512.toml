@@ -5,7 +5,7 @@
 # Other settings at the channel defaults: re-tau 180, stretch 2.0, cfl 0.4,
 # isothermal walls, profile-dt 1.
 #
-#   build/dns --config chan512.toml
+#   build/dns --config examples/configs/chan512.toml
 
 subcommand = "channel"
 n = 512

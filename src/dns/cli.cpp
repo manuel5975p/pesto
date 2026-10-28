@@ -606,8 +606,8 @@ BODY (exactly one; required)
                      you are after.
                      Composable with --cut-flux. Try ETA ~ h/uInf. [0]
   --pitch DEG        DEPRECATED: rotates RAW MODEL AXES, not aircraft
-  --yaw DEG          angles. Bake attitude with build/orient.py and
-                     leave these at 0.
+  --yaw DEG          angles. Bake attitude into the mesh and leave
+                     these at 0.
 
 PHYSICS
   --physics incompressible|compressible          [incompressible]
@@ -1043,8 +1043,7 @@ OUTPUT (--emit is repeatable; default = stats,bin)
                      nothing written to disk. Same planes as --emit web plus
                      the 3D field when nz > 1, published under a seqlock so a
                      slow or dead viewer can never stall the solver. This is
-                     what `dns-ui` attaches to; pair it with --emit none for a
-                     run that leaves no artefacts at all.
+                     what `dns-ui` attaches to.
   --emit volume      <out>_{vol,lam}.bin full 3D field per frame
   --emit slices      three centre planes instead of the volume
   --emit vtk         <out>_%05d.vtk legacy structured points

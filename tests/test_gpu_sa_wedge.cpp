@@ -3,7 +3,8 @@
 // Re 1e3, M 0.2, RANS SA-neg, explicit LTS to TOL 1e-4 through the binary,
 // pinned to its measured state. The OpenFOAM comparison on the identical mesh
 // is PRINTED, not gated: tier B measures -1.07%, outside the 1% the
-// masterplan set before measuring (issues.md). ~30 s.
+// masterplan set before measuring (docs/validation.md "Sphere RANS on the
+// revolved wedge"). ~30 s.
 #include "validation_util.hpp"
 #include "check.hpp"
 #include "gpu_test_util.hpp"
@@ -71,7 +72,7 @@ void wedgeGate()
               std::abs(ts - kThetaS) < 0.1,
           "SA wedge gate: cd, L_r, theta_s at their measured values");
     check(mut > 5 && mut < 20, "SA wedge gate: turbulent wake (mu_t/mu max in (5, 20))");
-    // Not a check: the code-to-code number, for the log (issues.md).
+    // Not a check: the code-to-code number, for the log (docs/validation.md).
     std::printf("  vs OpenFOAM SpalartAllmaras (central U, identical mesh): cd0 "
                 "%.5f vs %.5f (%+.2f%%, tier B), theta_s %.2f vs %.2f (M 0.2), "
                 "L_r %.4f vs %.4f (M 0.2)\n",

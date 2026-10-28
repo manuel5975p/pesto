@@ -8,7 +8,7 @@
 # Rendering follows the calibrated high-Re recipe: signed wz asinh with
 # vort-max ~ measured peak, speed as |u| - uInf delta.
 #
-#   build/dns --config sphere448sigma_re4e4.toml
+#   build/dns --config examples/configs/sphere448sigma_re4e4.toml
 
 subcommand = "flow"
 physics = "compressible"

@@ -53,20 +53,20 @@ carries, the viewer renders whatever it finds.
   frame's files are fully written before the manifest naming them lands
   (manifest rename is the commit point).
 
-## Writer API (`src/dns/webframes.*`, implemented; test `webframes`)
+## Writer API (`src/dns/webframes.*`; test `webframes`)
 
-    WebFrames wf(dir, grid, simJson);
-    wf.field("vort", Kind::Diverging, -8.0, 8.0);
-    wf.field("speed", Kind::Sequential, 0.0, 1.6);
+    WebFrames wf(dir, w, h, simJson);
+    wf.addField("vort", "diverging", -8.0, 8.0);
+    wf.addField("speed", "sequential", 0.0, 1.6);
     wf.writeStatic("mask", maskPtr, 0.0, 1.0);
-    wf.write(t, {{"vort", vortPtr}, {"speed", speedPtr}});   // per frame
+    wf.writeFrame(t, {vortPtr, speedPtr});   // per frame, in declared order
 
-Apps choose the set: defaults mirror today's vort+speed; extra primitives
-(p, rho, u, v) opt-in via a `--wfields` flag.
+`RunOutput` (`dns/output.cpp`) writes one such directory per published plane
+(`web_<out><suffix>`; the `sim` object carries `plane` and `off`), with the
+run's frame field set (vort + speed, plus `temp` where the run publishes it).
 
 **The mask is `static` by contract, and a MOVING body breaks that assumption.**
-A rotor run (`--rotor-mach`, README §12.3) has a body whose occupancy changes
-with azimuth. `RunOutput::updateMask` refreshes the mask the sinks that read it
+A rotor run (`--rotor-mach`) has a body whose occupancy changes with azimuth. `RunOutput::updateMask` refreshes the mask the sinks that read it
 PER FRAME use — the PNG frames and the live shared-memory planes, so images and
 the cockpit view follow the blade. This format is not one of them: `mask.bin`
 here, and the one-shot `<prefix>_mask.bin`, both hold the mask the run STARTED
@@ -89,7 +89,7 @@ reads exactly as before):
 |---|---|---|
 | `rans` | a RANS run (channel or flow) | `"SA-neg"`, `"SST-2003m"`, `"SST-Vm"` |
 | `steady` | `dns channel --steady-scheme implicit` | `"implicit"` |
-| `ransMode` | `dns flow` RANS, or a compressible `--steady` run | `"urans"`, `"steady-explicit"`, `"steady-implicit-nk"` (`--steady-scheme implicit`; later `"urans-dual"`) |
+| `ransMode` | `dns flow` RANS, or a compressible `--steady` run | `"urans"`, `"steady-explicit"`, `"steady-implicit-nk"` (`--steady-scheme implicit`) |
 | `ransInflow` | `dns flow` RANS | the describe's freestream turbulence string, e.g. `"nu~inf/nu = 3 (TMR)"` |
 
 ## `<prefix>_surface.csv` (`--emit surface`, `dns flow --ogrid`)
@@ -138,7 +138,7 @@ the flux from the FLUID into the BODY (the force on the body), solver units:
 | `p` | the KG face pressure the flux uses, ½(p_fluid + p_ghost), minus pInf |
 | `fx`, `fy`, `fz` | the full face momentum flux minus pInf s (gauge); Σ = the tally to round-off |
 | `fpx`, `fpy`, `fpz` | its pressure part p s |
-| `fcx`, `fcy`, `fcz` | its convective part ρ_f u_a,n u_f (u_a the advecting velocity: wall-relative in the MRF zone). Zero on an exact no-penetration face when u_a is wall-relative (a resting wall, or MRF); on the staircase it is the mirror's imperfection carried through the wall, not a stress, and it scales with the wall speed. On a DIRECT moving rotor (`--rotor-bins`) u_a is the absolute velocity on a fixed face the wall sweeps through, so `fc` also carries the wall's own normal motion ρ u_w,n u |
+| `fcx`, `fcy`, `fcz` | its convective part. The interface faces are impermeable (`DeviceCompGhost::applyRhs`), so `fc` is exactly 0 at a resting wall and under MRF (no advection relative to the wall / frame); on a moving rotor (`--rotor-frame moving`) it is the wall's own normal motion ρ u_wall·n u, u_wall sampled at the face centre |
 | `fvx`, `fvy`, `fvz` | the viscous stress, f − fp − fc |
 
 `tools/parity/split_dns.py` sorts a rotor's rows into hub and blade and

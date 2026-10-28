@@ -119,10 +119,9 @@ menu:  dns-ui  frame  body  ortho  view  log  undo  redo  RUN/stop
 ```
 
 The four dividers drag, and they are **painted after the regions**, with a grip
-at the centre — drawn before them the panels covered the bar, and an invisible
-handle is not a handle (the bottom dock in particular read as a fixed height).
-The dock's divider exists while it is **collapsed** too: dragging the closed
-header's top edge upward opens the dock at the height you dragged it to.
+at the centre, so no panel covers them. The dock's divider exists while it is
+**collapsed** too: dragging the closed header's top edge upward opens the dock
+at the height you dragged it to.
 
 The viewport is a real region: the scene is projected into its rect and
 Vulkan-scissored to it, so a panel can never be overdrawn by 3D geometry, and a
@@ -153,12 +152,10 @@ Two rules do the work, and both are in `Gui::dragRate` / `Gui::dragFill`:
   `Cs = 0.1` at 83%.
 
 The field commits a snap of a **continuous shadow value**, not the sum of its own
-committed increments. That is what fixes the two ways it used to feel broken:
-held against `lo`/`hi` it accumulated the whole overshoot as an invisible debt
-that had to be dragged back off before the value would move again, and a field
-whose quantum was coarser than one pixel of travel (`cells z`, 0.25 cells/px
-against a quantum of 1) re-rounded to its old value every frame and could not be
-dragged at all. `checkDragLaw` in `guicheck.cpp` pins all of it.
+committed increments: held against `lo`/`hi` it accumulates no invisible
+overshoot (reversing the drag moves the value at once), and a field whose
+quantum is coarser than one pixel of travel (`cells z`, 0.25 cells/px against a
+quantum of 1) still drags. `checkDragLaw` in `guicheck.cpp` pins all of it.
 
 ## Two cases: `flow` and `convection`
 
@@ -396,7 +393,5 @@ Under `--focal` the solver's body is the WORLD sdf at the MAPPED cell centres
 `dns::sampleCutMapped` (the world sdf at the mapped sub-samples, in index
 space) and the surface samples the sdf at physical positions. The world-lattice
 `sampleCut()` the runner keeps is the qRef frontal-area measurement only (see
-`dns/geometry.hpp`). It used to be the drawn one too -- sdf in reference space,
-plotted at mapped positions -- which showed the body shrunk by the plateau
-slope and sitting inside the drawn plateau, while the run had it on coarse
-cells beside it. With `--focal` off the two coincide exactly.
+`dns/geometry.hpp`) and is never drawn. With `--focal` off the two coincide
+exactly.

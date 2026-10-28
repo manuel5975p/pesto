@@ -35,7 +35,7 @@ runTgv3d(const Grid& g, const VectorField& ic, const TgvRun& r,
         return std::unexpected(h.error());
     const auto gg = GpuGrid::from(g);
 
-    // The dissipation series IS this subcommand's output (README §3), so it
+    // The dissipation series IS this subcommand's output, so it
     // goes to stdout in the reference curves' format, not to a diagnostic.
     TgvSeries::header();
     TgvSeries series;

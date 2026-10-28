@@ -1,10 +1,9 @@
 # dns vs OpenFOAM parity suite
 
-Replaces the ad-hoc `runs/verify` / `runs/prop1c/foam` comparisons. Those
-checked accuracy correctly (same case, method-independent answer) but timed
-dns' explicit compressible time-march against simpleFoam's steady
-incompressible solve -- different equations, different mode. Not a cost
-comparison.
+Accuracy and cost, both solvers generated from one case spec. A cost number
+compares like with like: dns' explicit compressible time march against
+simpleFoam's steady incompressible solve is different equations in a
+different mode, hence the tiers.
 
 ## Two tiers, one case spec
 
@@ -30,10 +29,16 @@ A foam parity number names its U scheme. The reference is central
 (`u_scheme = "linear"`: `Gauss linear` in tier A, `bounded Gauss linear` in
 B/Bc), as in CLAUDE.md "OpenFOAM parity" -- linearUpwind is a numerical
 diffusion dns does not have (rotor: linearUpwind put foam's L1 CT 22% above
-its own reference, central 5%). Every report row names its scheme. The 2D
-cases still run `linearUpwind` and are flagged "stale: regenerate before
-citing". Tier Bc's energy convection (`bounded Gauss linearUpwind grad(e)`,
-`bounded Gauss linear` for Ekp) is recorded in the report; the rule covers U.
+its own reference, central 5%). Every report row names its scheme; the 2D
+cases (cyl40, cyl100, sect) are still configured `linearUpwind`, so their rows
+are not parity numbers. Tier Bc's energy convection (`bounded Gauss
+linearUpwind grad(e)`, `bounded Gauss linear` for Ekp) is recorded in the
+report; the rule covers U.
+
+The laplacian / snGrad is unlimited (`limited = False`, `Gauss linear
+corrected`, nNonOrthogonalCorrectors 1-2) on the rotor and section branches:
+`limited corrected 0.33` cost +9.3% Cn on the 7° ellipse section at 53°
+non-orthogonality (it does not refine away) and 1.2–2.3% |CT| on rotor2.
 
 ## Cases (cheap on purpose)
 
@@ -75,9 +80,9 @@ Three traps, each commented in the script:
 
 Verdict (exp_thermal.md, reproduced end to end by the script in
 impl_batch.md): equivalent. Nu -0.34% (Tw/Tinf 1.1) and -0.14% (2.0), cd
-+0.43% / +0.14%. The dns 2x-grid change is 0.12% in Nu. Open: the M 0.5
-adiabatic recovery reference (foam LTS unconverged, cd -3.1%) and RANS Prt
-heat transfer; neither is codified.
++0.43% / +0.14%. The dns 2x-grid change is 0.12% in Nu. Open (issues.md 29):
+the M 0.5 adiabatic recovery reference and RANS Prt heat transfer; neither is
+codified.
 
 `rotor` is NOT prop1c. prop1c (chord 0.109 D, t/c 0.55) needs c/h >= 10,
 i.e. D/h >= 111 and ~1 h per point (L3: below c/h 10 the result depends on

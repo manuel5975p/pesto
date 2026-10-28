@@ -6,7 +6,7 @@
 # vort_max scaled from the 448 recipe by sqrt(Re) (BL vorticity ~ sqrt(Re)):
 # 120 * sqrt(1e4/4e4) = 60.
 #
-#   build/dns --config sphere256sigma_re1e4.toml
+#   build/dns --config examples/configs/sphere256sigma_re1e4.toml
 
 subcommand = "flow"
 physics = "compressible"

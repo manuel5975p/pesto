@@ -65,7 +65,7 @@ studies only. `isothermal = false` reproduces kFarWallY bit-for-bit
 - `yplus`/`uplus` (and the stats `utauBot`/`utauTop`/`retau`) use the FITTED
   u_τ = √(ν du/dy|_w), a 2-point one-sided wall gradient with ν = 1/Re_τ
   (ρ_b = 1), NOT the exact discrete wall units (τ_w ≡ 1, u_τ = 1). Measured
-  on converged RANS states (2026-10-27): fitted u_τ +0.13% (Re_τ 1e5, ny
+  on converged RANS states: fitted u_τ +0.13% (Re_τ 1e5, ny
   2048, `--stretch 4`), +0.52% (Re_τ 1e4, ny 512), +1.0% (Re_τ 193, ny 128),
   +2% (Re_τ 180, ny 64). For a profile comparison at the 1% level divide by
   the exact u_τ = 1 instead (u⁺ = u, y⁺ = y Re_τ). At high Mach the wall
@@ -85,11 +85,11 @@ Untripped (`--kick 0`) stays laminar — that is the test oracle, not a bug.
 - Laminar oracle (test_gpu_channel): ny=32, beta=1 — profile matches the
   Poiseuille parabola to 1.6e-3 Linf; extracted tau_wall 1.043 (the bias is
   the wall-adjacent cell's truncation; halves with dy: 8.5% at ny=16).
-- KMM Re_tau 180 campaign: NOT yet run/measured. dt ~ 2.4e-5 at Mach 0.2
-  (acoustic limit in the wall cell) -> ~1.25M steps for 30 turnovers on the
-  default grid. `--mach 0.3` cuts ~35% at the price of compressibility
-  drift from the incompressible reference. Do not cite KMM agreement until
-  a stationary-window average has been measured and recorded here.
+- KMM Re_tau 180 campaign: not run. dt ~ 2.4e-5 at Mach 0.2 (acoustic
+  limit in the wall cell) -> ~1.25M steps for 30 turnovers on the default
+  grid. `--mach 0.3` cuts ~35% at the price of compressibility drift from
+  the incompressible reference. There is no KMM agreement to cite until a
+  stationary-window average is measured and recorded here.
 
 ## RANS (`--rans sa-neg|sst-2003m|sst-vm`, `--steady TOL`)
 
@@ -113,9 +113,10 @@ Measured (FP64 oracle = the same discrete operator; MKM ub⁺ 15.679 at Re_τ
 wall ω; ub 15.776 / 15.464 / 15.292 / 15.207 / 15.166 at ny 48–768), so its
 ny-64 15.633 (−0.29%) is wall-BC error, not model agreement; at Re_τ 392.24
 the continuum is −1.8% (2003m) / −2.1% (Vm) and SA-neg +0.44%
-(docs/validation.md). The FP32 steady march lands on the oracle (ub within 0.06% after
-3–4e5 iterations, 45–55 s at ny 64) but its residual floors at ~1 (the FP32
-update floor) — it cannot certify convergence; see `docs/rans.md`.
+(docs/validation.md). The FP32 steady march lands on the oracle (ub within
+0.06% after 3–4e5 iterations, 45–55 s at ny 64) but its residual floors at ~1
+(the FP32 update floor) and certifies nothing, so `--steady TOL` stops on the
+integrals (ub, bulk T, the turbulence integrals); see `docs/rans.md`.
 
 `--steady-scheme explicit|implicit` picks the pseudo-time scheme (default
 `explicit`, the local-time-stepping march above). `implicit` is a coupled
@@ -161,7 +162,7 @@ Smagorinsky has no wall damping: |S| at the wall is u_τ²/ν, so the first cell
 carries ν_t/ν ≈ (Cs Δ⁺)². σ vanishes in pure shear (`gpu_channel_les` L3: μt
 ≡ 0 on the laminar Poiseuille state, smag 10.1 μ on the same state).
 
-**Measured (2026-10-27, gfx1100, W11).** 32 × 48 × 32, `--stretch 1.6`
+**Measured (gfx1100; issues.md 25).** 32 × 48 × 32, `--stretch 1.6`
 (y⁺₁ = 2.08, Δx⁺ 70.7, Δz⁺ 23.6), `--mach 0.3`, Re_τ 180, `--kick 0.1`,
 `--tt 40` (≈ 5.0e5 steps, dt ≈ 8e-5); ub⁺ = ub (the exact u_τ = 1) over
 t 25–40, ± batch SE of 5 × 3 δ/u_τ batches (an UNDERESTIMATE: 3 δ/u_τ is
@@ -176,8 +177,7 @@ not many ub correlation times), against MKM 15.68:
 None of the three windows passes the stationarity rule (|linear trend| < 1
 SE), so these are NOT converged LES statistics and carry no band; Δx⁺ 70 is
 a wall-resolved LES grid in name only. Smagorinsky's undamped wall ν_t (its
-largest value sits IN the first cell) kills the turbulence at this Δ — the
-expected failure, now a number. σ keeps the near-wall layer molecular but
+largest value sits IN the first cell) kills the turbulence at this Δ. σ keeps the near-wall layer molecular but
 over-predicts ub⁺ further than no model on this grid; whether that is the
 model or the 40 δ/u_τ transient is not resolved by these runs. Commands:
 plans/verify/impl_W11.md.

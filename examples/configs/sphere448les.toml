@@ -7,7 +7,7 @@
 # buffers + FFT workspace exceed the 16 GiB card on top of ~11 GB of
 # state/cut (measured exit 6 at init, 2026-07-23); 448^3 fits.
 #
-#   build/dns --config sphere448les.toml
+#   build/dns --config examples/configs/sphere448les.toml
 
 subcommand = "flow"
 body = "sphere"

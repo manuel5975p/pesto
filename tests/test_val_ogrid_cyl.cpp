@@ -49,7 +49,7 @@ const std::string kBase =
 
 // (a) Re 100 shedding. Measured 2026-10-27 (gfx1100, 21 s): St 0.1679, cd
 // 1.3802, cl' 0.3331; the envelope is within 0.5% of its limit from t ~ 80
-// (99% at 71.6, issues.md 16), so the window [82, 121.4] is 8.4 periods
+// (99% at 71.6, docs/rans.md "The full revolution"), so the window [82, 121.4] is 8.4 periods
 // (>= 7 full crossing-to-crossing periods) of the saturated cycle. Bands
 // are the masterplan's, set before measuring.
 void shedding()

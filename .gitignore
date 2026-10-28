@@ -14,7 +14,20 @@ png_*/
 
 # Frames / renders
 *.png
-!cube512_frame.png
+
+# Run output dropped in the repo root (dns --out NAME, dns-ui --check)
+/*.json
+/*_stats.csv
+/*_profiles.csv
+/*_surface.csv
+
+# Local working notes and run trees (untracked by decision)
+plans/
+runs/
+__pycache__/
+
+# Local Python venv (Cantera 3.2.0 for chemistry references)
+.venv/
 
 # Large mesh assets
 *.glb

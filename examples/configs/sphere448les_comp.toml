@@ -6,7 +6,7 @@
 # ramp 2 (tEnd = ramp + 2 L/uInf). Acoustic CFL makes steps ~16x smaller
 # than the incompressible twin -- that cost IS the benchmark.
 #
-#   build/dns --config sphere448les_comp.toml
+#   build/dns --config examples/configs/sphere448les_comp.toml
 
 subcommand = "flow"
 physics = "compressible"

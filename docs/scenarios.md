@@ -1,29 +1,25 @@
 # Scenarios — cheap runnable recipes
 
 One page of "interesting fluid scenarios" a user can run as-is (masterplan
-`plans/verify/masterplan_verify.md` W16). Every argv below passes `--dry-run`
-on the 2026-10-27 build (checked 2026-10-27, W16); every number comes from a run
-another verification item already made — this page adds no code and no run.
+`plans/verify/masterplan_verify.md` W16). Every argv below passes
+`--dry-run`; every number comes from a run another verification item already
+made, recorded in the cited `plans/verify/impl_W*.md` and docs section.
 gfx1100 (RX 7900 XTX), Release `build/`. Box units unless stated (O-grid
 cylinder/sphere: D = π/4, U = 1, so St = f·D and `--ft` counts 40 D).
 
 Conventions:
 - **Wall time** is the measured run (stepping plus setup, lock wait
   excluded). "long" = over 60 s; the hard ceiling is 300 s.
-- **Peak VRAM: not recorded.** None of the source runs logged it and this page
-  adds no GPU run. All of these grids are ≤ 6.6 M cells.
+- **Peak VRAM: not recorded.** All of these grids are ≤ 6.6 M cells.
 - **Label** is the one the run prints (dry-run `label` line, progress lines,
   stats header). Quote it with the number.
-- **Run directory**: `$S` = the verification session's scratchpad
-  (`/tmp/claude-1000/-home-manuel-Documents-pesto/c3bc040d-2132-4633-a610-50a9da9c0d9c/scratchpad`),
-  which is ephemeral; the durable record of each run is the cited
-  `plans/verify/impl_W*.md` and docs section. `runs/parity/` is in the repo.
 - Always `--dry-run` first; replace `--out` with your own prefix.
+  `runs/parity/` is in the repo.
 
 | # | scenario | label | wall | source |
 |---|---|---|---|---|
 | 1 | O-grid cylinder Re 40 steady / Re 100 shedding | DNS | 3.2 s / 21 s | W12 |
-| 2 | O-grid cylinder Re 1e4 URANS shedding vs OpenFOAM | RANS SST-2003m / SA-neg, URANS | 96–191 s (long) | W12 |
+| 2 | O-grid cylinder Re 1e4 URANS shedding vs OpenFOAM | RANS SST-2003m, URANS | 96–191 s (long) | W12 |
 | 3 | Compressible TGV Re 1600, DNS / smag / σ vs 512³ | DNS / LES | ≤ 0.5 s each | W10 |
 | 4 | Channel Re_τ 180, DNS / smag / σ | DNS / LES | 52 / 74 / 82 s (long) | W11 |
 | 5 | Supersonic isothermal channel M_b 1.5 (CKM 1995) | RANS SA-neg, implicit steady | < 1 s | W13 |
@@ -50,9 +46,9 @@ Conventions:
   (0.32–0.34); first/last-period cl' 0.3323 / 0.3331 (saturated).
 - `--ogrid-trip 0.05` is what makes 3.8 suffice: the 2D cylinder O-grid is
   untripped by default and then reaches the same limit cycle ~1.8× later;
-  the trip shortens only the linear growth (issues.md 16).
+  the trip shortens only the linear growth (docs/rans.md "The full
+  revolution").
 - Test: `val_ogrid_cyl` (both runs, 26.7 s, labels `validation;literature`).
-  Runs: `$S/impl/W12/re40*` (+ the grid/Mach/far study `re40_*`),
   `plans/verify/impl_W12.md`.
 
 ## 2. O-grid cylinder Re 1e4: URANS shedding vs OpenFOAM (long)
@@ -66,31 +62,31 @@ Conventions:
   [O-grid trip 0.05 U]` (SA: `RANS SA-neg -- ...`), compensated state
   (`--compensated`, issues.md 20).
 - Wall: SST 191 s (781682 steps, 0.244 ms/step); SST `--cfl 0.8` 96 s
-  (390842 steps, means within SE of cfl 0.4: cd / cl_rms / St 1.6989 /
-  1.2190 / 0.2314); SA 171 s of stepping (780090 steps × 0.220 ms; W12
-  quotes 195 s, its log 286 s including lock wait). Run health: y⁺
-  max 0.93–1.12 (the dry-run's 1.76 is an estimate), 0 SST floor hits.
-- Report a URANS number as a window mean ± batch SE (docs/rans.md
-  "Reporting a URANS result").
+  (390842 steps, paired cl within 3.5e-3 of cfl 0.4); SA 171 s of stepping
+  (780090 steps × 0.220 ms). Run health: y⁺ max 0.93–1.12 (the dry-run's
+  1.76 is an estimate), 0 SST floor hits.
+- 64 D/U is the run, not a citable window: the start-up overshoot is still
+  in it. Report a URANS number as a window mean ± batch SE over ~10 saturated
+  periods (docs/rans.md "Reporting a URANS result"); the measured saturated
+  SST window is 75–128 D/U (12 periods: cl_rms 1.2061 ± 0.0006).
+- Against OpenFOAM rhoPimpleFoam on the identical mesh (central U, PIMPLE
+  nOuter 2, `waveTransmissive` far p), saturated windows, SST, R 20 D:
 
-| | window D/U (periods) | cd | cl_rms | St |
-|---|---|---|---|---|
-| dns SST-2003m | 27.7–62.3 (8) | 1.6985 ± 0.0069 | 1.2164 ± 0.0084 | 0.2314 ± 0.0019 |
-| OpenFOAM kOmegaSST | 45.7–63.5 (4) | 1.6945 ± 0.0130 | 1.2084 ± 0.0020 | 0.2249 ± 0.0035 |
-| Δ | | +0.24% | +0.66% | +2.92% |
-| dns SA-neg | 45.2–66.0 (5) | 1.7383 ± 0.0054 | 1.3581 ± 0.0047 | 0.2406 ± 0.0003 |
-| OpenFOAM SpalartAllmaras | 49.6–66.4 (4) | 1.7372 ± 0.0043 | 1.3626 ± 0.0028 | 0.2391 ± 0.0015 |
-| Δ | | +0.06% | −0.33% | +0.63% |
+| | cd | St | cl_rms |
+|---|---|---|---|
+| dns | 1.6923 | 0.2282 | 1.2061 |
+| OpenFOAM kOmegaSST | 1.7111 | 0.2323 | 1.2100 |
+| Δ | −1.10% | −1.76% | −0.32% |
 
-- Every Δ is within 1.7 SE. Open: on the common late window t ≥ 45 the SST
-  cl_rms gap is −0.74% at −4.2 SE, unattributed (issues.md 24).
-- OpenFOAM on the identical mesh (rhoPimpleFoam, PIMPLE nOuter 2, np 6,
-  ≈ 3 min per model): a 1-step `--emit mesh` run, then
+- The gap changes sign with the far-field radius (dns − OpenFOAM cd +0.77%
+  at 80 D): dns is radius-converged from 40 D, OpenFOAM is not at 80 D
+  (docs/validation.md "O-grid cylinder URANS shedding vs OpenFOAM", issues.md
+  24).
+- OpenFOAM side: a 1-step `--emit mesh` run, then
   `python3 -I tools/parity/ocyl1e4.py case MESH.bin DIR sst|sa --end 66.5 --np 6`
   and `python3 -I tools/parity/ocyl1e4.py run DIR --timeout 288`.
-- Runs: `$S/impl/W12/{sst_c04,sst_c08,sa_c04,foam_sst,foam_sa}`,
-  docs/validation.md "O-grid cylinder URANS shedding vs OpenFOAM",
-  `plans/verify/impl_W12.md`.
+- `plans/verify/impl_W12.md`, `plans/verify/exp_sst24.md`,
+  `plans/verify/exp_sst40.md`.
 
 ## 3. Compressible Taylor–Green vortex Re 1600: DNS, Smagorinsky, σ (LES)
 
@@ -98,8 +94,8 @@ Conventions:
     # or directly: build/test_gpu_les_tgv_comp
 
 - There is no `dns` argv: `dns tgv` is the incompressible solver and takes
-  no `--les` (that plumbing was dropped by decision, masterplan §6). The
-  test binary IS the recipe; it prints every number below.
+  no `--les` (by decision, masterplan §6). The test binary IS the recipe; it
+  prints every number below.
 - M 0.1, Re 1600, 32³, cfl 0.4, to t = 12. Labels DNS / `LES smag Cs=0.17` /
   `LES sigma Csigma=1.35`. 32³ is under-resolved by design: model
   behaviour, not a converged LES.
@@ -115,8 +111,7 @@ Conventions:
 
 - The models fix the peak VALUE, not the curve: both peak ~2.5 time units
   early. σ is NOT quiet for t < 3 on the TGV (ε_sgs/ε_visc 1.35 at t 0.5).
-- Runs: `$S/impl/W10/tgv_run{1,2,3}.log`, docs/validation.md "LES known
-  answers", `plans/verify/impl_W10.md`.
+- docs/validation.md "LES known answers", `plans/verify/impl_W10.md`.
 
 ## 4. Channel Re_τ 180: DNS vs Smagorinsky vs σ (LES, long)
 
@@ -138,8 +133,8 @@ Conventions:
 
 - No window is stationary (|trend| > 4.6 SE on every run): a result, not
   a band. nutWall == 0.0 exactly every row (odd wall image).
-- Runs: `$S/impl/W11/man/`, docs/channel.md "LES", issues.md 25,
-  `plans/verify/impl_W11.md`. Test: `gpu_channel_les` (0.8 s).
+- docs/channel.md "LES", issues.md 25, `plans/verify/impl_W11.md`. Test:
+  `gpu_channel_les` (0.8 s).
 
 ## 5. Supersonic isothermal channel, M_b 1.5 (Coleman, Kim & Moser 1995)
 
@@ -155,8 +150,8 @@ Conventions:
 - Tc/Tw 1.3816 (CKM ≈ 1.38); Re_τ on wall values 224.5 (CKM 222); the van
   Driest slope over 30 < y⁺ < 0.3 Re_τ is 3.07 vs 3.04 at M_b 0.2 (oracle
   ny 128; raw u⁺: +17%) — CKM's collapse.
-- Runs: `$S/impl/W13/ckm/`, docs/rans.md "Scenario: the supersonic
-  isothermal channel", `plans/verify/impl_W13.md`.
+- docs/rans.md "Scenario: the supersonic isothermal channel",
+  `plans/verify/impl_W13.md`.
 
 ## 6. Full-revolution sphere Re 250: the steady m = 1 wake (DNS)
 
@@ -192,25 +187,24 @@ Conventions:
 - `tests/data/rotor2.stl` is byte-identical to the suite's `body.stl`.
   Wall 34.9 s (L1), 112.7 s (L2, ny 132 ratio 7), 259.6 s (L3, ny 164
   ratio 8).
-- Reference: rhoSimpleFoam (tier Bc), central U, same STL. CT/CQ below are
-  the suite's (`runs/parity/report.md`); the stats file's own `ct`/`cq`
-  columns carry the opposite sign.
+- Reference: rhoSimpleFoam (tier Bc), central U, unlimited laplacian, same
+  STL: CT −0.017090 (fine L3), CQ 0.083313 (Richardson). The stats file's
+  own `ct`/`cq` columns carry the opposite sign of the suite's CT/CQ.
 
-| | CT | CQ |
-|---|---|---|
-| dns L1 / L2 / L3 | −0.05223 / −0.03180 / −0.02891 | 0.09167 / 0.08465 / 0.08208 |
-| dns Richardson | −0.02756 | 0.07743 |
-| OpenFOAM Bc L3 (CQ: Richardson) | −0.01729 | 0.08351 |
-| verdict (bands CT 5%, CQ 2%, fixed before measuring) | +59% | −7.3% → NOT AT PARITY |
+| | L1 | L2 | L3 | band (fixed before measuring) |
+|---|---|---|---|---|
+| dns CT vs Bc | +120.4% | +53.6% | +46.9% | 5% |
+| dns CQ vs Bc | −11.3% | −5.6% | −5.1% | 2% |
 
-- The W6 split puts the CT gap on the blade (106–114% of it), not the hub;
-  the CQ near-agreement at L3 is a cancellation with a convective flux
-  through the moving staircase wall (CQ − CQ_c −8.6% at L3). issues.md 14.
+- NOT AT PARITY. The CT gap is on the blade's chord-normal force, and it is
+  frame-independent (`--rotor-frame moving` agrees with MRF to +5.6 / +3.6%
+  CT at L1 / L2): issues.md 14.
 - A 1 D/U pin of L1 (`--ramp 0.4 --ft 0.054512`, 10.9 s) is ctest
   `gpu_mrf_rotor2`.
 - Runs: `runs/parity/A/rotor2/dns_L{1,2,3}`, `runs/parity/{B,Bc}/rotor2/`,
   `runs/parity/report.md`, `runs/parity/split/rotor2/`,
-  `plans/verify/impl_W7.md`, `plans/verify/impl_W6.md`.
+  `plans/verify/impl_W7.md`, `plans/verify/impl_W6.md`,
+  `plans/verify/impl_imperm.md`.
 
 ## 8. Axisymmetric SA-neg sphere Re 1e3 vs OpenFOAM (wedge)
 
@@ -225,7 +219,7 @@ Conventions:
   9.86.
 - OpenFOAM SA (ft2 true, central `linear` U, same mesh, 16 s via
   `tools/parity/sph1e4.py`): cd 0.484191 → tier A +0.25%. Tier B (dns
-  Mach-extrapolated with an M 0.1 run, 86 s): −1.07%, outside the planned 1%
-  gate (issues.md 21).
-- Test: `gpu_sa_wedge` (29.5 s) pins the dns state. Runs:
-  `$S/impl/W13/wedge/`, `plans/verify/impl_W13.md`.
+  Mach-extrapolated with an M 0.1 run, 86 s): −1.07% at this L1 mesh; at L2
+  (`--n 128 --ny 96`) −0.125% (docs/validation.md "Sphere RANS on the
+  revolved wedge").
+- Test: `gpu_sa_wedge` (29.5 s) pins the dns state. `plans/verify/impl_W13.md`.
