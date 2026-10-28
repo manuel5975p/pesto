@@ -6,6 +6,7 @@
 #include "dns/config.hpp"
 #include "dns/rans.hpp"
 
+#include <format>
 #include <span>
 #include <string>
 #include <string_view>
@@ -42,6 +43,16 @@ std::string ransWedgeSuffix(double deg, bool ensemble = true);
 // wall sits at first-order position on a staircase of cells.
 inline constexpr std::string_view kImmersedSuffix =
     " [immersed ghost wall: first-order wall position, NOT body-fitted]";
+// The frozen rotor's steady march (--rotor-frame mrf --steady), ahead of
+// kImmersedSuffix: its fixed point is the frozen rotor's, not a time mean.
+inline constexpr std::string_view kMrfSteadySuffix =
+    " [MRF frozen rotor: an APPROXIMATION, blade fixed at azimuth 0]";
+// --precond K, appended last: " [low-Mach preconditioned pseudo-time, K=k]".
+// Pre: K > 0.
+inline std::string precondSuffix(double K)
+{
+    return std::format(" [low-Mach preconditioned pseudo-time, K={:g}]", K);
+}
 // What a time-accurate run on the wedge appends to its label.
 inline constexpr std::string_view kAxisymUnsteady =
     "; axisymmetric unsteadiness only -- NOT the sphere's physical shedding";

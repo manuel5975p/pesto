@@ -49,7 +49,18 @@ Numbers are measured, gfx1100.
    cap (exit 8) whatever TOL. Decision needed: a Mach-aware monitor floor, a
    wake monitor other than the whole-domain deficit W (its jitter is
    dominated by the large far-field cells), or accept exit 8 + the printed
-   floors for M ≤ 0.1.
+   floors for M ≤ 0.1. Same at the MRF props (2026-10-28,
+   `plans/verify/impl_M1.md`): rotor2 L1 (M 0.082) at 60000 iterations ct
+   jitter 1.80e-3 (√2 J > TOL 2e-3), cq 2.7e-4, jet monitor 8.05e-3 (>
+   2^-10, trend not monotone); DTMB P1 (M 0.109) ct jitter 0.57 at 16000
+   (unlimited LTS), 6.5e-2 at 13500 (`--lts-max 1`). Settle (|ct/ct_∞ − 1|
+   < 1e-2 / 1e-3 / 3e-4 for good, rotor2 unlimited): 25550 / 59900 /
+   60000+ iterations; certified: never. With `--precond 2` (2026-10-28,
+   `plans/verify/impl_M2.md`) rotor2 at 30000: ct trend 2.5e-4 jitter
+   3.2e-4, cq 1.3e-5 / 2.2e-5 -- the observables WOULD certify TOL 2e-3;
+   the jet monitor (jitter 6.2e-2 relative: its mean ~0.028 sits near zero)
+   alone blocks it. That makes the monitor choice the binding part of this
+   decision for the props.
 5. **OpenFOAM SA ft2 sensitivity exceeds the U4 trigger.** sph1e4 L2: `ft2
    true` 0.41285, `ft2 false` 0.40885 (−0.97%, trigger 0.5%). A dns
    `sa-noft2` is a user decision, not built.
@@ -106,6 +117,24 @@ Numbers are measured, gfx1100.
     seen to diverge from it. Fix (Σ form) changes every RANS dt and LTS bit
     and needs the steady certifications re-pinned: USER DECISION (masterplan
     §5 item 6).
+
+30. **The immersed RANS steady march accepts `--far sponge` and
+    `--nscbc-strip`**, whose relaxation runs per stage in the stage hook, not
+    per unit local dt: the fixed point then depends on the lts ratios (and on
+    dtRef). Rejected for the MRF steady march (2026-10-28); for immersed RANS
+    it is unmeasured and still accepted (rejecting it changes accepted argv:
+    user decision).
+
+31. **`--precond` is laminar only and loses on the diffusive-bound O-grid.**
+    RANS is rejected (the scalars' point-implicit stage has no
+    preconditioned form; masterplan K6, SA wedge M 0.2, not run). O-grid
+    cylinder Re 40 (2026-10-28, `plans/verify/impl_M2.md`): M 0.1 certifies
+    cd 1.55804 in 38000 (plain) / 48000 (K 1) / 42400 (K 3) iterations,
+    2.99 / 5.41 / 4.81 s; M 0.05 80000 / 68800 / 59200, 6.26 / 7.63 /
+    6.81 s. The wall cells sit on the diffusive bound (design_implicit
+    §2.1), and the materialized residual costs +43% per iteration on this
+    latency-bound 2D case (+20% at prop scale). A fused stage would remove
+    most of it; not built (no win to fuse for here).
 
 ## LES
 
@@ -199,6 +228,28 @@ Numbers are measured, gfx1100.
       time-averaged `--emit surface` for moving runs; `--mrf-zone` (zone
       radius and blend; triggered by |ΔCT| > 2%); MRF azimuth scans at rotor2
       L2/L3 and DTMB D/h 189; an L4 (over the cap).
+    - **Steady frozen rotor** (`--rotor-frame mrf --steady`, 2026-10-28,
+      `plans/verify/impl_M1.md`): rotor2 L1 fixed point ct 0.037694, cq
+      −0.074022 (identical at `--lts-max` 1/2/4/∞; time march 3.0–4.5 D/U
+      mean 0.037608 / −0.074030). No wall-time win: LTS slows the march
+      (ct inside 1% after 8100 / 19600 / 23850 / 25550 iterations at R = 1 /
+      2 / 4 / ∞; time march 8570 steps, 35.5 s; steady 4.0 ms/it vs 3.69
+      ms/step), no certificate in 60000 (item 4). DTMB P1: unlimited LTS ct
+      sample sd 0.011 at 12000–16000 (mean −0.01731), R = 1 sd 0.0012 (mean
+      −0.01706, still drifting); time march last 0.6 D/U −0.01629. Open: why
+      LTS amplifies the pseudo-time oscillation (the fine plateau carries the
+      near wake at dtRef; the blend region steps up to R× faster). M2
+      (`--precond K`, 2026-10-28, `plans/verify/impl_M2.md`) damps it: K 2
+      unlimited settles rotor2 ct to 1e-2 / 1e-3 / 3e-4 after 8200 / 15500 /
+      22550 iterations (ct 0.037697, cq −0.074022), 4.94 ms/it (+20%); K 3
+      stable, noisier; K 1 diverges (exit 7 < 1000 it), K 1 + `--lts-max 1`
+      survives but crawls; K 3 + `--lts-max 1` worse than either. DTMB P1 K 2
+      (13500 it, 22.7 ms/it): ct sd 7% (unlimited plain 65%), window means
+      −0.01691 / −0.01688 / −0.01684 (flat; R = 1 plain drifts −0.01802 →
+      −0.01706); time march −0.01629. Still no wall win over the rotor2
+      time march (ct 1e-2 at 8200 it ≈ 40 s vs 35.5 s); DTMB P3 (K5) not
+      run. Open: the U_r floor should follow the tip speed, not U∞ (K 1
+      diverging at U_r = 0.08 c under a 0.41 c tip).
     - **Recipe** (each run ≤ 300 s): `gpurun -t 300 -m 16G -- env
       PARITY_LOCK_HELD=1 python3 tools/parity/suite.py run rotor2 --tier
       B|Bc --solver foam --level k`, `... run rotor2 --tier A --solver dns

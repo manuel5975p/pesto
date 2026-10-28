@@ -194,6 +194,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--max-iters", &c.maxIters}, {"--dt-recompute", &c.dtRecompute},
              {"--steady", &c.steady}, {"--seq", &c.seq},
              {"--steady-steps", &c.steadySteps},
+             {"--steady-sample", &c.steadySample}, {"--lts-max", &c.ltsMax},
+             {"--precond", &c.precond},
              {"--rans-nutinf", &c.ransNutInf}, {"--rans-kinf", &c.ransKInf},
              {"--rans-mutinf", &c.ransMutInf},
              {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
@@ -801,6 +803,11 @@ ROTOR (compressible; the body SPINS about a fixed shaft)
                                an axisymmetric body (pinned in gpu_mrf)
                                and an approximation for a real blade.
                                Thrust/torque columns are unchanged.
+                               With --focal it also takes --steady (the
+                               frozen rotor's fixed point in local-time-
+                               stepping pseudo-time, stopped on ct, cq
+                               and the axial jet momentum); moving
+                               geometry has no steady state.
   --rotor-bins N     azimuth bins. Geometry is precomputed at N evenly
                      spaced angles and replayed, so the time loop never
                      rebuilds it. 0 = the NATURAL count 2 pi R / h_fine:
@@ -977,10 +984,13 @@ RUN LENGTH
                      give-up cap -- reaching it is exit 8, not a
                      silent answer. --les 0. Only converges below the
                      shedding onset (cyl Re<47).
-                     COMPRESSIBLE (--ogrid with or without --rans, or
-                     immersed with --rans): PSEUDO-time, stopped on the
-                     integrals (cd, cdf, wake deficit, turbulence; the
-                     immersed wall: cd and turbulence) -- TOL is their
+                     COMPRESSIBLE (--ogrid with or without --rans,
+                     immersed with --rans, or an immersed
+                     --rotor-frame mrf rotor on --focal): PSEUDO-time,
+                     stopped on the integrals (cd, cdf, wake deficit,
+                     turbulence; the immersed wall: cd and turbulence;
+                     the MRF rotor: ct, cq and the axial jet momentum
+                     int (rho u_a - rho_inf U_a) dV) -- TOL is their
                      relative remaining change, in [1e-6, 1). The FP32
                      state jitters the integrals (3e-7..5e-5 relative,
                      measured), so the stop is JITTER-FLOORED: the trend
@@ -993,6 +1003,25 @@ RUN LENGTH
                      0 = plain time-march.                            [0]
   --steady-steps N   compressible --steady iteration cap; reaching it is
                      exit 8.                                     [1000000]
+  --steady-sample N  iterations between the explicit compressible
+                     --steady march's stop samples and stats rows, in
+                     [1, 100000]. The stop needs >= 48 samples, so the
+                     default certifies nothing before 9600 iterations;
+                     a short march (an MRF rotor) wants ~50. Rejects
+                     --steady-scheme implicit (it samples every armed
+                     Newton step); requires --steady.            [200]
+  --lts-max R        cap the explicit --steady march's local time step at
+                     R x the smallest cell's (R >= 1; 1 = one global
+                     pseudo-time step). Same fixed point, different path.
+                     Rejects --steady-scheme implicit; requires --steady.
+                     0 = unlimited.                                   [0]
+  --precond K        Weiss-Smith low-Mach preconditioning of the explicit
+                     laminar --steady march: each cell's pressure rate is
+                     scaled by eps = U_r^2/c^2, U_r = max(K U_inf, |u_rel|,
+                     nu/h) <= c, and its local dt follows u' + c'. Same
+                     fixed point, a different pseudo-time path. K in
+                     (0, 10]. Requires --steady; rejects --rans and
+                     --steady-scheme implicit. 0 = off.               [0]
   --steady-scheme explicit|implicit
                      compressible --steady pseudo-time scheme: explicit
                      local time stepping, or implicit Newton-Krylov
@@ -1030,8 +1059,9 @@ OUTPUT (--emit is repeatable; default = stats,bin)
                      (--ogrid adds heat; --rans appends cdp,cdf,mutMax,
                      yplusMax,yplusMean,floorHits -- immersed: mutMax,
                      yplusMax,yplusMean,floorHits; compressible --steady
-                     appends iter,resid,resU,resE,resT,remaining, and
-                     --steady-scheme implicit cfl,alpha,rejects,krylov.)
+                     appends iter,resid,resU,resE,resT,remaining (+ jet
+                     on an MRF rotor), and --steady-scheme implicit
+                     cfl,alpha,rejects,krylov.)
                      (dns channel writes a third schema; see its help.)
                      Parse by COLUMN NAME from the header row, never
                      by index.

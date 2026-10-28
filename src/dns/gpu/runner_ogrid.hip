@@ -824,7 +824,21 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
                                              .cap = r.steadySteps,
                                              .statsEvery = r.statsEvery,
                                              .series = 3 + ds->nT + lateral,
-                                             .observables = 2 + lateral};
+                                             .observables = 2 + lateral,
+                                             .precond = r.precondK > 0};
+        dev->setLtsMax(r.ltsMax);
+        // --precond: eps = 1 on the ghost rows (wall image, characteristic
+        // far row), axis ghost columns and wedge ghost planes -- every cell
+        // the stage hook overwrites (!fluid).
+        if (r.precondK > 0)
+        {
+            assert(!rans && !implicit);
+            std::vector<std::uint8_t> off(g.size());
+            for (std::size_t c = 0; c < g.size(); ++c)
+                off[c] = fluid[c] ? 0 : 1;
+            if (!dev->setPrecond(r.precondK, r.uInf, off))
+                return fail(6, "GPU allocation failed (--precond)");
+        }
         auto res = implicit ? nkMarch(sp, io)
                             : internal::explicitSteadyMarch(*dev, *ds, *red,
                                                             sp, io);

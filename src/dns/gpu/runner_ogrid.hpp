@@ -121,6 +121,10 @@ struct OGridRun
     // steadySteps caps it (exit 8). tEnd and ramp are not read then.
     double steadyTol = 0;
     long steadySteps = 0;
+    double ltsMax = 0;   // --lts-max (explicit march): cap on dt_c/dtRef; 0 = off
+    // --precond K (explicit march, laminar): Weiss-Smith low-Mach
+    // preconditioning (dns/precond.hpp); 0 = off, bit for bit.
+    double precondK = 0;
     // The Newton-Krylov march (gpu/nk) instead of the explicit LTS one.
     // Pre: nz == 1 or the revolved wedge.
     bool steadyImplicit = false;

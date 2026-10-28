@@ -3,6 +3,7 @@
 
 #include "dns/ogrid.hpp"
 
+#include "dns/precond.hpp"
 #include "dns/pseudo_time.hpp"
 #include "dns/rans_label.hpp"
 #include "dns/remap.hpp"
@@ -2065,10 +2066,15 @@ std::optional<ConfigError> flowRotor(const RawConfig& r, Case& c)
                 return err(2, "--rotor-mach", "apertures and the Brinkman band "
                                "are built once from a static body; the moving "
                                "wall is the ghost wall alone");
-            if (r.seq > 1 || r.steady > 0)
-                return err(2, "--rotor-mach", "a spinning body has no steady "
-                               "state and no per-level restart; drop --seq / "
-                               "--steady");
+            if (r.seq > 1)
+                return err(2, "--rotor-mach", "a spinning body has no per-"
+                               "level restart; drop --seq");
+            // The frozen rotor (--rotor-frame mrf) HAS a fixed point -- the
+            // steady-in-the-blade-frame flow -- so it takes --steady
+            // (flowRans checks the rest); moving geometry does not.
+            if (r.steady > 0 && r.rotorFrame != 1)
+                return err(2, "--steady", "moving geometry has no steady "
+                               "state; --rotor-frame mrf is the frozen rotor");
             if (!finitePos(r.rotorMach))
                 return err(2, "--rotor-mach", "must be finite and > 0 (the TIP "
                                               "Mach number)");
@@ -2508,6 +2514,10 @@ std::optional<ConfigError> flowRans(const RawConfig& r, Case& c)
                                     "adapter, which is not built");
     }
     c.compSteady = comp && c.steadyTol > 0;
+    if (!c.compSteady && r.given.contains("--precond"))
+        return err(2, "--precond", "preconditioning changes the transient; it "
+                                   "is a pseudo-time device only (requires "
+                                   "the compressible --steady TOL)");
     if (!c.compSteady)
     {
         // Both knobs belong to the compressible pseudo-time march only.
@@ -2515,16 +2525,60 @@ std::optional<ConfigError> flowRans(const RawConfig& r, Case& c)
                                  "pseudo-time march)"
                                : "is compressible steady only (the "
                                  "incompressible --steady has its own stop)";
-        if (auto e = rejectGiven(r, {"--steady-steps", "--steady-scheme"}, why);
+        if (auto e = rejectGiven(r,
+                                 {"--steady-steps", "--steady-scheme",
+                                  "--steady-sample", "--lts-max"},
+                                 why);
             e)
             return e;
     }
     else
     {
-        if (!c.ogrid && !rans)
+        if (!c.ogrid && !rans && !c.rotorMrf)
             return err(2, "--steady", "a compressible DNS has no steady pseudo-"
                                       "time solve on an immersed body; add "
                                       "--rans or use --ogrid");
+        // The frozen rotor's steady march (masterplan_levers M1): immersed,
+        // laminar, on a focal mesh. MRF + RANS is rejected above.
+        if (c.rotorMrf && c.ogrid)
+            return err(2, "--steady", "with an O-grid rotor is not built: its "
+                                      "steady stop has no ct/cq series");
+        if (c.rotorMrf && !c.focalActive)
+            return err(2, "--steady", "the frozen-rotor steady march needs "
+                                      "--focal: local time stepping has no "
+                                      "leverage on a uniform mesh (issues.md "
+                                      "6)");
+        // A state relaxation in the stage hook (the sponge, the NSCBC strip)
+        // is applied per stage, not per unit of local dt, so its fixed point
+        // would move with the lts ratios.
+        if (c.rotorMrf && (c.far == FarField::Sponge || c.nscbcStrip > 0))
+            return err(2, "--steady", "with --far sponge or --nscbc-strip: a "
+                                      "per-stage state relaxation is not "
+                                      "local-time-step consistent, so the "
+                                      "frozen rotor's fixed point would "
+                                      "depend on the lts ratios");
+        c.steadySample = r.steadySample;
+        if (!(c.steadySample >= 1 && c.steadySample <= 100000))
+            return err(2, "--steady-sample", "must be in [1, 100000] "
+                                             "iterations");
+        c.ltsMax = r.ltsMax;
+        if (!(std::isfinite(c.ltsMax) && (c.ltsMax == 0 || c.ltsMax >= 1)))
+            return err(2, "--lts-max", "must be >= 1 (a multiple of the "
+                                       "smallest local dt), or 0 = unlimited");
+        if (r.given.contains("--precond"))
+        {
+            c.precondK = r.precond;
+            if (!(std::isfinite(c.precondK) && c.precondK > 0 &&
+                  c.precondK <= kPrecondKMax))
+                return err(2, "--precond",
+                           std::format("K must be in (0, {:g}] (the U_r floor "
+                                       "K U_inf; absent = off)",
+                                       kPrecondKMax));
+            if (rans)
+                return err(2, "--precond", "with --rans is not built: the "
+                                           "turbulence scalars' point-implicit "
+                                           "stage has no preconditioned form");
+        }
         // A relative change: >= 1 certifies nothing, and below kSteadyTolMin
         // the FP32 integrals' sampling noise decides (docs/rans.md).
         if (!(c.steadyTol >= kSteadyTolMin && c.steadyTol < 1))
@@ -2554,6 +2608,15 @@ std::optional<ConfigError> flowRans(const RawConfig& r, Case& c)
                                      "with --steady-scheme implicit: explicit-"
                                      "march knobs; the implicit march ramps "
                                      "its own pseudo-time step");
+                e)
+                return e;
+            if (auto e = rejectGiven(r,
+                                     {"--steady-sample", "--lts-max",
+                                      "--precond"},
+                                     "with --steady-scheme implicit: it tunes "
+                                     "the explicit march only (the Newton "
+                                     "march samples every armed step and "
+                                     "has no lts ratios)");
                 e)
                 return e;
             if (!c.ogrid)
@@ -3022,10 +3085,16 @@ std::string flowRunLabel(const Case& c)
             : c.steadyScheme == SteadyScheme::Implicit
                 ? RansMode::SteadyImplicitNk
                 : RansMode::SteadyExplicit;
+        // The frozen rotor's steady march (immersed, laminar): the MRF note
+        // ahead of the wall's.
         const std::string where =
-            rans && !c.ogrid ? std::string(kImmersedSuffix) : geo;
+            rans && !c.ogrid ? std::string(kImmersedSuffix)
+            : c.rotorMrf && !c.ogrid
+                ? std::string(kMrfSteadySuffix) + std::string(kImmersedSuffix)
+                : geo;
         std::string l = ransRunLabel(c.rans, mode, 0, where);
         if (wedge && !c.compSteady) l += kAxisymUnsteady;
+        if (c.precondK > 0) l += precondSuffix(c.precondK);
         return l;
     }
     if (wedge) return "DNS" + geo + std::string(kAxisymUnsteady);
@@ -3389,8 +3458,21 @@ std::string Case::describe() const
                                steadyTol, steadySteps, kNkRestart)
                  : std::format("  run        steady TOL={:.6g} cap {} "
                                "iterations, local time stepping cfl={:.3g}, "
-                               "localDt every {}\n",
-                               steadyTol, steadySteps, cfl, dtRecompute);
+                               "localDt every {}{}\n",
+                               steadyTol, steadySteps, cfl, dtRecompute,
+                               (steadySample == 200
+                                    ? std::string()
+                                    : std::format(", stop sample every {}",
+                                                  steadySample)) +
+                                   (ltsMax > 0
+                                        ? std::format(", lts ratio <= {:g}",
+                                                      ltsMax)
+                                        : std::string()) +
+                                   (precondK > 0
+                                        ? std::format(", Weiss-Smith low-Mach "
+                                                      "preconditioner K={:g}",
+                                                      precondK)
+                                        : std::string()));
         s += compSteady ? std::string()
                  : std::string("  run        URANS: SSP-RK3 on the global "
                                "dt (acoustic + per-cell RANS diffusive "

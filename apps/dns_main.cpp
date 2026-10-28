@@ -431,6 +431,14 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
     rr.steadyImplicit =
         c.compSteady && c.steadyScheme == SteadyScheme::Implicit;
     rr.compensated = c.compensated;
+    // --steady-sample: the explicit march's stop/stats cadence (the validator
+    // rejects it with the implicit one); a time march keeps its 200.
+    if (c.compSteady)
+    {
+        rr.statsEvery = c.steadySample;
+        rr.ltsMax = c.ltsMax;
+        rr.precondK = c.precondK;
+    }
     rr.label = flowRunLabel(c);
     if (rans || c.compSteady || c.emit.contains(Emit::Surface) ||
         c.emit.contains(Emit::Mesh))
@@ -673,6 +681,23 @@ int runFlowCompressible(const Case& c, CaseGeometry& geo)
         rr.steadySteps = c.steadySteps;
         rr.label = flowRunLabel(c);
         std::printf("# %s\n", rr.label.c_str());
+    }
+    // The frozen rotor's laminar steady march (--rotor-frame mrf --steady):
+    // the same pseudo-time knobs, and its label.
+    else if (c.compSteady)
+    {
+        rr.steadyTol = c.steadyTol;
+        rr.steadySteps = c.steadySteps;
+        rr.label = flowRunLabel(c);
+        std::printf("# %s\n", rr.label.c_str());
+    }
+    // --steady-sample: the stop/stats cadence of the pseudo-time march only;
+    // a time march keeps its 200.
+    if (c.compSteady)
+    {
+        rr.statsEvery = c.steadySample;
+        rr.ltsMax = c.ltsMax;
+        rr.precondK = c.precondK;
     }
 
     auto res = gpu::runCompressible(g, host, geo.sdf,

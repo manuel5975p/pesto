@@ -21,7 +21,9 @@
 #include "dns/ogrid.hpp"
 #include "dns/transport.hpp"
 #include "dns/gpu/comp.hpp"
+#include "dns/gpu/comp_far.hpp"
 #include "dns/gpu/comp_ghost.hpp"
+#include "dns/gpu/comp_nscbc.hpp"
 #include "dns/gpu/ogrid_bc.hpp"
 #include "dns/gpu/rotortable.hpp"
 #include "dns/remap.hpp"
@@ -38,6 +40,7 @@
 #include <fstream>
 #include <iterator>
 #include <numbers>
+#include <random>
 #include <regex>
 #include <string>
 #include <string_view>
@@ -558,7 +561,330 @@ void testRotor2Pin()
                             "_surface.csv"})
         std::filesystem::remove(prefix + suf, ec);
 }
+
+// --- 4b. the frozen rotor's steady march end to end (M1 T4) ------------------
+//
+// The same rotor2 L1 grid through `--steady`. Measured 2026-10-28 (gfx1100,
+// plans/verify/impl_M1.md): the march does NOT certify TOL 2e-3 inside 60000
+// iterations at M 0.082 (ct jitter 1.8e-3, the jet monitor 8e-3 > 2^-10), and
+// local time stepping SLOWS it (ct inside 1% for good after 8100 iterations at
+// --lts-max 1, 19600 / 23850 / 25550 at 2 / 4 / unlimited). So this pins what
+// the march delivers in a test budget: --lts-max 1, 10000 iterations, exit 8
+// by design, and the window mean over iterations (8000, 10000] against the
+// time march's 3.0-4.5 D/U mean (ct 0.037608, cq -0.074030; the fixed point
+// itself is ct 0.037694, cq -0.074022 at every lts cap measured).
+void testRotor2Steady()
+{
+    const std::string prefix = "gpu_mrf_steady";
+    const std::string out = prefix + "_stdout.txt";
+    const int rc = valtest::runBinaryTo(
+        "\"" DNS_BIN "\" flow --physics compressible --body \"" DNS_ROTOR2_STL
+        "\" --robust --n 150 --ny 100 --nz 100 --dr 6 --focal auto "
+        "--focal-ratio 5 --focal-blend 1 --rotor-mach 0.41 --rotor-axis x "
+        "--rotor-frame mrf --mach 0.082219 --re 220 --steady 2e-3 "
+        "--steady-sample 50 --steady-steps 10000 --lts-max 1 --emit stats "
+        "--emit surface --out " + prefix, out);
+    check(rc == 8, "rotor2 L1 steady: exit 8 at the 10000 cap (not certifiable "
+                   "at M 0.082 in budget)");
+    std::ifstream f(out);
+    const std::string log((std::istreambuf_iterator<char>(f)), {});
+    check(log.find("# DNS -- steady (local time stepping: pseudo-time, not "
+                   "time-accurate) [MRF frozen rotor: an APPROXIMATION, blade "
+                   "fixed at azimuth 0] [immersed ghost wall") != std::string::npos,
+          "steady MRF label printed");
+    check(log.find("# steady stop (jitter-floored, relative): ct trend") !=
+                  std::string::npos &&
+              log.find("| cq trend") != std::string::npos &&
+              log.find("| int rho u_axis") != std::string::npos,
+          "floor line names ct, cq, int rho u_axis");
+    const auto st = valtest::loadCsv(prefix + "_stats.csv");
+    check(st.has_value() && !st->col("iter").empty() && !st->col("jet").empty(),
+          "steady rotor stats rows (iter, jet columns)");
+    if (!st || st->col("iter").empty()) return;
+    const auto& it = st->col("iter");
+    check(it.back() == 10000 && it.front() == 50, "sampled every 50 to the cap");
+    double ct = 0, cq = 0;
+    int n = 0;
+    for (std::size_t i = 0; i < it.size(); ++i)
+        if (it[i] > 8000) {
+            ct += st->col("ct")[i];
+            cq += st->col("cq")[i];
+            ++n;
+        }
+    ct /= std::max(n, 1);
+    cq /= std::max(n, 1);
+    constexpr double ctTm = 0.037608, cqTm = -0.074030;
+    std::printf("rotor2 steady (8000, 10000] mean: ct %.6f (%+.3f%%) cq %.6f "
+                "(%+.3f%%) vs the time march's 3.0-4.5 D/U mean\n",
+                ct, 100 * (ct / ctTm - 1), cq, 100 * (cq / cqTm - 1));
+    check(std::abs(ct / ctTm - 1) < 0.01, "steady ct within 1% of the time mean");
+    check(std::abs(cq / cqTm - 1) < 0.005, "steady cq within 0.5% of the time mean");
+    std::ifstream sf(prefix + "_surface.csv");
+    std::string head;
+    std::getline(sf, head);
+    check(head.starts_with("# DNS -- steady (local time stepping: pseudo-time, "
+                           "not time-accurate) [MRF frozen rotor: an "
+                           "APPROXIMATION, blade fixed at azimuth 0] [immersed") &&
+              head.find("[MRF frozen rotor: an APPROXIMATION] |") ==
+                  std::string::npos,
+          "surface header: the steady label, MRF note once");
+    std::error_code ec;
+    for (const char* suf : {"_stdout.txt", "_stats.csv", ".json", "_mask.bin",
+                            "_surface.csv"})
+        std::filesystem::remove(prefix + suf, ec);
+}
+
+// --- 4c. --precond end to end (masterplan_levers M2 G3/G4) -------------------
+//
+// The O-grid cylinder Re 40 (val_ogrid_cyl's steady argv) at M 0.1 with
+// --precond 3 must certify the SAME cd as the plain march (1.55804, cd jitter
+// J 6.6e-5: within 2J), and M 0.05 with --precond 1 must not diverge (the
+// viscous-floor case). Measured 2026-10-28: K 3 certifies 1.55804 at 42400
+// iterations (plain 38000), M 0.05 K 1 at 68800 (plain 80000). The prop is
+// the customer (impl_M2.md); this pins the fixed point and the stability.
+void testPrecondCyl()
+{
+    const std::string base =
+        "\"" DNS_BIN "\" flow --physics compressible --body cylinder --ogrid "
+        "--n 256 --ny 96 --re 40 --steady 1e-4 --steady-steps 100000 "
+        "--emit stats --quiet";
+    struct Case
+    {
+        const char* name;
+        const char* extra;
+    };
+    for (const Case k : {Case{"gpu_precond_m01_k3", " --mach 0.1 --precond 3"},
+                         Case{"gpu_precond_m005_k1", " --mach 0.05 --precond 1"}}) {
+        const std::string prefix = k.name;
+        const std::string out = prefix + "_stdout.txt";
+        const int rc = valtest::runBinaryTo(base + k.extra + " --out " + prefix, out);
+        check(rc == 0, prefix + ": certifies (exit 0, no divergence)");
+        std::ifstream f(out);
+        const std::string log((std::istreambuf_iterator<char>(f)), {});
+        check(log.find("[low-Mach preconditioned pseudo-time, K=") !=
+                  std::string::npos,
+              prefix + ": label carries the preconditioner");
+        const auto st = valtest::loadCsv(prefix + "_stats.csv");
+        if (st && !st->col("cd").empty()) {
+            const double cd = st->col("cd").back();
+            std::printf("%s: cd %.6f after %.0f iterations\n", k.name, cd,
+                        st->col("iter").back());
+            // M 0.1: the plain march's 1.55804 within 2J; M 0.05: the plain
+            // 1.55792 within its J (~4 x M 0.1's: cd jitter scales 1/M^2).
+            const double ref = std::string_view(k.name).ends_with("k3")
+                                   ? 1.55804 : 1.55792;
+            const double tol = std::string_view(k.name).ends_with("k3")
+                                   ? 2 * 6.6e-5 : 2.6e-4;
+            check(std::abs(cd - ref) <= tol, prefix + ": cd = the plain fixed point");
+        } else {
+            check(false, prefix + ": stats rows");
+        }
+        std::error_code ec;
+        for (const char* suf : {"_stdout.txt", "_stats.csv", ".json", "_mask.bin"})
+            std::filesystem::remove(prefix + suf, ec);
+    }
+}
 #endif
+
+// --- 5. the frozen rotor's steady march is lts-independent (M1 T5) ----------
+//
+// `dns flow --rotor-frame mrf --steady` marches the runner's full rhs -- the
+// stage kernel with the MRF source and frame transport on a focal mesh, the
+// NSCBC x rows, the moving ghost wall's impermeable/side faces (applyRhs) --
+// at a per-cell dt. Its fixed point is the frozen rotor's only if EVERY rhs
+// term scales with the cell's own dt (StageCombine::crAt): a term on the bare
+// cr converges to lts R_k + R_h = 0 instead (the G7 trap). The rig: a 2D
+// spinning cylinder (z shaft, omega R = 0.5 U) in a Re 20 crossflow, the
+// runner's hook wiring, marched at lts == 1 (one global pseudo-time step, so
+// a cr-only term is harmless there) to its fixed point. From that state, 50
+// steps with RANDOM lts in [1, 10] must drift no more than the lts == 1
+// continuation; a negative control with applyRhs on the bare cr must drift
+// visibly more (the test can see the bug class it guards).
+void testSteadyLts()
+{
+    const int nx = 192, ny = 96;
+    const double Lx = 16.0, Ly = 8.0, D = 1.0, cx = 4.5, cy = 4.0;
+    const double gam = 1.4, rhoInf = 1.0, uInf = 1.0, mach = 0.2;
+    const double pInf = rhoInf * uInf * uInf / (gam * mach * mach);
+    const double mu = rhoInf * uInf * D / 20.0;
+    const auto g = Grid::make(nx, ny, 1, Lx, Ly, 1.0);
+    const double lo[3] = {3.0, 2.5, 0}, hi[3] = {6.0, 5.5, 0},
+                 w[3] = {1.0, 1.0, 0};
+    const AxisRemap3 fr = focalRemap(g, true, lo, hi, w, 2.0);
+    auto mtr = CurvMetrics::build(CurvMesh::fromRemap(g, fr));
+    if (!mtr) { check(false, "steady-lts metrics: " + mtr.error()); return; }
+    const Rotor rot{.axis = RotorAxis::Z,
+                    .shaft = {cx, cy, 0.5},
+                    .omega = 1.0,
+                    .radius = 0.5 * D,
+                    .bins = 1,
+                    .thicken = 0.0};
+    const Sdf sdf = [&](double x, double y, double) {
+        return std::hypot(x - cx, y - cy) - 0.5 * D;
+    };
+    const gpu::DeviceCompGhost::WallMotion uw = gpu::rotorWallMotion(rot);
+    auto dev = gpu::DeviceComp::make(*mtr, rigGas(gam, mu), 0.0,
+                                     SgsModel::Smagorinsky);
+    auto gh = gpu::DeviceCompGhost::make(g, sdf, gam, rhoInf, pInf, nullptr, fr,
+                                         {}, &uw);
+    auto ds = gpu::DeviceCompState::make(g.size(), 0, true);
+    auto red = gpu::ReduceScratch::make();
+    gpu::DeviceCompFar::Config fc;
+    fc.rhoInf = rhoInf;
+    fc.uInf = uInf;
+    fc.pInf = pInf;
+    fc.gamma = gam;
+    fc.ns = 8;
+    fc.sigMax = 0.0; // NSCBC owns x; y = free-slip mirrors, no sponge
+    auto far = gpu::DeviceCompFar::make(g, fc);
+    gpu::DeviceCompNscbc::Config nc;
+    nc.rhoInf = rhoInf;
+    nc.uInf = uInf;
+    nc.pInf = pInf;
+    nc.gamma = gam;
+    nc.xc = cx;
+    nc.yc = cy;
+    nc.zc = 0.5;
+    nc.aBody = 0.5 * D;
+    nc.Rgas = 1.0;
+    nc.TInf = pInf / rhoInf;
+    auto nsc = gpu::DeviceCompNscbc::make(g, nc);
+    if (!dev || !gh || !ds || !red || !far || !nsc) {
+        check(false, "steady-lts setup");
+        return;
+    }
+    gpu::MrfZone z;
+    z.axis = 2;
+    z.omega = rot.omega;
+    z.center[0] = cx; z.center[1] = cy; z.center[2] = 0.5;
+    z.r1 = 0.8; z.r2 = 1.3;
+    z.a1 = 1e30; z.a2 = 2e30; // z shaft at nz == 1
+    if (dev->setMrf(z, fr) != hipSuccess) { check(false, "steady-lts setMrf"); return; }
+
+    std::vector<std::uint8_t> fluid(g.size(), 1);
+    for (int c : gh->solidCells()) fluid[std::size_t(c)] = 0;
+    for (int i = 0; i < nx; ++i) fluid[g.idx(i, 0, 0)] = fluid[g.idx(i, ny - 1, 0)] = 0;
+    if (!dev->enableSteady(fluid) || !dev->enableCompensation()) {
+        check(false, "steady-lts enableSteady/compensation");
+        return;
+    }
+    auto applyBc = [&](gpu::DeviceCompState& s) {
+        far->apply(s);
+        gh->apply(s);
+    };
+    bool brokenHook = false; // the negative control: applyRhs on the bare cr
+    dev->setStageHook(applyBc);
+    dev->setRhsHook([&](const gpu::DeviceCompState& s, gpu::DeviceCompState& out,
+                        const gpu::StageCombine& cmb) {
+        nsc->apply(*dev, s, out, cmb, fr);
+        if (!brokenHook) { gh->applyRhs(*dev, s, out, cmb); return; }
+        gpu::StageCombine bare = cmb;
+        bare.lts = nullptr;
+        gh->applyRhs(*dev, s, out, bare);
+    });
+
+    auto host = CompState::zeros(g);
+    for (std::size_t c = 0; c < g.size(); ++c) {
+        host.rho[c] = rhoInf;
+        host.mx[c] = rhoInf * uInf;
+        host.E[c] = pInf / (gam - 1.0) + 0.5 * rhoInf * uInf * uInf;
+    }
+    (void)ds->upload(host);
+    applyBc(*ds);
+
+    // The fixed point at lts == 1 (--lts-max 1).
+    dev->setLtsMax(1.0);
+    dev->setLts(true);
+    double dref = 0;
+    const int nConv = 24000;
+    for (int it = 0; it < nConv; ++it) {
+        if (it % 16 == 0) dref = 0.95 * dev->localDt(*ds, *red, 0.4);
+        dev->step(*ds, gpu::Real(dref));
+        applyBc(*ds);
+    }
+    const gpu::ResidualNorms rn = dev->residual(*ds, *red);
+    const auto F0 = gh->force(*dev, *ds, rot.shaft);
+    std::printf("steady-lts: %d lts==1 iterations, dtRef %.3e, residual mom "
+                "%.3e E %.3e, cd %.5f cl %.5f torque %.5e\n",
+                nConv, dref, rn.mom, rn.E, F0.fx / (0.5 * rhoInf * uInf * uInf * D),
+                F0.fy / (0.5 * rhoInf * uInf * uInf * D), F0.qz);
+    check(std::isfinite(rn.mom) && std::isfinite(F0.fx), "steady-lts: finite");
+    CompState h0 = CompState::zeros(g);
+    (void)ds->download(h0);
+
+    // Max |du|/U, |drho|/rho over the fluid cells after 50 steps.
+    bool usePrecond = false; // stepPrecond instead of step (M2 G2)
+    auto drift = [&](bool randomLts, bool broken) {
+        (void)ds->upload(h0);
+        applyBc(*ds);
+        brokenHook = broken;
+        double dt = 0;
+        if (randomLts) {
+            const double d = dev->localDt(*ds, *red, 0.4);
+            std::mt19937 rng(11);
+            std::uniform_real_distribution<float> U(1.0f, 10.0f);
+            std::vector<gpu::Real> l(g.size());
+            for (auto& x : l) x = U(rng);
+            (void)dev->uploadLts(l);
+            dt = 0.095 * d;
+        } else {
+            dt = 0.95 * dev->localDt(*ds, *red, 0.4); // ltsMax 1: all ratios 1
+        }
+        for (int it = 0; it < 50; ++it) {
+            if (usePrecond) dev->stepPrecond(*ds, gpu::Real(dt));
+            else dev->step(*ds, gpu::Real(dt));
+            applyBc(*ds);
+        }
+        brokenHook = false;
+        CompState h = CompState::zeros(g);
+        (void)ds->download(h);
+        double du = 0;
+        for (std::size_t c = 0; c < g.size(); ++c) {
+            if (!fluid[c]) continue;
+            du = std::max({du,
+                           std::abs(h.mx[c] / h.rho[c] - h0.mx[c] / h0.rho[c]) / uInf,
+                           std::abs(h.my[c] / h.rho[c] - h0.my[c] / h0.rho[c]) / uInf,
+                           std::abs(h.rho[c] - h0.rho[c]) / rhoInf});
+        }
+        return du;
+    };
+    const double d1 = drift(false, false);
+    const double dr = drift(true, false);
+    const double db = drift(true, true);
+    std::printf("steady-lts: 50-step drift, lts == 1 %.3e | random lts [1,10] "
+                "%.3e (%.2fx) | random lts, applyRhs on bare cr %.3e (%.1fx)\n",
+                d1, dr, dr / d1, db, db / d1);
+    check(dr <= 4.0 * d1, "T5: random lts keeps the frozen rotor's fixed point "
+                          "(<= 4x the lts == 1 drift)");
+    check(db > 4.0 * d1, "T5 control: an lts-ignoring rhs term drifts > 4x");
+
+    // M2 G2: the same with --precond 1 (stepPrecond; localDt now bounds the
+    // preconditioned wave). The hooks see a pure-residual combination there
+    // and lts multiplies the corrected TOTAL R, so a hook cannot take a bare
+    // cr (no control: the bug class is unreachable). eps = 1 on the box
+    // faces and the solid cells, as runner_comp sets it.
+    std::vector<std::uint8_t> off(g.size(), 0);
+    for (int j = 0; j < ny; ++j)
+        for (int i = 0; i < nx; ++i) {
+            const std::size_t c = g.idx(i, j, 0);
+            off[c] = (i == 0 || i == nx - 1 || j == 0 || j == ny - 1 ||
+                      !fluid[c]) ? 1 : 0;
+        }
+    if (!dev->setPrecond(1.0, uInf, off)) {
+        check(false, "steady-lts setPrecond");
+        return;
+    }
+    usePrecond = true;
+    const double p1 = drift(false, false);
+    const double pr = drift(true, false);
+    usePrecond = false;
+    std::printf("steady-lts --precond 1: 50-step drift, lts == 1 %.3e (%.2fx "
+                "the plain lts == 1) | random lts [1,10] %.3e (%.2fx)\n",
+                p1, p1 / d1, pr, pr / p1);
+    check(std::isfinite(p1) && std::isfinite(pr), "G2: precond drift finite");
+    check(pr <= 4.0 * p1, "G2: random lts keeps the preconditioned march's "
+                          "fixed point (<= 4x the lts == 1 drift)");
+}
 
 } // namespace
 
@@ -573,6 +899,29 @@ int main(int argc, char** argv)
 #else
         check(false, "rotor2 needs DNS_BIN and DNS_ROTOR2_STL");
 #endif
+        return dnstest::finish();
+    }
+    // `steady`: the frozen rotor's steady march end to end (gpu_mrf_steady).
+    if (argc > 1 && std::string_view(argv[1]) == "steady") {
+#if defined(DNS_BIN) && defined(DNS_ROTOR2_STL)
+        testRotor2Steady();
+#else
+        check(false, "steady needs DNS_BIN and DNS_ROTOR2_STL");
+#endif
+        return dnstest::finish();
+    }
+    // `precond`: --precond end to end on the O-grid cylinder (gpu_precond).
+    if (argc > 1 && std::string_view(argv[1]) == "precond") {
+#if defined(DNS_BIN) && defined(DNS_ROTOR2_STL)
+        testPrecondCyl();
+#else
+        check(false, "precond needs DNS_BIN");
+#endif
+        return dnstest::finish();
+    }
+    // `steadylts`: the frozen rotor's random-lts fixed point (gpu_mrf_steady_lts).
+    if (argc > 1 && std::string_view(argv[1]) == "steadylts") {
+        testSteadyLts();
         return dnstest::finish();
     }
     testTransparency();

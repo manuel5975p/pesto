@@ -159,7 +159,8 @@ and raises the freestream by uniform Galilean boosts (start-up |p′|/p∞ 0.56%
 vs 12.7% impulsive); the quiet start is too symmetric to shed, so `--kick`
 adds a solenoidal (acoustically silent) vortex trip one D behind the body.
 `--steady TOL` on the compressible paths is pseudo-time stopped on the
-integrals, not the residual (`docs/rans.md`); `--compensated` runs a time march
+integrals, not the residual (`docs/rans.md`; `--steady-sample N` = iterations
+per stop sample, default 200); `--compensated` runs a time march
 on the Kahan-compensated state (use it for any dt-convergence claim).
 
 **Temperature.** Air, calorically perfect, γ = 1.4 fixed. `dns::Transport`
@@ -395,6 +396,32 @@ other rotor flag is rejected without it. Compressible `flow` only.
   banded 1e-3); a crossflow rotor co-rotates its own far field. Also runs on
   the O-grid (`--ogrid --rotor-frame mrf`, z shaft, per-node stream potential;
   torque vs Cartesian direct 0.22%).
+- **`--rotor-frame mrf --steady TOL`** (immersed, laminar, `--focal` only):
+  the frozen rotor's fixed point in local-time-stepping pseudo-time, stopped
+  on ct, cq and the axial jet momentum ∫(ρu_a − ρ∞U_a)dV; label `DNS --
+  steady (...) [MRF frozen rotor: an APPROXIMATION, blade fixed at azimuth
+  0] [immersed ghost wall ...]`. `--steady-sample N` sets the stop cadence
+  (the stop needs ≥ 48 samples: 9600 iterations at the default 200);
+  `--lts-max R` caps dt_c/dtRef. **Measured, not a speed-up**
+  (`plans/verify/impl_M1.md`): the fixed point is lts-independent (rotor2 L1
+  ct 0.037694 / cq −0.074022 at R = 1, 2, 4, ∞; +0.23% / −0.01% vs the time
+  march's 3.0–4.5 D/U mean), but local time stepping SLOWS it (ct inside 1%
+  for good after 8100 / 19600 / 23850 / 25550 iterations at R = 1 / 2 / 4 /
+  ∞, vs the 8570-step time march) and nothing certifies TOL 2e-3 inside 60000
+  iterations at M 0.082 (ct jitter 1.8e-3, jet 8e-3). DTMB P1 (M 0.109,
+  ratio 10): ct sample sd 65% unlimited, 7% at R = 1 after 13500 iterations.
+- **`--precond K`** (any explicit laminar `--steady`; label adds `[low-Mach
+  preconditioned pseudo-time, K=...]`): Weiss–Smith preconditioning, the
+  pressure rate of each cell's total residual scaled by ε = U_r²/c², U_r =
+  max(K U∞, |u_rel|, ν/h) ≤ c, local dt on u′ + c′. Same fixed point
+  (`plans/verify/impl_M2.md`): rotor2 L1 `--precond 2` reaches ct 0.037697 /
+  cq −0.074022, ct inside 1e-3 of it after 15500 iterations (unlimited LTS
+  59900, `--lts-max 1` 29700), cq inside 3e-4 after 10750 (52500 / 29500); ct
+  jitter at 30000 it 3.2e-4 (5.7e-3 / 1.9e-3), +20% per iteration. Still
+  exit 8 (the jet monitor) and still slower than the 8570-step time march.
+  `--precond 1` diverges on rotor2 (U_r floor under the tip speed); K 3 is
+  stable but jitters more. DTMB P1 K 2: ct sd 7% (unlimited 65%), window
+  mean flat at −0.0168. No gain on the O-grid cylinder (diffusive-bound).
 - **Test propeller**: `python3 tools/propeller.py prop.stl --blades 3
   --pitch 0.8` writes a parametric STL (shaft +x) and prints the `--scale`
   to pass (auto-fit uses the static extent, which for odd blade counts

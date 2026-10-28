@@ -250,6 +250,9 @@ struct RawConfig
     int rans = 0;
     int steadySteps = 1000000;
     int steadyScheme = 0;  // SteadyScheme index: 0 explicit, 1 implicit
+    int steadySample = 200; // `dns flow --steady` stop/stats cadence (iterations)
+    double ltsMax = 0;      // `dns flow --steady` lts ratio cap; 0 = unlimited
+    double precond = 0;     // `dns flow --steady` low-Mach precond K; 0 = off
     // flow RANS freestream turbulence, in FREESTREAM units (dns/rans.hpp):
     // SA nu~/nu, SST k/U^2 and mu_t/mu (which sets omega).
     double ransNutInf = kRansNutInfRatio, ransKInf = kRansKInf,
@@ -417,6 +420,16 @@ public:
     // --steady-scheme: Implicit is the Newton line march (docs/rans.md,
     // "Implicit pseudo-time"); its cap defaults to kImplicitSteadySteps.
     SteadyScheme steadyScheme = SteadyScheme::Explicit;
+    // --steady-sample: iterations between the explicit `dns flow --steady`
+    // march's stop samples and stats rows. 200 = the cadence it always had.
+    int steadySample = 200;
+    // --lts-max: cap on the explicit march's local-dt ratio dt_c/dtRef
+    // (1 = a global pseudo-time step); 0 = unlimited, the march as before.
+    double ltsMax = 0;
+    // --precond K: Weiss-Smith low-Mach preconditioning of the explicit
+    // laminar `dns flow --steady` march (dns/precond.hpp), U_r floor K U_inf.
+    // 0 = off, the march as before. A pseudo-time device: same fixed point.
+    double precondK = 0;
     // flow RANS (docs/rans.md, "dns flow"): the freestream inflow flags as
     // given, and the freestream SPECIFIC scalars they resolve to in box units
     // (SA: nu~ | SST: k, omega). compSteady: a compressible --steady run

@@ -123,7 +123,7 @@ struct CompRun
     // plane), which is not something a thermal knob should do behind the
     // user's back.
     bool tempFrames = false;
-    int statsEvery = 200;        // steps between force rows
+    int statsEvery = 200;        // steps between force rows (--steady-sample)
 
     // Rotor: the body SPINS about rotor.shaft. Inactive by default, and then
     // nothing it touches runs -- the ghost wall gets no velocity, the tally
@@ -148,12 +148,17 @@ struct CompRun
     RansModel rans = RansModel::None;
     std::vector<double> wallDist;   // g.size(), immersedWallDistance
     double phiInf[2] = {0, 0};      // specific freestream scalars
-    // Compressible --steady (> 0, RANS only here): the explicit local-time-
-    // stepping march on the compensated state, stopped on cd and the
-    // turbulence integrals; steadySteps caps it (exit 8). tEnd and ramp are
-    // not read then.
+    // Compressible --steady (> 0; RANS, or the laminar frozen rotor on a
+    // focal mesh): the explicit local-time-stepping march on the compensated
+    // state, stopped on cd and the turbulence integrals (rotor: ct, cq and
+    // the axial jet momentum), sampled every statsEvery iterations;
+    // steadySteps caps it (exit 8). tEnd and ramp are not read then.
     double steadyTol = 0;
     long steadySteps = 0;
+    double ltsMax = 0;   // --lts-max: cap on dt_c/dtRef; 0 = unlimited
+    // --precond K: Weiss-Smith low-Mach preconditioning of the steady march
+    // (dns/precond.hpp); 0 = off, the march bit for bit. Pre: rans == None.
+    double precondK = 0;
     // --compensated: the time march on the compensated state too (the
     // steady march always has it). Pre: penalize == 0.
     bool compensated = false;

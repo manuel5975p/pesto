@@ -395,7 +395,7 @@ if(BUILD_TESTING)
     set(DNS_TESTS cli geometry output poisson projection tgv tgv3d cutcell cutcell_sphere comp comp_curv meshsdf
         fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport
         rotor focal cli_defaults comp_axis_permute rans rans_channel1d
-        steady_stop blockband channel_line pseudo_time flow_rans_config)
+        steady_stop blockband channel_line pseudo_time flow_rans_config precond)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)
     endif()
@@ -516,6 +516,17 @@ if(BUILD_TESTING)
         add_test(NAME gpu_mrf_rotor2 COMMAND test_gpu_mrf rotor2)
         set_tests_properties(gpu_mrf_rotor2 PROPERTIES SKIP_RETURN_CODE 77
             TIMEOUT 60)
+        # The frozen rotor's steady march (masterplan_levers M1): rotor2 L1
+        # --steady --lts-max 1 to its 10000 cap (T4, ~45 s), and the random-
+        # lts fixed point of the runner's hook set on a 2D rig (T5).
+        add_test(NAME gpu_mrf_steady COMMAND test_gpu_mrf steady)
+        add_test(NAME gpu_mrf_steady_lts COMMAND test_gpu_mrf steadylts)
+        # --precond (masterplan_levers M2 G3/G4): the O-grid cylinder's cd
+        # unchanged by the preconditioner, M 0.05 K 1 stable (~13 s). The
+        # random-lts fixed point with it on rides gpu_mrf_steady_lts (G2).
+        add_test(NAME gpu_precond COMMAND test_gpu_mrf precond)
+        set_tests_properties(gpu_mrf_steady gpu_mrf_steady_lts gpu_precond
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
         # The incompressible 3D SGS wall tally against the eddy-diffusion
         # substep's own momentum drain (W1; ~1 s).
         add_test(NAME gpu_les_tally3d COMMAND test_gpu_les_smag tally3d)
@@ -745,9 +756,9 @@ if(BUILD_TESTING)
         gpu_hit_mini gpu_les_wall gpu_les_tally3d gpu_les_tgv_comp
         gpu_channel_les)
     dns_label(mrf rotor gpu_rotor_wall gpu_rotor_table gpu_mrf gpu_mrf_rotor2
-        gpu_mrf_conservation gpu_mrf_stabledt gpu_rotor_comoving_fixed_point
+        gpu_mrf_steady gpu_mrf_steady_lts gpu_precond gpu_mrf_conservation gpu_mrf_stabledt gpu_rotor_comoving_fixed_point
         gpu_ghost_translate rotor_tip_guard gpu_rotor_swap_ledger)
-    dns_label(fast channel_config transport rans rans_channel1d steady_stop
+    dns_label(fast channel_config transport rans rans_channel1d steady_stop precond
         blockband channel_line pseudo_time flow_rans_config gpu_channel
         gpu_rans_mask gpu_rans_ogrid gpu_rans_mms gpu_axisym gpu_axisym3d gpu_nk
         gpu_rans_immersed gpu_determinism gpu_rans_implicit tgv tgv3d sgs_op

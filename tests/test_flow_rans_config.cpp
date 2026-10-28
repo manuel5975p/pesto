@@ -625,8 +625,176 @@ void compensated()
     rejected({"hit", "--compensated"}, 1, "hit --compensated: unknown flag");
 }
 
+// --rotor-frame mrf --steady (masterplan_levers M1, T1): the frozen rotor's
+// laminar pseudo-time march, on --focal only; --steady-sample everywhere the
+// explicit flow march runs.
+void mrfSteady()
+{
+    const Args rot = {"flow",         "--physics",     "compressible",
+                      "--body",       "sphere",        "--n",
+                      "96",           "--ny",          "64",
+                      "--nz",         "64",            "--dr",
+                      "6",            "--rotor-mach",  "0.3",
+                      "--rotor-axis", "x",             "--focal",
+                      "auto",         "--focal-ratio", "3",
+                      "--focal-blend", "1",            "--out",
+                      "x"};
+    auto with = [&](Args extra) {
+        Args a = rot;
+        a.insert(a.end(), extra.begin(), extra.end());
+        return a;
+    };
+    const Args mrf = {"--rotor-frame", "mrf"};
+    auto mrfWith = [&](Args extra) {
+        Args a = mrf;
+        a.insert(a.end(), extra.begin(), extra.end());
+        return with(a);
+    };
+
+    auto ok = runCli(mrfWith({"--steady", "2e-3", "--steady-sample", "50"}));
+    check(ok && ok->compSteady && ok->rotorMrf && ok->steadySample == 50 &&
+              ok->ramp == 0 && ok->kick == 0,
+          "mrf + --focal + --steady: accepted, impulsive, sample 50");
+    if (ok) {
+        const std::string l = dns::flowRunLabel(*ok);
+        check(l == "DNS -- steady (local time stepping: pseudo-time, not "
+                   "time-accurate) [MRF frozen rotor: an APPROXIMATION, blade "
+                   "fixed at azimuth 0] [immersed ghost wall: first-order wall "
+                   "position, NOT body-fitted]",
+              "mrf steady label: steady LTS + MRF note + immersed wall");
+        check(ok->describe().find("stop sample every 50") != std::string::npos,
+              "describe names the sample cadence");
+        check(ok->meta.ransMode == "steady-explicit",
+              "RunMeta: steady-explicit");
+    }
+    auto def = runCli(mrfWith({"--steady", "2e-3"}));
+    check(def && def->steadySample == 200 &&
+              def->describe().find("stop sample") == std::string::npos,
+          "--steady-sample absent: 200, describe unchanged");
+    // The MRF time march keeps an empty label (its progress line unchanged).
+    auto tm = runCli(mrfWith({}));
+    check(tm && !tm->compSteady && dns::flowRunLabel(*tm).empty(),
+          "mrf time march: no label");
+
+    rejectedAt(with({"--rotor-frame", "mrf", "--focal", "none"}), "--focal",
+               "--focal none is not a plateau");
+    {
+        Args a = {"flow",       "--physics",    "compressible", "--body",
+                  "sphere",     "--n",          "96",           "--ny",
+                  "64",         "--nz",         "64",           "--dr",
+                  "6",          "--rotor-mach", "0.3",          "--rotor-axis",
+                  "x",          "--rotor-frame", "mrf",         "--steady",
+                  "2e-3",       "--out",        "x"};
+        rejectedAt(a, "--steady", "mrf + --steady without --focal: exit 2");
+    }
+    rejectedAt(with({"--steady", "2e-3"}), "--steady",
+               "moving rotor + --steady: exit 2 by name");
+    rejectedAt(mrfWith({"--steady", "2e-3", "--rans", "sa-neg"}), "--rans",
+               "mrf + --steady + --rans: exit 2");
+    rejectedAt(mrfWith({"--steady", "2e-3", "--ramp", "0.4"}), "--ramp",
+               "mrf + --steady + --ramp: exit 2");
+    rejectedAt(mrfWith({"--steady", "2e-3", "--kick", "0"}), "--kick",
+               "mrf + --steady + --kick: exit 2");
+    rejectedAt(mrfWith({"--steady", "2e-3", "--ft", "1"}), "--ft",
+               "mrf + --steady + --ft: exit 2");
+    rejectedAt(mrfWith({"--steady", "2e-3", "--far", "sponge"}), "--steady",
+               "mrf + --steady + --far sponge: exit 2 (not lts-consistent)");
+    rejectedAt(mrfWith({"--steady", "2e-3", "--nscbc-strip", "2"}), "--steady",
+               "mrf + --steady + --nscbc-strip: exit 2 (not lts-consistent)");
+    rejectedAt(mrfWith({"--seq", "2", "--steady", "2e-3"}), "--rotor-mach",
+               "--seq on an mrf rotor: exit 2");
+    rejectedAt(with({"--seq", "2", "--steady", "2e-3"}), "--rotor-mach",
+               "--seq on a moving rotor: exit 2");
+    rejectedAt(og({"--rotor-mach", "0.2", "--rotor-frame", "mrf",
+                   "--rotor-axis", "z", "--steady", "1e-4"}),
+               "--steady", "O-grid mrf + --steady: not built, exit 2");
+
+    // --steady-sample
+    rejectedAt(mrfWith({"--steady-sample", "50"}), "--steady-sample",
+               "--steady-sample without --steady: exit 2");
+    rejectedAt(mrfWith({"--steady", "2e-3", "--steady-sample", "0"}),
+               "--steady-sample", "--steady-sample 0: exit 2");
+    rejectedAt(mrfWith({"--steady", "2e-3", "--steady-sample", "100001"}),
+               "--steady-sample", "--steady-sample 100001: exit 2");
+    rejectedAt(og({"--steady", "1e-4", "--steady-scheme", "implicit",
+                   "--steady-sample", "50"}),
+               "--steady-sample", "--steady-sample + implicit: exit 2");
+    auto ogs = runCli(og({"--steady", "1e-4", "--steady-sample", "50"}));
+    check(ogs && ogs->steadySample == 50, "--steady-sample on the O-grid");
+    auto ogd = runCli(og({"--steady", "1e-4"}));
+    auto ogg = runCli(og({"--steady", "1e-4", "--steady-sample", "200"}));
+    check(ogd && ogg && ogd->describe() == ogg->describe(),
+          "--steady-sample 200 given == defaulted");
+    rejected({"channel", "--rans", "sa-neg", "--steady", "1e-4",
+              "--steady-sample", "50"},
+             1, "channel --steady-sample: unknown flag");
+
+    // --lts-max (the stop-rule contingency of M1)
+    auto lm = runCli(mrfWith({"--steady", "2e-3", "--lts-max", "2"}));
+    check(lm && lm->ltsMax == 2 &&
+              lm->describe().find("lts ratio <= 2") != std::string::npos,
+          "--lts-max 2: accepted, described");
+    check(def && def->ltsMax == 0 &&
+              def->describe().find("lts ratio") == std::string::npos,
+          "--lts-max absent: 0 (unlimited), describe unchanged");
+    rejectedAt(mrfWith({"--lts-max", "2"}), "--lts-max",
+               "--lts-max without --steady: exit 2");
+    rejectedAt(mrfWith({"--steady", "2e-3", "--lts-max", "0.5"}), "--lts-max",
+               "--lts-max 0.5: exit 2");
+    rejectedAt(og({"--steady", "1e-4", "--steady-scheme", "implicit",
+                   "--lts-max", "2"}),
+               "--lts-max", "--lts-max + implicit: exit 2");
+    auto ogl = runCli(og({"--steady", "1e-4", "--lts-max", "1"}));
+    check(ogl && ogl->ltsMax == 1, "--lts-max on the O-grid");
+
+    // --precond K (masterplan_levers M2, U2): pseudo-time only, laminar only.
+    auto pc = runCli(mrfWith({"--steady", "2e-3", "--precond", "1"}));
+    check(pc && pc->precondK == 1 &&
+              dns::flowRunLabel(*pc).ends_with(
+                  "[immersed ghost wall: first-order wall position, NOT "
+                  "body-fitted] [low-Mach preconditioned pseudo-time, K=1]") &&
+              pc->describe().find("Weiss-Smith low-Mach preconditioner K=1") !=
+                  std::string::npos,
+          "mrf steady --precond 1: accepted, labelled, described");
+    check(def && def->precondK == 0 &&
+              def->describe().find("preconditioner") == std::string::npos &&
+              dns::flowRunLabel(*def).find("preconditioned") ==
+                  std::string::npos,
+          "--precond absent: 0 (off), label and describe unchanged");
+    auto ogp = runCli(og({"--steady", "1e-4", "--precond", "3"}));
+    check(ogp && ogp->precondK == 3 &&
+              dns::flowRunLabel(*ogp) ==
+                  "DNS -- steady (local time stepping: pseudo-time, not "
+                  "time-accurate) [low-Mach preconditioned pseudo-time, K=3]",
+          "O-grid steady --precond 3: accepted, labelled");
+    rejectedAt(og({"--precond", "1"}), "--precond",
+               "--precond without --steady: exit 2 (a pseudo-time device)");
+    rejectedAt(mrfWith({"--precond", "1"}), "--precond",
+               "mrf time march + --precond: exit 2");
+    rejectedAt(og({"--steady", "1e-4", "--steady-scheme", "implicit",
+                   "--precond", "1"}),
+               "--precond", "--precond + implicit: exit 2");
+    rejectedAt(og({"--steady", "1e-4", "--precond", "0"}), "--precond",
+               "--precond 0 given: exit 2");
+    rejectedAt(og({"--steady", "1e-4", "--precond", "-1"}), "--precond",
+               "--precond -1: exit 2");
+    rejectedAt(og({"--steady", "1e-4", "--precond", "10.5"}), "--precond",
+               "--precond 10.5 (> 10): exit 2");
+    check(runCli(og({"--steady", "1e-4", "--precond", "10"})).has_value(),
+          "--precond 10: accepted (the bound)");
+    rejectedAt(og({"--steady", "1e-4", "--rans", "sa-neg", "--precond", "1"}),
+               "--precond", "--precond + --rans: exit 2 (not built)");
+    rejected({"channel", "--rans", "sa-neg", "--steady", "1e-4", "--precond",
+              "1"},
+             1, "channel --precond: unknown flag");
+    rejected({"flow", "--body", "cylinder", "--steady", "1e-4", "--precond",
+              "1", "--out", "x"},
+             2, "incompressible flow --precond: exit 2");
+}
+
 int main()
 {
+    mrfSteady();
     revolved();
     headDescribes();
     accepts();

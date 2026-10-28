@@ -43,6 +43,10 @@ struct SteadyMarchParams
     // jitter-floored rule (steadyFloor), the first `observables` series being
     // reported values and the rest monitors.
     int observables = -1;
+    // --precond: DeviceComp::stepPrecond instead of step (setPrecond ran,
+    // so localDt already bounds the preconditioned wave). false = the march
+    // as before.
+    bool precond = false;
 };
 
 // The stop the params ask for.
@@ -135,7 +139,8 @@ explicitSteadyMarch(DeviceComp& dev, DeviceCompState& s, ReduceScratch& red,
             return fail(7, std::format("dt collapsed to {:.3e} from {:.3e} -- "
                                        "the state diverged",
                                        dtRef, dt0));
-        dev.step(s, Real(dtRef));
+        if (p.precond) dev.stepPrecond(s, Real(dtRef));
+        else dev.step(s, Real(dtRef));
         io.afterStep(s);
         res.t += dtRef;
         ++res.steps;

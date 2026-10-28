@@ -18,6 +18,7 @@
 #include "dns/gpu/internal/steady_march.hpp"
 #include "dns/gpu/reductions.hpp"
 #include "dns/gpu/rotortable.hpp"
+#include "dns/rans_label.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -52,7 +53,12 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     // below bit for bit.
     const bool rans = r.rans != RansModel::None;
     const bool steady = r.steadyTol > 0;
-    assert(!steady || rans); // the validator: immersed --steady needs --rans
+    // The validator: immersed --steady needs --rans, or is the frozen rotor's
+    // laminar march on a focal mesh (enableSteady needs the curvilinear path).
+    assert(!steady || rans || (r.rotor.active() && r.rotorMrf && focal));
+    // The frozen rotor's steady march: stopped on ct, cq and the axial jet
+    // momentum instead of cd and the turbulence integrals.
+    const bool rotorSteady = steady && r.rotor.active();
 
     // The PointRemaps of the two curvilinear meshes; both are the exact
     // identity when their parameters are off, so building them unconditionally
@@ -438,11 +444,13 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     // that are neither solid nor a far mirror row) is where the SST guard
     // counts, the residual norms and the stop integrals sum; mu_t gets the
     // ghost wall's odd image and the mirror rows' even copy.
+    // The same mask is the laminar steady march's residual/integral mask.
     std::vector<std::uint8_t> fluid;
-    if (rans)
+    std::vector<std::uint8_t> solid;
+    if (rans || steady)
     {
         fluid.assign(g.size(), 1);
-        std::vector<std::uint8_t> solid(g.size(), 0);
+        solid.assign(g.size(), 0);
         for (int c : ghost->solidCells()) {
             fluid[std::size_t(c)] = 0;
             solid[std::size_t(c)] = 1;
@@ -455,6 +463,11 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
             for (int j = 0; j < g.ny; ++j)
                 for (int i = 0; i < g.nx; ++i)
                     for (int k : {0, g.nz - 1}) fluid[g.idx(i, j, k)] = 0;
+    }
+    if (steady && !rans && !dev->enableSteady(fluid))
+        return fail(6, "GPU allocation failed (steady)");
+    if (rans)
+    {
         ScalarBoundary bnd;
         bnd.open[0] = 1;   // x: the NSCBC / sponge faces
         bnd.open[1] = r.open ? 1 : 0;
@@ -568,6 +581,8 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     if (steady)
         cols.insert(cols.end(),
                     {"iter", "resid", "resU", "resE", "resT", "remaining"});
+    // The frozen rotor's stop monitor, int (rho u_a - rho_inf U_a) dV.
+    if (rotorSteady) cols.push_back("jet");
     if (auto e = out.declareSeries("stats", cols); !e)
         return fail(4, e.error());
     const int shaftAxis = rotorAxisIndex(r.rotor.axis);
@@ -646,13 +661,13 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     // and the stop integrals sum_fluid V t_i.
     DeviceBuffer<double> vol64;
     DeviceBuffer<std::uint8_t> fluidDev;
-    if (rans)
+    if (rans || steady)
     {
         auto v = DeviceBuffer<double>::make(g.size());
         auto f = DeviceBuffer<std::uint8_t>::make(g.size());
         if (!v || !f || v->upload(mtr->vol.data()) != hipSuccess ||
             f->upload(fluid.data()) != hipSuccess)
-            return fail(6, "GPU allocation failed (RANS measurements)");
+            return fail(6, "GPU allocation failed (steady/RANS measurements)");
         vol64 = std::move(*v);
         fluidDev = std::move(*f);
     }
@@ -694,7 +709,8 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         std::string l = !r.label.empty() ? r.label
                         : r.les > 0      ? lesRunLabel(r.sgs, r.les, g.nz == 1)
                                          : std::string("DNS");
-        if (r.rotor.active() && r.rotorMrf)
+        // The steady march's label already carries the (longer) MRF note.
+        if (r.rotor.active() && r.rotorMrf && !rotorSteady)
             l += " [MRF frozen rotor: an APPROXIMATION]";
         return l;
     };
@@ -736,11 +752,19 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         // stop is on cd and the turbulence integrals, never the residual,
         // whose norms are reported in freestream units (mom D/U^2, energy
         // D/U^3, SA nu~ 1/U^2, SST k D/U^3 and ln omega D/U).
+        // The frozen rotor (rotorSteady, laminar) stops on ct and cq
+        // (observables) and the axial jet momentum int (rho u_a - rho_inf
+        // U_a) dV (monitor): the slow mode the forces alone can miss.
         const bool sst = ransSst(r.rans);
         const double tU = r.D / r.uInf;
         double resid = HUGE_VAL, resU = 0, resE = 0, resT = 0;
+        double thrust = 0, torque = 0, jet = 0;
         DeviceCompGhost::Force F{};
         RansExtra x;
+        const DeviceScalar* axialMom[3] = {&ds->mx, &ds->my, &ds->mz};
+        // The freestream's own share of the axial momentum, so the monitor
+        // reads the jet rather than the box (zero for a cross-flow shaft).
+        const double jetOff = shaftAxis == 0 ? r.rhoInf * r.uInf : 0.0;
         internal::SteadyMarchIo io;
         io.afterStep = [&](DeviceCompState& s) { applyBc(s); };
         io.sample = [&](long) -> std::expected<std::vector<double>, RunError> {
@@ -749,17 +773,33 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
             st.cd = F.fx / (r.qRef * span);
             st.cl = F.fy / (r.qRef * span);
             st.cs = F.fz / (r.qRef * span);
-            x = measureRans();
+            if (rans) x = measureRans();
+            if (rotorSteady)
+            {
+                const double f[3] = {F.fx, F.fy, F.fz};
+                const double qm[3] = {F.qx, F.qy, F.qz};
+                thrust = f[shaftAxis];
+                torque = qm[shaftAxis];
+                jet = internal::reduce(
+                    *red, g.size(),
+                    internal::MaskedVolSum{fluidDev.data(), vol64.data(),
+                                           axialMom[shaftAxis]->data(), jetOff},
+                    rocprim::plus<double>(), 0.0);
+            }
             if (auto h = internal::checkDevice("a stats row", &*red); !h)
                 return std::unexpected(h.error());
             resU = n.mom * tU / r.uInf;
             resE = n.E * tU / (r.uInf * r.uInf);
-            resT = sst ? std::max(n.t[0] * tU / (r.uInf * r.uInf), n.t[1] * tU)
-                       : n.t[0] / (r.uInf * r.uInf);
+            resT = !rans ? 0.0
+                   : sst ? std::max(n.t[0] * tU / (r.uInf * r.uInf),
+                                    n.t[1] * tU)
+                         : n.t[0] / (r.uInf * r.uInf);
             resid = std::max({resU, resE, resT});
             if (!std::isfinite(resid) || !std::isfinite(st.cd))
                 return fail(7, "the residual is not finite (the state "
                                "diverged)");
+            if (rotorSteady)
+                return std::vector<double>{thrust / ctDen, torque / cqDen, jet};
             std::vector<double> q = {st.cd};
             for (int i = 0; i < ds->nT; ++i) q.push_back(x.turb[i]);
             return q;
@@ -767,18 +807,32 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         io.row = [&](const internal::SteadyRow& sr) {
             const double wmax =
                 r.cfl / sr.dtRef * std::min({g.hx, g.hy, g.hz});
-            const double row[] = {sr.t,     sr.dtRef,  st.cd,    st.cl,
-                                  st.cs,    wmax,      F.heat,   x.mutMax,
-                                  x.ypMax,  x.ypMean,  x.hits,
-                                  double(sr.iter), resid, resU, resE, resT,
-                                  sr.remaining};
+            // Assembled in the order of `cols`: base, rotor, RANS, steady.
+            std::vector<double> row = {sr.t,  sr.dtRef, st.cd, st.cl,
+                                       st.cs, wmax,     F.heat};
+            if (r.rotor.active())
+                row.insert(row.end(), {thrust, torque, thrust / ctDen,
+                                       torque / cqDen});
+            if (rans)
+                row.insert(row.end(), {x.mutMax, x.ypMax, x.ypMean, x.hits});
+            row.insert(row.end(), {double(sr.iter), resid, resU, resE, resT,
+                                   sr.remaining});
+            if (rotorSteady) row.push_back(jet);
             out.row("stats", row);
             if (!sr.print) return;
-            std::printf("iter=%ld cd=%.5f cl=%+.2e mutMax=%.3g y+max=%.3g "
-                        "remaining=%.2e resid=%.3e (U %.2e E %.2e T %.2e) "
-                        "dtRef=%.2e %s\n",
-                        sr.iter, st.cd, st.cl, x.mutMax, x.ypMax, sr.remaining,
-                        resid, resU, resE, resT, sr.dtRef, r.label.c_str());
+            if (rotorSteady)
+                std::printf("iter=%ld ct=%+.6f cq=%+.6f jet=%+.6e remaining="
+                            "%.2e resid=%.3e (U %.2e E %.2e) dtRef=%.2e %s\n",
+                            sr.iter, thrust / ctDen, torque / cqDen, jet,
+                            sr.remaining, resid, resU, resE, sr.dtRef,
+                            r.label.c_str());
+            else
+                std::printf("iter=%ld cd=%.5f cl=%+.2e mutMax=%.3g y+max=%.3g "
+                            "remaining=%.2e resid=%.3e (U %.2e E %.2e T %.2e) "
+                            "dtRef=%.2e %s\n",
+                            sr.iter, st.cd, st.cl, x.mutMax, x.ypMax,
+                            sr.remaining, resid, resU, resE, resT, sr.dtRef,
+                            r.label.c_str());
             std::fflush(stdout);
         };
         const internal::SteadyMarchParams sp{.cfl = r.cfl,
@@ -788,16 +842,44 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                                              .dtRecompute = r.dtRecompute,
                                              .cap = r.steadySteps,
                                              .statsEvery = r.statsEvery,
-                                             .series = 1 + ds->nT,
-                                             .observables = 1};
+                                             .series = rotorSteady ? 3 : 1 + ds->nT,
+                                             .observables = rotorSteady ? 2 : 1,
+                                             .precond = r.precondK > 0};
+        dev->setLtsMax(r.ltsMax);
+        // --precond: eps = 1 (physical speeds) on every cell that is not
+        // plain interior fluid -- the solid/ghost cells and far mirror rows
+        // (!fluid) and the outermost layer of every box face, where the
+        // NSCBC rows overwrite the rhs with a characteristic decomposition
+        // that assumes the physical eigenvalues.
+        if (r.precondK > 0)
+        {
+            assert(!rans);
+            std::vector<std::uint8_t> off(g.size(), 0);
+            for (int k = 0; k < g.nz; ++k)
+                for (int j = 0; j < g.ny; ++j)
+                    for (int i = 0; i < g.nx; ++i) {
+                        const bool face =
+                            i == 0 || i == g.nx - 1 || j == 0 ||
+                            j == g.ny - 1 ||
+                            (g.nz > 1 && (k == 0 || k == g.nz - 1));
+                        const std::size_t c = g.idx(i, j, k);
+                        off[c] = face || !fluid[c] ? 1 : 0;
+                    }
+            if (!dev->setPrecond(r.precondK, r.uInf, off))
+                return fail(6, "GPU allocation failed (--precond)");
+        }
         auto res = internal::explicitSteadyMarch(*dev, *ds, *red, sp, io);
         if (!res) return std::unexpected(res.error());
         {
             const char* names[3] = {"cd", sst ? "int rho k" : "int rho nu~",
                                     "int rho omega"};
+            const char* rotorNames[3] = {"ct", "cq", "int rho u_axis"};
             std::fputs(internal::steadyFloorReport(
                            res->floors,
-                           std::span<const char* const>(names, 1 + ds->nT))
+                           rotorSteady
+                               ? std::span<const char* const>(rotorNames, 3)
+                               : std::span<const char* const>(names,
+                                                              1 + ds->nT))
                            .c_str(),
                        stdout);
             std::fflush(stdout);

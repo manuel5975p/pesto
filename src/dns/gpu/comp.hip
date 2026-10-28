@@ -5,6 +5,7 @@
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/internal/stage_write.hpp"
 #include "dns/gpu/rans.hpp"
+#include "dns/precond.hpp"
 #include "dns/remap.hpp"
 
 #include <rocprim/device/device_reduce.hpp>
@@ -916,6 +917,36 @@ __global__ void kPenalizeMomentum(std::size_t n, const Real* lam, Real idte,
     mz[c] *= f;
 }
 
+// The StageCombine of one RK stage: out = ca a + cb b + cr R (lts, and the
+// low words when out is compensated). Shared by step() and stepPrecond().
+StageCombine stageCombineOf(const Real* lts, const DeviceCompState& a, Real ca,
+                            const DeviceCompState& b, Real cb, Real cr,
+                            DeviceCompState& out)
+{
+    StageCombine k{{a.rho.data(), a.mx.data(), a.my.data(), a.mz.data(),
+                    a.E.data()},
+                   {b.rho.data(), b.mx.data(), b.my.data(), b.mz.data(),
+                    b.E.data()},
+                   ca, cb, cr};
+    for (int i = 0; i < a.nT; ++i) {
+        k.ta[i] = a.t[i].data();
+        k.tb[i] = b.t[i].data();
+    }
+    k.lts = lts;
+    if (!out.compensated()) return k;
+    for (int v = 0; v < 5; ++v) {
+        k.al[v] = a.lo[v].data();
+        k.bl[v] = b.lo[v].data();
+        k.ol[v] = out.lo[v].data();
+    }
+    for (int i = 0; i < a.nT; ++i) {
+        k.tal[i] = a.tlo[i].data();
+        k.tbl[i] = b.tlo[i].data();
+        k.otl[i] = out.tlo[i].data();
+    }
+    return k;
+}
+
 } // namespace
 
 void penalizeMomentum(const GpuGrid& g, const DeviceScalar& lam, Real eta,
@@ -946,28 +977,7 @@ void DeviceComp::step(DeviceCompState& s, Real dt)
     auto cmb = [lts](const DeviceCompState& a, Real ca,
                      const DeviceCompState& b, Real cb, Real cr,
                      DeviceCompState& out) {
-        StageCombine k{{a.rho.data(), a.mx.data(), a.my.data(), a.mz.data(),
-                        a.E.data()},
-                       {b.rho.data(), b.mx.data(), b.my.data(), b.mz.data(),
-                        b.E.data()},
-                       ca, cb, cr};
-        for (int i = 0; i < a.nT; ++i) {
-            k.ta[i] = a.t[i].data();
-            k.tb[i] = b.t[i].data();
-        }
-        k.lts = lts;
-        if (!out.compensated()) return k;
-        for (int v = 0; v < 5; ++v) {
-            k.al[v] = a.lo[v].data();
-            k.bl[v] = b.lo[v].data();
-            k.ol[v] = out.lo[v].data();
-        }
-        for (int i = 0; i < a.nT; ++i) {
-            k.tal[i] = a.tlo[i].data();
-            k.tbl[i] = b.tlo[i].data();
-            k.otl[i] = out.tlo[i].data();
-        }
-        return k;
+        return stageCombineOf(lts, a, ca, b, cb, cr, out);
     };
     // Idempotent::yes: s is already the hook's output (setStageHook).
     if (hook_ && hookAtEntry_) hook_(s);
@@ -1076,6 +1086,109 @@ __global__ void kLtsRatio(std::size_t n, const double* dtc, double dtRef,
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= n) return;
     lts[c] = Real(dtc[c] / dtRef);
+}
+
+// --lts-max: the same ratio capped at `cap` (a separate kernel, so the
+// uncapped march keeps its instantiation byte for byte).
+__global__ void kLtsRatioCapped(std::size_t n, const double* dtc, double dtRef,
+                                double cap, Real* lts)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    const double q = dtc[c] / dtRef;
+    lts[c] = Real(q < cap ? q : cap);
+}
+
+// --precond (dns/precond.hpp): one cell's eps, relative speed, c^2 and
+// largest aov, in FP64 off the conserved state. The ONE evaluation both the
+// local dt and the stage correction read, so the dt is always the bound of
+// the eps the stage applies. Off rows: eps = 1.
+struct PrecondCell
+{
+    GpuGrid g;
+    MrfView mrf;
+    const Real *rho, *mx, *my, *mz, *E;
+    const Real *ax, *ay, *az; // az == nullptr when nz == 1 (localDt's az)
+    const std::uint8_t* off;
+    double kU2; // K^2 uInf^2
+    Transport tr;
+    struct Out
+    {
+        double eps, urel, c2, aov;
+        CellPrim q;
+    };
+    __host__ __device__ Out operator()(int c) const
+    {
+        Out o;
+        o.q = cellPrim(rho, mx, my, mz, E, tr.gamma, c);
+        double ur[3] = {o.q.u, o.q.v, o.q.w};
+        mrfCellVel(mrf, g, c, ur);
+        o.urel = sqrt(ur[0] * ur[0] + ur[1] * ur[1] + ur[2] * ur[2]);
+        o.c2 = tr.gamma * o.q.p / o.q.rho;
+        o.aov = ax[c] > ay[c] ? ax[c] : ay[c];
+        if (az && az[c] > o.aov) o.aov = az[c];
+        o.eps = 1.0;
+        if (off[c]) return o;
+        const double nu = tr.mu(o.q.p / (o.q.rho * tr.Rgas)) / o.q.rho;
+        const double vs = nu * o.aov;
+        o.eps = precondEps(o.c2, o.urel * o.urel, kU2, vs * vs);
+        return o;
+    }
+};
+
+// The preconditioned twin of WavePerDtCurv: (|u'| + c') / width.
+struct WavePerDtCurvPrecond
+{
+    PrecondCell cell;
+    __host__ __device__ double operator()(int c) const
+    {
+        const PrecondCell::Out o = cell(c);
+        const double sp = precondWave(o.urel, o.c2, o.eps);
+        if (!isfinite(sp)) return HUGE_VAL; // never dropped by the min-dt
+        return sp * o.aov;
+    }
+};
+
+// kLocalDt with the preconditioned wave (a separate kernel: the plain
+// instantiation stays byte for byte).
+__global__ void kLocalDtPrecond(WavePerDtCurvPrecond wave,
+                                rans::LaminarDiffDt diff, double cfl,
+                                std::size_t n, double* dtc)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    const double w = wave(int(c));
+    const double a = w > 0.0 ? cfl / w : HUGE_VAL;
+    const double v = diff(int(c));
+    dtc[c] = a < v ? a : v;
+}
+
+// out = ca a + cb b + crAt(c) P R over `cells`: R the materialized total
+// residual at the stage input (whose conserved fields `cell` reads), P the
+// rank-one correction at that state. A non-finite state gives a NaN eps and
+// a NaN stage value: the march's dt guard reports it, nothing clamps it.
+template <bool Comp>
+__global__ void kPrecondCombine(PrecondCell cell, StageCombine cmb,
+                                const Real* R0, const Real* R1, const Real* R2,
+                                const Real* R3, const Real* R4, Real* o0,
+                                Real* o1, Real* o2, Real* o3, Real* o4,
+                                CellRange cells)
+{
+    const std::size_t c =
+        cells.first + std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= cells.end) return;
+    Real R[5] = {R0[c], R1[c], R2[c], R3[c], R4[c]};
+    if (!cell.off[c]) {
+        const PrecondCell::Out o = cell(int(c));
+        const Real u[3] = {Real(o.q.u), Real(o.q.v), Real(o.q.w)};
+        const Real H = Real((double(cell.E[c]) + o.q.p) / o.q.rho);
+        precondApply<Real>(R, u, H, Real(cell.tr.gamma), Real(o.c2),
+                           Real(o.eps));
+    }
+    Real* out[5] = {o0, o1, o2, o3, o4};
+    const Real cr = cmb.crAt(c);
+    for (int v = 0; v < 5; ++v)
+        internal::stagePut<Comp>(cmb, v, c, cr, R[v], out[v]);
 }
 
 struct DtAt
@@ -1223,6 +1336,17 @@ double DeviceComp::localDt(const DeviceCompState& s, ReduceScratch& r,
         diff.az = az;
         kLocalDt<<<launchBlocks(n), blockSize>>>(wave, diff, cfl, n,
                                                  dtc_.data());
+    } else if (precond()) {
+        const rans::LaminarDiffDt diff{
+            s.rho.data(),         s.mx.data(),          s.my.data(),
+            s.mz.data(),          s.E.data(),           curv_->aov[0].data(),
+            curv_->aov[1].data(), az,                   tr_};
+        const PrecondCell cell{g_, mz, s.rho.data(), s.mx.data(), s.my.data(),
+                               s.mz.data(), s.E.data(), curv_->aov[0].data(),
+                               curv_->aov[1].data(), az, precOff_.data(),
+                               precKU2_, tr_};
+        kLocalDtPrecond<<<launchBlocks(n), blockSize>>>(
+            WavePerDtCurvPrecond{cell}, diff, cfl, n, dtc_.data());
     } else {
         const rans::LaminarDiffDt diff{
             s.rho.data(),         s.mx.data(),          s.my.data(),
@@ -1237,10 +1361,81 @@ double DeviceComp::localDt(const DeviceCompState& s, ReduceScratch& r,
     // A collapsed or non-finite reference is the caller's divergence report;
     // the ratios are only meaningful against a positive one.
     if (!(dtRef > 0.0) || !std::isfinite(dtRef)) return dtRef;
-    kLtsRatio<<<launchBlocks(n), blockSize>>>(n, dtc_.data(), dtRef,
-                                              lts_.data());
+    if (ltsMax_ > 0)
+        kLtsRatioCapped<<<launchBlocks(n), blockSize>>>(n, dtc_.data(), dtRef,
+                                                        ltsMax_, lts_.data());
+    else
+        kLtsRatio<<<launchBlocks(n), blockSize>>>(n, dtc_.data(), dtRef,
+                                                  lts_.data());
     checkLastKernel("kLtsRatio");
     return dtRef;
+}
+
+std::expected<void, hipError_t>
+DeviceComp::setPrecond(double K, double uInf,
+                       const std::vector<std::uint8_t>& offRows)
+{
+    assert(curvilinear() && !rans() && K > 0.0 && uInf > 0.0 &&
+           offRows.size() == g_.size());
+    auto m = DeviceBuffer<std::uint8_t>::make(g_.size());
+    if (!m) return std::unexpected(m.error());
+    if (auto e = m->upload(offRows.data()); e != hipSuccess)
+        return std::unexpected(e);
+    auto r = DeviceCompState::make(g_.size(), 0, false);
+    if (!r) return std::unexpected(r.error());
+    precOff_ = std::move(*m);
+    precR_ = std::move(*r);
+    precKU2_ = K * K * uInf * uInf;
+    return {};
+}
+
+void DeviceComp::precondStage(const DeviceCompState& s, const StageCombine& cmb,
+                              DeviceCompState& out)
+{
+    // The TOTAL residual: stage kernel AND every rhs hook (NSCBC rows, the
+    // ghost wall's faces, the sink) in residual mode. Correcting the stage
+    // kernel's part alone would converge to P R_k + R_h = 0.
+    residualInto(s, precR_);
+    const MrfView mz = mrf_ ? mrfView() : MrfView{};
+    const Real* az = curv_->aovSteadyZ.size() ? curv_->aovSteadyZ.data()
+                     : g_.nz > 1              ? curv_->aov[2].data()
+                                              : nullptr;
+    const PrecondCell cell{g_, mz, s.rho.data(), s.mx.data(), s.my.data(),
+                           s.mz.data(), s.E.data(), curv_->aov[0].data(),
+                           curv_->aov[1].data(), az, precOff_.data(),
+                           precKU2_, tr_};
+    const CellRange cells = stageRange_;
+    internal::withCompensation(cmb, [&](auto comp) {
+        kPrecondCombine<decltype(comp)::value>
+            <<<launchBlocks(cells.size()), blockSize>>>(
+                cell, cmb, precR_.rho.data(), precR_.mx.data(),
+                precR_.my.data(), precR_.mz.data(), precR_.E.data(),
+                out.rho.data(), out.mx.data(), out.my.data(), out.mz.data(),
+                out.E.data(), cells);
+    });
+    checkLastKernel("kPrecondCombine");
+}
+
+void DeviceComp::stepPrecond(DeviceCompState& s, Real dt)
+{
+    // step()'s choreography verbatim (no-alias rule, handle swap, entry hook,
+    // ca = 1 - cb), with precondStage for stage(). The rhs hooks see a pure-
+    // residual combination (no lts), and the lts ratio multiplies the whole
+    // corrected R in kPrecondCombine: no hook can take a bare cr here.
+    assert(precond() && s.nT == 0 && s.compensated() == compensated_);
+    const Real* lts = ltsOn_ ? lts_.data() : nullptr;
+    if (hook_ && hookAtEntry_) hook_(s);
+    precondStage(s, stageCombineOf(lts, s, Real(1), s, Real(0), dt, q1_), q1_);
+    if (hook_) hook_(q1_);
+    precondStage(q1_,
+                 stageCombineOf(lts, s, Real(0.75), q1_, Real(0.25),
+                                Real(0.25) * dt, q2_),
+                 q2_);
+    if (hook_) hook_(q2_);
+    const Real cb3 = Real(2.0 / 3.0), ca3 = Real(1) - cb3;
+    precondStage(q2_, stageCombineOf(lts, s, ca3, q2_, cb3, cb3 * dt, q1_),
+                 q1_);
+    std::swap(s, q1_);
 }
 
 void DeviceComp::setLts(bool on)

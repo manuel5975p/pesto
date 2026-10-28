@@ -632,6 +632,30 @@ under the geometric rule -- the reason for several series. The window is
 half the history, so a run certifies at about twice its settling time.
 Test `steady_stop` and `gpu_runners` (SA cylinder Re 40 certifies).
 
+`--steady-sample N` (explicit flow march; default 200, byte for byte) sets
+the iterations per sample: with b ≥ 8 the window needs n ≥ 48 samples, so
+the default certifies nothing before 9600 iterations. `--lts-max R` caps
+the lts ratios at R (separate `kLtsRatioCapped` kernel; absent = the old
+march). The frozen rotor (`--rotor-frame mrf --steady`) stops on ct, cq
+(observables) and ∫(ρu_a − ρ∞U_a)dV (monitor); measured there LTS slows
+the march and nothing certifies at M 0.08–0.11 (`plans/verify/impl_M1.md`,
+issues.md 4/14).
+
+`--precond K` (explicit laminar march only; RANS, implicit and time marches
+rejected) is Weiss–Smith low-Mach preconditioning (`dns/precond.hpp`):
+per stage `DeviceComp::stepPrecond` materializes the TOTAL residual with
+`residualInto` (every rhs hook in residual mode), applies the rank-one
+correction R' = R − ((1−ε)/c²) a bᵀR (a = (1, u, H), bᵀR = dp/dτ; pressure
+rate × ε, velocity and entropy rates exact) and writes ca a + cb b +
+crAt(c) R' (compensated); `localDt` bounds u' + c' from the same per-cell
+ε. ε = 1 on overwrite rows. Same fixed point (P invertible); absent = byte
+for byte. Measured (`plans/verify/impl_M2.md`): rotor2 L1 K 2 settles ct /
+cq to 1e-3 / 3e-4 in 15500 / 10750 iterations vs 59900 / 52500 plain
+unlimited, at +20% per iteration; O-grid cylinder Re 40 M 0.1 K 1 / 3
+certifies the same cd 1.55804 in 48000 / 42400 iterations vs 38000 (the
+wall cells are diffusive-bound; no wall-time gain), M 0.05 in 68800 /
+59200 vs 80000.
+
 Measured (gfx1100, M 0.2, cap far above the stop):
 
 | run | stop | iterations | wall | cd | jitter cd / W |

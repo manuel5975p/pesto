@@ -373,6 +373,9 @@ public:
     // step() passes the lts ratios in every StageCombine when on.
     // Pre (on): localDt or uploadLts ran.
     void setLts(bool on);
+    // --lts-max: later localDt calls cap every ratio dt_c/dtRef at R (dtRef
+    // itself unchanged). R == 0 = unlimited, the default. Pre: R == 0 or >= 1.
+    void setLtsMax(double R) { ltsMax_ = R; }
     // Compensated accumulation (DeviceCompState::lo): the stage buffers gain
     // low words and every step() writes through them. Irreversible. Every
     // state-overwriting hook must zero its overwritten cells' low words (the
@@ -382,6 +385,23 @@ public:
     bool compensated() const { return compensated_; }
     // Diagnostic/test: the lts ratios from host, g.size() entries >= 1.
     hipError_t uploadLts(const std::vector<Real>& ratios);
+    // --precond K (masterplan_levers M2, dns/precond.hpp): Weiss-Smith low-
+    // Mach preconditioning of the pseudo-time march. Later localDt calls bound
+    // each cell by its preconditioned wave u' + c', and stepPrecond applies
+    // the rank-one correction to the TOTAL residual (stage kernel + every rhs
+    // hook). offRows (1 = eps 1, the physical speeds): boundary/overwrite
+    // rows, ghost and solid cells. Allocates one residual scratch state.
+    // Never calling it keeps step() and localDt bit for bit.
+    // Pre: curvilinear(), !rans(), K > 0, uInf > 0, offRows g.size().
+    std::expected<void, hipError_t>
+    setPrecond(double K, double uInf, const std::vector<std::uint8_t>& offRows);
+    bool precond() const { return precKU2_ > 0.0; }
+    // One preconditioned SSP-RK3 step in place: step()'s stage sequence and
+    // hooks, but each stage materializes R = residualInto(stage input) and
+    // writes out = ca a + cb b + crAt(c) P R. Same fixed point as step()
+    // (P invertible); a different pseudo-time path. Pre: precond(),
+    // s.nT == 0, dt from the preconditioned localDt.
+    void stepPrecond(DeviceCompState& s, Real dt);
     // SST: positivity-guard hits since enableRans (0 for SA). Synchronizes.
     unsigned long long floorHits() const;
     // SST: the per-cell F1 blend of the last stage or updateMut.
@@ -475,6 +495,10 @@ private:
     // cr = 1 already).
     void stage(const DeviceCompState& s, const StageCombine& cmb,
                DeviceCompState& out, bool residualMode = false);
+    // stepPrecond's stage: R of s into precR_, then out = ca a + cb b +
+    // crAt(c) P R over the stage range. Same aliasing contract as stage().
+    void precondStage(const DeviceCompState& s, const StageCombine& cmb,
+                      DeviceCompState& out);
     // The primitives of s, then mu_t from them into nut_, then the mesh
     // family's image rows (mutHook_); also the scalar stage's per-cell cache
     // of s. SA fuses the two pointwise kernels into one launch (same bits).
@@ -535,7 +559,12 @@ private:
     DeviceBuffer<unsigned long long> hits_;
     double omegaFloor_ = 0;
     bool ltsOn_ = false;
+    double ltsMax_ = 0;   // --lts-max; 0 = unlimited
     bool compensated_ = false;
+    // --precond: K^2 uInf^2 (0 = off), the eps = 1 rows, the residual scratch.
+    double precKU2_ = 0.0;
+    DeviceBuffer<std::uint8_t> precOff_;
+    DeviceCompState precR_;
     std::function<void(DeviceCompState&)> hook_;
     bool hookAtEntry_ = true; // setStageHook's Idempotent::no
     CellRange stageRange_{};  // setStageRange; the whole grid by default
