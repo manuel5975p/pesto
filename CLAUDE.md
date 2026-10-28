@@ -17,6 +17,7 @@ Specs: `docs/nscbc.md`, `docs/validation.md` (anchors), `docs/viewer-format.md`,
 - TWO GPU backends, ONE set of sources: `src/dns/gpu/*.hip` is HIP; `DNS_WITH_CUDA=ON` compiles the SAME files through the shim `src/compat/cuda` (read its README). Never fork a solver per backend; never `#if DNS_WITH_CUDA` outside the shim — a HIP call the shim lacks is a build error ON PURPOSE: extend the shim in the same commit. App code uses `DNS_WITH_GPU` (not `DNS_WITH_HIP`). Backend name (`gpu::backendName`, `backend=` provenance) = `DNS_GPU_BACKEND_NAME` from the CMake backend branch, not a header `#if`.
 - GPU arch AUTO-DETECTED (`CMAKE_HIP_ARCHITECTURES` / `CMAKE_CUDA_ARCHITECTURES`); wrong HIP arch = `getStatFunc` assertion. CUDA needs nvcc `-std=c++23` (configure compiles `<expected>`); CMake ≥ 4.3 needs the CUDA23 dialect flag taught, which the CUDA branch does.
 - Long runs: `run_in_background`, act on the completion notification. No Monitor/sleep/until polling.
+- **Every GPU run and every heavy CPU run (OpenFOAM, GPU ctest) goes through the job server**: `build/simjob submit (--gpu|--cpu) -t SEC -m MB --wait -- EXE ARGS` (multi-step / OpenFOAM: `--spec FILE.json --inherit-env`; timing measurements: `--bench`). Caps 1800 s / 16384 MB. One gpu + one cpu job at a time. Never run the GPU outside it. `docs/jobs.md`.
 - Artifacts when asked to publish: dark mode; videos colormapped with curl and |velocity|.
 
 ## Layering

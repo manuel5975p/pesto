@@ -521,5 +521,6 @@ Tiers, labels, tolerances, the quarantine and anchor regeneration:
 | `docs/scene.md` | the `--scene` TOML format and per-object integrals |
 | `docs/ui.md` | `dns-ui`: editor, run cockpit, live viewer |
 | `docs/viewer-format.md` | web frame format, run `.json`, `_surface.csv`, `--emit mesh` |
+| `docs/jobs.md` | `simjobd` / `simjob`: the job server every GPU/CPU run goes through |
 | `src/compat/cuda/README.md` | the CUDA header shim |
 | `docs/archive/` | historical plans and analyses |

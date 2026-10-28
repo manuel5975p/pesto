@@ -105,6 +105,23 @@ target_link_libraries(dns_prop PUBLIC dns_core PRIVATE Threads::Threads)
 add_executable(dns apps/dns_main.cpp)
 target_link_libraries(dns PRIVATE dns_core dns_prop)
 
+# The simulation job server and its client (docs/jobs.md). Linux + systemd
+# user session; links nothing of the solver, so it never goes stale with it.
+add_library(simjobs STATIC
+    src/jobs/io.cpp
+    src/jobs/json.cpp
+    src/jobs/runner.cpp
+    src/jobs/sched.cpp
+    src/jobs/server.cpp
+    src/jobs/sha256.cpp
+    src/jobs/spec.cpp
+)
+target_include_directories(simjobs PUBLIC src)
+add_executable(simjobd apps/simjobd.cpp)
+target_link_libraries(simjobd PRIVATE simjobs)
+add_executable(simjob apps/simjob.cpp)
+target_link_libraries(simjob PRIVATE simjobs)
+
 # The one GPU source list, shared by both backends.
 set(DNS_GPU_SOURCES
     src/dns/gpu/axis_bc.hip
@@ -389,6 +406,21 @@ if(BUILD_TESTING)
         set_tests_properties(${t} PROPERTIES TIMEOUT 120)
     endforeach()
     target_link_libraries(test_fieldpng PRIVATE ZLIB::ZLIB) # decodes IDAT
+
+    # Job server: pure parts (sha256, json, spec, admission) and a live run of
+    # the real simjobd + simjob binaries (skips without a systemd user session).
+    add_executable(test_jobs tests/test_jobs.cpp)
+    target_link_libraries(test_jobs PRIVATE simjobs)
+    add_test(NAME jobs COMMAND test_jobs)
+    set_tests_properties(jobs PROPERTIES TIMEOUT 30 LABELS fast)
+    add_executable(jobs_hog tests/jobs_hog.cpp)
+    add_executable(test_jobs_live tests/test_jobs_live.cpp)
+    target_link_libraries(test_jobs_live PRIVATE simjobs)
+    target_compile_definitions(test_jobs_live PRIVATE
+        SIMJOBD_BIN="$<TARGET_FILE:simjobd>" SIMJOB_BIN="$<TARGET_FILE:simjob>"
+        JOBS_HOG_BIN="$<TARGET_FILE:jobs_hog>")
+    add_test(NAME jobs_live COMMAND test_jobs_live)
+    set_tests_properties(jobs_live PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     set_tests_properties(cli_defaults comp_axis_permute blockband channel_line
                          pseudo_time PROPERTIES TIMEOUT 60)
 
