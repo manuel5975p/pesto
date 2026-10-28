@@ -1,5 +1,7 @@
 #include "dns/flow_ic.hpp"
 
+#include "dns/parallel.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -74,7 +76,7 @@ void incompressibleBodyIC(const Case& c, const CaseGeometry& geo,
 void compressibleBodyIC(const Case& c, const CaseGeometry& geo,
                         const AxisRemap3& fRemap, const TanhStretchY& yRemap,
                         double rhoInf, double pInf, double gamma,
-                        CompState& host, std::vector<float>& mask)
+                        CompState& host, std::vector<float>& mask, int threads)
 {
     const auto& g = c.grid;
     const double h = c.h;
@@ -88,32 +90,41 @@ void compressibleBodyIC(const Case& c, const CaseGeometry& geo,
     // Physical cell-centre positions come from the PointRemap of whichever
     // curvilinear mesh is active (both are the exact identity when off), so
     // the taper and the trip sit where the cells actually are.
-    for (int k = 0; k < g.nz; ++k)
-        for (int j = 0; j < g.ny; ++j)
-            for (int i = 0; i < g.nx; ++i)
-            {
-                const std::size_t q = g.idx(i, j, k);
-                const double x = fRemap.fx.map((i + 0.5) * h),
-                             y = fRemap.fy.map(yRemap.mapY((j + 0.5) * g.hy)),
-                             z = g.nz > 1 ? fRemap.fz.map((k + 0.5) * g.hz)
-                                          : c.placement.cz;
-                const double d = geo.sdf(x, y, z);
-                const double f = std::clamp(d / (3.0 * h), 0.0, 1.0);
-                double uu = u0 * f * f * (3 - 2 * f), vv = 0.0;
-                if (kA != 0.0 && d > 0.0)
-                {
-                    const double dx = x - kx, dy = y - ky;
-                    const double e = kA * std::exp(-(dx * dx + dy * dy) / (kw * kw));
-                    uu += 2 * dy / kw * e;
-                    vv -= 2 * dx / kw * e;
-                }
-                host.rho[q] = rhoInf;
-                host.mx[q] = rhoInf * uu;
-                host.my[q] = rhoInf * vv;
-                host.E[q] = pInf / (gamma - 1.0)
-                          + 0.5 * rhoInf * (uu * uu + vv * vv);
-                if (d < 0.0) mask[q] = 0.0f;
-            }
+    // One sdf evaluation per cell is the whole cost (a mesh body: 122 s of
+    // a 155 s host phase at 20.7M cells, single-threaded), so (j, k) rows
+    // come from an atomic queue, each worker on its own copy of the sdf (the
+    // classifyCompGhost contract); a cell writes only index q, so the state
+    // is bit-identical for any worker count (host_threads).
+    auto cell = [&](const Sdf& sdf, int i, int j, int k)
+    {
+        const std::size_t q = g.idx(i, j, k);
+        const double x = fRemap.fx.map((i + 0.5) * h),
+                     y = fRemap.fy.map(yRemap.mapY((j + 0.5) * g.hy)),
+                     z = g.nz > 1 ? fRemap.fz.map((k + 0.5) * g.hz)
+                                  : c.placement.cz;
+        const double d = sdf(x, y, z);
+        const double f = std::clamp(d / (3.0 * h), 0.0, 1.0);
+        double uu = u0 * f * f * (3 - 2 * f), vv = 0.0;
+        if (kA != 0.0 && d > 0.0)
+        {
+            const double dx = x - kx, dy = y - ky;
+            const double e = kA * std::exp(-(dx * dx + dy * dy) / (kw * kw));
+            uu += 2 * dy / kw * e;
+            vv -= 2 * dx / kw * e;
+        }
+        host.rho[q] = rhoInf;
+        host.mx[q] = rhoInf * uu;
+        host.my[q] = rhoInf * vv;
+        host.E[q] = pInf / (gamma - 1.0) + 0.5 * rhoInf * (uu * uu + vv * vv);
+        if (d < 0.0) mask[q] = 0.0f;
+    };
+    const std::size_t rows = std::size_t(g.ny) * std::size_t(g.nz);
+    const int nw = workerCount(threads, rows);
+    const std::vector<Sdf> sdfs(std::size_t(nw), geo.sdf);
+    forItems(nw, rows, [&](int w, std::size_t r) {
+        const int k = int(r / std::size_t(g.ny)), j = int(r % std::size_t(g.ny));
+        for (int i = 0; i < g.nx; ++i) cell(sdfs[std::size_t(w)], i, j, k);
+    });
 }
 
 void channelIC(const Case& c, const ChannelStretchY& remap, double delta,

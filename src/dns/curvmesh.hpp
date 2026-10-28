@@ -145,7 +145,11 @@ struct CurvMetrics
     double hmin = 0.0; // min cell width over cells and non-degenerate axes
 
     // nx, ny >= 2; nz == 1 or nz >= 2; node arrays sized g.size().
-    static std::expected<CurvMetrics, std::string> build(const CurvMesh& m);
+    // threads <= 0: hardware concurrency. Contiguous (j, k)-row blocks, each
+    // cell by the serial expression: bit-identical for ANY thread count,
+    // and the error returned is the serial loop's first (host_threads).
+    static std::expected<CurvMetrics, std::string> build(const CurvMesh& m,
+                                                         int threads = 0);
 };
 
 } // namespace dns

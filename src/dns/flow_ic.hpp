@@ -53,10 +53,16 @@ void incompressibleBodyIC(const Case& c, const CaseGeometry& geo,
 // `remap` and `yRemap` are the active mesh maps (both the exact identity when
 // off): the taper and the trip must sit where the cells PHYSICALLY are, not
 // where their indices are.
+//
+// threads <= 0: hardware concurrency. Rows from an atomic queue, each worker
+// on its own copy of geo.sdf (which must tolerate concurrent copies, as the
+// ghost-wall classification already requires): bit-identical for ANY count
+// (host_threads).
 void compressibleBodyIC(const Case& c, const CaseGeometry& geo,
                         const AxisRemap3& remap, const TanhStretchY& yRemap,
                         double rhoInf, double pInf, double gamma,
-                        CompState& state, std::vector<float>& mask);
+                        CompState& state, std::vector<float>& mask,
+                        int threads = 0);
 
 // Channel: laminar Poiseuille scaled to the log-law bulk target (so the flux
 // does not have to be shed during transition) plus a deterministic

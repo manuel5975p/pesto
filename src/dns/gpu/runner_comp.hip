@@ -3,6 +3,7 @@
 #include "dns/interrupt.hpp"
 
 #include "dns/curvmesh.hpp"
+#include "dns/parallel.hpp"
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/comp_far.hpp"
 #include "dns/gpu/comp_ghost.hpp"
@@ -226,9 +227,10 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         // Threaded sdf sweep: on a focal mesh nearly every cell is inside the
         // bbox band, and a mesh sdf there is minutes single-threaded (DTMB
         // 4119, 160k triangles, 6.1M cells: ~2 min). The same sdf copies the
-        // azimuth table already evaluates concurrently.
-        const int classifyThreads =
-            std::max(1, int(std::thread::hardware_concurrency()) / 2);
+        // azimuth table already evaluates concurrently. All hardware threads
+        // (the tables do not depend on the count): DTMB P1 3.35 s at 10, 2.03
+        // s at 20 on the 20-thread host.
+        const int classifyThreads = workerCount(0, std::size_t(g.nz));
         const CompGhostTables tbls = classifyCompGhost(
             g, sdf, bbox ? bbox->data() : nullptr, fremap, &motion,
             classifyThreads);

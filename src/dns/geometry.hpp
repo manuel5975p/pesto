@@ -31,12 +31,16 @@ struct SampleOpts
     // Band half-width beyond which a cell is trivially fluid/solid, in world
     // units, relative to sdf(centre). 0 = half the cell diagonal.
     double band = 0.0;
+    // Host workers, <= 0 = hardware concurrency. Never changes a value.
+    int threads = 0;
 };
 
 // lambda / ax / ay / az by supersampling `sdf` (> 0 is fluid). Cells whose
 // block-centre Lipschitz bound proves them wholly fluid or wholly solid skip
 // the inner samples entirely -- the dominant cost on large grids.
 // nz == 1 or zInvariant: the z pass is skipped and az mirrors lambda.
+// Threaded over block rows, one sdf copy per worker (sdf must tolerate
+// concurrent copies): bit-identical for any o.threads (host_threads).
 // Pre: grid dims > 0, sdf approximately a true distance near the wall.
 // Post: every value in [0,1].
 std::expected<CutGeometry, std::string>

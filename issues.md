@@ -318,3 +318,11 @@ Numbers are measured, gfx1100.
 - Rotors: no table cache, no incompressible branch, no dns-ui support.
 - dns-ui: a stop issued before a run reaches its time loop is not clean.
 - README names gfx1201; this machine is gfx1100.
+- **Host phase** (`dns/parallel.hpp`, bit-identical; `runs/prop/curv/`,
+  `--bench` short runs): DTMB 4119 P1 50.7 → 8.0 s, P3 156.0 → 20.8 s.
+  Serial P3 split: body IC 122.1 s (one mesh-sdf call per cell; the older
+  "dominated by `CurvMetrics::build`" was wrong), metrics 16.7, MRF
+  classify 9.6 (10 threads), `sampleCut` 4.3. Left at P3: body IC 12.6 s on
+  20 threads. A bbox short-circuit (cell > 3h outside the body AABB ⇒ f = 1)
+  would skip most calls but equals the full sweep only where the mesh sign
+  test is right far from the body (non-watertight meshes) — not built.

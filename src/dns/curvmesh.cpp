@@ -1,5 +1,8 @@
 #include "dns/curvmesh.hpp"
 
+#include "dns/parallel.hpp"
+
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <format>
@@ -184,7 +187,8 @@ std::array<double, 3> CurvMesh::node(int i, int j, int k) const
     return {p[0] + A.shift, p[1] + B.shift, p[2] + C.shift};
 }
 
-std::expected<CurvMetrics, std::string> CurvMetrics::build(const CurvMesh& m)
+std::expected<CurvMetrics, std::string> CurvMetrics::build(const CurvMesh& m,
+                                                           int threads)
 {
     const Grid& g = m.g;
     const std::size_t n = g.size();
@@ -218,13 +222,28 @@ std::expected<CurvMetrics, std::string> CurvMetrics::build(const CurvMesh& m)
     CurvMetrics t;
     t.g = g;
     t.wrap = m.wrap;
-    for (int a = 0; a < 3; ++a) {
-        for (int c = 0; c < 3; ++c) t.S[a][c].assign(n, 0.0);
-        for (int e = 0; e < 9; ++e) t.Ji[a][e].assign(n, 0.0);
-        t.aov[a].assign(n, 0.0);
+    // Every table zero-filled, one whole array per task (40 arrays of n
+    // doubles, 6.6 GB at 20.7M cells; the fill is first touch of the pages).
+    {
+        std::vector<std::vector<double>*> arrays;
+        for (int a = 0; a < 3; ++a) {
+            for (int c = 0; c < 3; ++c) arrays.push_back(&t.S[a][c]);
+            for (int e = 0; e < 9; ++e) arrays.push_back(&t.Ji[a][e]);
+            arrays.push_back(&t.aov[a]);
+        }
+        if (m.wrap[2] == AxisWrap::MirrorZ) arrays.push_back(&t.aovSteadyZ);
+        arrays.push_back(&t.vol);
+        forBlocks(workerCount(threads, arrays.size()), arrays.size(),
+                  [&](int, std::size_t lo, std::size_t hi) {
+                      for (std::size_t q = lo; q < hi; ++q)
+                          arrays[q]->assign(n, 0.0);
+                  });
     }
-    if (m.wrap[2] == AxisWrap::MirrorZ) t.aovSteadyZ.assign(n, 0.0);
-    t.vol.assign(n, 0.0);
+    // Both cell passes run over (j, k) rows in nw contiguous blocks, each
+    // cell computed by exactly the serial expression and written only to its
+    // own index: bit-identical for every thread count.
+    const std::size_t rows = std::size_t(g.ny) * std::size_t(g.nz);
+    const int nw = workerCount(threads, rows);
 
     auto nd = [&](int i, int j, int k) -> V3 {
         const auto p = m.node(i, j, k);
@@ -255,79 +274,96 @@ std::expected<CurvMetrics, std::string> CurvMetrics::build(const CurvMesh& m)
         P[3] = corner(0, 1);
     };
 
-    for (int k = 0; k < g.nz; ++k)
-        for (int j = 0; j < g.ny; ++j)
-            for (int i = 0; i < g.nx; ++i) {
-                const std::size_t c = g.idx(i, j, k);
-                const V3 o = nd(i, j, k);
-                double v6 = 0.0;
-                const V3 cc0 = centroid(i, j, k);
-                for (int a = 0; a < 3; ++a) {
-                    V3 P[4];
-                    face(i, j, k, a, 1, P);
-                    // Exact bilinear-quad area vector, outward +a.
-                    const V3 Sv = 0.5 * cross(P[2] - P[0], P[3] - P[1]);
-                    t.S[a][0][c] = Sv.x;
-                    t.S[a][1][c] = Sv.y;
-                    t.S[a][2][c] = Sv.z;
-                    // Diagonal P0-P2 on every face: neighbours triangulate the
-                    // shared surface identically, so the cells tile the box.
-                    v6 += tet6(o, P[0], P[1], P[2]) + tet6(o, P[0], P[2], P[3]);
-                    V3 Q[4];
-                    face(i, j, k, a, 0, Q);
-                    v6 += tet6(o, Q[0], Q[2], Q[1]) + tet6(o, Q[0], Q[3], Q[2]);
+    // One cell's faces, Jacobians and volume; writes only index c.
+    auto cell = [&](int i, int j, int k) -> std::expected<void, std::string> {
+        const std::size_t c = g.idx(i, j, k);
+        const V3 o = nd(i, j, k);
+        double v6 = 0.0;
+        const V3 cc0 = centroid(i, j, k);
+        for (int a = 0; a < 3; ++a) {
+            V3 P[4];
+            face(i, j, k, a, 1, P);
+            // Exact bilinear-quad area vector, outward +a.
+            const V3 Sv = 0.5 * cross(P[2] - P[0], P[3] - P[1]);
+            t.S[a][0][c] = Sv.x;
+            t.S[a][1][c] = Sv.y;
+            t.S[a][2][c] = Sv.z;
+            // Diagonal P0-P2 on every face: neighbours triangulate the
+            // shared surface identically, so the cells tile the box.
+            v6 += tet6(o, P[0], P[1], P[2]) + tet6(o, P[0], P[2], P[3]);
+            V3 Q[4];
+            face(i, j, k, a, 0, Q);
+            v6 += tet6(o, Q[0], Q[2], Q[1]) + tet6(o, Q[0], Q[3], Q[2]);
 
-                    // dx/dxi at the hi face: normal from cell centroids,
-                    // tangents from face edge midpoints (dxi = 1).
-                    const int t1 = (a + 1) % 3, t2 = (a + 2) % 3;
-                    const V3 cc1 = centroid(i + (a == 0), j + (a == 1), k + (a == 2));
-                    V3 col[3];
-                    col[a] = cc1 - cc0;
-                    col[t1] = 0.5 * ((P[1] + P[2]) - (P[0] + P[3]));
-                    col[t2] = 0.5 * ((P[3] + P[2]) - (P[0] + P[1]));
-                    if (a == 0 && isAxisFace(m, i)) {
-                        if (Sv.x != 0.0 || Sv.y != 0.0 || Sv.z != 0.0)
-                            return std::unexpected(std::format(
-                                "axis face ({}, {}, {}) is not degenerate (S = "
-                                "{:.3e} {:.3e} {:.3e})",
-                                i, j, k, Sv.x, Sv.y, Sv.z));
-                        const V3 F = i == m.axisFaces[0]
-                                         ? centroid(i + 1, j, k)
-                                         : cc0;
-                        const auto row = axisLimitRow(col[t1], P[0], F,
-                                                      i == m.axisFaces[0]);
-                        if (!row)
-                            return std::unexpected(std::format(
-                                "axis face ({}, {}, {}): {}", i, j, k,
-                                row.error()));
-                        t.Ji[a][0][c] = row->x;
-                        t.Ji[a][1][c] = row->y;
-                        t.Ji[a][2][c] = row->z;
-                        continue; // rows j, k stay 0: read only times S = 0
-                    }
-                    // A placeholder column's own faces are replaced below.
-                    if (isGhostColumn(m, i)) continue;
-                    const double M[3][3] = {{col[0].x, col[1].x, col[2].x},
-                                            {col[0].y, col[1].y, col[2].y},
-                                            {col[0].z, col[1].z, col[2].z}};
-                    double inv[3][3], det = 0.0;
-                    if (!invert3(M, inv, det))
-                        return std::unexpected(std::format(
-                            "degenerate face Jacobian at cell ({}, {}, {}) axis "
-                            "{} (det {})",
-                            i, j, k, a, det));
-                    for (int d = 0; d < 3; ++d)
-                        for (int cx = 0; cx < 3; ++cx)
-                            t.Ji[a][d * 3 + cx][c] = inv[d][cx];
-                }
-                const double vol = v6 / 6.0;
-                if (isGhostColumn(m, i)) continue;
-                if (!(vol > 0.0))
+            // dx/dxi at the hi face: normal from cell centroids,
+            // tangents from face edge midpoints (dxi = 1).
+            const int t1 = (a + 1) % 3, t2 = (a + 2) % 3;
+            const V3 cc1 = centroid(i + (a == 0), j + (a == 1), k + (a == 2));
+            V3 col[3];
+            col[a] = cc1 - cc0;
+            col[t1] = 0.5 * ((P[1] + P[2]) - (P[0] + P[3]));
+            col[t2] = 0.5 * ((P[3] + P[2]) - (P[0] + P[1]));
+            if (a == 0 && isAxisFace(m, i)) {
+                if (Sv.x != 0.0 || Sv.y != 0.0 || Sv.z != 0.0)
                     return std::unexpected(std::format(
-                        "non-positive cell volume at ({}, {}, {}): {}", i, j, k,
-                        vol));
-                t.vol[c] = vol;
+                        "axis face ({}, {}, {}) is not degenerate (S = "
+                        "{:.3e} {:.3e} {:.3e})",
+                        i, j, k, Sv.x, Sv.y, Sv.z));
+                const V3 F = i == m.axisFaces[0] ? centroid(i + 1, j, k) : cc0;
+                const auto row =
+                    axisLimitRow(col[t1], P[0], F, i == m.axisFaces[0]);
+                if (!row)
+                    return std::unexpected(std::format(
+                        "axis face ({}, {}, {}): {}", i, j, k, row.error()));
+                t.Ji[a][0][c] = row->x;
+                t.Ji[a][1][c] = row->y;
+                t.Ji[a][2][c] = row->z;
+                continue; // rows j, k stay 0: read only times S = 0
             }
+            // A placeholder column's own faces are replaced below.
+            if (isGhostColumn(m, i)) continue;
+            const double M[3][3] = {{col[0].x, col[1].x, col[2].x},
+                                    {col[0].y, col[1].y, col[2].y},
+                                    {col[0].z, col[1].z, col[2].z}};
+            double inv[3][3], det = 0.0;
+            if (!invert3(M, inv, det))
+                return std::unexpected(std::format(
+                    "degenerate face Jacobian at cell ({}, {}, {}) axis "
+                    "{} (det {})",
+                    i, j, k, a, det));
+            for (int d = 0; d < 3; ++d)
+                for (int cx = 0; cx < 3; ++cx)
+                    t.Ji[a][d * 3 + cx][c] = inv[d][cx];
+        }
+        const double vol = v6 / 6.0;
+        if (isGhostColumn(m, i)) return {};
+        if (!(vol > 0.0))
+            return std::unexpected(std::format(
+                "non-positive cell volume at ({}, {}, {}): {}", i, j, k, vol));
+        t.vol[c] = vol;
+        return {};
+    };
+    // A block stops at its first bad cell; blocks ascend in (k, j, i), so
+    // the lowest failing block holds the serial loop's first error.
+    {
+        std::vector<std::string> err(static_cast<std::size_t>(nw));
+        std::vector<char> bad(std::size_t(nw), 0);
+        forBlocks(nw, rows, [&](int w, std::size_t r0, std::size_t r1) {
+            for (std::size_t r = r0; r < r1; ++r) {
+                const int k = int(r / std::size_t(g.ny));
+                const int j = int(r % std::size_t(g.ny));
+                for (int i = 0; i < g.nx; ++i)
+                    if (auto e = cell(i, j, k); !e) {
+                        err[std::size_t(w)] = std::move(e.error());
+                        bad[std::size_t(w)] = 1;
+                        return;
+                    }
+            }
+        });
+        for (int w = 0; w < nw; ++w)
+            if (bad[std::size_t(w)])
+                return std::unexpected(std::move(err[std::size_t(w)]));
+    }
 
     // The placeholder columns past the axis: their j- and k-face tables and
     // volume are their real neighbour's (the ghost's own rhs is discarded;
@@ -348,10 +384,15 @@ std::expected<CurvMetrics, std::string> CurvMetrics::build(const CurvMesh& m)
             }
     }
 
-    // Widths need the neighbour's face norms, hence the second pass.
-    t.hmin = 1e300;
-    for (int k = 0; k < g.nz; ++k)
-        for (int j = 0; j < g.ny; ++j)
+    // Widths need the neighbour's face norms, hence the second pass. Each
+    // block keeps its own minimum; min is exact, so the merged hmin is the
+    // serial one.
+    std::vector<double> hminW(std::size_t(nw), 1e300);
+    forBlocks(nw, rows, [&](int w, std::size_t r0, std::size_t r1) {
+        double hm = 1e300;
+        for (std::size_t r = r0; r < r1; ++r) {
+            const int k = int(r / std::size_t(g.ny));
+            const int j = int(r % std::size_t(g.ny));
             for (int i = 0; i < g.nx; ++i) {
                 const std::size_t c = g.idx(i, j, k);
                 for (int a = 0; a < 3; ++a) {
@@ -383,9 +424,14 @@ std::expected<CurvMetrics, std::string> CurvMetrics::build(const CurvMesh& m)
                         t.aov[a][c] *= g.hz;
                     }
                     if (a < 2 || g.nz > 1)
-                        t.hmin = std::min(t.hmin, 1.0 / t.aov[a][c]);
+                        hm = std::min(hm, 1.0 / t.aov[a][c]);
                 }
             }
+        }
+        hminW[std::size_t(w)] = hm;
+    });
+    t.hmin = 1e300;
+    for (const double hm : hminW) t.hmin = std::min(t.hmin, hm);
     return t;
 }
 

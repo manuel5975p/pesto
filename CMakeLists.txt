@@ -395,7 +395,8 @@ if(BUILD_TESTING)
     set(DNS_TESTS cli geometry output poisson projection tgv tgv3d cutcell cutcell_sphere comp comp_curv meshsdf
         fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport
         rotor focal cli_defaults comp_axis_permute rans rans_channel1d
-        steady_stop blockband channel_line pseudo_time flow_rans_config precond)
+        steady_stop blockband channel_line pseudo_time flow_rans_config precond
+        host_threads)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)
     endif()
@@ -406,6 +407,8 @@ if(BUILD_TESTING)
         set_tests_properties(${t} PROPERTIES TIMEOUT 120)
     endforeach()
     target_link_libraries(test_fieldpng PRIVATE ZLIB::ZLIB) # decodes IDAT
+    target_compile_definitions(test_host_threads PRIVATE
+        DNS_ROTOR2_STL="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/rotor2.stl")
 
     # Job server: pure parts (sha256, json, spec, admission) and a live run of
     # the real simjobd + simjob binaries (skips without a systemd user session).

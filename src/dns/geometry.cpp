@@ -1,5 +1,7 @@
 #include "dns/geometry.hpp"
 
+#include "dns/parallel.hpp"
+
 #include <algorithm>
 #include <cmath>
 
@@ -24,7 +26,7 @@ double frac(const Sdf& sdf, double x0, double y0, double z0, double ex, double e
 } // namespace
 
 std::expected<CutGeometry, std::string>
-sampleCut(const Grid& g, const Sdf& sdf, SampleOpts o)
+sampleCut(const Grid& g, const Sdf& sdfShared, SampleOpts o)
 {
     if (g.nx < 1 || g.ny < 1 || g.nz < 1)
         return std::unexpected("sampleCut: grid dimensions must be >= 1");
@@ -57,69 +59,81 @@ sampleCut(const Grid& g, const Sdf& sdf, SampleOpts o)
                     + double(flat ? 0.0 : double(B * g.hz) * (B * g.hz)));
 
     const int kEnd = flat ? 1 : g.nz;   // one layer when z-invariant
-    for (int kb = 0; kb < kEnd; kb += kStep)
-        for (int jb = 0; jb < g.ny; jb += B)
-            for (int ib = 0; ib < g.nx; ib += B)
-            {
-                const int i1 = std::min(ib + B, g.nx), j1 = std::min(jb + B, g.ny);
-                const int k1 = flat ? 1 : std::min(kb + B, g.nz);
-                const double phiC = sdf((ib + 0.5 * (i1 - ib)) * g.hx,
-                                        (jb + 0.5 * (j1 - jb)) * g.hy,
-                                        flat ? 0.5 * g.hz
-                                             : (kb + 0.5 * (k1 - kb)) * g.hz);
-                const bool allFluid = phiC >= band + blockR;
-                const bool allSolid = phiC <= -band - blockR;
+    // (kb, jb) block rows from an atomic queue (rows through the body cost
+    // all the samples), each worker on its own sdf copy; a block row writes
+    // only its own cells (all k when flat), so the geometry is bit-identical
+    // for any worker count (host_threads). A mesh body at 20.7M cells: 4.26 s
+    // serial.
+    const std::size_t nJb = std::size_t((g.ny + B - 1) / B);
+    const std::size_t nKb = std::size_t((kEnd + kStep - 1) / kStep);
+    auto blockRow = [&](const Sdf& sdf, int kb, int jb) {
+        for (int ib = 0; ib < g.nx; ib += B)
+        {
+            const int i1 = std::min(ib + B, g.nx), j1 = std::min(jb + B, g.ny);
+            const int k1 = flat ? 1 : std::min(kb + B, g.nz);
+            const double phiC = sdf((ib + 0.5 * (i1 - ib)) * g.hx,
+                                    (jb + 0.5 * (j1 - jb)) * g.hy,
+                                    flat ? 0.5 * g.hz
+                                         : (kb + 0.5 * (k1 - kb)) * g.hz);
+            const bool allFluid = phiC >= band + blockR;
+            const bool allSolid = phiC <= -band - blockR;
 
-                for (int k = kb; k < k1; ++k)
-                    for (int j = jb; j < j1; ++j)
-                        for (int i = ib; i < i1; ++i)
+            for (int k = kb; k < k1; ++k)
+                for (int j = jb; j < j1; ++j)
+                    for (int i = ib; i < i1; ++i)
+                    {
+                        double lam, ax, ay, az;
+                        if (allFluid || allSolid)
+                            lam = ax = ay = az = allFluid ? 1.0 : 0.0;
+                        else
                         {
-                            double lam, ax, ay, az;
-                            if (allFluid || allSolid)
-                                lam = ax = ay = az = allFluid ? 1.0 : 0.0;
-                            else
-                            {
-                                const double x0 = i * g.hx, y0 = j * g.hy,
-                                             z0 = flat ? 0.0 : k * g.hz;
-                                const double zc = flat ? 0.5 * g.hz
-                                                       : z0 + 0.5 * g.hz;
-                                lam = classify(
-                                    sdf(x0 + 0.5 * g.hx, y0 + 0.5 * g.hy, zc),
-                                    [&] {
-                                        return frac(sdf, x0, y0, z0, g.hx, g.hy, hz,
-                                                    nc, nc, flat ? 1 : nc);
-                                    });
-                                ax = classify(sdf(x0, y0 + 0.5 * g.hy, zc), [&] {
-                                    return frac(sdf, x0, y0, z0, 0, g.hy, hz, 1, nf,
-                                                flat ? 1 : nf);
+                            const double x0 = i * g.hx, y0 = j * g.hy,
+                                         z0 = flat ? 0.0 : k * g.hz;
+                            const double zc = flat ? 0.5 * g.hz
+                                                   : z0 + 0.5 * g.hz;
+                            lam = classify(
+                                sdf(x0 + 0.5 * g.hx, y0 + 0.5 * g.hy, zc),
+                                [&] {
+                                    return frac(sdf, x0, y0, z0, g.hx, g.hy, hz,
+                                                nc, nc, flat ? 1 : nc);
                                 });
-                                ay = classify(sdf(x0 + 0.5 * g.hx, y0, zc), [&] {
-                                    return frac(sdf, x0, y0, z0, g.hx, 0, hz, nf, 1,
-                                                flat ? 1 : nf);
-                                });
-                                // A z-invariant body cuts no z face: the w face
-                                // sees exactly the cell's own fluid fraction.
-                                az = flat ? lam
-                                          : classify(
-                                                sdf(x0 + 0.5 * g.hx, y0 + 0.5 * g.hy,
-                                                    z0),
-                                                [&] {
-                                                    return frac(sdf, x0, y0, z0, g.hx,
-                                                                g.hy, 0, nf, nf, 1);
-                                                });
-                            }
-                            // Replicate the single layer over k when flat.
-                            for (int kk = flat ? 0 : k; kk < (flat ? g.nz : k + 1);
-                                 ++kk)
-                            {
-                                const auto id = g.idx(i, j, kk);
-                                cut.lambda[id] = lam;
-                                cut.ax[id] = ax;
-                                cut.ay[id] = ay;
-                                cut.az[id] = az;
-                            }
+                            ax = classify(sdf(x0, y0 + 0.5 * g.hy, zc), [&] {
+                                return frac(sdf, x0, y0, z0, 0, g.hy, hz, 1, nf,
+                                            flat ? 1 : nf);
+                            });
+                            ay = classify(sdf(x0 + 0.5 * g.hx, y0, zc), [&] {
+                                return frac(sdf, x0, y0, z0, g.hx, 0, hz, nf, 1,
+                                            flat ? 1 : nf);
+                            });
+                            // A z-invariant body cuts no z face: the w face
+                            // sees exactly the cell's own fluid fraction.
+                            az = flat ? lam
+                                      : classify(
+                                            sdf(x0 + 0.5 * g.hx, y0 + 0.5 * g.hy,
+                                                z0),
+                                            [&] {
+                                                return frac(sdf, x0, y0, z0, g.hx,
+                                                            g.hy, 0, nf, nf, 1);
+                                            });
                         }
-            }
+                        // Replicate the single layer over k when flat.
+                        for (int kk = flat ? 0 : k; kk < (flat ? g.nz : k + 1);
+                             ++kk)
+                        {
+                            const auto id = g.idx(i, j, kk);
+                            cut.lambda[id] = lam;
+                            cut.ax[id] = ax;
+                            cut.ay[id] = ay;
+                            cut.az[id] = az;
+                        }
+                    }
+        }
+    };
+    const int nw = workerCount(o.threads, nKb * nJb);
+    const std::vector<Sdf> sdfs(std::size_t(nw), sdfShared);
+    forItems(nw, nKb * nJb, [&](int w, std::size_t r) {
+        blockRow(sdfs[std::size_t(w)], int(r / nJb) * kStep, int(r % nJb) * B);
+    });
     return cut;
 }
 

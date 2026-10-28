@@ -320,6 +320,12 @@ conservation are exact (FP32 freestream drift 0.0), and the uniform mesh
 reproduces the Cartesian rhs to 5e-15. Isentropic vortex: order 4.01 ratio.
 LES filters at the cell's own Δ (isotropic `vol^(1/3)`, deliberately not
 anisotropy-corrected). The channel's tanh stretching is `CurvMesh::channelY`.
+The host phase runs on all host threads (`dns/parallel.hpp`: row blocks or an
+atomic row queue, own-index writes, one sdf copy per worker), bit-identical to
+serial at any thread count (`host_threads`): `CurvMetrics::build`,
+`sampleCut`, the compressible body IC (one sdf call per cell) and the MRF
+ghost classification. DTMB 4119 host phase: P1 (6.1M cells) 50.7 → 8.0 s, P3
+(20.7M) 156.0 → 20.8 s.
 
 **`--focal`** clusters a fine plateau box (body + wake, or `auto` from the body
 AABB) with one `Focal1D` map per axis: an integrated quintic smoothstep with
