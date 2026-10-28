@@ -66,7 +66,7 @@ DNS 13.6 ms/step (1234 Mcell/s), Smagorinsky 15.6, σ 16.0, 1.46 GiB.
 | `hit` | forced homogeneous isotropic turbulence, SI-configured, h = 1.5 η | `dns hit --help` |
 | `channel` | wall-resolved compressible channel; `--les`, `--rans` | `docs/channel.md`, `docs/rans.md` |
 | `conv` | Rayleigh–Bénard convection, compressible or Boussinesq | below |
-| `flame` | 1D premixed flame, single-step chemistry, against its FP64 oracle | `docs/chem.md` |
+| `flame` | 1D premixed flame, single-step chemistry, against its FP64 oracle; `--mode chamber`: a closed 2D combustion chamber with a nozzle jet | `docs/chem.md` |
 | `bench` | step time, Mcell/s and the VRAM this process allocates | `dns bench --help` |
 | `prop` | propeller thrust curve by BEMT or lifting line, host-only | below |
 
@@ -112,6 +112,11 @@ build/dns conv --rayleigh 5e4 --n 96 --ny 48 --nz 1
 
 # 1D premixed flame, 15 cells per thermal thickness, M 0.01 (~11 s)
 build/dns flame --inflow-speed 0.98 --tt 20 --emit stats
+
+# closed 2D combustion chamber: premixed injector, wedge flame holder,
+# nozzle jet into a cold coflow; 4 cells per thermal thickness (~37 s), video
+build/dns flame --mode chamber --tt 80 --emit stats --emit bin --fdt 0.5 --out c
+python3 tools/chem/chamber_video.py c --out chamber.mp4 --png chamber.png
 
 # a multi-object scene
 build/dns flow --scene examples/tandem_cylinders.toml
@@ -526,6 +531,6 @@ Tiers, labels, tolerances, the quarantine and anchor regeneration:
 | `docs/ui.md` | `dns-ui`: editor, run cockpit, live viewer |
 | `docs/viewer-format.md` | web frame format, run `.json`, `_surface.csv`, `--emit mesh` |
 | `docs/jobs.md` | `simjobd` / `simjob`: the job server every GPU/CPU run goes through |
-| `docs/chem.md` | `dns flame`: model C0, the phase-plane oracle vs Cantera, species scheme, hook order, measured S_L |
+| `docs/chem.md` | `dns flame`: model C0, the phase-plane oracle vs Cantera, species scheme, hook order, measured S_L; the `--mode chamber` combustion chamber and its balances |
 | `src/compat/cuda/README.md` | the CUDA header shim |
 | `docs/archive/` | historical plans and analyses |

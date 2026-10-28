@@ -188,10 +188,130 @@ Cost: 15 cells, M 0.01, tt 10: 56346 steps, 0.20 ms/step, 11.3 s wall.
 | `gpu_flame_passive` | GPU API | species off/on bitwise mean flow, uniform Y, passive copies, boundedness |
 | `gpu_flame_conservation` | GPU API | mass, E + qρY, fuel vs rate tally |
 | `gpu_flame1d_grid` / `_mach` / `_suth` | GPU binary | the tables above |
+| `chamber_config` | host | polygon SDF, regions (closed cavity, probes), IC, isentropic inverse, dry-run, every rejection by name |
+| `gpu_chamber` | GPU binary | inert wall impermeability; reacting balances, nozzle vs isentropic, anchoring |
+
+## Chamber (`--mode chamber`)
+
+A closed 2D combustion chamber, model C0 as above, at M_flame 0.02
+(inflated; the label says so). Files: `dns/chamber.{hpp,cpp}` (geometry,
+regions, IC, isentropic nozzle), `gpu/runner_chamber.{hpp,hip}`, the walled
+instantiation of `kSpeciesStage` (`SpeciesSetup::solid`), validation in
+`config.cpp` (`finishChamber`, `chamberFlagScope`), tool
+`tools/chem/chamber_video.py`.
+
+**Geometry** (lengths in δ_th, `--chamber-height` 15, `--chamber-length`
+30): back wall, straight section, linear converging nozzle (length Hc/2,
+`--nozzle-ratio` Hc/He 3), walls 1.5 δ_th, one simple C-shaped polygon; a
+solid wedge flame holder (`--holder-height` 4, length 0.75 of it, apex 3.75
+δ_th past the inner back face). ONE immersed ADIABATIC ghost wall
+(`DeviceCompGhost`, stage hook `apply`, rhs hook `applyRhs`: impermeable
+faces). Ambient: cold inert gas (Tu, Y = 0) in a coflow (`--coflow` 2 S_L),
+x NSCBC (inflow at the coflow, outflow anchored at p0) + sink, y periodic,
+`--clearance` 10 δ_th above and below, `--downstream` 40 δ_th of jet.
+
+**Injector = volumetric mass-flow source.** The task's cheap choice was the
+whole back face; it is the whole back wall here, as a band 1.25 δ_th deep:
+ρ += S, E += S cp Tu (the injected gas's enthalpy at rest), ρY += S, S
+uniform per band cell, total ṁ = ρ_u `--inject-speed` Hc (3 S_L), sin² ramp
+over `--inject-ramp` (1). Why not an NSCBC face: the chamber's back wall
+then lies on the x-lo face with ghost rows inside the characteristic rows
+and sink band, and the species open-face rule has ONE yIn per run (the inert
+ambient needs 0) -- the source keeps the body away from every open face and
+every shared kernel. Held for the whole step: an SSP-RK3 step adds exactly S
+dt (weights sum to 1); `injCum` is its FP64 sum.
+
+**Species at the wall** (`SpeciesSetup::solid`, a device mask, compiled
+only into the `kSpeciesStage<true>` instantiation; null = the old kernel):
+a fluid/solid face carries NO species flux (convective or diffusive -- the
+impermeable, zero-gradient wall `applyRhs` makes for the mean flow), a solid
+MUSCL second neighbour drops the face to first order, a solid cell gets no
+species rhs and no heat release (ρY = 0 there from the IC on, so ω = 0).
+
+**IC (ignition, no spark):** cavity fresh (Y = 1, Tu) up to the holder base,
+burnt behind it (oracle profile across x = holder base), all at rest at p0;
+ambient at the coflow. Rhs hook: NSCBC → species re-carry → sink → species
+sink → wall faces → injector.
+
+**Stop guard:** exit 8 on flash-back (injector-band burn > 1e-3 of the
+total after ramp + 2) or blow-off (fuel through the exit > 0.5 of the
+injected after ramp + 2 Lc/U); 7 on a non-finite state.
+
+**Stats** (`<out>_stats.csv`, region sums over fluid cells,
+`dns::chamberRegions`): t, dt, inj, injCum, fuel, burn, burnCav, outNoz
+(fuel through the exit column), outDom (fuel through the domain faces),
+mdotIn, mdotNoz, Me (mass-weighted exit Mach), pCh (fresh plenum), p0Noz
+(p + ½ρ|u|² ahead of the contraction), pAmb (ambient beside the lips),
+h0Noz (exit total-enthalpy flux), Tmax, mass, energy, yHits, omegaInj, fx
+(fluid → body force; thrust = −fx minus the coflow drag, not separated).
+
+### Measured (gfx1100, simjob, 2026-10-28)
+
+Defaults (4 cells/δ_th: 364 × 152, 0.44 ms/step, tt 80 in 37 s) and the
+demo (6 cells/δ_th: 530 × 228, 0.57 ms/step, tt 80 in 71 s). Anchored V
+flame on the holder, complete combustion inside the chamber, every run.
+
+| quantity | 4 cells, t ∈ [40, 80] | 6 cells, t ∈ [40, 80] |
+|---|---|---|
+| burn / injected | 0.9978 | 0.9986 |
+| ṁ_exit / ṁ_in | 1.0010 | 0.9993 |
+| q burn / (h0 flux − ṁ_in cp Tu) | 0.9989 | 0.9959 (definition unverified, issues.md C8) |
+| T0_exit / Tb | 0.9982 | 0.9964 |
+| p_chamber / p_amb (fresh plenum) | 1.1676 | 1.1697 |
+| p0_nozzle / p_amb | 1.1521 | 1.1536 |
+| p_amb / p0 | 1.0430 | 1.0431 |
+| exit Mach, measured (mass-weighted) | 0.3841 | 0.3827 |
+| exit Mach, isentropic from measured ṁ, T0, p_amb, He | 0.3805 | 0.3794 |
+| Δp0 measured / Δp0 isentropic | 1.448 | 1.470 |
+| fuel through the exit / injected | < 1e-16 | < 1e-16 |
+
+(Simple means of the stats rows; `gpu_chamber` uses trapezoid window means
+over [25, 40]: burn/inj 0.9943, ṁ 0.9949, energy 1.0018, Me 0.3844 vs
+0.3808, Cd 0.832.) The 1D estimate at the validator's assumptions (T0 = Tb,
+p_e = p0) gives Me 0.3963 and p0/p_amb 1.1143. The nozzle needs 1.45× the
+isentropic total-pressure drop: a discharge coefficient Cd = ṁ/ṁ_ideal(p0)
+of 0.83 for an exit Reynolds number u_e He/ν_b ~ 100 (thick boundary layers
+in a 20-cell exit). The ambient beside the lips sits 4.3% above p0 (the
+outflow's soft pressure anchor, issues.md C3).
+
+**Inert** (`--reaction off`, tt 8): fuel − fuel0 − injCum stays within
+3.3e-5 of fuel0 + injCum (grows steadily; attributed, not proven, to the
+FP32 absorption bias of the injector's constant ~1.5e-3 increment into
+ρY ~ 1, the same rounding error for every step of a dt-recompute block; a
+diffusive wall leak
+against the empty ghost would be ~1e2 per unit time, 1e4× that); nothing
+reaches a domain face (outDom 1.8e-32); hot IC gas only compresses, Tmax ≤
+Tb (p/p0)^(2/7) × 1.0013.
+
+**yHits** (counted, never clamped): up to 162 (4 cells) / 178 (6 cells)
+fluid cells per row, all FRESH gas with Y − 1 ≤ 4.3e-6 (demo frames: max
+4.29e-6, min Y exactly 0) -- consistent with (not proven to be) the same
+FP32 absorption of the injector increment into ρ and ρY, whose transport
+rounds differently (KG continuity vs MUSCL species flux).
+
+**Thermo-acoustic limit cycle.** After the start transient decays (burn
+rms 0.3–0.4% at t ≈ 30), a self-excited oscillation grows: f = 2.95
+(4 cells) / 2.93 (6 cells) per flame time -- grid-independent to 1% -- in
+burn, exit Mach, fx and the nozzle total pressure together (the plenum
+probe shows mostly its 2f harmonic). Growth rate of the burn rms (log fit
+over t ∈ [40, 70]) 0.075 (4 cells, already bending into saturation) /
+0.052 (6 cells) per flame time; at 4 cells it levels off near t = 70 at burn
+rms 6.7%, plenum p rms 0.36% (rms over [75, 80]; still creeping up, issues.md
+C9); at 6 cells it is still growing at t = 80
+(burn rms 2.3%). The 1D two-temperature chamber (closed back,
+fresh to the holder base, burnt to the exit, measured p and T) has
+longitudinal modes 2.74 (open exit) and 3.14 (closed exit); a compact
+nozzle at M_e 0.38 lies between the two, and so does the measured 2.94. The
+hot-section transverse mode is 2.33. Mode not identified (issues.md C1).
+With it, Tmax rises above Tb in the holder's base recirculation: 1.046 Tb
+(4 cells, saturated) and 1.013 Tb (6 cells, t = 75) -- cause not isolated
+(C2).
 
 ## Not built
 
 Le ≠ 1 (`--lewis` unregistered until an oracle exists), curvilinear,
 compensated, RANS/LES species (asserted), nz > 1 (`--nz` must be 1), the
 low-Mach branch (`--physics incompressible` rejected), multi-step
-chemistry, dns-ui (its editor covers `flow` and `conv` only).
+chemistry, dns-ui (its editor covers `flow` and `conv` only). Chamber:
+isothermal (cooled) walls, a total-pressure inlet, non-premixed injection,
+a moving/2D-curved nozzle wall beyond the polygon, 3D.

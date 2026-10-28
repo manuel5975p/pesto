@@ -43,6 +43,7 @@
 #include "dns/gpu/runner_channel.hpp"
 #include "dns/gpu/runner_conv.hpp"
 #include "dns/gpu/runner_flame.hpp"
+#include "dns/gpu/runner_chamber.hpp"
 #include "dns/gpu/runner_rb.hpp"
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/runner_comp.hpp"
@@ -937,8 +938,77 @@ int runConv(const Case& c)
 
 // --- flame -----------------------------------------------------------------
 
+// --mode chamber (docs/chem.md, "Chamber"): the closed 2D combustion chamber.
+int runChamberCase(const Case& c)
+{
+    if (!haveGpu(c))
+        return die(exitNoGpu, "no GPU device (dns flame is GPU-only)");
+#if DNS_WITH_GPU
+    const auto& g = c.grid;
+    const ChamberSpec& s = c.chamber;
+    const double Tu = c.flameTu, sig = c.flameModel.sigma;
+    gpu::ChamberRun rr;
+    rr.regions = chamberRegions(g, s);
+    CompState host;
+    std::vector<double> rhoY;
+    const FlameEigen& tab = c.flameEig.tab;
+    chamberIC(g, rr.regions, kGammaAir, Tu, sig, c.chamberCoflow,
+              [&](double x) { return flameProfile(tab, x); }, s.xBase(), host,
+              rhoY);
+
+    FrameGeometry fg = FrameGeometry::centred(g, s.Hc);
+    fg.mask.resize(g.size());
+    for (std::size_t i = 0; i < g.size(); ++i)
+        fg.mask[i] = rr.regions[i] == std::uint8_t(ChamberRegion::Solid) ? 0.0f
+                                                                         : 1.0f;
+    auto out = RunOutput::make(
+        outputConfig(c, std::format("{{\"app\":\"dns\",\"flame\":\"chamber\","
+                                    "\"sigma\":{},\"beta\":{},\"Lambda\":{},"
+                                    "\"mach\":{},\"h\":{},\"xe\":{},"
+                                    "\"yc\":{},\"He\":{},\"Hc\":{}",
+                                    sig, c.flameModel.beta, c.flameEig.Lambda,
+                                    c.mach, c.h, s.xe(), s.yc, s.He, s.Hc)),
+        c.meta, g, std::move(fg));
+    if (!out) return die(exitOutput, out.error());
+
+    rr.tr = Transport::air(c.prandtl, Tu, c.tinfK, c.prandtl, kGammaAir,
+                           kRgasBox, c.sutherland);
+    rr.sp.nY = 1;
+    rr.sp.fuel = 0;
+    rr.sp.lnA = c.chamberReaction ? std::log(c.flameEig.Lambda)
+                                  : -std::numeric_limits<double>::infinity();
+    rr.sp.Ta = c.flameModel.theta() * Tu;
+    rr.sp.q = rr.tr.cp() * (sig - 1) * Tu;
+    rr.sp.invPr = 1.0 / c.prandtl;
+    rr.sp.openX = true;
+    rr.sp.yIn[0] = 0.0; // the ambient is inert
+    rr.Tu = Tu;
+    rr.sigma = sig;
+    rr.uCo = c.chamberCoflow;
+    rr.etaIn = c.nscbcEtaIn;
+    rr.thermalInflow = c.nscbcThermalInflow;
+    rr.sinkNb = c.nscbcSink;
+    rr.sinkAmp = c.nscbcSinkAmp;
+    rr.spec = s;
+    rr.mdot = c.chamberMdot;
+    rr.ramp = c.chamberRamp;
+    rr.reaction = c.chamberReaction;
+    rr.cfl = c.cfl;
+    rr.tEnd = c.tEnd;
+    rr.dtRecompute = c.dtRecompute;
+    rr.label = chamberRunLabel(c);
+
+    auto res = gpu::runChamber(g, host, rhoY, rr, *out);
+    if (!res) return die(res.error().code, res.error().message);
+    return reportDone(*res, *out);
+#else
+    return exitNoGpu;
+#endif
+}
+
 int runFlame(const Case& c)
 {
+    if (c.chamberMode) return runChamberCase(c);
     if (!haveGpu(c))
         return die(exitNoGpu, "no GPU device (dns flame is GPU-only)");
 #if DNS_WITH_GPU

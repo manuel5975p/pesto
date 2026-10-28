@@ -3,6 +3,7 @@
 // The ONLY way to obtain a Case is validate(); its constructor is private.
 #pragma once
 
+#include "dns/chamber.hpp"
 #include "dns/chem.hpp"
 #include "dns/grid.hpp"
 #include "dns/prop/spec.hpp"
@@ -22,6 +23,8 @@
 namespace dns {
 
 enum class Subcommand { Flow, Tgv, Hit, Bench, Channel, Conv, Prop, Flame };
+// `dns flame --mode` values (RawConfig::flameMode); 0 = premixed.
+inline constexpr int kFlameModeChamber = 1;
 enum class Physics { Incompressible, Compressible };
 enum class FarField { Tunnel, Fringe, Sponge, Nscbc, Periodic };
 enum class Backend { Cpu, Gpu, Auto };
@@ -264,12 +267,25 @@ struct RawConfig
     int sides = 0;          // 0 periodic lateral faces, 1 closed (--sides)
 
     // flame (premixed; docs/chem.md). Lengths in oracle thermal thicknesses.
-    int flameMode = 0;          // --mode; 0 premixed (the only one built)
+    int flameMode = 0;          // --mode; 0 premixed, kFlameModeChamber
     double expansion = 5.0;     // sigma = Tb / Tu
     double zeldovich = 8.0;     // beta
     double cellsPerDelta = 15;  // cells per oracle delta_th
     double upstream = 12, downstream = 10; // fresh / burnt extents
     double inflowSpeed = 1.0;   // inflow speed / S_L
+    // --mode chamber (docs/chem.md, "Chamber"); lengths in delta_th.
+    struct ChamberFlags
+    {
+        double injectSpeed = 3.0;  // fresh bulk speed past the injector / S_L
+        double coflow = 2.0;       // ambient coflow / S_L
+        double height = 15;        // inner chamber height
+        double length = 30;        // straight section length
+        double nozzleRatio = 3;    // Hc / He
+        double holder = 4;         // holder base height
+        double clearance = 10;     // ambient above and below the chamber
+        double ramp = 1;           // injection ramp, flame times
+        int reaction = 1;          // --reaction on|off
+    } chamber;
 
     // bench
     int steps = 20;
@@ -482,6 +498,12 @@ public:
     double flameUp = 0, flameDown = 0; // fresh / burnt extents, delta_th
     double flameXf0 = 0;        // initial flame position (mid temperature)
     double flameUIn = 1;        // inflow speed / S_L (the IC's mass flux)
+    // --mode chamber (dns/chamber.hpp): geometry in box units, the injected
+    // mass flux per unit depth (rho_u injectSpeed Hc), coflow, ramp.
+    bool chamberMode = false;
+    ChamberSpec chamber;
+    double chamberMdot = 0, chamberCoflow = 0, chamberRamp = 0;
+    bool chamberReaction = true;
 
     // prop: the resolved thrust-curve case (dns/prop/spec.hpp). Host-only --
     // `dns prop` never acquires a GPU.
@@ -531,6 +553,10 @@ std::string flowRunLabel(const Case& c);
 // central mass flux). The ONE text the dry-run, the progress line and the
 // manifest carry. Pre: c.sub == Flame.
 std::string flameRunLabel(const Case& c);
+
+// --mode chamber's label: flameRunLabel's model text plus the chamber's
+// immersed-wall and injector statement. Pre: c.chamberMode.
+std::string chamberRunLabel(const Case& c);
 
 // The finest cell spacing the run resolves: the focal plateau's when
 // focalActive, the grid's otherwise, both by the hMin rule (z excluded at

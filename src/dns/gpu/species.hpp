@@ -31,6 +31,7 @@ struct SpeciesView
     Real yIn[kMaxY] = {};
     const Real* Y[kMaxY] = {};  // the cell pass's Y_k = rhoY_k / rho
     const Real* omega = nullptr;
+    const std::uint8_t* solid = nullptr; // SpeciesSetup::solid
 };
 
 // The cell pass of state s: Y_k = rhoY_k / rho into Y[k], and
@@ -42,7 +43,9 @@ void cellPass(const GpuGrid& g, const DeviceCompState& s, const Real* T,
 // The species stage: out.y[k] = ca ya + cb yb + crAt(c) (-div F_k - delta_kF
 // omega), plus the heat release E += crAt(c) q omega on the SAME omega (fused
 // into this launch; nothing in between reads E). Run after kCompStage and
-// before the rhs hook. Plain (non-compensated) form only.
+// before the rhs hook. Plain (non-compensated) form only. sv.solid != null
+// selects the walled instantiation (SpeciesSetup::solid); null is the
+// original kernel.
 void stage(const GpuGrid& g, ViscView vv, PrimView q, const StageCombine& cmb,
            const SpeciesCombine& sc, const SpeciesView& sv,
            DeviceCompState& out);

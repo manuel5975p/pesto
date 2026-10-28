@@ -99,6 +99,8 @@ Specs: `docs/nscbc.md`, `docs/validation.md` (anchors), `docs/viewer-format.md`,
 - **Order inside the rhs hook: NSCBC → species re-carry → sink → species sink.** The re-carry must see the NSCBC density before the sink writes ρ. The species sink adds Y × the band's continuity term — D4 on ρY itself is unbounded on Y (measured 1 + 2e-5), do not bring it back.
 - **Mach inflation** is allowed for the non-dimensional model and is in the label (`flameRunLabel`). M 0.01 is the sweet spot: M 0.005 is FP32-contaminated (issues.md §31).
 - **S_L is measured on a SLIDING flame** (`--inflow-speed 0.98`, window [10, 20]): a stationary flame near |S_h − u_in| ≲ 1e-3 pins to the grid (issues.md §30).
+- **`--mode chamber`: species see an immersed wall only through `SpeciesSetup::solid`** — a separate `kSpeciesStage<true>` instantiation (null mask = the old kernel, byte-identical): zero species flux (convective AND diffusive) through every fluid/solid face, matching `applyRhs`'s impermeable mean-flow face; solid cells get no species rhs and no heat release, and keep ρY = 0 from the IC. The chamber runner puts `ghost.applyRhs` in its rhs hook (NSCBC → re-carry → sink → species sink → wall faces → injector).
+- **The chamber injector is a volumetric mass-flow source, never an NSCBC face**: the body stays (band + 4 δ_th) off every open face and the inert ambient keeps yIn = 0. It adds ρ, E = S cp Tu (enthalpy at rest), ρY = S, held for the whole step (RK3 adds exactly S dt). Quote chamber pressure ratios against the MEASURED pAmb (it sits 4.3% above p0, issues.md C3).
 
 ## DNS vs LES vs RANS labeling
 

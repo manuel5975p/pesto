@@ -936,6 +936,7 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
             sv.Y[k] = ycache_[k].data();
         }
         sv.omega = omega_.data();
+        sv.solid = sp_.solid;
         species::stage(g_, vv, q, cmb, *sc, sv, out);
     }
     if (rhsHook_) rhsHook_(s, out, cmb);
