@@ -1,0 +1,28 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      refineMeshDict;
+}
+
+set refineBox;
+
+coordinateSystem global;
+
+globalCoeffs
+{
+    tan1 (1 0 0);
+    tan2 (0 1 0);
+}
+
+directions
+(
+    tan1
+    tan2
+    normal
+);
+
+useHexTopology  true;
+geometricCut    false;
+writeMesh       false;

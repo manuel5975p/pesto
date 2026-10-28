@@ -1,0 +1,26 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  dns test-mesh generation (tools/mesh/make_test_meshes.sh). Mesh tools only.
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+
+application     blockMesh;
+startFrom       latestTime;
+startTime       0;
+stopAt          endTime;
+endTime         1;
+deltaT          1;
+writeControl    timeStep;
+writeInterval   1;
+purgeWrite      0;
+writeFormat     ascii;
+writePrecision  15;
+writeCompression off;
+timeFormat      general;
+timePrecision   6;
+runTimeModifiable false;

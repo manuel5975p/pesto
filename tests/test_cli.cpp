@@ -2,6 +2,7 @@
 // masterplan_recompose, plus the rejection cases the old parsers silently
 // swallowed (unknown flags became the grid size; atof garbage became a default).
 #include "dns/config.hpp"
+#include "dns/facemesh.hpp"
 #include "check.hpp"
 #include "cli_test_util.hpp"
 
@@ -436,6 +437,23 @@ int main()
         check(smagWarns("flow --physics compressible --body none --n 128 "
                         "--nz 64 --les 0.17") == 0,
               "body-free smag LES does not warn");
+    }
+
+    // dns mesh (docs/mesh.md): host-only, --polymesh required (a CLI error,
+    // exit 1), --order spelled by cellOrderNames(); no grid/run/output flags.
+    {
+        auto c = runCli(split("mesh --polymesh /some/constant/polyMesh"));
+        check(c && c->sub == dns::Subcommand::Mesh && c->polyMeshDir == "/some/constant/polyMesh"
+                  && c->meshOrder == int(dns::CellOrder::Morton),
+              "mesh: --polymesh resolves, order defaults to morton");
+        auto o = runCli(split("mesh --polymesh d --order colour"));
+        check(o && o->meshOrder == int(dns::CellOrder::ColourMajor), "mesh: --order colour");
+        auto s = runCli(split("mesh --polymesh d --order source --dry-run"));
+        check(s && s->meshOrder == int(dns::CellOrder::Source) && s->dryRun, "mesh: --order source --dry-run");
+        rejected({"mesh"}, 1, "mesh without --polymesh is a CLI error");
+        rejected({"mesh", "--polymesh", "d", "--order", "hilbert"}, 1, "mesh: unknown --order value");
+        for (const char* f : {"--n", "--out", "--backend", "--seed", "--emit", "--re"})
+            rejected({"mesh", "--polymesh", "d", f, "1"}, 1, std::string("mesh rejects ") + f);
     }
 
     if (dnstest::gFailures == 0) std::printf("cli: ok\n");

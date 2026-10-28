@@ -1,0 +1,78 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  box_cyclic: 4 x 3 x 2 hexes on 1 x 0.75 x 0.5 (h = 0.25 exactly).
+  x and z cyclic (translational), y walls. tests/data/mesh/box_cyclic.
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      blockMeshDict;
+}
+
+scale 1;
+
+vertices
+(
+    (0 0    0)
+    (1 0    0)
+    (1 0.75 0)
+    (0 0.75 0)
+    (0 0    0.5)
+    (1 0    0.5)
+    (1 0.75 0.5)
+    (0 0.75 0.5)
+);
+
+blocks
+(
+    hex (0 1 2 3 4 5 6 7) (4 3 2) simpleGrading (1 1 1)
+);
+
+edges ();
+
+boundary
+(
+    xlo
+    {
+        type cyclic;
+        neighbourPatch xhi;
+        transform translational;
+        separationVector (1 0 0);
+        faces ((0 4 7 3));
+    }
+    xhi
+    {
+        type cyclic;
+        neighbourPatch xlo;
+        transform translational;
+        separationVector (-1 0 0);
+        faces ((1 2 6 5));
+    }
+    ylo
+    {
+        type wall;
+        faces ((0 1 5 4));
+    }
+    yhi
+    {
+        type wall;
+        faces ((3 7 6 2));
+    }
+    zlo
+    {
+        type cyclic;
+        neighbourPatch zhi;
+        transform translational;
+        separationVector (0 0 0.5);
+        faces ((0 3 2 1));
+    }
+    zhi
+    {
+        type cyclic;
+        neighbourPatch zlo;
+        transform translational;
+        separationVector (0 0 -0.5);
+        faces ((4 5 6 7));
+    }
+);

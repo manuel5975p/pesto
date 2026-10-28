@@ -15,6 +15,7 @@
 #include "dns/flow_ic.hpp"
 #include "dns/framemap.hpp"
 #include "dns/diagnostics.hpp"
+#include "dns/facemesh.hpp"
 #include "dns/geometry.hpp"
 #include "dns/hit_ic.hpp"
 #include "dns/interrupt.hpp"
@@ -1655,6 +1656,47 @@ int runProp(const Case& cs)
     return 0;
 }
 
+// --- mesh --------------------------------------------------------------------
+
+// --dry-run: the manifest only (owner note, boundary, zone names); no bulk
+// data. A mesh that cannot be read is an input error (3).
+int runMeshManifest(const Case& cs)
+{
+    auto m = readPolyManifest(cs.polyMeshDir);
+    if (!m) return die(exitInput, m.error());
+    std::string s = std::format("manifest:\n"
+                                "  format     {}, label {}, scalar 64\n"
+                                "  counts     {} points, {} cells, {} faces ({} internal)\n",
+                                m->binary ? "binary" : "ascii", m->labelBits, m->nPoints, m->nCells,
+                                m->nFaces, m->nInternalFaces);
+    for (const auto& p : m->patches)
+    {
+        s += std::format("  patch      {:<24} {:<14} {:>9} faces", p.name, foamPatchTypeName(p.type),
+                         p.nFaces);
+        if (p.type == FoamPatchType::Cyclic)
+            s += " <-> " + p.neighbourPatch
+                 + (p.separation ? std::format(" (translational {} {} {})", (*p.separation)[0],
+                                               (*p.separation)[1], (*p.separation)[2])
+                                 : std::string(" (transform unknown)"));
+        s += "\n";
+    }
+    for (const auto& z : m->cellZones) s += "  cellZone   " + z + "\n";
+    std::fputs(s.c_str(), stdout);
+    return 0;
+}
+
+// Host-only: Acquire = read the polyMesh and build the FaceMesh (exit 3 on
+// any rejection), Run = the quality report. Never probes a GPU.
+int runMesh(const Case& cs)
+{
+    auto pm = readPolyMesh(cs.polyMeshDir);
+    if (!pm) return die(exitInput, pm.error());
+    auto fm = FaceMesh::fromPolyMesh(*pm, CellOrder(cs.meshOrder));
+    if (!fm) return die(exitInput, cs.polyMeshDir + ": " + fm.error());
+    std::fputs(meshReport(*fm, meshQuality(*fm, *pm)).c_str(), stdout);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1740,6 +1782,9 @@ int main(int argc, char** argv)
     {
         std::fputs(c->describe().c_str(), stdout);
         if (scene) std::fputs(scene->describe().c_str(), stdout);
+        // Phase 1.5 for `dns mesh` (the --scene precedent): the manifest
+        // names the input file's facts, read without bulk data.
+        if (c->sub == Subcommand::Mesh) return runMeshManifest(*c);
         return 0;
     }
 
@@ -1764,6 +1809,7 @@ int main(int argc, char** argv)
     case Subcommand::Conv: return runConv(*c);
     case Subcommand::Prop: return runProp(*c);
     case Subcommand::Flame: return runFlame(*c);
+    case Subcommand::Mesh: return runMesh(*c);
     }
     return 1;
 }

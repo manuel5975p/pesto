@@ -24,7 +24,7 @@
 
 namespace dns {
 
-enum class Subcommand { Flow, Tgv, Hit, Bench, Channel, Conv, Prop, Flame };
+enum class Subcommand { Flow, Tgv, Hit, Bench, Channel, Conv, Prop, Flame, Mesh };
 // `dns flame --mode` values (RawConfig::flameMode); 0 premixed, 1 bunsen,
 // 2 diffusion, 3 candle.
 inline constexpr int kFlameModeChamber = 4;
@@ -344,6 +344,10 @@ struct RawConfig
            stallVisc = 2.0;
     int liftHub = 0, wakePitch = 0;   // prop::HubModel, prop::WakePitch
     bool selftest = false;
+
+    // mesh (host-only FaceMesh report; docs/mesh.md)
+    std::string polymesh;        // --polymesh DIR (a constant/polyMesh directory)
+    int meshOrder = 1;           // --order: CellOrder index (0 source, 1 morton, 2 colour)
 };
 
 // Fully resolved case. Every derived quantity is computed here, so downstream
@@ -585,6 +589,11 @@ public:
     // prop: the resolved thrust-curve case (dns/prop/spec.hpp). Host-only --
     // `dns prop` never acquires a GPU.
     prop::Case prop;
+
+    // mesh: the polyMesh directory and the CellOrder index. Host-only --
+    // `dns mesh` reads the mesh in phase 3 and never acquires a GPU.
+    std::string polyMeshDir;
+    int meshOrder = 1;
 
     std::string outPrefix;
     std::set<Emit> emit;

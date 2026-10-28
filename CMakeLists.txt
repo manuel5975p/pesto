@@ -46,6 +46,7 @@ add_library(dns_core
     src/dns/framemap.cpp
     src/dns/cutcell.cpp
     src/dns/diagnostics.cpp
+    src/dns/facemesh.cpp
     src/dns/fieldpng.cpp
     src/dns/flame1d.cpp
     src/dns/flow_ic.cpp
@@ -55,10 +56,12 @@ add_library(dns_core
     src/dns/comp.cpp
     src/dns/curvmesh.cpp
     src/dns/interrupt.cpp
+    src/dns/la/graph.cpp
     src/dns/meshio.cpp
     src/dns/meshsdf.cpp
     src/dns/ogrid.cpp
     src/dns/poisson.cpp
+    src/dns/polymesh.cpp
     src/dns/prop/spec.cpp
     src/dns/pseudo_time.cpp
     src/dns/rans_channel1d.cpp
@@ -405,7 +408,8 @@ if(BUILD_TESTING)
         fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport
         rotor focal cli_defaults comp_axis_permute rans rans_channel1d
         steady_stop blockband channel_line pseudo_time flow_rans_config precond
-        host_threads flame1d flame_config bunsen diffusion candle chamber_config)
+        host_threads flame1d flame_config bunsen diffusion candle chamber_config
+        polymesh facemesh)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)
     endif()
@@ -421,6 +425,19 @@ if(BUILD_TESTING)
     # The Cantera reference of the chemistry oracle (tools/chem/cantera_flame.py).
     target_compile_definitions(test_flame1d PRIVATE
         DNS_CHEM_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/chem")
+    # FaceMesh (docs/mesh.md): the checked-in polyMesh fixtures and their
+    # checkMesh logs (tools/mesh/make_test_meshes.sh). facemesh_mb is the
+    # 831k-cell snappy mesh, LOCAL only (runs/ is git-ignored): rc 77 when
+    # absent.
+    set(DNS_MESH_DATA ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/mesh)
+    foreach(t polymesh facemesh)
+        target_compile_definitions(test_${t} PRIVATE DNS_MESH_DATA="${DNS_MESH_DATA}")
+    endforeach()
+    target_compile_definitions(test_facemesh PRIVATE
+        DNS_LOCAL_MESH_MB="${CMAKE_SOURCE_DIR}/runs/foam_mesh/mB")
+    add_test(NAME facemesh_mb COMMAND test_facemesh mb)
+    set_tests_properties(facemesh_mb PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    set_tests_properties(polymesh PROPERTIES TIMEOUT 60)
 
     # Job server: pure parts (sha256, json, spec, admission) and a live run of
     # the real simjobd + simjob binaries (skips without a systemd user session).
@@ -443,7 +460,8 @@ if(BUILD_TESTING)
     # case is reachable in phases 1-3a.
     add_executable(test_errors tests/test_errors.cpp)
     target_link_libraries(test_errors PRIVATE dns_core)
-    target_compile_definitions(test_errors PRIVATE DNS_BIN="$<TARGET_FILE:dns>")
+    target_compile_definitions(test_errors PRIVATE DNS_BIN="$<TARGET_FILE:dns>"
+                               DNS_MESH_DATA="${DNS_MESH_DATA}")
     add_dependencies(test_errors dns)
     add_test(NAME errors COMMAND test_errors)
     set_tests_properties(errors PROPERTIES TIMEOUT 120)

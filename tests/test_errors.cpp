@@ -29,6 +29,9 @@
 #ifndef DNS_BIN
 #error "DNS_BIN must be defined (path to the dns binary)"
 #endif
+#ifndef DNS_MESH_DATA
+#error "DNS_MESH_DATA must point at tests/data/mesh"
+#endif
 
 namespace {
 
@@ -207,6 +210,36 @@ int main()
         expect("flow --body " + tmp.string() + " --n 32 --nz 32", 3,
                "a binary STL with a NaN vertex");
         std::filesystem::remove(tmp);
+    }
+
+    // --- dns mesh (host-only; docs/mesh.md) ---------------------------------
+    {
+        const std::string box = std::string(DNS_MESH_DATA) + "/box_cyclic/constant/polyMesh";
+        expect("mesh --help", 0, "mesh --help");
+        expect("mesh", 1, "mesh without --polymesh");
+        expect("mesh --polymesh " + box + " --bogus", 1, "mesh: unknown option");
+        expect("mesh --polymesh " + box + " --order zigzag", 1, "mesh: unknown --order");
+        expect("mesh --polymesh /nonexistent/constant/polyMesh", 3, "mesh: no such directory");
+        expect("mesh --polymesh /nonexistent/constant/polyMesh --dry-run", 3,
+               "mesh --dry-run reads the manifest: missing is exit 3");
+        expect("mesh --polymesh " + std::string(DNS_MESH_DATA) + "/box_cyclic", 3,
+               "mesh: a case dir, not constant/polyMesh");
+        expect("mesh --polymesh " + box, 0, "mesh: the box reports");
+        expect("mesh --polymesh " + box + " --order colour", 0, "mesh: --order colour");
+        // --dry-run prints the manifest (counts, patches) without bulk data.
+        const std::string cmd = "\"" DNS_BIN "\" mesh --polymesh " + box + " --dry-run 2>&1";
+        std::string out;
+        if (FILE* p = popen(cmd.c_str(), "r"))
+        {
+            char buf[512];
+            while (std::fgets(buf, sizeof buf, p)) out += buf;
+            pclose(p);
+        }
+        const bool ok = out.find("manifest:") != std::string::npos
+                        && out.find("60 points, 24 cells, 98 faces (46 internal)") != std::string::npos
+                        && out.find("xlo") != std::string::npos;
+        std::printf("%-56s %s\n", "mesh --dry-run prints the manifest", ok ? "ok" : "FAIL");
+        if (!ok) ++dnstest::gFailures;
     }
 
     // --- 4: output ----------------------------------------------------------

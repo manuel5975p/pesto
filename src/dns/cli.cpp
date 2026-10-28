@@ -1,4 +1,5 @@
 #include "dns/cli.hpp"
+#include "dns/facemesh.hpp"
 #include "dns/numparse.hpp"
 #include "dns/rans_label.hpp"
 
@@ -150,16 +151,20 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                            c.profileDt = 0.0; break;
     // Air at 15 C.
     case Subcommand::Prop: c.nu = 1.5e-5; break;
+    case Subcommand::Mesh: break;
     // The P1 flame: M 0.01 (inflated; docs/chem.md), 10 flame times.
     case Subcommand::Flame: c.ny = 4; c.physics = Physics::Compressible;
                             c.mach = 0.01; c.cfl = 0.4; c.tt = 10;
                             c.profileDt = 0.0; break;
     }
 
-    // Numeric / string options valid in this subcommand. prop is host-only
-    // and has no grid, so it takes none of the grid/run-length/seed flags.
-    std::vector<Opt> opts{{"--out", &c.out}};
-    if (c.sub != Subcommand::Prop)
+    // Numeric / string options valid in this subcommand. prop and mesh are
+    // host-only and have no grid, so they take none of the grid/run-length/
+    // seed flags; mesh writes nothing, so it has no --out either.
+    const bool hostOnly = c.sub == Subcommand::Prop || c.sub == Subcommand::Mesh;
+    std::vector<Opt> opts;
+    if (c.sub != Subcommand::Mesh) opts.push_back({"--out", &c.out});
+    if (!hostOnly)
         opts.insert(opts.end(), {{"--n", &c.n},
                                  {"--nz", &c.nz},
                                  {"--re", &c.re},
@@ -281,13 +286,14 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--align-iters", &c.alignIters}, {"--align-tol", &c.alignTol},
              {"--seg-deg", &c.segDeg}, {"--core", &c.core},
              {"--stall-visc", &c.stallVisc}});
+    if (c.sub == Subcommand::Mesh) add({{"--polymesh", &c.polymesh}});
 
     int physicsSel = int(c.physics), farSel = int(c.far), backendSel = int(c.backend),
         sgsSel = int(c.sgs);
     int abcSel = int(c.nscbcAbc);
     std::vector<EnumOpt> enums;
-    // prop never touches a GPU, so it has no backend to choose.
-    if (c.sub != Subcommand::Prop)
+    // prop and mesh never touch a GPU, so they have no backend to choose.
+    if (!hostOnly)
         enums.push_back({"--backend", {{"cpu", int(Backend::Cpu)}, {"gpu", int(Backend::Gpu)},
                                        {"auto", int(Backend::Auto)}}, &backendSel});
     if (c.sub == Subcommand::Prop)
@@ -296,6 +302,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         enums.push_back({"--hub", enumValues(prop::hubModelNames()), &c.liftHub});
         enums.push_back({"--wake-pitch", enumValues(prop::wakePitchNames()), &c.wakePitch});
     }
+    if (c.sub == Subcommand::Mesh)
+        enums.push_back({"--order", enumValues(cellOrderNames()), &c.meshOrder});
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench
         || c.sub == Subcommand::Conv || c.sub == Subcommand::Flame)
         enums.push_back({"--physics", enumValues(physicsNames()), &physicsSel});
@@ -374,7 +382,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     for (const auto& o : opts) known.emplace_back(o.name);
     for (const auto& e : enums) known.emplace_back(e.name);
     for (const auto& f : flags) known.emplace_back(f.first);
-    if (c.sub != Subcommand::Prop) known.emplace_back("--emit");
+    if (!hostOnly) known.emplace_back("--emit");
     known.emplace_back("--help");
 
     auto err = [&](const string& m) {
@@ -391,7 +399,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         auto fl = std::ranges::find_if(flags, [&](auto& p) { return s == p.first; });
         if (fl != flags.end()) { *fl->second = true; c.given.insert(string(s)); continue; }
 
-        if (s == "--emit" && c.sub != Subcommand::Prop)
+        if (s == "--emit" && !hostOnly)
         {
             if (a + 1 >= argc) return err("option '--emit' requires a value");
             bool ok = false;
@@ -461,8 +469,10 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     c.far = FarField(farSel);
     c.sgs = SgsModel(sgsSel);
     c.nscbcAbc = NscbcAbc(abcSel);
-    // prop's --out is an optional CSV path: absent = no file.
-    if (!c.given.contains("--out") && c.sub != Subcommand::Prop) c.out = string(sub);
+    // prop's --out is an optional CSV path: absent = no file. mesh has none.
+    if (!c.given.contains("--out") && !hostOnly) c.out = string(sub);
+    if (c.sub == Subcommand::Mesh && c.polymesh.empty())
+        return err("dns mesh requires --polymesh DIR (a constant/polyMesh directory)");
     return c;
 }
 
@@ -561,8 +571,11 @@ subcommands:
   flame   single-step flames: 1D premixed, 2D slot Bunsen, 2D jet diffusion
   bench   step-time and throughput benchmark
   prop    propeller thrust curve by BEMT or lifting line (host-only, no GPU)
+  mesh    read an OpenFOAM polyMesh into a FaceMesh, report its quality
+          (host-only, no GPU)
 
-common options (every subcommand; prop takes no --backend/--seed):
+common options (every subcommand; prop and mesh take no --backend/--seed,
+mesh no --out):
   --backend cpu|gpu|auto   compute backend                        [auto]
   --out PREFIX             output file/dir prefix           [<subcommand>]
   --seed N                 RNG seed for any stochastic input          [1]
@@ -1767,6 +1780,38 @@ OUTPUT
   --dump-span J      also print the spanwise solution at this J
   --quiet            no table on stdout (warnings still on stderr)
   --dry-run          validate, print the resolved case; reads no file
+)";
+    case Subcommand::Mesh:
+        return
+R"(dns mesh — read an OpenFOAM polyMesh into a FaceMesh and report it
+
+Host-only (never acquires a GPU, writes nothing). The FaceMesh is the one
+finite-volume mesh of the FV path (docs/mesh.md): geometry by OpenFOAM
+v2606's own definition, cyclic pairs merged into internal faces, `empty`
+one-cell extrusions as the 2D restriction. Accepted: what blockMesh,
+snappyHexMesh, extrudeMesh, refineMesh, foamFormatConvert and plot3dToFoam
+write (ASCII or binary, label 32/64, scalar 64; patches wall, patch,
+symmetry, symmetryPlane, empty, cyclic translational). Rejected by name:
+*.gz, processor patches (decomposed), cyclicAMI/ACMI, nonConformal, mapped,
+cyclic rotational, wedge (not built yet), #include.
+
+usage: dns mesh --polymesh DIR [--order source|morton|colour] [--dry-run]
+
+  --polymesh DIR     a constant/polyMesh directory                 (required)
+  --order KIND       cell numbering: source (polyMesh order), morton
+                     (Z-order of the cell centres), colour (greedy colours
+                     of the Morton graph, colour-major)              [morton]
+  --dry-run          read the manifest only (counts, patches, zones,
+                     format): no points, no faces
+  --quiet            accepted; the report is the output
+
+REPORT
+  counts and dimension, patches, cell zones, volume min/max/total,
+  non-orthogonality max/average, skewness and aspect ratio max (checkMesh's
+  definitions), the CFL width dim V / sum|S| (min, p1, median, max), the
+  max adjacent volume ratio (warns above 1.25), faces-per-cell and
+  nodes-per-face histograms, and the colour count.
+  Exit codes: 0 ok, 1 CLI, 3 mesh input (unreadable, rejected, invalid).
 )";
     }
     return {};

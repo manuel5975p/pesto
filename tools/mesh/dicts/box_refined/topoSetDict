@@ -1,0 +1,20 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      topoSetDict;
+}
+
+// An interior block of 2 x 2 x 2 coarse cells, off-centre, away from every
+// cyclic face: refinement never touches a coupled boundary.
+actions
+(
+    {
+        name    refineBox;
+        type    cellSet;
+        action  new;
+        source  boxToCell;
+        box     (0.3 0.2 0.15) (0.6 0.45 0.35);
+    }
+);

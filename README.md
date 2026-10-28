@@ -69,9 +69,10 @@ DNS 13.6 ms/step (1234 Mcell/s), Smagorinsky 15.6, σ 16.0, 1.46 GiB.
 | `flame` | single-step flames: premixed against its FP64 oracle (1D, or a 2D slot Bunsen cone, `--mode bunsen`); a 2D slot-jet diffusion flame, F + s O → P, against the Burke–Schumann sheet (`--mode diffusion`); the same flame under gravity from a wick, a 2D candle (`--mode candle`); a closed 2D combustion chamber with a nozzle jet (`--mode chamber`) | `docs/chem.md` |
 | `bench` | step time, Mcell/s and the VRAM this process allocates | `dns bench --help` |
 | `prop` | propeller thrust curve by BEMT or lifting line, host-only | below |
+| `mesh` | read an OpenFOAM polyMesh into a FaceMesh, report counts and checkMesh-equivalent quality, host-only | `docs/mesh.md` |
 
-Common to all: `--out`, `--quiet`, `--dry-run`, `--help`, and (except `prop`)
-`--backend`, `--seed`. `--config FILE.toml` supplies any flag from a TOML file
+Common to all: `--quiet`, `--dry-run`, `--help`, `--out` (except `mesh`), and
+(except `prop`, `mesh`) `--backend`, `--seed`. `--config FILE.toml` supplies any flag from a TOML file
 (`n = 512` is `--n 512`); explicit CLI flags override it.
 
 Parsing is strict: an unknown flag, a missing or non-numeric value, or a flag
@@ -141,7 +142,8 @@ numbers: `docs/scenarios.md`. TOML run configs: `examples/configs/`.
 
 ```
 cli/config (parse + validate, pure)  [+ dns/scene, dns/remap, dns/sgs, dns/rans]
-  → bodies/geometry (sdf + cut sampling)  [+ dns/curvmesh, dns/framemap, dns/walldist]
+  → bodies/geometry (sdf + cut sampling)  [+ dns/curvmesh, dns/framemap, dns/walldist,
+                                           dns/polymesh, dns/facemesh, dns/la/graph]
     → gpu/{tunnel,bodyforce,les,rans,cutpoisson,cutflux,derived,comp_channel,comp_conv,boussinesq}
       → gpu/runner_{incomp,comp,channel,conv,rb,ogrid}   (the time loops)
         → output (RunOutput, the one artefact sink)
@@ -384,6 +386,23 @@ condition: `--far`, every `--nscbc-*`, `--pot`, `--focal`, `--stretch`,
 `--open`, `--kick` and friends are rejected. Measured Re 100 / Re 40:
 `docs/validation.md` "O-grid cylinder".
 
+**FaceMesh** (`src/dns/{polymesh,facemesh}.*`, `src/dns/la/graph.*`,
+`docs/mesh.md`; masterplan_meshsolver phase 1, host only — no solver runs on
+it yet): the one face-based mesh of the coming FV path. Built from an
+OpenFOAM polyMesh (`readPolyMesh`: ASCII/binary, label 32/64; snappy,
+blockMesh, extrudeMesh, refineMesh output; everything else rejected by name)
+or from any structured `CurvMesh` (`fromCurvMesh` writes a PolyMesh and
+routes through the same builder). Geometry is OpenFOAM v2606's own
+definition: the checked-in snappy cylinder and the 831k-cell DTMB `mB` mesh
+reproduce checkMesh's volume, non-orthogonality, skewness and aspect ratio
+to every printed digit (`test_facemesh`); the uniform box is exact, the 2D
+O-grid matches `CurvMetrics` to 4e-16 (S) / 2.4e-15 (V). Cyclic pairs merge
+into internal faces, `empty` one-cell extrusions are the 2D restriction
+(S_e, d_e exactly 0), cells in Source / Morton / colour-major order with
+bitwise-identical geometry, threaded and byte-identical at any thread count.
+`la::CellGraph` is the matrix pattern with per-face slots. `dns mesh
+--polymesh DIR` prints the report (mB: 0.7 s).
+
 ## Rotors (`dns flow --rotor-mach`)
 
 `--rotor-mach M` spins the immersed body about a shaft through the placement
@@ -589,6 +608,7 @@ Tiers, labels, tolerances, the quarantine and anchor regeneration:
 | `docs/ui.md` | `dns-ui`: editor, run cockpit, live viewer |
 | `docs/viewer-format.md` | web frame format, run `.json`, `_surface.csv`, `--emit mesh` |
 | `docs/jobs.md` | `simjobd` / `simjob`: the job server every GPU/CPU run goes through |
+| `docs/mesh.md` | FaceMesh: the polyMesh subset accepted and rejected, the geometry definition, cyclic/2D/ordering rules, `CellGraph`, `dns mesh`, test meshes |
 | `docs/chem.md` | `dns flame`: model C0, the phase-plane oracle vs Cantera, species scheme, hook order, measured S_L; the 2D slot Bunsen (per-row inflow, pilot anchoring, measured cone); the slot-jet diffusion flame; the 2D candle (gravity, hydrostatic NSCBC, height vs fuel flow); the `--mode chamber` combustion chamber and its balances |
 | `src/compat/cuda/README.md` | the CUDA header shim |
 | `docs/archive/` | historical plans and analyses |

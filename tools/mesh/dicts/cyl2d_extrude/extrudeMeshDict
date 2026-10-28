@@ -1,0 +1,23 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      extrudeMeshDict;
+}
+
+// One layer of unit depth from the snapped zhi plane: the 2D mesh.
+constructFrom   patch;
+sourceCase      "../snappy";
+sourcePatches   (zhi);
+exposedPatchName zlo;
+flipNormals     false;
+extrudeModel    linearNormal;
+nLayers         1;
+expansionRatio  1.0;
+linearNormalCoeffs
+{
+    thickness   1;
+}
+mergeFaces      false;
+mergeTol        0;

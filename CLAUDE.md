@@ -1,15 +1,15 @@
 # dns — working notes
 
 Reference: **README.md** (overview, solvers, BCs, walls, meshes, rotors); flags: `dns <sub> --help`. Design history: `docs/archive/`.
-Specs: `docs/nscbc.md`, `docs/validation.md` (anchors), `docs/viewer-format.md`, `docs/channel.md`, `docs/scene.md`, `docs/rans.md`, `docs/ui.md`, `docs/scenarios.md`, `docs/chem.md`.
+Specs: `docs/nscbc.md`, `docs/validation.md` (anchors), `docs/viewer-format.md`, `docs/channel.md`, `docs/scene.md`, `docs/rans.md`, `docs/ui.md`, `docs/scenarios.md`, `docs/chem.md`, `docs/mesh.md`.
 **Open issues: `issues.md`** — what is broken, unproven or undecided at this commit. Read it before starting work; update it in the same commit that fixes, finds or defers an issue. This file stays the stable invariants.
 
 ## Ground rules
 
-- ONE solver binary: `build/dns <flow|tgv|hit|channel|conv|flame|bench|prop>`. `dns --help` / `dns <sub> --help` are authoritative — read them, don't guess flags.
+- ONE solver binary: `build/dns <flow|tgv|hit|channel|conv|flame|bench|prop|mesh>`. `dns --help` / `dns <sub> --help` are authoritative — read them, don't guess flags.
 - `dns-ui` (scene editor, run cockpit, live viewer) links `dns_core` ONLY — never `dns_gpu`, never a solver. It RUNS a case by spawning `dns` and WATCHES it by mapping the run's shared-memory segment. `docs/ui.md`.
 - Live results are shared memory: `--emit shm` (`src/dns/shmframes.hpp`) publishes planes, mask, 3D volumes under a SEQLOCK (writer bumps odd, copies, bumps even; reader copies between two equal even reads, discards a torn one). The solver NEVER blocks on a viewer. Volumes capped at 512 MB, else planes only.
-- `--dry-run` validates + prints the resolved case (and DNS/LES label), no GPU or filesystem. Use it before every real run.
+- `--dry-run` validates + prints the resolved case (and DNS/LES label), no GPU or filesystem (exception: `--scene` and `dns mesh` read their input file's header facts in phase 1.5). Use it before every real run.
 - Parsing is strict: unknown/missing/non-numeric flag = hard error. Exit codes: 0 ok, 1 CLI, 2 config, 3 input, 4 output, 5 no GPU, 6 resource, 7 numerical, 8 non-convergence, 77 skipped.
 - `main` = Parse → Validate → Acquire → Run. Phases 1-2 touch neither filesystem nor GPU; phase 3 creates every output before the first `hipMalloc`.
 - `std::expected` for anything a USER can cause; `assert` only for what a PROGRAMMER can cause (only if the validator makes it unreachable). Release is the build that runs — never assert-as-input-guard.
@@ -22,7 +22,7 @@ Specs: `docs/nscbc.md`, `docs/validation.md` (anchors), `docs/viewer-format.md`,
 
 ## Layering
 
-`cli/config` (pure parse+validate; also `dns/scene`, `dns/remap`, `dns/sgs`, `dns/rans`) → `bodies/geometry` (sdf + cut sampling; also `dns/curvmesh`, `dns/framemap`, `dns/walldist`, FP64 oracle `dns/rans_channel1d`, implicit host line `dns/channel_line` + `dns/blockband` + `dns/pseudo_time` — header is constants/declarations only, so config may read its cap) → `gpu/{tunnel,bodyforce,les,rans,cutpoisson,cutflux,derived,comp_channel,comp_conv}` → `gpu/runner_{incomp,comp,channel,conv}` → `output` (RunOutput, the one artefact sink). Preserve it; validated physics constants live at their definitions with the measured bracket.
+`cli/config` (pure parse+validate; also `dns/scene`, `dns/remap`, `dns/sgs`, `dns/rans`) → `bodies/geometry` (sdf + cut sampling; also `dns/curvmesh`, `dns/framemap`, `dns/walldist`, the FV mesh `dns/polymesh` + `dns/facemesh` + `dns/la/graph`, FP64 oracle `dns/rans_channel1d`, implicit host line `dns/channel_line` + `dns/blockband` + `dns/pseudo_time` — header is constants/declarations only, so config may read its cap) → `gpu/{tunnel,bodyforce,les,rans,cutpoisson,cutflux,derived,comp_channel,comp_conv}` → `gpu/runner_{incomp,comp,channel,conv}` → `output` (RunOutput, the one artefact sink). Preserve it; validated physics constants live at their definitions with the measured bracket.
 
 ## Invariants you must not break
 
@@ -45,6 +45,16 @@ Specs: `docs/nscbc.md`, `docs/validation.md` (anchors), `docs/viewer-format.md`,
 - **The editor covers `dns flow` and `dns conv`, both physics of each.** `DocState::sub` picks the subcommand; panels gate wholesale on it. Conv's SI face: height + temperature drop + material → Ra DERIVED (as size + freestream → Re). `dns-ui --check` has a COMMAND ROUND-TRIP GATE: exported argv → real `cli::parse` + `validate` must reproduce the document's case at the printed 4-significant-digit precision.
 - The self-check owns `/dev/shm/dns_uicheck*`, clears them at BOTH ends, asserts nothing outlived it (a leak fails the NEXT `--check`). A stop before a run reaches its time loop is still not clean — `docs/ui.md`.
 - **The editor owns no physics.** It CALLS `dns::sceneObjectBox`, `sceneBoxInside`, `needs3d`, `validSceneName`, `defaultSceneName`, `checkSceneNames` (`dns/scene.*`; `parseScene`/`buildSceneGeometry` route through them). Never restate a rule in `src/ui/` — move it, refactor the core caller onto it in the same commit. The editor's scene IS `parseScene(sceneToml())`.
+
+## FaceMesh — the FV path's mesh (`docs/mesh.md`, masterplan_meshsolver)
+
+- **ONE face-based mesh type, ONE geometry definition: OpenFOAM v2606's** (`makeFaceCentresAndAreas` fan, `makeCellCentresAndVols` pyramids, same operand order, FP64). `fromCurvMesh` writes a PolyMesh (`polyOf`) and routes through `fromPolyMesh` — never a second geometry code. Warped hexes: V differs from `CurvMetrics::vol` at warp order, stated, not "fixed". Pinned to checkMesh's printed digits (`test_facemesh` F1, local F8 on `mB`).
+- **The reader accepts exactly what the OpenFOAM mesh tools write; everything else is REJECTED BY NAME** (`*.gz`, `processor`, AMI/ACMI, nonConformal, mapped, rotational cyclic, `#include`). Never "best-effort" a mesh.
+- **2D is a one-cell-thick `empty` extrusion, not a code path**: every non-empty face's emptyAxis component of S and d is set EXACTLY 0 after `|S·e| ≤ 1e-12|S|` is verified.
+- **Cyclic pairs are internal faces**; the lower source cell's side keeps S, Cf, srcFace; `d = (C_b + (Cf_a − Cf_b)) − C_a`.
+- **Geometry is computed once in SOURCE numbering; orderings permute and re-orient (an own/nei swap negates S and d exactly)**: bitwise invariant under Source/Morton/ColourMajor. Internal faces sorted (own, nei, srcFace), CSR cell→faces ascending: the deterministic gather order. `CellGraph` slots: scatter in face order, no FP atomics.
+- **Threaded host build is byte-identical at any thread count** (`forBlocks`, own-index writes, lowest block's first error; `test_facemesh` F5).
+- `dns mesh` is host-only (`dns prop` precedent): no `--out`/`--backend`/`--seed`; `--dry-run` reads the manifest only.
 
 ## Temperature (compressible)
 

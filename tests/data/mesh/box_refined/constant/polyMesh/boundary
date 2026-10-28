@@ -1,0 +1,89 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2606                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    arch        "LSB;label=32;scalar=64";
+    class       polyBoundaryMesh;
+    location    "constant/polyMesh";
+    object      boundary;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+6
+(
+    xlo
+    {
+        type            cyclic;
+        inGroups        1(cyclic);
+        nFaces          24;
+        startFace       772;
+        matchTolerance  0.0001;
+        transform       translational;
+        neighbourPatch  xhi;
+        separationVector (1 0 0);
+    }
+    xhi
+    {
+        type            cyclic;
+        inGroups        1(cyclic);
+        nFaces          24;
+        startFace       796;
+        matchTolerance  0.0001;
+        transform       translational;
+        neighbourPatch  xlo;
+        separationVector (-1 0 0);
+    }
+    ylo
+    {
+        type            cyclic;
+        inGroups        1(cyclic);
+        nFaces          32;
+        startFace       820;
+        matchTolerance  0.0001;
+        transform       translational;
+        neighbourPatch  yhi;
+        separationVector (0 0.75 0);
+    }
+    yhi
+    {
+        type            cyclic;
+        inGroups        1(cyclic);
+        nFaces          32;
+        startFace       852;
+        matchTolerance  0.0001;
+        transform       translational;
+        neighbourPatch  ylo;
+        separationVector (0 -0.75 0);
+    }
+    zlo
+    {
+        type            cyclic;
+        inGroups        1(cyclic);
+        nFaces          48;
+        startFace       884;
+        matchTolerance  0.0001;
+        transform       translational;
+        neighbourPatch  zhi;
+        separationVector (0 0 0.5);
+    }
+    zhi
+    {
+        type            cyclic;
+        inGroups        1(cyclic);
+        nFaces          48;
+        startFace       932;
+        matchTolerance  0.0001;
+        transform       translational;
+        neighbourPatch  zlo;
+        separationVector (0 0 -0.5);
+    }
+)
+
+// ************************************************************************* //

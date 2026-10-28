@@ -561,6 +561,22 @@ Measured gfx1100 via simjob, 2026-10-28, defaults (4 cells/δ_th) and the
   0.344% → 0.357% → 0.361%); the quoted 6.7% / 0.36% are the [75, 80]
   values. tt 80 does not show a flat envelope.
 
+## FaceMesh / FV path (`docs/mesh.md`, `plans/masterplan_meshsolver.md`)
+
+56. **Phase 1 only: the FaceMesh exists, no solver runs on it.** Built and
+    pinned: polyMesh reader/writer, `fromPolyMesh` / `fromCurvMesh`,
+    orderings, `CellGraph`, `dns mesh` (`plans/verify/impl_meshsolver_p1.md`).
+    Deferred by plan: `wedge` patches and axis prisms in `fromPolyMesh`, and
+    revolved structured meshes (`axisFaces`, `MirrorZ`) in `polyOf` (P8);
+    decomposed meshes (`processor*`: run reconstructParMesh), non-conformal
+    couplings, rotational cyclics — all rejected by name. `meshQuality`
+    needs a `fromPolyMesh` mesh (on a `fromCurvMesh` one `srcCell` is
+    `Grid::idx`). Which cell order the GPU path uses (Morton vs colour-major)
+    is P4's measurement. The `mB` gate (`facemesh_mb`) is local only
+    (`runs/` is git-ignored); its checkMesh log was an 8-rank run whose face
+    count (2 622 899) includes processor faces — the reconstructed mesh has
+    2 600 459, which the gate pins.
+
 ## Older open items (details in CLAUDE.md)
 
 - No anchor for the Re800 compressible cases or `sphere_re300_n160_cd`

@@ -1,6 +1,7 @@
 #include "dns/config.hpp"
 #include "dns/numparse.hpp"
 
+#include "dns/facemesh.hpp"
 #include "dns/ogrid.hpp"
 
 #include "dns/precond.hpp"
@@ -299,7 +300,7 @@ std::span<const char* const> subcommandNames()
 {
     static constexpr const char* kNames[] = {"flow",    "tgv",  "hit",
                                              "bench",   "channel", "conv",
-                                             "prop",    "flame"};
+                                             "prop",    "flame", "mesh"};
     return kNames;
 }
 
@@ -3818,6 +3819,13 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     // prop shares none of the grid prologue: its --out is a CSV path, and
     // optional.
     if (r.sub == Subcommand::Prop) return validateProp(r, std::move(c));
+    // mesh: host-only, no grid and no output; the parser requires --polymesh.
+    if (r.sub == Subcommand::Mesh)
+    {
+        c.polyMeshDir = r.polymesh;
+        c.meshOrder = r.meshOrder;
+        return c;
+    }
 
     if (c.outPrefix.empty())
         return bad(2, "--out", "output prefix must not be empty");
@@ -4036,6 +4044,12 @@ double hFine(const Case& c)
 std::string Case::describe() const
 {
     if (sub == Subcommand::Prop) return describeProp(prop);
+    if (sub == Subcommand::Mesh)
+        return std::format("case:\n"
+                           "  mode       FaceMesh report of an OpenFOAM polyMesh (host-only, no GPU)\n"
+                           "  polymesh   {}\n"
+                           "  order      {}\n",
+                           polyMeshDir, cellOrderNames()[std::size_t(meshOrder)]);
     if (sub == Subcommand::Hit) return describeHit(*this);
     if (sub == Subcommand::Flame && flameDiffusion)
     {

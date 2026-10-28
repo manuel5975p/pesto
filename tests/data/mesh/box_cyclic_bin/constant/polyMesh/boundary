@@ -1,0 +1,89 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2606                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    arch        "LSB;label=32;scalar=64";
+    class       polyBoundaryMesh;
+    location    "constant/polyMesh";
+    object      boundary;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+
+6
+(
+    xlo
+    {
+        type            cyclic;
+        inGroups        1 ( cyclic );
+        nFaces          6;
+        startFace       46;
+        matchTolerance  0.0001;
+        transform       translational;
+        neighbourPatch  xhi;
+        separationVector ( 1 0 0 );
+    }
+
+    xhi
+    {
+        type            cyclic;
+        inGroups        1 ( cyclic );
+        nFaces          6;
+        startFace       52;
+        matchTolerance  0.0001;
+        transform       translational;
+        neighbourPatch  xlo;
+        separationVector ( -1 0 0 );
+    }
+
+    ylo
+    {
+        type            wall;
+        inGroups        1 ( wall );
+        nFaces          8;
+        startFace       58;
+    }
+
+    yhi
+    {
+        type            wall;
+        inGroups        1 ( wall );
+        nFaces          8;
+        startFace       66;
+    }
+
+    zlo
+    {
+        type            cyclic;
+        inGroups        1 ( cyclic );
+        nFaces          12;
+        startFace       74;
+        matchTolerance  0.0001;
+        transform       translational;
+        neighbourPatch  zhi;
+        separationVector ( 0 0 0.5 );
+    }
+
+    zhi
+    {
+        type            cyclic;
+        inGroups        1 ( cyclic );
+        nFaces          12;
+        startFace       86;
+        matchTolerance  0.0001;
+        transform       translational;
+        neighbourPatch  zlo;
+        separationVector ( 0 0 -0.5 );
+    }
+
+)
+
+
+// ************************************************************************* //
