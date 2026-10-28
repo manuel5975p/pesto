@@ -43,6 +43,15 @@ public:
     void apply(const DeviceCompState& s, DeviceCompState& out,
                const StageCombine& cmb) const;
 
+    // The species twin (dns flame), plain write: rho Y_k += crAt Y_k R_rho,
+    // R_rho the band's own continuity term and Y_k the stage input's -- the
+    // band moves species with the mass and never changes Y. Without it the
+    // band damps rho but not rho Y and a uniform Y drifts; with D4 on rho Y
+    // itself (measured) Y overshoots its bounds. Call right after apply().
+    // Pre: s.nY >= 1, plain cmb.
+    void applySpecies(const DeviceCompState& s, DeviceCompState& out,
+                      const StageCombine& cmb) const;
+
 private:
     DeviceCompSink(const Grid& g, const Config& c);
 

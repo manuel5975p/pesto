@@ -168,6 +168,10 @@ the other case has no meaning for. In convection mode the Geometry region says
 so instead of offering a body picker whose every choice the validator would
 reject.
 
+`dns flame` (docs/chem.md) is NOT an editor case: the editor covers `flow`
+and `conv` only. A flame run is driven from the CLI; its frames (`temp`,
+`fuel`, `omega`) are declared in the run manifest like any other channel.
+
 ### `convection`
 
 Same idiom as the rest of the editor: you edit the tangible quantities and the

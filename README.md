@@ -66,6 +66,7 @@ DNS 13.6 ms/step (1234 Mcell/s), Smagorinsky 15.6, σ 16.0, 1.46 GiB.
 | `hit` | forced homogeneous isotropic turbulence, SI-configured, h = 1.5 η | `dns hit --help` |
 | `channel` | wall-resolved compressible channel; `--les`, `--rans` | `docs/channel.md`, `docs/rans.md` |
 | `conv` | Rayleigh–Bénard convection, compressible or Boussinesq | below |
+| `flame` | 1D premixed flame, single-step chemistry, against its FP64 oracle | `docs/chem.md` |
 | `bench` | step time, Mcell/s and the VRAM this process allocates | `dns bench --help` |
 | `prop` | propeller thrust curve by BEMT or lifting line, host-only | below |
 
@@ -108,6 +109,9 @@ build/dns channel --rans sa-neg --steady 1e-4 --steady-scheme implicit \
 
 # 2D Rayleigh-Benard, Ra 5e4
 build/dns conv --rayleigh 5e4 --n 96 --ny 48 --nz 1
+
+# 1D premixed flame, 15 cells per thermal thickness, M 0.01 (~11 s)
+build/dns flame --inflow-speed 0.98 --tt 20 --emit stats
 
 # a multi-object scene
 build/dns flow --scene examples/tandem_cylinders.toml
@@ -522,5 +526,6 @@ Tiers, labels, tolerances, the quarantine and anchor regeneration:
 | `docs/ui.md` | `dns-ui`: editor, run cockpit, live viewer |
 | `docs/viewer-format.md` | web frame format, run `.json`, `_surface.csv`, `--emit mesh` |
 | `docs/jobs.md` | `simjobd` / `simjob`: the job server every GPU/CPU run goes through |
+| `docs/chem.md` | `dns flame`: model C0, the phase-plane oracle vs Cantera, species scheme, hook order, measured S_L |
 | `src/compat/cuda/README.md` | the CUDA header shim |
 | `docs/archive/` | historical plans and analyses |

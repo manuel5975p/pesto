@@ -11,6 +11,7 @@
 #include "dns/cli.hpp"
 #include "dns/casegeom.hpp"
 #include "dns/config.hpp"
+#include "dns/flame1d.hpp"
 #include "dns/flow_ic.hpp"
 #include "dns/framemap.hpp"
 #include "dns/diagnostics.hpp"
@@ -41,6 +42,7 @@
 #include "dns/gpu/reductions.hpp"
 #include "dns/gpu/runner_channel.hpp"
 #include "dns/gpu/runner_conv.hpp"
+#include "dns/gpu/runner_flame.hpp"
 #include "dns/gpu/runner_rb.hpp"
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/runner_comp.hpp"
@@ -933,6 +935,66 @@ int runConv(const Case& c)
 }
 
 
+// --- flame -----------------------------------------------------------------
+
+int runFlame(const Case& c)
+{
+    if (!haveGpu(c))
+        return die(exitNoGpu, "no GPU device (dns flame is GPU-only)");
+#if DNS_WITH_GPU
+    const auto& g = c.grid;
+    CompState host = CompState::zeros(g);
+    std::vector<double> rhoY;
+    flameIC(c, host, rhoY);
+
+    FrameGeometry fg = FrameGeometry::centred(g, 1.0);
+    fg.mask.assign(g.size(), 1.0f);
+    auto out = RunOutput::make(
+        outputConfig(c, std::format("{{\"app\":\"dns\",\"flame\":\"premixed\","
+                                    "\"sigma\":{},\"beta\":{},\"Lambda\":{},"
+                                    "\"mach\":{}",
+                                    c.flameModel.sigma, c.flameModel.beta,
+                                    c.flameEig.Lambda, c.mach)),
+        c.meta, g, std::move(fg));
+    if (!out) return die(exitOutput, out.error());
+
+    const double Tu = c.flameTu, sig = c.flameModel.sigma;
+    gpu::FlameRun rr;
+    // mu = Pr at Tref = Tu: lambda_u = mu cp / Pr = cp (delta_D = 1).
+    rr.tr = Transport::air(c.prandtl, Tu, c.tinfK, c.prandtl, kGammaAir,
+                           kRgasBox, c.sutherland);
+    rr.sp.nY = 1;
+    rr.sp.fuel = 0;
+    rr.sp.lnA = std::log(c.flameEig.Lambda);
+    rr.sp.Ta = c.flameModel.theta() * Tu;
+    rr.sp.q = rr.tr.cp() * (sig - 1) * Tu;
+    rr.sp.invPr = 1.0 / c.prandtl;
+    rr.sp.openX = true;
+    rr.sp.yIn[0] = 1.0;
+    rr.Tu = Tu;
+    rr.sigma = sig;
+    rr.uIn = c.flameUIn;
+    rr.pB = Tu - c.flameUIn * c.flameUIn * (sig - 1); // the IC's burnt p
+    rr.etaIn = c.nscbcEtaIn;
+    rr.thermalInflow = c.nscbcThermalInflow;
+    rr.sinkNb = c.nscbcSink;
+    rr.sinkAmp = c.nscbcSinkAmp;
+    rr.dth = c.flameEig.dthOverDD;
+    rr.cfl = c.cfl;
+    rr.tEnd = c.tEnd;
+    rr.dtRecompute = c.dtRecompute;
+    rr.profileDt = c.profileDt;
+    rr.label = flameRunLabel(c);
+
+    auto res = gpu::runFlame(g, host, rhoY, rr, *out);
+    if (!res) return die(res.error().code, res.error().message);
+    return reportDone(*res, *out);
+#else
+    return exitNoGpu;
+#endif
+}
+
+
 // --- tgv -------------------------------------------------------------------
 
 int runTgv(const Case& c)
@@ -1492,6 +1554,7 @@ int main(int argc, char** argv)
     case Subcommand::Channel: return runChannel(*c);
     case Subcommand::Conv: return runConv(*c);
     case Subcommand::Prop: return runProp(*c);
+    case Subcommand::Flame: return runFlame(*c);
     }
     return 1;
 }

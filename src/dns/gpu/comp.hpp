@@ -54,16 +54,24 @@ struct MrfZone
 // hi only; the stage combination accumulates into the pair, so an update
 // below ulp(hi)/2 is kept instead of rounding away (docs/rans.md, "The FP32
 // update floor"). Empty lo = the plain FP32 state.
+// Most species a state carries (dns flame; docs/chem.md).
+inline constexpr int kMaxY = 4;
+
 struct DeviceCompState
 {
     DeviceScalar rho, mx, my, mz, E;
     DeviceScalar t[2]; // conserved turbulence scalars (rho nu~ | rho k, rho omega)
     DeviceScalar lo[5], tlo[2]; // low words of the above; empty = plain
     int nT = 0;
+    // Conserved species rho Y_k (dns flame). nY == 0 leaves y[] empty and is
+    // the solver bit for bit: no kernel reads them.
+    DeviceScalar y[kMaxY];
+    int nY = 0;
 
-    // Pre: 0 <= nT <= 2. compensated allocates the low words, zeroed.
+    // Pre: 0 <= nT <= 2, 0 <= nY <= kMaxY, !(compensated && nY) (compensated
+    // species are out of scope). compensated allocates the low words, zeroed.
     static std::expected<DeviceCompState, hipError_t>
-    make(std::size_t n, int nT = 0, bool compensated = false);
+    make(std::size_t n, int nT = 0, bool compensated = false, int nY = 0);
 
     bool compensated() const { return lo[0].size() != 0; }
 
@@ -75,6 +83,39 @@ struct DeviceCompState
     // Pre: i < nT; upload: h.size() == n.
     hipError_t uploadTurb(int i, const std::vector<double>& h);
     hipError_t downloadTurb(int i, std::vector<double>& h) const;
+    // Species k (conserved rho Y_k) from/to host doubles (download resizes h).
+    // Pre: k < nY; upload: h.size() == n.
+    hipError_t uploadSpecies(int k, const std::vector<double>& h);
+    hipError_t downloadSpecies(int k, std::vector<double>& h) const;
+};
+
+// The species half of a stage combination (dns flame): the a/b species
+// buffers of the same (a, b) states StageCombine names. A separate struct so
+// StageCombine -- every hot kernel's by-value argument -- is untouched.
+struct SpeciesCombine
+{
+    const Real* ya[kMaxY] = {};
+    const Real* yb[kMaxY] = {};
+    int nY = 0;
+};
+
+// The chemistry DeviceComp::enableSpecies installs (docs/chem.md). Model C0:
+// equal molecular weights and cp, Le = 1, ONE irreversible step consuming
+// species `fuel`: omega = exp(lnA - Ta/T) rho max(Y_fuel, 0), heat release
+// q omega into E. Species other than the fuel are passive.
+struct SpeciesSetup
+{
+    int nY = 1;          // 1 <= nY <= kMaxY
+    int fuel = 0;        // the species the step consumes
+    double lnA = 0;      // ln of the pre-exponential; -inf = no reaction
+    double Ta = 0;       // activation temperature, box units
+    double q = 0;        // heat release per unit fuel mass, box units
+    double invPr = 1.0 / 0.72; // rho D = mu / Pr (Le = 1)
+    // Open x faces (NSCBC): the species flux there is the boundary cell's
+    // own mdot carrying yIn in and the cell's Y out, no diffusion -- the RANS
+    // ScalarBoundary rule. false = periodic x.
+    bool openX = false;
+    double yIn[kMaxY] = {}; // inflow mass fractions (openX)
 };
 
 // An unevaluated sum hi + lo of two floats (the compensated state's words).
@@ -388,6 +429,34 @@ public:
     const DeviceScalar& f1() const { return f1_; }
     // The eddy conductivity scale cp / Pr_t the RANS/LES face flux uses.
     Real eddyKapScale() const { return Real(tr_.cp() / prt_); }
+
+    // --- Species (dns flame; dns/chem.hpp, gpu/species.hpp, docs/chem.md) ----
+    // Install the chemistry: the Y cache (nY x n), the per-stage fuel rate
+    // omega, and species stage buffers. Each stage then runs, after the
+    // verbatim kCompStage: the cell pass (Y_k = rhoY_k/rho, omega -- ONE
+    // buffer, read by both the species rhs and the heat release), the
+    // limited species stage on faceFlux's own mass flux, and E += cr q omega,
+    // all BEFORE the rhs hook. Never calling it keeps every path bit for bit.
+    // Pre: !curvilinear(), !rans(), !compensated(), !les(), !mrfActive(),
+    // 1 <= s.nY <= kMaxY, 0 <= s.fuel < s.nY. Post: step() requires
+    // state.nY == nSpecies().
+    std::expected<void, hipError_t> enableSpecies(const SpeciesSetup& s);
+    int nSpecies() const { return sp_.nY; } // 0 = species off
+    const SpeciesSetup& speciesSetup() const { return sp_; }
+    // The cell pass of the last stage or updateChem: omega and Y_k.
+    const DeviceScalar& omega() const { return omega_; }
+    const DeviceScalar& speciesY(int k) const { return ycache_[k]; }
+    // primitives(s), then the cell pass of s (diagnostics, stats, dt).
+    // Pre: nSpecies() > 0.
+    void updateChem(const DeviceCompState& s);
+    // The open-face species re-carry (the RANS kOpenScalarFix, plain form, on
+    // y[]): the NSCBC overwrote continuity on the open-face cells, so their
+    // rhoY is re-carried by the density the mean flow produced:
+    // rhoY = (rhoY_own / rho_own) rho_out, rho_own the density the species'
+    // own fluxes imply. Call INSIDE the rhs hook, after the NSCBC overwrite
+    // and BEFORE the sink (which writes rho too). Pre: speciesSetup().openX.
+    void speciesOpenConsistency(const DeviceCompState& s, DeviceCompState& out,
+                                const StageCombine& cmb) const;
     // RANS: the wall distance enableRans uploaded (FP32, g.size()).
     const DeviceScalar& wallDistance() const { return wd_; }
 
@@ -473,8 +542,14 @@ private:
     // residualMode: the scalar kernel writes its pure rhs instead of the
     // point-implicit combination (the mean flow is pure rhs under ca = cb = 0,
     // cr = 1 already).
+    // sc: the species a/b of the same stage (nSpecies() > 0 only; null = the
+    // species-off stage, the code before species existed).
     void stage(const DeviceCompState& s, const StageCombine& cmb,
-               DeviceCompState& out, bool residualMode = false);
+               DeviceCompState& out, bool residualMode = false,
+               const SpeciesCombine* sc = nullptr);
+    // The species cell pass of s into ycache_/omega_. Pre: primitives(s)
+    // current, nSpecies() > 0.
+    void chemCellPass(const DeviceCompState& s);
     // The primitives of s, then mu_t from them into nut_, then the mesh
     // family's image rows (mutHook_); also the scalar stage's per-cell cache
     // of s. SA fuses the two pointwise kernels into one launch (same bits).
@@ -536,6 +611,10 @@ private:
     double omegaFloor_ = 0;
     bool ltsOn_ = false;
     bool compensated_ = false;
+    // Species (enableSpecies): the setup (nY == 0 = off), the Y_k cache and
+    // the per-stage fuel rate.
+    SpeciesSetup sp_{.nY = 0};
+    DeviceScalar ycache_[kMaxY], omega_;
     std::function<void(DeviceCompState&)> hook_;
     bool hookAtEntry_ = true; // setStageHook's Idempotent::no
     CellRange stageRange_{};  // setStageRange; the whole grid by default

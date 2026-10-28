@@ -257,6 +257,63 @@ Numbers are measured, gfx1100.
     reference (dns r 0.77, foam + div(τ·u) 0.71 and still rising, foam LTS run
     unconverged, cd −3.1%); RANS Prt heat transfer, not compared.
 
+## Chemistry (`dns flame`, docs/chem.md)
+
+Measured gfx1100 via simjob, 2026-10-28.
+
+30. **A stationary flame pins to the grid.** With `--inflow-speed 1` at 30
+    cells/δ_th (|S_h − 1| ≈ 5e-4) the consumption speed follows the local
+    fresh velocity instead of being a flame property: five run variants
+    settled anywhere in 0.9995–1.0011 (cfl 0.2 flat at 1.000106, sink 32
+    flat at 1.00109). S_L is therefore measured on a SLIDING flame
+    (`--inflow-speed 0.98`, window t ∈ [10, 20]). Undecided: whether the
+    default `--inflow-speed` should be below 1.
+31. **S_c wanders at the 1e-4–5e-4 level as h and M shrink.** Sliding,
+    window halves differ 1.2e-5 (7.5 cells), 3.7e-5 (15), 4.7e-4 (30) at
+    M 0.01, and 3.1e-4 at M 0.005 (15 cells). Consistent with FP32 pressure
+    resolution (ulp(p0)/ρ_u S_L² = 4e-4 at M 0.01, 1.7e-3 at M 0.005), not
+    proven. The plan's 1e-4 flatness band was not met; the tests use 1e-3.
+    The M 0.005 point also sits +8.3e-4 above the O(M²) fit through M
+    0.01/0.02 (1.004144 vs 1.00331), so the ladder's low end is
+    FP32-contaminated; M 0.01 is the sweet spot. Inflow variants do not
+    help (c15, 40 flame times: `--nscbc-tinflow` and `--nscbc-etain 2` drift
+    by 3e-4 where the default holds 8e-5).
+32. **Periodic-box FP32 mass drift.** The conservation box (two flames, M
+    0.02, 5696 steps) loses mass 5.1e-5 and E + qρY 5.3e-5 relative; the
+    non-reacting twin (ρ never sees the species code) 2.0e-5 / 2.9e-5. Both
+    negative, larger than a random-walk estimate (~1e-5): a solver-level
+    rounding bias of the stage write, unexplained. The fuel tracks it
+    exactly (fuel discrepancy = 0.93 × the mass drift = the fuel fraction).
+    Over 50 steps every balance holds to 1e-7.
+33. **RANS open-face scalar fix runs after the sink** (`comp.hip`, the
+    `bnd_.any()` branch, vs `runner_comp.hip`'s rhs hook): the sink writes ρ
+    but not ρφ, so φ = t/ρ is not preserved in the sink band. Unmeasured;
+    found while placing the species re-carry (which runs BEFORE the sink).
+34. **The species sink twin conserves species mass only where Y is uniform
+    across the band.** It adds Y_k × the band's continuity term (bounded);
+    D4 on ρY itself pushed the fresh Y to 1 + 2e-5 (measured, docs/chem.md).
+    Exact in the P1 flame (the bands sit in uniform fresh / burnt gas).
+35. **NSCBC carries no species waves** (Sutherland & Kennedy 2003): valid only
+    while ω vanishes in the boundary rows (omegaEdge 4.7e-16 measured).
+    Same premise, second consequence (verify 2026-10-28): the NSCBC
+    `stagePut` OVERWRITES E on the i = 0 / nx−1 cells, discarding the
+    `crAt q ω` the species launch added there, while the fuel's −ω survives
+    the re-carry. E + qρY therefore leaks q ω per boundary cell — 4.7e-16
+    of the peak rate in P1, unmeasurable, but structural: a case burning in
+    the boundary rows must re-add q ω after the overwrite (or zero ω there).
+36. **Not built: Le ≠ 1** (no oracle; `--lewis` unregistered), curvilinear,
+    compensated, RANS and LES species (asserted), nz > 1 flames, the
+    low-Mach branch, multi-step chemistry, dns-ui support for `flame`.
+37. **The chemistry dt bound never binds in the P1 range** (dtChem/dt
+    8–32), so kChemDt = 0.5 is unbracketed by measurement: halving or
+    doubling it cannot move S_L.
+38. **Grid order 2.37 vs the host scheme's 2.12; DNS − host error offsets
+    +1.5e-3 / −2.6e-4 / −1.5e-4 at 7.5 / 15 / 30 cells** (after removing the
+    measured O(M²) offset −3.9e-4 at M 0.01). The host Newton (scouting, low-Mach) is not the
+    DNS's operator (KG energy flux, compressibility); a C++ discrete oracle
+    (plan §3.2, optional) would separate scheme from Mach/FP32 error. Not
+    built.
+
 ## Older open items (details in CLAUDE.md)
 
 - No anchor for the Re800 compressible cases or `sphere_re300_n160_cd`

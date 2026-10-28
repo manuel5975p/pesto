@@ -36,6 +36,7 @@ add_library(dns_core
     src/dns/blockband.cpp
     src/dns/bodies.cpp
     src/dns/channel_line.cpp
+    src/dns/chem.cpp
     src/dns/cli.cpp
     src/dns/casegeom.cpp
     src/dns/config.cpp
@@ -43,6 +44,7 @@ add_library(dns_core
     src/dns/cutcell.cpp
     src/dns/diagnostics.cpp
     src/dns/fieldpng.cpp
+    src/dns/flame1d.cpp
     src/dns/flow_ic.cpp
     src/dns/geometry.cpp
     src/dns/operators.cpp
@@ -128,6 +130,7 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/nk.hip
     src/dns/gpu/bodyforce.hip
     src/dns/gpu/boussinesq.hip
+    src/dns/gpu/chem.hip
     src/dns/gpu/comp.hip
     src/dns/gpu/comp_channel.hip
     src/dns/gpu/comp_conv.hip
@@ -152,10 +155,12 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/runner_channel.hip
     src/dns/gpu/runner_comp.hip
     src/dns/gpu/runner_conv.hip
+    src/dns/gpu/runner_flame.hip
     src/dns/gpu/runner_ogrid.hip
     src/dns/gpu/runner_rb.hip
     src/dns/gpu/runner_incomp.hip
     src/dns/gpu/runner_periodic.hip
+    src/dns/gpu/species.hip
     src/dns/gpu/timestepper.hip
     src/dns/gpu/tunnel.hip
 )
@@ -395,7 +400,8 @@ if(BUILD_TESTING)
     set(DNS_TESTS cli geometry output poisson projection tgv tgv3d cutcell cutcell_sphere comp comp_curv meshsdf
         fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport
         rotor focal cli_defaults comp_axis_permute rans rans_channel1d
-        steady_stop blockband channel_line pseudo_time flow_rans_config)
+        steady_stop blockband channel_line pseudo_time flow_rans_config
+        flame1d flame_config)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)
     endif()
@@ -406,6 +412,9 @@ if(BUILD_TESTING)
         set_tests_properties(${t} PROPERTIES TIMEOUT 120)
     endforeach()
     target_link_libraries(test_fieldpng PRIVATE ZLIB::ZLIB) # decodes IDAT
+    # The Cantera reference of the chemistry oracle (tools/chem/cantera_flame.py).
+    target_compile_definitions(test_flame1d PRIVATE
+        DNS_CHEM_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/chem")
 
     # Job server: pure parts (sha256, json, spec, admission) and a live run of
     # the real simjobd + simjob binaries (skips without a systemd user session).
@@ -481,7 +490,8 @@ if(BUILD_TESTING)
                   gpu_rotor_comoving_fixed_point gpu_comp_scale_invariance
                   gpu_ghost_translate gpu_rotor_swap_ledger
                   gpu_comp_axis_permute gpu_comp_curv_axis_permute
-                  comp_time_order gpu_comp_viscous_modes)
+                  comp_time_order gpu_comp_viscous_modes
+                  gpu_flame_passive gpu_flame_conservation)
             add_executable(test_${t} tests/test_${t}.cpp)
             target_link_libraries(test_${t} PRIVATE dns_gpu)
             add_test(NAME ${t} COMMAND test_${t})
@@ -497,7 +507,8 @@ if(BUILD_TESTING)
             gpu_comp_scale_invariance gpu_ghost_translate gpu_comp_axis_permute
             gpu_comp_curv_axis_permute comp_time_order gpu_comp_viscous_modes
             gpu_rans_mask gpu_rans_ogrid gpu_rans_mms gpu_axisym gpu_axisym3d
-            gpu_rans_immersed gpu_les_wall
+            gpu_rans_immersed gpu_les_wall gpu_flame_passive
+            gpu_flame_conservation
             PROPERTIES TIMEOUT 60)
         set_tests_properties(gpu_nk gpu_rotor_swap_ledger PROPERTIES TIMEOUT 120)
         # ~56 s alone (G10's 2.2e5-iteration compensated march, G9's 1.2e5
@@ -601,6 +612,19 @@ if(BUILD_TESTING)
         # Channel LES (W11): the odd mu_t wall image, the label, sigma == 0 on
         # the laminar state, --les 0 byte-identical (~2 s).
         dns_gpu_bin_test(gpu_channel_les 60)
+        # dns flame (docs/chem.md): the 1D premixed flame against its FP64
+        # oracle -- grid convergence (3 runs), the Mach ladder + dt check
+        # (4 runs), Sutherland (1 run). Each run < 1 min.
+        add_executable(test_gpu_flame1d tests/test_gpu_flame1d.cpp)
+        target_link_libraries(test_gpu_flame1d PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_flame1d PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_flame1d dns)
+        add_test(NAME gpu_flame1d_grid COMMAND test_gpu_flame1d grid)
+        add_test(NAME gpu_flame1d_mach COMMAND test_gpu_flame1d mach)
+        add_test(NAME gpu_flame1d_suth COMMAND test_gpu_flame1d suth)
+        set_tests_properties(gpu_flame1d_grid gpu_flame1d_mach gpu_flame1d_suth
+            PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 
 
         # --- Physical validation suite (docs/validation.md) -----------------

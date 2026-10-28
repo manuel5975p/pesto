@@ -150,6 +150,10 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                            c.profileDt = 0.0; break;
     // Air at 15 C.
     case Subcommand::Prop: c.nu = 1.5e-5; break;
+    // The P1 flame: M 0.01 (inflated; docs/chem.md), 10 flame times.
+    case Subcommand::Flame: c.ny = 4; c.physics = Physics::Compressible;
+                            c.mach = 0.01; c.cfl = 0.4; c.tt = 10;
+                            c.profileDt = 0.0; break;
     }
 
     // Numeric / string options valid in this subcommand. prop is host-only
@@ -228,6 +232,20 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--profile-dt", &c.profileDt},
              {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
              {"--planes", &c.planes}, {"--png-down", &c.pngDown}});
+    if (c.sub == Subcommand::Flame)
+        add({{"--ny", &c.ny}, {"--mach", &c.mach},
+             {"--expansion", &c.expansion}, {"--zeldovich", &c.zeldovich},
+             {"--prandtl", &c.prandtl}, {"--tinf", &c.tinf},
+             {"--cells-per-delta", &c.cellsPerDelta},
+             {"--upstream", &c.upstream}, {"--downstream", &c.downstream},
+             {"--inflow-speed", &c.inflowSpeed},
+             {"--nscbc-etain", &c.nscbcEtaIn}, {"--nscbc-sink", &c.nscbcSink},
+             {"--nscbc-sink-amp", &c.nscbcSinkAmp},
+             {"--tt", &c.tt}, {"--cfl", &c.cfl},
+             {"--dt-recompute", &c.dtRecompute},
+             {"--profile-dt", &c.profileDt},
+             {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
+             {"--planes", &c.planes}, {"--png-down", &c.pngDown}});
     if (c.sub == Subcommand::Prop)
         add({{"--planform", &c.planform}, {"--polar", &c.polar},
              {"--thin-cd0", &c.thinCd0}, {"--thin-alpha0", &c.thinAlpha0},
@@ -255,8 +273,10 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         enums.push_back({"--wake-pitch", enumValues(prop::wakePitchNames()), &c.wakePitch});
     }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench
-        || c.sub == Subcommand::Conv)
+        || c.sub == Subcommand::Conv || c.sub == Subcommand::Flame)
         enums.push_back({"--physics", enumValues(physicsNames()), &physicsSel});
+    if (c.sub == Subcommand::Flame)
+        enums.push_back({"--mode", {{"premixed", 0}}, &c.flameMode});
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench
         || c.sub == Subcommand::Channel)
         enums.push_back({"--sgs", enumValues(sgsModelNames()), &sgsSel});
@@ -287,7 +307,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         enums.push_back({"--steady-scheme", enumValues(steadySchemeNames()),
                          &c.steadyScheme});
     }
-    if (c.sub == Subcommand::Flow || c.sub == Subcommand::Conv)
+    if (c.sub == Subcommand::Flow || c.sub == Subcommand::Conv
+        || c.sub == Subcommand::Flame)
         enums.push_back({"--visc", {{"constant", 0}, {"sutherland", 1}},
                          &c.visc});
     if (c.sub == Subcommand::Conv)
@@ -311,6 +332,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Channel)
         flags.push_back({"--compensated", &c.compensated});
+    if (c.sub == Subcommand::Flame)
+        flags.push_back({"--nscbc-tinflow", &c.nscbcTinflow});
     if (c.sub == Subcommand::Prop) flags.push_back({"--selftest", &c.selftest});
 
     std::vector<string> known;
@@ -501,6 +524,7 @@ subcommands:
   hit     forced homogeneous isotropic turbulence (SI-configured)
   channel wall-resolved turbulent channel flow (compressible, forced)
   conv    Rayleigh-Bénard convection: heated floor, cooled lid, gravity
+  flame   1D premixed flame, single-step chemistry (compressible)
   bench   step-time and throughput benchmark
   prop    propeller thrust curve by BEMT or lifting line (host-only, no GPU)
 
@@ -1368,6 +1392,65 @@ R"(dns bench — step-time and throughput benchmark
   --les CS         compressible only: time the SGS path too          [off]
   --sgs smag|sigma which nut(grad u) --les uses                    [smag]
   Reports ms/step, Mcell-updates/s and the VRAM this run allocates.
+)";
+    case Subcommand::Flame:
+        return
+R"(dns flame — 1D freely propagating premixed flame (docs/chem.md)
+
+Compressible DNS of a laminar flame held in an open x box: fresh gas enters
+through a characteristic (NSCBC) inflow, burns in a single step F -> P, and
+leaves through the outflow. The model is C0: calorically perfect (gamma 1.4
+fixed), equal molecular weights, Le = 1, one species carried (Y = Y_F).
+
+Box units: rho_u = S_L = R = 1 and delta_D = lambda_u/(rho_u cp S_L) = 1, so
+mu = Pr and the pre-exponential A = Lambda -- the FP64 phase-plane eigenvalue
+of the model, computed at validation and printed by --dry-run. The oracle
+flame burns at S_L = 1 exactly; the run measures its own S_L against that.
+Tu = p0 = 1/(gamma M^2): --mach sets the sound speed, not the flame.
+
+MACH INFLATION. A real CH4/air flame has S_L/c_u ~ 1.15e-3; the acoustic dt
+scales with it, so the run inflates it (default 0.01). The compressible flame
+speed carries an O(M^2) offset (gamma M^2 (sigma - 1)): measured below 0.5%
+over M 0.005-0.02. The label states the M used, always.
+
+SPECIES. rho Y rides EXACTLY the central mass flux of the mean flow with an
+MC-limited MUSCL face value: deliberate, bounded scalar dissipation on the
+species alone (the RANS precedent). The mean flow stays central.
+
+  --mode premixed      the only mode built                     [premixed]
+  --mach M             flame Mach number S_L/c_u, (0, 0.05]       [0.01]
+                       (warns above 0.02, the measured ladder top)
+  --expansion SIGMA    Tb/Tu, (1, 10]                                [5]
+  --zeldovich BETA     Zeldovich number, [2, 20]                     [8]
+  --prandtl PR         molecular Prandtl number (Le = 1)          [0.72]
+  --visc constant|sutherland                                 [constant]
+  --tinf K             Tu in kelvin; required with sutherland
+  --cells-per-delta N  cells per oracle thermal thickness, >= 4     [15]
+  --upstream N         fresh extent in thermal thicknesses, >= 6    [12]
+  --downstream N       burnt extent in thermal thicknesses, >= 4    [10]
+  --ny N               periodic y cells, >= 4                        [4]
+  --nz 1               the only value (multi-D flames are P2)
+  --inflow-speed U     inflow velocity in S_L (1 = a stationary flame) [1]
+  --nscbc-etain E      inflow relax stiffness, as dns flow         [100]
+  --nscbc-sink N       sink band per open face, cells; 0 = off      [16]
+  --nscbc-sink-amp A   sink strength, (0, 2]                         [1]
+  --tt T               run length in flame times delta_D/S_L        [10]
+  --cfl C              acoustic CFL                                [0.4]
+  --dt-recompute N     steps between dt recomputations             [16]
+  --profile-dt DT      <out>_profiles.csv x-profile dump interval
+                       (t,x,T,rho,u,p,Y,omega); 0 = off               [0]
+  --emit png|web|bin|shm  frames: temp (T - Tu), fuel (Y), omega
+  --fdt/--pdt/--wdt    frame cadences as in dns flow
+
+  Rejected by name: --re, --ft (use --tt), --n (use --cells-per-delta),
+  --physics incompressible (no low-Mach branch yet).
+
+STATS (<out>_stats.csv): t, dt, dtChem, SL (consumption speed, the integral
+of omega over rho_u Y_u), SLdisp (u_in - dx_f/dt), xf (mid-temperature
+crossing), dth ((Tb - Tu)/max dT/dx), Tmax, mass, energy (E + q rho Y),
+omegaEdge (max omega in the sink bands / max omega), yHits (cells with Y
+outside [-1e-6, 1 + 1e-6], counted, never clamped).
+Exit 8 when the flame drifts within band + 2 delta_th of either face.
 )";
     case Subcommand::Prop:
         return

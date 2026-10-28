@@ -296,8 +296,9 @@ std::span<const char* const> nscbcAbcNames()
 
 std::span<const char* const> subcommandNames()
 {
-    static constexpr const char* kNames[] = {"flow",    "tgv",  "hit", "bench",
-                                             "channel", "conv", "prop"};
+    static constexpr const char* kNames[] = {"flow",    "tgv",  "hit",
+                                             "bench",   "channel", "conv",
+                                             "prop",    "flame"};
     return kNames;
 }
 
@@ -957,6 +958,139 @@ std::expected<Case, ConfigError> validateConv(const RawConfig& r, Case c)
               .farField = c.closedSides ? "closed-sides" : "periodic",
               .physics = name(c.physics),
               .kick = c.kick,
+              .sgs = "",
+              .rans = "",
+              .steady = ""};
+    c.meta.setGrid(c.grid);
+    return c;
+}
+
+// --- flame ------------------------------------------------------------------
+// The 1D freely propagating premixed flame (docs/chem.md): model C0, the
+// oracle eigenvalue resolved HERE (pure FP64, ~0.1 s) so the grid is counted
+// in the oracle's own thermal thickness and --dry-run prints Lambda.
+std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
+{
+    if (auto e = rejectGiven(r, {"--re"}, "does not apply: a flame is set by "
+                                          "--expansion, --zeldovich and "
+                                          "--prandtl (Re = 1/Pr on delta_D)");
+        e)
+        return std::unexpected(*e);
+    if (auto e = rejectGiven(r, {"--ft"}, "does not apply: the run length is "
+                                          "--tt (flame times delta_D/S_L)");
+        e)
+        return std::unexpected(*e);
+    if (auto e = rejectGiven(r, {"--n"}, "does not apply: the grid is "
+                                         "--cells-per-delta over --upstream "
+                                         "+ --downstream thermal thicknesses");
+        e)
+        return std::unexpected(*e);
+    if (c.physics != Physics::Compressible)
+        return bad(2, "--physics", "a flame is compressible only (no low-Mach "
+                                   "branch until P7; docs/chem.md)");
+    if (r.flameMode != 0)
+        return bad(2, "--mode", "only premixed is built");
+    if (r.nz != 1)
+        return bad(2, "--nz", "must be 1: multi-D flames are P2 (docs/chem.md)");
+    if (r.ny < 4) return bad(2, "--ny", "must be >= 4 (periodic y)");
+    c.mach = r.mach;
+    if (!(finitePos(c.mach) && c.mach <= 0.05))
+        return bad(2, "--mach", "must be in (0, 0.05]: the flame Mach number "
+                                "S_L/c_u, inflated above a real flame's "
+                                "~1e-3 to keep the acoustic dt affordable");
+    if (!(r.expansion > 1 && r.expansion <= 10))
+        return bad(2, "--expansion", "must be in (1, 10] (sigma = Tb/Tu)");
+    if (!(r.zeldovich >= 2 && r.zeldovich <= 20))
+        return bad(2, "--zeldovich", "must be in [2, 20]");
+    c.prandtl = r.prandtl;
+    if (!finitePos(c.prandtl)) return bad(2, "--prandtl", "must be finite and > 0");
+    c.sutherland = r.visc == 1;
+    c.tinfK = r.tinf;
+    if (c.sutherland && !(r.given.contains("--tinf") && finitePos(c.tinfK)))
+        return bad(2, "--tinf", "is required with --visc sutherland: the "
+                                "unburnt temperature in kelvin (Sutherland's "
+                                "110.4 K needs a dimensional anchor)");
+    if (!c.sutherland && r.given.contains("--tinf"))
+        return bad(2, "--tinf", "only anchors --visc sutherland");
+    if (!(std::isfinite(r.cellsPerDelta) && r.cellsPerDelta >= 4))
+        return bad(2, "--cells-per-delta", "must be >= 4");
+    if (!(std::isfinite(r.upstream) && r.upstream >= 6))
+        return bad(2, "--upstream", "must be >= 6 thermal thicknesses");
+    if (!(std::isfinite(r.downstream) && r.downstream >= 4))
+        return bad(2, "--downstream", "must be >= 4 thermal thicknesses");
+    if (!finitePos(r.inflowSpeed))
+        return bad(2, "--inflow-speed", "must be finite and > 0 (x S_L)");
+    c.nscbcEtaIn = r.nscbcEtaIn;
+    if (!finitePos(c.nscbcEtaIn))
+        return bad(2, "--nscbc-etain", "must be finite and > 0");
+    c.nscbcThermalInflow = r.nscbcTinflow;
+    c.nscbcSink = r.given.contains("--nscbc-sink") ? r.nscbcSink : 16;
+    if (c.nscbcSink < 0) return bad(2, "--nscbc-sink", "must be >= 0 (0 = off)");
+    c.nscbcSinkAmp = r.nscbcSinkAmp;
+    if (!(c.nscbcSinkAmp > 0 && c.nscbcSinkAmp <= 2))
+        return bad(2, "--nscbc-sink-amp", "must be in (0, 2] (the SSP-RK3 "
+                                          "real-axis bound)");
+
+    PremixedModel md;
+    md.sigma = r.expansion;
+    md.beta = r.zeldovich;
+    md.Pr = c.prandtl;
+    md.sutherland = c.sutherland;
+    md.sOverTu = c.sutherland ? Transport::sutherlandK / c.tinfK : 0.0;
+    auto eig = premixedEigen(md);
+    if (!eig) return bad(2, "--zeldovich", eig.error());
+    c.flameModel = md;
+    c.flameEig = std::move(*eig);
+    c.flameCells = r.cellsPerDelta;
+    c.flameUp = r.upstream;
+    c.flameDown = r.downstream;
+    c.flameUIn = r.inflowSpeed;
+    c.flameTu = 1.0 / (kGammaAir * c.mach * c.mach);
+
+    const double dth = c.flameEig.dthOverDD;
+    const double h = dth / c.flameCells;
+    const int nb = c.nscbcSink;
+    const int nx = int(std::ceil((c.flameUp + c.flameDown) * c.flameCells -
+                                 1e-9)) + 2 * nb;
+    auto box = makeBox(nx, r.ny, 1, nx * h, r.ny * h, 1.0);
+    if (!box) return std::unexpected(box.error());
+    c.grid = *box;
+    c.n = nx;
+    c.h = h;
+    c.L = nx * h;
+    c.flameXf0 = nb * h + c.flameUp * dth;
+    c.uInf = c.flameUIn;
+    c.re = 1.0 / c.prandtl; // rho_u S_L delta_D / mu
+    c.nu = c.prandtl;       // mu (rho_u = 1): lambda_u = cp
+    c.far = FarField::Nscbc;
+    c.bodyKind = BodyKind::None;
+
+    if (auto e = resolveCfl(r, c, 0.4); e) return std::unexpected(*e);
+    if (!finitePos(r.tt)) return bad(2, "--tt", "must be finite and > 0");
+    c.ft = r.tt;
+    c.tEnd = r.tt; // tau = delta_D / S_L = 1
+    if (auto e = checkProfileDt(r, c); e) return std::unexpected(*e);
+    if (auto e = resolveDtRecompute(r, c, 16); e) return std::unexpected(*e);
+    if (auto e = validateFrameOutputs(r, c); e) return std::unexpected(*e);
+    if (auto e = resolveEmit(c, {Emit::Stats}); e) return std::unexpected(*e);
+
+    if (c.mach > 0.02)
+        c.warnings.push_back(std::format(
+            "--mach {:.4g} is above the measured ladder top 0.02: the "
+            "compressible flame speed carries an O(M^2) offset "
+            "(gamma M^2 (sigma - 1) = {:.3g})",
+            c.mach, kGammaAir * c.mach * c.mach * (md.sigma - 1)));
+    if (nb == 0)
+        c.warnings.push_back("--nscbc-sink 0: the bare characteristic "
+                             "boundary (nothing drains mesh-scale content)");
+    c.meta = {.D = 1.0,
+              .re = c.re,
+              .mach = c.mach,
+              .frameDt = c.fdt,
+              .body = "premixed flame",
+              .farField = "nscbc",
+              .physics = name(c.physics),
+              .kick = 0.0,
               .sgs = "",
               .rans = "",
               .steady = ""};
@@ -2979,6 +3113,7 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         return validatePeriodic(r, std::move(c));
     if (r.sub == Subcommand::Channel) return validateChannel(r, std::move(c));
     if (r.sub == Subcommand::Conv) return validateConv(r, std::move(c));
+    if (r.sub == Subcommand::Flame) return validateFlame(r, std::move(c));
     return validateFlow(r, std::move(c));
 }
 
@@ -3033,6 +3168,17 @@ std::string flowRunLabel(const Case& c)
     return {};
 }
 
+std::string flameRunLabel(const Case& c)
+{
+    assert(c.sub == Subcommand::Flame);
+    return std::format(
+        "DNS [premixed single-step, calorically perfect, Le=1, "
+        "M_flame={:g} (inflated; CH4/air 1.15e-3)] species: MC-limited MUSCL "
+        "on the central mass flux (bounded scalar transport; mean flow "
+        "central)",
+        c.mach);
+}
+
 double hFine(const Case& c)
 {
     return c.focalActive ? hMin(c.grid.nz, c.focalHFine[0], c.focalHFine[1],
@@ -3046,6 +3192,51 @@ std::string Case::describe() const
 {
     if (sub == Subcommand::Prop) return describeProp(prop);
     if (sub == Subcommand::Hit) return describeHit(*this);
+    if (sub == Subcommand::Flame)
+    {
+        const double sig = flameModel.sigma, dth = flameEig.dthOverDD;
+        // dt estimate: the burnt acoustic bound and the thermal one (the
+        // runner's stableDt; the chemistry bound is printed at run time).
+        const double dtAc = cfl * h / (std::sqrt(sig) / mach + sig * flameUIn);
+        const double dtTh = 0.25 * h * h * (1.0 / sig) /
+                            (prandtl * std::max(1.0, kGammaAir / prandtl));
+        return std::format(
+            "case:\n"
+            "  mode       1D freely propagating premixed flame (dns flame "
+            "--mode premixed)\n"
+            "  model      single step F -> P, calorically perfect (gamma 1.4), "
+            "equal W, Le = 1\n"
+            "             sigma = Tb/Tu = {:.6g}  beta = {:.6g}  theta = Ta/Tu "
+            "= {:.6g}  Pr = {:.4g}\n"
+            "  oracle     Lambda = {:.10g} (FP64 phase plane; A burns at S_L = "
+            "1)  delta_th/delta_D = {:.6g}\n"
+            "  units      rho_u = S_L = R = 1, delta_D = 1, Tu = p0 = "
+            "1/(gamma M^2) = {:.6g}, q = cp (sigma-1) Tu = {:.6g}\n"
+            "  transport  {}\n"
+            "  grid       {} x {} x 1  h = {:.6g} = delta_th/{:.4g}  box "
+            "{:.6g} x {:.6g}  [native 2D, y periodic]\n"
+            "  flame      x_f0 = {:.6g} ({:.4g} delta_th fresh + {} sink "
+            "cells), {:.4g} delta_th burnt\n"
+            "  boundary   x NSCBC: inflow u = {:.4g} S_L (etaIn {:.4g}), "
+            "outflow p = p_b = p0 - {:.4g}; species carried in at Y = 1\n"
+            "             sink {} cells, amp {:.3g}\n"
+            "  run        tt = {:.6g} flame times (tEnd = {:.6g})  cfl = {:.3g}  "
+            "dt est {:.3e} (acoustic {:.3e}, thermal {:.3e})\n"
+            "  label      {}\n"
+            "  out        {}\n",
+            sig, flameModel.beta, flameModel.theta(), prandtl,
+            flameEig.Lambda, dth, flameTu,
+            kGammaAir / (kGammaAir - 1) * (sig - 1) * flameTu,
+            sutherland ? std::format("Sutherland lambda(T), S/Tu = {:.6g} "
+                                     "(Tu = {:.6g} K)",
+                                     flameModel.sOverTu, tinfK)
+                       : std::string("constant mu = Pr, lambda = cp"),
+            grid.nx, grid.ny, h, flameCells, grid.nx * h, grid.ny * h,
+            flameXf0, flameUp, nscbcSink, flameDown, flameUIn, nscbcEtaIn,
+            flameUIn * flameUIn * (sig - 1), nscbcSink, nscbcSinkAmp, ft,
+            tEnd, cfl, std::min(dtAc, dtTh), dtAc, dtTh,
+            flameRunLabel(*this), outPrefix);
+    }
     // Shared by both conv branches.
     const std::string patchLabel =
         hotPatch >= 1.0

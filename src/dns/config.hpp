@@ -3,6 +3,7 @@
 // The ONLY way to obtain a Case is validate(); its constructor is private.
 #pragma once
 
+#include "dns/chem.hpp"
 #include "dns/grid.hpp"
 #include "dns/prop/spec.hpp"
 #include "dns/rans.hpp"
@@ -20,7 +21,7 @@
 
 namespace dns {
 
-enum class Subcommand { Flow, Tgv, Hit, Bench, Channel, Conv, Prop };
+enum class Subcommand { Flow, Tgv, Hit, Bench, Channel, Conv, Prop, Flame };
 enum class Physics { Incompressible, Compressible };
 enum class FarField { Tunnel, Fringe, Sponge, Nscbc, Periodic };
 enum class Backend { Cpu, Gpu, Auto };
@@ -262,6 +263,14 @@ struct RawConfig
     double hotPatch = 1.0;  // heated side fraction of the floor; 1 = all of it
     int sides = 0;          // 0 periodic lateral faces, 1 closed (--sides)
 
+    // flame (premixed; docs/chem.md). Lengths in oracle thermal thicknesses.
+    int flameMode = 0;          // --mode; 0 premixed (the only one built)
+    double expansion = 5.0;     // sigma = Tb / Tu
+    double zeldovich = 8.0;     // beta
+    double cellsPerDelta = 15;  // cells per oracle delta_th
+    double upstream = 12, downstream = 10; // fresh / burnt extents
+    double inflowSpeed = 1.0;   // inflow speed / S_L
+
     // bench
     int steps = 20;
 
@@ -463,6 +472,17 @@ public:
     // stratification here, so dtempSuper == dtemp and gravity is not a knob.
     double kappaDiff = 0;  // thermal diffusivity
 
+    // flame (premixed single-step, model C0; dns/chem.hpp, docs/chem.md).
+    // Box units: rho_u = S_L = R = 1, delta_D = lambda_u/(rho_u cp S_L) = 1,
+    // so mu = Pr (lambda_u = cp) and A = Lambda. Tu = p0 = 1/(gamma M^2).
+    PremixedModel flameModel;
+    PremixedEigen flameEig;     // the oracle: Lambda, delta_th, profile table
+    double flameTu = 0;         // unburnt temperature = p0
+    double flameCells = 0;      // cells per delta_th
+    double flameUp = 0, flameDown = 0; // fresh / burnt extents, delta_th
+    double flameXf0 = 0;        // initial flame position (mid temperature)
+    double flameUIn = 1;        // inflow speed / S_L (the IC's mass flux)
+
     // prop: the resolved thrust-curve case (dns/prop/spec.hpp). Host-only --
     // `dns prop` never acquires a GPU.
     prop::Case prop;
@@ -504,6 +524,13 @@ private:
 // steady march, or the axisymmetric wedge; "" for a plain DNS/LES time march
 // (whose label is the DNS/LES slot of describe()).
 std::string flowRunLabel(const Case& c);
+
+// The run label of a `dns flame` case: the model (single-step, calorically
+// perfect, Le = 1), the flame Mach number with "(inflated)" and the CH4/air
+// value it stands in for, and the species scheme (MC-limited MUSCL on the
+// central mass flux). The ONE text the dry-run, the progress line and the
+// manifest carry. Pre: c.sub == Flame.
+std::string flameRunLabel(const Case& c);
 
 // The finest cell spacing the run resolves: the focal plateau's when
 // focalActive, the grid's otherwise, both by the hMin rule (z excluded at

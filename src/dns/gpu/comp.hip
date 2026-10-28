@@ -5,6 +5,7 @@
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/internal/stage_write.hpp"
 #include "dns/gpu/rans.hpp"
+#include "dns/gpu/species.hpp"
 #include "dns/remap.hpp"
 
 #include <rocprim/device/device_reduce.hpp>
@@ -445,9 +446,10 @@ hipError_t widenPair(const DeviceScalar& hi, const DeviceScalar& lo,
 } // namespace
 
 std::expected<DeviceCompState, hipError_t>
-DeviceCompState::make(std::size_t n, int nT, bool compensated)
+DeviceCompState::make(std::size_t n, int nT, bool compensated, int nY)
 {
-    assert(nT >= 0 && nT <= 2);
+    assert(nT >= 0 && nT <= 2 && nY >= 0 && nY <= kMaxY &&
+           !(compensated && nY));
     DeviceCompState s;
     auto alloc = [n](DeviceScalar& b, bool zeroed) -> hipError_t {
         auto e = DeviceScalar::make(n);
@@ -471,7 +473,24 @@ DeviceCompState::make(std::size_t n, int nT, bool compensated)
                 return std::unexpected(e);
     }
     s.nT = nT;
+    for (int k = 0; k < nY; ++k)
+        if (auto e = alloc(s.y[k], false); e != hipSuccess)
+            return std::unexpected(e);
+    s.nY = nY;
     return s;
+}
+
+hipError_t DeviceCompState::uploadSpecies(int k, const std::vector<double>& h)
+{
+    assert(k >= 0 && k < nY && h.size() == y[k].size());
+    return uploadNarrow(h, y[k]);
+}
+
+hipError_t DeviceCompState::downloadSpecies(int k, std::vector<double>& h) const
+{
+    assert(k >= 0 && k < nY);
+    h.resize(y[k].size());
+    return downloadWiden(y[k], h);
 }
 
 hipError_t DeviceCompState::uploadTurb(int i, const std::vector<double>& h)
@@ -819,8 +838,10 @@ void DeviceComp::setStageRange(CellRange r)
 }
 
 void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
-                       DeviceCompState& out, bool residualMode)
+                       DeviceCompState& out, bool residualMode,
+                       const SpeciesCombine* sc)
 {
+    assert((sc != nullptr) == (nSpecies() > 0));
     // RANS: mu_t lagged within the stage exactly like LES -- from the stage
     // input, through the SAME nut slot of the mean-flow flux.
     if (rans()) primitivesAndMut(s);
@@ -898,7 +919,69 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
             out.mz.data(), out.E.data(), nutp, kapScale, mz);
     });
     checkLastKernel("kCompStage");
+    if (sc) {
+        // Species (docs/chem.md): the cell pass of s, then the species
+        // stage, whose launch also adds the heat release to out.E on the
+        // SAME omega -- all before the rhs hook, so a characteristic
+        // overwrite still owns its rows.
+        chemCellPass(s);
+        species::SpeciesView sv;
+        sv.nY = sp_.nY;
+        sv.fuel = sp_.fuel;
+        sv.openX = sp_.openX ? 1 : 0;
+        sv.invPr = Real(sp_.invPr);
+        sv.q = Real(sp_.q);
+        for (int k = 0; k < sp_.nY; ++k) {
+            sv.yIn[k] = Real(sp_.yIn[k]);
+            sv.Y[k] = ycache_[k].data();
+        }
+        sv.omega = omega_.data();
+        species::stage(g_, vv, q, cmb, *sc, sv, out);
+    }
     if (rhsHook_) rhsHook_(s, out, cmb);
+}
+
+void DeviceComp::chemCellPass(const DeviceCompState& s)
+{
+    assert(nSpecies() > 0 && s.nY == nSpecies());
+    Real* Y[kMaxY] = {ycache_[0].data(), ycache_[1].data(), ycache_[2].data(),
+                      ycache_[3].data()};
+    species::cellPass(g_, s, T_.data(), Real(sp_.lnA), Real(sp_.Ta), sp_.fuel,
+                      Y, omega_.data());
+}
+
+void DeviceComp::updateChem(const DeviceCompState& s)
+{
+    primitives(s);
+    chemCellPass(s);
+}
+
+void DeviceComp::speciesOpenConsistency(const DeviceCompState& s,
+                                        DeviceCompState& out,
+                                        const StageCombine& cmb) const
+{
+    assert(nSpecies() > 0 && sp_.openX);
+    const PrimView q{s.rho.data(), u_.data(), v_.data(), w_.data(), e_.data(),
+                     p_.data(), T_.data()};
+    species::openConsistency(g_, q, cmb, sp_.nY, out);
+}
+
+std::expected<void, hipError_t> DeviceComp::enableSpecies(const SpeciesSetup& s)
+{
+    assert(!curvilinear() && !rans() && !compensated_ && !les() && !mrf_);
+    assert(s.nY >= 1 && s.nY <= kMaxY && s.fuel >= 0 && s.fuel < s.nY &&
+           s.invPr > 0 && s.Ta >= 0);
+    const std::size_t n = g_.size();
+    for (int k = 0; k < s.nY; ++k) {
+        auto b = DeviceScalar::make(n);
+        if (!b) return std::unexpected(b.error());
+        ycache_[k] = std::move(*b);
+    }
+    auto o = DeviceScalar::make(n);
+    if (!o) return std::unexpected(o.error());
+    omega_ = std::move(*o);
+    sp_ = s;
+    return allocStages(0);
 }
 
 namespace {
@@ -969,11 +1052,27 @@ void DeviceComp::step(DeviceCompState& s, Real dt)
         }
         return k;
     };
+    // Species (nSpecies() > 0): their a/b of the same two states; null off.
+    assert(s.nY == sp_.nY);
+    SpeciesCombine sk[3];
+    const SpeciesCombine* sp[3] = {nullptr, nullptr, nullptr};
+    if (sp_.nY > 0) {
+        const DeviceCompState* ab[3][2] = {{&s, &s}, {&s, &q1_}, {&s, &q2_}};
+        for (int st = 0; st < 3; ++st) {
+            for (int k = 0; k < sp_.nY; ++k) {
+                sk[st].ya[k] = ab[st][0]->y[k].data();
+                sk[st].yb[k] = ab[st][1]->y[k].data();
+            }
+            sk[st].nY = sp_.nY;
+            sp[st] = &sk[st];
+        }
+    }
     // Idempotent::yes: s is already the hook's output (setStageHook).
     if (hook_ && hookAtEntry_) hook_(s);
-    stage(s, cmb(s, Real(1), s, Real(0), dt, q1_), q1_);
+    stage(s, cmb(s, Real(1), s, Real(0), dt, q1_), q1_, false, sp[0]);
     if (hook_) hook_(q1_);
-    stage(q1_, cmb(s, Real(0.75), q1_, Real(0.25), Real(0.25) * dt, q2_), q2_);
+    stage(q1_, cmb(s, Real(0.75), q1_, Real(0.25), Real(0.25) * dt, q2_), q2_,
+          false, sp[1]);
     if (hook_) hook_(q2_);
     // ca = 1 - cb, not Real(1/3): the two rounded thirds sum to 1 + 3e-8 in
     // FP32, which inflated every conserved total by ~2e-8 per step on any
@@ -981,7 +1080,7 @@ void DeviceComp::step(DeviceCompState& s, Real dt)
     // RANS residual at 2^-25 q / dt. 1 - Real(2/3) is exact (Sterbenz), so
     // ca + cb == 1 exactly; cr = cb dt is unchanged.
     const Real cb3 = Real(2.0 / 3.0), ca3 = Real(1) - cb3;
-    stage(q2_, cmb(s, ca3, q2_, cb3, cb3 * dt, q1_), q1_);
+    stage(q2_, cmb(s, ca3, q2_, cb3, cb3 * dt, q1_), q1_, false, sp[2]);
     std::swap(s, q1_);
 }
 
@@ -1252,7 +1351,7 @@ void DeviceComp::setLts(bool on)
 std::expected<void, hipError_t> DeviceComp::allocStages(int nT)
 {
     for (auto* q : {&q1_, &q2_}) {
-        auto e = DeviceCompState::make(g_.size(), nT, compensated_);
+        auto e = DeviceCompState::make(g_.size(), nT, compensated_, sp_.nY);
         if (!e) return std::unexpected(e.error());
         *q = std::move(*e);
     }
@@ -1279,6 +1378,7 @@ hipError_t DeviceComp::uploadLts(const std::vector<Real>& ratios)
 void DeviceComp::residualInto(const DeviceCompState& s, DeviceCompState& out)
 {
     assert(s.nT == nTurb() && out.nT == s.nT && &out != &s);
+    assert(nSpecies() == 0); // species residuals: out of scope (docs/chem.md)
     // ca = cb = 0, cr = 1, no lts: the mean-flow kernel and every hook then
     // write the pure rhs (0 a + 0 b + 1 R == R exactly); the scalar kernel
     // needs its explicit mode, because the point-implicit form would return

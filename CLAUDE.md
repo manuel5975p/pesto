@@ -1,12 +1,12 @@
 # dns — working notes
 
 Reference: **README.md** (overview, solvers, BCs, walls, meshes, rotors); flags: `dns <sub> --help`. Design history: `docs/archive/`.
-Specs: `docs/nscbc.md`, `docs/validation.md` (anchors), `docs/viewer-format.md`, `docs/channel.md`, `docs/scene.md`, `docs/rans.md`, `docs/ui.md`, `docs/scenarios.md`.
+Specs: `docs/nscbc.md`, `docs/validation.md` (anchors), `docs/viewer-format.md`, `docs/channel.md`, `docs/scene.md`, `docs/rans.md`, `docs/ui.md`, `docs/scenarios.md`, `docs/chem.md`.
 **Open issues: `issues.md`** — what is broken, unproven or undecided at this commit. Read it before starting work; update it in the same commit that fixes, finds or defers an issue. This file stays the stable invariants.
 
 ## Ground rules
 
-- ONE solver binary: `build/dns <flow|tgv|hit|channel|conv|bench|prop>`. `dns --help` / `dns <sub> --help` are authoritative — read them, don't guess flags.
+- ONE solver binary: `build/dns <flow|tgv|hit|channel|conv|flame|bench|prop>`. `dns --help` / `dns <sub> --help` are authoritative — read them, don't guess flags.
 - `dns-ui` (scene editor, run cockpit, live viewer) links `dns_core` ONLY — never `dns_gpu`, never a solver. It RUNS a case by spawning `dns` and WATCHES it by mapping the run's shared-memory segment. `docs/ui.md`.
 - Live results are shared memory: `--emit shm` (`src/dns/shmframes.hpp`) publishes planes, mask, 3D volumes under a SEQLOCK (writer bumps odd, copies, bumps even; reader copies between two equal even reads, discards a torn one). The solver NEVER blocks on a viewer. Volumes capped at 512 MB, else planes only.
 - `--dry-run` validates + prints the resolved case (and DNS/LES label), no GPU or filesystem. Use it before every real run.
@@ -89,6 +89,16 @@ Specs: `docs/nscbc.md`, `docs/validation.md` (anchors), `docs/viewer-format.md`,
 - **The moving mask reaches only sinks that re-read it**: `RunOutput::updateMask` (frame time, toggling two bins' solid lists) refreshes PNG frames and shm planes. `<prefix>_mask.bin` and the web `static` mask hold azimuth 0; making them time-dependent is a viewer-format version bump (`docs/viewer-format.md`).
 - **`--rotor-frame mrf` is the frozen-rotor APPROXIMATION and says so everywhere.** Static azimuth-0 geometry, same `u = ω×r` image, rotating-frame equations (transport `u − f·ω×r`, Coriolis `−fρω×u`, pressure work on absolute u) in a blended cylinder sized off the swept bounds, REJECTED within (band + 4) cells of a face. (1) Transport correction is a CORNER STREAM POTENTIAL difference (`ψ = −ω f_a G(r)`, `G' = r f_r`), so it telescopes — never the pointwise `f·ω×r` (3e-2 velocity ring). (2) The tally passes the same `MrfView` as the rhs. (3) `stableDt` subtracts the frame velocity (eigenvalues `u_rel ± c`). Exact only for axisymmetric outer conditions (`gpu_mrf`: spinning cylinder vs direct 1e-4); warn for crossflow. `--rotor-bins` rejected; `rotor.bins == 1` and `Case::rotorMrf` is the switch. **O-grid MRF** (`--ogrid --rotor-frame mrf`, z shaft; moving geometry rejected): `DeviceComp::setMrfCurv` uses a per-NODE stream potential (face flux = Δψ of two corner nodes, telescopes on any z-extruded mesh, cancels the wall's normal flux at f = 1); wall row mirrors about `ω×r` at face midpoints (resting verbatim at ω = 0); tally adds the shaft moment. `gpu_mrf`: vs Cartesian direct 0.22%, transparency 6e-8.
 - Not built: on-disk table cache, incompressible branch, `dns-ui` support (editor `Build` is one `geo.cut`: azimuth 0 only).
+
+## Chemistry (`dns flame`, `docs/chem.md`)
+
+- **Species off is the solver bit for bit.** `nY == 0` takes no new branch in any kernel and `StageCombine` is unchanged (species ride `SpeciesCombine`). HEAD-vs-branch stats byte compares (flow comp + NSCBC + sink + ghost, conv, channel 3D, channel RANS) and the bench enforce it.
+- **Species ride the central MASS flux of `faceFlux` verbatim** (`Real(0.5)(ρa+ρb) * Real(0.5)(ua+ub)`), MC-limited MUSCL face value. Measured host: van Leer p = 1.75, upwind −2% at 15 cells; MC 2.12. A power-of-two uniform Y is exact to the bit through every stage, hook and band (`gpu_flame_passive`).
+- **One ω buffer per stage, read by both the species rhs and the heat release** (fused in the species launch, before the rhs hook).
+- **The rate floors Y; the state is never clamped; the guard counts** (`yHits`).
+- **Order inside the rhs hook: NSCBC → species re-carry → sink → species sink.** The re-carry must see the NSCBC density before the sink writes ρ. The species sink adds Y × the band's continuity term — D4 on ρY itself is unbounded on Y (measured 1 + 2e-5), do not bring it back.
+- **Mach inflation** is allowed for the non-dimensional model and is in the label (`flameRunLabel`). M 0.01 is the sweet spot: M 0.005 is FP32-contaminated (issues.md §31).
+- **S_L is measured on a SLIDING flame** (`--inflow-speed 0.98`, window [10, 20]): a stationary flame near |S_h − u_in| ≲ 1e-3 pins to the grid (issues.md §30).
 
 ## DNS vs LES vs RANS labeling
 
