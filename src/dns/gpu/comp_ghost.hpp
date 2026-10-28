@@ -156,9 +156,12 @@ struct CompGhostCapacity
 // fluid/solid face (a closed surface, sum n A == 0) and the fluid never sees a
 // resting pInf cell. Every wrong-side face has a side image or is counted in
 // sideSkipped. Pre: bbox is null or 6 doubles [lo xyz, hi xyz].
+// threads > 1 evaluates the sdf sweep on that many workers, each on its own
+// copy of sdf (which must then be reentrant, as buildRotorTable already
+// requires); the tables are bit-identical for any count.
 CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                                   const double* bbox, const AxisRemap3& remap,
-                                  const GhostWallMotion* motion);
+                                  const GhostWallMotion* motion, int threads = 1);
 
 class DeviceCompGhost
 {

@@ -9,6 +9,8 @@
 #include <algorithm> // std::max(initializer_list): NOT in <bits/stl_algobase.h>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
+#include <thread>
 #include <vector>
 
 namespace dns::gpu {
@@ -968,7 +970,7 @@ void CompGhostCapacity::cover(const CompGhostTables& t)
 
 CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                                   const double* bbox, const AxisRemap3& R,
-                                  const GhostWallMotion* motion)
+                                  const GhostWallMotion* motion, int threads)
 {
     const int nx = g.nx, ny = g.ny, nz = g.nz;
     const double hx = g.hx, hy = g.hy, hz = g.hz;
@@ -1038,13 +1040,31 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
     };
 
     std::vector<double> phi(g.size());
-    for (int k = 0; k < nz; ++k)
-        for (int j = 0; j < ny; ++j)
-            for (int i = 0; i < nx; ++i) {
-                const double x = cx(i), y = cy(j), z = cz(k);
-                phi[g.idx(i, j, k)] =
-                    (bbox && farFromBox(x, y, z)) ? outer : sdf(x, y, z);
-            }
+    // z slabs [k0, k1), each worker on its own copy of sdf: the values do not
+    // depend on the split, so the tables are bit-identical for any count.
+    auto phiSlab = [&](const GhostSdf& f, int k0, int k1) {
+        for (int k = k0; k < k1; ++k)
+            for (int j = 0; j < ny; ++j)
+                for (int i = 0; i < nx; ++i) {
+                    const double x = cx(i), y = cy(j), z = cz(k);
+                    phi[g.idx(i, j, k)] =
+                        (bbox && farFromBox(x, y, z)) ? outer : f(x, y, z);
+                }
+    };
+    const int nw = std::clamp(threads, 1, nz);
+    if (nw == 1)
+        phiSlab(sdf, 0, nz);
+    else {
+        std::vector<std::thread> pool;
+        pool.reserve(std::size_t(nw));
+        for (int w = 0; w < nw; ++w)
+            pool.emplace_back([&, w] {
+                const GhostSdf f = sdf;
+                phiSlab(f, int(std::int64_t(nz) * w / nw),
+                        int(std::int64_t(nz) * (w + 1) / nw));
+            });
+        for (auto& th : pool) th.join();
+    }
 
     // The flux stencil of a fluid cell: its face neighbours and its EDGE
     // neighbours (faceFlux reads the normal pair plus the tangential averages

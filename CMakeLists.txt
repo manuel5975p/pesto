@@ -447,7 +447,7 @@ if(BUILD_TESTING)
                   gpu_comp_ghost_closure_focal gpu_comp_ghost_couette_exact
                   gpu_comp_ghost_twoside gpu_comp_ghost_imperm
                   gpu_rotor_comoving_fixed_point gpu_comp_scale_invariance
-                  gpu_ghost_translate
+                  gpu_ghost_translate gpu_rotor_swap_ledger
                   gpu_comp_axis_permute gpu_comp_curv_axis_permute
                   comp_time_order gpu_comp_viscous_modes)
             add_executable(test_${t} tests/test_${t}.cpp)
@@ -467,7 +467,7 @@ if(BUILD_TESTING)
             gpu_rans_mask gpu_rans_ogrid gpu_rans_mms gpu_axisym gpu_axisym3d
             gpu_rans_immersed gpu_les_wall
             PROPERTIES TIMEOUT 60)
-        set_tests_properties(gpu_nk PROPERTIES TIMEOUT 120)
+        set_tests_properties(gpu_nk gpu_rotor_swap_ledger PROPERTIES TIMEOUT 120)
         # ~56 s alone (G10's 2.2e5-iteration compensated march, G9's 1.2e5
         # plain one). Its SST half is its own entry, ~32 s (S-G9's 2.2e5).
         # The 273 s once measured under ctest -j4 was GPU contention, which
@@ -714,7 +714,7 @@ if(BUILD_TESTING)
         gpu_channel_les)
     dns_label(mrf rotor gpu_rotor_wall gpu_rotor_table gpu_mrf gpu_mrf_rotor2
         gpu_mrf_conservation gpu_mrf_stabledt gpu_rotor_comoving_fixed_point
-        gpu_ghost_translate rotor_tip_guard)
+        gpu_ghost_translate rotor_tip_guard gpu_rotor_swap_ledger)
     dns_label(fast channel_config transport rans rans_channel1d steady_stop
         blockband channel_line pseudo_time flow_rans_config gpu_channel
         gpu_rans_mask gpu_rans_ogrid gpu_rans_mms gpu_axisym gpu_axisym3d gpu_nk

@@ -1430,6 +1430,17 @@ Reported per stats row when a rotor is active: `thrust` (force along the shaft),
 the drag is, so torque and drag can never disagree about which faces are the
 body.
 
+A moving (`--rotor-frame moving`) run adds `ct_c cq_c ct_sw cq_sw mdot_sw`:
+the tally's convective part (the swept wall face's `ρ u_w·n u`, included in
+`ct`/`cq`) and the rate at which the azimuth swaps hand the fluid content
+(cells that change side carry it, and no face tally sees it). `ct − ct_c` is
+the pressure + viscous force the body feels, `ct + ct_sw` the fluid's momentum
+budget, and `ct_c + ct_sw` the swept wall's net sink — a discretization error,
+reported so it can be quoted (rotor2 L1/L2: 0.0083 / 0.0025 CT). A freed cell
+enters on the wall profile (its ghost image reflected about the wall velocity),
+not on the image itself, which carries the wall-relative velocity reversed and
+was a 0.025 CT sink at L1 (`gpu_rotor_swap_ledger`).
+
 **Resolution is the gate, and it is measured, not assumed.** The ghost wall
 needs a mirror band at least two cells thick on each side
 (`gpu/comp_ghost.hpp`), so a blade under 4 fine cells thick has its two surfaces

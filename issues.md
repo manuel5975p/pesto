@@ -278,7 +278,12 @@ uncommitted).
 
 ## Rotor MRF parity (masterplan `plans/verify/masterplan_verify.md` W5-W7)
 
-14. **Rotor MRF parity is open. dns L1 CT is −0.02392 against central
+14. **Rotor MRF parity is open.** Status 2026-10-28 ((F) below): dns MRF
+    and dns moving agree on rotor2 CT to +5.6 / +3.6% (L1/L2) after the
+    freed-cell fill, so the gap to foam is frame-independent; DTMB 4119
+    MRF at D/h 189 is CT −14.7%, CQ −2.2% vs the foam best-grid estimate
+    (G2 × compressibility; CT itself ±5%+), deficit at r/R > 0.8
+    (`plans/verify/exp_prop.md`). **dns L1 CT is −0.02392 against central
     simpleFoam −0.01790 (+33.6%) and central rhoSimpleFoam −0.01865
     (+28.2%). CQ is +1.0% and −0.45% against the same two references. The
     OpenFOAM reference is itself
@@ -498,7 +503,9 @@ uncommitted).
         total normal −10.0 → −10.3%. The quoted numbers are final snapshots,
         but they are within 0.7% of the window means.
       - **Frame: dns MRF ≠ dns moving, by more than the gap, and they
-        bracket foam.**
+        bracket foam.** RETRACTED as an immersed-wall frame error by (F):
+        the moving numbers below were the freed-cell image's momentum
+        sink, not a frame-dependent wall error.
         - Moving (natural bins) time-mean CT is +0.0134 / +0.0090 /
           −0.0009 ± 0.0011 at L1/L2/L3. MRF is −0.0463 / −0.0303 / −0.0273,
           and foam −0.0171.
@@ -565,6 +572,66 @@ uncommitted).
           has a normal velocity (`gpu_mrf` frame parity uses an axisymmetric
           cylinder, where (ω×r)·n = 0, so it never tests that);
         - a time-averaged `--emit surface` for moving runs.
+    - **(F) FIXED 2026-10-28: the MRF-vs-moving gap was the moving path's
+      swap, not the frame** (`plans/verify/impl_mrfmove.md`). dns sign
+      below (ct > 0 = net drag; foam CT = −ct), window 3.0–4.5 D/U.
+      - **Swap ledger.** A swap hands the fluid the content of the cells
+        that change side (freed cells: their old ghost image; deleted
+        cells: their fluid state), which no face tally sees. Moving stats
+        now carry `ct_c cq_c ct_sw cq_sw mdot_sw` (fc and the ledger rate;
+        `thrust torque ct cq` byte-identical to HEAD, MRF/static stats
+        files byte-identical whole). `gpu_rotor_swap_ledger` (periodic 2D
+        ellipse): fluid Px/Py = −∫tally + ledger to ≤ 2.9e-7 absolute
+        (≤ 1.5e-7 of ∫|F|dt); without the ledger it misses by 6e-3–1.4e-2.
+        Lz closes to 5–8e-4 of ΔLz (cell-centre arms: angular momentum
+        is not telescoped).
+      - **The cancellation hypothesis (fc + swap ≈ 0) is REFUTED.**
+        Net swept-wall sink ct_c + ct_sw, HEAD image: +0.0253 / +0.0192
+        CT (L1/L2), cq_c + cq_sw −0.0211 / −0.0152; ct_sw +0.0410 /
+        +0.0307 against ct_c −0.0157 / −0.0115. Cause: a freed cell
+        enters the fluid holding its ghost image (1+a)u_w − a u_s, the
+        wall-relative velocity REVERSED.
+      - **Fix: freed-cell fill** (`SwapLedgerScratch::reseedCreated`,
+        always on for moving rotors): reflect the image about u_w,
+        u = u_w + a(u_s − u_w), rho and internal energy kept. Sink
+        +0.0083 / +0.0025 CT (−67 / −87%), cq −0.0080 / −0.0046. 2D
+        ellipse Lz sink −0.150 → −0.092 of ∫Q 1.50.
+      - **Frames now agree on CT** (moving full ct vs MRF): L1 +0.01184
+        → +0.04047 vs +0.03833 (+5.6%), L2 +0.01011 → +0.02786 vs
+        +0.02689 (+3.6%). CQ −0.06419 → −0.08499 vs −0.07393 (+15%), L2
+        −0.07050 → −0.08424 vs −0.07852 (+7.3%), converging.
+      - **So the foam gap is frame-INDEPENDENT.** vs Bc unlimited (CT
+        0.017090, CQ 0.083313): MRF L2 +57% / −5.8%, moving L2 +63% /
+        +1.1%. The open item is the outer-span chord-normal deficit
+        ((D)), now also measured on a real prop (DTMB 4119, below).
+      - **MRF azimuth bias at L1 (X5): spread 0.0165 CT** over blade
+        orientations 0 / 22.5 / 45 / 67.5° (ct +0.03833 / +0.03280 /
+        +0.04933 / +0.04025, mean +0.04018; cq spread 0.0031, mean
+        −0.07596). Quote the azimuth mean at L1; L2/L3 not scanned.
+      - **DTMB 4119, MRF, Re_D 800, J 0.833, tip M 0.41, 3.18 D/U**
+        (foam sign). Only converged foam: simpleFoam B F1 (708k cells,
+        central U, M → 0): CT 0.02799, CQ 0.06265 (CT_p 0.0948, CT_v
+        −0.0668). Every rhoSimpleFoam (Bc) F1 attempt diverged (rc 1).
+        dns D/h_fine 113.8 (6.1M) / 154.4 (12.0M): CT 0.01629 / 0.01846
+        (−42 / −34%), CQ 0.06129 / 0.06007 (−2.2 / −4.1%); CT drift
+        over the last 0.6 D/U +2.5 / +1.3%, CQ ≤ 0.05%. CT_p 0.0862
+        (−9.1%), CT_v −0.0657 (−1.6%) at 154. NOT AT PARITY: CT is
+        viscous-cancelled (lift thrust 0.086 against drag 0.066), so a 9%
+        pressure-thrust deficit is −34% CT -- the rotor2 pattern.
+        **Rescored 2026-10-28 (`exp_prop.md`): F1 is foam's coarsest mesh
+        (CT F1/G1/G2 0.02799/0.02473/0.02358); the reference is G2 ×
+        F1's A/B ratio = CT 0.0233 (±5%+), CQ 0.0612 (±1.2%).** D/h 114 /
+        154 / 189 (P3, 20.7M, 1186 s GPU): CT 0.01615 / 0.01835 / 0.01939
+        at matched post-ramp windows (P3 2.5–3.0 D/U 0.01987, flat to
+        0.2% within the block), CQ 0.06126 / 0.06005 / 0.05991 -> P3 CT
+        −14.7%, CQ −2.2%. Ladder extrapolates CT 0.021–0.024: overlaps
+        foam, parity neither shown nor excluded. Blade bins inboard of
+        r/D 0.40 within 3–5% of G2; r/D 0.40–0.45 −9.3% (flat 154 → 189),
+        0.45–0.50 −34% (still rising): 75% of the deficit at r/R > 0.8,
+        t/h_fine 3.3 → 1.7. Hub at parity. MRF azimuth bias at D/h 114:
+        +15° turn moves CT −10.0%, CQ −1.1% (tip bin); unmeasured at 189.
+        Torque p/v split +29% / −18% vs G2 while total CQ agrees
+        (unisolated).
     - **dns (rotor).** L1 is the 80f147f run (4.58 D/U, D/h_fine 59.5, 4.1M cells,
       131 s). L2/L3 are not run: they cost ~550 and ~2100 s, over the cap.
       rotor1 cannot be grid-refined under 300 s, which is why W7 makes

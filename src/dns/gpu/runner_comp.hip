@@ -30,6 +30,7 @@
 #include <numbers>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace dns::gpu {
@@ -216,8 +217,15 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         // tip 0.5608 vs real 0.3927, r2 0.718 against a plateau half-width
         // 0.589, diverged at t = 3.07).
         const GhostWallMotion motion = rotorWallMotion(r.rotor);
+        // Threaded sdf sweep: on a focal mesh nearly every cell is inside the
+        // bbox band, and a mesh sdf there is minutes single-threaded (DTMB
+        // 4119, 160k triangles, 6.1M cells: ~2 min). The same sdf copies the
+        // azimuth table already evaluates concurrently.
+        const int classifyThreads =
+            std::max(1, int(std::thread::hardware_concurrency()) / 2);
         const CompGhostTables tbls = classifyCompGhost(
-            g, sdf, bbox ? bbox->data() : nullptr, fremap, &motion);
+            g, sdf, bbox ? bbox->data() : nullptr, fremap, &motion,
+            classifyThreads);
         if (tbls.nGhost() == 0 || tbls.nFace() == 0)
             return fail(3, "rotor: the body has no mirrored ghost cells -- it "
                            "is not resolved by this grid at all");
@@ -413,6 +421,11 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     // long run cannot drift off the table.
     int rotorBinLoaded = 0;
     long rotorSwaps = 0;
+    // The swap ledger (moving rotors): fluid content gained across swaps since
+    // the last stats row, shaft components, and the run totals.
+    SwapLedgerScratch ledger;
+    double swMass = 0, swMom = 0, swMoment = 0, tPrevRow = 0;
+    double swTotal[3] = {0, 0, 0};
     // The body mask the artefacts show. A rotor's blade moves, so it is
     // refreshed at FRAME time (rare) rather than at bin time (often), and by
     // toggling the two bins' solid lists rather than rewriting the grid -- the
@@ -540,6 +553,15 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                                        "ct", "cq"}
             : std::vector<std::string>{"t", "dt", "cd", "cl", "cs", "wmax",
                                        "qw"};
+    // A MOVING rotor's tally carries the swept wall's convective flux fc (zero
+    // on MRF and at rest), which is not a body force: its counterpart is the
+    // content the azimuth swaps hand the fluid, which no face tally sees. Both
+    // are reported so the pressure+viscous force (ct - ct_c) and the fluid's
+    // budget force (ct + ct_sw) can be read; ct_c + ct_sw is the swept wall's
+    // net momentum sink, a discretization error (rotor2 L2 0.0025 CT with the
+    // freed-cell fill). ct/cq keep their full-tally meaning.
+    if (rotorTable)
+        cols.insert(cols.end(), {"ct_c", "cq_c", "ct_sw", "cq_sw", "mdot_sw"});
     if (rans)
         cols.insert(cols.end(),
                     {"mutMax", "yplusMax", "yplusMean", "floorHits"});
@@ -823,6 +845,24 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
             const int b = rotorBin(r.rotor, rotorAzimuth(r.rotor, t));
             if (b != rotorBinLoaded)
             {
+                // Freed cells enter the fluid on the wall profile, not on
+                // their ghost image (the wall-relative velocity reversed):
+                // the image cost rotor2 L1 a net momentum sink of 0.0253 CT
+                // at the swept wall, the fill 0.0083 (impl_mrfmove.md).
+                auto n = ledger.reseedCreated(
+                    *ds, rotorTable->bins[std::size_t(rotorBinLoaded)],
+                    rotorTable->bins[std::size_t(b)]);
+                if (!n) return fail(6, "rotor freed-cell fill failed");
+                auto sw = ledger.measure(
+                    g, fremap,
+                    mtr ? std::span<const double>(mtr->vol)
+                        : std::span<const double>{},
+                    *ds, rotorTable->bins[std::size_t(rotorBinLoaded)],
+                    rotorTable->bins[std::size_t(b)], r.rotor.shaft);
+                if (!sw) return fail(6, "rotor swap ledger failed");
+                swMass += sw->mass;
+                swMom += sw->mom[shaftAxis];
+                swMoment += sw->moment[shaftAxis];
                 if (ghost->load(rotorTable->bins[std::size_t(b)]) != hipSuccess)
                     return fail(6, "rotor azimuth swap failed");
                 rotorBinLoaded = b;
@@ -874,7 +914,40 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
             // both signed, so a rotor pushing the wrong way reads negative
             // rather than plausible.
             const double thrust = f[shaftAxis], torque = q[shaftAxis];
-            if (r.rotor.active())
+            if (rotorTable)
+            {
+                auto sf = ghost->surfaceFaces(*dev, *ds, 0.0);
+                if (!sf) return fail(6, "the surface tally split failed");
+                const auto& pv = r.rotor.shaft;
+                const int u = (shaftAxis + 1) % 3, v = (shaftAxis + 2) % 3;
+                double fc = 0, qc = 0;
+                for (const auto& sface : *sf)
+                {
+                    const double a[3] = {sface.x[0] - pv[0], sface.x[1] - pv[1],
+                                         sface.x[2] - pv[2]};
+                    fc += sface.fc[shaftAxis];
+                    qc += a[u] * sface.fc[v] - a[v] * sface.fc[u];
+                }
+                const double span_t = t - tPrevRow;
+                const double rate = span_t > 0 ? 1.0 / span_t : 0.0;
+                const double row[] = {
+                    t,      dt,     st.cd,  st.cl,
+                    st.cs,  wmax,   F.heat, thrust,
+                    torque, ctDen > 0 ? thrust / ctDen : 0.0,
+                    cqDen > 0 ? torque / cqDen : 0.0,
+                    ctDen > 0 ? fc / ctDen : 0.0,
+                    cqDen > 0 ? qc / cqDen : 0.0,
+                    ctDen > 0 ? -swMom * rate / ctDen : 0.0,
+                    cqDen > 0 ? -swMoment * rate / cqDen : 0.0,
+                    swMass * rate};
+                out.row("stats", row);
+                swTotal[0] += swMass;
+                swTotal[1] += swMom;
+                swTotal[2] += swMoment;
+                swMass = swMom = swMoment = 0.0;
+                tPrevRow = t;
+            }
+            else if (r.rotor.active())
             {
                 const double row[] = {t,      dt,     st.cd,  st.cl,
                                       st.cs,  wmax,   F.heat, thrust,
@@ -956,6 +1029,10 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                     "%.1f revolutions)\n",
                     rotorSwaps, st.steps, double(rotorSwaps) / double(st.steps),
                     std::abs(r.rotor.omega) * t / (2.0 * std::numbers::pi));
+    if (rotorTable && st.steps > 0)
+        std::printf("rotor: swap ledger over the logged rows: mass %+.6e, "
+                    "shaft momentum %+.6e, shaft moment %+.6e (fluid gain)\n",
+                    swTotal[0], swTotal[1], swTotal[2]);
     if (auto e = writeSurface(); !e) return std::unexpected(e.error());
     finishTiming(st, wall0, out);
     return st;

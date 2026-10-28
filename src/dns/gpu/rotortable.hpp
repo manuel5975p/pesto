@@ -27,7 +27,9 @@
 #include "dns/gpu/comp_ghost.hpp"
 #include "dns/rotor.hpp"
 
+#include <array>
 #include <expected>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -74,5 +76,47 @@ std::expected<RotorTable, std::string>
 buildRotorTable(const Grid& g, const Rotor& rot,
                 const std::function<GhostSdf()>& sdfFactory,
                 const double* bbox, const AxisRemap3& remap, int threads = 0);
+
+// What the FLUID gains when the resident bin changes: cells solid before and
+// fluid after (created) enter with the state they hold, cells fluid before
+// and solid after (deleted) leave with theirs. The surface tally never sees
+// this content, so a moving rotor's momentum budget is tally + swap ledger
+// (the tally's convective part fc is the swept wall's half of the same
+// transfer). FP64 sums of q V; `moment` is sum (x - pivot) x (rho u) V.
+struct SwapLedger
+{
+    double mass = 0, mom[3] = {}, moment[3] = {};
+    int created = 0, deleted = 0;
+};
+
+// Device scratch for swap ledgers, grown on demand (a swap is a surface's worth
+// of cells). Pre: s holds the state the swap happens to; from.solid and
+// to.solid ascending (classifyCompGhost order); vol empty (uniform cells,
+// g.cellVolume()) or g.size() exact cell volumes; centres are the remap of the
+// reference centres (the identity off focal). Fails only on a device error.
+class SwapLedgerScratch
+{
+public:
+    std::expected<SwapLedger, hipError_t>
+    measure(const Grid& g, const AxisRemap3& remap, std::span<const double> vol,
+            const DeviceCompState& s, const CompGhostTables& from,
+            const CompGhostTables& to, const std::array<double, 3>& pivot);
+
+    // Freed-cell fill: a cell that turns fluid at this swap holds its old
+    // ghost image (1 + a) u_w - a u_s, the wall-relative velocity REVERSED.
+    // Reflect it about u_w -- u = u_w + a (u_s - u_w), the same linear wall
+    // profile on the fluid side -- keeping rho and the internal energy (low
+    // words zeroed). Returns the number of cells reseeded; created cells that
+    // were deep (no image) are left as they are. Pre: s ghost-filled with
+    // `from`, before load(to); from has a moving wall (uwall).
+    std::expected<int, hipError_t> reseedCreated(DeviceCompState& s,
+                                                 const CompGhostTables& from,
+                                                 const CompGhostTables& to);
+
+private:
+    DeviceBuffer<Real> uw_;
+    DeviceBuffer<int> idx_;
+    DeviceBuffer<Real> val_;
+};
 
 } // namespace dns::gpu
