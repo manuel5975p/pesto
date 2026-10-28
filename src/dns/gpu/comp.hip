@@ -928,13 +928,18 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
         species::SpeciesView sv;
         sv.nY = sp_.nY;
         sv.fuel = sp_.fuel;
+        sv.ox = sp_.ox;
+        sv.stoich = Real(sp_.stoich);
         sv.openX = sp_.openX ? 1 : 0;
         sv.invPr = Real(sp_.invPr);
         sv.q = Real(sp_.q);
         for (int k = 0; k < sp_.nY; ++k) {
             sv.yIn[k] = Real(sp_.yIn[k]);
             sv.Y[k] = ycache_[k].data();
+            sv.yInRow[k] = yinRow_[k].size() ? yinRow_[k].data() : nullptr;
+            sv.yHi[k] = Real(sp_.yHi[k]);
         }
+        sv.ambientHi = sp_.ambientHi ? 1 : 0;
         sv.omega = omega_.data();
         species::stage(g_, vv, q, cmb, *sc, sv, out);
     }
@@ -947,7 +952,7 @@ void DeviceComp::chemCellPass(const DeviceCompState& s)
     Real* Y[kMaxY] = {ycache_[0].data(), ycache_[1].data(), ycache_[2].data(),
                       ycache_[3].data()};
     species::cellPass(g_, s, T_.data(), Real(sp_.lnA), Real(sp_.Ta), sp_.fuel,
-                      Y, omega_.data());
+                      sp_.ox, Y, omega_.data());
 }
 
 void DeviceComp::updateChem(const DeviceCompState& s)
@@ -966,11 +971,31 @@ void DeviceComp::speciesOpenConsistency(const DeviceCompState& s,
     species::openConsistency(g_, q, cmb, sp_.nY, out);
 }
 
+void DeviceComp::speciesBoundaryHeat(DeviceCompState& out,
+                                     const StageCombine& cmb) const
+{
+    assert(nSpecies() > 0 && sp_.openX);
+    species::boundaryHeat(g_, cmb, Real(sp_.q), omega_.data(), out);
+}
+
+void DeviceComp::speciesInflowPin(DeviceCompState& out) const
+{
+    assert(nSpecies() > 0 && sp_.openX);
+    species::SpeciesView sv;
+    sv.nY = sp_.nY;
+    for (int k = 0; k < sp_.nY; ++k) {
+        sv.yIn[k] = Real(sp_.yIn[k]);
+        sv.yInRow[k] = yinRow_[k].size() ? yinRow_[k].data() : nullptr;
+    }
+    species::inflowPin(g_, sv, out);
+}
+
 std::expected<void, hipError_t> DeviceComp::enableSpecies(const SpeciesSetup& s)
 {
     assert(!curvilinear() && !rans() && !compensated_ && !les() && !mrf_);
     assert(s.nY >= 1 && s.nY <= kMaxY && s.fuel >= 0 && s.fuel < s.nY &&
-           s.invPr > 0 && s.Ta >= 0);
+           s.invPr > 0 && s.Ta >= 0 && s.ox < s.nY && s.ox != s.fuel &&
+           s.stoich > 0);
     const std::size_t n = g_.size();
     for (int k = 0; k < s.nY; ++k) {
         auto b = DeviceScalar::make(n);
@@ -980,6 +1005,17 @@ std::expected<void, hipError_t> DeviceComp::enableSpecies(const SpeciesSetup& s)
     auto o = DeviceScalar::make(n);
     if (!o) return std::unexpected(o.error());
     omega_ = std::move(*o);
+    const std::size_t rows = std::size_t(g_.ny) * g_.nz;
+    for (int k = 0; k < s.nY; ++k) {
+        if (s.yInRow[k].empty()) continue;
+        assert(s.openX && s.yInRow[k].size() == rows);
+        auto b = DeviceScalar::make(rows);
+        if (!b) return std::unexpected(b.error());
+        const std::vector<Real> f(s.yInRow[k].begin(), s.yInRow[k].end());
+        if (auto e = b->upload(f.data()); e != hipSuccess)
+            return std::unexpected(e);
+        yinRow_[k] = std::move(*b);
+    }
     sp_ = s;
     return allocStages(0);
 }

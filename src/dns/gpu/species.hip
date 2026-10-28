@@ -4,6 +4,7 @@
 #include "dns/gpu/device_util.hpp"
 
 #include <cassert>
+#include <type_traits>
 
 namespace dns::gpu::species {
 namespace {
@@ -19,6 +20,20 @@ __global__ void kChemCellPass(GpuGrid g, int nY, const Real* rho,
     const Real r = rho[c];
     for (int k = 0; k < nY; ++k) Y[k][c] = ys.ya[k][c] / r;
     omega[c] = arrheniusRate(lnA, Ta, r, Y[fuel][c], T[c]);
+}
+
+// The two-reactant cell pass (SpeciesSetup::ox >= 0): arrheniusRate2.
+__global__ void kChemCellPass2(GpuGrid g, int nY, const Real* rho,
+                               SpeciesCombine ys, const Real* T, Real lnA,
+                               Real Ta, int fuel, int ox, Real* Y0, Real* Y1,
+                               Real* Y2, Real* Y3, Real* omega)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= g.size()) return;
+    Real* Y[kMaxY] = {Y0, Y1, Y2, Y3};
+    const Real r = rho[c];
+    for (int k = 0; k < nY; ++k) Y[k][c] = ys.ya[k][c] / r;
+    omega[c] = arrheniusRate2(lnA, Ta, r, Y[fuel][c], Y[ox][c], T[c]);
 }
 
 // Wrap-aware offsets from cell (i,j,k) to its SECOND neighbours along each
@@ -99,6 +114,9 @@ __device__ inline void cellFaces(const GpuGrid& g, int i, int a, int open,
           op && i == g.nx - 1};
 }
 
+// Row: per-row inflow fractions (SpeciesView::yInRow); its own instantiation,
+// so the uniform-inflow kernel is the shipped code.
+template <bool Row>
 __global__ void kSpeciesStage(GpuGrid g, ViscView vv, PrimView q,
                               StageCombine cmb, SpeciesCombine sc,
                               SpeciesView sv, Real* oy0, Real* oy1, Real* oy2,
@@ -127,9 +145,13 @@ __global__ void kSpeciesStage(GpuGrid g, ViscView vv, PrimView q,
         const Real dl = openLo ? Real(0) : faceRhoD(vv, q, sv.invPr, fl);
         for (int s = 0; s < sv.nY; ++s) {
             const Real* Y = sv.Y[s];
-            const Real Fh = openHi ? mo * (mo > Real(0) ? Y[c] : sv.yIn[s])
+            Real yin = sv.yIn[s];
+            if constexpr (Row)
+                if (sv.yInRow[s])
+                    yin = sv.yInRow[s][std::size_t(j) + std::size_t(g.ny) * k];
+            const Real Fh = openHi ? mo * (mo > Real(0) ? Y[c] : yin)
                                    : faceY(Y, fh, mh, dh, h);
-            const Real Fl = openLo ? mo * (mo < Real(0) ? Y[c] : sv.yIn[s])
+            const Real Fl = openLo ? mo * (mo < Real(0) ? Y[c] : yin)
                                    : faceY(Y, fl, ml, dl, h);
             div[s] -= (Fh - Fl) / h;
         }
@@ -139,6 +161,114 @@ __global__ void kSpeciesStage(GpuGrid g, ViscView vv, PrimView q,
     const Real om = sv.omega[c];
     for (int s = 0; s < sv.nY; ++s) {
         const Real r = s == sv.fuel ? div[s] - om : div[s];
+        out[s][c] = cmb.ca * sc.ya[s][c] + cmb.cb * sc.yb[s][c] + cr * r;
+    }
+    oE[c] += cr * (sv.q * om);
+}
+
+// The shared limiter of face f (two-reactant kernel): theta = min over the
+// VOTING species of mcSlope(d1, d2) / d2, in [0, 2] (2 = none votes). The
+// face value Y_up + theta/2 d2 is LINEAR in Y across species: an affine
+// combination of the species (the coupling functions, the mixture fraction)
+// is transported exactly by the same formula, whatever theta is. A voter
+// keeps its own TVD bound (theta <= its own MC ratio; Sweby's region is
+// star-shaped toward 0). A species votes iff |d2| >= kVoteJump = 2^-24 (the
+// FP32 resolution of a unit mass fraction): a reactant consumed to ~1e-40
+// on the far side of the sheet carries sign-flipping rounding noise whose
+// "extrema" (theta = 0) forced first-order upwind on EVERY species across
+// the whole far side -- measured on the advected layer (gpu_diffusion_mix)
+// Z 5.0e-3 below the analytic erf at the slab centre with every species
+// voting, max error 1.5e-3 with the threshold. A non-voter moves at most |d2| <
+// 2^-24 past its own neighbours per face, and votes again once it varies.
+inline constexpr float kVoteJump = 0x1p-24f;
+__device__ inline Real sharedTheta(const SpeciesView& sv, const Face& f,
+                                   Real mdot)
+{
+    // Upwind cell = an open-face boundary cell (no second neighbour): the
+    // CENTRAL face value (theta 1, between the two cells, so bounded) -- the
+    // premixed kernel's first-order upwind there is a convective-flux
+    // mismatch mdot (Y_R - Y_L)/2 against the central energy flux.
+    if (mdot >= Real(0) ? f.firstL : f.firstR) return Real(1);
+    Real th = Real(2);
+    for (int s = 0; s < sv.nY; ++s) {
+        const Real* Y = sv.Y[s];
+        Real d1, d2;
+        if (mdot >= Real(0)) {
+            d1 = f.firstL ? Real(0) : Y[f.L] - Y[f.LL];
+            d2 = Y[f.R] - Y[f.L];
+        } else {
+            d1 = f.firstR ? Real(0) : Y[f.R] - Y[f.RR];
+            d2 = Y[f.L] - Y[f.R];
+        }
+        if (fabsf(d2) >= kVoteJump) th = fminf(th, mcSlope(d1, d2) / d2);
+    }
+    return th;
+}
+
+__device__ inline Real faceY2(const Real* Y, const Face& f, Real mdot,
+                              Real th, Real rhoD, Real h)
+{
+    const Real yf = mdot >= Real(0)
+                        ? Y[f.L] + Real(0.5) * th * (Y[f.R] - Y[f.L])
+                        : Y[f.R] + Real(0.5) * th * (Y[f.L] - Y[f.R]);
+    return mdot * yf - rhoD * (Y[f.R] - Y[f.L]) / h;
+}
+
+// The two-reactant species stage (SpeciesSetup::ox >= 0): kSpeciesStage
+// with the shared limiter and the oxidizer sink stoich * omega. Its own
+// kernel, so the premixed one stays the shipped code. The open x-hi face
+// carries the boundary cell's own Y BOTH ways: the inflow fractions belong
+// to x-lo (the premixed kernel's backflow took the x-lo row's jet fuel in
+// through the outflow). AmbHi (the candle's top): backflow carries sv.yHi.
+template <bool Row, bool AmbHi = false>
+__global__ void kSpeciesStage2(GpuGrid g, ViscView vv, PrimView q,
+                               StageCombine cmb, SpeciesCombine sc,
+                               SpeciesView sv, Real* oy0, Real* oy1, Real* oy2,
+                               Real* oy3, Real* oE)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= g.size()) return;
+    int i, j, k;
+    decompose(g, c, i, j, k);
+    const Offsets o = offsetsAt(g, i, j, k);
+    const Offsets o2 = offsets2At(g, i, j, k);
+    const Real* uc[3] = {q.u, q.v, q.w};
+    Real div[kMaxY] = {Real(0), Real(0), Real(0), Real(0)};
+    for (int a = 0; a < 3; ++a) {
+        const Real h = a == 0 ? g.hx : a == 1 ? g.hy : g.hz;
+        Face fh, fl;
+        cellFaces(g, i, a, sv.openX, c, o, o2, fh, fl);
+        const bool openHi = sv.openX && a == 0 && i == g.nx - 1;
+        const bool openLo = sv.openX && a == 0 && i == 0;
+        const Real mo = q.rho[c] * q.u[c];
+        const Real mh = openHi ? mo : faceMdot(q, uc[a], fh);
+        const Real ml = openLo ? mo : faceMdot(q, uc[a], fl);
+        const Real dh = openHi ? Real(0) : faceRhoD(vv, q, sv.invPr, fh);
+        const Real dl = openLo ? Real(0) : faceRhoD(vv, q, sv.invPr, fl);
+        const Real th = openHi ? Real(0) : sharedTheta(sv, fh, mh);
+        const Real tl = openLo ? Real(0) : sharedTheta(sv, fl, ml);
+        for (int s = 0; s < sv.nY; ++s) {
+            const Real* Y = sv.Y[s];
+            Real yin = sv.yIn[s];
+            if constexpr (Row)
+                if (sv.yInRow[s])
+                    yin = sv.yInRow[s][std::size_t(j) + std::size_t(g.ny) * k];
+            Real yb = Y[c]; // backflow: the cell's own Y
+            if constexpr (AmbHi) yb = mo < Real(0) ? sv.yHi[s] : Y[c];
+            const Real Fh = openHi ? mo * yb : faceY2(Y, fh, mh, th, dh, h);
+            const Real Fl = openLo ? mo * (mo < Real(0) ? Y[c] : yin)
+                                   : faceY2(Y, fl, ml, tl, dl, h);
+            div[s] -= (Fh - Fl) / h;
+        }
+    }
+    Real* out[kMaxY] = {oy0, oy1, oy2, oy3};
+    const Real cr = cmb.crAt(c);
+    const Real om = sv.omega[c];
+    const Real omO = sv.stoich * om;
+    for (int s = 0; s < sv.nY; ++s) {
+        const Real r = s == sv.fuel ? div[s] - om
+                       : s == sv.ox ? div[s] - omO
+                                    : div[s];
         out[s][c] = cmb.ca * sc.ya[s][c] + cmb.cb * sc.yb[s][c] + cr * r;
     }
     oE[c] += cr * (sv.q * om);
@@ -188,12 +318,20 @@ __global__ void kSpeciesOpenFix(GpuGrid g, PrimView q, StageCombine cmb,
 } // namespace
 
 void cellPass(const GpuGrid& g, const DeviceCompState& s, const Real* T,
-              Real lnA, Real Ta, int fuel, Real* const Y[kMaxY], Real* omega)
+              Real lnA, Real Ta, int fuel, int ox, Real* const Y[kMaxY],
+              Real* omega)
 {
-    assert(s.nY >= 1 && fuel >= 0 && fuel < s.nY);
+    assert(s.nY >= 1 && fuel >= 0 && fuel < s.nY && ox < s.nY && ox != fuel);
     SpeciesCombine ys;
     for (int k = 0; k < s.nY; ++k) ys.ya[k] = s.y[k].data();
     ys.nY = s.nY;
+    if (ox >= 0) {
+        kChemCellPass2<<<launchBlocks(g.size()), blockSize>>>(
+            g, s.nY, s.rho.data(), ys, T, lnA, Ta, fuel, ox, Y[0], Y[1], Y[2],
+            Y[3], omega);
+        checkLastKernel("kChemCellPass2");
+        return;
+    }
     kChemCellPass<<<launchBlocks(g.size()), blockSize>>>(
         g, s.nY, s.rho.data(), ys, T, lnA, Ta, fuel, Y[0], Y[1], Y[2], Y[3],
         omega);
@@ -205,10 +343,83 @@ void stage(const GpuGrid& g, ViscView vv, PrimView q, const StageCombine& cmb,
            DeviceCompState& out)
 {
     assert(!cmb.ol[0] && !cmb.lts && sc.nY == sv.nY && out.nY == sv.nY);
-    kSpeciesStage<<<launchBlocks(g.size()), blockSize>>>(
-        g, vv, q, cmb, sc, sv, out.y[0].data(), out.y[1].data(),
-        out.y[2].data(), out.y[3].data(), out.E.data());
+    bool row = false;
+    for (int s = 0; s < sv.nY; ++s) row = row || sv.yInRow[s] != nullptr;
+    auto launch = [&](auto r) {
+        kSpeciesStage<decltype(r)::value><<<launchBlocks(g.size()), blockSize>>>(
+            g, vv, q, cmb, sc, sv, out.y[0].data(), out.y[1].data(),
+            out.y[2].data(), out.y[3].data(), out.E.data());
+    };
+    auto launch2 = [&](auto r, auto amb) {
+        kSpeciesStage2<decltype(r)::value, decltype(amb)::value>
+            <<<launchBlocks(g.size()), blockSize>>>(
+                g, vv, q, cmb, sc, sv, out.y[0].data(), out.y[1].data(),
+                out.y[2].data(), out.y[3].data(), out.E.data());
+    };
+    if (sv.ox >= 0) {
+        // The ambient top rides the per-row (candle) instantiation only.
+        assert(!sv.ambientHi || (row && sv.openX));
+        if (row && sv.ambientHi) launch2(std::true_type{}, std::true_type{});
+        else if (row) launch2(std::true_type{}, std::false_type{});
+        else launch2(std::false_type{}, std::false_type{});
+        checkLastKernel("kSpeciesStage2");
+        return;
+    }
+    if (row) launch(std::true_type{});
+    else launch(std::false_type{});
     checkLastKernel("kSpeciesStage");
+}
+
+namespace {
+
+__global__ void kBoundaryHeat(GpuGrid g, StageCombine cmb, Real q,
+                              const Real* omega, Real* oE)
+{
+    const std::size_t nA = std::size_t(g.ny) * g.nz;
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= 2 * nA) return;
+    const std::size_t r = t % nA;
+    const int i = t < nA ? 0 : g.nx - 1;
+    const std::size_t c = gidx(g, i, int(r % g.ny), int(r / g.ny));
+    oE[c] += cmb.crAt(c) * (q * omega[c]);
+}
+
+__global__ void kSpeciesInflowPin(GpuGrid g, int nY, SpeciesView sv,
+                                  const Real* oRho, Real* y0, Real* y1,
+                                  Real* y2, Real* y3)
+{
+    const std::size_t nA = std::size_t(g.ny) * g.nz;
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= nA) return;
+    const int j = int(t % g.ny), k = int(t / g.ny);
+    const std::size_t c = gidx(g, 0, j, k);
+    Real* y[kMaxY] = {y0, y1, y2, y3};
+    for (int s = 0; s < nY; ++s) {
+        const Real yt = sv.yInRow[s] ? sv.yInRow[s][t] : sv.yIn[s];
+        y[s][c] = yt * oRho[c];
+    }
+}
+
+} // namespace
+
+void inflowPin(const GpuGrid& g, const SpeciesView& sv, DeviceCompState& out)
+{
+    assert(sv.nY >= 1 && out.nY == sv.nY);
+    const std::size_t n = std::size_t(g.ny) * g.nz;
+    kSpeciesInflowPin<<<launchBlocks(n), blockSize>>>(
+        g, sv.nY, sv, out.rho.data(), out.y[0].data(), out.y[1].data(),
+        out.y[2].data(), out.y[3].data());
+    checkLastKernel("kSpeciesInflowPin");
+}
+
+void boundaryHeat(const GpuGrid& g, const StageCombine& cmb, Real q,
+                  const Real* omega, DeviceCompState& out)
+{
+    assert(!cmb.ol[0]);
+    const std::size_t n = 2 * std::size_t(g.ny) * g.nz;
+    kBoundaryHeat<<<launchBlocks(n), blockSize>>>(g, cmb, q, omega,
+                                                  out.E.data());
+    checkLastKernel("kBoundaryHeat");
 }
 
 void openConsistency(const GpuGrid& g, PrimView q, const StageCombine& cmb,

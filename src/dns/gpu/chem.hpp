@@ -20,7 +20,9 @@ inline constexpr double kChemDt = 0.5;
 // FP64 chemistry dt bound kChemDt / max_c J_c, J_c = A e^(-Ta/T)
 // (1 + q Y Ta / (cv T^2)): the fuel's own consumption rate plus the thermal
 // runaway rate of the heat release, per cell from the conserved state. The
-// solver's stableDt stays byte-identical; the runner takes the min.
+// solver's stableDt stays byte-identical; the runner takes the min. Two-
+// reactant step (SpeciesSetup::ox >= 0): J_c = k rho (Y_O + s Y_F + q Y_F Y_O
+// Ta/(cv T^2)).
 // Pre: d.nSpecies() > 0, s.nY == d.nSpecies().
 double chemStableDt(const DeviceComp& d, const DeviceCompState& s,
                     ReduceScratch& r);
@@ -28,9 +30,11 @@ double chemStableDt(const DeviceComp& d, const DeviceCompState& s,
 // Deterministic FP64 per-x-column sums over (j, k), one thread per column,
 // fixed order: out[i * kFlameSums + q] for q =
 //   0 rho, 1 rho u, 2 T, 3 rho Y_fuel, 4 omega, 5 E + q rho Y_fuel, 6 u, 7 p,
-//   8 count of cells with Y_fuel outside [-1e-6, 1 + 1e-6].
+//   8 count of cells with Y_fuel outside [-1e-6, 1 + 1e-6],
+//   9 min Y_fuel, 10 max Y_fuel (Y = rhoY/rho in FP64 from the FP32 words:
+//     the overshoot MAGNITUDE the count hides).
 // Pre: d.updateChem(s) ran (primitives and omega of s are live).
-inline constexpr int kFlameSums = 9;
+inline constexpr int kFlameSums = 11;
 hipError_t flameColumnStats(const DeviceComp& d, const DeviceCompState& s,
                             DeviceBuffer<double>& scratch,
                             std::vector<double>& host);

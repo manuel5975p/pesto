@@ -35,11 +35,13 @@ find_package(ZLIB REQUIRED) # fieldpng.cpp (PNG frame export)
 add_library(dns_core
     src/dns/blockband.cpp
     src/dns/bodies.cpp
+    src/dns/bunsen.cpp
     src/dns/channel_line.cpp
     src/dns/chem.cpp
     src/dns/cli.cpp
     src/dns/casegeom.cpp
     src/dns/config.cpp
+    src/dns/diffusion.cpp
     src/dns/framemap.cpp
     src/dns/cutcell.cpp
     src/dns/diagnostics.cpp
@@ -401,7 +403,7 @@ if(BUILD_TESTING)
         fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport
         rotor focal cli_defaults comp_axis_permute rans rans_channel1d
         steady_stop blockband channel_line pseudo_time flow_rans_config
-        flame1d flame_config)
+        flame1d flame_config bunsen diffusion candle)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)
     endif()
@@ -625,6 +627,52 @@ if(BUILD_TESTING)
         add_test(NAME gpu_flame1d_suth COMMAND test_gpu_flame1d suth)
         set_tests_properties(gpu_flame1d_grid gpu_flame1d_mach gpu_flame1d_suth
             PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        # dns flame --mode bunsen (docs/chem.md): the cone at U_jet 3 and 5
+        # (8 cells, ~20 s each), the anchoring guard (cold coflow exits 8,
+        # the fast burnt strip anchors), the per-row inflow bit for bit.
+        add_executable(test_gpu_bunsen tests/test_gpu_bunsen.cpp)
+        target_link_libraries(test_gpu_bunsen PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_bunsen PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_bunsen dns)
+        add_test(NAME gpu_bunsen_cone COMMAND test_gpu_bunsen cone)
+        add_test(NAME gpu_bunsen_anchor COMMAND test_gpu_bunsen anchor)
+        set_tests_properties(gpu_bunsen_cone gpu_bunsen_anchor
+            PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        # dns flame --mode diffusion (docs/chem.md): the two-reactant step on
+        # an analytic diffusion layer -- the coupling function to rounding,
+        # bounds, the Burke-Schumann sheet position and flux (mix), the flame
+        # temperature against T_ad (heat); and the jet through the binary.
+        add_executable(test_gpu_diffusion_layer
+            tests/test_gpu_diffusion_layer.cpp)
+        target_link_libraries(test_gpu_diffusion_layer PRIVATE dns_gpu)
+        add_test(NAME gpu_diffusion_mix COMMAND test_gpu_diffusion_layer mix)
+        add_test(NAME gpu_diffusion_heat COMMAND test_gpu_diffusion_layer heat)
+        set_tests_properties(gpu_diffusion_mix gpu_diffusion_heat
+            PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+        add_executable(test_gpu_diffusion_jet tests/test_gpu_diffusion_jet.cpp)
+        target_link_libraries(test_gpu_diffusion_jet PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_diffusion_jet PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_diffusion_jet dns)
+        add_test(NAME gpu_diffusion_jet COMMAND test_gpu_diffusion_jet jet)
+        add_test(NAME gpu_diffusion_guard COMMAND test_gpu_diffusion_jet guard)
+        set_tests_properties(gpu_diffusion_jet gpu_diffusion_guard
+            PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+        # dns flame --mode candle (docs/chem.md): the diffusion flame under
+        # gravity -- the quiescent hydrostatic box stays at rest (rest), g = 0
+        # is the diffusion jet bit for bit (g0), the flame height vs the fuel
+        # flow rate against Roper's buoyant slot law (height).
+        add_executable(test_gpu_candle tests/test_gpu_candle.cpp)
+        target_link_libraries(test_gpu_candle PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_candle PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_candle dns)
+        add_test(NAME gpu_candle_rest COMMAND test_gpu_candle rest)
+        add_test(NAME gpu_candle_g0 COMMAND test_gpu_candle g0)
+        add_test(NAME gpu_candle_height COMMAND test_gpu_candle height)
+        set_tests_properties(gpu_candle_rest gpu_candle_g0 gpu_candle_height
+            PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
 
 
         # --- Physical validation suite (docs/validation.md) -----------------

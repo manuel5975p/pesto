@@ -97,6 +97,46 @@ int main()
                   std::abs(b->flameEig.Lambda / 69343676.77 - 1) < 1e-6,
               "--cells-per-delta 30 --zeldovich 10 resolve");
     }
+    {
+        // --wrinkle: off is exactly the planar IC; on displaces the front by
+        // flameWrinkle(y), mode sum with the documented amplitude.
+        check(flameWrinkle(0, 8, 3.0, 10.0) == 0, "wrinkle A = 0 is exactly 0");
+        double s2 = 0;
+        const int M = 4096;
+        for (int j = 0; j < M; ++j) {
+            const double w = flameWrinkle(1.0, 16, (j + 0.5) * 10.0 / M, 10.0);
+            s2 += w * w;
+        }
+        check(std::abs(std::sqrt(s2 / M) - std::sqrt(0.5)) < 1e-9,
+              "wrinkle rms = A/sqrt(2) over the box height");
+        check(std::abs(flameWrinkle(1.0, 16, 0.3, 10.0) -
+                       flameWrinkle(1.0, 16, 10.3, 10.0)) < 1e-12,
+              "wrinkle is Ly-periodic");
+
+        auto p = runCli({"flame", "--ny", "128"});
+        auto w = runCli({"flame", "--ny", "128", "--wrinkle", "0.5",
+                         "--wrinkle-modes", "4"});
+        check(p && w && p->flameWrinkle == 0 && w->flameWrinkle == 0.5 &&
+                  w->flameWrinkleModes == 4,
+              "--wrinkle 0.5 --wrinkle-modes 4 resolve");
+        if (p && w) {
+            CompState qp, qw;
+            std::vector<double> rp, rw;
+            flameIC(*p, qp, rp);
+            flameIC(*w, qw, rw);
+            const Grid& g = p->grid;
+            bool rowsEqual = true, rowsDiffer = false;
+            for (int i = 0; i < g.nx; ++i) {
+                rowsEqual = rowsEqual && qp.rho[g.idx(i, 0, 0)] == qp.rho[g.idx(i, 77, 0)];
+                rowsDiffer = rowsDiffer || qw.rho[g.idx(i, 0, 0)] != qw.rho[g.idx(i, 77, 0)];
+            }
+            check(rowsEqual && rowsDiffer, "planar IC is y-uniform, wrinkled is not");
+            check(p->describe().find("wrinkle") == std::string::npos &&
+                      w->describe().find("wrinkle 0.5 delta_th over modes 1..4") !=
+                          std::string::npos,
+                  "dry-run names the wrinkle only when on");
+        }
+    }
 
     rejects({"flame", "--re", "100"}, 2, "--re", "--re rejected by name");
     rejects({"flame", "--ft", "3"}, 2, "--ft", "--ft rejected by name");
@@ -129,8 +169,112 @@ int main()
     rejects({"flame", "--nscbc-etain", "0"}, 2, "--nscbc-etain",
             "--nscbc-etain 0 rejected");
     rejects({"flame", "--tt", "0"}, 2, "--tt", "--tt 0 rejected");
-    rejects({"flame", "--mode", "diffusion"}, 1, "premixed",
-            "--mode diffusion is a CLI error listing premixed");
+    rejects({"flame", "--ny", "128", "--wrinkle", "-1"}, 2, "--wrinkle",
+            "--wrinkle -1 rejected");
+    rejects({"flame", "--ny", "128", "--wrinkle-modes", "4"}, 2,
+            "--wrinkle-modes", "--wrinkle-modes without --wrinkle rejected");
+    rejects({"flame", "--ny", "128", "--wrinkle", "0.5", "--wrinkle-modes", "17"},
+            2, "--wrinkle-modes", "--wrinkle-modes 17 > ny/8 rejected");
+    rejects({"flame", "--ny", "128", "--wrinkle", "0.5", "--wrinkle-modes", "0"},
+            2, "--wrinkle-modes", "--wrinkle-modes 0 rejected");
+    rejects({"flame", "--ny", "128", "--wrinkle", "2", "--wrinkle-modes", "16"},
+            2, "--wrinkle", "--wrinkle 2 x sqrt(16) past half of --downstream rejected");
+    {
+        // --mode bunsen: the box from the burner, the dry-run geometry, the
+        // inflow profile and IC (dns/bunsen.hpp).
+        auto c = runCli({"flame", "--mode", "bunsen"});
+        check(c && c->flameBunsen, "--mode bunsen validates at its defaults");
+        if (c) {
+            const double dth = c->flameEig.dthOverDD, h = c->grid.hx;
+            const BunsenGeom& b = c->bunsen;
+            check(std::abs(h - dth / 8) < 1e-15, "bunsen default: 8 cells/delta_th");
+            check(c->grid.ny == 2 * 18 * 8 && c->grid.nx == 45 * 8 + 32,
+                  "bunsen grid 392 x 288 (W 12 + 2 x 12 coflow; 45 delta_th "
+                  "+ 2 x 16 sink)");
+            check(std::abs(b.W - 12 * dth) < 1e-12 && b.uJet == 5 &&
+                      b.uCo == 1 && b.tCo == 5 && b.pilot == 0 &&
+                      std::abs(b.yc - 0.5 * c->grid.ny * h) < 1e-12,
+                  "bunsen defaults: W 12, U 5, burnt coflow at 1, centred");
+            check(std::abs(b.coneH - 6 * std::sqrt(24.0) * dth) < 1e-9,
+                  "ideal cone height (W/2) sqrt(U^2 - 1)");
+            const std::string d = c->describe();
+            check(d.find("2D slot Bunsen") != std::string::npos &&
+                      d.find("alpha = 11.54 deg") != std::string::npos &&
+                      d.find("burnt") != std::string::npos,
+                  "dry-run prints the burner, the ideal angle, the pilot");
+            CompState q;
+            std::vector<double> ry;
+            bunsenIC(*c, q, ry);
+            const Grid& g = c->grid;
+            const std::size_t jc = std::size_t(g.ny / 2);
+            const std::size_t a = g.idx(0, int(jc), 0), o = g.idx(0, 0, 0);
+            const std::size_t t = g.idx(g.nx - 1, int(jc), 0);
+            // The axis sits (W/2) cos(alpha) = 9.4 delta_D inside the flank:
+            // the preheat tail e^-9.4 still shows at 1e-4.
+            check(std::abs(ry[a] / q.rho[a] - 1) < 1e-3 &&
+                      std::abs(q.mx[a] / q.rho[a] - 5) < 5e-3,
+                  "IC at the slot exit: Y = 1, u = U_jet (to the preheat tail)");
+            check(ry[o] / q.rho[o] < 1e-9 &&
+                      std::abs(q.rho[o] * 5 - 1) < 1e-9,
+                  "IC in the coflow: Y = 0, rho = rho_u / sigma (burnt)");
+            check(ry[t] / q.rho[t] < 1e-6 && std::abs(q.mx[t] - 5) < 1e-9,
+                  "IC past the tip: burnt, the column's mass flux");
+        }
+        auto p = runCli({"flame", "--mode", "bunsen", "--coflow-temp", "1",
+                         "--pilot-width", "3", "--pilot-speed", "5"});
+        check(p && p->bunsen.tCo == 1 && p->bunsen.tPilot == 5 &&
+                  p->bunsen.uPilot == 5 &&
+                  p->grid.ny == 2 * int(std::ceil((6 + 3 + 12) * 8.0)),
+              "pilot strips: temp defaults to sigma, box widened by them");
+        auto e = runCli({"flame", "--mode", "bunsen", "--expansion", "7"});
+        check(e && e->bunsen.tCo == 7, "--coflow-temp default follows sigma");
+        auto L = runCli({"flame", "--mode", "bunsen", "--jet-speed", "3",
+                         "--cells-per-delta", "12", "--length", "30"});
+        check(L && L->grid.nx == 30 * 12 + 32, "--length 30 at 12 cells");
+    }
+    for (const char* f : {"--upstream", "--downstream", "--inflow-speed",
+                          "--wrinkle", "--wrinkle-modes", "--ny", "--profile-dt"})
+        rejects({"flame", "--mode", "bunsen", f, "1"}, 2, f,
+                std::string(f) + " rejected by name with --mode bunsen");
+    for (const char* f : {"--slot-width", "--jet-speed", "--coflow-speed",
+                          "--coflow-width", "--coflow-temp", "--pilot-width",
+                          "--pilot-temp", "--pilot-speed", "--slot-edge",
+                          "--length", "--pulse", "--pulse-freq"})
+        rejects({"flame", f, "1"}, 2, f,
+                std::string(f) + " rejected by name without --mode bunsen");
+    auto B = [](std::vector<std::string> extra) {
+        std::vector<std::string> a{"flame", "--mode", "bunsen"};
+        a.insert(a.end(), extra.begin(), extra.end());
+        return a;
+    };
+    rejects(B({"--slot-width", "3"}), 2, "--slot-width", "--slot-width 3 rejected");
+    rejects(B({"--jet-speed", "1.2"}), 2, "--jet-speed", "--jet-speed 1.2 rejected");
+    rejects(B({"--jet-speed", "8", "--mach", "0.05"}), 2, "--jet-speed",
+            "jet Mach 0.4 rejected");
+    rejects(B({"--coflow-speed", "6"}), 2, "--coflow-speed",
+            "--coflow-speed above the jet rejected");
+    rejects(B({"--coflow-width", "1"}), 2, "--coflow-width",
+            "--coflow-width 1 rejected");
+    rejects(B({"--coflow-temp", "0.5"}), 2, "--coflow-temp",
+            "--coflow-temp 0.5 rejected");
+    rejects(B({"--coflow-temp", "6"}), 2, "--coflow-temp",
+            "--coflow-temp above sigma rejected");
+    rejects(B({"--pilot-temp", "3"}), 2, "--pilot-temp",
+            "--pilot-temp without --pilot-width rejected");
+    rejects(B({"--pilot-width", "2", "--pilot-speed", "9"}), 2, "--pilot-speed",
+            "--pilot-speed above the jet rejected");
+    rejects(B({"--slot-edge", "0.1"}), 2, "--slot-edge",
+            "--slot-edge below one cell rejected");
+    rejects(B({"--length", "20"}), 2, "--length",
+            "--length shorter than the cone rejected");
+    rejects(B({"--pulse", "0.6", "--pulse-freq", "1"}), 2, "--pulse",
+            "--pulse 0.6 rejected");
+    rejects(B({"--pulse", "0.1"}), 2, "--pulse-freq",
+            "--pulse without --pulse-freq rejected");
+    rejects(B({"--pulse-freq", "1"}), 2, "--pulse-freq",
+            "--pulse-freq without --pulse rejected");
+    rejects({"flame", "--mode", "counterflow"}, 1, "premixed",
+            "an unbuilt --mode is a CLI error listing premixed");
     rejects({"flame", "--lewis", "0.8"}, 1, "--lewis",
             "--lewis is not registered (no Le != 1 oracle)");
     rejects({"flame", "--body", "cylinder"}, 1, "--body",

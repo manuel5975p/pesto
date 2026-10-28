@@ -50,6 +50,16 @@ DNS_HD inline R arrheniusRate(R lnA, R Ta, R rho, R Y, R T)
     return exp(lnA - Ta / T) * rho * (Y > R(0) ? Y : R(0));
 }
 
+// Bimolecular fuel consumption rate of the diffusion flame F + s O -> (1+s) P
+// (dns/diffusion.hpp): omega = exp(lnA - Ta/T) rho^2 max(Y_F, 0) max(Y_O, 0).
+// Same floors, same log form. Pre: T > 0.
+template <class R>
+DNS_HD inline R arrheniusRate2(R lnA, R Ta, R rho, R YF, R YO, R T)
+{
+    return exp(lnA - Ta / T) * rho * rho * (YF > R(0) ? YF : R(0)) *
+           (YO > R(0) ? YO : R(0));
+}
+
 // A dimensional (or non-dimensional) 1D flame: F -> P, Le = 1, Y_u = 1, so
 // Y = (Tb - T)/(Tb - Tu) and q = cp (Tb - Tu). rho(T) and lambda(T) are the
 // isobaric state; omega = A rho Y exp(-Ta/T).

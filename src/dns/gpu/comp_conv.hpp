@@ -8,7 +8,7 @@
 // The solver is FULLY COMPRESSIBLE, so density responds to temperature through
 // the equation of state and buoyancy is just gravity acting on that density.
 // There is no Boussinesq approximation here and no buoyancy term beyond
-// addGravityY: the whole effect is rho(T) g.
+// addGravity: the whole effect is rho(T) g.
 //
 // GPU-only header.
 #pragma once
@@ -49,7 +49,7 @@ public:
         // across the PLATES is the experiment, and a conducting side would be a
         // second uncontrolled source. false leaves x and z periodic.
         bool closedSides = false;
-        // Gravity magnitude (along -y), the SAME gy addGravityY applies: the
+        // Gravity magnitude (along -y), the SAME gy addGravity applies: the
         // plates' pressure image balances it. 0 is the zero-gradient copy.
         double gravity = 0.0;
     };
@@ -70,18 +70,23 @@ private:
     Config c_;
 };
 
-// Gravity of magnitude gy pointing in -y, on the FLUID cells (rows 1..ny-2,
-// and with `closed` the lateral ghost columns excluded too):
-// out.my += crAt * (-gy rho) and out.E += crAt * (-gy my), with rho and my the
+// THE gravity source: magnitude gy pointing in -axis, m the axis momentum:
+// out.m += crAt * (-gy rho) and out.E += crAt * (-gy m), with rho and m the
 // live stage state. Applied inside the RHS hook so it rides SSP-RK3 exactly
-// and the FUSED stage kernel stays untouched (StageCombine, comp.hpp); the
-// ghost rows are excluded because the wall mirror owns them.
+// and the FUSED stage kernel stays untouched (StageCombine, comp.hpp).
+//   axis 1 (y): the conv box. FLUID cells only (rows 1..ny-2, and with
+//     `closed` the lateral ghost columns excluded too): the wall mirror owns
+//     the ghost rows. The shipped conv arithmetic, bit for bit.
+//   axis 0 (x): the open-x flame box (dns flame --mode candle). No ghost
+//     cells: every cell, the NSCBC rows included -- their LODI carries the
+//     hydrostatic incoming waves (DeviceCompNscbc::Config::hydroLo/Hi), so
+//     call it AFTER the overwrite. Pre: !closed.
 //
 // gy does not enter stableDt: the free-fall bound sqrt(h/gy) is orders above
 // the acoustic one for every case this solver can run (the layer would have to
 // be shorter than a cell for it to bind).
-void addGravityY(const GpuGrid& g, double gy, const StageCombine& cmb,
-                 bool closed, const DeviceCompState& s, DeviceCompState& out);
+void addGravity(const GpuGrid& g, int axis, double gy, const StageCombine& cmb,
+                bool closed, const DeviceCompState& s, DeviceCompState& out);
 
 // Deterministic FP64 per-y-plane moment sums: for every row j,
 //   out[j*6 + 0..5] = sum over (i,k) of

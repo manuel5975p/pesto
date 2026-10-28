@@ -66,7 +66,7 @@ DNS 13.6 ms/step (1234 Mcell/s), Smagorinsky 15.6, σ 16.0, 1.46 GiB.
 | `hit` | forced homogeneous isotropic turbulence, SI-configured, h = 1.5 η | `dns hit --help` |
 | `channel` | wall-resolved compressible channel; `--les`, `--rans` | `docs/channel.md`, `docs/rans.md` |
 | `conv` | Rayleigh–Bénard convection, compressible or Boussinesq | below |
-| `flame` | 1D premixed flame, single-step chemistry, against its FP64 oracle | `docs/chem.md` |
+| `flame` | single-step flames: premixed against its FP64 oracle (1D, or a 2D slot Bunsen cone, `--mode bunsen`); a 2D slot-jet diffusion flame, F + s O → P, against the Burke–Schumann sheet (`--mode diffusion`); the same flame under gravity from a wick, a 2D candle (`--mode candle`) | `docs/chem.md` |
 | `bench` | step time, Mcell/s and the VRAM this process allocates | `dns bench --help` |
 | `prop` | propeller thrust curve by BEMT or lifting line, host-only | below |
 
@@ -112,6 +112,18 @@ build/dns conv --rayleigh 5e4 --n 96 --ny 48 --nz 1
 
 # 1D premixed flame, 15 cells per thermal thickness, M 0.01 (~11 s)
 build/dns flame --inflow-speed 0.98 --tt 20 --emit stats
+
+# 2D slot Bunsen cone on a burnt coflow, U_jet 5 S_L, M 0.02 (~20 s); video:
+# tools/chem/fire_video.py PREFIX --out cone.mp4 (needs --emit bin)
+build/dns flame --mode bunsen --mach 0.02 --tt 30 --emit stats
+
+# 2D slot-jet diffusion flame (fuel slot, oxidizer coflow), steady by tt ~60
+# (~15 s for tt 80); same video tool
+build/dns flame --mode diffusion --tt 80 --emit stats
+
+# 2D candle: the diffusion flame under gravity from a low-Peclet wick, steady
+# by tt ~20 (~100 s for tt 30); fire_video.py --gamma 3 --smooth 4
+build/dns flame --mode candle --tt 30 --emit stats
 
 # a multi-object scene
 build/dns flow --scene examples/tandem_cylinders.toml
@@ -414,7 +426,7 @@ A layer between no-slip isothermal plates (hot floor, cold lid), gravity in
 R = ρ_ref = 1.
 
 **`--physics compressible`** (default, `gpu/comp_conv` + `runner_conv`).
-Buoyancy is ρ(T)·g through the EOS — one source term (`addGravityY`) on the
+Buoyancy is ρ(T)·g through the EOS — one source term (`addGravity`) on the
 RHS hook; there is no Boussinesq approximation in this branch. The IC is the
 hydrostatic conduction state. `--mach` SETS gravity (`g = M²γ/dtemp`). Gravity
 carries its adiabatic gradient g/c_p, so only the superadiabatic excess drives
@@ -526,6 +538,6 @@ Tiers, labels, tolerances, the quarantine and anchor regeneration:
 | `docs/ui.md` | `dns-ui`: editor, run cockpit, live viewer |
 | `docs/viewer-format.md` | web frame format, run `.json`, `_surface.csv`, `--emit mesh` |
 | `docs/jobs.md` | `simjobd` / `simjob`: the job server every GPU/CPU run goes through |
-| `docs/chem.md` | `dns flame`: model C0, the phase-plane oracle vs Cantera, species scheme, hook order, measured S_L |
+| `docs/chem.md` | `dns flame`: model C0, the phase-plane oracle vs Cantera, species scheme, hook order, measured S_L; the 2D slot Bunsen (per-row inflow, pilot anchoring, measured cone); the slot-jet diffusion flame; the 2D candle (gravity, hydrostatic NSCBC, height vs fuel flow) |
 | `src/compat/cuda/README.md` | the CUDA header shim |
 | `docs/archive/` | historical plans and analyses |

@@ -107,6 +107,14 @@ struct SpeciesSetup
 {
     int nY = 1;          // 1 <= nY <= kMaxY
     int fuel = 0;        // the species the step consumes
+    // Two-reactant step (dns flame --mode diffusion, dns/diffusion.hpp): ox
+    // >= 0 names the oxidizer, consumed at stoich * omega, and the rate is
+    // arrheniusRate2 (rho^2 Y_F Y_O). Every species then shares ONE MC
+    // limiter per face, so any affine combination (the coupling functions)
+    // is transported by the same linear face formula (docs/chem.md). ox < 0
+    // is the premixed step and its kernels, bit for bit.
+    int ox = -1;
+    double stoich = 1;
     double lnA = 0;      // ln of the pre-exponential; -inf = no reaction
     double Ta = 0;       // activation temperature, box units
     double q = 0;        // heat release per unit fuel mass, box units
@@ -116,6 +124,18 @@ struct SpeciesSetup
     // ScalarBoundary rule. false = periodic x.
     bool openX = false;
     double yIn[kMaxY] = {}; // inflow mass fractions (openX)
+    // Per-row inflow mass fractions (openX, dns flame --mode bunsen): one
+    // entry per (j, k) row at j + ny k, replacing yIn[k] for that species.
+    // Empty = the uniform yIn (its own kernel instantiation, bit for bit).
+    std::vector<double> yInRow[kMaxY] = {};
+    // x-hi backflow fractions (two-reactant kernel only, dns flame --mode
+    // candle): flow entering through the TOP carries yHi -- the ambient air
+    // the NSCBC top relaxes it toward -- instead of the boundary cell's own
+    // Y (products drawn back down into the box diluted its oxidizer: the
+    // scouts' tips crept up through the run). false = own Y both ways, its
+    // own instantiation (bit for bit).
+    bool ambientHi = false;
+    double yHi[kMaxY] = {};
 };
 
 // An unevaluated sum hi + lo of two floats (the compensated state's words).
@@ -457,6 +477,25 @@ public:
     // and BEFORE the sink (which writes rho too). Pre: speciesSetup().openX.
     void speciesOpenConsistency(const DeviceCompState& s, DeviceCompState& out,
                                 const StageCombine& cmb) const;
+    // The heat release of the open-x rows, re-added after the NSCBC overwrite
+    // dropped it: out.E += crAt q omega on i = 0 and nx - 1, omega the
+    // stage's own cell pass (NSCBC with a source term: LODI owns the
+    // hyperbolic part, the source rides along). Only a flame that burns in
+    // its boundary rows needs it (--mode bunsen); the 1D flame's boundary
+    // rate is 4.7e-16 of the peak and keeps the historical bits by not
+    // calling it. Call INSIDE the rhs hook, right after the NSCBC overwrite.
+    // Pre: speciesSetup().openX, plain cmb.
+    void speciesBoundaryHeat(DeviceCompState& out,
+                             const StageCombine& cmb) const;
+    // The x-lo inflow row's species PINNED to the inflow fractions: rhoY_k =
+    // Y_in,k(row) rho_out on i = 0 (dns flame --mode diffusion). The stiff
+    // NSCBC entropy relax holds that row's T at its target, so its species
+    // are held with it (free, they mix laterally and burn against a held T:
+    // cp T + q Y_F stops being the mixing invariant there). A consistency
+    // choice; its isolated effect is not measured (issues.md §45). Call
+    // INSIDE the rhs hook after the NSCBC overwrite and the re-carry.
+    // Pre: speciesSetup().openX.
+    void speciesInflowPin(DeviceCompState& out) const;
     // RANS: the wall distance enableRans uploaded (FP32, g.size()).
     const DeviceScalar& wallDistance() const { return wd_; }
 
@@ -615,6 +654,7 @@ private:
     // the per-stage fuel rate.
     SpeciesSetup sp_{.nY = 0};
     DeviceScalar ycache_[kMaxY], omega_;
+    DeviceScalar yinRow_[kMaxY]; // SpeciesSetup::yInRow on the device
     std::function<void(DeviceCompState&)> hook_;
     bool hookAtEntry_ = true; // setStageHook's Idempotent::no
     CellRange stageRange_{};  // setStageRange; the whole grid by default

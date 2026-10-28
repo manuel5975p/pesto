@@ -293,7 +293,8 @@ Measured gfx1100 via simjob, 2026-10-28.
     across the band.** It adds Y_k × the band's continuity term (bounded);
     D4 on ρY itself pushed the fresh Y to 1 + 2e-5 (measured, docs/chem.md).
     Exact in the P1 flame (the bands sit in uniform fresh / burnt gas).
-35. **NSCBC carries no species waves** (Sutherland & Kennedy 2003): valid only
+35. **NSCBC carries no species waves** (Sutherland & Kennedy 2003; the
+    `--mode bunsen` hook re-adds q ω after the overwrite, below): valid only
     while ω vanishes in the boundary rows (omegaEdge 4.7e-16 measured).
     Same premise, second consequence (verify 2026-10-28): the NSCBC
     `stagePut` OVERWRITES E on the i = 0 / nx−1 cells, discarding the
@@ -301,8 +302,11 @@ Measured gfx1100 via simjob, 2026-10-28.
     the re-carry. E + qρY therefore leaks q ω per boundary cell — 4.7e-16
     of the peak rate in P1, unmeasurable, but structural: a case burning in
     the boundary rows must re-add q ω after the overwrite (or zero ω there).
+    `--mode bunsen` (anchored IN the inflow rows) re-adds it
+    (`speciesBoundaryHeat`); the 1D runner does not (keeps its bits).
 36. **Not built: Le ≠ 1** (no oracle; `--lewis` unregistered), curvilinear,
-    compensated, RANS and LES species (asserted), nz > 1 flames, the
+    compensated, RANS and LES species (asserted), nz > 1 flames (2D is:
+    `--wrinkle`, `--mode bunsen`), the
     low-Mach branch, multi-step chemistry, dns-ui support for `flame`.
 37. **The chemistry dt bound never binds in the P1 range** (dtChem/dt
     8–32), so kChemDt = 0.5 is unbracketed by measurement: halving or
@@ -313,6 +317,112 @@ Measured gfx1100 via simjob, 2026-10-28.
     DNS's operator (KG energy flux, compressibility); a C++ discrete oracle
     (plan §3.2, optional) would separate scheme from Mach/FP32 error. Not
     built.
+39. **2D yHits are an FP32 inflow-row drift, not an unbounded scheme**
+    (measured 2026-10-28, `yMin`/`yMax` columns). 2D wrinkled run (M 0.02,
+    8 cells, ny 256, tt 4): Y − 1 ≤ 1.8e-6 (15 ulp), Y ≥ 0, only at i ≤ 14;
+    the inflow row drifts +9…+15 ulp (1D: stays exactly 1; sink off: still
+    +12 ulp). Convected downstream it lit ~150k cells of a long ny 1280 run
+    at the 1e-6 (8.4 ulp) threshold. Mechanism inside the open-row re-carry
+    under transverse fluxes not isolated further; not fixed (not material),
+    the count threshold unchanged (1D bits).
+40. **Bunsen flank consumption speed −2.2% at U_jet 3** (SLflank 0.979 /
+    0.978 at 8 / 16 cells; mFlank 0.989 / 0.986), vs +0.3% at U_jet 5
+    (16 cells). Grid-independent: stretch/curvature on the shorter cone
+    (the fit window sits nearer tip and base) or the window choice;
+    unattributed. The cone-angle relation sin α = S_L/U_jet reads +2.1% /
+    +3.8% high (16 cells) — the fresh flow decelerating ahead of the flank;
+    not separated from stretch by a measurement of the approach velocity.
+41. **Bunsen anchors only on a burnt pilot.** Measured at U_jet 5: cold or
+    T/Tu 3 coflow, a cold u = 0 rim and slow thin burnt strips blow off;
+    burnt coflow (default) and 3 δ_th burnt strips at the jet speed anchor
+    (docs/chem.md table). Not built: an immersed ghost-wall burner lip
+    (needs species through `DeviceCompGhost`: impermeable zero species flux
+    on fluid/ghost faces, ghost Y image, stats excluding solid cells) — the
+    physical rim stabilisation. Not measured: anchoring vs U_jet (only 3 and
+    5 run), the pilot's minimum width, the pulsed jet's anchoring margin.
+42. **Bunsen y is periodic** (coflow W per side by default): the image jets
+    confine the expansion. Coflow width sensitivity of the cone angle not
+    measured; open y faces (NSCBC openY + species) not built.
+43. **The diffusion jet is attached BY CONSTRUCTION.** Its inflow row is the
+    Burke–Schumann sheet of Z(y): the edge burns at the exit plane. No lip,
+    no lifted or triple-flame base was run. Measured map (W 16, s 1,
+    docs/chem.md): edge 1 l goes out at t 0.48; edge 2, edge 1 + 2 l Z_st
+    pilots, edge 3 hold at β 5 / Da 1000; β 8 needs Da ~5000 (exit 8 at
+    1000). Not mapped: the extinction boundary in (edge, Da, β) at other W,
+    s, coflow speeds; a frozen (cold, mixed) inflow with an edge-flame base.
+44. **The shared limiter clips every species at any voter's extremum.** It is
+    what makes the coupling functions exact (Z vs tracer within the FP32
+    walk; per-species 1.226e-3), but a first-order face for all species
+    wherever one reactant peaks: the slab-centre Z sits 1.5e-3 off the erf
+    at h 0.25. Vote threshold 2^-24 is a choice (noise reactants at ~1e-40
+    forced Z 5.0e-3 off with every species voting); a non-voter can move
+    < 2^-24 past its neighbours per face (counted in `hits`: 0 in every
+    run). Grid order of the two-reactant scheme not measured.
+45. **The jet's inflow row runs 0.35 T0 cool at the sheet peak.** The LODI
+    row keeps transverse conduction against the entropy relax (etaIn c/L,
+    etaIn 100): steady default jet, H = T/T0 − 1 + (q/cp T0)(Y_F − Y_F1 Z)
+    is −0.351 at i = 0, 0.206 at i = 1, 0.074 at i = 4, ≤ 0.0095 past the
+    band. Not fixed; a stiffer --nscbc-etain not measured on the final
+    code. The species pin on that row
+    (`speciesInflowPin`) is a consistency choice; its isolated effect was
+    not measured. The re-added boundary heat is 0 there (pinned sheet: ω 0).
+46. **Outflow anchor σ 4 for the jet is a constant, no flag.** At the
+    shared 0.25 the box pressurized to p/p0 1.67 (t 14; cold streams 1.6–1.7
+    T0, interior 1.28 T_ad); at 4 the steady jet holds p/p0 1.000 ± 0.003.
+    The stiffer anchor's acoustic reflection is not measured.
+47. **Diffusion validation gaps.** The flame-sheet POSITION x_f(t) is
+    validated only isothermal (the heated layer has no similarity solution:
+    ρ²D varies); no counterflow/strained flame vs Cantera; the jet tip is a
+    regression pin (51.2 l measured vs the constant-density Burke–Schumann
+    70.3 l, which D ∝ T shortens — a variable-density estimate not built).
+    The heated Tmax extrapolation assumes the Da^(−1/3) law (measured ratio
+    2.275, not 2). The jet does not flicker unforced (Re = W/Pr ≈ 22, no
+    gravity; gravity exists in `--mode candle`, §49–53); `--pulse` opens
+    its tip periodically (fuel out/in up to 0.019).
+    y periodic: the products fill the box top (coflow 24 l in the demo), and
+    the images confine the jet — s 2 tip 147.4 l at coflow 16 l vs 129.3 l
+    at 24 l (the 16 l run predates §48's change; closed tip). Open y faces
+    not built.
+48. **The jet drops q ω on its outflow row** (§35's leak, chosen): re-adding
+    it there ran away when the tip opened into the LODI row (T 4.3 T_ad at
+    i = nx − 1, p/p0 0.95–1.12, backflow; s 2, coflow 40 l). Without it, a
+    pulsed jet that opens its tip burns its outflow row cold (E + qρY_F
+    loses q ω there); the size of that leak is not measured. A burning
+    outflow needs NSCBC with species/heat source terms (Sutherland &
+    Kennedy 2003), not built.
+49. **Candle fuel balance closes to ~5%, not 1%.** Steady W 1 (t 20–30):
+    burn/in 1.031 AND fuel out/in 0.017–0.025 (Y_F ~8e−4 leaks past the
+    tip into the plume: finite-rate tip leakage); W 0.5 burn/in 0.986,
+    W 0.75 1.015. Suspects, not isolated: the species sink twin in the
+    inflow band, which holds the flame base (§34: exact only where Y is
+    uniform across the band; the candle's base is 2 l of a 10 l flame),
+    and the first-interior-face fuelIn estimate at Pe ≤ 1. Not tested
+    (no band in `gpu_candle_*`); the tip leak's Da dependence not measured.
+50. **The candle box recirculates.** y periodic (12 l per side) with a
+    fixed 1 U coflow: the plume entrains more than the coflow supplies, so
+    air is drawn DOWN through the top in every run (uOutMin −7.6…−12 U).
+    The top takes it as ambient air (ρ_a, v = 0 at etaLat 0.05, Y = air:
+    the Hydro NSCBC + `yHi`). Not measured: sensitivity of the tip to
+    L_y, coflow speed, box length; whether the relax rate matters. Open
+    y faces / an open (pressure) bottom not built.
+51. **Candle unsteadiness unattributed.** W ≤ 1 steady; W 1.25 one slow
+    ~13 l/U cycle (t 10–30); W 1.5 flaps sinuously with tip pinch-off at
+    4.26 / 4.07 / 4.14 l/U (f 0.24 U/l = 0.165× Cetegen–Ahmed 0.479
+    sqrt(g/W), 0.25× with D = the flame width). Flame instability vs the
+    periodic box's recirculation (§50) not separated (no wider box run).
+52. **Candle height law: 4/3 approached, not reached.** H ∝ Q^1.19 over
+    W 0.5–1 (local 1.12 → 1.30; Roper's buoyant slot 4/3; momentum 2
+    excluded). Every W ≥ 1.25 is unsteady, so no steady flame sits in the
+    far-field regime. One grid only (8 cells/l), one g (14), Da 5000, β 5:
+    tip convergence and chemistry sensitivity not measured. The wick is
+    the inflow plane (attached by construction, §43); no immersed wick.
+53. **Candle NSCBC top (`Hydro`).** The hydrostatic incoming waves are
+    validated at rest only (|u| 1.2e−3 U vs 0.67 U without); their
+    acoustic reflection and the backflow blend's rate are not measured.
+    The rest residual 1.2e−3 U is not attributed (FP32 p rounding: ulp(p0)
+    = 2e−3 at M 0.005 is the candidate). The Mach is inflated: buoyant
+    Mach 0.17 at the defaults (|u|max 34 U, M 0.005); the M dependence of
+    the tip not measured.
 
 ## Older open items (details in CLAUDE.md)
 

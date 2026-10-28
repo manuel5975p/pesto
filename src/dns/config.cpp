@@ -966,11 +966,454 @@ std::expected<Case, ConfigError> validateConv(const RawConfig& r, Case c)
 }
 
 // --- flame ------------------------------------------------------------------
+// --mode bunsen's default resolution: 8 cells per delta_th (the demo grid;
+// the 1D ladder puts S_L +1.7% high at 7.5 cells, docs/chem.md).
+constexpr double kBunsenCellsDefault = 8;
+
+// The slot burner (dns/bunsen.hpp): validates the burner flags and sets the
+// box, c.bunsen (box units) and c.uInf. Lengths arrive in delta_th.
+// Pre: c.flameEig, c.flameCells, c.flameModel set; nb = the sink band.
+std::expected<void, ConfigError> bunsenGeometry(const RawConfig& r, Case& c,
+                                                int nb)
+{
+    const double dth = c.flameEig.dthOverDD, cells = c.flameCells;
+    const double h = dth / cells, sig = c.flameModel.sigma;
+    if (!(std::isfinite(r.slotWidth) && r.slotWidth >= 4))
+        return bad(2, "--slot-width", "must be >= 4 thermal thicknesses (a "
+                                      "cone needs a straight flank)");
+    if (!(std::isfinite(r.jetSpeed) && r.jetSpeed >= 1.5 && r.jetSpeed <= 20))
+        return bad(2, "--jet-speed", "must be in [1.5, 20] S_L (a cone "
+                                     "needs U > S_L; above 20 it outgrows "
+                                     "any affordable box)");
+    if (r.jetSpeed * c.mach > 0.3)
+        return bad(2, "--jet-speed", std::format(
+                                         "jet Mach {:.3g} = U M exceeds 0.3: "
+                                         "lower --mach or the jet speed",
+                                         r.jetSpeed * c.mach));
+    if (!(std::isfinite(r.coflowSpeed) && r.coflowSpeed >= 0 &&
+          r.coflowSpeed <= r.jetSpeed))
+        return bad(2, "--coflow-speed", "must be in [0, --jet-speed] S_L");
+    const double wco = r.coflowWidth < 0 ? r.slotWidth : r.coflowWidth;
+    if (!(std::isfinite(wco) && wco >= 2))
+        return bad(2, "--coflow-width", "must be >= 2 thermal thicknesses per "
+                                        "side (y is periodic: the coflow "
+                                        "separates the jet from its image)");
+    const double tco = r.coflowTemp < 0 && !r.given.contains("--coflow-temp")
+                           ? sig
+                           : r.coflowTemp;
+    if (!(std::isfinite(tco) && tco >= 1 && tco <= sig))
+        return bad(2, "--coflow-temp", std::format(
+                                           "must be in [1, --expansion = {:g}] "
+                                           "(T/Tu: 1 cold inert, sigma the "
+                                           "burnt pilot)",
+                                           sig));
+    if (!(std::isfinite(r.pilotWidth) && r.pilotWidth >= 0))
+        return bad(2, "--pilot-width", "must be finite and >= 0 thermal "
+                                       "thicknesses");
+    if (!(r.pilotWidth > 0))
+        if (auto e = rejectGiven(r, {"--pilot-temp", "--pilot-speed"},
+                                 "needs --pilot-width > 0");
+            e)
+            return std::unexpected(*e);
+    const double tp = r.pilotTemp < 0 && !r.given.contains("--pilot-temp")
+                          ? sig
+                          : r.pilotTemp;
+    if (!(std::isfinite(tp) && tp >= 1 && tp <= sig))
+        return bad(2, "--pilot-temp", std::format(
+                                          "must be in [1, --expansion = {:g}] "
+                                          "(T/Tu)",
+                                          sig));
+    const double up = r.pilotSpeed < 0 && !r.given.contains("--pilot-speed")
+                          ? r.coflowSpeed
+                          : r.pilotSpeed;
+    if (!(std::isfinite(up) && up >= 0 && up <= r.jetSpeed))
+        return bad(2, "--pilot-speed", "must be in [0, --jet-speed] S_L");
+    if (!(std::isfinite(r.slotEdge) && r.slotEdge * cells >= 1))
+        return bad(2, "--slot-edge", std::format(
+                                         "must be >= one cell ({:.4g} "
+                                         "thermal thicknesses at "
+                                         "--cells-per-delta {:g})",
+                                         1.0 / cells, cells));
+    const double coneH = 0.5 * r.slotWidth *
+                         std::sqrt(r.jetSpeed * r.jetSpeed - 1.0); // delta_th
+    const double len = r.flameLength < 0 ? std::ceil(1.25 * coneH + 8)
+                                         : r.flameLength;
+    if (!(std::isfinite(len) && len >= coneH + 4))
+        return bad(2, "--length", std::format(
+                                      "must be >= the ideal cone height + 4 = "
+                                      "{:.4g} thermal thicknesses (the tip "
+                                      "and its burnt gas must fit)",
+                                      coneH + 4));
+    if (!(std::isfinite(r.pulse) && r.pulse >= 0 && r.pulse <= 0.5))
+        return bad(2, "--pulse", "must be in [0, 0.5] (fraction of the jet "
+                                 "speed)");
+    if (r.pulse > 0 && !(std::isfinite(r.pulseFreq) && r.pulseFreq > 0))
+        return bad(2, "--pulse-freq", "must be finite and > 0 with --pulse "
+                                      "(1/tau)");
+    if (r.given.contains("--pulse-freq") && !(r.pulse > 0))
+        return bad(2, "--pulse-freq", "needs --pulse > 0");
+
+    const int half = int(std::ceil((0.5 * r.slotWidth + r.pilotWidth + wco) *
+                                   cells - 1e-9));
+    const int ny = 2 * half;
+    const int nx = int(std::ceil(len * cells - 1e-9)) + 2 * nb;
+    auto box = makeBox(nx, ny, 1, nx * h, ny * h, 1.0);
+    if (!box) return std::unexpected(box.error());
+    c.grid = *box;
+    BunsenGeom& b = c.bunsen;
+    b.W = r.slotWidth * dth;
+    b.uJet = r.jetSpeed;
+    b.uCo = r.coflowSpeed;
+    b.wCo = wco * dth;
+    b.tCo = tco;
+    b.pilot = r.pilotWidth * dth;
+    b.tPilot = tp;
+    b.uPilot = up;
+    b.edge = r.slotEdge * dth;
+    b.yc = half * h;
+    b.coneH = coneH * dth;
+    b.pulse = r.pulse;
+    b.pulseFreq = r.pulseFreq;
+    c.flameBunsen = true;
+    c.uInf = r.jetSpeed;
+    return {};
+}
+
+// --mode diffusion defaults that differ from the shared flame flags' (those
+// are premixed numbers in delta_th and S_L): the jet Mach, the slot width
+// (the jet Peclet number), the edge half-width, all in l = D0/U_jet.
+constexpr double kDiffMachDefault = 0.05;
+constexpr double kDiffSlotDefault = 16;
+// Edge 3: measured (2026-10-28, W 16, s 1, beta 5, Da 1000, M 0.05, 4
+// cells/l, tt 40) edge 1 exits 8 at t = 0.48 (the thin IC sheet goes out);
+// edge 2 and edge 1 + 2 l burnt Z_st pilots anchor; edge 3 is steady (tip
+// 51.2 l, TmaxIn/T_ad 0.986). docs/chem.md, anchoring table.
+constexpr double kDiffEdgeDefault = 3.0;
+// beta 5: measured (same case, edge 3, outflow sigma 4, the inflow pin) beta 8
+// at Da 1000 extinguishes the IC sheet by t = 1.8 (exit 8); beta 5 anchors
+// (tip 51.2 l, Tmax/T_ad 0.986, steady by t ~ 60).
+constexpr double kDiffBetaDefault = 5.0;
+
+// --mode candle defaults (docs/chem.md, candle section), in l = D0/U_fuel and
+// U_fuel. Paraffin/air: s ~3.4 (mass, with O2), Y_O2 0.233 -> Z_st 0.064.
+// Fr = U^2/(g W) = 1/(g W) = 0.071 at the defaults (buoyancy-controlled).
+// Measured (2026-10-28, scouts): in the 2D buoyancy regime the flame's
+// aspect follows the fuel Peclet number W (H/w ~ Q/D): W 2 at g 7 burned a
+// needle (tip 24 l, half-width 2 l), W 1 at g 14 a teardrop (tip ~9.5 l,
+// half-width 1.4 l) -- hence the low-Peclet wick on a finer grid.
+constexpr double kCandleGravityDefault = 14;
+constexpr double kCandleSlotDefault = 1;
+constexpr double kCandleStoichDefault = 3.4;
+constexpr double kCandleOxYDefault = 0.233;
+constexpr double kCandleEdgeDefault = 0.5;
+constexpr double kCandleCellsDefault = 8;
+constexpr double kCandleCoflowWidthDefault = 12;
+constexpr double kCandleLengthDefault = 32;
+// Da 5000: at 1000 the W 1 candle's ignition kernel went out (exit 8 at t
+// 0.56, Tmax past the band 2.99 T0).
+constexpr double kCandleDaDefault = 5000;
+// The IC lights a short column (a closed Burke-Schumann sheet 4 l tall), not
+// the whole box: the extruded column of the jet IC is a box-tall thermal that
+// rolled up into vortices descending from the top (scout, W 4: outflow
+// backflow -44 U, diverged at t 10.7).
+constexpr double kCandleIgnitionDefault = 4;
+// M = U_fuel/c0: the buoyant flow runs ~35 U_fuel (measured |u|max), so the
+// fuel Mach is inflated far less than the jet's: buoyant Mach ~0.18.
+constexpr double kCandleMachDefault = 0.005;
+
+// The 2D slot-jet diffusion flame (docs/chem.md, dns/diffusion.hpp): model
+// C1, the burner on the bunsen flags (lengths in l, speeds in U_jet), the
+// box, the label inputs. Every premixed-only flag is rejected by name.
+// --mode candle is the same model and burner under gravity (-x) with the
+// candle defaults above.
+std::expected<Case, ConfigError> validateDiffusion(const RawConfig& r, Case c)
+{
+    const bool candle = r.flameMode == 3;
+    if (auto e = candle ? rejectGiven(r, {"--pilot-width", "--pilot-speed"},
+                                      "does not apply to --mode candle (the "
+                                      "flame anchors on its inflow sheet: no "
+                                      "pilot)")
+                        : rejectGiven(r, {"--gravity", "--quiescent"},
+                                      "only applies to --mode candle");
+        e)
+        return std::unexpected(*e);
+    if (candle && r.quiescent)
+        if (auto e = rejectGiven(r,
+                                 {"--slot-width", "--slot-edge",
+                                  "--coflow-speed", "--pulse", "--pulse-freq"},
+                                 "does not apply with --quiescent (no fuel, "
+                                 "every inflow row at rest)");
+            e)
+            return std::unexpected(*e);
+    // A candle default where the shared flag (a premixed / jet number) was
+    // not given.
+    auto pick = [&](const char* flag, double given, double dflt) {
+        return candle && !r.given.contains(flag) ? dflt : given;
+    };
+    if (auto e = rejectGiven(r, {"--re"}, "does not apply: the jet is set by "
+                                          "--slot-width (its Peclet number "
+                                          "U W / D0) and --prandtl");
+        e)
+        return std::unexpected(*e);
+    if (auto e = rejectGiven(r, {"--ft"}, "does not apply: the run length is "
+                                          "--tt (in l/U_jet)");
+        e)
+        return std::unexpected(*e);
+    if (auto e = rejectGiven(r, {"--n"}, "does not apply: the grid is "
+                                         "--cells-per-unit over the burner "
+                                         "and --length");
+        e)
+        return std::unexpected(*e);
+    if (c.physics != Physics::Compressible)
+        return bad(2, "--physics", "a flame is compressible only (no low-Mach "
+                                   "branch until P7; docs/chem.md)");
+    if (auto e = rejectGiven(r,
+                             {"--upstream", "--downstream", "--inflow-speed",
+                              "--wrinkle", "--wrinkle-modes", "--ny",
+                              "--profile-dt", "--cells-per-delta",
+                              "--jet-speed", "--coflow-temp", "--pilot-temp"},
+                             "does not apply to --mode diffusion (the jet "
+                             "speed is the unit, the inflow state is the "
+                             "Burke-Schumann sheet of its mixture fraction, "
+                             "the grid is --cells-per-unit)");
+        e)
+        return std::unexpected(*e);
+    if (r.nz != 1)
+        return bad(2, "--nz", "must be 1: multi-D flames are P2 (docs/chem.md)");
+    c.mach = r.given.contains("--mach")
+                 ? r.mach
+                 : (candle ? kCandleMachDefault : kDiffMachDefault);
+    if (!(finitePos(c.mach) && c.mach <= 0.2))
+        return bad(2, "--mach", "must be in (0, 0.2] for --mode diffusion "
+                                "and candle: the jet Mach number U_jet/c0");
+    DiffusionModel md;
+    md.s = pick("--stoich", r.stoich, kCandleStoichDefault);
+    if (!(std::isfinite(md.s) && md.s > 0 && md.s <= 100))
+        return bad(2, "--stoich", "must be in (0, 100] (oxidizer mass per "
+                                  "unit fuel mass)");
+    md.yF1 = r.fuelY;
+    if (!(md.yF1 > 0 && md.yF1 <= 1))
+        return bad(2, "--fuel-y", "must be in (0, 1] (the fuel stream's Y_F; "
+                                  "balance inert)");
+    md.yO2 = pick("--ox-y", r.oxY, kCandleOxYDefault);
+    if (!(md.yO2 > 0 && md.yO2 <= 1))
+        return bad(2, "--ox-y", "must be in (0, 1] (the oxidizer stream's "
+                                "Y_O; balance inert)");
+    md.sigma = r.expansion;
+    if (!(md.sigma > 1 && md.sigma <= 10))
+        return bad(2, "--expansion", "must be in (1, 10] (sigma = T_ad(Z_st) "
+                                     "/ T0, the flame-sheet temperature)");
+    md.beta = r.given.contains("--zeldovich") ? r.zeldovich : kDiffBetaDefault;
+    if (!(md.beta >= 2 && md.beta <= 20))
+        return bad(2, "--zeldovich", "must be in [2, 20]");
+    md.Da = pick("--damkohler", r.damkohler, kCandleDaDefault);
+    if (!(finitePos(md.Da) && md.Da <= 1e6))
+        return bad(2, "--damkohler", "must be in (0, 1e6] (A rho0 "
+                                     "e^(-Ta/T_ad) l/U_jet)");
+    c.prandtl = r.prandtl;
+    if (!finitePos(c.prandtl)) return bad(2, "--prandtl", "must be finite and > 0");
+    c.sutherland = r.visc == 1;
+    c.tinfK = r.tinf;
+    if (c.sutherland && !(r.given.contains("--tinf") && finitePos(c.tinfK)))
+        return bad(2, "--tinf", "is required with --visc sutherland: T0 in "
+                                "kelvin (Sutherland's 110.4 K needs a "
+                                "dimensional anchor)");
+    if (!c.sutherland && r.given.contains("--tinf"))
+        return bad(2, "--tinf", "only anchors --visc sutherland");
+    const double cells =
+        pick("--cells-per-unit", r.cellsPerUnit, kCandleCellsDefault);
+    if (!(std::isfinite(cells) && cells >= 2 && cells <= 64))
+        return bad(2, "--cells-per-unit", "must be in [2, 64] (cells per l = "
+                                          "D0/U_jet)");
+    const double h = 1.0 / cells;
+    const double W = r.given.contains("--slot-width")
+                         ? r.slotWidth
+                         : (candle ? kCandleSlotDefault : kDiffSlotDefault);
+    // The candle's wick is a low-Peclet slot (the default Pe is 1).
+    const double wMin = candle ? 0.5 : 4;
+    if (!(std::isfinite(W) && W >= wMin && W <= 200))
+        return bad(2, "--slot-width", std::format("must be in [{:g}, 200] l "
+                                                  "(the jet Peclet number U W "
+                                                  "/ D0)",
+                                                  wMin));
+    if (!(std::isfinite(r.coflowSpeed) && r.coflowSpeed >= 0 &&
+          r.coflowSpeed <= 2))
+        return bad(2, "--coflow-speed", "must be in [0, 2] U_jet");
+    const double wco = r.coflowWidth < 0
+                           ? (candle ? kCandleCoflowWidthDefault : W)
+                           : r.coflowWidth;
+    if (!(std::isfinite(wco) && wco >= 2))
+        return bad(2, "--coflow-width", "must be >= 2 l per side (y is "
+                                        "periodic: the coflow separates the "
+                                        "jet from its image)");
+    if (!(std::isfinite(r.pilotWidth) && r.pilotWidth >= 0))
+        return bad(2, "--pilot-width", "must be finite and >= 0 l");
+    if (!(r.pilotWidth > 0))
+        if (auto e = rejectGiven(r, {"--pilot-speed"}, "needs --pilot-width > 0");
+            e)
+            return std::unexpected(*e);
+    const double up = r.pilotSpeed < 0 && !r.given.contains("--pilot-speed")
+                          ? r.coflowSpeed
+                          : r.pilotSpeed;
+    if (!(std::isfinite(up) && up >= 0 && up <= 2))
+        return bad(2, "--pilot-speed", "must be in [0, 2] U_jet");
+    const double edge = r.given.contains("--slot-edge")
+                            ? r.slotEdge
+                            : (candle ? kCandleEdgeDefault : kDiffEdgeDefault);
+    if (!(std::isfinite(edge) && edge * cells >= 1))
+        return bad(2, "--slot-edge", std::format("must be >= one cell ({:.4g} "
+                                                 "l at --cells-per-unit {:g})",
+                                                 1.0 / cells, cells));
+    const double tipCold = sheetTipConstantDensity(W, md.zst());
+    const double len =
+        r.flameLength >= 0
+            ? r.flameLength
+            : (candle ? kCandleLengthDefault
+                      : std::ceil(std::min(1.25 * tipCold + 8, 20.0 * W)));
+    if (!(std::isfinite(len) && len >= W))
+        return bad(2, "--length", "must be >= the slot width (l)");
+    const double ign = r.given.contains("--ignition")
+                           ? r.ignition
+                           : (candle ? kCandleIgnitionDefault : 0.0);
+    if (r.given.contains("--ignition") &&
+        !(std::isfinite(ign) && ign >= 1 && ign <= len))
+        return bad(2, "--ignition", "must be in [1, --length] l (the IC's "
+                                    "burning column)");
+    if (candle && r.quiescent && r.given.contains("--ignition"))
+        return bad(2, "--ignition", "does not apply with --quiescent (no "
+                                    "fuel: the IC is the ambient at rest)");
+    const double grav =
+        candle ? (r.given.contains("--gravity") ? r.gravity
+                                                : kCandleGravityDefault)
+               : 0.0;
+    if (!(std::isfinite(grav) && grav >= 0 && grav <= 1000))
+        return bad(2, "--gravity", "must be in [0, 1000] U_jet^2/l (g along "
+                                   "-x; 0 = the diffusion jet bit for bit)");
+    if (!(std::isfinite(r.pulse) && r.pulse >= 0 && r.pulse <= 0.5))
+        return bad(2, "--pulse", "must be in [0, 0.5] (fraction of the jet "
+                                 "speed)");
+    if (r.pulse > 0 && !(std::isfinite(r.pulseFreq) && r.pulseFreq > 0))
+        return bad(2, "--pulse-freq", "must be finite and > 0 with --pulse "
+                                      "(U_jet/l)");
+    if (r.given.contains("--pulse-freq") && !(r.pulse > 0))
+        return bad(2, "--pulse-freq", "needs --pulse > 0");
+    const double uMax = std::max({1.0, r.coflowSpeed, up}) * (1 + r.pulse);
+    if (uMax * c.mach > 0.3)
+        return bad(2, "--mach", std::format("the fastest inflow stream's Mach "
+                                            "{:.3g} exceeds 0.3",
+                                            uMax * c.mach));
+    if (candle && grav > 0) {
+        const CandleScales cs = candleScales(md, grav, W, len, c.mach);
+        if (cs.machBuoyant > 0.3)
+            return bad(2, "--mach", std::format(
+                                        "the buoyant Mach M sqrt(2 g L (sigma "
+                                        "- 1)/sigma) = {:.3g} exceeds 0.3: "
+                                        "lower --mach, --gravity or --length",
+                                        cs.machBuoyant));
+        if (cs.machBuoyant > 0.15)
+            c.warnings.push_back(std::format(
+                "buoyant Mach {:.3g} (free-fall speed {:.3g} U): O(M^2) "
+                "compressibility in the plume",
+                cs.machBuoyant, cs.uFreeFall));
+        if (!r.quiescent && cs.froude > 0.3)
+            c.warnings.push_back(std::format(
+                "Froude number U^2/(g W) = {:.3g}: the fuel jet's momentum is "
+                "not negligible against buoyancy (not a candle)",
+                cs.froude));
+        if (cs.adiabatic > 0.02)
+            c.warnings.push_back(std::format(
+                "adiabatic fraction (g/cp) L/(T_ad - T0) = {:.3g}: the "
+                "inflated Mach makes the column's lapse rate visible",
+                cs.adiabatic));
+    }
+    c.nscbcEtaIn = r.nscbcEtaIn;
+    if (!finitePos(c.nscbcEtaIn))
+        return bad(2, "--nscbc-etain", "must be finite and > 0");
+    c.nscbcThermalInflow = r.nscbcTinflow;
+    c.nscbcSink = r.given.contains("--nscbc-sink") ? r.nscbcSink : 16;
+    if (c.nscbcSink < 0) return bad(2, "--nscbc-sink", "must be >= 0 (0 = off)");
+    c.nscbcSinkAmp = r.nscbcSinkAmp;
+    if (!(c.nscbcSinkAmp > 0 && c.nscbcSinkAmp <= 2))
+        return bad(2, "--nscbc-sink-amp", "must be in (0, 2] (the SSP-RK3 "
+                                          "real-axis bound)");
+
+    const int nb = c.nscbcSink;
+    const int half = int(std::ceil((0.5 * W + r.pilotWidth + wco) * cells - 1e-9));
+    const int ny = 2 * half;
+    const int nx = int(std::ceil(len * cells - 1e-9)) + 2 * nb;
+    auto box = makeBox(nx, ny, 1, nx * h, ny * h, 1.0);
+    if (!box) return std::unexpected(box.error());
+    c.grid = *box;
+    BunsenGeom& b = c.bunsen;
+    b.W = W;
+    b.uJet = 1;
+    b.uCo = r.coflowSpeed;
+    b.wCo = wco;
+    b.pilot = r.pilotWidth;
+    b.uPilot = up;
+    b.tCo = b.tPilot = 1; // unused: the inflow is the Burke-Schumann state
+    b.edge = edge;
+    b.yc = half * h;
+    b.coneH = 0;
+    b.pulse = r.pulse;
+    b.pulseFreq = r.pulseFreq;
+    c.diff = md;
+    c.flameDiffusion = true;
+    c.flameCandle = candle;
+    c.flameGravity = grav;
+    c.flameQuiescent = candle && r.quiescent;
+    c.flameIgnition = c.flameQuiescent ? 0.0 : ign;
+    c.flameTu = 1.0 / (kGammaAir * c.mach * c.mach);
+    c.flameCells = cells;
+    c.n = c.grid.nx;
+    c.h = h;
+    c.L = c.grid.nx * h;
+    c.re = W / c.prandtl; // U W rho0 / mu, mu = Pr
+    c.nu = c.prandtl;
+    c.uInf = 1.0;
+    c.far = FarField::Nscbc;
+    c.bodyKind = BodyKind::None;
+
+    if (auto e = resolveCfl(r, c, 0.4); e) return std::unexpected(*e);
+    if (!finitePos(r.tt)) return bad(2, "--tt", "must be finite and > 0");
+    c.ft = r.tt;
+    c.tEnd = r.tt;
+    if (auto e = resolveDtRecompute(r, c, 16); e) return std::unexpected(*e);
+    if (auto e = validateFrameOutputs(r, c); e) return std::unexpected(*e);
+    if (auto e = resolveEmit(c, {Emit::Stats}); e) return std::unexpected(*e);
+
+    if (c.mach > 0.1)
+        c.warnings.push_back(std::format(
+            "--mach {:.4g}: the heat release's dilatation carries an O(M^2) "
+            "compressibility error (gamma M^2 (sigma - 1) = {:.3g})",
+            c.mach, kGammaAir * c.mach * c.mach * (md.sigma - 1)));
+    if (nb == 0)
+        c.warnings.push_back("--nscbc-sink 0: the bare characteristic "
+                             "boundary (nothing drains mesh-scale content)");
+    c.meta = {.D = 1.0,
+              .re = c.re,
+              .mach = c.mach,
+              .frameDt = c.fdt,
+              .body = candle ? (c.flameQuiescent ? "candle box at rest"
+                                                 : "candle diffusion flame")
+                             : "slot jet diffusion flame",
+              .farField = "nscbc",
+              .physics = name(c.physics),
+              .kick = 0.0,
+              .sgs = "",
+              .rans = "",
+              .steady = ""};
+    c.meta.setGrid(c.grid);
+    return c;
+}
+
 // The 1D freely propagating premixed flame (docs/chem.md): model C0, the
 // oracle eigenvalue resolved HERE (pure FP64, ~0.1 s) so the grid is counted
 // in the oracle's own thermal thickness and --dry-run prints Lambda.
 std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
 {
+    if (r.flameMode == 2 || r.flameMode == 3)
+        return validateDiffusion(r, std::move(c));
     if (auto e = rejectGiven(r, {"--re"}, "does not apply: a flame is set by "
                                           "--expansion, --zeldovich and "
                                           "--prandtl (Re = 1/Pr on delta_D)");
@@ -988,11 +1431,41 @@ std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
     if (c.physics != Physics::Compressible)
         return bad(2, "--physics", "a flame is compressible only (no low-Mach "
                                    "branch until P7; docs/chem.md)");
-    if (r.flameMode != 0)
-        return bad(2, "--mode", "only premixed is built");
+    const bool bunsen = r.flameMode == 1;
+    if (r.flameMode != 0 && !bunsen)
+        return bad(2, "--mode", "must be premixed, bunsen, diffusion or candle");
+    if (auto e = rejectGiven(r,
+                             {"--stoich", "--fuel-y", "--ox-y", "--damkohler",
+                              "--cells-per-unit", "--ignition"},
+                             "only applies to --mode diffusion and candle");
+        e)
+        return std::unexpected(*e);
+    if (auto e = rejectGiven(r, {"--gravity", "--quiescent"},
+                             "only applies to --mode candle");
+        e)
+        return std::unexpected(*e);
+    // Each mode's own flags, rejected by name in the other.
+    if (auto e = bunsen ? rejectGiven(r,
+                                      {"--upstream", "--downstream",
+                                       "--inflow-speed", "--wrinkle",
+                                       "--wrinkle-modes", "--ny",
+                                       "--profile-dt"},
+                                      "does not apply to --mode bunsen (the "
+                                      "slot burner sets the box and the IC; "
+                                      "x-profiles are a 1D diagnostic)")
+                        : rejectGiven(r,
+                                      {"--slot-width", "--jet-speed",
+                                       "--coflow-speed", "--coflow-width",
+                                       "--coflow-temp", "--pilot-width",
+                                       "--pilot-temp", "--pilot-speed",
+                                       "--slot-edge", "--length", "--pulse",
+                                       "--pulse-freq"},
+                                      "only applies to --mode bunsen");
+        e)
+        return std::unexpected(*e);
     if (r.nz != 1)
         return bad(2, "--nz", "must be 1: multi-D flames are P2 (docs/chem.md)");
-    if (r.ny < 4) return bad(2, "--ny", "must be >= 4 (periodic y)");
+    if (!bunsen && r.ny < 4) return bad(2, "--ny", "must be >= 4 (periodic y)");
     c.mach = r.mach;
     if (!(finitePos(c.mach) && c.mach <= 0.05))
         return bad(2, "--mach", "must be in (0, 0.05]: the flame Mach number "
@@ -1020,6 +1493,17 @@ std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
         return bad(2, "--downstream", "must be >= 4 thermal thicknesses");
     if (!finitePos(r.inflowSpeed))
         return bad(2, "--inflow-speed", "must be finite and > 0 (x S_L)");
+    if (!(std::isfinite(r.wrinkle) && r.wrinkle >= 0))
+        return bad(2, "--wrinkle", "must be finite and >= 0 (thermal thicknesses)");
+    if (r.given.contains("--wrinkle-modes") && !r.given.contains("--wrinkle"))
+        return bad(2, "--wrinkle-modes", "needs --wrinkle");
+    if (r.wrinkle > 0 && (r.wrinkleModes < 1 || 8 * r.wrinkleModes > r.ny))
+        return bad(2, "--wrinkle-modes", "must be in [1, ny/8] (8 cells per "
+                                         "shortest seeded wavelength)");
+    if (r.wrinkle > 0 && r.wrinkle * std::sqrt(double(r.wrinkleModes)) >
+                             std::min(r.upstream, r.downstream) / 2)
+        return bad(2, "--wrinkle", "peak displacement A sqrt(N) must stay "
+                                   "within half of --upstream and --downstream");
     c.nscbcEtaIn = r.nscbcEtaIn;
     if (!finitePos(c.nscbcEtaIn))
         return bad(2, "--nscbc-etain", "must be finite and > 0");
@@ -1045,21 +1529,30 @@ std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
     c.flameUp = r.upstream;
     c.flameDown = r.downstream;
     c.flameUIn = r.inflowSpeed;
+    c.flameWrinkle = r.wrinkle;
+    c.flameWrinkleModes = r.wrinkleModes;
     c.flameTu = 1.0 / (kGammaAir * c.mach * c.mach);
 
     const double dth = c.flameEig.dthOverDD;
+    if (bunsen && !r.given.contains("--cells-per-delta"))
+        c.flameCells = kBunsenCellsDefault;
     const double h = dth / c.flameCells;
     const int nb = c.nscbcSink;
-    const int nx = int(std::ceil((c.flameUp + c.flameDown) * c.flameCells -
-                                 1e-9)) + 2 * nb;
-    auto box = makeBox(nx, r.ny, 1, nx * h, r.ny * h, 1.0);
-    if (!box) return std::unexpected(box.error());
-    c.grid = *box;
-    c.n = nx;
+    if (bunsen) {
+        auto e = bunsenGeometry(r, c, nb);
+        if (!e) return std::unexpected(e.error());
+    } else {
+        const int nx = int(std::ceil((c.flameUp + c.flameDown) * c.flameCells -
+                                     1e-9)) + 2 * nb;
+        auto box = makeBox(nx, r.ny, 1, nx * h, r.ny * h, 1.0);
+        if (!box) return std::unexpected(box.error());
+        c.grid = *box;
+        c.flameXf0 = nb * h + c.flameUp * dth;
+        c.uInf = c.flameUIn;
+    }
+    c.n = c.grid.nx;
     c.h = h;
-    c.L = nx * h;
-    c.flameXf0 = nb * h + c.flameUp * dth;
-    c.uInf = c.flameUIn;
+    c.L = c.grid.nx * h;
     c.re = 1.0 / c.prandtl; // rho_u S_L delta_D / mu
     c.nu = c.prandtl;       // mu (rho_u = 1): lambda_u = cp
     c.far = FarField::Nscbc;
@@ -1087,7 +1580,7 @@ std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
               .re = c.re,
               .mach = c.mach,
               .frameDt = c.fdt,
-              .body = "premixed flame",
+              .body = c.flameBunsen ? "slot Bunsen flame" : "premixed flame",
               .farField = "nscbc",
               .physics = name(c.physics),
               .kick = 0.0,
@@ -3168,15 +3661,66 @@ std::string flowRunLabel(const Case& c)
     return {};
 }
 
+namespace {
+
+// " | 2D slot Bunsen: ..." -- the burner and its anchoring, named.
+std::string bunsenLabel(const BunsenGeom& b, double sigma)
+{
+    auto kind = [&](double t) {
+        return t >= sigma ? "burnt" : t > 1 ? "warm inert" : "cold inert";
+    };
+    return std::format(
+        " | 2D slot Bunsen: U_jet {:g} S_L, coflow {} (T/Tu {:g}) at {:g} "
+        "S_L{}",
+        b.uJet, kind(b.tCo), b.tCo, b.uCo,
+        b.pilot > 0 ? std::format(", {} pilot strips (T/Tu {:g}) at {:g} S_L",
+                                  kind(b.tPilot), b.tPilot, b.uPilot)
+                    : std::string());
+}
+
+} // namespace
+
 std::string flameRunLabel(const Case& c)
 {
     assert(c.sub == Subcommand::Flame);
+    if (c.flameDiffusion) {
+        const DiffusionModel& m = c.diff;
+        const BunsenGeom& b = c.bunsen;
+        return std::format(
+            "DNS [diffusion single-step F + {:g} O -> {:g} P, calorically "
+            "perfect, "
+            "Le=1, Y_F1={:g}, Y_O2={:g}, Z_st={:.4g}, T_ad/T0={:g}, Da={:g}, "
+            "M_jet={:g}] species: MC-limited MUSCL, ONE limiter shared by the "
+            "species (coupling functions exact), on the central mass flux "
+            "(mean flow central) | 2D slot jet: Pe=W={:g}, coflow {:g} U_jet{}; "
+            "inflow = the Burke-Schumann sheet of its mixture fraction",
+            m.s, 1 + m.s, m.yF1, m.yO2, m.zst(), m.sigma, m.Da, c.mach, b.W,
+            b.uCo,
+            b.pilot > 0 ? std::format(", burnt Z_st pilot strips {:g} at {:g} "
+                                      "U_jet",
+                                      b.pilot, b.uPilot)
+                        : std::string()) +
+               (c.flameCandle
+                    ? std::format(" | candle: gravity g={:g} U^2/l along -x "
+                                  "(Fr=U^2/(gW)={:.3g}), hydrostatic "
+                                  "ambient column{}",
+                                  c.flameGravity,
+                                  c.flameGravity > 0
+                                      ? 1.0 / (c.flameGravity * b.W)
+                                      : HUGE_VAL,
+                                  c.flameQuiescent ? "; QUIESCENT (no fuel, "
+                                                     "inflow at rest)"
+                                                   : "")
+                    : std::string());
+    }
     return std::format(
         "DNS [premixed single-step, calorically perfect, Le=1, "
         "M_flame={:g} (inflated; CH4/air 1.15e-3)] species: MC-limited MUSCL "
         "on the central mass flux (bounded scalar transport; mean flow "
-        "central)",
-        c.mach);
+        "central){}",
+        c.mach,
+        c.flameBunsen ? bunsenLabel(c.bunsen, c.flameModel.sigma)
+                      : std::string());
 }
 
 double hFine(const Case& c)
@@ -3192,6 +3736,162 @@ std::string Case::describe() const
 {
     if (sub == Subcommand::Prop) return describeProp(prop);
     if (sub == Subcommand::Hit) return describeHit(*this);
+    if (sub == Subcommand::Flame && flameDiffusion)
+    {
+        const DiffusionModel& m = diff;
+        const BunsenGeom& b = bunsen;
+        const double sig = m.sigma;
+        double uMax = std::max({1.0, b.uCo, b.uPilot}) * (1 + b.pulse);
+        std::string mode = "2D slot jet diffusion flame (dns flame --mode "
+                           "diffusion)";
+        std::string grav;
+        if (flameCandle) {
+            mode = "2D candle: the diffusion flame under gravity, pointing "
+                   "+x (dns flame --mode candle)";
+            const double Lb = grid.nx * h;
+            if (flameGravity > 0) {
+                const CandleScales cs =
+                    candleScales(m, flameGravity, b.W, Lb, mach);
+                uMax = std::max(uMax, cs.uFreeFall);
+                grav = std::format(
+                    "  gravity    g = {:.6g} U^2/l along -x; ambient column "
+                    "isothermal T0, p_a(x) = p0 exp(-g x/(R T0)), p_a(L)/p0 = "
+                    "{:.6g}\n"
+                    "             Fr = U^2/(g W) = {:.4g}; free-fall speed "
+                    "sqrt(2 g L (sigma-1)/sigma) = {:.4g} U (buoyant Mach "
+                    "{:.3g})\n"
+                    "             adiabatic fraction (g/cp) L/(T_ad - T0) = "
+                    "{:.3g}; flicker scale 0.479 sqrt(g/W) = {:.4g} U/l\n",
+                    flameGravity, 1 - cs.hydroDrop, cs.froude, cs.uFreeFall,
+                    cs.machBuoyant, cs.adiabatic, cs.flicker);
+            } else
+                grav = "  gravity    g = 0: the diffusion jet bit for bit\n";
+            if (flameQuiescent)
+                grav += "  quiescent  NO fuel, every inflow row at rest (Z = "
+                        "0, u = 0, T0): the hydrostatic rest check\n";
+        }
+        const double dtAc = cfl * h / (std::sqrt(sig) / mach + sig * uMax);
+        const double dtTh = 0.25 * h * h * (1.0 / sig) /
+                            (prandtl * std::max(1.0, kGammaAir / prandtl));
+        return std::format(
+            "case:\n"
+            "  mode       {}\n"
+            "{}"
+            "  model      single step F + s O -> (1+s) P, omega = A rho^2 Y_F "
+            "Y_O e^(-Ta/T); calorically perfect\n"
+            "             (gamma 1.4), equal W, Le = 1; s = {:g}, Y_F1 = {:g}, "
+            "Y_O2 = {:g} -> Z_st = {:.6g}\n"
+            "             T_ad/T0 = {:.6g}, q/(cp T0) = {:.6g} per unit fuel, "
+            "beta = {:.6g}, Ta/T0 = {:.6g}, Da = {:.6g} (ln A = {:.6g})\n"
+            "  units      rho0 = R = U_jet = 1, l = D0/U_jet = 1 (mu = Pr = "
+            "{:.4g}), T0 = p0 = 1/(gamma M^2) = {:.6g}\n"
+            "  transport  {}\n"
+            "  grid       {} x {} x 1  h = {:.6g} = l/{:.4g}  box {:.6g} x "
+            "{:.6g}  [x jet axis, y periodic]\n"
+            "  burner     slot W = {:.4g} l (Pe = Re Pr = {:.4g}, Re = {:.4g}) "
+            "centred at y = {:.6g}, fuel Z = 1, u = 1 (jet Mach {:.3g})\n"
+            "             oxidizer coflow {:.4g} l per side, Z = 0, u = {:.4g}"
+            "{}\n"
+            "             edges tanh half-width {:.4g} l ({:.3g} cells){}\n"
+            "             inflow state: the Burke-Schumann sheet of Z(y) (the "
+            "jet edge burns at the exit plane)\n"
+            "  sheet      constant-density Burke-Schumann tip W^2/(16 "
+            "erfinv(Z_st)^2) = {:.4g} l (scale only; D(T) shortens it); box "
+            "length {:.4g} l past the bands\n"
+            "  boundary   x-lo NSCBC per-row inflow (u, rho), etaIn {:.4g}, "
+            "species pinned to the sheet; x-hi outflow p = {} (anchor sigma "
+            "{:g}), backflow carries the cell's own Y\n"
+            "             sink {} cells, amp {:.3g}\n"
+            "  run        tt = {:.6g} l/U_jet  cfl = {:.3g}  dt est {:.3e} "
+            "(acoustic {:.3e}, thermal {:.3e}; chemistry at run time)\n"
+            "  label      {}\n"
+            "  out        {}\n",
+            mode, grav,
+            m.s, m.yF1, m.yO2, m.zst(), sig, m.qOverCpT0(), m.beta, m.theta(),
+            m.Da, m.lnA(), prandtl, flameTu,
+            sutherland ? std::format("Sutherland mu(T), T0 = {:.6g} K", tinfK)
+                       : std::string("constant mu = Pr, rho D = mu/Pr"),
+            grid.nx, grid.ny, h, flameCells, grid.nx * h, grid.ny * h, b.W,
+            b.W, b.W / prandtl, b.yc, mach, b.wCo, b.uCo,
+            b.pilot > 0 ? std::format("\n             pilot strips {:.4g} l "
+                                      "per side: burnt gas at Z_st (T_ad), u "
+                                      "= {:.4g}",
+                                      b.pilot, b.uPilot)
+                        : std::string(),
+            b.edge, b.edge / h,
+            b.pulse > 0 ? std::format("\n             jet pulse u_jet (1 + "
+                                      "{:.3g} sin(2 pi {:.4g} t))",
+                                      b.pulse, b.pulseFreq)
+                        : std::string(),
+            sheetTipConstantDensity(b.W, m.zst()),
+            grid.nx * h - 2.0 * nscbcSink * h, nscbcEtaIn,
+            flameCandle && flameGravity > 0
+                ? "p_a(x_out), both faces' incoming acoustic waves carrying "
+                  "the ambient hydrostatic gradient; air drawn DOWN through "
+                  "the top relaxes to the ambient rho_a, v = 0"
+                : "p0",
+            kDiffOutflowSigma,
+            nscbcSink, nscbcSinkAmp, tEnd, cfl, std::min(dtAc, dtTh), dtAc, dtTh,
+            flameRunLabel(*this), outPrefix);
+    }
+    if (sub == Subcommand::Flame && flameBunsen)
+    {
+        const double sig = flameModel.sigma, dth = flameEig.dthOverDD;
+        const BunsenGeom& b = bunsen;
+        const double dtAc = cfl * h / (std::sqrt(sig) / mach + sig * b.uJet);
+        const double dtTh = 0.25 * h * h * (1.0 / sig) /
+                            (prandtl * std::max(1.0, kGammaAir / prandtl));
+        const double alpha =
+            std::asin(1.0 / b.uJet) * 180.0 / std::numbers::pi;
+        return std::format(
+            "case:\n"
+            "  mode       2D slot Bunsen flame (dns flame --mode bunsen)\n"
+            "  model      single step F -> P, calorically perfect (gamma 1.4), "
+            "equal W, Le = 1\n"
+            "             sigma = Tb/Tu = {:.6g}  beta = {:.6g}  theta = Ta/Tu "
+            "= {:.6g}  Pr = {:.4g}\n"
+            "  oracle     Lambda = {:.10g}  delta_th/delta_D = {:.6g}\n"
+            "  units      rho_u = S_L = R = 1, delta_D = 1, Tu = p0 = {:.6g}\n"
+            "  transport  {}\n"
+            "  grid       {} x {} x 1  h = {:.6g} = delta_th/{:.4g}  box "
+            "{:.6g} x {:.6g}  [x jet axis, y periodic]\n"
+            "  burner     slot W = {:.4g} delta_th centred at y = {:.6g}; jet "
+            "Y = 1, T = Tu, u = {:.4g} S_L (jet Mach {:.3g})\n"
+            "             coflow {:.4g} delta_th per side, Y = 0, T = {:.4g} Tu, "
+            "u = {:.4g} S_L{}\n"
+            "             edges tanh half-width {:.4g} delta_th ({:.3g} cells)"
+            "{}\n"
+            "  cone       ideal sin(alpha) = S_L/U: alpha = {:.4g} deg, height "
+            "{:.4g} delta_th; box length {:.4g} delta_th past the bands\n"
+            "  boundary   x-lo NSCBC per-row inflow (u, rho, Y), etaIn {:.4g}; "
+            "x-hi outflow p = p0; q omega re-added on the open rows\n"
+            "             sink {} cells, amp {:.3g}\n"
+            "  run        tt = {:.6g} flame times  cfl = {:.3g}  dt est {:.3e} "
+            "(acoustic {:.3e}, thermal {:.3e})\n"
+            "  label      {}\n"
+            "  out        {}\n",
+            sig, flameModel.beta, flameModel.theta(), prandtl, flameEig.Lambda,
+            dth, flameTu,
+            sutherland ? std::format("Sutherland lambda(T), S/Tu = {:.6g} "
+                                     "(Tu = {:.6g} K)",
+                                     flameModel.sOverTu, tinfK)
+                       : std::string("constant mu = Pr, lambda = cp"),
+            grid.nx, grid.ny, h, flameCells, grid.nx * h, grid.ny * h,
+            b.W / dth, b.yc, b.uJet, b.uJet * mach, b.wCo / dth, b.tCo, b.uCo,
+            b.pilot > 0 ? std::format("\n             pilot strips {:.4g} "
+                                      "delta_th per side: Y = 0, T = {:.4g} "
+                                      "Tu, u = {:.4g} S_L",
+                                      b.pilot / dth, b.tPilot, b.uPilot)
+                        : std::string(),
+            b.edge / dth, b.edge / h,
+            b.pulse > 0 ? std::format("\n             jet pulse u_jet (1 + "
+                                      "{:.3g} sin(2 pi {:.4g} t))",
+                                      b.pulse, b.pulseFreq)
+                        : std::string(),
+            alpha, b.coneH / dth, grid.nx * h / dth - 2.0 * nscbcSink / flameCells,
+            nscbcEtaIn, nscbcSink, nscbcSinkAmp, tEnd, cfl,
+            std::min(dtAc, dtTh), dtAc, dtTh, flameRunLabel(*this), outPrefix);
+    }
     if (sub == Subcommand::Flame)
     {
         const double sig = flameModel.sigma, dth = flameEig.dthOverDD;
@@ -3216,7 +3916,7 @@ std::string Case::describe() const
             "  grid       {} x {} x 1  h = {:.6g} = delta_th/{:.4g}  box "
             "{:.6g} x {:.6g}  [native 2D, y periodic]\n"
             "  flame      x_f0 = {:.6g} ({:.4g} delta_th fresh + {} sink "
-            "cells), {:.4g} delta_th burnt\n"
+            "cells), {:.4g} delta_th burnt{}\n"
             "  boundary   x NSCBC: inflow u = {:.4g} S_L (etaIn {:.4g}), "
             "outflow p = p_b = p0 - {:.4g}; species carried in at Y = 1\n"
             "             sink {} cells, amp {:.3g}\n"
@@ -3232,7 +3932,14 @@ std::string Case::describe() const
                                      flameModel.sOverTu, tinfK)
                        : std::string("constant mu = Pr, lambda = cp"),
             grid.nx, grid.ny, h, flameCells, grid.nx * h, grid.ny * h,
-            flameXf0, flameUp, nscbcSink, flameDown, flameUIn, nscbcEtaIn,
+            flameXf0, flameUp, nscbcSink, flameDown,
+            flameWrinkle > 0
+                ? std::format("\n             wrinkle {:.4g} delta_th over "
+                              "modes 1..{} (shortest {:.4g} delta_th)",
+                              flameWrinkle, flameWrinkleModes,
+                              grid.ny * h / flameWrinkleModes / dth)
+                : std::string(),
+            flameUIn, nscbcEtaIn,
             flameUIn * flameUIn * (sig - 1), nscbcSink, nscbcSinkAmp, ft,
             tEnd, cfl, std::min(dtAc, dtTh), dtAc, dtTh,
             flameRunLabel(*this), outPrefix);

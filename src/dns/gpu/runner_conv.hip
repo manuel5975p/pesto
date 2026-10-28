@@ -50,7 +50,7 @@ runConv(const Grid& g, const CompState& ic, const ConvRun& r, RunOutput& out)
     // untouched (never a state edit).
     dev->setRhsHook([&](const DeviceCompState& s, DeviceCompState& o,
                         const StageCombine& cmb) {
-        addGravityY(gg, r.gravity, cmb, r.closedSides, s, o);
+        addGravity(gg, 1, r.gravity, cmb, r.closedSides, s, o);
     });
 
     if (ds->upload(ic) != hipSuccess)

@@ -239,6 +239,19 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--cells-per-delta", &c.cellsPerDelta},
              {"--upstream", &c.upstream}, {"--downstream", &c.downstream},
              {"--inflow-speed", &c.inflowSpeed},
+             {"--wrinkle", &c.wrinkle}, {"--wrinkle-modes", &c.wrinkleModes},
+             {"--slot-width", &c.slotWidth}, {"--jet-speed", &c.jetSpeed},
+             {"--coflow-speed", &c.coflowSpeed},
+             {"--coflow-width", &c.coflowWidth},
+             {"--coflow-temp", &c.coflowTemp},
+             {"--pilot-width", &c.pilotWidth}, {"--pilot-temp", &c.pilotTemp},
+             {"--pilot-speed", &c.pilotSpeed},
+             {"--slot-edge", &c.slotEdge}, {"--length", &c.flameLength},
+             {"--pulse", &c.pulse}, {"--pulse-freq", &c.pulseFreq},
+             {"--stoich", &c.stoich}, {"--fuel-y", &c.fuelY},
+             {"--ox-y", &c.oxY}, {"--damkohler", &c.damkohler},
+             {"--cells-per-unit", &c.cellsPerUnit},
+             {"--gravity", &c.gravity}, {"--ignition", &c.ignition},
              {"--nscbc-etain", &c.nscbcEtaIn}, {"--nscbc-sink", &c.nscbcSink},
              {"--nscbc-sink-amp", &c.nscbcSinkAmp},
              {"--tt", &c.tt}, {"--cfl", &c.cfl},
@@ -276,7 +289,10 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         || c.sub == Subcommand::Conv || c.sub == Subcommand::Flame)
         enums.push_back({"--physics", enumValues(physicsNames()), &physicsSel});
     if (c.sub == Subcommand::Flame)
-        enums.push_back({"--mode", {{"premixed", 0}}, &c.flameMode});
+        enums.push_back({"--mode",
+                         {{"premixed", 0}, {"bunsen", 1}, {"diffusion", 2},
+                          {"candle", 3}},
+                         &c.flameMode});
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench
         || c.sub == Subcommand::Channel)
         enums.push_back({"--sgs", enumValues(sgsModelNames()), &sgsSel});
@@ -332,8 +348,10 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Channel)
         flags.push_back({"--compensated", &c.compensated});
-    if (c.sub == Subcommand::Flame)
+    if (c.sub == Subcommand::Flame) {
         flags.push_back({"--nscbc-tinflow", &c.nscbcTinflow});
+        flags.push_back({"--quiescent", &c.quiescent});
+    }
     if (c.sub == Subcommand::Prop) flags.push_back({"--selftest", &c.selftest});
 
     std::vector<string> known;
@@ -524,7 +542,7 @@ subcommands:
   hit     forced homogeneous isotropic turbulence (SI-configured)
   channel wall-resolved turbulent channel flow (compressible, forced)
   conv    Rayleigh-Bénard convection: heated floor, cooled lid, gravity
-  flame   1D premixed flame, single-step chemistry (compressible)
+  flame   single-step flames: 1D premixed, 2D slot Bunsen, 2D jet diffusion
   bench   step-time and throughput benchmark
   prop    propeller thrust curve by BEMT or lifting line (host-only, no GPU)
 
@@ -1395,7 +1413,8 @@ R"(dns bench — step-time and throughput benchmark
 )";
     case Subcommand::Flame:
         return
-R"(dns flame — 1D freely propagating premixed flame (docs/chem.md)
+R"(dns flame — single-step flames: 1D planar premixed, a 2D slot Bunsen, or a
+2D slot-jet diffusion flame (docs/chem.md)
 
 Compressible DNS of a laminar flame held in an open x box: fresh gas enters
 through a characteristic (NSCBC) inflow, burns in a single step F -> P, and
@@ -1417,7 +1436,9 @@ SPECIES. rho Y rides EXACTLY the central mass flux of the mean flow with an
 MC-limited MUSCL face value: deliberate, bounded scalar dissipation on the
 species alone (the RANS precedent). The mean flow stays central.
 
-  --mode premixed      the only mode built                     [premixed]
+  --mode premixed|bunsen|diffusion|candle
+                       1D planar flame | 2D slot Bunsen | 2D jet diffusion
+                       flame | 2D candle (own sections below)   [premixed]
   --mach M             flame Mach number S_L/c_u, (0, 0.05]       [0.01]
                        (warns above 0.02, the measured ladder top)
   --expansion SIGMA    Tb/Tu, (1, 10]                                [5]
@@ -1425,12 +1446,17 @@ species alone (the RANS precedent). The mean flow stays central.
   --prandtl PR         molecular Prandtl number (Le = 1)          [0.72]
   --visc constant|sutherland                                 [constant]
   --tinf K             Tu in kelvin; required with sutherland
-  --cells-per-delta N  cells per oracle thermal thickness, >= 4     [15]
+  --cells-per-delta N  cells per oracle thermal thickness, >= 4
+                                                     [15; bunsen 8]
   --upstream N         fresh extent in thermal thicknesses, >= 6    [12]
   --downstream N       burnt extent in thermal thicknesses, >= 4    [10]
   --ny N               periodic y cells, >= 4                        [4]
   --nz 1               the only value (multi-D flames are P2)
   --inflow-speed U     inflow velocity in S_L (1 = a stationary flame) [1]
+  --wrinkle A          IC front displacement, delta_th: modes 1..N of the
+                       box height, A/sqrt(N) each, phases k^2 golden;
+                       0 = planar (seeds Darrieus-Landau in 2D)       [0]
+  --wrinkle-modes N    number of seeded modes, [1, ny/8]              [8]
   --nscbc-etain E      inflow relax stiffness, as dns flow         [100]
   --nscbc-sink N       sink band per open face, cells; 0 = off      [16]
   --nscbc-sink-amp A   sink strength, (0, 2]                         [1]
@@ -1445,12 +1471,119 @@ species alone (the RANS precedent). The mean flow stays central.
   Rejected by name: --re, --ft (use --tt), --n (use --cells-per-delta),
   --physics incompressible (no low-Mach branch yet).
 
+BUNSEN (--mode bunsen). x is the jet axis: the x-lo face is the burner exit,
+a per-row NSCBC inflow of a slot jet of fresh gas (Y = 1, T = Tu) between
+two coflows of inert gas (Y = 0); y is periodic (the coflow separates the
+jet from its image). Edges are tanh blends. The flame ANCHORS ON A BURNT
+PILOT: by default the whole coflow is burnt gas (T = sigma Tu). Measured at
+U_jet 5, 8 cells: burnt coflow anchors; cold coflow, T/Tu 3, a cold u = 0
+rim and slow (1 S_L) burnt strips of 0.75-1.5 delta_th all blow off.
+Lengths in delta_th, speeds in S_L, temperatures as T/Tu.
+  --slot-width W       jet width, >= 4                               [12]
+  --jet-speed U        fresh jet speed, [1.5, 20]; U M <= 0.3          [5]
+  --coflow-speed U     coflow speed, [0, U_jet]                       [1]
+  --coflow-width W     coflow per side, >= 2              [slot width]
+  --coflow-temp T      coflow T/Tu, [1, sigma]               [sigma: pilot]
+  --pilot-width W      strip per side between jet and coflow, Y = 0  [0]
+  --pilot-temp T       its T/Tu, [1, sigma]                       [sigma]
+  --pilot-speed U      its speed, [0, U_jet]               [coflow speed]
+                       (a cold coflow anchors on a FAST burnt strip:
+                       --pilot-width 3 --pilot-speed U_jet measured)
+  --slot-edge E        tanh half-width of the edges, >= 1 cell     [0.25]
+  --length L           x extent past the sink bands, >= cone + 4
+                                         [ceil(1.25 cone height + 8)]
+  --pulse A            jet speed modulation u_jet (1 + A sin 2 pi f t),
+                       [0, 0.5]                                       [0]
+  --pulse-freq F       its frequency f, 1/tau (needs --pulse)
+  Rejected by name with bunsen: --upstream, --downstream, --inflow-speed,
+  --wrinkle, --wrinkle-modes, --ny (the burner sets the box), --profile-dt;
+  and the bunsen flags without it.
+
 STATS (<out>_stats.csv): t, dt, dtChem, SL (consumption speed, the integral
 of omega over rho_u Y_u), SLdisp (u_in - dx_f/dt), xf (mid-temperature
 crossing), dth ((Tb - Tu)/max dT/dx), Tmax, mass, energy (E + q rho Y),
 omegaEdge (max omega in the sink bands / max omega), yHits (cells with Y
-outside [-1e-6, 1 + 1e-6], counted, never clamped).
+outside [-1e-6, 1 + 1e-6], counted, never clamped), yMin, yMax.
 Exit 8 when the flame drifts within band + 2 delta_th of either face.
+Bunsen: t, dt, dtChem, xTip, xBase (the Tmid isotherm on the axis / the
+lowest burning flank row), tanA, tanL, tanR, rms (least squares of the flank
+over the middle half of the cone), sinRatio (sin(alpha) U_jet / S_L; 1 =
+the ideal cone), SLflank (omega over the flank rows per flank length),
+mFlank (rho u.n at the flank isotherm), burn, fuelIn (the inflow face's
+rho u Y), fuelNom, burnRatio, Tmax, mass, energy, yHits, yMin, yMax, uJet.
+Exit 8 when the cone is not anchored: flash-back, blow-through, the base
+lifting past half the tip height, or fewer than 4 burning flank rows.
+
+DIFFUSION (--mode diffusion). Non-premixed: F + s O -> (1+s) P, omega =
+A rho^2 Y_F Y_O e^(-Ta/T), Y_F and Y_O carried with ONE MC limiter shared by
+the species (the coupling function Y_F - Y_O/s and the mixture fraction Z
+are then transported exactly as passive scalars). Box units: rho0 = R =
+U_jet = 1, length l = D0/U_jet (mu = Pr; the slot width IS the jet Peclet
+number), T0 = p0 = 1/(gamma M^2), M = U_jet/c0. x is the jet axis: a fuel
+slot (Z = 1) between oxidizer coflows (Z = 0), y periodic. The inflow row is
+the Burke-Schumann flame sheet of its mixture fraction Z(y) (the jet edge
+burns at the exit plane: the anchor), species pinned there; the IC is that
+row extruded. Lengths in l, speeds in U_jet.
+  --stoich S           oxidizer mass per fuel mass, (0, 100]          [1]
+  --fuel-y Y           fuel stream Y_F (balance inert), (0, 1]        [1]
+  --ox-y Y             oxidizer stream Y_O (balance inert), (0, 1]    [1]
+                       Z_st = Y_O2 / (S Y_F1 + Y_O2)
+  --expansion SIGMA    flame-sheet temperature T_ad(Z_st)/T0, (1, 10]  [5]
+  --zeldovich BETA     Zeldovich number at T_ad, [2, 20]            [5]
+                       (beta 8 extinguishes the default sheet, measured)
+  --damkohler DA       A rho0 e^(-Ta/T_ad) l/U_jet, (0, 1e6]       [1000]
+  --mach M             jet Mach U_jet/c0, (0, 0.2]                 [0.05]
+  --cells-per-unit N   cells per l, [2, 64]                           [4]
+  --slot-width W       fuel slot width = Peclet number, [4, 200]     [16]
+  --coflow-speed U     oxidizer coflow speed, [0, 2]                  [1]
+  --coflow-width W     coflow per side, >= 2                  [slot width]
+  --pilot-width W      burnt Z_st strips per side (T_ad, no reactant) [0]
+  --pilot-speed U      their speed, [0, 2]                 [coflow speed]
+  --slot-edge E        tanh half-width of the inflow edges, >= 1 cell  [3]
+                       (edge 1 extinguishes at the exit, measured)
+  --length L           x extent past the sink bands, >= W
+                     [ceil(min(1.25 x constant-density sheet tip + 8, 20 W))]
+  --pulse A, --pulse-freq F   jet speed u_jet (1 + A sin 2 pi f t)
+  --tt T               run length in l/U_jet                         [10]
+  Rejected by name with diffusion: --upstream, --downstream, --inflow-speed,
+  --wrinkle, --wrinkle-modes, --ny, --profile-dt, --cells-per-delta,
+  --jet-speed, --coflow-temp, --pilot-temp; and the diffusion flags
+  (--stoich, --fuel-y, --ox-y, --damkohler, --cells-per-unit) elsewhere.
+  Stats: t, dt, dtChem, xTip (the axis Z_st crossing; NaN = open tip),
+  xBase (lowest row with omega >= 0.1 max), half (Z_st half-width at tip/2),
+  Tmax, TmaxIn (past the inflow band), burn, fuelIn (fuel through the first
+  interior face: convective + diffusive), fuelOut (rho u Y_F out), burnRatio,
+  mass, energy (E + q rho Y_F), pMean (box-mean p/p0), zMin, zMax, yfMin,
+  yoMin, hits, uJet. Frames: temp, fuel, oxid, omega. Exit 8 when TmaxIn
+  falls below (1 + sigma) T0/2 (extinction) or the base lifts past half the
+  box.
+  --ignition L         the IC burns a closed Burke-Schumann column L tall
+                       (Z(y) w(x), tanh edge), coflow air above; absent =
+                       the inflow row extruded over the whole box
+
+CANDLE (--mode candle). The diffusion model above under GRAVITY g along -x:
+the flame points UP (+x), fuel leaves a low-Peclet slot (the wick) at the
+bottom into a slow air coflow. Buoyancy, not the fuel jet, sets the flow:
+Fr = U^2/(g W) printed (0.071 at the defaults). The ambient column is
+isothermal at T0, p_a(x) = p0 exp(-g x/(R T0)): the IC pressure, the inflow
+density, the outflow target p_a(x_out), and BOTH faces' incoming acoustic
+waves carry its hydrostatic gradient (without them the boundary rows sag at
+g/2: a quiescent box reached |u| 0.67 U, with them 1.2e-3 U). Air drawn DOWN
+through the top (the plume's entrainment in the periodic box) is ambient
+air: rho_a, v = 0, Y_O2. Gravity is THE source of dns conv (one kernel).
+Defaults: paraffin/air s 3.4, Y_O2 0.233 (Z_st 0.064), W 1, g 14, 8 cells/l,
+edge 0.5, Da 5000, M 0.005, coflow 1 U x 12 l per side, length 32,
+ignition 4. g = 0 is --mode diffusion bit for bit.
+  --gravity G          g along -x in U^2/l, [0, 1000]                [14]
+  --quiescent          no fuel, every inflow row at rest: the hydrostatic
+                       rest check (rejects the slot and pulse flags)
+  --mach M             U_fuel/c0; buoyant Mach M sqrt(2 g L (sigma-1)/sigma)
+                       must stay <= 0.3 (warns above 0.15)       [0.005]
+  Rejected by name with candle: --pilot-width, --pilot-speed; --gravity and
+  --quiescent elsewhere. Stats: the diffusion columns + uMax (max |u|),
+  uOutMin (min u on the top row; < 0 = air drawn in); pMean over the ambient
+  column. Measured: H ~ Q^1.19 over W 0.5-1 (local 1.30 at 0.75-1; Roper's
+  buoyant slot 4/3); W >= 1.25 oscillates slowly (period ~13 l/U).
 )";
     case Subcommand::Prop:
         return

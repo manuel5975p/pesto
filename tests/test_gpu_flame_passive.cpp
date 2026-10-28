@@ -48,6 +48,9 @@ struct Spec
     double Ta = 2.0, q = 0.0;
     double yIn = 0.5;
     double (*yInit)(double x) = nullptr;
+    // (f) the per-row inflow (--mode bunsen's NSCBC targets and species
+    // fractions), filled with the uniform values: must be bit for bit.
+    bool rows = false;
 };
 
 double blob(double x) { return 0.5 + 0.4 * std::exp(-std::pow((x - 1.6) / 0.3, 2)); }
@@ -69,6 +72,9 @@ Result run(const Spec& sp, bool open)
         ss.q = sp.q;
         ss.openX = open;
         for (int k = 0; k < sp.nY; ++k) ss.yIn[k] = sp.yIn;
+        if (sp.rows)
+            for (int k = 0; k < sp.nY; ++k)
+                ss.yInRow[k].assign(std::size_t(g.ny), sp.yIn);
         if (!dev->enableSpecies(ss)) std::exit(EXIT_FAILURE);
     }
     auto ds = gpu::DeviceCompState::make(g.size(), 0, false, sp.nY);
@@ -76,8 +82,13 @@ Result run(const Spec& sp, bool open)
     std::optional<gpu::DeviceCompNscbc> nsc;
     std::optional<gpu::DeviceCompSink> snk;
     if (open) {
-        auto m = gpu::DeviceCompNscbc::make(
-            g, gpu::DeviceCompNscbc::Config{1.0, uMean, pInf, gam});
+        gpu::DeviceCompNscbc::Config nc{1.0, uMean, pInf, gam};
+        if (sp.rows) {
+            nc.inflowU.assign(std::size_t(g.ny), uMean);
+            nc.inflowJet.assign(std::size_t(g.ny), 1.0); // pulse 0
+            nc.inflowRho.assign(std::size_t(g.ny), 1.0);
+        }
+        auto m = gpu::DeviceCompNscbc::make(g, nc);
         auto s = gpu::DeviceCompSink::make(g, {.nb = kNb, .alpha = 1.0,
                                                .cInf = cInf});
         if (!m || !s) std::exit(EXIT_FAILURE);
@@ -217,6 +228,18 @@ int main()
         std::printf("  passive blob: Y in [%.9f, %.9f]\n", lo, hi);
         check(lo >= 0.5 - 1e-6 && hi <= 0.9 + 1e-6,
               std::string("(e) passive blob stays in [0.5, 0.9] to 1e-6, ") + tag);
+
+        if (open) {
+            // (f) per-row inflow targets and fractions at the uniform values
+            // run their own kernel instantiations: same bits.
+            Spec f0{.nY = 1, .lnA = std::log(5.0), .q = 3.0, .yInit = blob};
+            Spec f1 = f0;
+            f1.rows = true;
+            const Result a0 = run(f0, open), a1 = run(f1, open);
+            check(sameFlow(a0, a1) && a0.y[0] == a1.y[0],
+                  "(f) uniform per-row inflow (u, rho, Y): bit for bit the "
+                  "uniform targets, open (NSCBC + sink)");
+        }
     }
     return dnstest::finish();
 }

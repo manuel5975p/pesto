@@ -3,7 +3,9 @@
 // The ONLY way to obtain a Case is validate(); its constructor is private.
 #pragma once
 
+#include "dns/bunsen.hpp"
 #include "dns/chem.hpp"
+#include "dns/diffusion.hpp"
 #include "dns/grid.hpp"
 #include "dns/prop/spec.hpp"
 #include "dns/rans.hpp"
@@ -264,12 +266,42 @@ struct RawConfig
     int sides = 0;          // 0 periodic lateral faces, 1 closed (--sides)
 
     // flame (premixed; docs/chem.md). Lengths in oracle thermal thicknesses.
-    int flameMode = 0;          // --mode; 0 premixed (the only one built)
+    int flameMode = 0;          // --mode; 0 premixed, 1 bunsen, 2 diffusion,
+                                // 3 candle
     double expansion = 5.0;     // sigma = Tb / Tu
     double zeldovich = 8.0;     // beta
     double cellsPerDelta = 15;  // cells per oracle delta_th
     double upstream = 12, downstream = 10; // fresh / burnt extents
     double inflowSpeed = 1.0;   // inflow speed / S_L
+    double wrinkle = 0;         // IC front displacement amplitude, delta_th
+    int wrinkleModes = 8;       // modes 1..N of the box height
+    // --mode bunsen (2D slot burner; docs/chem.md). Lengths in delta_th,
+    // speeds in S_L, temperatures in Tu.
+    double slotWidth = 12;      // jet width W
+    double jetSpeed = 5;        // fresh jet speed
+    double coflowSpeed = 1;     // coflow speed
+    double coflowWidth = -1;    // per side; < 0 = slotWidth
+    double coflowTemp = -1;     // coflow T/Tu, [1, sigma]; < 0 = sigma (pilot)
+    double pilotWidth = 0;      // strip per side between jet and coflow
+    double pilotTemp = -1;      // its T/Tu; < 0 = sigma (burnt pilot)
+    double pilotSpeed = -1;     // its speed; < 0 = coflowSpeed
+    double slotEdge = 0.25;     // tanh half-width of every profile edge
+    double flameLength = -1;    // x extent beyond the bands; < 0 = auto
+    double pulse = 0;           // jet speed modulation amplitude (fraction)
+    double pulseFreq = 0;       // its frequency, 1/tau
+    // --mode diffusion (2D slot jet diffusion flame; dns/diffusion.hpp).
+    // Lengths in l = D0/U_jet, speeds in U_jet; the burner flags above keep
+    // their names (slot width = the jet Peclet number).
+    double stoich = 1;          // s: F + s O -> (1+s) P
+    double fuelY = 1;           // fuel stream Y_F
+    double oxY = 1;             // oxidizer stream Y_O
+    double damkohler = 1000;    // A rho0 e^(-Ta/T_ad) l/U
+    double cellsPerUnit = 4;    // cells per l
+    // --mode candle (the diffusion model under gravity; dns/diffusion.hpp).
+    double gravity = -1;        // g along -x in U^2/l; < 0 = the candle default
+    bool quiescent = false;     // no fuel, inflow at rest: the hydrostatic check
+    double ignition = -1;       // IC sheet length (diffusion, candle); < 0 =
+                                // the mode default (diffusion: the whole box)
 
     // bench
     int steps = 20;
@@ -482,6 +514,31 @@ public:
     double flameUp = 0, flameDown = 0; // fresh / burnt extents, delta_th
     double flameXf0 = 0;        // initial flame position (mid temperature)
     double flameUIn = 1;        // inflow speed / S_L (the IC's mass flux)
+    double flameWrinkle = 0;    // IC front displacement amplitude, delta_th
+    int flameWrinkleModes = 8;  // modes 1..N of the box height (flameWrinkle)
+    // --mode bunsen: the slot burner (dns/bunsen.hpp). Box units (lengths in
+    // delta_D, speeds in S_L), except the temperature RATIO bunsenCoflowT.
+    bool flameBunsen = false;
+    BunsenGeom bunsen;
+    // --mode diffusion: the two-reactant model and the slot jet (box units:
+    // rho0 = R = U_jet = 1, l = D0/U_jet = 1, T0 = flameTu = 1/(gamma M^2)).
+    // The burner geometry rides `bunsen` (uJet = 1; tCo/tPilot unused: the
+    // inflow is the Burke-Schumann state of its mixture fraction).
+    bool flameDiffusion = false;
+    DiffusionModel diff;
+    // --mode candle: flameDiffusion AND gravity g along -x (the burner axis;
+    // the flame points UP = +x), in U_jet^2/l. The ambient column is
+    // isothermal at T0: p_a(x) = p0 exp(-g x/(R T0)) (candleAmbientP).
+    // g == 0 is the diffusion runner bit for bit. flameQuiescent: no fuel,
+    // every inflow row at rest (the hydrostatic rest check).
+    bool flameCandle = false;
+    double flameGravity = 0;
+    bool flameQuiescent = false;
+    // The IC's burning column length (--ignition, l): the inflow mixture
+    // fraction Z(y) times w(x) = (1 - tanh((x - L_ign)/edge))/2, laid as its
+    // Burke-Schumann state (a closed sheet). 0 = the whole box, the inflow
+    // row extruded (the diffusion default, bit for bit).
+    double flameIgnition = 0;
 
     // prop: the resolved thrust-curve case (dns/prop/spec.hpp). Host-only --
     // `dns prop` never acquires a GPU.

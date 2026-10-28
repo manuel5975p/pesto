@@ -60,7 +60,7 @@ Drift run(bool reacting, double tEnd)
     CompState ic;
     std::vector<double> ry;
     premixedState(g, gam, Tu, sig, 0.0,
-                  [&](double x) {
+                  [&](double x, double) {
                       return std::min(flameProfile(eig->tab, x - xa),
                                       flameProfile(eig->tab, xb - x));
                   },
