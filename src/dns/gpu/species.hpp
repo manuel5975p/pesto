@@ -40,6 +40,7 @@ struct SpeciesView
     Real yHi[kMaxY] = {};
     const Real* Y[kMaxY] = {};  // the cell pass's Y_k = rhoY_k / rho
     const Real* omega = nullptr;
+    const std::uint8_t* solid = nullptr; // SpeciesSetup::solid
 };
 
 // The cell pass of state s: Y_k = rhoY_k / rho into Y[k], and
@@ -56,6 +57,8 @@ void cellPass(const GpuGrid& g, const DeviceCompState& s, const Real* T,
 // after kCompStage and before the rhs hook. Plain (non-compensated) form
 // only. ox >= 0: the face value is Y_up + theta/2 (Y_down - Y_up) with ONE
 // theta per face, the min over species of the MC ratio (kSpeciesStage2).
+// sv.solid != null selects the walled instantiation (SpeciesSetup::solid;
+// premixed, uniform inflow only); null is the original kernel.
 void stage(const GpuGrid& g, ViscView vv, PrimView q, const StageCombine& cmb,
            const SpeciesCombine& sc, const SpeciesView& sv,
            DeviceCompState& out);

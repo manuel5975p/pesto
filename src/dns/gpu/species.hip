@@ -115,8 +115,10 @@ __device__ inline void cellFaces(const GpuGrid& g, int i, int a, int open,
 }
 
 // Row: per-row inflow fractions (SpeciesView::yInRow); its own instantiation,
-// so the uniform-inflow kernel is the shipped code.
-template <bool Row>
+// so the uniform-inflow kernel is the shipped code. kSolid: the immersed-wall
+// instantiation (SpeciesSetup::solid); false is the kernel as it was before
+// walls existed. Row && kSolid is not instantiated.
+template <bool Row, bool kSolid>
 __global__ void kSpeciesStage(GpuGrid g, ViscView vv, PrimView q,
                               StageCombine cmb, SpeciesCombine sc,
                               SpeciesView sv, Real* oy0, Real* oy1, Real* oy2,
@@ -124,6 +126,17 @@ __global__ void kSpeciesStage(GpuGrid g, ViscView vv, PrimView q,
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
+    if constexpr (kSolid) {
+        // A solid cell carries no species rhs and releases no heat (its rho
+        // Y stays at its IC value, 0, so omega is 0 there anyway; this also
+        // keeps a non-finite ghost omega out of E).
+        if (sv.solid[c]) {
+            Real* out[kMaxY] = {oy0, oy1, oy2, oy3};
+            for (int s = 0; s < sv.nY; ++s)
+                out[s][c] = cmb.ca * sc.ya[s][c] + cmb.cb * sc.yb[s][c];
+            return;
+        }
+    }
     int i, j, k;
     decompose(g, c, i, j, k);
     const Offsets o = offsetsAt(g, i, j, k);
@@ -134,6 +147,17 @@ __global__ void kSpeciesStage(GpuGrid g, ViscView vv, PrimView q,
         const Real h = a == 0 ? g.hx : a == 1 ? g.hy : g.hz;
         Face fh, fl;
         cellFaces(g, i, a, sv.openX, c, o, o2, fh, fl);
+        // Walled faces: no flux; a solid second neighbour (the MUSCL
+        // upwind-upwind cell) drops the face to first order.
+        bool wallH = false, wallL = false;
+        if constexpr (kSolid) {
+            wallH = sv.solid[fh.R] != 0;
+            wallL = sv.solid[fl.L] != 0;
+            fh.firstL = fh.firstL || sv.solid[fh.LL];
+            fh.firstR = fh.firstR || sv.solid[fh.RR];
+            fl.firstL = fl.firstL || sv.solid[fl.LL];
+            fl.firstR = fl.firstR || sv.solid[fl.RR];
+        }
         // Open x domain faces: the boundary cell's own mdot, the inflow
         // value in and the cell's out, no diffusion (ScalarBoundary).
         const bool openHi = sv.openX && a == 0 && i == g.nx - 1;
@@ -149,10 +173,14 @@ __global__ void kSpeciesStage(GpuGrid g, ViscView vv, PrimView q,
             if constexpr (Row)
                 if (sv.yInRow[s])
                     yin = sv.yInRow[s][std::size_t(j) + std::size_t(g.ny) * k];
-            const Real Fh = openHi ? mo * (mo > Real(0) ? Y[c] : yin)
-                                   : faceY(Y, fh, mh, dh, h);
-            const Real Fl = openLo ? mo * (mo < Real(0) ? Y[c] : yin)
-                                   : faceY(Y, fl, ml, dl, h);
+            Real Fh = openHi ? mo * (mo > Real(0) ? Y[c] : yin)
+                             : faceY(Y, fh, mh, dh, h);
+            Real Fl = openLo ? mo * (mo < Real(0) ? Y[c] : yin)
+                             : faceY(Y, fl, ml, dl, h);
+            if constexpr (kSolid) {
+                if (wallH) Fh = Real(0);
+                if (wallL) Fl = Real(0);
+            }
             div[s] -= (Fh - Fl) / h;
         }
     }
@@ -345,10 +373,13 @@ void stage(const GpuGrid& g, ViscView vv, PrimView q, const StageCombine& cmb,
     assert(!cmb.ol[0] && !cmb.lts && sc.nY == sv.nY && out.nY == sv.nY);
     bool row = false;
     for (int s = 0; s < sv.nY; ++s) row = row || sv.yInRow[s] != nullptr;
-    auto launch = [&](auto r) {
-        kSpeciesStage<decltype(r)::value><<<launchBlocks(g.size()), blockSize>>>(
-            g, vv, q, cmb, sc, sv, out.y[0].data(), out.y[1].data(),
-            out.y[2].data(), out.y[3].data(), out.E.data());
+    // The walled kernel is premixed and uniform-inflow only (the chamber).
+    assert(!sv.solid || (!row && sv.ox < 0));
+    auto launch = [&](auto r, auto solid) {
+        kSpeciesStage<decltype(r)::value, decltype(solid)::value>
+            <<<launchBlocks(g.size()), blockSize>>>(
+                g, vv, q, cmb, sc, sv, out.y[0].data(), out.y[1].data(),
+                out.y[2].data(), out.y[3].data(), out.E.data());
     };
     auto launch2 = [&](auto r, auto amb) {
         kSpeciesStage2<decltype(r)::value, decltype(amb)::value>
@@ -365,8 +396,9 @@ void stage(const GpuGrid& g, ViscView vv, PrimView q, const StageCombine& cmb,
         checkLastKernel("kSpeciesStage2");
         return;
     }
-    if (row) launch(std::true_type{});
-    else launch(std::false_type{});
+    if (sv.solid) launch(std::false_type{}, std::true_type{});
+    else if (row) launch(std::true_type{}, std::false_type{});
+    else launch(std::false_type{}, std::false_type{});
     checkLastKernel("kSpeciesStage");
 }
 

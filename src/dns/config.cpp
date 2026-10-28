@@ -965,6 +965,151 @@ std::expected<Case, ConfigError> validateConv(const RawConfig& r, Case c)
     return c;
 }
 
+// --- flame --mode chamber ----------------------------------------------------
+// The closed 2D combustion chamber (docs/chem.md, "Chamber"; dns/chamber.hpp).
+
+// Which flags belong to which flame mode: a flag of the other mode that was
+// TYPED is an error by name, never ignored.
+std::optional<ConfigError> chamberFlagScope(const RawConfig& r, bool chamber)
+{
+    if (chamber)
+        return rejectGiven(r, {"--ny", "--upstream", "--inflow-speed",
+                               "--profile-dt", "--wrinkle", "--wrinkle-modes"},
+                           "does not apply to --mode chamber (the grid is "
+                           "derived from the chamber; fresh gas enters "
+                           "through the injector, --inject-speed)");
+    return rejectGiven(r, {"--inject-speed", "--coflow", "--chamber-height",
+                           "--chamber-length", "--nozzle-ratio",
+                           "--holder-height", "--clearance", "--inject-ramp",
+                           "--reaction"},
+                       "only applies to --mode chamber");
+}
+
+std::expected<Case, ConfigError> finishChamber(const RawConfig& r, Case c)
+{
+    const auto& f = r.chamber;
+    const double cells =
+        r.given.contains("--cells-per-delta") ? r.cellsPerDelta : 4.0;
+    const double down = r.given.contains("--downstream") ? r.downstream : 40.0;
+    if (!(down >= 10))
+        return bad(2, "--downstream", "must be >= 10 thermal thicknesses "
+                                      "(the jet region past the nozzle)");
+    if (!(finitePos(f.injectSpeed) && f.injectSpeed <= 20))
+        return bad(2, "--inject-speed", "must be in (0, 20] (x S_L)");
+    if (!(finitePos(f.coflow) && f.coflow <= 20))
+        return bad(2, "--coflow", "must be in (0, 20] (x S_L): a static "
+                                  "ambient makes the NSCBC inflow an acoustic "
+                                  "mirror");
+    if (!(std::isfinite(f.height) && f.height >= 8))
+        return bad(2, "--chamber-height", "must be >= 8 thermal thicknesses");
+    if (!(std::isfinite(f.length) && f.length >= 10))
+        return bad(2, "--chamber-length", "must be >= 10 thermal thicknesses");
+    if (!(f.nozzleRatio >= 1.5 && f.nozzleRatio <= 6))
+        return bad(2, "--nozzle-ratio", "must be in [1.5, 6] (Hc / He)");
+    if (!(f.holder >= 1 && f.holder <= f.height - 4))
+        return bad(2, "--holder-height", "must be in [1, chamber height - 4] "
+                                         "thermal thicknesses");
+    if (!(std::isfinite(f.clearance) && f.clearance >= 4))
+        return bad(2, "--clearance", "must be >= 4 thermal thicknesses");
+    if (!(std::isfinite(f.ramp) && f.ramp >= 0))
+        return bad(2, "--inject-ramp", "must be finite and >= 0");
+
+    const double dth = c.flameEig.dthOverDD;
+    const double h = dth / cells;
+    const int nb = c.nscbcSink;
+    ChamberSpec s;
+    s.tw = 1.5 * dth;
+    s.Hc = f.height * dth;
+    s.Lc = f.length * dth;
+    s.He = s.Hc / f.nozzleRatio;
+    s.Ln = 0.5 * s.Hc;
+    s.Hg = f.holder * dth;
+    s.Lg = 0.75 * s.Hg;
+    s.wInj = 1.25 * dth;
+    s.x0 = nb * h + 4 * dth;
+    s.xg = s.xb() + s.wInj + 2.5 * dth;
+    if (s.xBase() > s.xn() - 2 * dth)
+        return bad(2, "--chamber-length", "too short for the injector, the "
+                                          "holder and 2 thermal thicknesses "
+                                          "behind it");
+    if (s.He / h < 8)
+        return bad(2, "--nozzle-ratio", std::format(
+                       "leaves the nozzle exit {:.3g} cells tall (< 8): raise "
+                       "--cells-per-delta or --chamber-height",
+                       s.He / h));
+    const int nx = int(std::ceil((s.xe() + down * dth) / h - 1e-9)) + nb;
+    const int ny =
+        int(std::ceil((s.Hc + 2 * s.tw + 2 * f.clearance * dth) / h - 1e-9));
+    auto box = makeBox(nx, ny, 1, nx * h, ny * h, 1.0);
+    if (!box) return std::unexpected(box.error());
+    s.yc = 0.5 * ny * h;
+    c.grid = *box;
+    c.n = nx;
+    c.h = h;
+    c.L = nx * h;
+    c.flameCells = cells;
+    c.flameDown = down;
+    c.flameTu = 1.0 / (kGammaAir * c.mach * c.mach);
+    c.chamberMode = true;
+    c.chamber = s;
+    c.chamberMdot = f.injectSpeed * s.Hc; // rho_u = 1
+    c.chamberCoflow = f.coflow;
+    c.chamberRamp = f.ramp;
+    c.chamberReaction = f.reaction == 1;
+    c.flameUIn = f.injectSpeed;
+    c.uInf = f.coflow;
+    c.re = 1.0 / c.prandtl;
+    c.nu = c.prandtl;
+    c.far = FarField::Nscbc;
+    c.bodyKind = BodyKind::None;
+
+    // The nozzle at the burnt total temperature, exit at the ambient p0: a
+    // choked estimate has no subsonic solution and the central flux has no
+    // shock capturing.
+    const double Tu = c.flameTu, sig = c.flameModel.sigma;
+    auto nz = isentropicNozzle(c.chamberMdot, sig * Tu, s.He, Tu, kGammaAir,
+                               kRgasBox);
+    if (!nz)
+        return bad(2, "--inject-speed", std::format(
+                       "chokes the nozzle ({}): lower --inject-speed or "
+                       "--nozzle-ratio, or raise --mach",
+                       nz.error()));
+    if (nz->Me > 0.7)
+        c.warnings.push_back(std::format(
+            "the isentropic exit Mach is {:.3g} (> 0.7): the central flux has "
+            "no shock capturing", nz->Me));
+
+    if (auto e = resolveCfl(r, c, 0.4); e) return std::unexpected(*e);
+    if (!finitePos(r.tt)) return bad(2, "--tt", "must be finite and > 0");
+    c.ft = r.given.contains("--tt") ? r.tt : 60.0;
+    c.tEnd = c.ft;
+    if (auto e = resolveDtRecompute(r, c, 16); e) return std::unexpected(*e);
+    if (auto e = validateFrameOutputs(r, c); e) return std::unexpected(*e);
+    if (auto e = resolveEmit(c, {Emit::Stats}); e) return std::unexpected(*e);
+    if (c.mach > 0.02)
+        c.warnings.push_back(std::format(
+            "--mach {:.4g} is above the measured ladder top 0.02", c.mach));
+    if (nb == 0)
+        c.warnings.push_back("--nscbc-sink 0: the bare characteristic "
+                             "boundary (nothing drains mesh-scale content)");
+    if (!c.chamberReaction)
+        c.warnings.push_back("--reaction off: inert species transport (the "
+                             "wall-impermeability check), no flame");
+    c.meta = {.D = s.Hc,
+              .re = c.re,
+              .mach = c.mach,
+              .frameDt = c.fdt,
+              .body = "combustion chamber",
+              .farField = "nscbc",
+              .physics = name(c.physics),
+              .kick = 0.0,
+              .sgs = "",
+              .rans = "",
+              .steady = ""};
+    c.meta.setGrid(c.grid);
+    return c;
+}
+
 // --- flame ------------------------------------------------------------------
 // --mode bunsen's default resolution: 8 cells per delta_th (the demo grid;
 // the 1D ladder puts S_L +1.7% high at 7.5 cells, docs/chem.md).
@@ -1129,6 +1274,7 @@ constexpr double kCandleMachDefault = 0.005;
 std::expected<Case, ConfigError> validateDiffusion(const RawConfig& r, Case c)
 {
     const bool candle = r.flameMode == 3;
+    if (auto e = chamberFlagScope(r, false); e) return std::unexpected(*e);
     if (auto e = candle ? rejectGiven(r, {"--pilot-width", "--pilot-speed"},
                                       "does not apply to --mode candle (the "
                                       "flame anchors on its inflow sheet: no "
@@ -1432,8 +1578,11 @@ std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
         return bad(2, "--physics", "a flame is compressible only (no low-Mach "
                                    "branch until P7; docs/chem.md)");
     const bool bunsen = r.flameMode == 1;
-    if (r.flameMode != 0 && !bunsen)
-        return bad(2, "--mode", "must be premixed, bunsen, diffusion or candle");
+    const bool chamber = r.flameMode == kFlameModeChamber;
+    if (r.flameMode != 0 && !bunsen && !chamber)
+        return bad(2, "--mode", "must be premixed, bunsen, diffusion, candle "
+                                "or chamber");
+    if (auto e = chamberFlagScope(r, chamber); e) return std::unexpected(*e);
     if (auto e = rejectGiven(r,
                              {"--stoich", "--fuel-y", "--ox-y", "--damkohler",
                               "--cells-per-unit", "--ignition"},
@@ -1466,7 +1615,7 @@ std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
     if (r.nz != 1)
         return bad(2, "--nz", "must be 1: multi-D flames are P2 (docs/chem.md)");
     if (!bunsen && r.ny < 4) return bad(2, "--ny", "must be >= 4 (periodic y)");
-    c.mach = r.mach;
+    c.mach = chamber && !r.given.contains("--mach") ? 0.02 : r.mach;
     if (!(finitePos(c.mach) && c.mach <= 0.05))
         return bad(2, "--mach", "must be in (0, 0.05]: the flame Mach number "
                                 "S_L/c_u, inflated above a real flame's "
@@ -1525,6 +1674,7 @@ std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
     if (!eig) return bad(2, "--zeldovich", eig.error());
     c.flameModel = md;
     c.flameEig = std::move(*eig);
+    if (chamber) return finishChamber(r, std::move(c));
     c.flameCells = r.cellsPerDelta;
     c.flameUp = r.upstream;
     c.flameDown = r.downstream;
@@ -3723,6 +3873,64 @@ std::string flameRunLabel(const Case& c)
                       : std::string());
 }
 
+std::string chamberRunLabel(const Case& c)
+{
+    assert(c.chamberMode);
+    return flameRunLabel(c) +
+           " chamber: immersed adiabatic ghost wall [first-order wall "
+           "position, NOT body-fitted; species flux zero through wall faces], "
+           "injector = volumetric mass-flow source band" +
+           (c.chamberReaction ? std::string()
+                              : std::string(" [--reaction off: inert]"));
+}
+
+namespace {
+
+std::string describeChamber(const Case& c)
+{
+    const ChamberSpec& s = c.chamber;
+    const double sig = c.flameModel.sigma, dth = c.flameEig.dthOverDD;
+    const double Tu = c.flameTu;
+    const auto nz = isentropicNozzle(c.chamberMdot, sig * Tu, s.He, Tu,
+                                     kGammaAir, kRgasBox);
+    const double cb = std::sqrt(sig) / c.mach;
+    const double ue = nz ? nz->Me * cb : 0.0;
+    return std::format(
+        "case:\n"
+        "  mode       closed 2D combustion chamber (dns flame --mode chamber)\n"
+        "  model      single step F -> P, calorically perfect (gamma 1.4), "
+        "equal W, Le = 1\n"
+        "             sigma = {:.6g}  beta = {:.6g}  Pr = {:.4g}  Lambda = "
+        "{:.10g}  delta_th/delta_D = {:.6g}\n"
+        "  units      rho_u = S_L = R = 1, delta_D = 1, Tu = p0 = {:.6g}\n"
+        "  grid       {} x {} x 1  h = {:.6g} = delta_th/{:.4g}  box {:.6g} x "
+        "{:.6g}  [native 2D, y periodic]\n"
+        "  chamber    inner {:.4g} x {:.4g} (back face x = {:.4g}), wall "
+        "{:.4g}, nozzle {:.4g} long to exit {:.4g} at x = {:.4g} (ratio "
+        "{:.3g})\n"
+        "  holder     wedge apex x = {:.4g}, base {:.4g} tall at x = {:.4g}\n"
+        "  injector   band x < {:.4g}: premixed Y = 1 at Tu, {:.4g} S_L bulk "
+        "(mdot {:.4g} per unit depth), ramp {:.4g}\n"
+        "  ambient    cold inert gas (Tu, Y = 0), coflow {:.4g} S_L, x NSCBC "
+        "(etaIn {:.4g}), p = p0; sink {} cells, amp {:.3g}\n"
+        "  IC         cavity fresh up to the holder base, burnt behind it "
+        "(oracle profile), at rest, p0\n"
+        "  estimate   isentropic exit (T0 = Tb, p_e = p0): Me = {:.4g}, u_e = "
+        "{:.4g}, p0/p_amb = {:.6g}\n"
+        "  run        tt = {:.6g} flame times  cfl = {:.3g}\n"
+        "  label      {}\n"
+        "  out        {}\n",
+        sig, c.flameModel.beta, c.prandtl, c.flameEig.Lambda, dth, Tu,
+        c.grid.nx, c.grid.ny, c.h, c.flameCells, c.grid.nx * c.h,
+        c.grid.ny * c.h, s.Lc + s.Ln, s.Hc, s.xb(), s.tw, s.Ln, s.He, s.xe(),
+        s.Hc / s.He, s.xg, s.Hg, s.xBase(), s.xb() + s.wInj, c.flameUIn,
+        c.chamberMdot, c.chamberRamp, c.chamberCoflow, c.nscbcEtaIn,
+        c.nscbcSink, c.nscbcSinkAmp, nz ? nz->Me : 0.0, ue,
+        nz ? nz->p0 / Tu : 0.0, c.ft, c.cfl, chamberRunLabel(c), c.outPrefix);
+}
+
+} // namespace
+
 double hFine(const Case& c)
 {
     return c.focalActive ? hMin(c.grid.nz, c.focalHFine[0], c.focalHFine[1],
@@ -3892,6 +4100,7 @@ std::string Case::describe() const
             nscbcEtaIn, nscbcSink, nscbcSinkAmp, tEnd, cfl,
             std::min(dtAc, dtTh), dtAc, dtTh, flameRunLabel(*this), outPrefix);
     }
+    if (sub == Subcommand::Flame && chamberMode) return describeChamber(*this);
     if (sub == Subcommand::Flame)
     {
         const double sig = flameModel.sigma, dth = flameEig.dthOverDD;

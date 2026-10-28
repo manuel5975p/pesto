@@ -40,6 +40,7 @@ add_library(dns_core
     src/dns/chem.cpp
     src/dns/cli.cpp
     src/dns/casegeom.cpp
+    src/dns/chamber.cpp
     src/dns/config.cpp
     src/dns/diffusion.cpp
     src/dns/framemap.cpp
@@ -154,6 +155,7 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/rans.hip
     src/dns/gpu/reductions.hip
     src/dns/gpu/rotortable.hip
+    src/dns/gpu/runner_chamber.hip
     src/dns/gpu/runner_channel.hip
     src/dns/gpu/runner_comp.hip
     src/dns/gpu/runner_conv.hip
@@ -403,7 +405,7 @@ if(BUILD_TESTING)
         fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport
         rotor focal cli_defaults comp_axis_permute rans rans_channel1d
         steady_stop blockband channel_line pseudo_time flow_rans_config
-        flame1d flame_config bunsen diffusion candle)
+        flame1d flame_config bunsen diffusion candle chamber_config)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini)
     endif()
@@ -673,6 +675,11 @@ if(BUILD_TESTING)
         add_test(NAME gpu_candle_height COMMAND test_gpu_candle height)
         set_tests_properties(gpu_candle_rest gpu_candle_g0 gpu_candle_height
             PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+        # --mode chamber (docs/chem.md, "Chamber"): the closed 2D combustion
+        # chamber -- inert wall impermeability (fuel = injected to rounding),
+        # then the reacting fuel/energy balance, the nozzle against the
+        # isentropic estimate, and anchoring. Two runs, ~2 min.
+        dns_gpu_bin_test(gpu_chamber 600)
 
 
         # --- Physical validation suite (docs/validation.md) -----------------

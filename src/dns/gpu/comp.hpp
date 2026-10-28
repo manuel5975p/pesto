@@ -136,6 +136,15 @@ struct SpeciesSetup
     // own instantiation (bit for bit).
     bool ambientHi = false;
     double yHi[kMaxY] = {};
+    // Immersed ghost wall (--mode chamber): DEVICE mask, 1 on every solid
+    // (ghost or deep) cell, owned by the caller for the solver's lifetime.
+    // A face with a solid side carries NO species flux (convective or
+    // diffusive: the impermeable, zero-gradient wall the mean flow's
+    // DeviceCompGhost::applyRhs makes), a solid upwind second neighbour
+    // drops that face to first order, and a solid cell gets no species rhs
+    // and no heat release. Null = no wall: the kernel without the mask,
+    // compiled separately (bit for bit the code before it).
+    const std::uint8_t* solid = nullptr;
 };
 
 // An unevaluated sum hi + lo of two floats (the compensated state's words).

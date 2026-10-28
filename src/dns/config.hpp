@@ -4,6 +4,7 @@
 #pragma once
 
 #include "dns/bunsen.hpp"
+#include "dns/chamber.hpp"
 #include "dns/chem.hpp"
 #include "dns/diffusion.hpp"
 #include "dns/grid.hpp"
@@ -24,6 +25,9 @@
 namespace dns {
 
 enum class Subcommand { Flow, Tgv, Hit, Bench, Channel, Conv, Prop, Flame };
+// `dns flame --mode` values (RawConfig::flameMode); 0 premixed, 1 bunsen,
+// 2 diffusion, 3 candle.
+inline constexpr int kFlameModeChamber = 4;
 enum class Physics { Incompressible, Compressible };
 enum class FarField { Tunnel, Fringe, Sponge, Nscbc, Periodic };
 enum class Backend { Cpu, Gpu, Auto };
@@ -267,7 +271,7 @@ struct RawConfig
 
     // flame (premixed; docs/chem.md). Lengths in oracle thermal thicknesses.
     int flameMode = 0;          // --mode; 0 premixed, 1 bunsen, 2 diffusion,
-                                // 3 candle
+                                // 3 candle, kFlameModeChamber
     double expansion = 5.0;     // sigma = Tb / Tu
     double zeldovich = 8.0;     // beta
     double cellsPerDelta = 15;  // cells per oracle delta_th
@@ -302,6 +306,19 @@ struct RawConfig
     bool quiescent = false;     // no fuel, inflow at rest: the hydrostatic check
     double ignition = -1;       // IC sheet length (diffusion, candle); < 0 =
                                 // the mode default (diffusion: the whole box)
+    // --mode chamber (docs/chem.md, "Chamber"); lengths in delta_th.
+    struct ChamberFlags
+    {
+        double injectSpeed = 3.0;  // fresh bulk speed past the injector / S_L
+        double coflow = 2.0;       // ambient coflow / S_L
+        double height = 15;        // inner chamber height
+        double length = 30;        // straight section length
+        double nozzleRatio = 3;    // Hc / He
+        double holder = 4;         // holder base height
+        double clearance = 10;     // ambient above and below the chamber
+        double ramp = 1;           // injection ramp, flame times
+        int reaction = 1;          // --reaction on|off
+    } chamber;
 
     // bench
     int steps = 20;
@@ -539,6 +556,12 @@ public:
     // Burke-Schumann state (a closed sheet). 0 = the whole box, the inflow
     // row extruded (the diffusion default, bit for bit).
     double flameIgnition = 0;
+    // --mode chamber (dns/chamber.hpp): geometry in box units, the injected
+    // mass flux per unit depth (rho_u injectSpeed Hc), coflow, ramp.
+    bool chamberMode = false;
+    ChamberSpec chamber;
+    double chamberMdot = 0, chamberCoflow = 0, chamberRamp = 0;
+    bool chamberReaction = true;
 
     // prop: the resolved thrust-curve case (dns/prop/spec.hpp). Host-only --
     // `dns prop` never acquires a GPU.
@@ -588,6 +611,10 @@ std::string flowRunLabel(const Case& c);
 // central mass flux). The ONE text the dry-run, the progress line and the
 // manifest carry. Pre: c.sub == Flame.
 std::string flameRunLabel(const Case& c);
+
+// --mode chamber's label: flameRunLabel's model text plus the chamber's
+// immersed-wall and injector statement. Pre: c.chamberMode.
+std::string chamberRunLabel(const Case& c);
 
 // The finest cell spacing the run resolves: the focal plateau's when
 // focalActive, the grid's otherwise, both by the hMin rule (z excluded at

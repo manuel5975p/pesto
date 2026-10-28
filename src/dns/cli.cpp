@@ -259,6 +259,15 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--profile-dt", &c.profileDt},
              {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
              {"--planes", &c.planes}, {"--png-down", &c.pngDown}});
+    if (c.sub == Subcommand::Flame) // --mode chamber (validator scopes them)
+        add({{"--inject-speed", &c.chamber.injectSpeed},
+             {"--coflow", &c.chamber.coflow},
+             {"--chamber-height", &c.chamber.height},
+             {"--chamber-length", &c.chamber.length},
+             {"--nozzle-ratio", &c.chamber.nozzleRatio},
+             {"--holder-height", &c.chamber.holder},
+             {"--clearance", &c.chamber.clearance},
+             {"--inject-ramp", &c.chamber.ramp}});
     if (c.sub == Subcommand::Prop)
         add({{"--planform", &c.planform}, {"--polar", &c.polar},
              {"--thin-cd0", &c.thinCd0}, {"--thin-alpha0", &c.thinAlpha0},
@@ -289,10 +298,14 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         || c.sub == Subcommand::Conv || c.sub == Subcommand::Flame)
         enums.push_back({"--physics", enumValues(physicsNames()), &physicsSel});
     if (c.sub == Subcommand::Flame)
+    {
         enums.push_back({"--mode",
                          {{"premixed", 0}, {"bunsen", 1}, {"diffusion", 2},
-                          {"candle", 3}},
+                          {"candle", 3}, {"chamber", kFlameModeChamber}},
                          &c.flameMode});
+        enums.push_back({"--reaction", {{"on", 1}, {"off", 0}},
+                         &c.chamber.reaction});
+    }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench
         || c.sub == Subcommand::Channel)
         enums.push_back({"--sgs", enumValues(sgsModelNames()), &sgsSel});
@@ -1436,9 +1449,10 @@ SPECIES. rho Y rides EXACTLY the central mass flux of the mean flow with an
 MC-limited MUSCL face value: deliberate, bounded scalar dissipation on the
 species alone (the RANS precedent). The mean flow stays central.
 
-  --mode premixed|bunsen|diffusion|candle
+  --mode premixed|bunsen|diffusion|candle|chamber
                        1D planar flame | 2D slot Bunsen | 2D jet diffusion
-                       flame | 2D candle (own sections below)   [premixed]
+                       flame | 2D candle | closed 2D combustion chamber
+                       (own sections below)                   [premixed]
   --mach M             flame Mach number S_L/c_u, (0, 0.05]       [0.01]
                        (warns above 0.02, the measured ladder top)
   --expansion SIGMA    Tb/Tu, (1, 10]                                [5]
@@ -1584,6 +1598,38 @@ ignition 4. g = 0 is --mode diffusion bit for bit.
   uOutMin (min u on the top row; < 0 = air drawn in); pMean over the ambient
   column. Measured: H ~ Q^1.19 over W 0.5-1 (local 1.30 at 0.75-1; Roper's
   buoyant slot 4/3); W >= 1.25 oscillates slowly (period ~13 l/U).
+
+--mode chamber: a closed 2D combustion chamber (docs/chem.md, "Chamber").
+An immersed ADIABATIC ghost-wall body -- back wall, straight section,
+linear converging nozzle -- with a wedge flame holder inside; premixed
+reactants (Y = 1, Tu) enter through an injector band across the whole back
+wall (a volumetric mass-flow source: the chamber pressure rises until the
+nozzle passes it). Outside: cold inert ambient (Tu, Y = 0) in a coflow, x
+NSCBC + sink, y periodic. IC: cavity fresh up to the holder base, burnt
+behind it (oracle profile), all at rest at p0. Lengths in delta_th.
+  --inject-speed U     fresh bulk speed past the injector, S_L        [3]
+  --coflow U           ambient coflow, S_L                            [2]
+  --chamber-height H   inner height, >= 8                            [15]
+  --chamber-length L   straight section, >= 10                       [30]
+  --nozzle-ratio R     Hc / He, [1.5, 6]                              [3]
+  --holder-height H    wedge base height, [1, H - 4]                  [4]
+  --clearance C        ambient above and below, >= 4                 [10]
+  --downstream N       jet region past the nozzle, >= 10             [40]
+  --inject-ramp T      smooth injection ramp, flame times             [1]
+  --reaction on|off    off = inert species (wall-impermeability check) [on]
+  chamber defaults: --mach 0.02, --cells-per-delta 4, --tt 60.
+  Rejected with chamber: --ny, --upstream, --inflow-speed, --profile-dt;
+  the chamber flags are rejected without it.
+  STATS: t, dt, inj (fuel injection rate), injCum (its FP64 time integral),
+  fuel (fluid inventory of rho Y), burn (integral of omega), burnCav (in the
+  cavity), outNoz (fuel flux through the exit plane), outDom (fuel leaving
+  the domain), mdotNoz, Me (mass-weighted exit Mach), pCh (fresh plenum),
+  p0Noz (total p ahead of the contraction), pAmb (ambient beside the lips),
+  h0Noz (exit total-enthalpy flux), Tmax, mass, energy (E + q rho Y),
+  yHits, omegaInj (burn in the injector band / burn), fx (fluid -> body
+  force, x). Exit 8 on flash-back (injector-band burn > 1e-3 of the total
+  after ramp + 2) or blow-off (fuel through the exit > 0.5 of the injected
+  after ramp + 2 Lc/U); 7 on divergence.
 )";
     case Subcommand::Prop:
         return

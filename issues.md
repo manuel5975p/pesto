@@ -424,6 +424,60 @@ Measured gfx1100 via simjob, 2026-10-28.
     Mach 0.17 at the defaults (|u|max 34 U, M 0.005); the M dependence of
     the tip not measured.
 
+### Chamber (`dns flame --mode chamber`, docs/chem.md "Chamber")
+
+Measured gfx1100 via simjob, 2026-10-28, defaults (4 cells/δ_th) and the
+6-cell demo. Numbered C1… so they merge beside the other flame branches.
+
+- C1. **Thermo-acoustic limit cycle, mode not identified.** A self-excited
+  oscillation at f = 2.95 (4 cells) / 2.93 (6 cells) per flame time grows
+  after t ≈ 35 (burn-rms log growth 0.075 / 0.052) and saturates at 4 cells
+  (burn rms 6.7%, plenum p rms 0.36%). 1D two-temperature longitudinal
+  modes bracket it (2.74 open exit, 3.14 closed exit); hot transverse 2.33.
+  No pressure mode shape is output (frames: temp, fuel, omega), no geometry
+  or --inject-speed scan. Whether the default should be a quiet operating
+  point is undecided.
+- C2. **Tmax above Tb in the holder's base recirculation**, growing with
+  the C1 amplitude: 1.046 Tb (4 cells, saturated) and 1.013 Tb (6 cells,
+  t = 75); ≤ 1.0011 before the oscillation. Not compression of IC gas (the
+  inert check bounds that at 1.0013 × Tb (p/p0)^(2/7), and the IC gas is
+  gone by t = 30). Candidates, unseparated: the species/energy scheme
+  mismatch (MUSCL ρY vs central E) on a moving front at 4–6 cells/δ_th; the
+  staircase wall's energy flux (viscous work at a face whose mirror
+  velocity is not zero).
+- C3. **The ambient beside the nozzle lips sits 4.3% above p0** (both
+  resolutions). The outflow's soft pressure anchor (σ 0.25) and the jet are
+  the suspects; unmeasured. Chamber ratios are quoted against the MEASURED
+  pAmb, never against p0.
+- C4. **Nozzle total-pressure drop 1.45× the isentropic one** (Cd 0.83,
+  1.448 → 1.470 from 4 to 6 cells), attributed to the viscous exit at
+  u_e He/ν_b ~ 100; no Reynolds or resolution study beyond the two points.
+- C5. **FP32 injector rounding**: the inert fuel residual grows steadily
+  to 3.3e-5 of the inventory by t = 8, and ≤ 178 fresh cells per row read
+  Y − 1 ≤ 4.3e-6 (yHits). Attributed to the absorption of the small
+  per-stage source increment into an O(1) FP32 state, not proven; an FP64
+  per-cell injection tally would separate it.
+- C6. **Adiabatic no-slip walls cannot quench**: wall flash-back is
+  possible in principle. Not observed (injector-band burn ≤ 1e-15 of the
+  total through t = 80 at 3 S_L); the flash-back / blow-off guards never
+  fired in any run, so their thresholds (1e-3, 0.5) are unbracketed. No
+  --inject-speed scan; isothermal chamber walls not built.
+- C7. `fx` is the whole fluid → body force, the exterior coflow drag
+  included; thrust is not separated. Exit-plane quantities are cell-centre
+  sums over the last cavity column (x = xe − h/2), not face fluxes (ṁ
+  closes to 0.1% regardless).
+- C8. **6-cell energy-balance entry unverified** (docs/chem.md table).
+  The 4-cell entry was quoted as 1.0011 but the labelled quantity
+  q burn / (h0 − ṁ_in cp Tu), simple mean over t ∈ [40, 80], is 0.9989
+  (verified rerun, stats rows byte-identical to the implementer's over
+  t ≤ 40); 1.0011 is its inverse. The 6-cell 0.9959 was not rerun (GPU
+  budget), so its definition is unknown: 0.9959 or 1/0.9959. Either way
+  within 0.5%.
+- C9. **Saturation at 4 cells is approximate.** Burn rms over [t0, 80]
+  still rises 6.49% → 6.64% → 6.70% for t0 = 65, 70, 75 (plenum p rms
+  0.344% → 0.357% → 0.361%); the quoted 6.7% / 0.36% are the [75, 80]
+  values. tt 80 does not show a flat envelope.
+
 ## Older open items (details in CLAUDE.md)
 
 - No anchor for the Re800 compressible cases or `sphere_re300_n160_cd`
