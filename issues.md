@@ -213,6 +213,38 @@ Numbers are measured, gfx1100.
       rising): 75% of the deficit at r/R > 0.8, t/h_fine 3.3 → 1.7. Hub at
       parity. Azimuth bias at D/h 114: +15° moves CT −10.0%, CQ −1.1%. Torque
       p/v split +29% / −18% vs G2 while total CQ agrees (unisolated).
+    - **`--thin-seal` overshoots** (2026-10-28, `plans/verify/impl_propperf.md`;
+      analysis_propperf gate S5 FAILED, S6/S7 not run). P1 D/h 114, parity
+      argv, 235 fluid/fluid faces sealed, vs foam G1 (× 0.98828 / 1.00219),
+      window 2.58–3.18 D/U: CT 0.01629 → 0.02883 (−33.3% → **+18.0%**, gate
+      ≤ 10%), CQ 0.06129 → 0.06374 (−1.1% → **+2.9%**, gate ≤ 2%); tip bin
+      0.45–0.50 −74.2% → −0.5% (gate −25%: met). Final-snapshot bins
+      0.30/0.35/0.40: +14.4 / +12.8 / +8.7% (snapshot 6% above the window).
+      Still rising (blocks 2.5–3.0 / 3.0–3.18: 0.02853 / 0.02932). Same
+      pattern as the floored-STL emulation (+7.3% vs foam on that body).
+      Open: the sheet model's own body bias (t → 0 below τ) vs the
+      remaining p/v split error; side-image stencils of a sealed face may
+      take fluid corners from the far side of a sub-cell sheet (unmeasured).
+      P1 az 15° and P2m sealed not run.
+    - **NSCBC centre table is NOT bit-identical** (`plans/verify/
+      verify_propperf.md`): it is on by default for every `--focal` NSCBC
+      run. Focal sphere 128×96×96 (with and without `--pot`): stats differ
+      from the pre-table binary from the 4th row on at rounding level (cd
+      equal to 6 digits; cl/cs ~1e-3 relative). base + table alone ==
+      final byte for byte, so the table is the cause, not the seal refactor.
+      The P1 short byte match (412 steps, 3 rows) was too short to see it.
+      Undecided: keep (focal sphere 2.76 → 2.62 ms/step) or revert.
+      14.57 → 13.65 ms/step (re-measured 14.41 → 13.44); the plan's `kNscbcCells` ≤ 0.15 ms/launch gate
+      is NOT met (inferred 0.57 ms/launch from the step saving; not
+      profiled), so 14 FP64 maps were only ~35% of that kernel. With
+      `--dt-recompute 16` (now in `runs/prop/bench/dns.sh`,
+      `runs/prop/dns/argv.txt`): 12.25 ms/step full P1 (215.7 s wall vs
+      247.6), window CT/CQ 0.01629 / 0.06129 unchanged to 5 digits
+      (verified: 1.3e-5 / 1.2e-6 relative). P2m full with dt16
+      (`plans/verify/bench_prop_after.md`): 25.37 ms/step, window CT/CQ
+      0.01846454 / 0.06007321 vs 0.01846500 / 0.06007321 before (−2.5e-5 /
+      0 relative). `runs/prop/dns/argv.txt` is the P3 argv: dt16 there is NOT
+      measured at P3 (its CT/CQ are the pre-dt16 run's).
     - **rotor** (single blade): last measured at 80f147f, before the
       two-sided and impermeable faces; L2/L3 exceed the 300 s cap; its B/Bc
       foam references are still limited (65° snappy meshes). Not re-measured.
@@ -320,6 +352,9 @@ Numbers are measured, gfx1100.
 - README names gfx1201; this machine is gfx1100.
 - **Host phase** (`dns/parallel.hpp`, bit-identical; `runs/prop/curv/`,
   `--bench` short runs): DTMB 4119 P1 50.7 → 8.0 s, P3 156.0 → 20.8 s.
+  Merged with the NSCBC table + `--dt-recompute 16` (`plans/verify/
+  bench_prop_after.md`): host P1 7.2 / P2m 13.3 / P3 20.9 s; P1 end to end
+  247.6 → 172.3 s measured, P2m 635.1 (extrap.) → 478.5 s measured.
   Serial P3 split: body IC 122.1 s (one mesh-sdf call per cell; the older
   "dominated by `CurvMetrics::build`" was wrong), metrics 16.7, MRF
   classify 9.6 (10 threads), `sampleCut` 4.3. Left at P3: body IC 12.6 s on

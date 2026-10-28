@@ -388,6 +388,19 @@ other rotor flag is rejected without it. Compressible `flow` only.
   surfaces reading through each other; the run reports the deep-solid count
   and warns at 0. `--blade-thicken C` dilates by C fine cells (exact Minkowski
   sum) — it CHANGES THE BODY and must be reported with every result.
+- **`--thin-seal`** (compressible immersed ghost wall, static or `--rotor-frame
+  mrf`; off by default): a section thinner than the staircase — only a cell
+  CENTRE in solid makes a ghost — lets flow through between two fluid cells.
+  With the flag, every fluid/fluid face whose centre-to-centre segment
+  crosses the body (sphere-traced on the sdf) is a wall face of BOTH cells,
+  each imaged about its own surface: a zero-thickness sheet. The body is not
+  changed; the run prints the sealed count and labels `[thin sections sealed:
+  sub-cell sheets imaged as zero-thickness walls]`. 0 sealed faces is
+  bit-identical to the flag off. Rejected with `--ogrid`, `--rans`,
+  incompressible and `--rotor-frame moving`. Measured (DTMB 4119 P1, D/h 114,
+  `plans/verify/impl_propperf.md`): 235 faces sealed; tip bin vs OpenFOAM G1
+  −74.2% → −0.5%, but total CT −33% → **+18.0%** and CQ −1.1% → **+2.9%**
+  (window 2.58–3.18 D/U, still rising): it overshoots; not a parity setting.
 - **Tip Mach**: the run measures the real tip radius and stops if a body
   reaching past `D/2` exceeds the budget. Flow accelerating over a bluff
   spinning body goes sonic far below tip Mach 1 (a 3.5:1 lens at real tip 0.53

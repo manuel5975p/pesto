@@ -2454,6 +2454,29 @@ std::optional<ConfigError> flowRans(const RawConfig& r, Case& c)
     c.rans = RansModel(r.rans);
     const bool rans = c.rans != RansModel::None;
     const bool sa = c.rans == RansModel::SaNeg, sst = ransSst(c.rans);
+    // --thin-seal: the compressible immersed ghost wall's sealed faces
+    // (CompGhostTables::sealed). Every path it is not built for rejects it.
+    c.thinSeal = r.thinSeal;
+    if (c.thinSeal)
+    {
+        if (!comp)
+            return err(2, "--thin-seal", "seals faces of the compressible "
+                                         "immersed ghost wall; add --physics "
+                                         "compressible");
+        if (c.ogrid)
+            return err(2, "--thin-seal", "the O-grid wall is a mesh face row: "
+                                         "it has no staircase to leak");
+        if (c.bodyKind == BodyKind::None)
+            return err(2, "--thin-seal", "--body none has no wall to seal");
+        if (rans)
+            return err(2, "--thin-seal", "the RANS scalar wall images (ghost "
+                                         "k, nu~, omega, mu_t clamp) know no "
+                                         "sealed faces");
+        if (c.rotor.active() && !c.rotorMrf)
+            return err(2, "--thin-seal", "the moving rotor's azimuth tables "
+                                         "are not sealed; use --rotor-frame "
+                                         "mrf");
+    }
     if (c.ogridRevolved && c.ogridNphi == 0 && c.cs > 0)
         return err(2, "--les", "an axisymmetric wedge has no resolved 3D "
                                "turbulence to filter");
@@ -3094,6 +3117,7 @@ std::string flowRunLabel(const Case& c)
                 : geo;
         std::string l = ransRunLabel(c.rans, mode, 0, where);
         if (wedge && !c.compSteady) l += kAxisymUnsteady;
+        if (c.thinSeal) l += kThinSealSuffix;
         if (c.precondK > 0) l += precondSuffix(c.precondK);
         return l;
     }
@@ -3561,6 +3585,14 @@ std::string Case::describe() const
                 "             Report it with every result.\n",
                 bladeThickenCells, rotor.thicken, 2.0 * rotor.thicken);
     }
+    if (thinSeal)
+        s += "  wall       THIN SECTIONS SEALED: a fluid/fluid face whose "
+             "centre segment crosses\n"
+             "             the body is a wall face of both cells (zero-"
+             "thickness sheet; body\n"
+             "             unchanged). Label: [thin sections sealed: sub-cell "
+             "sheets imaged as\n"
+             "             zero-thickness walls]\n";
     if (noslipY) s += "  walls      y walls no-slip (adiabatic mirror)\n";
     return s;
 }

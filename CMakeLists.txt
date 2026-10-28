@@ -530,6 +530,16 @@ if(BUILD_TESTING)
         add_test(NAME gpu_precond COMMAND test_gpu_mrf precond)
         set_tests_properties(gpu_mrf_steady gpu_mrf_steady_lts gpu_precond
             PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+        # --thin-seal (analysis_propperf S1/S2): `host` is the classification
+        # alone (sealed count vs segment clipping, none on resolved bodies,
+        # thread-count identity; no device); `gpu` the sealed membranes
+        # holding a pressure jump and their chamber masses (~seconds).
+        add_executable(test_gpu_thin_seal tests/test_gpu_thin_seal.cpp)
+        target_link_libraries(test_gpu_thin_seal PRIVATE dns_gpu)
+        add_test(NAME thin_seal COMMAND test_gpu_thin_seal host)
+        add_test(NAME gpu_thin_seal COMMAND test_gpu_thin_seal gpu)
+        set_tests_properties(thin_seal gpu_thin_seal
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
         # The incompressible 3D SGS wall tally against the eddy-diffusion
         # substep's own momentum drain (W1; ~1 s).
         add_test(NAME gpu_les_tally3d COMMAND test_gpu_les_smag tally3d)

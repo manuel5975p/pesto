@@ -792,8 +792,59 @@ void mrfSteady()
              2, "incompressible flow --precond: exit 2");
 }
 
+// --thin-seal (analysis_propperf 7.1): compressible immersed ghost wall only,
+// static or MRF; everything else rejected by name. Off: describe and label
+// unchanged; on: both say so.
+void thinSeal()
+{
+    const Args sph = {"flow", "--physics", "compressible", "--body", "sphere",
+                      "--n",  "96",        "--ny",         "64",     "--nz",
+                      "64",   "--out",     "x"};
+    auto with = [&](Args extra) {
+        Args a = sph;
+        a.insert(a.end(), extra.begin(), extra.end());
+        return a;
+    };
+    const auto off = runCli(sph);
+    const auto on = runCli(with({"--thin-seal"}));
+    check(off && !off->thinSeal &&
+              off->describe().find("SEALED") == std::string::npos,
+          "--thin-seal absent: off, describe unchanged");
+    check(on && on->thinSeal &&
+              on->describe().find("THIN SECTIONS SEALED") != std::string::npos,
+          "--thin-seal: accepted on the static ghost wall, described");
+    const Args mrf = {"--rotor-mach", "0.3", "--rotor-axis", "x",
+                      "--rotor-frame", "mrf", "--dr", "6", "--focal", "auto",
+                      "--focal-ratio", "3", "--focal-blend", "1"};
+    Args m = mrf;
+    m.push_back("--thin-seal");
+    const auto mr = runCli(with(m));
+    check(mr && mr->thinSeal && mr->rotorMrf, "--thin-seal + MRF: accepted");
+    Args ms = m;
+    ms.insert(ms.end(), {"--steady", "2e-3"});
+    const auto st = runCli(with(ms));
+    check(st && dns::flowRunLabel(*st).find("[thin sections sealed: sub-cell "
+                                            "sheets imaged as zero-thickness "
+                                            "walls]") != std::string::npos,
+          "--thin-seal + MRF steady: the run label carries the seal");
+    Args mv = {"--rotor-mach", "0.3", "--rotor-axis", "x", "--dr", "6",
+               "--thin-seal"};
+    rejectedAt(with(mv), "--thin-seal", "--thin-seal + moving rotor: exit 2");
+    rejectedAt(og({"--thin-seal"}), "--thin-seal", "--thin-seal + --ogrid: exit 2");
+    rejectedAt({"flow", "--body", "sphere", "--nz", "64", "--thin-seal",
+                "--out", "x"},
+               "--thin-seal", "--thin-seal incompressible: exit 2");
+    rejectedAt(with({"--rans", "sa-neg", "--thin-seal"}), "--thin-seal",
+               "--thin-seal + --rans: exit 2");
+    rejectedAt({"flow", "--physics", "compressible", "--body", "none",
+                "--thin-seal", "--out", "x"},
+               "--thin-seal", "--thin-seal + --body none: exit 2");
+    rejected({"channel", "--thin-seal"}, 1, "channel --thin-seal: unknown flag");
+}
+
 int main()
 {
+    thinSeal();
     mrfSteady();
     revolved();
     headDescribes();

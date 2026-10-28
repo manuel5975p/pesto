@@ -310,6 +310,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         flags.push_back({"--nscbc-tinflow", &c.nscbcTinflow});
         flags.push_back({"--ogrid", &c.ogrid});
         flags.push_back({"--temp", &c.tempFrames});
+        flags.push_back({"--thin-seal", &c.thinSeal});
     }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Channel)
         flags.push_back({"--compensated", &c.compensated});
@@ -830,6 +831,15 @@ ROTOR (compressible; the body SPINS about a fixed shaft)
                      surfaces reading through each other. The run reports
                      the deep-solid cell count -- 0 means the blade is
                      nowhere thicker than the band.                     [0]
+  --thin-seal        compressible immersed ghost wall: SEAL sections the
+                     staircase leaks through. A fluid/fluid face whose
+                     centre-to-centre segment crosses the body becomes a
+                     wall face of both cells, each side imaged about its
+                     own surface: a zero-thickness sheet. The body is NOT
+                     changed (unlike --blade-thicken); a section thinner
+                     than a cell flows through without it. Labelled
+                     "[thin sections sealed]". Rejected with --ogrid,
+                     --rans, incompressible and --rotor-frame moving. [off]
 
 BODY-FITTED O-GRID (compressible)
   --ogrid            wrap the body in an ANNULAR body-fitted mesh instead

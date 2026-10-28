@@ -47,6 +47,10 @@ inline constexpr std::string_view kImmersedSuffix =
 // kImmersedSuffix: its fixed point is the frozen rotor's, not a time mean.
 inline constexpr std::string_view kMrfSteadySuffix =
     " [MRF frozen rotor: an APPROXIMATION, blade fixed at azimuth 0]";
+// --thin-seal (classifyCompGhost thinSeal): sections under the staircase's
+// resolution are walls of zero thickness, not the body's own thickness.
+inline constexpr std::string_view kThinSealSuffix =
+    " [thin sections sealed: sub-cell sheets imaged as zero-thickness walls]";
 // --precond K, appended last: " [low-Mach preconditioned pseudo-time, K=k]".
 // Pre: K > 0.
 inline std::string precondSuffix(double K)

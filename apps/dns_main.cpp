@@ -628,6 +628,7 @@ int runFlowCompressible(const Case& c, CaseGeometry& geo)
     rr.vortAsinh = c.vortAsinh;
     rr.speedDelta = c.speedDelta;
     rr.tempFrames = c.tempFrames;
+    rr.thinSeal = c.thinSeal;
     rr.far = c.far;
     rr.open = c.open;
     rr.spongeCells = c.spongeCells;

@@ -132,6 +132,19 @@ struct CompGhostTables
     // fluid cell's side (diagnostic, like fallback).
     int sideSkipped = 0;
 
+    // THIN-SECTION SEAL (classifyCompGhost thinSeal = true; off = none, the
+    // tables byte-identical). A FLUID/FLUID face whose centre-to-centre
+    // segment crosses the body -- a section thinner than the staircase, which
+    // flow otherwise passes straight through -- becomes an interface face of
+    // BOTH fluid cells: (A, +a) and (B, -a) in fcell/fdir, each carrying a side
+    // image about its own cell's surface (the two-sided machinery above), so
+    // the section is a zero-thickness impermeable sheet. Mask, ghosts and deep
+    // cells are unchanged; no ghost owns these faces (gfnb never lists them).
+    // sealed counts the sealed FLUID/FLUID faces (each is two table faces);
+    // a side whose sample is unusable is counted in sideSkipped and keeps the
+    // impermeable face of its real neighbour.
+    int sealed = 0;
+
     int nGhost() const { return int(gcell.size()); }
     int nDeep() const { return int(deep.size()); }
     int nFace() const { return int(fcell.size()); }
@@ -159,9 +172,14 @@ struct CompGhostCapacity
 // threads > 1 evaluates the sdf sweep on that many workers, each on its own
 // copy of sdf (which must then be reentrant, as buildRotorTable already
 // requires); the tables are bit-identical for any count.
+// thinSeal adds the sealed fluid/fluid faces (CompGhostTables::sealed); the
+// crossing test sphere-traces the sdf, so it needs a true distance (a lower
+// bound at least). Faces across the periodic wrap are never sealed.
+// thinSeal false: the tables are what they always were, byte for byte.
 CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                                   const double* bbox, const AxisRemap3& remap,
-                                  const GhostWallMotion* motion, int threads = 1);
+                                  const GhostWallMotion* motion, int threads = 1,
+                                  bool thinSeal = false);
 
 class DeviceCompGhost
 {

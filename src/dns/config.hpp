@@ -233,6 +233,7 @@ struct RawConfig
     int vortMap = 0;         // 0 linear clip, 1 asinh (png display only)
     int speedMap = 0;        // 0 |u| viridis, 1 delta: |u|-uInf diverging
     bool tempFrames = false; // --temp: add a T - Tinf frame channel
+    bool thinSeal = false;   // --thin-seal: seal sub-cell sections (ghost wall)
 
     // hit
     double urms = 60.0, spin = 10.0, stats = 10.0;
@@ -369,6 +370,11 @@ public:
     // blended zone (gpu/comp.hpp MrfZone). rotor.active() stays the one test
     // for "this run spins"; this picks which of the two formulations it takes.
     bool rotorMrf = false;
+    // --thin-seal: on the compressible immersed ghost wall, a fluid/fluid face
+    // whose centre segment crosses the body is a wall face of both cells,
+    // each imaged about its own surface (CompGhostTables::sealed). The body
+    // is unchanged; sections under the staircase become zero-thickness sheets.
+    bool thinSeal = false;
 
     // Body-fitted O-grid (dns/ogrid.hpp). ogridRFar is resolved to WORLD
     // units; the grid is (n angular) x (ny radial, incl. 2 ghost rows) x nz,

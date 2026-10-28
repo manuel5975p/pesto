@@ -136,6 +136,9 @@ struct CompRun
     // hFine is the validator's fine spacing (plateau under --focal), used to
     // size the zone's blend margins in cells.
     bool rotorMrf = false;
+    // --thin-seal: seal fluid/fluid faces whose centre segment crosses the
+    // body (CompGhostTables::sealed). Off = the ghost wall's tables unchanged.
+    bool thinSeal = false;
     double hFine = 0;
 
     // --- RANS on the immersed ghost wall (masterplan_flowrans P5) ---------

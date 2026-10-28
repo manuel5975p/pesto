@@ -128,6 +128,14 @@ public:
     // Periodic grid, nx >= 4 (ny/nz >= 4 on open axes); subsonic freestream.
     static std::expected<DeviceCompNscbc, hipError_t> make(const Grid& g, Config c);
 
+    // Focal variant of make: also tabulates `remap`'s physical cell centres
+    // (indices -1..n per axis, filled on the device by the same map), so the
+    // AxisRemap3 apply below reads them instead of evaluating the FP64 map 14
+    // times per boundary cell. NOT bit-identical (verify_propperf: ulp drift).
+    // Pre: apply(..., AxisRemap3) is then always passed this same remap.
+    static std::expected<DeviceCompNscbc, hipError_t>
+    make(const Grid& g, Config c, const AxisRemap3& remap);
+
     // Overwrite the rhs of every open-boundary cell with the characteristic
     // form, written into the stage output through the same RK combination the
     // interior used (dns/gpu/comp.hpp, StageCombine); install via
@@ -173,6 +181,9 @@ private:
     // Scratch, rewritten every stage: held by pointer so apply() stays const
     // (it is an rhs producer, not a state owner) and the class stays movable.
     std::unique_ptr<NscbcModalAbc> abc_;
+    // Focal centre table (make with an AxisRemap3), x | y | z, n + 2 each;
+    // empty = the AxisRemap3 apply evaluates the map itself.
+    DeviceBuffer<double> ctab_;
 };
 
 } // namespace dns::gpu

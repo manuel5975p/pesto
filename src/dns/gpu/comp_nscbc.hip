@@ -27,6 +27,27 @@ constexpr Real kLatBand = Real(0.01);
 // anything anyway and the ratio is dominated by whatever noise is on Lout.
 constexpr Real kBetaXMax = Real(18);
 
+// An AxisRemap3's physical cell centres, tabulated per axis for the indices
+// -1..n (c[d][i + 1]): kNscbcCells reads the map ONLY as cell-centre
+// coordinates, and the map is separable (filled by the same Focal1D::map,
+// kCentreTable; FP contraction differs: a focal run drifts at ulp level from
+// make() + inline map, verify_propperf). Motive: 14 FP64 maps per cell made
+// kNscbcCells 18% of the DTMB 4119 P1 step (analysis_propperf section 5).
+struct CentreTable3
+{
+    const double* c[3];
+};
+
+// out[t] = f.map((t - 1 + 0.5) h), t in [0, n + 2): coordD's own X for index
+// t - 1, through the same map call.
+__global__ void kCentreTable(Focal1D f, double h, int n, double* out)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n + 2) return;
+    const int ii = t - 1;
+    out[t] = f.map((ii + 0.5) * h);
+}
+
 // One thread per open-boundary cell (x extremes always; y/z extremes when
 // open). Per boundary axis n the characteristic amplitudes in +axis
 // orientation (lam1 = un-c, lam2..4 = un, lam5 = un+c; t1/t2 = tangents):
@@ -116,13 +137,19 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
     // triple: a periodic-compatible remap yields the correct periodic-image
     // position by itself, and TanhStretchY's smooth extension covers the
     // wall-ghost rows (same convention as kVorticityZRemap).
+    // CentreTable3: the same doubles, read from the per-axis table.
     auto coordD = [&](int ii, int jj, int kk, int d) {
-        const double X[3] = {(ii + 0.5) * double(g.hx),
-                             (jj + 0.5) * double(g.hy),
-                             (kk + 0.5) * double(g.hz)};
-        double x[3];
-        R.map(X, x);
-        return x[d];
+        if constexpr (std::is_same_v<Remap, CentreTable3>) {
+            const int id[3] = {ii, jj, kk};
+            return R.c[d][id[d] + 1];
+        } else {
+            const double X[3] = {(ii + 0.5) * double(g.hx),
+                                 (jj + 0.5) * double(g.hy),
+                                 (kk + 0.5) * double(g.hz)};
+            double x[3];
+            R.map(X, x);
+            return x[d];
+        }
     };
 
     auto onFace = [&](int a) {
@@ -474,7 +501,38 @@ void DeviceCompNscbc::apply(const DeviceComp& d, const DeviceCompState& s,
 {
     CurvView cv;
     if (!curvViewOf(d, cv)) return;
-    launchNscbc(g_, c_, u_, cInf_, Q_, d, s, out, cmb, remap, cv, nullptr);
+    if (ctab_.size() == 0) {
+        launchNscbc(g_, c_, u_, cInf_, Q_, d, s, out, cmb, remap, cv, nullptr);
+        return;
+    }
+    const double* t = ctab_.data();
+    const CentreTable3 tab{{t, t + (g_.nx + 2), t + (g_.nx + 2) + (g_.ny + 2)}};
+    launchNscbc(g_, c_, u_, cInf_, Q_, d, s, out, cmb, tab, cv, nullptr);
+}
+
+std::expected<DeviceCompNscbc, hipError_t>
+DeviceCompNscbc::make(const Grid& g, Config c, const AxisRemap3& remap)
+{
+    auto m = make(g, c);
+    if (!m) return m;
+    const GpuGrid gg = GpuGrid::from(g);
+    const int n[3] = {gg.nx, gg.ny, gg.nz};
+    auto buf = DeviceBuffer<double>::make(std::size_t(n[0] + n[1] + n[2] + 6));
+    if (!buf) return std::unexpected(buf.error());
+    const Focal1D* f[3] = {&remap.fx, &remap.fy, &remap.fz};
+    // h exactly as coordD forms it: the device grid's float spacing, widened.
+    const double h[3] = {double(gg.hx), double(gg.hy), double(gg.hz)};
+    std::size_t off = 0;
+    for (int a = 0; a < 3; ++a) {
+        kCentreTable<<<launchBlocks(std::size_t(n[a] + 2)), blockSize>>>(
+            *f[a], h[a], n[a], buf->data() + off);
+        checkLastKernel("kCentreTable");
+        off += std::size_t(n[a] + 2);
+    }
+    if (auto e = hipDeviceSynchronize(); e != hipSuccess)
+        return std::unexpected(e);
+    m->ctab_ = std::move(*buf);
+    return m;
 }
 
 } // namespace dns::gpu

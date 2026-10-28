@@ -970,7 +970,8 @@ void CompGhostCapacity::cover(const CompGhostTables& t)
 
 CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                                   const double* bbox, const AxisRemap3& R,
-                                  const GhostWallMotion* motion, int threads)
+                                  const GhostWallMotion* motion, int threads,
+                                  bool thinSeal)
 {
     const int nx = g.nx, ny = g.ny, nz = g.nz;
     const double hx = g.hx, hy = g.hy, hz = g.hz;
@@ -1427,6 +1428,142 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                 }
         return false;
     };
+    // Append interface face (fluid c, direction d) to fcell/fdir with its
+    // physical centre and, on a moving wall, the wall velocity there.
+    auto pushFace = [&](std::size_t c, int i, int j, int k, int d) {
+        fcell.push_back(int(c));
+        fdir.push_back(d);
+        // Physical centre of the shared face: the cell centre stepped half a
+        // REFERENCE cell along the axis, then mapped. On the identity remap
+        // this is the Cartesian face centre exactly.
+        const int a = d / 2;
+        const double s = (d & 1) ? -0.5 : 0.5;
+        const int ijk[3] = {i, j, k};
+        double ref[3];
+        for (int q = 0; q < 3; ++q)
+            ref[q] = (ijk[q] + 0.5 + (q == a ? s : 0.0)) * href[q];
+        const double xfc[3] = {R.fx.map(ref[0]), R.fy.map(ref[1]),
+                               R.fz.map(ref[2])};
+        for (int q = 0; q < 3; ++q) fpos.push_back(Real(xfc[q]));
+        // The impermeable face moves with the wall material AT the face
+        // centre: for a rigid motion the closed staircase then encloses no
+        // net volume change.
+        if (motion) {
+            const GhostWallKinematics kin = (*motion)(xfc[0], xfc[1], xfc[2]);
+            for (int q = 0; q < 3; ++q) T.fuwall.push_back(Real(kin.u[q]));
+        }
+    };
+    // Append the side image `im` of interface face `face` (fluid cell c).
+    auto pushSide = [&](std::size_t c, int face, const Image& im) {
+        if (T.sideCell.empty() || T.sideCell.back() != int(c)) {
+            T.sideCell.push_back(int(c));
+            T.sideStart.push_back(T.nSide());
+        }
+        T.sideFace.push_back(face);
+        T.sideScale.push_back(Real(im.a));
+        for (int s = 0; s < 8; ++s) {
+            T.sideNbr.push_back(im.v.nb[s]);
+            T.sideW.push_back(Real(im.v.w[s] / im.v.wsum));
+            T.sideTnbr.push_back(im.t.nb[s]);
+            T.sideTw.push_back(Real(im.t.w[s] / im.t.wsum));
+        }
+        if (motion) {
+            // The side image's own wall point: the surface the fluid cell
+            // sees, which on a rotor moves at its own omega x r.
+            const GhostWallKinematics kin =
+                (*motion)(im.wall[0], im.wall[1], im.wall[2]);
+            for (int a = 0; a < 3; ++a) T.sideUwall.push_back(Real(kin.u[a]));
+            T.sideAspan.push_back(Real(kin.a[0] * im.t.span[0]
+                                       + kin.a[1] * im.t.span[1]
+                                       + kin.a[2] * im.t.span[2]));
+        }
+    };
+
+    // Thin-section seal flags (CompGhostTables::sealed): bit a of seal[c] set
+    // when the face between fluid cell c and fluid c + e_a is sealed. The
+    // staircase lets flow through any section thinner than about h_a |n_a|
+    // + h_t |n_t| (exp_prop / analysis_propperf: 57-100% of the DTMB 4119
+    // planform past r/D 0.40 at D/h 114), because only a cell CENTRE in solid
+    // makes a ghost. A face is sealed when its centre-to-centre segment
+    // crosses the body: candidates have phi_A + phi_B <= |AB| (necessary for
+    // a distance), the crossing is sphere-traced from both ends, and the
+    // midpoint of the two hits must be strictly inside (a tangent touch is
+    // not a sheet). Faces across the periodic wrap are skipped (no body
+    // reaches the box faces). Per cell, so the z-slab split cannot change it.
+    std::vector<std::uint8_t> seal;
+    if (thinSeal) {
+        seal.assign(g.size(), 0);
+        const int naxis = nz == 1 ? 2 : 3;
+        // First t in [0, L) where the sdf along p0 + dir t e_a falls under
+        // 1e-9 L, or -1 when the segment stays clear (or the trace stalls).
+        auto trace = [](const GhostSdf& f, const double p0[3], int a,
+                        double dir, double L) {
+            double t = 0.0;
+            for (int it = 0; it < 4096; ++it) {
+                double p[3] = {p0[0], p0[1], p0[2]};
+                p[a] += dir * t;
+                const double d = f(p[0], p[1], p[2]);
+                if (d < 1e-9 * L) return t;
+                t += d;
+                if (t >= L) return -1.0;
+            }
+            return -1.0;
+        };
+        auto sealSlab = [&](const GhostSdf& f, int k0, int k1) {
+            const int n[3] = {nx, ny, nz};
+            for (int k = k0; k < k1; ++k)
+                for (int j = 0; j < ny; ++j)
+                    for (int i = 0; i < nx; ++i) {
+                        const std::size_t c = g.idx(i, j, k);
+                        if (phi[c] < 0.0) continue;
+                        const int ijk[3] = {i, j, k};
+                        const double xa[3] = {cx(i), cy(j), cz(k)};
+                        for (int a = 0; a < naxis; ++a) {
+                            if (ijk[a] + 1 >= n[a]) continue;
+                            int nb[3] = {i, j, k};
+                            ++nb[a];
+                            const std::size_t b = g.idx(nb[0], nb[1], nb[2]);
+                            if (phi[b] < 0.0) continue;
+                            const double xb[3] = {cx(nb[0]), cy(nb[1]),
+                                                  cz(nb[2])};
+                            const double L = xb[a] - xa[a];
+                            if (phi[c] + phi[b] > L) continue;
+                            const double t1 = trace(f, xa, a, 1.0, L);
+                            if (t1 < 0.0) continue;
+                            const double t2 = trace(f, xb, a, -1.0, L);
+                            if (t2 < 0.0 || t1 + t2 >= L) continue;
+                            double pm[3] = {xa[0], xa[1], xa[2]};
+                            pm[a] += 0.5 * (t1 + (L - t2));
+                            if (f(pm[0], pm[1], pm[2]) >= 0.0) continue;
+                            seal[c] |= std::uint8_t(1u << a);
+                        }
+                    }
+        };
+        const int sw = std::clamp(threads, 1, nz);
+        if (sw == 1)
+            sealSlab(sdf, 0, nz);
+        else {
+            std::vector<std::thread> pool;
+            pool.reserve(std::size_t(sw));
+            for (int w = 0; w < sw; ++w)
+                pool.emplace_back([&, w] {
+                    const GhostSdf f = sdf;
+                    sealSlab(f, int(std::int64_t(nz) * w / sw),
+                             int(std::int64_t(nz) * (w + 1) / sw));
+                });
+            for (auto& th : pool) th.join();
+        }
+    }
+    // Is face (i, j, k, direction d) sealed? A -face reads its back
+    // neighbour's flag; neither side wraps (the flags exclude it).
+    auto sealedFace = [&](int i, int j, int k, int d) {
+        const int a = d / 2;
+        if (!(d & 1)) return ((seal[g.idx(i, j, k)] >> a) & 1u) != 0;
+        int nb[3] = {i, j, k};
+        if (--nb[a] < 0) return false;
+        return ((seal[g.idx(nb[0], nb[1], nb[2])] >> a) & 1u) != 0;
+    };
+
     auto addSide = [&](std::size_t c, int i, int j, int k, int d, int q,
                        int face) {
         const double* ng = &gnorm[3 * std::size_t(q)];
@@ -1468,28 +1605,34 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
             ++T.sideSkipped;
             return;
         }
-        if (T.sideCell.empty() || T.sideCell.back() != int(c)) {
-            T.sideCell.push_back(int(c));
-            T.sideStart.push_back(T.nSide());
+        pushSide(c, face, im);
+    };
+    // A sealed face's side image (CompGhostTables::sealed): the neighbour B
+    // across the sheet imaged about the FLUID cell c's own surface -- addSide's
+    // construction with B's centre in place of a ghost's, and none of its
+    // wrong-side tests (B is fluid: there is no shared image to be wrong).
+    // Pre: the face does not wrap (sealFlags never marks one).
+    auto addSeal = [&](std::size_t c, int i, int j, int k, int d, int face) {
+        const int bi = i + dijk[d][0], bj = j + dijk[d][1], bk = k + dijk[d][2];
+        double dloc[3];
+        localSpacing(bi, bj, bk, dloc);
+        const double hl = minSpacing(dloc);
+        const double xb[3] = {cx(bi), cy(bj), cz(bk)};
+        const double xf[3] = {cx(i), cy(j), cz(k)};
+        double nf[3];
+        Image im;
+        bool ok = unitNormal(xf[0], xf[1], xf[2], hl, nf);
+        if (ok) {
+            double dw = 0.0;
+            for (int a = 0; a < 3; ++a)
+                dw += (xf[a] - phi[c] * nf[a] - xb[a]) * nf[a];
+            ok = dw > 0.0 && imageAlong(xb[0], xb[1], xb[2], nf, dw, hl, im);
         }
-        T.sideFace.push_back(face);
-        T.sideScale.push_back(Real(im.a));
-        for (int s = 0; s < 8; ++s) {
-            T.sideNbr.push_back(im.v.nb[s]);
-            T.sideW.push_back(Real(im.v.w[s] / im.v.wsum));
-            T.sideTnbr.push_back(im.t.nb[s]);
-            T.sideTw.push_back(Real(im.t.w[s] / im.t.wsum));
+        if (!ok) {
+            ++T.sideSkipped;
+            return;
         }
-        if (motion) {
-            // The side image's own wall point: the surface the fluid cell
-            // sees, which on a rotor moves at its own omega x r.
-            const GhostWallKinematics kin =
-                (*motion)(im.wall[0], im.wall[1], im.wall[2]);
-            for (int a = 0; a < 3; ++a) T.sideUwall.push_back(Real(kin.u[a]));
-            T.sideAspan.push_back(Real(kin.a[0] * im.t.span[0]
-                                       + kin.a[1] * im.t.span[1]
-                                       + kin.a[2] * im.t.span[2]));
-        }
+        pushSide(c, face, im);
     };
     for (int k = 0; k < nz; ++k)
         for (int j = 0; j < ny; ++j)
@@ -1500,37 +1643,16 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                     const std::size_t nc = g.idx(i + dijk[d][0], j + dijk[d][1],
                                                  k + dijk[d][2]);
                     if (isGhost[nc]) {
-                        fcell.push_back(int(c));
-                        fdir.push_back(d);
+                        pushFace(c, i, j, k, d);
                         const int q = ghostOf[nc];
                         assert(q >= 0 && nfnb[q] < ndir);
                         T.gfnb[std::size_t(nfn) * q + nfnb[q]++] = int(c);
-                        // Physical centre of the shared face: the cell centre
-                        // stepped half a REFERENCE cell along the axis, then
-                        // mapped. On the identity remap this is the Cartesian
-                        // face centre exactly.
-                        const int a = d / 2;
-                        const double s = (d & 1) ? -0.5 : 0.5;
-                        const int ijk[3] = {i, j, k};
-                        double ref[3];
-                        for (int q = 0; q < 3; ++q)
-                            ref[q] = (ijk[q] + 0.5 + (q == a ? s : 0.0))
-                                     * href[q];
-                        const double xfc[3] = {R.fx.map(ref[0]),
-                                               R.fy.map(ref[1]),
-                                               R.fz.map(ref[2])};
-                        for (int q = 0; q < 3; ++q)
-                            fpos.push_back(Real(xfc[q]));
-                        // The impermeable face moves with the wall material
-                        // AT the face centre: for a rigid motion the closed
-                        // staircase then encloses no net volume change.
-                        if (motion) {
-                            const GhostWallKinematics kin =
-                                (*motion)(xfc[0], xfc[1], xfc[2]);
-                            for (int q = 0; q < 3; ++q)
-                                T.fuwall.push_back(Real(kin.u[q]));
-                        }
                         addSide(c, i, j, k, d, q, int(fcell.size()) - 1);
+                    } else if (thinSeal && sealedFace(i, j, k, d)) {
+                        assert(phi[nc] >= 0.0);
+                        pushFace(c, i, j, k, d);
+                        addSeal(c, i, j, k, d, int(fcell.size()) - 1);
+                        if (!(d & 1)) ++T.sealed;
                     }
                 }
             }

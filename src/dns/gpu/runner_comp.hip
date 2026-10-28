@@ -166,7 +166,10 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         nc.thermalInflow = r.nscbcThermalInflow;
         nc.Rgas = r.tr.Rgas;
         nc.TInf = r.pInf / (r.rhoInf * r.tr.Rgas);
-        auto m = DeviceCompNscbc::make(g, nc);
+        // Focal: the boundary rows read tabulated cell centres (the same
+        // doubles as the map; the stage hook below passes this fremap).
+        auto m = focal && !stretched ? DeviceCompNscbc::make(g, nc, fremap)
+                                     : DeviceCompNscbc::make(g, nc);
         if (!m) return fail(6, "NSCBC init failed");
         nsc = std::move(*m);
     }
@@ -204,6 +207,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     std::optional<RotorTable> rotorTable;
     std::optional<DeviceCompGhost> ghostOwned;
     DeviceCompGhost* ghost = nullptr;
+    int nSealed = 0; // --thin-seal: sealed fluid/fluid faces (CompGhostTables)
     if (r.rotor.active() && r.rotorMrf)
     {
         // --rotor-frame mrf: the frozen-rotor approximation. ONE classification
@@ -233,7 +237,8 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         const int classifyThreads = workerCount(0, std::size_t(g.nz));
         const CompGhostTables tbls = classifyCompGhost(
             g, sdf, bbox ? bbox->data() : nullptr, fremap, &motion,
-            classifyThreads);
+            classifyThreads, r.thinSeal);
+        nSealed = tbls.sealed;
         if (tbls.nGhost() == 0 || tbls.nFace() == 0)
             return fail(3, "rotor: the body has no mirrored ghost cells -- it "
                            "is not resolved by this grid at all");
@@ -382,6 +387,23 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         ghostOwned = std::move(*gh);
         ghost = &*ghostOwned;
     }
+    else if (r.thinSeal)
+    {
+        // --thin-seal: make()'s classification plus the sealed faces, with
+        // the sealing sweep threaded like the MRF path's.
+        const int classifyThreads = workerCount(0, std::size_t(g.nz));
+        const CompGhostTables tbls =
+            classifyCompGhost(g, sdf, bbox ? bbox->data() : nullptr, fremap,
+                              nullptr, classifyThreads, true);
+        nSealed = tbls.sealed;
+        CompGhostCapacity cap;
+        cap.cover(tbls);
+        auto gh = DeviceCompGhost::fromTables(g, tbls, cap, r.tr.gamma, r.rhoInf,
+                                              r.pInf, focal, wallBc);
+        if (!gh) return fail(6, "ghost wall init failed");
+        ghostOwned = std::move(*gh);
+        ghost = &*ghostOwned;
+    }
     else
     {
         auto gh = DeviceCompGhost::make(g, sdf, r.tr.gamma, r.rhoInf, r.pInf,
@@ -390,6 +412,13 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         if (!gh) return fail(6, "ghost wall init failed");
         ghostOwned = std::move(*gh);
         ghost = &*ghostOwned;
+    }
+    if (r.thinSeal)
+    {
+        std::printf("ghost wall: --thin-seal: %d fluid/fluid faces sealed "
+                    "(sub-cell sheets imaged as zero-thickness walls; the "
+                    "body is unchanged)\n", nSealed);
+        std::fflush(stdout);
     }
     // A resolution verdict like the deep-solid count: ghosts whose normal
     // sample found no fluid are imaged from their fluid neighbours instead
@@ -714,6 +743,8 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         // The steady march's label already carries the (longer) MRF note.
         if (r.rotor.active() && r.rotorMrf && !rotorSteady)
             l += " [MRF frozen rotor: an APPROXIMATION]";
+        // A steady run's r.label (flowRunLabel) already carries it.
+        if (r.thinSeal && r.label.empty()) l += kThinSealSuffix;
         return l;
     };
     auto writeSurface = [&]() -> std::expected<void, RunError> {
