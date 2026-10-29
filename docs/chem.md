@@ -602,6 +602,170 @@ rendered `--first 100 --height 232 --width 128 --smooth 3`
 regenerate). New `fire_video.py` options: `--height`, `--width`,
 `--pad-bottom`, `--smooth` (ffmpeg bicubic upscale).
 
+## Wick candle (`--mode candle --wick`)
+
+The candle above with a REAL wick: `dns/wick.{hpp,cpp}` (geometry, regions,
+soot constants, `measureWick`), `wickIC` (`flame1d`), `gpu/runner_wick`
+(its own runner: the slot candle's `runner_flame` is untouched), the walled
+two-reactant kernel `kSpeciesStage2<Row, AmbHi, Wall, Soot>` and the soot
+cell pass `kChemCellPass2Soot` (`gpu/species.hip`), per-ghost wall
+temperature (`GhostWallThermal::TwallAt`, `gpu/comp_ghost`), renderer
+`tools/chem/candle_render.py`.
+
+**Geometry (choices).** x up, gravity −x, y periodic. A candle body (box
+`--candle-width` 6 × `--candle-height` 4 l, top = the wax surface) floats
+1 l above the inflow sink band; the slow air coflow (1 U, the slot candle's
+reason: a periodic box with an open bottom is a chimney) passes round it. A
+wick (`--wick-width` 0.75 × `--wick-height` 2 l, sunk into the body) stands
+on its top. ONE immersed ghost wall, isothermal: the wick at
+`--wick-temp` 2 T0 (the fuel's vaporisation temperature, ~600 K at T0 300
+K), the body at T0 — a per-ghost wall temperature sampled at each ghost's
+wall point (`TwallAt`; empty = the uniform wall, tables and kernels byte for
+byte). The body floats rather than standing on the inflow face: the chamber's
+reason (no ghost rows inside the NSCBC rows and sink band); the render shows
+only its top 2.5 l.
+
+**Pressure image under gravity.** The wall's pressure image is the wall
+momentum balance grad p = ρ(f − a_wall); with f = −g x̂ the image is the
+hydrostatic one, obtained by handing the RESTING wall a `GhostWallMotion`
+with u = 0, a = +g x̂ (`p_g = p_s + ρ_s g (x_s − x_g)`, the conv plates'
+image). The impermeable faces then carry u_wall·n = 0: the resting wall's
+fluxes.
+
+**Fuel = a volumetric source band, FIXED rate.** The fluid cells
+face-adjacent to a WICK solid cell (above the wax; 38 cells at the defaults)
+get ρ += S, E += S cp T_wick (vapour at rest at the wick temperature),
+ρY_F += S Y_F1, S uniform, total `--fuel-rate` Q = 1 per unit depth (the
+slot candle's Q at W 1), held for the whole step (SSP-RK3 adds exactly S dt;
+`fuelInjCum` is its FP64 sum). The rate is NOT tied to the heat flux into
+the wick; that flux is measured (`qWick`, the Fourier face flux of every
+fluid/wick face with κ(T_face), the solver's own expression) and reported
+as `qWickRatio` = qWick/(Q q).
+
+**Species at the wall.** The chamber's rule on the two-reactant kernel, its
+own instantiation: no species flux (convective or diffusive) through a
+fluid/solid face, a solid upwind second neighbour makes the face "first"
+(shared θ = 1, central; soot first-order upwind), solid cells get no rhs and
+no heat release and keep ρY = 0 from the IC. Rhs hook: NSCBC → gravity →
+species re-carry → inflow pin → sink → species sink → wall faces
+(`applyRhs`) → fuel source; stage hook: the ghost fill.
+
+**Soot (model S1, one equation, semi-empirical).** ρY_s is species 2:
+
+    formation  ω_f  = A_f ρ Y_F e^(−Ta_f/T)          fuel → soot, no heat
+    oxidation  ω_ox = A_ox ρ² Y_s Y_O e^(−Ta_ox/T)   soot + s O → products, + q ω_ox
+
+Soot is the fuel's carbon in condensed form: the fuel's stoichiometry s and
+heat q, so T_ad and Z keep their meaning (the gas-phase Z excludes soot; the
+tip and Z bounds read it). Ta_f = 50 T0, Ta_ox = 60 T0 (~15000 K / 18000 K at
+T0 300 K: between Moss's surface growth 12100 K and Leung–Lindstedt's
+nucleation 21100 K, and Lee's oxidation 19800 K). A_f, A_ox are set by
+Damköhler numbers at T_ad (`--soot-form` 10, `--soot-ox` 2e5) — TUNED FOR
+APPEARANCE (a sooting yellow zone burned out at the tip), not calibrated.
+Soot rides its OWN MC limiter (it is in no coupling function; it never votes
+in the shared θ), no molecular diffusion (Sc → ∞), no thermophoresis, no
+radiation (the heat loss a real candle radiates, ~20–30%, is absent). First
+order in soot mass = a fixed particle size. Its stiffness k_f + k_ox ρ(Y_O +
+s Y_s) enters the step (`dtSoot`, kChemDt / max): never binding at the
+defaults (3e-3 vs the acoustic 1.1e-4). `--soot off` = two species.
+
+**Anchoring (measured, scouts, defaults otherwise, tt 4).** At the slot
+candle's Da 5000 the IC sheet's base LIFTED OFF (0.75 → 6.9 l above the wax
+by t 2) and the flame went out (exit 8 at t 3.0): the buoyant draft past the
+wick base outran the edge flame (the slot candle never tested this: its
+inflow sheet is attached by construction, §43). Da 2e4: base wandering
+0.6–1.6 l; Da 5e4: base 0.75 l, steady (the default with `--wick`); Da 5000
+with `--wick-temp 3`: base 0.125 l. dtChem 1.3e-3 never binds.
+
+**Soot tuning (scouts, defaults, tt 8, window t > 5; Da_f / Da_ox).**
+
+| Da_f | Da_ox | formed / Q | oxidised / formed | out of the top / formed | peak f_v |
+|---|---|---|---|---|---|
+| 2 | 2e3 | 0.0098 | 0.09 | 0.90 (smoking: a filament up the axis) | 2.7 ppm |
+| 2 | 5e4 | 0.0098 | 0.92 | 0.094 | 0.26 ppm |
+| 4 | 2e5 | 0.0195 | 1.009 | 3.4e-4 | 0.45 ppm |
+| **10** | **2e5** | **0.047** | **1.009** | **3.3e-4** | **1.1 ppm** |
+| 10 | 1e6 | 0.048 | 1.007 | 2.6e-5 | 0.96 ppm |
+
+(oxidised/formed > 1: the start's soot inventory still draining.) At the
+default the soot forms on the rich side just inside the sheet in the flame's
+upper half, converges (the buoyant stream tube contracts) into an inverted V
+and burns out through the tip: a non-smoking candle. Real candles reach
+f_v ~ 1–10 ppm; 1 ppm here is in range, by tuning.
+
+**Measured (gfx1100, simjob, 2026-10-28).** Defaults (8 cells/l, 288 ×
+200, 0.45 ms/step, tt 24 in 102 s) and the demo (12 cells/l, 416 × 300,
+0.62 ms/step, tt 12 in 107 s). The flame height drifts slowly (5.99 → 5.43 →
+6.13 → 6.36 l over t 4–24: the slot candle's slow box cycle, §51); the
+window halves of t ∈ [20, 24] agree to 1%.
+
+| quantity | 8 cells, t ∈ [20, 24] | 8 cells, [4, 6] | 12 cells, [4, 6] | 12 cells, [10, 12] |
+|---|---|---|---|---|
+| flame height above the wick tip (axis Z_st) | 6.362 l (halves 6.334 / 6.390) | 5.988 | 5.973 | 5.351 |
+| Z_st half-width at mid flame | 1.142 l | 1.110 | 1.100 | 1.041 |
+| flame base above the wax (ω ≥ 0.1 max) | 0.75 l | 0.75 | 0.75 | 0.75 |
+| top of the sooting zone above the wick tip | 6.86 l | 6.47 | 6.46 | 5.83 |
+| Tmax / T0 (T_ad 5) | 4.375 | 4.360 | 4.354 | 4.332 |
+| burn / Q | 0.940 | 0.949 | 0.951 | 0.949 |
+| soot formed / Q | 0.057 | 0.052 | 0.051 | 0.043 |
+| soot oxidised / formed | 0.998 | 1.005 | 1.008 | 0.999 |
+| soot out of the top / formed | 8.2e−5 | 2.0e−4 | 2.2e−4 | 4.1e−4 |
+| (burn + soot formed + fuel out) / Q | 0.9990 | 1.0039 | 1.0052 | 0.9985 |
+| peak f_v | 1.34 ppm | 1.22 | 1.26 | 1.09 |
+| qWick / (Q q) (conduction into the wick) | 0.0407 | 0.0438 | 0.0219 | 0.0281 |
+| qBody / (Q q) (into the T0 body) | 0.125 | 0.122 | 0.143 | 0.139 |
+| mean gas T in the source band / T0 | 2.027 | 2.029 | 2.001 | 2.002 |
+| box-mean p / p_a | 0.99949 | 0.99784 | 0.99759 | 0.99845 |
+| \|u\|max, min u on the top row | 26.6, −4.7 U | 26.6, −8.0 | 26.3, −7.3 | 25.7, −6.1 |
+| min dtSoot, dtChem vs dt | 2.7e−3, 1.4e−3 vs 1.08e−4 | — | 3.0e−3, 1.3e−3 vs 7.2e−5 | — |
+
+Fuel balance on its time INTEGRAL (inventory change = injected − burnt −
+into soot − out, stats rows trapezoid, after the start t > 2): 7.0e−5 of the
+22 injected (8 cells, t 2–24), 7.0e−5 (12 cells); soot: 2.3e−5 of the 1.13
+formed. The windowed ratio's ±0.5% is the inventory still moving. The
+start's under-sampled IC burn costs 7e−3 of the inventory before t 1. Inert
+(`gpu_wick_inert`, no reaction, tt 1): fuel = IC + injected − out to 3.2e−5
+of the inventory (the wall leaks nothing; the FP32 absorption of the source
+increment, the chamber's C5).
+
+Grid: height, half-width, Tmax, soot formed and f_v agree to 0.2–2% between
+8 and 12 cells/l at equal t; the WALL heat fluxes do not (qWick 0.044 vs
+0.022, qBody 0.122 vs 0.143): the staircase wall's conduction on a 6- vs
+9-cell wick is first order and unconverged (W6). The wick heat flux is the
+order of what vaporisation needs: qWick/(Q cp T0) = 2.7 (8 cells) — the
+vapour's sensible heat from T0 to 2 T0 (1.0) plus ~1.7 cp T0 ≈ 0.5 MJ/kg at
+T0 300 K, paraffin's latent heats' range — a consistency, not a validation.
+`hits` (Y_O above Y_O2 by ≤ 2e−5) 5000–20000 cells: the FP32 walk of the
+slot candle's start (W5). No flicker: the default flame is steady but for
+the slow height cycle above.
+
+**Demo** (`/home/manuel/Documents/pesto/runs/flames/candle2/`): `dns flame
+--mode candle --wick --cells-per-unit 12 --tt 12 --emit stats --emit bin
+--fdt 0.05` (171843 steps, 107 s), rendered `candle_render.py PREFIX
+--cells-per-unit 12 --scale 3 --first 80` (t 4–12, 160 frames, 5.3 s at 30
+fps): `candle_wick.mp4`, `candle_wick_final.png` (planar, the default);
+`--revolve`: `candle_wick_revolved.mp4` / `_final.png` (the visualization
+as if axisymmetric). Raw frames deleted (~690 MB; ~2 min of GPU to
+regenerate).
+
+**Render** (`tools/chem/candle_render.py`, numpy + ffmpeg). Colour from
+physics: soot incandescence of optically thin Rayleigh particles, I_λ = 6π
+E(m) f_v/λ · B_λ(T) · L (E(m) 0.26, L = one cell = `--cell-mm` 0.4 mm, f_v =
+ρY_s ρ0/ρ_soot with ρ_soot/ρ0 = 1800/1.177, T = 300 K (1 + temp/T0)),
+integrated over 380–780 nm against the CIE 1931 colour-matching functions
+(Wyman–Sloan–Shirley multi-lobe fit) → XYZ → linear sRGB; a camera white
+balance (von Kries, `--white-k` 1900 K: candlelight renders neutral);
+chemiluminescence as a CH* 431 / C2* 516 + 473 nm line spectrum scaled by the
+heat release ω (a DISPLAY stand-in: one-step chemistry has no CH*; its gain
+puts the peak at 0.5 of the display range); exposure fixed per video from the
+last frame's soot luminance; ACES filmic curve, sRGB OETF, mild blur and a
+bloom halo. The body: wax (albedo 0.95/0.92/0.85) and wick (char, 0.03)
+from the mask, lit by the soot emission through a 1/r kernel (FFT), a
+translucent glow under the wax top. The wick sits at T_wick ~600 K in the
+model: it does not incandesce and is drawn dark (no glowing tip). 2D: no
+line of sight (`--revolve` renders the planar field AS IF axisymmetric — a
+visualization, labelled so; not the default).
+
 ## Tests
 
 | test | kind | content |
@@ -621,6 +785,8 @@ regenerate). New `fire_video.py` options: `--height`, `--width`,
 | `gpu_diffusion_jet` / `_guard` | GPU binary | the default jet: fuel balance, closed tip, steady, attached, T, p, bounds, tip pin; β 8 exits 8 |
 | `candle` | host | the ambient column, the groups (Fr, free fall, adiabatic fraction, stratification, flicker scale), defaults, dry-run, label, the hydrostatic IC (p = p_a), the ignition column, quiescent IC, g = 0 IC == the diffusion IC bitwise, warnings, every rejection by name |
 | `gpu_candle_rest` / `_g0` / `_height` | GPU binary | quiescent box at rest (\|u\| < 5e−3); g = 0 == `--mode diffusion` byte for byte; H(W 1)/H(W 0.75) exponent in [1.15, 1.45], both closed and steady |
+| `wick` | host | body SDF (exact outside), wall T, regions (solid = sdf < 0, the source band beside the wick only, symmetric), soot Damköhler normalisation and floors, defaults / dry-run / label (2D, inflated, appearance-tuned, no radiation), IC (p = p_a on every cell, solids species-free, a closed sheet), `measureWick` on drawn fields, `--soot off`, every rejection by name |
+| `gpu_wick_inert` / `_flame` | GPU binary | no reaction: fuel = IC + injected − out (no wall leak); defaults tt 6: anchored, closed tip, fuel and soot integral balances, soot formed and burned out at the tip, the wick heated |
 | `chamber_config` | host | polygon SDF, regions (closed cavity, probes), IC, isentropic inverse, dry-run, every rejection by name |
 | `gpu_chamber` | GPU binary | inert wall impermeability; reacting balances, nozzle vs isentropic, anchoring |
 
@@ -744,11 +910,14 @@ With it, Tmax rises above Tb in the holder's base recirculation: 1.046 Tb
 
 Le ≠ 1 (`--lewis` unregistered until an oracle exists), curvilinear,
 compensated, RANS/LES species (asserted), nz > 1 (`--nz` must be 1), an
-immersed burner lip or wick (the chamber's walled species kernel is
-premixed-only), open y faces for bunsen, the jet and the candle, an open
+immersed burner lip for bunsen and the jet (the walled kernels exist:
+premixed for the chamber, two-reactant for the wick candle), open y faces
+for bunsen, the jet and the candle, an open
 (pressure) inflow bottom, gravity in the premixed modes, unequal W, a
 counterflow/strained-flame oracle, the low-Mach branch (`--physics
-incompressible` rejected), multi-step chemistry, dns-ui (its editor covers
+incompressible` rejected), multi-step chemistry, soot beyond the one-equation
+appearance model (nucleation/growth/PAH, thermophoresis, radiation), a fuel
+rate tied to the wick heat flux, a melting wax pool, dns-ui (its editor covers
 `flow` and `conv` only). Chamber: isothermal (cooled) walls, a
 total-pressure inlet, non-premixed injection, a moving/2D-curved nozzle wall
 beyond the polygon, 3D.

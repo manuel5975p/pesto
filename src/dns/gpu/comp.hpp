@@ -143,8 +143,21 @@ struct SpeciesSetup
     // DeviceCompGhost::applyRhs makes), a solid upwind second neighbour
     // drops that face to first order, and a solid cell gets no species rhs
     // and no heat release. Null = no wall: the kernel without the mask,
-    // compiled separately (bit for bit the code before it).
+    // compiled separately (bit for bit the code before it). The two-reactant
+    // kernel takes it too (--mode candle --wick: its own instantiation).
     const std::uint8_t* solid = nullptr;
+    // Soot (two-reactant kernel only, dns/wick.hpp SootModel): soot >= 0
+    // names the species slot carrying rho Y_s. Formation from fuel, omega_f =
+    // exp(sootLnAf - sootTaf/T) rho max(Y_F, 0) (fuel -> soot, no heat);
+    // oxidation omega_ox = exp(sootLnAox - sootTaox/T) rho^2 max(Y_s, 0)
+    // max(Y_O, 0), consuming stoich * omega_ox oxidizer and releasing
+    // q omega_ox (soot = the fuel's carbon in condensed form: the fuel's
+    // stoichiometry and heat). Soot never votes in the shared limiter (its
+    // own MC limiter) and diffuses at sootDiff * rho D. soot < 0 = no soot:
+    // the kernels without it, bit for bit.
+    int soot = -1;
+    double sootLnAf = 0, sootTaf = 0, sootLnAox = 0, sootTaox = 0;
+    double sootDiff = 0;
 };
 
 // An unevaluated sum hi + lo of two floats (the compensated state's words).
@@ -495,6 +508,10 @@ public:
     // The cell pass of the last stage or updateChem: omega and Y_k.
     const DeviceScalar& omega() const { return omega_; }
     const DeviceScalar& speciesY(int k) const { return ycache_[k]; }
+    // Soot (speciesSetup().soot >= 0): the cell pass's formation and
+    // oxidation rates (SpeciesSetup::soot); unallocated otherwise.
+    const DeviceScalar& sootForm() const { return sootF_; }
+    const DeviceScalar& sootOx() const { return sootO_; }
     // primitives(s), then the cell pass of s (diagnostics, stats, dt).
     // Pre: nSpecies() > 0.
     void updateChem(const DeviceCompState& s);
@@ -693,6 +710,7 @@ private:
     SpeciesSetup sp_{.nY = 0};
     DeviceScalar ycache_[kMaxY], omega_;
     DeviceScalar yinRow_[kMaxY]; // SpeciesSetup::yInRow on the device
+    DeviceScalar sootF_, sootO_; // soot rates (SpeciesSetup::soot >= 0)
     std::function<void(DeviceCompState&)> hook_;
     bool hookAtEntry_ = true; // setStageHook's Idempotent::no
     CellRange stageRange_{};  // setStageRange; the whole grid by default

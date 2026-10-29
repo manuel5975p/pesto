@@ -153,16 +153,21 @@ __device__ inline GhostCons ghostImage(Real gamma, int iso, Real Twall,
                 Real(0.5) * a * a * rg * (ui * ui + vi * vi + wi * wi)};
 }
 
+// gtw non-null: the per-ghost wall temperature (GhostWallThermal::TwallAt)
+// replaces the uniform Twall as the image's value; the arithmetic is the
+// same expression either way.
 __global__ void kGhostFill(Real gamma, int iso, Real Twall, Real Rgas,
                            const int* gcell, const int* gnbr, const Real* gw,
                            const int* tnbr, const Real* tw, const Real* gscale,
-                           const Real* uw, const Real* as, int m, Real* rho,
-                           Real* mx, Real* my, Real* mz, Real* E)
+                           const Real* uw, const Real* as, const Real* gtw,
+                           int m, Real* rho, Real* mx, Real* my, Real* mz,
+                           Real* E)
 {
     const int q = blockIdx.x * blockDim.x + threadIdx.x;
     if (q >= m) return;
+    const Real Tw = gtw ? gtw[q] : Twall;
     const GhostCons G = ghostImage(
-        gamma, iso, Twall, Rgas, gnbr + 8 * q, gw + 8 * q, tnbr + 8 * q,
+        gamma, iso, Tw, Rgas, gnbr + 8 * q, gw + 8 * q, tnbr + 8 * q,
         tw + 8 * q, gscale[q], uw ? uw + 3 * q : nullptr, uw ? as[q] : Real(0),
         rho, mx, my, mz, E);
     const int c = gcell[q];
@@ -674,6 +679,7 @@ struct SideView
     const int *face, *nbr, *tnbr, *cell, *start, *fcell, *fdir;
     const Real *w, *tw, *scale, *uw, *as;
     const Real* fuw; // per interface face (wallNormal); null unless moving
+    const Real* stw = nullptr; // per side face wall T; null = ImageParams'
 };
 
 // What kGhostFill's image reads besides its stencil, and the gas constant
@@ -728,8 +734,9 @@ __device__ inline FaceCell sideImage(const SideView& sv, int t,
                                      const ImageParams& ip, ConsView s,
                                      const Real* nut, std::size_t c)
 {
+    const Real Tw = sv.stw ? sv.stw[t] : ip.Twall;
     const GhostCons G = ghostImage(
-        ip.gamma, ip.iso, ip.Twall, ip.wallRgas, sv.nbr + 8 * t, sv.w + 8 * t,
+        ip.gamma, ip.iso, Tw, ip.wallRgas, sv.nbr + 8 * t, sv.w + 8 * t,
         sv.tnbr + 8 * t, sv.tw + 8 * t, sv.scale[t],
         sv.uw ? sv.uw + 3 * t : nullptr, sv.uw ? sv.as[t] : Real(0), s.rho,
         s.mx, s.my, s.mz, s.E);
@@ -971,7 +978,7 @@ void CompGhostCapacity::cover(const CompGhostTables& t)
 CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                                   const double* bbox, const AxisRemap3& R,
                                   const GhostWallMotion* motion, int threads,
-                                  bool thinSeal)
+                                  bool thinSeal, const GhostWallTemp* twallAt)
 {
     const int nx = g.nx, ny = g.ny, nz = g.nz;
     const double hx = g.hx, hy = g.hy, hz = g.hz;
@@ -1362,6 +1369,9 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                                          + kin.a[1] * im.t.span[1]
                                          + kin.a[2] * im.t.span[2]));
                 }
+                if (twallAt)
+                    T.gtwall.push_back(
+                        Real((*twallAt)(im.wall[0], im.wall[1], im.wall[2])));
             }
 
     // Interface faces: fluid cell next to a ghost cell.
@@ -1477,6 +1487,9 @@ CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                                        + kin.a[1] * im.t.span[1]
                                        + kin.a[2] * im.t.span[2]));
         }
+        if (twallAt)
+            T.sideTwall.push_back(
+                Real((*twallAt)(im.wall[0], im.wall[1], im.wall[2])));
     };
 
     // Thin-section seal flags (CompGhostTables::sealed): bit a of seal[c] set
@@ -1666,7 +1679,9 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::make(
     const double* bbox, const AxisRemap3& R, WallThermal wall,
     const WallMotion* motion)
 {
-    CompGhostTables T = classifyCompGhost(g, sdf, bbox, R, motion);
+    CompGhostTables T = classifyCompGhost(
+        g, sdf, bbox, R, motion, 1, false,
+        wall.TwallAt ? &wall.TwallAt : nullptr);
     CompGhostCapacity cap;
     cap.cover(T);
     const bool curv = R.fx.active || R.fy.active || R.fz.active;
@@ -1680,6 +1695,13 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::fromTables(
     const bool iso = wall.mode == WallThermal::Mode::Isothermal;
     if (iso && !(wall.Twall > 0.0 && wall.Rgas > 0.0))
         return std::unexpected(hipErrorInvalidValue);
+    // A varying wall temperature is an isothermal wall's, positive everywhere.
+    const bool varT = !t.gtwall.empty();
+    if (varT && !iso) return std::unexpected(hipErrorInvalidValue);
+    for (const Real v : t.gtwall)
+        if (!(v > Real(0))) return std::unexpected(hipErrorInvalidValue);
+    for (const Real v : t.sideTwall)
+        if (!(v > Real(0))) return std::unexpected(hipErrorInvalidValue);
     if (cap.nGhost < t.nGhost() || cap.nDeep < t.nDeep()
         || cap.nFace < t.nFace() || cap.nSide < t.nSide()
         || cap.nSideCell < t.nSideCell())
@@ -1753,6 +1775,10 @@ std::expected<DeviceCompGhost, hipError_t> DeviceCompGhost::fromTables(
         return std::unexpected(e);
     if (auto e = alloc(out.sideAspan_, mv ? ns : 0); e != hipSuccess)
         return std::unexpected(e);
+    if (auto e = alloc(out.gtwall_, varT ? ng : 0); e != hipSuccess)
+        return std::unexpected(e);
+    if (auto e = alloc(out.sideTwall_, varT ? ns : 0); e != hipSuccess)
+        return std::unexpected(e);
     auto acc = DeviceBuffer<double>::make(std::max<std::size_t>(nf, 1) * 7);
     if (!acc) return std::unexpected(acc.error());
     out.facc_ = std::move(*acc);
@@ -1789,6 +1815,11 @@ hipError_t DeviceCompGhost::load(const CompGhostTables& t)
         || t.tnbr.size() != t.gnbr.size() || t.tw.size() != t.gw.size()
         || t.gfnb.size() != std::size_t(CompGhostTables::kFaceNbr) * t.gcell.size())
         return hipErrorInvalidValue;
+    // The wall temperature table is whole or absent, like the wall velocity.
+    if (t.gtwall.empty() != (gtwall_.data() == nullptr)
+        || (!t.gtwall.empty() && (t.gtwall.size() != t.gcell.size()
+                                  || t.sideTwall.size() != ns)))
+        return hipErrorInvalidValue;
     auto put = [](auto& dst, const auto& src) -> hipError_t {
         if (src.empty()) return hipSuccess;
         return hipMemcpy(dst.data(), src.data(),
@@ -1804,6 +1835,8 @@ hipError_t DeviceCompGhost::load(const CompGhostTables& t)
     if (auto e = put(gfnb_, t.gfnb); e != hipSuccess) return e;
     if (auto e = put(uwall_, t.uwall); e != hipSuccess) return e;
     if (auto e = put(aspan_, t.aspan); e != hipSuccess) return e;
+    if (auto e = put(gtwall_, t.gtwall); e != hipSuccess) return e;
+    if (auto e = put(sideTwall_, t.sideTwall); e != hipSuccess) return e;
     if (auto e = put(deep_, t.deep); e != hipSuccess) return e;
     if (auto e = put(fcell_, t.fcell); e != hipSuccess) return e;
     if (auto e = put(fdir_, t.fdir); e != hipSuccess) return e;
@@ -1865,7 +1898,7 @@ void DeviceCompGhost::apply(DeviceCompState& s)
         kGhostFill<<<launchBlocks(nGhost_), blockSize>>>(
             gamma_, iso_, Twall_, Rgas_, gcell_.data(), gnbr_.data(),
             gw_.data(), tnbr_.data(), tw_.data(), gscale_.data(),
-            uwall_.data(), aspan_.data(), nGhost_, s.rho.data(),
+            uwall_.data(), aspan_.data(), gtwall_.data(), nGhost_, s.rho.data(),
             s.mx.data(), s.my.data(), s.mz.data(), s.E.data());
         checkLastKernel("kGhostFill");
     }
@@ -1888,7 +1921,7 @@ void DeviceCompGhost::applyRhs(const DeviceComp& solver,
                       sideCell_.data(),  sideStart_.data(), fcell_.data(),
                       fdir_.data(),      sideW_.data(),     sideTw_.data(),
                       sideScale_.data(), sideUwall_.data(), sideAspan_.data(),
-                      fuw_.data()};
+                      fuw_.data(),       sideTwall_.data()};
     const ImageParams ip{gamma_, iso_, Twall_, Rgas_,
                          Real(solver.transport().Rgas)};
     const ConsView cs{s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),
@@ -2043,7 +2076,7 @@ bool DeviceCompGhost::stageFlux(DeviceComp& solver, const DeviceCompState& s,
                           fdir_.data(),      sideW_.data(),
                           sideTw_.data(),    sideScale_.data(),
                           sideUwall_.data(), sideAspan_.data(),
-                          fuw_.data()};
+                          fuw_.data(),       sideTwall_.data()};
         const ImageParams ip{gamma_, iso_, Twall_, Rgas_,
                              Real(solver.transport().Rgas)};
         const ConsView cs{s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(),

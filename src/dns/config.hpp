@@ -13,6 +13,7 @@
 #include "dns/rotor.hpp"
 #include "dns/runmeta.hpp"
 #include "dns/sgs.hpp"
+#include "dns/wick.hpp"
 
 #include <expected>
 #include <optional>
@@ -310,6 +311,13 @@ struct RawConfig
     bool quiescent = false;     // no fuel, inflow at rest: the hydrostatic check
     double ignition = -1;       // IC sheet length (diffusion, candle); < 0 =
                                 // the mode default (diffusion: the whole box)
+    // --mode candle --wick (dns/wick.hpp): an immersed candle body + wick,
+    // fuel from the wick surface, soot. Lengths in l; < 0 = the default.
+    bool wick = false;
+    double wickWidth = -1, wickHeight = -1, wickTemp = -1, fuelRate = -1;
+    double candleWidth = -1, candleHeight = -1;
+    int soot = 1;               // --soot on|off
+    double sootForm = -1, sootOx = -1; // Damkohler numbers at T_ad
     // --mode chamber (docs/chem.md, "Chamber"); lengths in delta_th.
     struct ChamberFlags
     {
@@ -579,6 +587,14 @@ public:
     // Burke-Schumann state (a closed sheet). 0 = the whole box, the inflow
     // row extruded (the diffusion default, bit for bit).
     double flameIgnition = 0;
+    // --mode candle --wick (dns/wick.hpp): flameCandle AND an immersed candle
+    // body + wick (isothermal ghost wall), fuel injected through the wick
+    // surface at the fixed rate wick.Q, quiescent air (the slow coflow), and
+    // (wickSoot) the one-equation soot model as species 2. Its own runner.
+    bool flameWick = false;
+    WickSpec wick;
+    bool wickSoot = false;
+    SootModel soot;
     // --mode chamber (dns/chamber.hpp): geometry in box units, the injected
     // mass flux per unit depth (rho_u injectSpeed Hc), coflow, ramp.
     bool chamberMode = false;
@@ -643,6 +659,11 @@ std::string flameRunLabel(const Case& c);
 // --mode chamber's label: flameRunLabel's model text plus the chamber's
 // immersed-wall and injector statement. Pre: c.chamberMode.
 std::string chamberRunLabel(const Case& c);
+
+// --mode candle --wick's label: flameRunLabel's model text with the wick
+// candle's immersed wall, fuel source and soot statement (2D, inflated Mach,
+// appearance-tuned soot constants). Pre: c.flameWick.
+std::string wickRunLabel(const Case& c);
 
 // The finest cell spacing the run resolves: the focal plateau's when
 // focalActive, the grid's otherwise, both by the hMin rule (z excluded at

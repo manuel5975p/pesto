@@ -66,7 +66,7 @@ DNS 13.6 ms/step (1234 Mcell/s), Smagorinsky 15.6, σ 16.0, 1.46 GiB.
 | `hit` | forced homogeneous isotropic turbulence, SI-configured, h = 1.5 η | `dns hit --help` |
 | `channel` | wall-resolved compressible channel; `--les`, `--rans` | `docs/channel.md`, `docs/rans.md` |
 | `conv` | Rayleigh–Bénard convection, compressible or Boussinesq | below |
-| `flame` | single-step flames: premixed against its FP64 oracle (1D, or a 2D slot Bunsen cone, `--mode bunsen`); a 2D slot-jet diffusion flame, F + s O → P, against the Burke–Schumann sheet (`--mode diffusion`); the same flame under gravity from a wick, a 2D candle (`--mode candle`); a closed 2D combustion chamber with a nozzle jet (`--mode chamber`) | `docs/chem.md` |
+| `flame` | single-step flames: premixed against its FP64 oracle (1D, or a 2D slot Bunsen cone, `--mode bunsen`); a 2D slot-jet diffusion flame, F + s O → P, against the Burke–Schumann sheet (`--mode diffusion`); the same flame under gravity from a wick, a 2D candle (`--mode candle`), with an immersed wick, fuel from its surface and soot (`--mode candle --wick`); a closed 2D combustion chamber with a nozzle jet (`--mode chamber`) | `docs/chem.md` |
 | `bench` | step time, Mcell/s and the VRAM this process allocates | `dns bench --help` |
 | `prop` | propeller thrust curve by BEMT or lifting line, host-only | below |
 | `mesh` | read an OpenFOAM polyMesh into a FaceMesh, report counts and checkMesh-equivalent quality, host-only | `docs/mesh.md` |
@@ -125,6 +125,13 @@ build/dns flame --mode diffusion --tt 80 --emit stats
 # 2D candle: the diffusion flame under gravity from a low-Peclet wick, steady
 # by tt ~20 (~100 s for tt 30); fire_video.py --gamma 3 --smooth 4
 build/dns flame --mode candle --tt 30 --emit stats
+
+# 2D WICK candle: an immersed isothermal wick + candle body (ghost wall), fuel
+# vapour from the wick surface, soot (one-equation, appearance-tuned) formed
+# inside and burned out at the tip; steady by tt ~5 (~45 s for tt 10); the
+# physically coloured render (soot Planck x CIE -> sRGB, CH* blue)
+build/dns flame --mode candle --wick --tt 10 --emit stats --emit bin --fdt 0.05 --out w
+python3 tools/chem/candle_render.py w --out candle.mp4 --png candle.png
 
 # closed 2D combustion chamber: premixed injector, wedge flame holder,
 # nozzle jet into a cold coflow; 4 cells per thermal thickness (~37 s), video
@@ -609,6 +616,6 @@ Tiers, labels, tolerances, the quarantine and anchor regeneration:
 | `docs/viewer-format.md` | web frame format, run `.json`, `_surface.csv`, `--emit mesh` |
 | `docs/jobs.md` | `simjobd` / `simjob`: the job server every GPU/CPU run goes through |
 | `docs/mesh.md` | FaceMesh: the polyMesh subset accepted and rejected, the geometry definition, cyclic/2D/ordering rules, `CellGraph`, `dns mesh`, test meshes |
-| `docs/chem.md` | `dns flame`: model C0, the phase-plane oracle vs Cantera, species scheme, hook order, measured S_L; the 2D slot Bunsen (per-row inflow, pilot anchoring, measured cone); the slot-jet diffusion flame; the 2D candle (gravity, hydrostatic NSCBC, height vs fuel flow); the `--mode chamber` combustion chamber and its balances |
+| `docs/chem.md` | `dns flame`: model C0, the phase-plane oracle vs Cantera, species scheme, hook order, measured S_L; the 2D slot Bunsen (per-row inflow, pilot anchoring, measured cone); the slot-jet diffusion flame; the 2D candle (gravity, hydrostatic NSCBC, height vs fuel flow); the wick candle (immersed wick, fuel source, soot, the physical render); the `--mode chamber` combustion chamber and its balances |
 | `src/compat/cuda/README.md` | the CUDA header shim |
 | `docs/archive/` | historical plans and analyses |

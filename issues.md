@@ -418,10 +418,10 @@ Measured gfx1100 via simjob, 2026-10-28.
 41. **Bunsen anchors only on a burnt pilot.** Measured at U_jet 5: cold or
     T/Tu 3 coflow, a cold u = 0 rim and slow thin burnt strips blow off;
     burnt coflow (default) and 3 δ_th burnt strips at the jet speed anchor
-    (docs/chem.md table). Not built: an immersed ghost-wall burner lip
-    (needs species through `DeviceCompGhost`: impermeable zero species flux
-    on fluid/ghost faces, ghost Y image, stats excluding solid cells) — the
-    physical rim stabilisation. Not measured: anchoring vs U_jet (only 3 and
+    (docs/chem.md table). Not built: an immersed ghost-wall burner lip — the
+    physical rim stabilisation. The walled species kernels exist now
+    (premixed: the chamber; two-reactant: the wick candle) but neither
+    bunsen nor the jet uses one. Not measured: anchoring vs U_jet (only 3 and
     5 run), the pilot's minimum width, the pulsed jet's anchoring margin.
 42. **Bunsen y is periodic** (coflow W per side by default): the image jets
     confine the expansion. Coflow width sensitivity of the cone angle not
@@ -498,7 +498,8 @@ Measured gfx1100 via simjob, 2026-10-28.
     excluded). Every W ≥ 1.25 is unsteady, so no steady flame sits in the
     far-field regime. One grid only (8 cells/l), one g (14), Da 5000, β 5:
     tip convergence and chemistry sensitivity not measured. The wick is
-    the inflow plane (attached by construction, §43); no immersed wick.
+    the inflow plane (attached by construction, §43); the immersed wick is
+    `--wick` (W1–W9 below), whose anchoring needed Da 5e4.
 53. **Candle NSCBC top (`Hydro`).** The hydrostatic incoming waves are
     validated at rest only (|u| 1.2e−3 U vs 0.67 U without); their
     acoustic reflection and the backflow blend's rate are not measured.
@@ -506,6 +507,57 @@ Measured gfx1100 via simjob, 2026-10-28.
     = 2e−3 at M 0.005 is the candidate). The Mach is inflated: buoyant
     Mach 0.17 at the defaults (|u|max 34 U, M 0.005); the M dependence of
     the tip not measured.
+
+### Wick candle (`dns flame --mode candle --wick`, docs/chem.md "Wick candle")
+
+Measured gfx1100 via simjob, 2026-10-28. Numbered W1… beside the chamber's.
+
+- W1. **The fuel rate is FIXED, not tied to the heat flux into the wick.**
+  The flame delivers qWick = 0.041–0.044 Q q at 8 cells/l (2.7 Q cp T0: the
+  vapour's sensible heat T0 → 2 T0 plus ~1.7 cp T0 ≈ 0.5 MJ/kg at T0 300 K,
+  paraffin's latent heats' range — a consistency, not a validation), but
+  0.022–0.028 at 12 cells (W6). A wick model (ṁ = qWick / (L_v + cp ΔT),
+  wick T from a pyrolysis balance) is not built; the candle body takes
+  0.12–0.14 Q q (conduction into the T0 wax top under the flame base) and
+  nothing melts.
+- W2. **Soot model S1 is one equation and appearance-tuned.** Ta_f 50 T0,
+  Ta_ox 60 T0 from literature brackets, Da_f 10 / Da_ox 2e5 tuned so the
+  soot burns out at the tip (scouting table in docs/chem.md); no
+  nucleation/growth split, no PAH, no thermophoresis, no molecular
+  diffusion, no radiation (a real candle radiates ~20–30%: absent, so the
+  flame runs hotter than one with radiation would). f_v peak ~1.2 ppm (real
+  candles 1–10 ppm). Smoke point and smoking threshold not mapped.
+- W3. **Tmax 0.875 T_ad** (4.375 T0 at the defaults, t 20–24) against the
+  slot candle's 0.977: heat losses to the isothermal body (0.125 Q q) and
+  wick (0.041 Q q) are the candidates; the strain at the base not
+  separated.
+- W4. **Anchoring needs Da 5e4 at g 14** (5000: lift-off and exit 8 at t 3;
+  2e4: base wandering 0.6–1.6 l; `--wick-temp 3` at 5000: base 0.125 l). No
+  map in (Da, g, Q, T_wick); the base sits 0.75 l above the wax (row
+  quantized, flat) — a real candle's base is ~1–2 mm below the wick top's
+  level; here it is 1.25 l BELOW the wick tip.
+- W5. **hits ~8000 fluid cells** (Y_O above Y_O2 by up to ~2e-5, Z down to
+  −6e-6): the FP32 rounding walk of the long M 0.005 run, the slot candle's
+  start shows the same (37488 at t 1, issues §39 mechanism). Counted, never
+  clamped.
+- W6. **Wall heat fluxes are grid-dependent; the flame is not.** 8 vs 12
+  cells/l at t 4–6: height 5.988 / 5.973 l, half-width 1.110 / 1.100, Tmax
+  4.360 / 4.354 T0, soot formed 0.052 / 0.051 Q — but qWick 0.044 / 0.022 and
+  qBody 0.122 / 0.143 Q q (the staircase wall's conduction on a 6- vs
+  9-cell wick; 4 fallback ghosts at 12 cells). Two grids only.
+- W10. **Not strictly steady.** The flame height cycles slowly (5.99 →
+  5.43 → 6.13 → 6.36 l over t 4–24, 8 cells); t ∈ [20, 24] halves agree to
+  1%. The slot candle's slow box cycle (§50, §51) is the suspect; the
+  periodic box's recirculation (min top u −8 → −4.5 U) is still relaxing.
+- W7. **The wick is uniform T_wick, no char tip, no glow**; the body's top is
+  flat at T0 (no melt pool, no meniscus); the body floats 1 l above the inflow
+  band (the coflow passes under it). The render shows its top 2.5 l only.
+- W8. **The render's absolute scales are assumptions**: T0 = 300 K, slab
+  depth one cell = 0.4 mm, E(m) 0.26 — they set colour temperature (T) and
+  nothing else after the automatic exposure; the chemiluminescence gain is a
+  display choice (one-step chemistry has no CH*); white balance 1900 K.
+- W9. **Tip / Z read the gas-phase mixture fraction** (Y_F, Y_O): soot is
+  outside it; at the tip soot carries < 1% of the fuel element.
 
 ### Chamber (`dns flame --mode chamber`, docs/chem.md "Chamber")
 

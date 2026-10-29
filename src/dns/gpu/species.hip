@@ -36,6 +36,27 @@ __global__ void kChemCellPass2(GpuGrid g, int nY, const Real* rho,
     omega[c] = arrheniusRate2(lnA, Ta, r, Y[fuel][c], Y[ox][c], T[c]);
 }
 
+// kChemCellPass2 plus the soot rates (SpeciesSetup::soot): formation from the
+// fuel, first order in rho Y_F; oxidation by the oxidizer, rho^2 Y_s Y_O.
+// Both floor their Y (the state is never clamped).
+__global__ void kChemCellPass2Soot(GpuGrid g, int nY, const Real* rho,
+                                   SpeciesCombine ys, const Real* T, Real lnA,
+                                   Real Ta, int fuel, int ox, SootRates sr,
+                                   Real* Y0, Real* Y1, Real* Y2, Real* Y3,
+                                   Real* omega)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= g.size()) return;
+    Real* Y[kMaxY] = {Y0, Y1, Y2, Y3};
+    const Real r = rho[c];
+    for (int k = 0; k < nY; ++k) Y[k][c] = ys.ya[k][c] / r;
+    const Real t = T[c];
+    omega[c] = arrheniusRate2(lnA, Ta, r, Y[fuel][c], Y[ox][c], t);
+    sr.omegaF[c] = arrheniusRate(sr.lnAf, sr.Taf, r, Y[fuel][c], t);
+    sr.omegaOx[c] =
+        arrheniusRate2(sr.lnAox, sr.Taox, r, Y[sr.soot][c], Y[ox][c], t);
+}
+
 // Wrap-aware offsets from cell (i,j,k) to its SECOND neighbours along each
 // axis (p = +2, m = -2); a degenerate axis (n == 1) gives 0, the self-wrap.
 // Pre: n >= 3 on every non-degenerate axis.
@@ -209,6 +230,9 @@ __global__ void kSpeciesStage(GpuGrid g, ViscView vv, PrimView q,
 // voting, max error 1.5e-3 with the threshold. A non-voter moves at most |d2| <
 // 2^-24 past its own neighbours per face, and votes again once it varies.
 inline constexpr float kVoteJump = 0x1p-24f;
+// Soot: the soot slot never votes (it is in no coupling function; it keeps
+// its own MC limiter, faceY).
+template <bool Soot = false>
 __device__ inline Real sharedTheta(const SpeciesView& sv, const Face& f,
                                    Real mdot)
 {
@@ -219,6 +243,8 @@ __device__ inline Real sharedTheta(const SpeciesView& sv, const Face& f,
     if (mdot >= Real(0) ? f.firstL : f.firstR) return Real(1);
     Real th = Real(2);
     for (int s = 0; s < sv.nY; ++s) {
+        if constexpr (Soot)
+            if (s == sv.soot) continue;
         const Real* Y = sv.Y[s];
         Real d1, d2;
         if (mdot >= Real(0)) {
@@ -248,7 +274,15 @@ __device__ inline Real faceY2(const Real* Y, const Face& f, Real mdot,
 // carries the boundary cell's own Y BOTH ways: the inflow fractions belong
 // to x-lo (the premixed kernel's backflow took the x-lo row's jet fuel in
 // through the outflow). AmbHi (the candle's top): backflow carries sv.yHi.
-template <bool Row, bool AmbHi = false>
+// Wall (--mode candle --wick, SpeciesSetup::solid): kSpeciesStage<.., true>'s
+// immersed-wall rule -- no species flux (convective or diffusive) through a
+// fluid/solid face, a solid second neighbour makes the face's upwind side
+// "first" (shared theta: the central value; soot: first-order upwind), a
+// solid cell gets no rhs and no heat release. Soot (SpeciesSetup::soot): the
+// soot slot rides its own MC limiter with sootDiff * rho D, never votes, and
+// the soot sources (formation from fuel, oxidation by the oxidizer, its heat).
+// Wall and Soot false: the kernel as it was, bit for bit.
+template <bool Row, bool AmbHi = false, bool Wall = false, bool Soot = false>
 __global__ void kSpeciesStage2(GpuGrid g, ViscView vv, PrimView q,
                                StageCombine cmb, SpeciesCombine sc,
                                SpeciesView sv, Real* oy0, Real* oy1, Real* oy2,
@@ -256,6 +290,16 @@ __global__ void kSpeciesStage2(GpuGrid g, ViscView vv, PrimView q,
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
+    if constexpr (Wall) {
+        // A solid cell carries no species rhs and releases no heat (rho Y
+        // stays at its IC value 0; this also keeps a ghost's omega out of E).
+        if (sv.solid[c]) {
+            Real* out[kMaxY] = {oy0, oy1, oy2, oy3};
+            for (int s = 0; s < sv.nY; ++s)
+                out[s][c] = cmb.ca * sc.ya[s][c] + cmb.cb * sc.yb[s][c];
+            return;
+        }
+    }
     int i, j, k;
     decompose(g, c, i, j, k);
     const Offsets o = offsetsAt(g, i, j, k);
@@ -266,6 +310,15 @@ __global__ void kSpeciesStage2(GpuGrid g, ViscView vv, PrimView q,
         const Real h = a == 0 ? g.hx : a == 1 ? g.hy : g.hz;
         Face fh, fl;
         cellFaces(g, i, a, sv.openX, c, o, o2, fh, fl);
+        bool wallH = false, wallL = false;
+        if constexpr (Wall) {
+            wallH = sv.solid[fh.R] != 0;
+            wallL = sv.solid[fl.L] != 0;
+            fh.firstL = fh.firstL || sv.solid[fh.LL];
+            fh.firstR = fh.firstR || sv.solid[fh.RR];
+            fl.firstL = fl.firstL || sv.solid[fl.LL];
+            fl.firstR = fl.firstR || sv.solid[fl.RR];
+        }
         const bool openHi = sv.openX && a == 0 && i == g.nx - 1;
         const bool openLo = sv.openX && a == 0 && i == 0;
         const Real mo = q.rho[c] * q.u[c];
@@ -273,8 +326,8 @@ __global__ void kSpeciesStage2(GpuGrid g, ViscView vv, PrimView q,
         const Real ml = openLo ? mo : faceMdot(q, uc[a], fl);
         const Real dh = openHi ? Real(0) : faceRhoD(vv, q, sv.invPr, fh);
         const Real dl = openLo ? Real(0) : faceRhoD(vv, q, sv.invPr, fl);
-        const Real th = openHi ? Real(0) : sharedTheta(sv, fh, mh);
-        const Real tl = openLo ? Real(0) : sharedTheta(sv, fl, ml);
+        const Real th = openHi ? Real(0) : sharedTheta<Soot>(sv, fh, mh);
+        const Real tl = openLo ? Real(0) : sharedTheta<Soot>(sv, fl, ml);
         for (int s = 0; s < sv.nY; ++s) {
             const Real* Y = sv.Y[s];
             Real yin = sv.yIn[s];
@@ -283,15 +336,47 @@ __global__ void kSpeciesStage2(GpuGrid g, ViscView vv, PrimView q,
                     yin = sv.yInRow[s][std::size_t(j) + std::size_t(g.ny) * k];
             Real yb = Y[c]; // backflow: the cell's own Y
             if constexpr (AmbHi) yb = mo < Real(0) ? sv.yHi[s] : Y[c];
-            const Real Fh = openHi ? mo * yb : faceY2(Y, fh, mh, th, dh, h);
-            const Real Fl = openLo ? mo * (mo < Real(0) ? Y[c] : yin)
-                                   : faceY2(Y, fl, ml, tl, dl, h);
+            Real Fh, Fl;
+            if constexpr (Soot) {
+                if (s == sv.soot) {
+                    Fh = openHi ? mo * yb
+                                : faceY(Y, fh, mh, sv.sootDiff * dh, h);
+                    Fl = openLo ? mo * (mo < Real(0) ? Y[c] : yin)
+                                : faceY(Y, fl, ml, sv.sootDiff * dl, h);
+                } else {
+                    Fh = openHi ? mo * yb : faceY2(Y, fh, mh, th, dh, h);
+                    Fl = openLo ? mo * (mo < Real(0) ? Y[c] : yin)
+                                : faceY2(Y, fl, ml, tl, dl, h);
+                }
+            } else {
+                Fh = openHi ? mo * yb : faceY2(Y, fh, mh, th, dh, h);
+                Fl = openLo ? mo * (mo < Real(0) ? Y[c] : yin)
+                            : faceY2(Y, fl, ml, tl, dl, h);
+            }
+            if constexpr (Wall) {
+                if (wallH) Fh = Real(0);
+                if (wallL) Fl = Real(0);
+            }
             div[s] -= (Fh - Fl) / h;
         }
     }
     Real* out[kMaxY] = {oy0, oy1, oy2, oy3};
     const Real cr = cmb.crAt(c);
     const Real om = sv.omega[c];
+    if constexpr (Soot) {
+        // Fuel -> soot (no heat); soot + stoich O -> products (heat q).
+        const Real wf = sv.omegaF[c], wx = sv.omegaOx[c];
+        const Real omO = sv.stoich * (om + wx);
+        for (int s = 0; s < sv.nY; ++s) {
+            const Real r = s == sv.fuel   ? div[s] - om - wf
+                           : s == sv.ox   ? div[s] - omO
+                           : s == sv.soot ? div[s] + wf - wx
+                                          : div[s];
+            out[s][c] = cmb.ca * sc.ya[s][c] + cmb.cb * sc.yb[s][c] + cr * r;
+        }
+        oE[c] += cr * (sv.q * (om + wx));
+        return;
+    }
     const Real omO = sv.stoich * om;
     for (int s = 0; s < sv.nY; ++s) {
         const Real r = s == sv.fuel ? div[s] - om
@@ -366,6 +451,22 @@ void cellPass(const GpuGrid& g, const DeviceCompState& s, const Real* T,
     checkLastKernel("kChemCellPass");
 }
 
+void cellPassSoot(const GpuGrid& g, const DeviceCompState& s, const Real* T,
+                  Real lnA, Real Ta, int fuel, int ox, const SootRates& sr,
+                  Real* const Y[kMaxY], Real* omega)
+{
+    assert(s.nY >= 3 && fuel >= 0 && fuel < s.nY && ox >= 0 && ox < s.nY &&
+           ox != fuel && sr.soot >= 0 && sr.soot < s.nY && sr.soot != fuel &&
+           sr.soot != ox && sr.omegaF && sr.omegaOx);
+    SpeciesCombine ys;
+    for (int k = 0; k < s.nY; ++k) ys.ya[k] = s.y[k].data();
+    ys.nY = s.nY;
+    kChemCellPass2Soot<<<launchBlocks(g.size()), blockSize>>>(
+        g, s.nY, s.rho.data(), ys, T, lnA, Ta, fuel, ox, sr, Y[0], Y[1], Y[2],
+        Y[3], omega);
+    checkLastKernel("kChemCellPass2Soot");
+}
+
 void stage(const GpuGrid& g, ViscView vv, PrimView q, const StageCombine& cmb,
            const SpeciesCombine& sc, const SpeciesView& sv,
            DeviceCompState& out)
@@ -373,8 +474,11 @@ void stage(const GpuGrid& g, ViscView vv, PrimView q, const StageCombine& cmb,
     assert(!cmb.ol[0] && !cmb.lts && sc.nY == sv.nY && out.nY == sv.nY);
     bool row = false;
     for (int s = 0; s < sv.nY; ++s) row = row || sv.yInRow[s] != nullptr;
-    // The walled kernel is premixed and uniform-inflow only (the chamber).
-    assert(!sv.solid || (!row && sv.ox < 0));
+    // The walled premixed kernel is uniform-inflow only (the chamber); the
+    // walled two-reactant one is the per-row ambient-top candle's (--wick).
+    assert(!sv.solid || (!row && sv.ox < 0) ||
+           (sv.ox >= 0 && row && sv.ambientHi && sv.openX));
+    assert(sv.soot < 0 || (sv.ox >= 0 && sv.solid && sv.omegaF && sv.omegaOx));
     auto launch = [&](auto r, auto solid) {
         kSpeciesStage<decltype(r)::value, decltype(solid)::value>
             <<<launchBlocks(g.size()), blockSize>>>(
@@ -387,6 +491,19 @@ void stage(const GpuGrid& g, ViscView vv, PrimView q, const StageCombine& cmb,
                 g, vv, q, cmb, sc, sv, out.y[0].data(), out.y[1].data(),
                 out.y[2].data(), out.y[3].data(), out.E.data());
     };
+    auto launch2w = [&](auto soot) {
+        kSpeciesStage2<true, true, true, decltype(soot)::value>
+            <<<launchBlocks(g.size()), blockSize>>>(
+                g, vv, q, cmb, sc, sv, out.y[0].data(), out.y[1].data(),
+                out.y[2].data(), out.y[3].data(), out.E.data());
+    };
+    if (sv.ox >= 0 && sv.solid) {
+        // The wick candle: per-row inflow, ambient top, immersed wall.
+        if (sv.soot >= 0) launch2w(std::true_type{});
+        else launch2w(std::false_type{});
+        checkLastKernel("kSpeciesStage2");
+        return;
+    }
     if (sv.ox >= 0) {
         // The ambient top rides the per-row (candle) instantiation only.
         assert(!sv.ambientHi || (row && sv.openX));

@@ -1268,6 +1268,149 @@ constexpr double kCandleIgnitionDefault = 4;
 // fuel Mach is inflated far less than the jet's: buoyant Mach ~0.18.
 constexpr double kCandleMachDefault = 0.005;
 
+// --mode candle --wick defaults (docs/chem.md, "Wick candle"), in l and T0.
+// Wick 0.75 l = 6 cells at 8 cells/l: the ghost wall's two mirror cells per
+// side with room to spare; 2 l tall (about 1/5 of the flame, a real candle's
+// proportion). T_wick 2 T0: paraffin vapour boils at ~600-650 K (T0 300 K).
+// Fuel rate 1 = the slot candle's Q = rho U W at W 1 (tip ~11 l). Body 6 x 4 l
+// with 9.5 l of air per side: the slot candle's 25 l periodic width.
+constexpr double kWickWidthDefault = 0.75;
+constexpr double kWickHeightDefault = 2;
+constexpr double kWickTempDefault = 2;
+constexpr double kWickFuelRateDefault = 1;
+constexpr double kCandleBodyWidthDefault = 6;
+constexpr double kCandleBodyHeightDefault = 4;
+constexpr double kWickCoflowWidthDefault = 9.5;
+// Air below the candle body past the inflow sink band (the coflow passes
+// around it), l; at least 4 cells.
+constexpr double kWickGapBelow = 1;
+
+// Which flags belong to the wick candle: typed elsewhere = an error by name.
+std::optional<ConfigError> wickFlagScope(const RawConfig& r, bool candle)
+{
+    if (!candle)
+        return rejectGiven(r,
+                           {"--wick", "--wick-width", "--wick-height",
+                            "--wick-temp", "--fuel-rate", "--candle-width",
+                            "--candle-height", "--soot", "--soot-form",
+                            "--soot-ox"},
+                           "only applies to --mode candle --wick");
+    if (r.wick)
+        return rejectGiven(r,
+                           {"--slot-width", "--slot-edge", "--pilot-width",
+                            "--pilot-speed", "--pulse", "--pulse-freq",
+                            "--ignition", "--quiescent"},
+                           "does not apply with --wick (the wick is an "
+                           "immersed body; fuel vapour enters through its "
+                           "surface, the IC lights a sheet around it)");
+    return rejectGiven(r,
+                       {"--wick-width", "--wick-height", "--wick-temp",
+                        "--fuel-rate", "--candle-width", "--candle-height",
+                        "--soot", "--soot-form", "--soot-ox"},
+                       "only applies to --mode candle --wick");
+}
+
+// The wick candle on top of a validated --mode candle case: the body, the
+// wick, the fuel source, the soot model and the box (dns/wick.hpp).
+std::expected<Case, ConfigError> finishWick(const RawConfig& r, Case c)
+{
+    auto val = [&](const char* flag, double v, double dflt) {
+        return r.given.contains(flag) ? v : dflt;
+    };
+    const double cells = c.flameCells, h = c.h;
+    if (!r.given.contains("--damkohler")) c.diff.Da = kWickDaDefault;
+    WickSpec& s = c.wick;
+    s.wWick = val("--wick-width", r.wickWidth, kWickWidthDefault);
+    if (!(std::isfinite(s.wWick) && s.wWick * cells >= 4 - 1e-9 &&
+          s.wWick <= 20))
+        return bad(2, "--wick-width",
+                   std::format("must be in [4 cells, 20] l ({:.4g} l at "
+                               "--cells-per-unit {:g}): the ghost wall needs "
+                               "two mirror cells per side",
+                               4.0 / cells, cells));
+    s.hWick = val("--wick-height", r.wickHeight, kWickHeightDefault);
+    if (!(std::isfinite(s.hWick) && s.hWick * cells >= 2 - 1e-9 &&
+          s.hWick <= 50))
+        return bad(2, "--wick-height", "must be in [2 cells, 50] l");
+    s.tWick = val("--wick-temp", r.wickTemp, kWickTempDefault);
+    if (!(std::isfinite(s.tWick) && s.tWick >= 1 && s.tWick <= c.diff.sigma))
+        return bad(2, "--wick-temp", std::format("must be in [1, sigma = {:g}] "
+                                                 "(the wick wall T/T0: the "
+                                                 "fuel's vaporisation "
+                                                 "temperature)",
+                                                 c.diff.sigma));
+    s.tCandle = 1;
+    s.Q = val("--fuel-rate", r.fuelRate, kWickFuelRateDefault);
+    if (!(finitePos(s.Q) && s.Q <= 20))
+        return bad(2, "--fuel-rate", "must be in (0, 20] (fuel vapour mass "
+                                     "per unit time and depth, rho0 U l)");
+    s.yF = c.diff.yF1;
+    s.wCandle = val("--candle-width", r.candleWidth, kCandleBodyWidthDefault);
+    if (!(std::isfinite(s.wCandle) && s.wCandle >= s.wWick + 4 * h &&
+          s.wCandle <= 200))
+        return bad(2, "--candle-width", "must be in [wick width + 4 cells, "
+                                        "200] l");
+    const double hC = val("--candle-height", r.candleHeight,
+                          kCandleBodyHeightDefault);
+    if (!(std::isfinite(hC) && hC * cells >= 4 - 1e-9 && hC <= 100))
+        return bad(2, "--candle-height", "must be in [4 cells, 100] l");
+    const double wco = r.coflowWidth < 0 ? kWickCoflowWidthDefault
+                                         : r.coflowWidth;
+    if (!(std::isfinite(wco) && wco >= 2))
+        return bad(2, "--coflow-width", "must be >= 2 l per side (y is "
+                                        "periodic: the air separates the "
+                                        "candle from its image)");
+    const int nb = c.nscbcSink;
+    const double gap = std::max(kWickGapBelow, 4 * h);
+    const double len = c.grid.nx * h - 2.0 * nb * h; // validateDiffusion's
+    if (!(gap + hC + s.hWick + 8 <= len))
+        return bad(2, "--length", std::format("must be >= {:.4g} l: the air "
+                                              "below the body, the body, the "
+                                              "wick and 8 l of flame",
+                                              gap + hC + s.hWick + 8));
+    if (!r.soot)
+        if (auto e = rejectGiven(r, {"--soot-form", "--soot-ox"},
+                                 "does not apply with --soot off");
+            e)
+            return std::unexpected(*e);
+    c.wickSoot = r.soot != 0;
+    c.soot.Daf = val("--soot-form", r.sootForm, kSootDafDefault);
+    c.soot.Daox = val("--soot-ox", r.sootOx, kSootDaoxDefault);
+    if (!(finitePos(c.soot.Daf) && c.soot.Daf <= 1e6))
+        return bad(2, "--soot-form", "must be in (0, 1e6] (A_f e^(-Ta_f/T_ad) "
+                                     "l/U)");
+    if (!(finitePos(c.soot.Daox) && c.soot.Daox <= 1e6))
+        return bad(2, "--soot-ox", "must be in (0, 1e6] (A_ox rho0 "
+                                   "e^(-Ta_ox/T_ad) l/U)");
+
+    const int half = int(std::ceil((0.5 * s.wCandle + wco) * cells - 1e-9));
+    const int ny = 2 * half, nx = c.grid.nx;
+    auto box = makeBox(nx, ny, 1, nx * h, ny * h, 1.0);
+    if (!box) return std::unexpected(box.error());
+    c.grid = *box;
+    s.yc = half * h;
+    s.xBase = nb * h + gap;
+    s.xTop = s.xBase + hC;
+    c.bunsen.yc = s.yc;
+    c.bunsen.wCo = wco;
+    c.flameWick = true;
+    c.flameIgnition = 0; // the wick IC lights its own sheet
+    c.n = c.grid.nx;
+    c.L = c.grid.nx * h;
+    c.meta.body = c.wickSoot ? "wick candle diffusion flame with soot"
+                             : "wick candle diffusion flame";
+    c.meta.setGrid(c.grid);
+    // Blowing speed of the vapour off the wick: Q / (rho_v perimeter), rho_v
+    // = p0/(R T_wick) = 1/tWick.
+    const double uBlow = s.Q * s.tWick / (2 * s.hWick + s.wWick);
+    if (uBlow > 2)
+        c.warnings.push_back(std::format(
+            "--fuel-rate {:g}: the vapour leaves the wick at ~{:.3g} U "
+            "(Q T_wick/(rho0 T0 perimeter)): a jet, not a candle",
+            s.Q, uBlow));
+    return c;
+}
+
 // The 2D slot-jet diffusion flame (docs/chem.md, dns/diffusion.hpp): model
 // C1, the burner on the bunsen flags (lengths in l, speeds in U_jet), the
 // box, the label inputs. Every premixed-only flag is rejected by name.
@@ -1277,6 +1420,7 @@ std::expected<Case, ConfigError> validateDiffusion(const RawConfig& r, Case c)
 {
     const bool candle = r.flameMode == 3;
     if (auto e = chamberFlagScope(r, false); e) return std::unexpected(*e);
+    if (auto e = wickFlagScope(r, candle); e) return std::unexpected(*e);
     if (auto e = candle ? rejectGiven(r, {"--pilot-width", "--pilot-speed"},
                                       "does not apply to --mode candle (the "
                                       "flame anchors on its inflow sheet: no "
@@ -1552,6 +1696,7 @@ std::expected<Case, ConfigError> validateDiffusion(const RawConfig& r, Case c)
               .rans = "",
               .steady = ""};
     c.meta.setGrid(c.grid);
+    if (candle && r.wick) return finishWick(r, std::move(c));
     return c;
 }
 
@@ -1585,6 +1730,7 @@ std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
         return bad(2, "--mode", "must be premixed, bunsen, diffusion, candle "
                                 "or chamber");
     if (auto e = chamberFlagScope(r, chamber); e) return std::unexpected(*e);
+    if (auto e = wickFlagScope(r, false); e) return std::unexpected(*e);
     if (auto e = rejectGiven(r,
                              {"--stoich", "--fuel-y", "--ox-y", "--damkohler",
                               "--cells-per-unit", "--ignition"},
@@ -3985,7 +4131,101 @@ std::string chamberRunLabel(const Case& c)
                               : std::string(" [--reaction off: inert]"));
 }
 
+std::string wickRunLabel(const Case& c)
+{
+    assert(c.flameWick);
+    const DiffusionModel& m = c.diff;
+    const WickSpec& s = c.wick;
+    return std::format(
+        "DNS 2D [diffusion single-step F + {:g} O -> {:g} P, calorically "
+        "perfect, Le=1, Y_O2={:g}, Z_st={:.4g}, T_ad/T0={:g}, Da={:g}, "
+        "M={:g} (INFLATED: the buoyant plume runs at Mach ~M |u|max)] "
+        "species: MC-limited MUSCL, ONE limiter shared by fuel and oxidizer, "
+        "on the central mass flux (mean flow central) | WICK CANDLE: gravity "
+        "g={:g} U^2/l along -x, hydrostatic ambient column, immersed "
+        "isothermal ghost wall [first-order wall position, NOT body-fitted; "
+        "wick {:g} x {:g} l at T={:g} T0, body {:g} l wide at T0; species "
+        "flux zero through wall faces], fuel = volumetric source band on the "
+        "wick surface at the FIXED rate Q={:g} (not tied to the wick heat "
+        "flux){}",
+        m.s, 1 + m.s, m.yO2, m.zst(), m.sigma, m.Da, c.mach, c.flameGravity,
+        s.wWick, s.hWick, s.tWick, s.wCandle, s.Q,
+        c.wickSoot
+            ? std::format(" | SOOT: one-equation semi-empirical (formation "
+                          "Da_f={:g} e^-{:g}T0/T on rho Y_F, oxidation "
+                          "Da_ox={:g} e^-{:g}T0/T on rho^2 Y_s Y_O; constants "
+                          "TUNED FOR APPEARANCE; no diffusion, no "
+                          "thermophoresis, no radiation)",
+                          c.soot.Daf, c.soot.thetaF, c.soot.Daox,
+                          c.soot.thetaOx)
+            : std::string(" | no soot"));
+}
+
 namespace {
+
+std::string describeWick(const Case& c)
+{
+    const DiffusionModel& m = c.diff;
+    const WickSpec& s = c.wick;
+    const double h = c.h, sig = m.sigma;
+    const double Lb = c.grid.nx * h;
+    const CandleScales cs = candleScales(m, c.flameGravity, s.wWick, Lb, c.mach);
+    const double uMax = std::max(c.bunsen.uCo, cs.uFreeFall);
+    const double dtAc = c.cfl * h / (std::sqrt(sig) / c.mach + sig * uMax);
+    const double dtTh = 0.25 * h * h * (1.0 / sig) /
+                        (c.prandtl * std::max(1.0, kGammaAir / c.prandtl));
+    const double perim = 2 * s.hWick + s.wWick;
+    return std::format(
+        "case:\n"
+        "  mode       2D WICK CANDLE: an immersed candle body + wick, fuel "
+        "vapour from the wick surface, gravity -x (dns flame --mode candle "
+        "--wick)\n"
+        "  model      single step F + s O -> (1+s) P, omega = A rho^2 Y_F Y_O "
+        "e^(-Ta/T); calorically perfect (gamma 1.4), equal W, Le = 1\n"
+        "             s = {:g}, Y_O2 = {:g} -> Z_st = {:.6g}; T_ad/T0 = {:.6g}, "
+        "beta = {:.6g}, Ta/T0 = {:.6g}, Da = {:.6g} (ln A = {:.6g})\n"
+        "  soot       {}\n"
+        "  units      rho0 = R = U = 1, l = D0/U = 1 (mu = Pr = {:.4g}), T0 = "
+        "p0 = 1/(gamma M^2) = {:.6g}\n"
+        "  grid       {} x {} x 1  h = {:.6g} = l/{:.4g}  box {:.6g} x {:.6g}  "
+        "[x up, y periodic]\n"
+        "  candle     body x in [{:.4g}, {:.4g}] (wax top), {:.4g} l wide, "
+        "centred at y = {:.6g}; isothermal at T0\n"
+        "  wick       {:.4g} l wide, {:.4g} l above the wax (tip x = {:.4g}); "
+        "isothermal at {:.4g} T0 (vaporisation)\n"
+        "  fuel       Q = {:.4g} per unit depth (FIXED), Y_F = {:g}, at "
+        "{:.4g} T0 through the source band beside the wick (blowing ~{:.3g} "
+        "U)\n"
+        "  gravity    g = {:.6g} U^2/l along -x; p_a(L)/p0 = {:.6g}; free-fall "
+        "speed {:.4g} U (buoyant Mach {:.3g})\n"
+        "  air        coflow {:.4g} U from below, {:.4g} l per side beside the "
+        "body; y periodic\n"
+        "  boundary   x-lo NSCBC air inflow, x-hi outflow p_a(x_out) (anchor "
+        "sigma {:g}), both with the hydrostatic waves; air drawn down the top "
+        "is ambient; sink {} cells, amp {:.3g}\n"
+        "  IC         hydrostatic column; Z = e^(-d/0.5 l) around the wick up "
+        "to 4 l above its tip, as its Burke-Schumann state (a closed sheet)\n"
+        "  run        tt = {:.6g} l/U  cfl = {:.3g}  dt est {:.3e} (acoustic "
+        "{:.3e}, thermal {:.3e}; chemistry at run time)\n"
+        "  label      {}\n"
+        "  out        {}\n",
+        m.s, m.yO2, m.zst(), sig, m.beta, m.theta(), m.Da, m.lnA(),
+        c.wickSoot
+            ? std::format("one equation, rho Y_s (species 2): formation "
+                          "Da_f = {:g} (Ta_f = {:g} T0, ln A_f = {:.6g}), "
+                          "oxidation Da_ox = {:g} (Ta_ox = {:g} T0, ln A_ox "
+                          "= {:.6g}); appearance-tuned",
+                          c.soot.Daf, c.soot.thetaF, c.soot.lnAf(sig),
+                          c.soot.Daox, c.soot.thetaOx, c.soot.lnAox(sig))
+            : std::string("off"),
+        c.prandtl, c.flameTu, c.grid.nx, c.grid.ny, h, c.flameCells,
+        c.grid.nx * h, c.grid.ny * h, s.xBase, s.xTop, s.wCandle, s.yc,
+        s.wWick, s.hWick, s.xTip(), s.tWick, s.Q, s.yF, s.tWick,
+        s.Q * s.tWick / perim, c.flameGravity, 1 - cs.hydroDrop,
+        cs.uFreeFall, cs.machBuoyant, c.bunsen.uCo, c.bunsen.wCo,
+        kDiffOutflowSigma, c.nscbcSink, c.nscbcSinkAmp, c.tEnd, c.cfl,
+        std::min(dtAc, dtTh), dtAc, dtTh, wickRunLabel(c), c.outPrefix);
+}
 
 std::string describeChamber(const Case& c)
 {
@@ -4051,6 +4291,7 @@ std::string Case::describe() const
                            "  order      {}\n",
                            polyMeshDir, cellOrderNames()[std::size_t(meshOrder)]);
     if (sub == Subcommand::Hit) return describeHit(*this);
+    if (sub == Subcommand::Flame && flameWick) return describeWick(*this);
     if (sub == Subcommand::Flame && flameDiffusion)
     {
         const DiffusionModel& m = diff;

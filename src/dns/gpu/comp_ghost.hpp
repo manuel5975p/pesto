@@ -25,12 +25,20 @@ namespace dns::gpu {
 // mirror uses. Namespace scope, not nested, only so it can be a defaulted
 // argument of DeviceCompGhost::make.
 // Pre: Twall > 0 and Rgas > 0 when Isothermal.
+// TwallAt (optional, isothermal only): a wall temperature that varies over the
+// surface (dns flame --mode candle --wick: the wick at the fuel's vaporisation
+// temperature, the candle body at ambient). Sampled ONCE per ghost and per
+// side image at the foot of the wall normal (like WallMotion) into per-ghost
+// tables; Twall then only fills the deep-solid interior. Empty = the uniform
+// Twall, the tables and every kernel's arithmetic unchanged.
+using GhostWallTemp = std::function<double(double, double, double)>;
 struct GhostWallThermal
 {
     enum class Mode { Adiabatic, Isothermal };
     Mode mode = Mode::Adiabatic;
     double Twall = 0;  // solver units; used iff Isothermal, must be > 0 then
     double Rgas = 1.0; // specific gas constant of the state, p = rho R T
+    GhostWallTemp TwallAt; // empty = uniform Twall; values must be > 0
 };
 
 // sdf(x, y, z) > 0 in fluid, < 0 in solid, approximately a distance.
@@ -89,6 +97,9 @@ struct CompGhostTables
     // per unit sample density, p_ghost = p_sample + rho_sample * aspan. Present
     // exactly when uwall is.
     std::vector<Real> aspan;
+    // Per-ghost wall temperature at its wall point (GhostWallThermal::
+    // TwallAt); empty = the uniform Twall. sideTwall: the same per side face.
+    std::vector<Real> gtwall, sideTwall;
     std::vector<int> deep;   // deep-solid cells (quiescent fill)
     std::vector<int> fcell;  // fluid cell of an interface face
     std::vector<int> fdir;   // 0:+x 1:-x 2:+y 3:-y 4:+z 5:-z (ghost side)
@@ -176,10 +187,13 @@ struct CompGhostCapacity
 // crossing test sphere-traces the sdf, so it needs a true distance (a lower
 // bound at least). Faces across the periodic wrap are never sealed.
 // thinSeal false: the tables are what they always were, byte for byte.
+// twallAt non-null fills gtwall / sideTwall (GhostWallThermal::TwallAt);
+// null leaves them empty.
 CompGhostTables classifyCompGhost(const Grid& g, const GhostSdf& sdf,
                                   const double* bbox, const AxisRemap3& remap,
                                   const GhostWallMotion* motion, int threads = 1,
-                                  bool thinSeal = false);
+                                  bool thinSeal = false,
+                                  const GhostWallTemp* twallAt = nullptr);
 
 class DeviceCompGhost
 {
@@ -390,6 +404,9 @@ private:
     // Side images of the two-sided faces (CompGhostTables::side*).
     DeviceBuffer<int> sideFace_, sideNbr_, sideTnbr_, sideCell_, sideStart_;
     DeviceBuffer<Real> sideW_, sideTw_, sideScale_, sideUwall_, sideAspan_;
+    // Per-ghost / per-side-face wall temperature (CompGhostTables::gtwall,
+    // sideTwall); unallocated (null) = the uniform Twall_.
+    DeviceBuffer<Real> gtwall_, sideTwall_;
     DeviceBuffer<int> gcell_;    // ghost cell index
     DeviceBuffer<int> gnbr_;     // 8 trilinear source cells per ghost
     DeviceBuffer<Real> gw_;      // 8 renormalized weights per ghost

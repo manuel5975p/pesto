@@ -58,4 +58,16 @@ void bunsenIC(const Case& c, CompState& q, std::vector<double>& rhoY);
 // Pre: c.flameDiffusion.
 void diffusionIC(const Case& c, CompState& q, std::vector<double> (&rhoY)[2]);
 
+// The `dns flame --mode candle --wick` IC (dns/wick.hpp): the hydrostatic
+// ambient column p_a(x) on every cell at rest, and around the wick a closed
+// Burke-Schumann sheet: Z = e^(-d/kWickIcDecay) w(x), d the distance to the
+// wick box, w = (1 - tanh((x - (x_tip + kWickIcAbove))/0.5))/2, Z = 0 below
+// the wax top; rho = p_a/(R T). Solid cells: ambient air at rest with EVERY
+// rho Y = 0 (the walled kernel never moves them). rhoY[0] = rho Y_F, [1] =
+// rho Y_O, [2] = rho Y_s = 0 (resized; [2] empty without soot).
+// Pre: c.flameWick.
+inline constexpr double kWickIcDecay = 0.5;
+inline constexpr double kWickIcAbove = 4;
+void wickIC(const Case& c, CompState& q, std::vector<double> (&rhoY)[3]);
+
 } // namespace dns
