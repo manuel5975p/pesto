@@ -7,6 +7,7 @@
 #include "dns/chamber.hpp"
 #include "dns/chem.hpp"
 #include "dns/diffusion.hpp"
+#include "dns/fvprecision.hpp"
 #include "dns/grid.hpp"
 #include "dns/prop/spec.hpp"
 #include "dns/rans.hpp"
@@ -283,6 +284,18 @@ struct RawConfig
     double inflowSpeed = 1.0;   // inflow speed / S_L
     double wrinkle = 0;         // IC front displacement amplitude, delta_th
     int wrinkleModes = 8;       // modes 1..N of the box height
+    // 3D premixed in turbulence (docs/chem.md, "3D and turbulence").
+    double turb = 0;            // --turb: u'/S_L of the inflow box; 0 = off
+    double turbLength = 2.5;    // --turb-length: integral scale, delta_th
+    bool holdFlame = false;     // --hold-flame: inflow-speed controller
+    double frameStart = 0;      // --frame-start: no frame before this time
+    // Thickened flame (docs/chem.md, "LES species and TFLES"; premixed and
+    // bunsen). --tfles F (>= 1; 0 = off), --tfles-sensor dynamic|uniform
+    // (0 | 1), --efficiency none|charlette (0 | 1; default charlette with
+    // --les, else none).
+    double tfles = 0;
+    int tflesSensor = 0;
+    int efficiency = 0;
     // --mode bunsen (2D slot burner; docs/chem.md). Lengths in delta_th,
     // speeds in S_L, temperatures in Tu.
     double slotWidth = 12;      // jet width W
@@ -346,8 +359,16 @@ struct RawConfig
     bool selftest = false;
 
     // mesh (host-only FaceMesh report; docs/mesh.md)
-    std::string polymesh;        // --polymesh DIR (a constant/polyMesh directory)
+    std::string polymesh;        // --polymesh DIR (mesh: a constant/polyMesh directory;
+                                 // flow: an OpenFOAM case directory, docs/fv.md)
     int meshOrder = 1;           // --order: CellOrder index (0 source, 1 morton, 2 colour)
+    int fvPrecision = int(FvPrecision::Fp32); // --fv-precision fp32|fp64 (flow --polymesh only)
+    // EXPERIMENTAL coupled p-U prototype (plan_perf_5 P0b; flow --polymesh, fp64):
+    // --fv-coupled N (after N SIMPLE iterations), --fv-coupled-eta, --fv-coupled-alpha,
+    // --fv-coupled-check (G-JAC at the first outer iteration).
+    int fvCoupled = -1;
+    double fvCoupledEta = 0.1, fvCoupledAlpha = 1.0;
+    bool fvCoupledCheck = false;
 };
 
 // Fully resolved case. Every derived quantity is computed here, so downstream
@@ -556,6 +577,29 @@ public:
     double flameUIn = 1;        // inflow speed / S_L (the IC's mass flux)
     double flameWrinkle = 0;    // IC front displacement amplitude, delta_th
     int flameWrinkleModes = 8;  // modes 1..N of the box height (flameWrinkle)
+    // --turb (premixed, nz >= 8): u'/S_L of the frozen synthetic-HIT box
+    // (dns/turb_ic.hpp) swept through the inflow at the inflow speed (Taylor)
+    // and laid on the IC's fresh gas; 0 = off, the laminar runner bit for
+    // bit. flameTurbL = l_t in box units (delta_D); the box is flameTurbNbx x
+    // ny x nz cells of the run's h (L_bx = L_z). flameHold: the inflow speed
+    // tracks the consumption speed and holds the fresh-mass thickness
+    // integral(rho Y dx) at its first stats-row value (--hold-flame).
+    double flameTurb = 0;
+    double flameTurbL = 0;
+    int flameTurbNbx = 0;
+    bool flameHold = false;
+    // --frame-start: frames (every kind) begin at this time; 0 = from t = 0.
+    double frameStart = 0;
+    // Flame LES (--les CS --sgs M; premixed, nz >= 8) rides cs, sgsModel and
+    // lesLabel above. TFLES (--tfles F): flameTfles = F_max (0 = off; 1 is a
+    // run of the thickened kernels at no thickening), flameTflesUniform: the
+    // sensor is 1 everywhere, flameCharlette: E by Charlette 2002 (needs
+    // LES), flameTflesDilate: the sensor's max-filter radius in cells. The IC
+    // lays the oracle profile thickened by F (x/F).
+    double flameTfles = 0;
+    bool flameTflesUniform = false;
+    bool flameCharlette = false;
+    int flameTflesDilate = 0;
     // --mode bunsen: the slot burner (dns/bunsen.hpp). Box units (lengths in
     // delta_D, speeds in S_L), except the temperature RATIO bunsenCoflowT.
     bool flameBunsen = false;
@@ -594,6 +638,19 @@ public:
     // `dns mesh` reads the mesh in phase 3 and never acquires a GPU.
     std::string polyMeshDir;
     int meshOrder = 1;
+
+    // flow --polymesh CASE: the incompressible FV path (docs/fv.md), an
+    // OpenFOAM simpleFoam case directory read in phase 1.5 (--dry-run) / 3.
+    // fvMaxIters > 0 overrides controlDict's endTime. fvPrecision: FP32
+    // (default, with the solve floors) or FP64 (the parity mode).
+    std::string fvCase;
+    int fvMaxIters = 0;
+    FvPrecision fvPrecision = FvPrecision::Fp32;
+    // EXPERIMENTAL coupled prototype: -1 off (SIMPLE only), else coupled outer
+    // iterations after fvCoupled SIMPLE iterations (docs/fv.md "Coupled prototype").
+    int fvCoupled = -1;
+    double fvCoupledEta = 0.1, fvCoupledAlpha = 1.0;
+    bool fvCoupledCheck = false;
 
     std::string outPrefix;
     std::set<Emit> emit;

@@ -318,6 +318,8 @@ RunOutput::make(Config cfg, RunMeta meta, const Grid& g, FrameGeometry geo)
     RunOutput o;
     auto& p = *o.p_;
     p.cfg = std::move(cfg);
+    // Every frame cadence starts at frameStart (0 = the historical start).
+    p.nextFrame = p.nextPng = p.nextWeb = p.cfg.frameStart;
     p.meta = std::move(meta);
     p.g = g;
     p.geo = std::move(geo);

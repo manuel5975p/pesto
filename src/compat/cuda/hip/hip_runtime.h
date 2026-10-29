@@ -25,7 +25,9 @@ inline constexpr cudaMemcpyKind hipMemcpyDeviceToDevice = cudaMemcpyDeviceToDevi
 #define hipMalloc cudaMalloc
 #define hipFree cudaFree
 #define hipMemcpy cudaMemcpy
+#define hipMemcpyAsync cudaMemcpyAsync
 #define hipMemset cudaMemset
+#define hipMemsetAsync cudaMemsetAsync
 #define hipDeviceSynchronize cudaDeviceSynchronize
 #define hipGetLastError cudaGetLastError
 #define hipGetErrorString cudaGetErrorString

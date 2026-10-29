@@ -143,7 +143,7 @@ int main()
     rejects({"flame", "--n", "256"}, 2, "--n", "--n rejected by name");
     rejects({"flame", "--physics", "incompressible"}, 2, "--physics",
             "--physics incompressible rejected (no low-Mach branch)");
-    rejects({"flame", "--nz", "4"}, 2, "--nz", "--nz 4 rejected (multi-D is P2)");
+    rejects({"flame", "--nz", "4"}, 2, "--nz", "--nz 4 rejected (1 or >= 8)");
     rejects({"flame", "--ny", "3"}, 2, "--ny", "--ny 3 rejected");
     rejects({"flame", "--mach", "0.06"}, 2, "--mach", "--mach 0.06 rejected");
     rejects({"flame", "--mach", "0"}, 2, "--mach", "--mach 0 rejected");
@@ -279,5 +279,261 @@ int main()
             "--lewis is not registered (no Le != 1 oracle)");
     rejects({"flame", "--body", "cylinder"}, 1, "--body",
             "--body is not a flame flag");
+
+    // 3D premixed and --turb (docs/chem.md, "3D and turbulence").
+    {
+        auto c = runCli({"flame", "--nz", "16", "--ny", "16",
+                         "--cells-per-delta", "8"});
+        check(c && c->grid.nz == 16 && std::abs(c->grid.hz - c->grid.hx) < 1e-15,
+              "--nz 16: a 3D premixed box, hz = h");
+        if (c) {
+            const std::string d = c->describe();
+            check(d.find("3D planar premixed flame") != std::string::npos &&
+                      d.find("[3D, y and z periodic, hz = h]") != std::string::npos,
+                  "3D dry-run: mode and grid lines");
+            check(flameRunLabel(*c).find("; 3D nz=16]") != std::string::npos &&
+                      flameRunLabel(*c).starts_with("DNS ["),
+                  "3D label: DNS, '3D nz=16' in the bracket");
+        }
+        auto t = runCli({"flame", "--nz", "120", "--ny", "120",
+                         "--cells-per-delta", "8", "--mach", "0.02",
+                         "--upstream", "10", "--downstream", "8", "--turb",
+                         "4", "--hold-flame", "--seed", "3",
+                         "--inflow-speed", "2.5"});
+        check(t.has_value(), "the T2 case validates");
+        if (t) {
+            const double dth = t->flameEig.dthOverDD;
+            check(t->flameTurb == 4 && std::abs(t->flameTurbL - 2.5 * dth) < 1e-12 &&
+                      t->flameTurbNbx == 120 && t->flameHold && t->seed == 3,
+                  "--turb 4: u', l_t = 2.5 delta_th (default), L_bx = L_z, hold, "
+                  "seed");
+            const std::string l = flameRunLabel(*t);
+            check(l.find("synthetic HIT inflow u'/S_L=4, l_t=2.5 delta_th") !=
+                          std::string::npos &&
+                      l.find("seed 3") != std::string::npos &&
+                      l.find("flame held by inflow control") != std::string::npos,
+                  "turbulent label: u', l_t, seed, hold");
+            const std::string d = t->describe();
+            check(d.find("Re_t = u' l_t/nu = 22.25") != std::string::npos &&
+                      d.find("Peters 1999") != std::string::npos,
+                  "turbulent dry-run: Re_t and the correlations");
+            check(t->warnings.empty(), "T2 resolved: no h/eta warning");
+        }
+        auto u = runCli({"flame", "--nz", "60", "--ny", "60",
+                         "--cells-per-delta", "4", "--mach", "0.005", "--turb",
+                         "16", "--turb-length", "2.5"});
+        check(u && !u->warnings.empty() &&
+                  flameRunLabel(*u).starts_with("UNDER-RESOLVED DNS"),
+              "h/eta > 2: warned and labelled UNDER-RESOLVED DNS");
+    }
+    rejects({"flame", "--nz", "6"}, 2, "--nz", "--nz 6 rejected (1 or >= 8)");
+    rejects({"flame", "--mode", "bunsen", "--nz", "6"}, 2, "--nz",
+            "--nz 6 rejected with --mode bunsen (1 or >= 8)");
+    rejects({"flame", "--mode", "chamber", "--nz", "16"}, 2, "--nz",
+            "--nz 16 rejected with --mode chamber");
+    // 3D slot Bunsen (docs/chem.md, "3D turbulent slot Bunsen").
+    {
+        auto b = runCli({"flame", "--mode", "bunsen", "--nz", "16"});
+        check(b && b->grid.nz == 16 && b->grid.hz == b->h &&
+                  b->grid.ny == 288 && b->flameTurb == 0,
+              "--mode bunsen --nz 16: z periodic at hz = h, the 2D y extent");
+        if (b)
+            check(flameRunLabel(*b).find("3D slot Bunsen (spanwise periodic "
+                                         "L_z=") != std::string::npos &&
+                      b->describe().find("3D slot Bunsen flame (dns flame") !=
+                          std::string::npos,
+                  "3D bunsen: label and dry-run name the 3D burner");
+        auto t = runCli({"flame", "--mode", "bunsen", "--jet-speed", "20",
+                         "--slot-width", "24", "--coflow-width", "16",
+                         "--mach", "0.01", "--les", "1.35", "--sgs", "sigma",
+                         "--turb", "3", "--turb-length", "6",
+                         "--cells-per-delta", "2.5", "--tfles", "3", "--nz",
+                         "120", "--length", "100", "--slot-edge", "0.5",
+                         "--seed", "2"});
+        check(t.has_value(), "the P3 turbulent slot Bunsen LES validates");
+        if (t) {
+            const double dth = t->flameEig.dthOverDD;
+            check(t->grid.nx == 282 && t->grid.ny == 140 && t->grid.nz == 120 &&
+                      t->flameTurb == 3 &&
+                      std::abs(t->flameTurbL - 6 * dth) < 1e-12 &&
+                      t->flameTurbNbx == 120 && t->seed == 2 && t->lesLabel &&
+                      t->flameTfles == 3 && t->flameCharlette,
+                  "P3 case: 282 x 140 x 120, u' 3, l_t 6, L_bx = L_z, seed, "
+                  "LES + TFLES 3 + Charlette");
+            // Damkoehler S_T = 4: cone (W/2) sqrt((U/4)^2 - 1) = 12 sqrt(24).
+            check(std::abs(t->bunsen.coneH / dth - 12 * std::sqrt(24.0)) < 1e-9,
+                  "--turb: the IC cone uses Damkoehler's S_T = 1 + u'");
+            const std::string l = flameRunLabel(*t);
+            check(l.starts_with("LES [sigma-model Csigma=1.35") &&
+                      l.find("TFLES [F=3") != std::string::npos &&
+                      l.find("synthetic HIT jet inflow u'/S_L=3") !=
+                          std::string::npos &&
+                      l.find("x jet weight J") != std::string::npos &&
+                      l.find("M_flame=0.01 (inflated") != std::string::npos &&
+                      l.find("3D slot Bunsen") != std::string::npos,
+                  "P3 label: LES model + Cs, TFLES F, jet turbulence, Mach "
+                  "inflation, 3D burner");
+            const std::string d = t->describe();
+            check(d.find("Re_jet = U W/nu = 1068") != std::string::npos &&
+                      d.find("  tfles      F_max = 3") != std::string::npos &&
+                      d.find("  les        mu_t") != std::string::npos,
+                  "P3 dry-run: Re_jet, the tfles and les lines");
+            check(std::ranges::any_of(t->warnings,
+                                      [](const std::string& w) {
+                                          return w.find("Damkoehler") !=
+                                                 std::string::npos;
+                                      }),
+                  "--turb with bunsen warns that the cone uses Damkoehler's "
+                  "S_T");
+        }
+    }
+    rejects({"flame", "--mode", "bunsen", "--nz", "16", "--turb", "3",
+             "--jet-speed", "4.5"},
+            2, "--turb", "bunsen --turb: U_jet <= 1.25 S_T (no cone) rejected");
+    rejects({"flame", "--mode", "bunsen", "--nz", "16", "--turb", "2",
+             "--turb-length", "6"},
+            2, "--turb-length", "bunsen --turb: L_z < 6 l_t rejected");
+    rejects({"flame", "--mode", "bunsen", "--nz", "16", "--turb", "2",
+             "--length", "10"},
+            2, "--length", "bunsen --turb: --length below the turbulent cone "
+                           "rejected");
+    rejects({"flame", "--mode", "bunsen", "--nz", "200", "--jet-speed", "20",
+             "--mach", "0.0125", "--turb", "4"},
+            2, "--turb", "bunsen --turb: M (U_jet + 3 u') > 0.3 rejected");
+    rejects({"flame", "--mode", "bunsen", "--nz", "16", "--les", "1.35"}, 2,
+            "--les", "bunsen --les without an explicit --sgs rejected");
+    rejects({"flame", "--mode", "diffusion", "--nz", "16"}, 2, "--nz",
+            "--nz 16 rejected with --mode diffusion");
+    rejects({"flame", "--turb", "2"}, 2, "--turb", "--turb at nz 1 rejected");
+    rejects({"flame", "--nz", "16", "--ny", "16", "--turb", "-1"}, 2, "--turb",
+            "--turb -1 rejected");
+    rejects({"flame", "--nz", "16", "--ny", "16", "--turb-length", "1"}, 2,
+            "--turb-length", "--turb-length without --turb rejected");
+    rejects({"flame", "--nz", "16", "--ny", "16", "--hold-flame"}, 2,
+            "--hold-flame", "--hold-flame without --turb rejected");
+    rejects({"flame", "--seed", "3"}, 2, "--seed",
+            "--seed without --turb rejected");
+    rejects({"flame", "--nz", "64", "--ny", "64", "--cells-per-delta", "8",
+             "--turb", "2", "--turb-length", "0.4"},
+            2, "--turb-length", "l_t below 4 cells rejected");
+    rejects({"flame", "--nz", "64", "--ny", "64", "--cells-per-delta", "8",
+             "--turb", "2", "--turb-length", "2"},
+            2, "--turb-length", "L_y = 4 l_t (< 6 l_t) rejected");
+    rejects({"flame", "--nz", "120", "--ny", "120", "--cells-per-delta", "8",
+             "--mach", "0.05", "--turb", "2"},
+            2, "--turb", "M (U_in + 3 u') > 0.3 rejected");
+    for (const char* m : {"bunsen", "diffusion", "candle", "chamber"})
+        for (const char* f : {"--turb", "--turb-length", "--seed"})
+            rejects({"flame", "--mode", m, f, "1"}, 2, f,
+                    std::string(f) + " rejected by name with --mode " + m);
+    rejects({"flame", "--mode", "bunsen", "--hold-flame"}, 2, "--hold-flame",
+            "--hold-flame rejected with --mode bunsen");
+    rejects({"flame", "--frame-start", "1"}, 2, "--frame-start",
+            "--frame-start without a frame --emit rejected");
+    rejects({"flame", "--frame-start", "20", "--emit", "bin"}, 2,
+            "--frame-start", "--frame-start past --tt rejected");
+    {
+        auto f = runCli({"flame", "--frame-start", "2", "--emit", "bin"});
+        check(f && f->frameStart == 2, "--frame-start 2 with --emit bin");
+        auto z = runCli({"flame"});
+        check(z && z->frameStart == 0, "frames start at 0 by default");
+    }
+    rejects({"flow", "--body", "cylinder", "--turb", "1"}, 1, "--turb",
+            "--turb is not a flow flag");
+
+    // LES species and TFLES (docs/chem.md, "LES species and TFLES").
+    {
+        auto l = runCli({"flame", "--nz", "16", "--ny", "16", "--les", "1.35",
+                         "--sgs", "sigma", "--tfles", "4", "--cells-per-delta",
+                         "1.875", "--upstream", "30", "--downstream", "20"});
+        check(l.has_value(), "LES sigma + TFLES 4 at 1.875 cells validates");
+        if (l) {
+            check(l->lesLabel && l->cs == 1.35 &&
+                      l->sgsModel == SgsModel::Sigma && l->flameTfles == 4 &&
+                      !l->flameTflesUniform && l->flameCharlette &&
+                      l->flameTflesDilate == 19,
+                  "cs 1.35 sigma, F 4, dynamic, charlette by default with "
+                  "--les, dilation ceil(2.5 F cells) = 19");
+            const std::string lb = flameRunLabel(*l);
+            check(lb.starts_with("LES [sigma-model Csigma=1.35; species SGS "
+                                 "flux mu_t/Sc_t, Sc_t=Pr_t=0.9") &&
+                      lb.find("+ TFLES [F=4, dynamic sensor") !=
+                          std::string::npos &&
+                      lb.find("Charlette 2002 efficiency beta=0.5") !=
+                          std::string::npos &&
+                      lb.find("M_flame=0.01 (inflated") != std::string::npos,
+                  "label: LES model + Cs + species SGS + TFLES F, sensor, "
+                  "efficiency, Mach inflation");
+            const std::string d = l->describe();
+            check(d.find("  les        mu_t = rho (C Delta)^2") !=
+                          std::string::npos &&
+                      d.find("  tfles      F_max = 4: 7.5 cells across") !=
+                          std::string::npos,
+                  "dry-run: les and tfles lines");
+            check(l->meta.sgs == "sigma", "manifest sgs = sigma");
+        }
+        auto t = runCli({"flame", "--tfles", "4", "--cells-per-delta", "1.875",
+                         "--tfles-sensor", "uniform"});
+        check(t && t->flameTfles == 4 && t->flameTflesUniform &&
+                  !t->flameCharlette && !t->lesLabel,
+              "1D --tfles 4 uniform: no efficiency without --les");
+        if (t) {
+            check(flameRunLabel(*t).starts_with(
+                      "thickened flame TFLES [F=4, uniform sensor (Omega=1), "
+                      "no efficiency (E=1), no SGS model]"),
+                  "TFLES without LES: labelled thickened flame, no SGS model");
+            check(t->warnings.size() == 0, "7.5 thickened cells: no warning");
+        }
+        auto w = runCli({"flame", "--tfles", "2", "--cells-per-delta", "2.5"});
+        check(w && !w->warnings.empty(),
+              "5 cells across the thickened flame: warned (below 6)");
+        auto b = runCli({"flame", "--mode", "bunsen", "--tfles", "2",
+                         "--cells-per-delta", "4"});
+        check(b && b->flameTfles == 2 &&
+                  flameRunLabel(*b).find("TFLES [F=2") != std::string::npos,
+              "--mode bunsen --tfles 2 (2D) validates");
+        auto s = runCli({"flame", "--nz", "16", "--ny", "16", "--les", "0.17",
+                         "--sgs", "smag", "--tfles", "2", "--cells-per-delta",
+                         "4", "--efficiency", "none"});
+        check(s && !s->flameCharlette &&
+                  flameRunLabel(*s).starts_with("LES [Smagorinsky Cs=0.17"),
+              "Smagorinsky label; --efficiency none with --les");
+        auto o = runCli({"flame", "--nz", "16", "--ny", "16"});
+        check(o && !o->lesLabel && o->flameTfles == 0 &&
+                  flameRunLabel(*o).starts_with("DNS ["),
+              "no flag: DNS, no TFLES");
+    }
+    rejects({"flame", "--nz", "16", "--ny", "16", "--les", "1.35"}, 2, "--les",
+            "--les without an explicit --sgs rejected (names sigma 1.35)");
+    rejects({"flame", "--les", "1.35", "--sgs", "sigma"}, 2, "--les",
+            "--les at nz 1 rejected");
+    rejects({"flame", "--nz", "16", "--ny", "16", "--les", "-1", "--sgs",
+             "sigma"},
+            2, "--les", "--les -1 rejected");
+    rejects({"flame", "--sgs", "sigma"}, 2, "--sgs", "--sgs without --les rejected");
+    rejects({"flame", "--mode", "bunsen", "--les", "1.35", "--sgs", "sigma"}, 2,
+            "--les", "--les with 2D --mode bunsen (nz 1) rejected");
+    rejects({"flame", "--tfles", "0.5"}, 2, "--tfles", "--tfles 0.5 rejected");
+    rejects({"flame", "--tfles", "21"}, 2, "--tfles", "--tfles 21 rejected");
+    rejects({"flame", "--tfles-sensor", "uniform"}, 2, "--tfles-sensor",
+            "--tfles-sensor without --tfles rejected");
+    rejects({"flame", "--efficiency", "none"}, 2, "--efficiency",
+            "--efficiency without --tfles rejected");
+    rejects({"flame", "--tfles", "4", "--cells-per-delta", "2", "--efficiency",
+             "charlette"},
+            2, "--efficiency", "--efficiency charlette without --les rejected");
+    rejects({"flame", "--tfles", "2", "--cells-per-delta", "1.5"}, 2,
+            "--cells-per-delta", "F --cells-per-delta < 4 rejected");
+    rejects({"flame", "--tfles-sensor", "maybe"}, 1, "--tfles-sensor",
+            "--tfles-sensor maybe: not a value");
+    for (const char* m : {"diffusion", "candle", "chamber"})
+        for (const char* f : {"--les", "--tfles"})
+            rejects({"flame", "--mode", m, f, "1"}, 2, f,
+                    std::string(f) + " rejected by name with --mode " + m);
+    rejects({"flame", "--mode", "diffusion", "--sgs", "sigma"}, 2, "--sgs",
+            "--sgs rejected by name with --mode diffusion");
+    rejects({"flame", "--mode", "candle", "--efficiency", "none"}, 2,
+            "--efficiency", "--efficiency rejected by name with --mode candle");
+    rejects({"conv", "--tfles", "2"}, 1, "--tfles", "--tfles is not a conv flag");
     return dnstest::finish();
 }

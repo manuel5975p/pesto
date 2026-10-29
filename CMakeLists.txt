@@ -43,12 +43,20 @@ add_library(dns_core
     src/dns/chamber.cpp
     src/dns/config.cpp
     src/dns/diffusion.cpp
+    src/dns/foamdict.cpp
+    src/dns/foamio.cpp
     src/dns/framemap.cpp
+    src/dns/fvcase.cpp
+    src/dns/fvgrad.cpp
+    src/dns/fvsimple.cpp
+    src/dns/fvwalldist.cpp
+    src/dns/fvref.cpp
     src/dns/cutcell.cpp
     src/dns/diagnostics.cpp
     src/dns/facemesh.cpp
     src/dns/fieldpng.cpp
     src/dns/flame1d.cpp
+    src/dns/turb_ic.cpp
     src/dns/flow_ic.cpp
     src/dns/geometry.cpp
     src/dns/operators.cpp
@@ -56,7 +64,11 @@ add_library(dns_core
     src/dns/comp.cpp
     src/dns/curvmesh.cpp
     src/dns/interrupt.cpp
+    src/dns/la/amg.cpp
+    src/dns/la/ell.cpp
     src/dns/la/graph.cpp
+    src/dns/la/lines.cpp
+    src/dns/la/structured.cpp
     src/dns/meshio.cpp
     src/dns/meshsdf.cpp
     src/dns/ogrid.cpp
@@ -149,9 +161,17 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/cutflux.hip
     src/dns/gpu/cutpoisson.hip
     src/dns/gpu/derived.hip
+    src/dns/gpu/flame_turb.hip
     src/dns/gpu/device_util.hip
+    src/dns/gpu/fv_simple.hip
+    src/dns/gpu/fv_coupled.hip
+    src/dns/gpu/fv_ras.hip
     src/dns/gpu/ghostfill.hip
     src/dns/gpu/kernels.hip
+    src/dns/gpu/la/amg.hip
+    src/dns/gpu/la/blockell.hip
+    src/dns/gpu/la/krylov.hip
+    src/dns/gpu/la/smooth.hip
     src/dns/gpu/les.hip
     src/dns/gpu/ogrid_bc.hip
     src/dns/gpu/poisson.hip
@@ -163,11 +183,13 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/runner_comp.hip
     src/dns/gpu/runner_conv.hip
     src/dns/gpu/runner_flame.hip
+    src/dns/gpu/runner_fv.hip
     src/dns/gpu/runner_ogrid.hip
     src/dns/gpu/runner_rb.hip
     src/dns/gpu/runner_incomp.hip
     src/dns/gpu/runner_periodic.hip
     src/dns/gpu/species.hip
+    src/dns/gpu/tfles.hip
     src/dns/gpu/timestepper.hip
     src/dns/gpu/tunnel.hip
 )
@@ -409,9 +431,9 @@ if(BUILD_TESTING)
         rotor focal cli_defaults comp_axis_permute rans rans_channel1d
         steady_stop blockband channel_line pseudo_time flow_rans_config precond
         host_threads flame1d flame_config bunsen diffusion candle chamber_config
-        polymesh facemesh)
+        polymesh facemesh fvref la amg fvcase fvwalldist tfles)
     if(DNS_WITH_FFTW)
-        list(APPEND DNS_TESTS ke_conservation hit_mini)
+        list(APPEND DNS_TESTS ke_conservation hit_mini turb_ic)
     endif()
     foreach(t IN LISTS DNS_TESTS)
         add_executable(test_${t} tests/test_${t}.cpp)
@@ -425,12 +447,24 @@ if(BUILD_TESTING)
     # The Cantera reference of the chemistry oracle (tools/chem/cantera_flame.py).
     target_compile_definitions(test_flame1d PRIVATE
         DNS_CHEM_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/chem")
+    # Charlette's efficiency against tools/chem/tfles_eff.py (docs/chem.md).
+    target_compile_definitions(test_tfles PRIVATE
+        DNS_CHEM_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/chem")
+    # The 3D flame renderer's self-test (tools/chem/turb_render.py, numpy):
+    # optically thin blob total = integral j dV at any orbit angle, the z
+    # seam, byte determinism, the chemiluminescence colour. Host, seconds.
+    find_program(DNS_PYTHON3 python3)
+    if(DNS_PYTHON3)
+        add_test(NAME turb_render_selftest COMMAND ${DNS_PYTHON3}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/chem/turb_render.py --selftest)
+        set_tests_properties(turb_render_selftest PROPERTIES TIMEOUT 120)
+    endif()
     # FaceMesh (docs/mesh.md): the checked-in polyMesh fixtures and their
     # checkMesh logs (tools/mesh/make_test_meshes.sh). facemesh_mb is the
     # 831k-cell snappy mesh, LOCAL only (runs/ is git-ignored): rc 77 when
     # absent.
     set(DNS_MESH_DATA ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/mesh)
-    foreach(t polymesh facemesh)
+    foreach(t polymesh facemesh fvref la amg)
         target_compile_definitions(test_${t} PRIVATE DNS_MESH_DATA="${DNS_MESH_DATA}")
     endforeach()
     target_compile_definitions(test_facemesh PRIVATE
@@ -438,6 +472,25 @@ if(BUILD_TESTING)
     add_test(NAME facemesh_mb COMMAND test_facemesh mb)
     set_tests_properties(facemesh_mb PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     set_tests_properties(polymesh PROPERTIES TIMEOUT 60)
+    # FV oracle (docs/mesh.md): G1-G3, G5-G7 + extras in `fvref`; the G4 MMS
+    # march (3 nested meshes, threaded) on its own so ctest runs them apart.
+    add_test(NAME fvref_mms COMMAND test_fvref mms)
+    set_tests_properties(fvref_mms PROPERTIES TIMEOUT 300)
+    # AMG setup gate (docs/la.md, masterplan_meshsolver P5 "Setup"): the host
+    # hierarchy of a 6M-cell 7-point graph <= 3 s, two setups identical.
+    add_test(NAME amg_setup COMMAND test_amg setup)
+    set_tests_properties(amg_setup PROPERTIES TIMEOUT 120)
+    # Incompressible FV path (docs/fv.md): the OpenFOAM case layer and the
+    # simpleFoam parity references (tools/fv/make_test_data.sh).
+    set(DNS_FV_DATA ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/fv)
+    target_compile_definitions(test_fvcase PRIVATE DNS_FV_DATA="${DNS_FV_DATA}")
+    target_compile_definitions(test_fvwalldist PRIVATE DNS_FV_DATA="${DNS_FV_DATA}")
+    # The layered rotor2 L1 snappy mesh (tools/fv/make_rotor_bl.py, 123k cells,
+    # runs/ is git-ignored: rc 77 when absent): meshWave vs simpleFoam's serial
+    # wallDistance (checkMesh -writeFields, 12 digits).
+    add_test(NAME fvwalldist_rotor COMMAND test_fvwalldist
+        ${CMAKE_SOURCE_DIR}/runs/fv/bl/rotor2_L1_sst_np1 ${CMAKE_SOURCE_DIR}/runs/fv/bl/rotor2_L1_sst_np1/0/wallDistance)
+    set_tests_properties(fvwalldist_rotor PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 
     # Job server: pure parts (sha256, json, spec, admission) and a live run of
     # the real simjobd + simjob binaries (skips without a systemd user session).
@@ -461,7 +514,7 @@ if(BUILD_TESTING)
     add_executable(test_errors tests/test_errors.cpp)
     target_link_libraries(test_errors PRIVATE dns_core)
     target_compile_definitions(test_errors PRIVATE DNS_BIN="$<TARGET_FILE:dns>"
-                               DNS_MESH_DATA="${DNS_MESH_DATA}")
+                               DNS_MESH_DATA="${DNS_MESH_DATA}" DNS_FV_DATA="${DNS_FV_DATA}")
     add_dependencies(test_errors dns)
     add_test(NAME errors COMMAND test_errors)
     set_tests_properties(errors PROPERTIES TIMEOUT 120)
@@ -586,6 +639,48 @@ if(BUILD_TESTING)
         add_test(NAME gpu_les_tgv_comp COMMAND test_gpu_les_tgv_comp)
         set_tests_properties(gpu_les_tgv_comp PROPERTIES SKIP_RETURN_CODE 77
             TIMEOUT 60)
+        # gpu/la (docs/la.md): LA1 kernels vs the host FP64 restatement on
+        # structured and polyhedral graphs, LA2 Krylov residual + determinism,
+        # LA-perf (SpMV, batched lines; meaningful under simjob --bench).
+        add_executable(test_gpu_la tests/test_gpu_la.cpp)
+        target_link_libraries(test_gpu_la PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_la PRIVATE DNS_MESH_DATA="${DNS_MESH_DATA}")
+        add_test(NAME gpu_la1 COMMAND test_gpu_la la1)
+        add_test(NAME gpu_la2 COMMAND test_gpu_la la2)
+        add_test(NAME gpu_la_perf COMMAND test_gpu_la perf)
+        set_tests_properties(gpu_la1 gpu_la2 gpu_la_perf PROPERTIES SKIP_RETURN_CODE 77
+            TIMEOUT 180)
+        # gpu/la AMG (docs/la.md, masterplan_meshsolver P5): refresh vs the host
+        # Galerkin restatement on every shape + determinism; LA3 h-independence
+        # and anisotropy; LA4 AMG-PCG vs the FFT-PCG cut-cell solve; AMG-PCG on
+        # the checked-in polyhedral meshes (OpenFOAM's Laplacian coefficients).
+        add_executable(test_gpu_amg tests/test_gpu_amg.cpp)
+        target_link_libraries(test_gpu_amg PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_amg PRIVATE DNS_MESH_DATA="${DNS_MESH_DATA}")
+        # fp32: the FV path's p solve in float at the FP32 floor (docs/fv.md "Precision").
+        foreach(m refresh la3 la4 meshes fp32)
+            add_test(NAME gpu_amg_${m} COMMAND test_gpu_amg ${m})
+        endforeach()
+        set_tests_properties(gpu_amg_refresh gpu_amg_la3 gpu_amg_la4 gpu_amg_meshes gpu_amg_fp32
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+        # Incompressible FV path vs OpenFOAM simpleFoam on the identical
+        # blockMesh (docs/fv.md, gate IF1): cavity, skewed cavity, channel.
+        add_executable(test_gpu_fv_simple tests/test_gpu_fv_simple.cpp)
+        target_link_libraries(test_gpu_fv_simple PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_fv_simple PRIVATE DNS_FV_DATA="${DNS_FV_DATA}")
+        add_test(NAME gpu_fv_simple COMMAND test_gpu_fv_simple)
+        set_tests_properties(gpu_fv_simple PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+        # gpu/la performance kernels vs the pre-change kernels, kept verbatim in
+        # the test as oracles (masterplan_performance): memcmp, float + double.
+        # A HIP TU (it defines kernels), routed like the library under CUDA.
+        add_executable(test_gpu_la_ref tests/test_gpu_la_ref.hip)
+        if(DNS_WITH_CUDA)
+            set_source_files_properties(tests/test_gpu_la_ref.hip PROPERTIES LANGUAGE CUDA)
+        endif()
+        target_link_libraries(test_gpu_la_ref PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_la_ref PRIVATE DNS_MESH_DATA="${DNS_MESH_DATA}")
+        add_test(NAME gpu_la_ref COMMAND test_gpu_la_ref)
+        set_tests_properties(gpu_la_ref PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
         # The RANS / LES / MRF tier caps at 180 s (the val tier keeps its own).
         set_tests_properties(gpu_tgv gpu_comp_les gpu_les_smag gpu_rotor_wall
             gpu_rotor_table gpu_mrf gpu_channel PROPERTIES TIMEOUT 180)
@@ -668,8 +763,41 @@ if(BUILD_TESTING)
         add_test(NAME gpu_flame1d_grid COMMAND test_gpu_flame1d grid)
         add_test(NAME gpu_flame1d_mach COMMAND test_gpu_flame1d mach)
         add_test(NAME gpu_flame1d_suth COMMAND test_gpu_flame1d suth)
+        # The planar flame at nz 16 against nz 1 (docs/chem.md, 3D; ~20 s).
+        add_test(NAME gpu_flame3d_planar COMMAND test_gpu_flame1d 3d)
         set_tests_properties(gpu_flame1d_grid gpu_flame1d_mach gpu_flame1d_suth
+            gpu_flame3d_planar PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        # dns flame 3D (docs/chem.md, "3D and turbulence"): the z-extruded 2D
+        # flame bitwise per k plane at a fixed dt (extrude); the turbulent
+        # inflow instantiation, zero rows bit for bit, the row lerp bitwise,
+        # rows relaxed onto the inflow row (inflow). Seconds each.
+        add_executable(test_gpu_flame_turb tests/test_gpu_flame_turb.cpp)
+        target_link_libraries(test_gpu_flame_turb PRIVATE dns_gpu)
+        add_test(NAME gpu_flame3d_extrude COMMAND test_gpu_flame_turb extrude)
+        add_test(NAME gpu_flame_turb_inflow COMMAND test_gpu_flame_turb inflow)
+        set_tests_properties(gpu_flame3d_extrude gpu_flame_turb_inflow
+            PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        # dns flame LES species + TFLES (docs/chem.md, "LES species and
+        # TFLES"): --tfles 1 bit for bit, charlette == none on a planar
+        # flame (bits, binary); the sensor's coverage and the max filter
+        # (sensor); the species SGS flux exact / conservative, the open-row
+        # mu_t image (les_species); the Shvab-Zeldovich teeth (teeth); the
+        # laminar TFLES flame speed, 1D and 3D LES (1d, binary, ~3 min).
+        add_executable(test_gpu_tfles tests/test_gpu_tfles.cpp)
+        target_link_libraries(test_gpu_tfles PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_tfles PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_tfles dns)
+        add_test(NAME gpu_tfles_bits COMMAND test_gpu_tfles bits)
+        add_test(NAME gpu_tfles_sensor COMMAND test_gpu_tfles sensor)
+        add_test(NAME gpu_flame_les_species COMMAND test_gpu_tfles species)
+        add_test(NAME gpu_tfles_teeth COMMAND test_gpu_tfles teeth)
+        add_test(NAME gpu_tfles_1d COMMAND test_gpu_tfles lam)
+        set_tests_properties(gpu_tfles_bits gpu_tfles_sensor
+            gpu_flame_les_species gpu_tfles_teeth
             PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        set_tests_properties(gpu_tfles_1d PROPERTIES TIMEOUT 600
+            SKIP_RETURN_CODE 77)
         # dns flame --mode bunsen (docs/chem.md): the cone at U_jet 3 and 5
         # (8 cells, ~20 s each), the anchoring guard (cold coflow exits 8,
         # the fast burnt strip anchors), the per-row inflow bit for bit.
@@ -680,7 +808,12 @@ if(BUILD_TESTING)
         add_dependencies(test_gpu_bunsen dns)
         add_test(NAME gpu_bunsen_cone COMMAND test_gpu_bunsen cone)
         add_test(NAME gpu_bunsen_anchor COMMAND test_gpu_bunsen anchor)
+        # 3D slot Bunsen (docs/chem.md, "3D turbulent slot Bunsen"): the
+        # burner extruded to nz 8 equals the 2D run byte for byte (frames,
+        # span-mean cone), DNS and TFLES + LES sigma. Seconds.
+        add_test(NAME gpu_bunsen3d_extrude COMMAND test_gpu_bunsen extrude3d)
         set_tests_properties(gpu_bunsen_cone gpu_bunsen_anchor
+            gpu_bunsen3d_extrude
             PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
         # dns flame --mode diffusion (docs/chem.md): the two-reactant step on
         # an analytic diffusion layer -- the coupling function to rounding,

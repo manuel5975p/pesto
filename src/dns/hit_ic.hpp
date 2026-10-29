@@ -5,7 +5,17 @@
 #include "dns/field.hpp"
 #include "dns/grid.hpp"
 
+#include <cmath>
+
 namespace dns {
+
+// The model spectrum shape r^4 exp(-2 r^2), r = k/kp (unnormalised): the ONE
+// definition, shared by hitInitialCondition and the flame turbulence box
+// (dns/turb_ic.hpp).
+inline double hitModelSpectrum(double r)
+{
+    return r * r * r * r * std::exp(-2.0 * r * r);
+}
 
 #if DNS_WITH_FFTW
 // Seeds U with zero-mean turbulence of rms velocity uPrime (per component 3D rms).

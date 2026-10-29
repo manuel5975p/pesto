@@ -190,6 +190,19 @@ public:
     // du * inflowJet. 0 = the profile itself. Ignored without a profile.
     void setInflowPulse(double du) { pulse_ = du; }
 
+    // Turbulent inflow (dns flame --turb): per-row fluctuations at j + ny k,
+    // device arrays of ny * nz each, owned by the caller and live for every
+    // apply (gpu/flame_turb.hpp). The x-lo u target gains du, the inflow
+    // shear waves relax v, w toward dv, dw (instead of 0). All null = off.
+    // Zero rows are the off kernel bit for bit (its own instantiation).
+    // Pre: uniform mesh (the IdentityRemap apply), !potCorrect, no hydro.
+    void setTurbulentInflow(const Real* du, const Real* dv, const Real* dw)
+    {
+        tu_ = du;
+        tv_ = dv;
+        tw_ = dw;
+    }
+
     // Wake-source strength Q = F_drag / (rhoInf uInf) for the potential
     // correction; caller smooths (EMA) so the shedding oscillation does not
     // feed back. Ignored unless potCorrect. Pre: Q >= 0, finite.
@@ -204,6 +217,7 @@ private:
     double u_, cInf_;
     double Q_ = 0;
     double pulse_ = 0;
+    const Real *tu_ = nullptr, *tv_ = nullptr, *tw_ = nullptr;
     // The per-row inflow targets on the device (Config::inflowU/Jet/Rho);
     // empty = uniform targets.
     DeviceScalar inU_, inJ_, inR_;

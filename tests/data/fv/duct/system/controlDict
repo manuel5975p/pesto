@@ -1,0 +1,21 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+application simpleFoam;
+startFrom startTime;
+startTime 0;
+stopAt endTime;
+endTime 300;
+deltaT 1;
+writeControl timeStep;
+writeInterval 100;
+purgeWrite 0;
+writeFormat ascii;
+writePrecision 17;
+timeFormat general;
+timePrecision 10;
+runTimeModifiable false;

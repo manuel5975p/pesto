@@ -95,7 +95,7 @@ void hitInitialCondition(const Grid& g, double uPrime, unsigned seed, VectorFiel
     for (int s = 1; s < nShells; ++s)
     {
         const double k = s * k0, r = k / kp;
-        const double target = r * r * r * r * std::exp(-2.0 * r * r);
+        const double target = hitModelSpectrum(r);
         scale[s] = shellE[s] > 0 ? std::sqrt(target / shellE[s]) : 0.0;
     }
 

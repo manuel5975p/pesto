@@ -75,6 +75,7 @@ public:
         double fdt = 0.15, pdt = 0, wdt = 0;
         int planesPerAxis = 3;
         int pngDown = 1;       // box-average coarsening for PNG frames; 1 = full res
+        double frameStart = 0; // no frame (any kind) before this time; 0 = all
         std::string simJson;   // extra "sim" metadata for the web manifest
     };
 

@@ -20,8 +20,12 @@
 //          cfl 0.4 vs 0.2 at M 0.02: |dS_L| < 1e-4 (dt independence).
 //   suth   --visc sutherland --tinf 300 against the oracle built with the
 //          same lambda(T): |S_L - 1| < 1%.
+//   3d     8 cells, M 0.02, ny 16: the planar flame at nz 16 (hz = h) against
+//          nz 1: |S_L,3D - S_L,2D| <= 2e-4 (the stable dt is the max over
+//          axes, so a planar 3D flame takes the 2D steps: measured 2026-10-29
+//          identical, 0.0), the 3D columns present, area = 1 to 1e-3.
 //
-// Usage: test_gpu_flame1d grid|mach|suth. No HIP device -> skip (77).
+// Usage: test_gpu_flame1d grid|mach|suth|3d. No HIP device -> skip (77).
 #include "dns/gpu/device_util.hpp"
 #include "gpu_test_util.hpp"
 #include "validation_util.hpp"
@@ -46,6 +50,7 @@ struct Flame
     bool ok = false;
     double SL = 0, SLa = 0, SLb = 0; // window mean, its two halves
     double edge = 0, hits = 0, tmaxRel = 0, xfDrift = 0, dth = 0;
+    double area = NAN; // last row's A_T/A (3D stats only)
 };
 
 constexpr double kSigma = 5, kTw0 = 10, kTw1 = 20;
@@ -92,6 +97,8 @@ Flame runCase(const std::string& name, const std::string& args)
     f.tmaxRel = tu;
     f.xfDrift = xf.back() - xf.front();
     f.dth = dth.back();
+    if (std::ranges::find(tbl->names, "area") != tbl->names.end())
+        f.area = tbl->col("area").back();
     f.ok = std::isfinite(f.SL);
     std::printf("  %-8s S_L %.6f (%+.3f%%)  halves %.6f / %.6f  xf drift "
                 "%+.4f  dth %.5f  omegaEdge %.2e  yHits %g\n",
@@ -161,8 +168,19 @@ int main(int argc, char** argv)
         const Flame s = runCase("suth", "--visc sutherland --tinf 300");
         common("suth", s, 0.01);
         check(std::abs(s.SL - 1) < 0.01, "sutherland: |S_L - 1| < 1%");
+    } else if (mode == "3d") {
+        const std::string a = "--cells-per-delta 8 --mach 0.02 --ny 16";
+        const Flame p2 = runCase("p2d", a);
+        const Flame p3 = runCase("p3d", a + " --nz 16");
+        common("p2d", p2, 0.02);
+        common("p3d", p3, 0.02);
+        std::printf("  S_L 3D - 2D = %+.3e, area(3D) - 1 = %+.3e\n",
+                    p3.SL - p2.SL, p3.area - 1);
+        check(std::abs(p3.SL - p2.SL) <= 2e-4, "3D planar: |S_L,3D - S_L,2D| <= 2e-4");
+        check(std::isnan(p2.area), "nz 1: the 2D stats schema (no area column)");
+        check(std::abs(p3.area - 1) <= 1e-3, "3D planar: area = A_T/A = 1 to 1e-3");
     } else {
-        std::fprintf(stderr, "usage: test_gpu_flame1d grid|mach|suth\n");
+        std::fprintf(stderr, "usage: test_gpu_flame1d grid|mach|suth|3d\n");
         return 2;
     }
     return dnstest::finish();

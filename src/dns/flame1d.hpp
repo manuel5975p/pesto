@@ -6,7 +6,9 @@
 #include "dns/comp.hpp"
 #include "dns/config.hpp"
 #include "dns/grid.hpp"
+#include "dns/turb_ic.hpp"
 
+#include <array>
 #include <functional>
 #include <vector>
 
@@ -34,7 +36,8 @@ double flameWrinkle(double A, int N, double y, double Ly);
 
 // The `dns flame` IC: the oracle flame (Case::flameEig's table) with its mid
 // temperature at x = flameXf0 + flameWrinkle(y), mass flux m = flameUIn.
-// Pre: c.sub == Flame.
+// --tfles F > 1: the profile at (x - x_f)/F, the thickened flame (bunsenIC
+// likewise on the cone distance). Pre: c.sub == Flame.
 void flameIC(const Case& c, CompState& q, std::vector<double>& rhoY);
 
 // The `dns flame --mode bunsen` IC: the oracle profile on the signed distance
@@ -42,7 +45,8 @@ void flameIC(const Case& c, CompState& q, std::vector<double>& rhoY);
 // profile's weights J, P, C of y: T/Tu = t_f J + tPilot P + tCo C, Y =
 // Y(t_f) J. Uniform p = p0, v = 0, and each row's inflow mass flux
 // carried through: u = u_in(y) t / t_in(y) (x momentum only: the start
-// relaxes acoustically and convectively). Pre: c.flameBunsen.
+// relaxes acoustically and convectively). nz > 1: extruded over z (the slot
+// is z-invariant). Pre: c.flameBunsen.
 void bunsenIC(const Case& c, CompState& q, std::vector<double>& rhoY);
 
 // The `dns flame --mode diffusion` IC: the inflow row (diffusionInflow, the
@@ -57,5 +61,28 @@ void bunsenIC(const Case& c, CompState& q, std::vector<double>& rhoY);
 // oxidizer at rest everywhere. 0 / g 0 = the extruded row bit for bit.
 // Pre: c.flameDiffusion.
 void diffusionIC(const Case& c, CompState& q, std::vector<double> (&rhoY)[2]);
+
+// The frozen turbulence box of `--turb` (dns/turb_ic.hpp): u' = flameTurb,
+// l_t = flameTurbL, the periodic box flameTurbNbx x ny x nz cells of the run's
+// h (L_bx = L_z), seeded by --seed. Pre: c.flameTurb > 0.
+TurbSpec flameTurbSpec(const Case& c);
+
+// The `--turb` IC: the fresh gas carries the box's continuation of the
+// inflow sweep (the box at x_b = x, i.e. cell i reads box column i mod nbx),
+// windowed off ahead of the flame: u' w(x), w = (1 - tanh((x - (x_f0 - 1.5
+// l_t))/(0.25 l_t)))/2. m += rho u' w, E += the kinetic-energy change (p kept).
+// Pre: c.flameTurb > 0, box from turbBox(flameTurbSpec(c)).
+void addTurbulence(const Case& c, const std::array<std::vector<double>, 3>& box,
+                   CompState& q);
+
+// The `--mode bunsen --turb` IC: the box (cell i reads box column i mod nbx,
+// as addTurbulence) weighted by the cell's fresh fraction Y = rhoY/rho -- the
+// jet core and the unburnt cone carry it, the burnt coflow and products do
+// not. m += rho Y u', E += the kinetic-energy change (p kept).
+// Pre: c.flameBunsen, c.flameTurb > 0, box from turbBox(flameTurbSpec(c)),
+// rhoY from bunsenIC.
+void addBunsenTurbulence(const Case& c,
+                         const std::array<std::vector<double>, 3>& box,
+                         const std::vector<double>& rhoY, CompState& q);
 
 } // namespace dns

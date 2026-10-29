@@ -6,10 +6,13 @@
 #include "dns/gpu/comp_conv.hpp"
 #include "dns/gpu/comp_nscbc.hpp"
 #include "dns/gpu/comp_sink.hpp"
+#include "dns/gpu/derived.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/flame_turb.hpp"
 #include "dns/gpu/internal/frame_scratch.hpp"
 #include "dns/gpu/internal/run_loop.hpp"
 #include "dns/gpu/reductions.hpp"
+#include "dns/gpu/tfles.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -36,10 +39,28 @@ std::expected<RunStats, RunError> runFlame(
     assert(!(r.bunsen && r.diffusion) && int(rhoY.size()) == r.sp.nY);
     // The 2D burners share the per-row inflow and the boundary heat release.
     const bool rows = r.bunsen || r.diffusion;
-    auto dev = DeviceComp::make(g, r.tr);
+    assert(r.csLes == 0 || (g.nz > 1 && !r.diffusion));
+    assert(!r.tflesOn || !r.diffusion);
+    // csLes == 0: DeviceComp::make(g, tr), the DNS solver bit for bit.
+    auto dev = DeviceComp::make(g, r.tr, r.csLes, r.sgs);
     auto red = ReduceScratch::make();
     if (!dev || !red) return fail(6, "GPU allocation failed");
-    if (!dev->enableSpecies(r.sp)) return fail(6, "species allocation failed");
+    const GpuGrid gg = GpuGrid::from(g);
+    // Flame LES: mu_t on the open x rows from their neighbours (the SGS
+    // gradient there differences inflow against outflow across the wrap).
+    if (r.csLes > 0) dev->setMutHook(mutCopyOpenXHook(gg));
+    // TFLES: F E, E/F, Omega on the device, read by the species kernels.
+    std::optional<DeviceTfles> tf;
+    SpeciesSetup sp = r.sp;
+    if (r.tflesOn) {
+        auto m = DeviceTfles::make(g, r.tfles);
+        if (!m) return fail(6, "TFLES allocation failed");
+        tf = std::move(*m);
+        sp.tflesFE = tf->fe();
+        sp.tflesEoF = tf->eof();
+        sp.tflesOm = tf->om();
+    }
+    if (!dev->enableSpecies(sp)) return fail(6, "species allocation failed");
     auto ds = DeviceCompState::make(g.size(), 0, false, r.sp.nY);
     if (!ds) return fail(6, "GPU allocation failed");
 
@@ -64,11 +85,20 @@ std::expected<RunStats, RunError> runFlame(
     // Candle: the top is the ambient column's far field; air drawn back in
     // through it relaxes to the ambient density there (rho_a = p_a/(R T0)).
     if (r.gravity > 0) nc.rhoInf = r.pB / (r.tr.Rgas * r.Tu);
-    const GpuGrid gg = GpuGrid::from(g);
     auto nscm = DeviceCompNscbc::make(g, nc);
     if (!nscm) return fail(6, "NSCBC init failed");
     DeviceCompNscbc nsc = std::move(*nscm);
     nsc.setFreestream(r.uIn);
+    // --turb: the frozen box on the device, its rows on the inflow face.
+    const bool turb = !r.turbBox[0].empty();
+    assert(!turb || (!r.diffusion && g.nz > 1));
+    std::optional<DeviceTurbInflow> turbIn;
+    if (turb) {
+        auto m = DeviceTurbInflow::make(r.turbNbx, g.ny, g.nz, g.hx, r.turbBox);
+        if (!m) return fail(6, "turbulence table allocation failed");
+        turbIn = std::move(*m);
+        nsc.setTurbulentInflow(turbIn->du(), turbIn->dv(), turbIn->dw());
+    }
     std::optional<DeviceCompSink> snk;
     if (r.sinkNb > 0) {
         auto m = DeviceCompSink::make(
@@ -117,10 +147,21 @@ std::expected<RunStats, RunError> runFlame(
     const double Tmid = 0.5 * (1 + r.sigma) * r.Tu;
     const double dTflame = (r.sigma - 1) * r.Tu;
 
-    const std::vector<std::string> cols1d = {
+    std::vector<std::string> cols1d = {
         "t",      "dt",     "dtChem",    "SL",    "SLdisp", "xf",
         "dth",    "Tmax",   "mass",      "energy", "omegaEdge", "yHits",
         "uFresh", "pFresh", "TFresh",    "yMin",  "yMax"};
+    // 3D (nz > 1): the flame-surface ratio A_T/A (co-area integral of |grad
+    // c| over the cross-section), I0 = SL/area (Damkoehler's first
+    // hypothesis: 1 at Le = 1), u' over a slab ahead of the brush, the inflow
+    // target, the fresh-mass thickness x_I = integral of rho Y dx / (rho_u
+    // Y_u) (dx_I/dt = u_in - S_c exactly) and the brush's leading edge (the
+    // first plane-mean c >= kLeadC from the inflow). dth is then the
+    // plane-mean brush thickness.
+    const bool d3 = g.nz > 1 && !rows;
+    if (d3)
+        cols1d.insert(cols1d.end(), {"area", "I0", "uPrime", "uInflow",
+                                     "xFresh", "xLead"});
     // Bunsen: the cone (measureCone) -- tip, base, flank tan(alpha) from the
     // half-width and each side, the fit residual, the kinematic check
     // sin(alpha) U_jet / S_L (1 = the ideal cone), the flank consumption
@@ -148,10 +189,21 @@ std::expected<RunStats, RunError> runFlame(
     // u (< 0 = backflow through the top).
     std::vector<std::string> colsC = colsD;
     colsC.insert(colsC.end(), {"uMax", "uOutMin"});
-    const auto& cols = r.candle      ? colsC
-                       : r.diffusion ? colsD
-                       : r.bunsen    ? colsB
-                                     : cols1d;
+    std::vector<std::string> cols = r.candle      ? colsC
+                                    : r.diffusion ? colsD
+                                    : r.bunsen    ? colsB
+                                                  : cols1d;
+    // 3D bunsen (nz > 1): the cone is measured on the SPAN-MEAN (z) fields;
+    // appended ST = burn / (rho_u Y_u A_cone) (the consumption speed over
+    // the span-mean cone's area, A_cone = 2 hypot(xTip - xBase, W/2) L_z),
+    // area = integral |grad c| dV / A_cone (the flame-surface ratio) and I0 =
+    // ST/area (Damkoehler's first hypothesis). SLflank is then per unit
+    // span too.
+    const bool b3 = g.nz > 1 && r.bunsen;
+    if (b3) cols.insert(cols.end(), {"ST", "area", "I0"});
+    // TFLES: the Omega-weighted mean efficiency and the largest F E.
+    const std::size_t nBase = cols.size();
+    if (tf) cols.insert(cols.end(), {"Ebar", "FEmax"});
     // pMean's reference: p0, or the candle's ambient column averaged over
     // the rows (p_a(x) at the cell centres).
     double pRefMean = r.pB;
@@ -186,13 +238,61 @@ std::expected<RunStats, RunError> runFlame(
         JetMeasure jet;
         double fuelOut = 0, TmaxIn = 0, pMean = 0;
         double uMax = 0, uOutMin = HUGE_VAL;
+        double area = NAN, uPrime = NAN, xFresh = NAN, xLead = NAN;
+        double Ebar = NAN, FEmax = NAN; // TFLES
+        double ST = NAN;                // 3D bunsen (area: the cone's)
     };
+    // 3D bunsen: the span (z) means of the downloaded fields, k ascending in
+    // FP64, onto the nx x ny plane measureCone reads.
+    std::vector<float> Tm, Rm, Um, Vm, Wm;
+    auto spanMean = [&](const std::vector<float>& f, std::vector<float>& m) {
+        const std::size_t plane2 = std::size_t(g.nx) * g.ny;
+        m.resize(plane2);
+        for (std::size_t q = 0; q < plane2; ++q) {
+            double s = 0;
+            for (int k = 0; k < g.nz; ++k) s += f[q + plane2 * std::size_t(k)];
+            m[q] = float(s / g.nz);
+        }
+    };
+    DeviceBuffer<double> tflesScratch;
+    std::vector<double> tfs;
+    // A stats row: the mode's base columns, then (TFLES) Ebar, FEmax.
+    std::vector<double> rowBuf, rowBuf3;
+    auto emitRow = [&](std::span<const double> base, double Ebar,
+                       double FEmax) {
+        if (!tf) {
+            out.row("stats", base.first(nBase));
+            return;
+        }
+        rowBuf.assign(base.begin(), base.begin() + std::ptrdiff_t(nBase));
+        rowBuf.push_back(Ebar);
+        rowBuf.push_back(FEmax);
+        out.row("stats", rowBuf);
+    };
+    DeviceBuffer<double> turbScratch;
+    std::vector<double> ts;
+    // The uPrime slab ahead of the brush: x_f - 3 l .. x_f - 1.5 l, l = l_t
+    // (delta_th without --turb).
+    const double lSlab = turb ? r.lt : r.dth;
     auto col = [&](int i, int q) { return ps[std::size_t(i) * kFlameSums + q]; };
     auto measure = [&]() -> std::expected<Meas, RunError> {
         dev->updateChem(*ds);
         if (flameColumnStats(*dev, *ds, colScratch, ps) != hipSuccess)
             return fail(6, "flame column stats download failed");
         Meas m;
+        if (tf) {
+            if (tf->columnStats(tflesScratch, tfs) != hipSuccess)
+                return fail(6, "TFLES column stats download failed");
+            double so = 0, soe = 0, fe = 0;
+            for (int i = 0; i < g.nx; ++i) {
+                const std::size_t b = std::size_t(i) * DeviceTfles::kTflesSums;
+                so += tfs[b];
+                soe += tfs[b + 1];
+                fe = std::max(fe, tfs[b + 2]);
+            }
+            m.Ebar = so > 0 ? soe / so : NAN;
+            m.FEmax = fe;
+        }
         double wmax = 0, wedge = 0, gmax = -1;
         int kmax = -1;
         bool found = false;
@@ -277,6 +377,59 @@ std::expected<RunStats, RunError> runFlame(
             }
             return m;
         }
+        if (b3) {
+            for (auto* v : {&Th, &Rh, &Uh, &Vh, &Wh}) v->resize(g.size());
+            if (dev->T().download(Th.data()) != hipSuccess ||
+                ds->rho.download(Rh.data()) != hipSuccess ||
+                dev->u().download(Uh.data()) != hipSuccess ||
+                dev->v().download(Vh.data()) != hipSuccess ||
+                dev->omega().download(Wh.data()) != hipSuccess)
+                return fail(6, "field download failed");
+            // Pointwise peak (the 3D maximum, not the span mean's).
+            m.Tmax = *std::max_element(Th.begin(), Th.end());
+            spanMean(Th, Tm);
+            spanMean(Rh, Rm);
+            spanMean(Uh, Um);
+            spanMean(Vh, Vm);
+            spanMean(Wh, Wm);
+            // The burning window: half a thermal thickness in 2D; with TFLES
+            // the reaction zone of the F-thickened flame sits up to ~F - 1/2
+            // thicknesses behind the Tmid crossing (measured: at F 3, 2.5
+            // cells/delta_th the 2D window of 1 cell dropped every flank
+            // row of the span-mean cone). F = 1 is the 2D window.
+            const double Fw = r.tflesOn ? r.tfles.F : 1.0;
+            m.cone = measureCone(Tm, g.nx, g.ny, hx, Tmid, r.geom.yc, Wm,
+                                 int(std::ceil(0.5 * (2 * Fw - 1) * r.dth / hx)));
+            m.mFlank = flankMassFlux(m.cone, Rm, Um, Vm, g.nx, hx);
+            for (int k = 0; k < g.nz; ++k)
+                for (int j = 0; j < g.ny; ++j) {
+                    const std::size_t row = std::size_t(j) + std::size_t(g.ny) * k;
+                    const std::size_t c = row * g.nx; // i = 0
+                    m.fuelIn += double(Rh[c]) * Uh[c] * r.rowY[row] * g.hy * g.hz;
+                }
+            const double Lz = g.nz * g.hz;
+            if (m.cone.ok) {
+                double w = 0;
+                for (int i = m.cone.iLo; i <= m.cone.iHi; ++i) w += col(i, 4);
+                const double cosA = 1.0 / std::hypot(1.0, m.cone.tanA);
+                const double len =
+                    2.0 * (m.cone.iHi - m.cone.iLo + 1) * hx / cosA;
+                m.SLflank = w * dV / (len * Lz);
+            }
+            if (std::isfinite(m.cone.xTip) && std::isfinite(m.cone.xBase)) {
+                if (turbColumnStats(*dev, turbScratch, ts) != hipSuccess)
+                    return fail(6, "turbulence column stats download failed");
+                double a = 0;
+                for (int i = 0; i < g.nx; ++i)
+                    a += ts[std::size_t(i) * kTurbSums + 6] * dV;
+                const double aCone =
+                    2.0 * std::hypot(m.cone.xTip - m.cone.xBase,
+                                     0.5 * r.geom.W) * Lz;
+                m.ST = m.burn / aCone; // rho_u Y_u = 1
+                m.area = a / aCone;
+            }
+            return m;
+        }
         if (r.bunsen) {
             for (auto* v : {&Th, &Rh, &Uh, &Vh, &Wh}) v->resize(g.size());
             if (dev->T().download(Th.data()) != hipSuccess ||
@@ -324,6 +477,37 @@ std::expected<RunStats, RunError> runFlame(
         m.pRef = col(iRef, 7) / plane;
         m.TRef = col(iRef, 2) / plane;
         if (!found) m.xf = NAN;
+        if (d3) {
+            if (turbColumnStats(*dev, turbScratch, ts) != hipSuccess)
+                return fail(6, "turbulence column stats download failed");
+            auto tc = [&](int i, int q) {
+                return ts[std::size_t(i) * kTurbSums + q];
+            };
+            double a = 0, var = 0;
+            int nSlab = 0;
+            for (int i = 0; i < g.nx; ++i) {
+                a += tc(i, 6) * hx;
+                const double x = (i + 0.5) * hx;
+                if (!(x >= m.xf - 3 * lSlab && x <= m.xf - 1.5 * lSlab))
+                    continue;
+                for (int q = 0; q < 3; ++q) {
+                    const double mu = tc(i, q) / plane;
+                    var += tc(i, 3 + q) / plane - mu * mu;
+                }
+                ++nSlab;
+            }
+            m.area = a / plane;
+            // max(0, .): a laminar plane's E[u^2] - E[u]^2 rounds to -ulp.
+            m.uPrime =
+                nSlab > 0 ? std::sqrt(std::max(0.0, var) / (3.0 * nSlab)) : NAN;
+            double xi = 0;
+            for (int i = 0; i < g.nx; ++i) {
+                xi += col(i, 3) / plane * hx; // rho_u Y_u = 1
+                const double c = (col(i, 2) / plane - r.Tu) / dTflame;
+                if (std::isnan(m.xLead) && c >= kLeadC) m.xLead = (i + 0.5) * hx;
+            }
+            m.xFresh = xi;
+        }
         return m;
     };
 
@@ -359,6 +543,30 @@ std::expected<RunStats, RunError> runFlame(
                 {"fuel", fs.channel(1), 0, 1.0f, false},
                 {"oxid", fs.channel(2), 0, 1.0f, false},
                 {"omega", fs.channel(3), 0, omegaScale, false}};
+            fs.emit(out, t, ff);
+            return;
+        }
+        if (d3 || b3) {
+            // + |curl u| and |u| (cell-centred, central): the turbulence.
+            if (!fs.ensure(g.size(), 5, false)) return;
+            dev->updateChem(*ds);
+            curlMagCentred(gg, dev->u(), dev->v(), dev->w(), fs.vort());
+            speedCentred(gg, dev->u(), dev->v(), dev->w(), fs.speed());
+            fs.take(0, dev->T(), r.Tu);
+            fs.take(1, dev->speciesY(0));
+            fs.take(2, dev->omega());
+            fs.take(3, fs.vort());
+            fs.take(4, fs.speed());
+            const double us = std::max(1.0, r.uPrime);
+            const FrameField ff[5]{
+                {"temp", fs.channel(0), 0, tempScale, false},
+                {"fuel", fs.channel(1), 0, 1.0f, false},
+                {"omega", fs.channel(2), 0, omegaScale, false},
+                {"vort", fs.channel(3), 0, float(3 * us / lSlab), false},
+                {"speed", fs.channel(4), 0,
+                 r.bunsen ? float(r.sigma * r.geom.uJet + 3 * r.uPrime)
+                          : float(r.sigma * r.uIn + 3 * r.uPrime),
+                 false}};
             fs.emit(out, t, ff);
             return;
         }
@@ -402,13 +610,25 @@ std::expected<RunStats, RunError> runFlame(
     double lastHits = 0, lastMin = 0, lastMax = 1;
     const auto wall0 = std::chrono::steady_clock::now();
     bool bindChem = false;
+    // --turb: the swept distance (FP64 host) and the current inflow target
+    // (held over a step; --hold-flame moves it at stats rows).
+    double sweep = 0, uNow = r.uIn, sEma = r.uIn, tCtl = 0, xI0 = NAN;
 
     while (t < r.tEnd) {
         if (stopRequested()) break;
+        // TFLES: F E, E/F, Omega of this step's input state, held over its
+        // three stages (and read by the dt bound below).
+        if (tf) {
+            dev->primitives(*ds);
+            tf->update(*ds, dev->u(), dev->v(), dev->w(), dev->T());
+        }
         if (auto e = internal::recomputeDt(
                 sinceDt, dtStab, r.dtRecompute, r.dtMargin, 1e-9,
                 [&] {
-                    const double a = dev->stableDt(*ds, *red, r.cfl);
+                    double a = dev->stableDt(*ds, *red, r.cfl);
+                    if (tf)
+                        a = std::min(a, tflesStableDt(*dev, *ds,
+                                                      tf->feField(), *red));
                     dtChem = chemStableDt(*dev, *ds, *red);
                     bindChem = dtChem < a;
                     return std::min(a, dtChem);
@@ -418,8 +638,15 @@ std::expected<RunStats, RunError> runFlame(
         const double dt = std::min(r.tEnd - t, dtStab);
         // The pulse is held over the step (the stages see its start value).
         if (rows && r.geom.pulse > 0) nsc.setInflowPulse(jetNow(t));
+        // The box column the inflow sees now, held over the step (as the
+        // pulse); the face then advects it in at u_in.
+        if (turbIn) turbIn->sample(sweep);
+        // The box sweeps past the face at the inflow speed: u_in, or the
+        // bunsen jet's (pulse included, held over the step as the pulse).
+        const double uSweep = r.bunsen ? r.geom.uJet + jetNow(t) : uNow;
         dev->step(*ds, Real(dt));
         t += dt;
+        sweep += uSweep * dt;
         ++st.steps;
 
         const bool statsDue = cad.due(st.steps, t, r.tEnd);
@@ -452,7 +679,7 @@ std::expected<RunStats, RunError> runFlame(
                                       jm.zMax,    jm.yfMin,   jm.yoMin,
                                       jm.hits,    1.0 + jetNow(t),
                                       m->uMax,    m->uOutMin};
-                out.row("stats", std::span(row, cols.size()));
+                emitRow(row, m->Ebar, m->FEmax);
                 if (cad.printDue(st.steps, t, r.tEnd)) {
                     std::printf(
                         "t=%.3f/%.3f tip=%.4g base=%.4g half=%.4g "
@@ -489,19 +716,32 @@ std::expected<RunStats, RunError> runFlame(
                                       m->Tmax, m->mass,   m->energy,
                                       m->yHits, m->yMin,  m->yMax,
                                       uj};
-                out.row("stats", row);
+                if (b3) {
+                    rowBuf3.assign(std::begin(row), std::end(row));
+                    rowBuf3.insert(rowBuf3.end(),
+                                   {m->ST, m->area, m->ST / m->area});
+                    emitRow(rowBuf3, m->Ebar, m->FEmax);
+                } else {
+                    emitRow(row, m->Ebar, m->FEmax);
+                }
                 if (cad.printDue(st.steps, t, r.tEnd)) {
                     std::printf(
                         "t=%.3f/%.3f tip=%.3f base=%.3f alpha=%.3f deg "
                         "sin(a)U/SL=%.5f SLflank=%.5f mFlank=%.5f "
                         "burn/in=%.4f Tmax/Tb=%.5f yHits=%g Y=[%.3g,1%+.2e] "
-                        "dt=%.2e%s\n",
+                        "dt=%.2e%s",
                         t, r.tEnd, c.xTip, c.xBase,
                         std::atan(c.tanA) * 180 / std::numbers::pi,
                         sinA * r.geom.uJet, m->SLflank, m->mFlank,
                         m->burn / m->fuelIn,
                         m->Tmax / (r.sigma * r.Tu), m->yHits, m->yMin,
                         m->yMax - 1, dt, bindChem ? " (chem dt)" : "");
+                    if (b3)
+                        std::printf(" ST=%.4f area=%.4f I0=%.4f", m->ST,
+                                    m->area, m->ST / m->area);
+                    if (b3 && tf)
+                        std::printf(" Ebar=%.4f FEmax=%.4f", m->Ebar, m->FEmax);
+                    std::printf("\n");
                     std::fflush(stdout);
                     cad.printed(st.steps);
                 }
@@ -518,20 +758,47 @@ std::expected<RunStats, RunError> runFlame(
                                       m->omegaEdge, m->yHits,
                                       m->uRef,      m->pRef,
                                       m->TRef,      m->yMin,
-                                      m->yMax};
-                out.row("stats", row);
+                                      m->yMax,      m->area,
+                                      m->SL / m->area, m->uPrime,
+                                      uNow,         m->xFresh,
+                                      m->xLead};
+                emitRow(row, m->Ebar, m->FEmax);
                 xfPrev = m->xf;
                 tPrev = t;
                 if (cad.printDue(st.steps, t, r.tEnd)) {
                     std::printf("t=%.3f/%.3f SL=%.6f xf=%.4f dth=%.4f "
-                                "Tmax/Tb=%.5f omegaEdge=%.2e yHits=%g dt=%.2e%s\n",
+                                "Tmax/Tb=%.5f omegaEdge=%.2e yHits=%g dt=%.2e%s",
                                 t, r.tEnd, m->SL, m->xf, m->dth,
                                 m->Tmax / (r.sigma * r.Tu), m->omegaEdge,
                                 m->yHits, dt, bindChem ? " (chem dt)" : "");
+                    if (d3)
+                        std::printf(" area=%.4f I0=%.4f u'=%.4f u_in=%.4f "
+                                    "xI=%.4f lead=%.4f",
+                                    m->area, m->SL / m->area, m->uPrime, uNow,
+                                    m->xFresh, m->xLead);
+                    if (tf)
+                        std::printf(" Ebar=%.4f FEmax=%.4f", m->Ebar, m->FEmax);
+                    std::printf("\n");
                     std::fflush(stdout);
                     cad.printed(st.steps);
                 }
                 cad.logged(st.steps);
+                // --hold-flame: u_in tracks the consumption speed (EMA over
+                // kHoldEmaTau) and pulls the fresh-mass thickness back to its
+                // first-row value over kHoldTau, rate-limited; held over the
+                // steps until the next row.
+                if (r.hold && std::isnan(xI0)) xI0 = m->xFresh;
+                if (r.hold && t > tCtl && std::isfinite(m->xFresh) &&
+                    std::isfinite(m->SL)) {
+                    const double dtc = t - tCtl;
+                    tCtl = t;
+                    sEma += (m->SL - sEma) * std::min(1.0, dtc / kHoldEmaTau);
+                    const double want = sEma - (m->xFresh - xI0) / kHoldTau;
+                    const double lim = kHoldMaxRate * dtc;
+                    uNow = std::clamp(std::clamp(want, uNow - lim, uNow + lim),
+                                      kHoldUMin, kHoldUMax);
+                    nsc.setFreestream(uNow);
+                }
             }
             if (profDue) {
                 emitProfiles(t);
@@ -570,7 +837,10 @@ std::expected<RunStats, RunError> runFlame(
                     why = std::format("the base x={:.4g} lifted past half the "
                                       "tip height {:.4g} (blow-off)",
                                       c.xBase, c.xTip);
-                else if (!c.ok)
+                else if (!c.ok && !b3)
+                    // 3D: a turbulent brush's span mean need not keep a
+                    // straight flank; the fit's columns read NaN, the
+                    // physical guards above stay.
                     why = std::format("fewer than 4 burning flank rows between "
                                       "base {:.4g} and tip {:.4g} (the cone "
                                       "opened: blow-off)",
@@ -580,7 +850,15 @@ std::expected<RunStats, RunError> runFlame(
                                                "{} (adjust --jet-speed, "
                                                "--coflow-temp)",
                                                t, why));
-            } else if (m->xf < guard || m->xf > g.nx * hx - guard)
+            } else if (d3 && !(m->xLead >= nb * hx + r.dth))
+                return fail(8, std::format(
+                                   "flash-back at t={:.4g}: the brush's leading "
+                                   "edge (plane-mean c >= {:g}) at x={:.4g} "
+                                   "reached one delta_th of the inflow band "
+                                   "(x_f={:.4g}; raise --inflow-speed or "
+                                   "--upstream)",
+                                   t, kLeadC, m->xLead, m->xf));
+            else if (m->xf < guard || m->xf > g.nx * hx - guard)
                 return fail(8, std::format(
                                    "flame not stabilized: drifted to the "
                                    "{} band at t={:.4g} (x_f={:.4g}; adjust "

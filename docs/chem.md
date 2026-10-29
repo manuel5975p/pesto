@@ -1,9 +1,9 @@
-# Chemistry: `dns flame` (P0 oracle + P1 premixed flame + 2D slot Bunsen + 2D jet diffusion flame + 2D candle)
+# Chemistry: `dns flame` (P0 oracle + P1 premixed flame + 2D slot Bunsen + 2D jet diffusion flame + 2D candle + 3D premixed in turbulence + LES species and TFLES)
 
 Spec of the single-step premixed flame, of the two-reactant diffusion
 flame (`--mode diffusion`) and of the candle (`--mode candle`, the diffusion
 flame under gravity). Plan and measurements:
-`plans/chem_plan.md`, `plans/impl_chem.md`. Open items: `issues.md` §30–53.
+`plans/chem_plan.md`, `plans/impl_chem.md`. Open items: `issues.md` §30–53, T1–T7, L1–L6.
 
 ## Model C0
 
@@ -602,6 +602,428 @@ rendered `--first 100 --height 232 --width 128 --smooth 3`
 regenerate). New `fire_video.py` options: `--height`, `--width`,
 `--pad-bottom`, `--smooth` (ffmpeg bicubic upscale).
 
+## 3D and turbulence (`--nz`, `--turb`; premixed only)
+
+`--mode premixed` at `--nz N` (1, or ≥ 8; hz = h, z periodic) is the same
+solver: every kernel already loops over three axes. Files: `dns/turb_ic`
+(generator), `flame1d` (`flameTurbSpec`, `addTurbulence`),
+`gpu/flame_turb` (the swept box), `kNscbcCells<…, Turb>`, `kTurbColumns`
+(`gpu/chem`), the `d3` / `turb` branches of `runner_flame`.
+
+**Bit identity.** nz == 1 and no `--turb` run the shipped instantiations:
+base (pre-change tree, including the uncommitted FV work) vs branch md5 of
+every output but the `.json` (whose msPerStep is a timing): premixed 1D
+(stats + profiles), premixed 2D wrinkled with `--emit bin` (frames), bunsen,
+diffusion, candle, chamber, `flow --physics compressible --far nscbc`,
+`conv`, `channel` 3D, `channel --rans sa-neg --steady`, `hit` — 11/11
+identical (2026-10-29). A 2D wrinkled flame extruded to nz 4 equals the 2D
+field in every k plane bitwise after 200 fixed-dt steps, w ≡ 0
+(`gpu_flame3d_extrude`). A planar 3D flame takes the 2D dt (stableDt is the
+MAX over axes) and reproduces the 2D run exactly: 8 cells, M 0.02, ny 16,
+nz 16 vs 1, tt 20: 30715 steps both, S_L 1.0131918 both, ΔS_L = 0
+(`gpu_flame3d_planar`, gate 2e-4).
+
+**Generator** (`dns/turb_ic.hpp`). The box is built from its Fourier modes:
+mode m draws a complex Gaussian vector from SplitMix64(seed, m) + Box–Muller,
+the canonical member of ±m is drawn and the other is its conjugate, then the
+solenoidal projection. Shells (width k0 = min 2π/L_d) are rescaled to the
+deterministic per-mode weights E(k) dk³/(4πk²) of E = `hitModelSpectrum`(k/kp)
+(the `dns hit` shape, one definition), kp = √(2π)/l_t (L11 = l_t for the
+continuous spectrum), summed over the REFERENCE set |k| ≤ 8 kp, my = mz = 0
+excluded (every x-plane mean is then 0: no inflow mass-flux pumping); one
+global factor sets u'. Serial FP64 sums, lexicographic order; FFTW c2r per
+component with the cell-centre phase. A run grid holds the reference modes
+with |m_d| < n_d/2: a coarser grid is the spectral truncation of a finer one.
+Measured (`turb_ic`, 64³, L = 6 l_t): |k·û|/(|k||û|) ≤ 2.2e-15, û(−m) =
+conj û(m) exactly, shell energies = targets to 3e-15, u' to 2e-14, plane
+means ≤ 2.0e-15, FFT = direct mode sum to 7e-15; 32³ amplitudes bitwise the
+64³ ones and its field the fine field at its centres to 5.9e-14 (16³: 1.2e-3,
+truncated); lattice L11/l_t = 0.979 / 0.995 / 0.999 at L/l_t = 6 / 12 / 24.
+The lattice value is the EXPECTATION over draws; one realization at L = 6
+l_t holds few energetic modes (kp L/2π = 2.4) and scatters. The runs' box
+(seed 1, 90³, h = δ_th/6; P1 verifier, numpy correlation of the dumped
+`turbBox`): longitudinal L11 = 1.04 (u, x) / 0.81 (v, y) / 0.84 (w, z) l_t,
+mean 0.90 l_t; component rms 1.06 / 0.98 / 0.96 u'. Seed 2: mean 0.78 l_t
+(w, z 0.46). The l_t of the tables below is the spectrum's parameter, not
+the realized integral scale.
+
+**Inflow (Taylor).** The frozen box (`turbNbx` = nz cells of the run's h,
+L_bx = L_z) is swept through the inflow face at the CURRENT u_in: the face
+samples the box at x_b = −X(t), X = Σ u_in dt (FP64 host), linear in x between
+two box columns (`turbLerp`, an explicit `fmaf`, host twin bitwise), held over
+the step (as the pulse). `kNscbcCells<…, Turb>`: the u target gains du, the
+inflow shear waves L3/L4 relax v, w toward dv, dw instead of 0. The IC's fresh
+gas carries box(x_b = x) — the sweep's own continuation — windowed off ½(1 −
+tanh((x − (x_f0 − 1.5 l_t))/(0.25 l_t))) ahead of the flame (m += ρu', E +=
+the kinetic change, p kept). Inflow-row tracking of a held smooth solenoidal
+row set (`gpu_flame_turb_inflow` (c), one wavelength per box): v, w residual
+4.7% / 1.4% of the amplitude at 16 / 32 cells per wavelength (∝ k² — the
+transverse fluxes the LODI row keeps against etaIn c/L_x); u (acoustic L5,
+half that rate) 6.0% / 4.4%. A run's peak wavelength is ≥ 50 cells.
+
+**`--hold-flame`.** At every stats row u_in ← S_ema − (x_I − x_I0)/τ_h with
+x_I = ∫ρY dx/(ρ_u Y_u) the FRESH-MASS THICKNESS (stats `xFresh`; exactly
+dx_I/dt = u_in − S_c, inflow minus consumption, whatever the brush's shape),
+x_I0 its first-row value, S_ema the consumption speed's EMA (`kHoldEmaTau`
+1), τ_h = `kHoldTau` 2, rate-limited to `kHoldMaxRate` 1 S_L/τ, clamped to
+[0.5, 10] (`setFreestream`; the box sweep uses it). The consumption speed
+∫ω/(ρ_u Y_u A) does not depend on the frame; the controller only keeps the
+brush in the box. Measured (2026-10-29, u'_in 4, 6 cells): the first
+controller held the plane-mean T crossing x_f — the brush skewed, x_f moved
+DOWNSTREAM (16.9 → 19.1) while S_c rose 2.2 → 3, the controller cut u_in to
+1.16 and the leading edge flashed back into the inflow band (S_c 8, I0 2.2,
+omegaEdge 0.3). Hence x_I, and the 3D guard: exit 8 when the brush's leading
+edge (`xLead`, the first plane-mean c ≥ 0.05 from the inflow) comes within
+one δ_th of the inflow band.
+
+**Stats at nz > 1** (appended; dth is then the plane-mean brush thickness):
+`area` = ∫|∇c| dV/(L_y L_z) (co-area: the flame-surface ratio A_T/A; central
+|∇Y|, 0 on the open rows; a planar flame reads 1), `I0` = SL/area
+(Damköhler's first hypothesis: 1 at Le = 1), `uPrime` = √(mean component
+variance) over x ∈ [x_f − 3 l_t, x_f − 1.5 l_t] (l = δ_th without
+`--turb`), `uInflow`, `xFresh` (x_I above), `xLead`. Frames add `vort` (|∇×u|) and `speed` (|u|).
+The `I0` COLUMN divides the raw SL (box units) by area; the tables below
+first divide SL by the grid's laminar S_L (1.025 at 6 cells), so a column
+mean reads ~2.5% above the tabled I0 (R1: 1.030 vs 1.006). `Tmax` is, as in
+2D, the maximum of the PLANE-MEAN T over x — not the pointwise peak, which
+in 3D is higher; the Tmax/Tb gate below is on the plane mean.
+`--frame-start T` (every mode) delays every frame kind to T.
+
+**Labels.** `DNS [premixed …, M_flame=…; 3D nz=N, synthetic HIT inflow
+u'/S_L=…, l_t=… delta_th (frozen hash-seeded box, Taylor-swept, seed …;
+Re_t=…, h/eta=… at the inflow); flame held by inflow control]`; h/η > 2 at
+the inflow → `UNDER-RESOLVED DNS (h/eta=…)` and a warning. `--dry-run`
+prints Re_t, η, h/η, τ_t, Ka = (u'/S_L)^1.5 (l_t/δ_th)^−0.5, Da =
+(l_t/δ_th)/(u'/S_L) and the report-only Peters 1999 / Damköhler S_T/S_L.
+
+**Measured** (gfx1100, simjob, 2026-10-29; `tools/chem/turb_stats.py`).
+Cost: 5.90 ms/step at 176 × 120 × 120 (8 cells/δ_th, 2.53 M cells), 3.1 /
+3.8 ms/step at 176 / 224 × 90 × 90 (6 cells). dt 6.3e-4 (8 cells, M 0.02),
+8.4e-4 (6 cells, M 0.02), 4.3e-4 (M 0.01). The P1 plan's 8 cells/δ_th, 10 + 8
+δ_th box did not hold the brush (below), so the runs that count are at 6
+cells/δ_th (h/η ≤ 1.15 at the inflow; laminar S_L of that grid, 1D, tt 20,
+window [10, 20]: 1.025126 at M 0.02, 1.026526 at M 0.01 — the normalization),
+ny = nz = 90 (L_y = L_z = 15 δ_th = 6 l_t), l_t = 2.5 δ_th, downstream 16
+δ_th, `--hold-flame --inflow-speed 1.2`, window t ∈ [10, 20], S_T = SL /
+S_L(grid):
+
+| run | u'_in, M | upstream | u'_flame | S_T/S_L | A_T/A | I0 | halves | Tmax/Tb | Peters | Damköhler |
+|---|---|---|---|---|---|---|---|---|---|---|
+| R1 | 2, 0.02 | 8 δ_th, tt 25 | 0.917 | 1.478 | 1.469 | 1.006 | 1.306 / 1.644 | 1.0019 | 2.083 | 1.917 |
+| U2 | 4, 0.02 | 16 δ_th, tt 20 | 0.879 | 1.703 | 1.692 | 1.006 | 1.421 / 1.976 | 1.0041 | 2.051 | 1.879 |
+| U3 | 8, 0.01 | 16 δ_th, tt 20 | 2.492 | 3.049 | 2.923 | 1.043 | 3.307 / 2.792 | 1.0114 | 3.116 | 3.492 |
+
+(Peters / Damköhler at the MEASURED u'_flame, l = l_t, l_F = δ_D; report-only.)
+x_I held to −0.17/+0.09 (R1), −0.34/+0.11 (U2), −1.39/+0.83 δ_D (U3) of its
+first value; the plane-mean x_f wandered −6.2/+5.6 δ_D in U3. R1 over its own
+second half [12.5, 25]: S_T/S_L 1.790, I0 1.037, halves 1.512 / 2.060.
+
+What holds: **Damköhler's first hypothesis, I0 = (S_T/S_L)/(A_T/A) = 1.006 /
+1.006 / 1.043** (gate [0.8, 1.2]; per row 0.98–1.24 in U3), every run from the
+first rows on — the consumption speed is the flame surface times S_L at Le =
+1. S_T rises with u'_in (1.48, 1.70, 3.05) and sits at 0.71 / 0.83 / 0.98 of
+Peters at the measured u'. What does NOT hold (issues.md T4): the runs are
+NOT stationary — S_T still grows across the window at u'_flame ~0.9 (halves
++26% / +39%: a developing brush plus Darrieus–Landau at σ = 5 in a 15 δ_th box)
+and falls in U3 (−16%); the window-halves gate (7%) fails in all three. S_T is
+not strictly increasing with the MEASURED u'_flame: R1 and U2 reach u' 0.92 /
+0.88 (the longer upstream of U2 decays its stronger inflow turbulence to the
+same level) with S_T 1.48 / 1.70 — non-stationary noise at equal u', not a
+trend. U3 burns unburnt pockets in the outflow band (omegaEdge up to 0.386)
+and reaches Tmax/Tb 1.0114 (gate 1.01).
+
+Failed configurations (kept for the record): (a) the plan's T2, 8 cells,
+upstream 10 / downstream 8, tt 15, the first controller (x_f): window [7.5, 15]
+S_T 1.92 (unnormalized), I0 1.027, u' 1.73, halves 1.58 / 2.26, brush 15–17 δ_D
+past t 13.7 burning in a band (omegaEdge 0.51); (b) 6 cells, upstream 8, the
+first controller: u'_in 4 and 8 flashed back into the inflow band (S_c 8, I0
+2.2, omegaEdge 0.3–0.43); (c) the x_I controller, upstream 8: u'_in 4 and 8
+exit 8 on the leading-edge guard at t 11.9 / 4.8 (leading edge 11–13 δ_D
+ahead of x_f: the brush grows ~1–2.5 δ_D/τ) — hence upstream 16.
+
+Regenerate: `dns flame --nz 90 --ny 90 --cells-per-delta 6 --upstream 16
+--downstream 16 --hold-flame --inflow-speed 1.2 --tt 20 --turb 4 --mach 0.02`
+(U2, 95 s), `--turb 8 --mach 0.01` (U3, 180 s); R1 `--upstream 8 --tt 25
+--turb 2 --mach 0.02` (92 s); then `tools/chem/turb_stats.py PREFIX --t0 10
+--t1 20 --sl S_L(grid) --mach M`.
+
+## LES species and the thickened flame (`--les`, `--sgs`, `--tfles`)
+
+Files: `dns/tfles.hpp` (constants, Charlette, Colin, sensor norm,
+`TflesSetup`), `gpu/tfles.{hpp,hip}` (`DeviceTfles`, `mutCopyOpenXHook`),
+the `Eddy` / `Thick` instantiations of `kSpeciesStage` and `kChemCellPass<true>`
+(`gpu/species.hip`), `tflesStableDt` (`gpu/chem`), the runner and validator
+branches; `tools/chem/tfles_eff.py` (the independent transcription).
+
+**Equations** (F_max = `--tfles`, Ω ∈ [0, 1] the sensor, F = 1 + (F_max −
+1) Ω and E per cell, μ_t the LES `nut` slot, Sc_t = Pr_t = 0.9 ONE constant):
+
+    species  rho D_eff = F E mu/Pr + (1 - Omega) mu_t/Sc_t
+    energy   kappa_eff = F E kappa + (1 - Omega) mu_t cp/Pr_t
+    rate     (E/F) omega   -- the fuel sink and q omega, one buffer
+    momentum unchanged (mu + mu_t; mu is not thickened)
+
+The energy line is `faceFlux`'s κ + μ_t c_p/Pr_t plus an ADDITIVE face flux
+−(FE_f − 1) κ_f ∂T/∂n + Ω_f μ̄_t (c_p/Pr_t) ∂T/∂n in the species launch
+(κ_f with faceFlux's own Sutherland ratio, face values arithmetic means):
+conservative, `faceFlux` untouched. LES without TFLES (`Eddy`): ρD + μ̄_t/Sc_t
+on every interior face. Open x domain faces: no diffusion (as before).
+
+**Sensor** (`--tfles-sensor dynamic`, the default): Ω_raw = tanh(50 ω_s/
+ω_s,max), ω_s = `arrheniusRate` at Ta/2 (`kTflesTaFraction`, Legier et al.
+2000), normalised on the low-Mach Shvab–Zeldovich manifold
+(`tflesSensorLogMax`, FP64 bisection = a 2e6-point scan to 1e-12), then
+spread TOWARD COLDER GAS by a T-gated max filter of radius ceil(2.5 F_max
+δ_th/h) cells (`kTflesDilate`): Ω(c) = max of Ω_raw over the box cells n with
+T_n ≥ T_c, three separable passes (x clamped at the open faces, y and z
+periodic; the gate composes transitively). Why gated, measured on the
+thickened oracle (host scan, F 2–4 at 1.875–3 cells): a SYMMETRIC filter that
+covers c = 0.01 leaves Ω 0.03–0.6 at 2 F δ_th past c = 0.99; any symmetric
+radius that keeps the burnt side clean leaves Ω < 0.05 at c 0.01–0.03. The
+gated one at 2.5: Ω = 1.000000 on c ∈ [0.01, 0.99], ≤ 3.6e-5 beyond 2 F δ_th
+on both sides (`gpu_tfles_sensor`; Ω ≥ 0.99 from c = 0.006 / 0.008 at F 4 /
+F 2). `--tfles-sensor uniform`: Ω ≡ 1 (the laminar tests).
+
+**Efficiency** (`--efficiency charlette`, the default with `--les`; needs
+`--les`): Charlette, Meneveau & Veynante 2002, static β = 0.5, the saturated
+form min[Δ/δ_L − 1, Γ u'_Δ/S_L] (Wang, Boileau & Veynante 2011), Δ = F δ_L,
+δ_L = δ_th, Re_Δ = u'_Δ Δ/ν_u, C_k = 1.5; u'_Δ by Colin's operator 2 h³
+|∇²(∇×u)| (Δ/h)^(1/3) (central, wrap-aware; the curl removes dilatation, so a
+planar laminar flame has u' = 0 and E = 1 exactly). E = 1 on the 3 outermost
+x rows (`kTflesEdgeRows`: the curl would wrap). The C++ (double) equals the
+Python transcription on its 50-point table to 0.0 (same libm); the FP32
+kernel instantiation within 8e-8 of FP64 (`tfles`).
+
+**Frozen per step.** Ω, F, E, FE, E/F are formed from each step's INPUT
+state (one primitives launch + 7 kernels) and held over the three stages. The
+diffusive dt adds `tflesStableDt` = 0.25 h² ρ_min/(γ/Pr (μ(T_max) max FE +
+max μ_t)); `stableDt` and `chemStableDt` stay byte-identical (E/F ≤ 1).
+
+**Flame LES** (`--les CS --sgs smag|sigma`, nz ≥ 8, premixed): an explicit
+`--sgs` is REQUIRED (σ is exactly 0 on a laminar flame's 1D dilatation,
+Smagorinsky's |S| is not); μ_t on i = 0, nx − 1 is copied from i = 1, nx − 2
+(`mutCopyOpenXHook`: the SGS gradient there differences inflow against
+outflow across the wrap, §17 — measured on a u-jump box: Smagorinsky raw
+0.082 vs interior max 0.017; σ 0.008, rank-1). `--tfles` without `--les`
+(any nz, also `--mode bunsen` in 2D) is labelled `thickened flame TFLES [...,
+no SGS model]`; the IC is the oracle profile at (x − x_f)/F_max. Stats with
+`--tfles` append `Ebar` (Ω-weighted mean E) and `FEmax`; SL is then the
+consumption speed of (E/F) ω = resolved area × E × S_L.
+
+**Label** (always): `LES [sigma-model Csigma=1.35; species SGS flux mu_t/Sc_t,
+Sc_t=Pr_t=0.9; mu_t on the open x rows copied from the neighbour row] + TFLES
+[F=3, dynamic sensor (rate at Ta/2, tanh 50, spread 2.5 F delta_th toward
+colder gas), Charlette 2002 efficiency beta=0.5 (delta_L=delta_th), u'_Delta
+by Colin's operator] [premixed single-step, ..., M_flame=...]`.
+
+**Bit identity** (gfx1100, 2026-10-29; base = the pre-P2 tree incl. the
+uncommitted FV work, `build/turb_base_P2/dns`): flags absent, every output
+but the `.json` byte-identical in 13 cases (premixed 1D stats + profiles,
+2D wrinkled frames, 3D `--turb` volumes, bunsen / diffusion / chamber
+frames, candle, `flow` compressible NSCBC, `flow` 3D LES σ, conv, channel 3D,
+channel RANS, hit). `--tfles 1` (uniform AND dynamic: F = 1 + 0 Ω = 1) is the
+DNS byte for byte, 1D and 3D `--turb 4` (FP32 frames/volumes + every stats
+column; `gpu_tfles_bits`); a planar laminar 3D LES + TFLES 4 flame with
+`--efficiency charlette` equals `none` byte for byte (curl u ≡ 0 → E ≡ 1).
+Uniform ρY = ρ/2 stays bitwise under Eddy and Thick (60 steps, stirred
+hot/cold box); mass / ρY / E drift equals the DNS's own FP32 drift (200
+steps: 8.3e-7 / 8.4e-7 / 2.4e-6 vs 7.8e-7 / 7.7e-7 / 2.4e-6;
+`gpu_flame_les_species`).
+
+**Laminar TFLES** (M 0.01, `--inflow-speed 0.98`, `gpu_tfles_1d`): F 4 at
+1.875 cells (7.5 thickened), box 30 + 20 δ_th, tt 80, window [40, 80] against
+the DNS at 7.5 cells in the F-scaled box (7.5 + 5 δ_th, tt 20, window
+[10, 20]; the same 126 cells):
+
+| run | S_L | vs |
+|---|---|---|
+| L1a TFLES F 4, uniform | 1.016824 | L1c − 8.2e-4 (gate 2e-3) |
+| L1b TFLES F 4, dynamic | 1.016945 | L1a + 1.2e-4 relative (gate 1%) |
+| L1c DNS 7.5 cells | 1.017642 | (default box: 1.016856) |
+| L2 3D nz 16, LES σ 1.35 + Charlette | 1.016945 | L1b + 0.0 (bitwise S_L; gate 2e-4) |
+| L2' 3D, LES Smagorinsky 0.17 | 1.016992 | L1b + 4.7e-5 (+0.005%) |
+
+The Smagorinsky shift is small because Ω = 1 across the flame switches its
+SGS scalar flux off; its stress stays. Laminar S_L of the LES grids (1D,
+M 0.02, tt 40, window [20, 40]): 4 cells 1.030619; F 1.5 at 4 cells
+1.024656; F 2 at 3 cells 1.024326; F 3 at 2 cells 1.024106.
+
+**Shvab–Zeldovich teeth** (`gpu_tfles_teeth`, non-reacting stirred hot/cold
+box, 32 × 16 × 16, h 4 δ_D, two ABC modes, M 0.005, 300 steps, Smagorinsky
+Cs 2 so mean μ_t/μ = 14): max |T/Tu + (σ−1)Y − σ| = 1.58e-2 for the
+molecular DNS (the MUSCL-species / central-energy scheme floor), 1.14e-2
+with the eddy fluxes at Sc_t = Pr_t, 0.197 at the TEST-ONLY Sc_t = 0.45
+(×17.3); LES + TFLES F 2: 2.05e-2 / 4.89e-2 (the SGS flux is off where Ω =
+1). The plan's absolute 1e-2 is NOT met (the floor alone exceeds it): the
+test gates relative to the floor.
+
+**LES vs DNS** (the U2 case of "3D and turbulence": u'_in 4, l_t 2.5 δ_th,
+seed 1, hold, M 0.02, tt 20, window [10, 20]; the coarse boxes carry the
+same Fourier modes (spectral truncation); sink bands scaled to the DNS's
+physical width, 16 × h_DNS; S_T = SL / the grid's laminar S_L):
+
+| run | cells | S_T/S_L | / DNS | halves | A_T/A | E·A_T/A_T,DNS | brush / DNS | u'_flame | Ebar | FEmax | ms/step |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| DNS 6 cells | 224 × 90² | 1.703 | 1 | 1.42 / 1.98 | 1.692 | 1 | 10.09 δ_D | 0.879 | — | — | 3.81 |
+| DNS 4 cells | 160 × 60² | 1.835 | 1.078 | 1.52 / 2.14 | 1.797 | 1.062 | 1.021 | 0.898 | — | — | 1.12 |
+| LES σ, no TFLES, 4 cells | 160 × 60² | 1.851 | 1.087 | 1.54 / 2.15 | 1.810 | 1.069 | 1.017 | 0.896 | — | — | 1.28 |
+| LES σ + TFLES 1.5, Charlette, 4 cells | 160 × 60² | 1.186 | 0.696 | 1.13 / 1.24 | 1.190 | 0.703 | 0.707 | 0.815 | 1.00001 | 1.60 | 1.69 |
+| LES2-C: TFLES 2, Charlette, 3 cells | 128 × 45² | 1.088 | 0.639 | 1.07 / 1.11 | 1.092 | 0.646 | 0.602 | 0.801 | 1.0004 | 2.81 | 0.86 |
+| LES2-N: as LES2-C, E = 1 | | 1.089 | 0.639 | 1.07 / 1.11 | 1.092 | 0.645 | 0.602 | 0.801 | 1 | 2.00 | 0.82 |
+| LES4-C: TFLES 3, Charlette, 2 cells | 96 × 30² | 1.042 | 0.612 | 1.03 / 1.05 | 1.039 | 0.629 | 0.551 | 0.779 | 1.024 | 5.20 | 0.47 |
+| LES4-N: as LES4-C, E = 1 | | 1.042 | 0.612 | 1.03 / 1.05 | 1.040 | 0.614 | 0.552 | 0.779 | 1 | 3.00 | 0.47 |
+
+(The tables' "LES2"/"LES4" are the plan's names; the DNS is P1's 6-cell
+grid, so the LES grids are 1/2 and 1/3 of it with F 2 and 3, 6 thickened
+cells each.) **The plan's LES-vs-DNS gates FAIL** (issues.md L1): S_T 0.64 /
+0.61 of the DNS (gates within 15% / 25%), modelled area 0.65 / 0.63 (20% /
+30%), brush 0.60 / 0.55 (30% / 40%); the efficiency closes nothing (C − N:
+−0.0002 / +0.0003 in S_T/S_L). What the numbers say: resolution alone is not
+the loss (4 cells DNS / LES-σ within 9% of the 6-cell DNS); THICKENING is
+(F 1.5 already −30%), and the Charlette efficiency is ~1 here because Re_Δ =
+u'_Δ Δ/ν ~ 2–5 sits on its viscous cutoff (f_Re) — while the DNS's S_T
+grows through the window (halves 1.42 → 1.98), consistent with
+Darrieus–Landau wrinkling (σ = 5, unstable band ∝ 1/(F δ)) that a
+wrinkling-factor model does not represent (unproven: a u'_in 0.25 control
+shows no DL growth in 20 τ_F, A_T/A 1.003; F 1.5 with the UNIFORM sensor
+reads 1.184 vs 1.186 dynamic, so the sensor is not the loss; issues.md
+L1). Internally the LES is
+consistent: I0 = S_T/(A_T/A) = 0.996 / 1.002, resolved A_T ≤ A_T,DNS.
+
+Regenerate: `runs/flames/turb/p2/les.sh` and `les2.sh` (2.1 + 1.3 min GPU),
+then `tools/chem/turb_stats.py PREFIX --t0 10 --t1 20 --sl S_L(grid) --mach
+0.02`.
+
+## 3D turbulent slot Bunsen (`--mode bunsen --nz N`)
+
+`--mode bunsen` at `--nz N` (1, or ≥ 8; hz = h, z periodic): one span
+period of an infinite slot. Nothing new in a kernel: the per-row inflow
+arrays are filled at j + ny k (the slot repeated over z), `bunsenIC` is
+extruded over z, `--les`/`--sgs`/`--tfles` take the premixed 3D machinery
+(`Eddy`/`Thick` species instantiations with `Row`, the open-row μ_t copy).
+Files: `config` (`bunsenGeometry` nz, the shared `flameTurbSetup`),
+`flame1d` (`addBunsenTurbulence`), `dns_main` (rows, the J-weighted box),
+`runner_flame` (the `b3` branch), `tools/chem/turb_render.py`.
+
+**Turbulent jet** (`--turb U --turb-length L --seed S`): the same
+hash-seeded frozen box as the planar flame (`dns/turb_ic`, L_bx = L_z,
+L_y and L_z ≥ 6 l_t, l_t ≥ 4 cells), multiplied row by row by the jet weight
+J(y) on the device (the coflow stays laminar) and swept through the inflow at
+U_jet (+ the pulse) — `kNscbcCells<…, Prof, Turb>`, compiled since P1. The
+IC lays the box times the cell's fresh fraction Y (jet core and the unburnt
+cone). The box times J is no longer plane-mean free (its z-mean per y row
+is not zero): a small acoustic pumping, not measured. The IC cone and the
+`--length` bound use Damköhler's S_T = S_L (1 + u'/S_L) — an UPPER estimate
+(a slower-burning cone is taller), so it is a floor, warned at validation;
+U_jet ≤ 1.25 S_T is rejected (no cone). M (U_jet + 3 u') ≤ 0.3.
+
+**Measurement** (3D only; the 2D path is the shipped code): T, ρ, u, v, ω
+downloaded and averaged over z (k ascending, FP64) onto the nx × ny plane
+`measureCone` and `flankMassFlux` read; `Tmax` is the pointwise 3D peak,
+`fuelIn` sums the 3D inflow face, `SLflank` is per unit span. The burning
+window of the flank crossings is ½(2F − 1) δ_th (F = `--tfles`, 1 without):
+the thickened reaction zone sits up to ~F − ½ thicknesses behind the Tmid
+crossing — at F 3 and 2.5 cells/δ_th the 2D window (one cell) rejected every
+flank row of the span-mean cone (measured, run killed at t = 16 by the
+"cone opened" guard while burn/in read 0.977 and the base sat on the inflow
+row). In 3D that guard (fewer than 4 burning flank rows) no longer stops the
+run: a turbulent brush's span mean need not keep a straight flank; the fit
+columns read NaN; flash-back, blow-through and base lift-off still exit 8.
+Appended stats: `ST` = burn / A_cone (A_cone = 2 hypot(xTip − xBase, W/2) L_z,
+the span-mean cone's flank area; ρ_u Y_u = 1), `area` = ∫|∇c| dV / A_cone
+(co-area: the flame-surface ratio), `I0` = ST/area. Frames add `vort`, `speed`.
+
+**Bit identity** (gfx1100, simjob 612, 2026-10-29; base = the pre-P3 tree
+incl. the uncommitted FV work, `build/turb_base_P3/dns`): every output but
+the `.json` byte-identical in 10 flame cases — premixed 1D (stats +
+profiles), premixed 2D wrinkled frames, 3D `--turb` volumes, 3D LES σ + TFLES
+3 `--turb` volumes, bunsen (frames), bunsen `--tfles 2` (frames), bunsen
+`--pulse` (frames), diffusion (frames), candle, chamber (frames); 53 files
+(612), 60 after the last runner edit (617, every one identical). Verifier
+(simjob 618): the PRE-P1 base (`build/turb_base_P1/dns`) vs branch for
+premixed 1D, bunsen, diffusion, `flow --physics compressible --far nscbc`,
+`conv`, `hit`: 21/21 files identical — species off / nz 1 / LES off is the
+pre-turbulence solver across P1–P3. The final run's first three stats rows
+are reproduced byte for byte by the current binary (simjob 619). A flame
+LES run's `.json` now carries `cs` and `les` (it read `cs 0, les 0` with
+`sgs "sigma"` in run 615; DNS jsons unchanged).
+`gpu_bunsen3d_extrude`: the burner (W 6, U 3, 4 cells, M 0.02, tt 2)
+extruded to nz 8 equals the 2D run BYTE FOR BYTE — temp/fuel/omega mid-span
+frames and the span-mean cone columns (t, dt, xTip, xBase, tanA/L/R, rms,
+sinRatio, mFlank exactly; SLflank per unit span to 1e-6) — for the DNS and
+for TFLES 2 where the 3D run adds LES σ 1.35 (σ ≡ 0 on a 2D field) with
+`--efficiency none`. The 3D dt is the 2D dt (stableDt is the max over axes).
+
+**The run** (gfx1100, simjob 615, 2026-10-29; LABELLED LES everywhere):
+
+    dns flame --mode bunsen --jet-speed 8 --slot-width 24 --coflow-width 16
+      --mach 0.01 --les 1.35 --sgs sigma --efficiency charlette --turb 3
+      --turb-length 6 --cells-per-delta 2.5 --tfles 3 --nz 120 --length 100
+      --slot-edge 0.5 --tt 36 --frame-start 18 --fdt 0.04
+      --emit stats --emit volume --emit slices --out runs/flames/turb3d/final/b3
+
+282 × 140 × 120 = 4.74 M cells (h = δ_th/2.5, 7.5 cells across the F 3
+flame), burnt coflow at 1 S_L, span 2 W, Re_jet = U W/ν = 427, inflow Re_t =
+40, h/η = 1.06 (the velocity field is near-DNS-resolved; the LES content is
+the 3× thickened flame and a small σ SGS). 37361 steps, 16.34 ms/step (3.4
+ns/cell-step with stats every 200 steps and 451 volume frames of 5 channels,
+41 GB), 611 s wall. The plan's U_jet 20 was not run: the P2 measurement (TFLES
+keeps S_T near laminar) put its cone past any affordable box; at U 8 even
+the laminar cone (95 δ_th) fits. A first attempt exited 8 at t = 16.1 on the
+"cone opened" guard with burn/in 0.977 and the base on the inflow row (the
+1-cell burning window, above): fixed, rerun. Scout (U 10, 5.16 M cells):
+16.6 ms/step.
+
+Window t ∈ [18, 36] (94 stats rows, span means; halves [18, 27] / [27, 36]):
+
+| quantity | mean (sd) | halves |
+|---|---|---|
+| xTip | 91.7 δ_D = 57.3 δ_th (7.0 δ_D) | 90.6 / 92.8 δ_D (+2.3%) |
+| xBase | 0.32 δ_D (the first cell row: anchored) | – |
+| burn / fuelIn | 0.991 (0.029; 0.916–1.052) | 0.989 / 0.993 |
+| ST / S_L | 1.586 (0.123) | 1.602 / 1.571 |
+| area A_T/A_cone | 1.424 (0.096) | 1.436 / 1.414 |
+| I0 = ST/area | 1.113 (0.022) | 1.116 / 1.110 |
+| SLflank | 1.229 | 1.233 / 1.226 |
+| Ebar (Ω-weighted E) | 1.013 | 1.011 / 1.016 |
+
+Kinematic consistency (NOT an independent check: ST is defined on the same
+cone, ST = burn / (2 hypot(H, W/2) L_z) with burn ≈ fuelIn, so inverting it
+returns H up to burn/in and the jet profile): a cone of S_T 1.586 at U 8 is
+(W/2) √((U/S_T)² − 1) = 59.3 δ_th tall; measured 57.3. Likewise A_cone cancels
+in I0 = burn / ∫|∇c| dV; the laminar extruded burner of
+`gpu_bunsen3d_extrude` already reads I0 1.06 (DNS) / 1.13 (TFLES 2), so I0 >
+1 is not a turbulence effect (issues.md B4). Damköhler (1 + u'_in) 4, Peters 1999 4.23 at the
+INFLOW u' (u' at the flame not measured; the box decays in transit, ~14 τ_F
+to the tip): no literature band is claimed. FEmax = 3 √3 every row: E
+saturates at F^β = √3 somewhere (Charlette's Δ/δ_L − 1 branch); Ebar 1.013 —
+the efficiency closes little (as in P2). yHits ≤ 13 per row, Y ∈ [0, 1 +
+1.43e-6]. **Tmax** (pointwise 3D peak) / T_b: ≤ 1.043 up to t = 27, then
+grows to 1.131 (t 35.7): ALL of the excess sits in the inflow band (rows i ≤
+12, at the jet edges y ≈ yc ± W/2, where the base burns in the LODI rows and
+the re-added boundary heat; 15393 cells > 1.03 T_b in the last frame), the
+interior (i ∈ [16, 266)) peaks at 1.025 T_b (issues.md B2). With chemistry
+binding the dt from t ≈ 29 (dtChem 7e-4–1.5e-3).
+
+**Video** (`tools/chem/turb_render.py`, numpy + ffmpeg, simjob --cpu 616,
+8 workers, 109 s): `runs/flames/turb3d/turb_flame.mp4` (1920 × 1080, 30 fps,
+451 frames = 15.0 s for 18 τ_F, 3.1 MB) and the last frame
+`turb_flame_poster.png`. Left: the rendered light — chemiluminescence j = ω
+(the resolved, (E/F)-scaled heat release; optically thin), coloured by the
+CH* 431.4 / C2* 516.5, 473.7 nm lines + a weak CO2* continuum through the
+CIE 1931 functions (Wyman 2013 fit; CH* is out of the sRGB gamut, mapped in by
+adding white), plus a faint steel-blue fog ∝ |∇×u| Y_F (cold-jet vorticity,
+NOT light, small artificial absorption); orthographic orbit 15° → 40° about
+the jet axis; each ray covers the z period with a Hann window of half-length
+L_z cos θ (a partition of unity: every point of the periodic field counted
+once at any angle, no seam); the sink bands are cropped. Middle: |∇×u|
+(sqrt-mapped), right: |u|, both on the mid-span xy plane. Fixed exposure,
+FFT bloom, ACES. `turb_render_selftest` (host ctest): a blob's image total
+equals ∫ j dV to 1.0000 / 0.99996 / 0.9968 at θ 0 / 25 / 40°, the z seam to
+2.6e-4, bytes deterministic. Raw frames (41 GB) are deleted after the
+render; regenerate: the command above (simjob --gpu, ~10 min), then
+`runs/flames/turb3d/render.sh` (simjob --cpu, ~2 min).
+
 ## Tests
 
 | test | kind | content |
@@ -623,6 +1045,21 @@ regenerate). New `fire_video.py` options: `--height`, `--width`,
 | `gpu_candle_rest` / `_g0` / `_height` | GPU binary | quiescent box at rest (\|u\| < 5e−3); g = 0 == `--mode diffusion` byte for byte; H(W 1)/H(W 0.75) exponent in [1.15, 1.45], both closed and steady |
 | `chamber_config` | host | polygon SDF, regions (closed cavity, probes), IC, isentropic inverse, dry-run, every rejection by name |
 | `gpu_chamber` | GPU binary | inert wall impermeability; reacting balances, nozzle vs isentropic, anchoring |
+| `turb_ic` | host | the turbulence box: solenoidal, Hermitian, shell energies, u', plane means, FFT vs direct sum, coarse = spectral truncation (n/2, n/4), seed determinism, lattice L11, Peters/Damköhler, turbNumbers |
+| `flame_config` (3D) | host | `--nz` 1 / ≥ 8, hz = h, 3D dry-run and label, the T2 case, UNDER-RESOLVED label, every `--turb`/`--turb-length`/`--hold-flame`/`--seed`/`--frame-start` rejection by name |
+| `flame_config` (3D bunsen) | host | `--mode bunsen --nz 16`, the P3 case (282 × 140 × 120, Damköhler IC cone, label: LES + TFLES + jet turbulence + Mach, dry-run Re_jet, the warning), rejections: `--nz 6`, chamber `--nz`, U_jet ≤ 1.25 S_T, L_z < 6 l_t, `--length` below the turbulent cone, M (U + 3u') > 0.3, `--les` without `--sgs` |
+| `gpu_bunsen3d_extrude` | GPU binary | the burner at nz 8 equals 2D byte for byte (frames, span-mean cone), DNS and TFLES 2 + LES σ |
+| `turb_render_selftest` | host (python) | the renderer: blob total vs ∫ j dV at θ 0/25/40°, z seam, determinism, colour |
+| `gpu_flame3d_extrude` | GPU API | 2D wrinkled flame vs its nz 4 extrusion: every k plane bitwise, w ≡ 0 |
+| `gpu_flame_turb_inflow` | GPU API | Turb with zero rows = off (uniform and Prof targets) bitwise; device rows = host `fmaf` lerp bitwise; rows relaxed onto the inflow row (n 16, 32) |
+| `gpu_flame3d_planar` | GPU binary | nz 16 vs nz 1 planar flame: ΔS_L ≤ 2e-4, area = 1 |
+| `tfles` | host | Charlette limits (E(u'=0) = E(F=1) = E(Re→0) = 1, monotone in u' and Δ, ≤ F^β), C++ vs `tools/chem/tfles_eff.py` 1e-12, FP32 vs FP64, Colin scaling, the sensor norm vs a dense scan |
+| `flame_config` (LES/TFLES) | host | the LES + TFLES case, defaults (charlette with --les, dilation radius), labels (LES / Smagorinsky / thickened flame), dry-run lines, warning below 6 thickened cells, every rejection by name (--les without --sgs / at nz 1 / with bunsen, --sgs without --les, --tfles range, sensor/efficiency without --tfles, charlette without --les, F cells < 4, diffusion/candle/chamber) |
+| `gpu_tfles_bits` | GPU binary | `--tfles 1` (uniform, dynamic) == no `--tfles` bytewise, 1D and 3D `--turb`; planar 3D charlette == none bytewise |
+| `gpu_tfles_sensor` | GPU API | Ω coverage on the thickened oracle (F 4 / 1.875, F 2 / 3); the T-gated filter == host passes bitwise, == brute-force box max at uniform T |
+| `gpu_flame_les_species` | GPU API | uniform Y exact under Eddy / Thick; conservation vs the DNS's drift; the open-row μ_t image (σ and Smagorinsky) |
+| `gpu_tfles_teeth` | GPU API | Shvab–Zeldovich defect at Sc_t = Pr_t ≤ the DNS floor, ×10 at Sc_t 0.45; TFLES + LES within 2× the floor |
+| `gpu_tfles_1d` | GPU binary | laminar TFLES S_L (L1a/b/c), 3D LES σ bitwise S_L, Smagorinsky shift (~75 s) |
 
 ## Chamber (`--mode chamber`)
 
@@ -743,7 +1180,15 @@ With it, Tmax rises above Tb in the holder's base recirculation: 1.046 Tb
 ## Not built
 
 Le ≠ 1 (`--lewis` unregistered until an oracle exists), curvilinear,
-compensated, RANS/LES species (asserted), nz > 1 (`--nz` must be 1), an
+compensated, RANS species (asserted), LES at nz == 1, LES/TFLES species for
+the two-reactant and walled kernels (diffusion, candle, chamber), a separate
+Sc_t, thickened viscosity, SGS/thickening inside the NSCBC rows (the LODI
+transverse flux ignores μ_t), Colin's efficiency (needs a global Re_t), a
+dynamic Charlette β, nz > 1 for diffusion/candle/chamber, a cold-coflow
+or piloted 3D Bunsen (only the burnt coflow is run), `--hold-flame` for the
+Bunsen, a GPU span-mean kernel (the 3D Bunsen averages on the host),
+forced turbulence (the inflow box decays in transit), an inertial-range
+spectrum, an
 immersed burner lip or wick (the chamber's walled species kernel is
 premixed-only), open y faces for bunsen, the jet and the candle, an open
 (pressure) inflow bottom, gravity in the premixed modes, unequal W, a

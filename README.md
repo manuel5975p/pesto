@@ -61,12 +61,12 @@ DNS 13.6 ms/step (1234 Mcell/s), Smagorinsky 15.6, σ 16.0, 1.46 GiB.
 
 | sub | purpose | spec |
 |---|---|---|
-| `flow` | a body (or scene) in a uniform free stream: forces, wake, frames | below, `docs/scene.md` |
+| `flow` | a body (or scene) in a uniform free stream: forces, wake, frames; or an OpenFOAM simpleFoam case (`--polymesh CASE [--fv-precision fp32\|fp64]`) | below, `docs/scene.md`, `docs/fv.md` |
 | `tgv` | Taylor–Green vortex: 2D analytic check or 3D Re 1600 benchmark | `dns tgv --help` |
 | `hit` | forced homogeneous isotropic turbulence, SI-configured, h = 1.5 η | `dns hit --help` |
 | `channel` | wall-resolved compressible channel; `--les`, `--rans` | `docs/channel.md`, `docs/rans.md` |
 | `conv` | Rayleigh–Bénard convection, compressible or Boussinesq | below |
-| `flame` | single-step flames: premixed against its FP64 oracle (1D, or a 2D slot Bunsen cone, `--mode bunsen`); a 2D slot-jet diffusion flame, F + s O → P, against the Burke–Schumann sheet (`--mode diffusion`); the same flame under gravity from a wick, a 2D candle (`--mode candle`); a closed 2D combustion chamber with a nozzle jet (`--mode chamber`) | `docs/chem.md` |
+| `flame` | single-step flames: premixed against its FP64 oracle (1D; 3D at `--nz >= 8`, in synthetic inflow turbulence with `--turb`, as LES with `--les --sgs` and a thickened flame `--tfles`; or a slot Bunsen cone, `--mode bunsen`, 2D or 3D with the same turbulence/LES/TFLES flags); a 2D slot-jet diffusion flame, F + s O → P, against the Burke–Schumann sheet (`--mode diffusion`); the same flame under gravity from a wick, a 2D candle (`--mode candle`); a closed 2D combustion chamber with a nozzle jet (`--mode chamber`) | `docs/chem.md` |
 | `bench` | step time, Mcell/s and the VRAM this process allocates | `dns bench --help` |
 | `prop` | propeller thrust curve by BEMT or lifting line, host-only | below |
 | `mesh` | read an OpenFOAM polyMesh into a FaceMesh, report counts and checkMesh-equivalent quality, host-only | `docs/mesh.md` |
@@ -114,9 +114,36 @@ build/dns conv --rayleigh 5e4 --n 96 --ny 48 --nz 1
 # 1D premixed flame, 15 cells per thermal thickness, M 0.01 (~11 s)
 build/dns flame --inflow-speed 0.98 --tt 20 --emit stats
 
+# 3D premixed flame in synthetic inflow turbulence (u'/S_L 4, l_t 2.5 delta_th,
+# frozen hash-seeded box swept in at u_in), the fresh mass held by the inflow
+# controller; 224 x 90 x 90 at 6 cells per delta_th, ~95 s (docs/chem.md, 3D;
+# NOT statistically stationary at tt 20, issues.md T4); window statistics:
+# tools/chem/turb_stats.py PREFIX --t0 10 --t1 20 --sl 1.025126 --mach 0.02
+build/dns flame --nz 90 --ny 90 --cells-per-delta 6 --upstream 16 \
+  --downstream 16 --turb 4 --hold-flame --inflow-speed 1.2 --mach 0.02 --tt 20
+
+# The same flame as LES + thickened flame (TFLES F 3 at 2 cells per delta_th,
+# 96 x 30 x 30, ~4 s; sigma-model SGS, species SGS flux Sc_t = Pr_t, dynamic
+# sensor, Charlette efficiency). Labelled LES everywhere. It reads S_T/S_L
+# 1.04 against the DNS's 1.70: thickening suppresses the resolved wrinkling
+# and Charlette's efficiency is ~1 at these Re_Delta (docs/chem.md, issues.md
+# L1). --tfles alone (any nz, also --mode bunsen) thickens a laminar flame.
+build/dns flame --nz 30 --ny 30 --cells-per-delta 2 --tfles 3 --les 1.35 \
+  --sgs sigma --nscbc-sink 5 --upstream 16 --downstream 16 --turb 4 \
+  --hold-flame --inflow-speed 1.2 --mach 0.02 --tt 20
+
 # 2D slot Bunsen cone on a burnt coflow, U_jet 5 S_L, M 0.02 (~20 s); video:
 # tools/chem/fire_video.py PREFIX --out cone.mp4 (needs --emit bin)
 build/dns flame --mode bunsen --mach 0.02 --tt 30 --emit stats
+
+# 3D turbulent slot Bunsen, LES sigma + TFLES F 3 + Charlette, synthetic jet
+# turbulence u'/S_L 3 (4.74 M cells, ~10 min GPU, 41 GB of volume frames);
+# measured span-mean S_T/S_L 1.59, tip 57 delta_th (docs/chem.md). Video:
+# tools/chem/turb_render.py PREFIX --out turb_flame.mp4 (runs/flames/turb3d/render.sh)
+build/dns flame --mode bunsen --jet-speed 8 --slot-width 24 --coflow-width 16 \
+  --mach 0.01 --les 1.35 --sgs sigma --turb 3 --turb-length 6 \
+  --cells-per-delta 2.5 --tfles 3 --nz 120 --length 100 --slot-edge 0.5 \
+  --tt 36 --frame-start 18 --fdt 0.04 --emit stats --emit volume --emit slices
 
 # 2D slot-jet diffusion flame (fuel slot, oxidizer coflow), steady by tt ~60
 # (~15 s for tt 80); same video tool
@@ -143,10 +170,16 @@ numbers: `docs/scenarios.md`. TOML run configs: `examples/configs/`.
 ```
 cli/config (parse + validate, pure)  [+ dns/scene, dns/remap, dns/sgs, dns/rans]
   → bodies/geometry (sdf + cut sampling)  [+ dns/curvmesh, dns/framemap, dns/walldist,
-                                           dns/polymesh, dns/facemesh, dns/la/graph]
+                                           dns/polymesh, dns/facemesh, dns/la/graph,
+                                           dns/fvflux.hpp, dns/fvgrad, dns/fvref (FP64 FV oracle),
+                                           dns/la/{ell,lines,structured,amg},
+                                           dns/foamdict, dns/fvcase, dns/fvsimple (OpenFOAM case layer)]
     → gpu/{tunnel,bodyforce,les,rans,cutpoisson,cutflux,derived,comp_channel,comp_conv,boussinesq}
-      → gpu/runner_{incomp,comp,channel,conv,rb,ogrid}   (the time loops)
-        → output (RunOutput, the one artefact sink)
+      [+ gpu/la/{blockell,smooth,krylov,amg}: the sparse solver library (P3, P5)]
+      [+ gpu/fv_simple: incompressible FV SIMPLE on gpu/la (P5b)]
+      → gpu/runner_{incomp,comp,channel,conv,rb,ogrid,fv}   (the time / iteration loops)
+        → output (RunOutput, the one artefact sink; the FV path writes
+          OpenFOAM time directories through dns/foamio)
 ```
 
 `apps/dns_main.cpp` is **Parse → Validate → Acquire → Run**: phases 1–2 touch
@@ -173,6 +206,47 @@ confined box, FFT/DCT-preconditioned CG on the fluid subspace with cut cells.
 The pressure BC follows `--far`. `--steady TOL` marches until
 `max|du/dt|·D/U² < TOL` (only below the shedding onset); `--seq` converges on a
 grid ladder, changing only the initial guess.
+
+**Incompressible FV on an OpenFOAM mesh (`dns flow --polymesh CASE`,
+`docs/fv.md`).** OpenFOAM v2606 simpleFoam (SIMPLE / SIMPLEC, laminar, MRF)
+on the IDENTICAL polyMesh on the GPU (FP32 by default, `--fv-precision fp64`
+the parity mode; below), the linear solves on `gpu/la`
+(U: BiCGStab + multicolour GS; p: AMG-PCG) with OpenFOAM's normalised-residual
+stop. The case is the OpenFOAM case directory (0/, system/, constant/);
+anything the solver does not reproduce exactly is rejected by name. Fields
+match simpleFoam to 1e-13 iteration by iteration on blockMesh cases with
+tight solves; the snappy sphere Re 100 cd to 9e-13; the DTMB 4119 prop + MRF
+thrust / torque to 5e-6 / 2e-9 (G1, 989k cells) in 37.7 s vs 296.7 s for
+simpleFoam np 12. MRF is OpenFOAM's `MRFZoneList` (several zones, Coriolis,
+`makeRelative` incl. the double frame flux on a zone/zone face, rotating
+walls, `nonRotatingPatches`, forces moment about `CofR`; label `[MRF frozen
+rotor]`): the laminar rotor2 L1/L2 (115k / 145k cells) CT and CQ equal
+simpleFoam + MRF to 1e-11 after 1500 iterations, settling in the same
+iteration count; wall 13.2 / 15.8 s vs 32 / 44 s for simpleFoam np 6
+(2.4–2.8×; these small meshes are launch-bound). `limited corrected
+psi` laplacian / snGrad (the snappy-mesh default) is reproduced. RAS
+(`simulationType RAS`): OpenFOAM's kOmegaSST and SpalartAllmaras with
+omegaWallFunction (all blenders), nutLowRe / nutUSpalding / nutk wall
+functions, kqR, bounded upwind / linearUpwind / limitedLinear scalar
+transport, `bound()`, and the wall distance as OpenFOAM computes it (meshWave
+in its serial FaceCellWave order, or exactDistance — the knob is in the
+label): blockMesh cases equal simpleFoam to ≤ 1.6e-10 iteration by
+iteration; the TMR-like flat plate cf within 2.6e-4; rotor2 L1 re-meshed with
+snappy prism layers + kOmegaSST + MRF: CT 2.3e-8, CQ 1.3e-9 of serial
+simpleFoam, 12.1 s vs 39 s (np 6, `--bench`). Final prop table vs simpleFoam
+np 12 (cold, both `--bench`; docs/fv.md "Final prop parity"): rotor2 L1 / L2
+laminar MRF 13.2 / 15.8 s vs 41 / 55 s, rotor2 L1 SST + MRF 12.1 s vs 42 s,
+DTMB F1 laminar MRF (708k) 40.6 s vs 345 s, CT and CQ equal to ≤ 2.7e-9
+(laminar) / 2e-6 (SST: foam's np 12 decomposition; 2.3e-8 of serial foam).
+Those parity numbers are the FP64 parity mode (`--fv-precision fp64`, bit for
+bit the performance-round solver). The DEFAULT is `--fv-precision fp32`
+(docs/fv.md "Precision"): fields, matrices, Krylov and AMG in float, every
+reduction in FP64, each solve stopped at max(fvSolution tolerance, a measured
+FP32 floor: U / p 1e-6, turbulence 1e-7; logged `floor-limited`): rotor2 L1 /
+L2 / L1 SST / F1 2.63 / 2.30 / 3.79 / 8.18 ms/it (FP64 3.98 / 4.99 / 7.19 /
+21.88), 4.2 / 3.8 / 3.4 / 11.3 s whole run (8.1× / 12.8× / 12.9× / 29.4×
+simpleFoam np 6 per iteration), CT within 1.7e-6 of FP64 laminar and 1.25e-5
+SST (inside its 3e-5 end jitter), CQ ≤ 8.8e-7, same settle iteration.
 
 **Compressible.** 3D throughout. `stableDt` is recomputed every
 `--dt-recompute` steps with a 0.95 margin. The diffusive limit is thermal:
@@ -403,6 +477,36 @@ bitwise-identical geometry, threaded and byte-identical at any thread count.
 `la::CellGraph` is the matrix pattern with per-face slots. `dns mesh
 --polymesh DIR` prints the report (mB: 0.7 s).
 
+**FV face physics + CPU FP64 oracle** (`src/dns/fvflux.hpp`,
+`src/dns/fvgrad.*`, `src/dns/fvref.*`; phase P2, host only — the GPU FV
+path is P4): the Kennedy–Gruber mean flux and face viscous terms restated
+for an arbitrary face (DNS_HD, templated on double / float / `Dual<N>`),
+least-squares (pinned) or Green–Gauss cell gradients, the corrected face
+gradient (`AlongD`, pinned; α-damping available), every boundary kind as a
+face flux (wall adiabatic/isothermal with `u_w(x)`, slip, inflow, outflow,
+characteristic far field), the Σ-form dt and SSP-RK3. On a uniform periodic
+box it equals `dns::Comp` to 6e-15; second order on skewed meshes (MMS
+2.00); an adiabatic wall leaks exactly 0.0; threaded and byte-identical at
+any thread count (`docs/mesh.md`, `test_fvref`).
+
+**GPU sparse solver library** (`src/dns/gpu/la/`, `src/dns/la/{ell,lines,
+structured,amg}`; phases P3 + P5; its first customer is the incompressible FV
+path `dns flow --polymesh`, `docs/fv.md`):
+sliced-ELL block matrices on a `CellGraph` for B ∈ {1, 3, 5, 6, 7, 9, 11}
+(dense or 5 × 5 + scalar off-diagonals; float or double), SpMV, block Jacobi,
+multicolour block GS, batched block-tridiagonal line solves, FGMRES / PCG
+(classic or flexible) / BiCGStab whose inner products are batched,
+fixed-order FP64 reductions (byte-identical reruns), and aggregation AMG
+(Notay pairwise aggregation on the host once per mesh, coarse values
+re-gathered on the device in fixed order, V / scaled-V / K-cycle, B = 1 and
+every block shape). Own kernels, no vendor library, HIP and the CUDA shim
+alike. B5 SpMV 1.16 ns/cell at 1M cells; 8192 × 128 B5 lines 0.64 ms;
+AMG-PCG on Poisson 64² → 1024²: 12 / 16 / 15 iterations; on the 989k-cell
+prop mesh OpenFOAM's own pressure matrix (fields equal to 1e-14): 6
+iterations (~36 ms) to OpenFOAM's normalised residual at relTol 0.01 vs GAMG
+8 V-cycles / 0.70 s serial
+(`docs/la.md`, `test_la`, `test_amg`, `test_gpu_la`, `test_gpu_amg`).
+
 ## Rotors (`dns flow --rotor-mach`)
 
 `--rotor-mach M` spins the immersed body about a shaft through the placement
@@ -608,7 +712,9 @@ Tiers, labels, tolerances, the quarantine and anchor regeneration:
 | `docs/ui.md` | `dns-ui`: editor, run cockpit, live viewer |
 | `docs/viewer-format.md` | web frame format, run `.json`, `_surface.csv`, `--emit mesh` |
 | `docs/jobs.md` | `simjobd` / `simjob`: the job server every GPU/CPU run goes through |
-| `docs/mesh.md` | FaceMesh: the polyMesh subset accepted and rejected, the geometry definition, cyclic/2D/ordering rules, `CellGraph`, `dns mesh`, test meshes |
-| `docs/chem.md` | `dns flame`: model C0, the phase-plane oracle vs Cantera, species scheme, hook order, measured S_L; the 2D slot Bunsen (per-row inflow, pilot anchoring, measured cone); the slot-jet diffusion flame; the 2D candle (gravity, hydrostatic NSCBC, height vs fuel flow); the `--mode chamber` combustion chamber and its balances |
+| `docs/mesh.md` | FaceMesh: the polyMesh subset accepted and rejected, the geometry definition, cyclic/2D/ordering rules, `CellGraph`, `dns mesh`, test meshes; the FV face physics (flux, gradients, boundary kinds, Σ-form dt) and its FP64 oracle `FvRef` with the measured gates |
+| `docs/fv.md` | the incompressible FV path (`dns flow --polymesh`): simpleFoam's SIMPLE/SIMPLEC + MRF + RAS (kOmegaSST, SpalartAllmaras, wall functions, meshWave / exact wall distance) verbatim, BCs and schemes accepted, constraint-patch semantics, OpenFOAM's solver stop, outputs, prism-layer meshing, the IF1/IF2/IF3/IF-T/BL parity and wall-time numbers |
+| `docs/la.md` | `gpu/la`: block shapes, the sliced-ELL layout, smoothers, line sets, Krylov solvers and batched FP64 dots, the FP32-iterate floor, the measured LA1/LA2/LA-perf gates |
+| `docs/chem.md` | `dns flame`: model C0, the phase-plane oracle vs Cantera, species scheme, hook order, measured S_L; the 2D slot Bunsen (per-row inflow, pilot anchoring, measured cone); the slot-jet diffusion flame; the 2D candle (gravity, hydrostatic NSCBC, height vs fuel flow); the `--mode chamber` combustion chamber and its balances; 3D premixed flames in synthetic turbulence (generator, Taylor-swept inflow, hold controller, S_T/area/I0); LES species (SGS flux, Sc_t = Pr_t) and the thickened flame (TFLES: sensor, Charlette efficiency, laminar and LES-vs-DNS measurements); the 3D turbulent slot Bunsen LES (span-mean cone, ST/area/I0, the volume renderer) |
 | `src/compat/cuda/README.md` | the CUDA header shim |
 | `docs/archive/` | historical plans and analyses |

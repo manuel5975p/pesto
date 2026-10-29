@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <string>
 
@@ -31,6 +32,9 @@
 #endif
 #ifndef DNS_MESH_DATA
 #error "DNS_MESH_DATA must point at tests/data/mesh"
+#endif
+#ifndef DNS_FV_DATA
+#error "DNS_FV_DATA must point at tests/data/fv"
 #endif
 
 namespace {
@@ -240,6 +244,79 @@ int main()
                         && out.find("xlo") != std::string::npos;
         std::printf("%-56s %s\n", "mesh --dry-run prints the manifest", ok ? "ok" : "FAIL");
         if (!ok) ++dnstest::gFailures;
+    }
+
+    // --- dns flow --polymesh: the incompressible FV path (docs/fv.md) --------
+    {
+        const std::string cav = std::string(DNS_FV_DATA) + "/cavity";
+        expect("flow --polymesh " + cav + " --dry-run", 0, "fv: --dry-run resolves the case");
+        expect("flow --polymesh " + cav + " --physics incompressible --max-iters 5 --dry-run", 0,
+               "fv: --max-iters, explicit --physics incompressible");
+        expect("flow --polymesh " + cav + " --body cylinder --dry-run", 2, "fv: a structured flag is rejected");
+        expect("flow --polymesh " + cav + " --n 64 --dry-run", 2, "fv: --n is rejected");
+        expect("flow --polymesh " + cav + " --physics compressible --dry-run", 2,
+               "fv: compressible FV is not built");
+        expect("flow --polymesh " + cav + " --emit png --dry-run", 2, "fv: frames are not written");
+        expect("flow --polymesh " + cav + " --max-iters 0 --dry-run", 2, "fv: --max-iters 0");
+        expect("flow --polymesh " + cav + " --fv-precision fp64 --dry-run", 0, "fv: --fv-precision fp64");
+        expect("flow --polymesh " + cav + " --fv-precision fp32 --dry-run", 0, "fv: --fv-precision fp32");
+        expect("flow --polymesh " + cav + " --fv-precision fp16 --dry-run", 1, "fv: unknown --fv-precision value");
+        expect("flow --polymesh " + cav + " --fv-precision --dry-run", 1, "fv: --fv-precision without a value");
+        expect("flow --body cylinder --fv-precision fp64 --dry-run", 2, "--fv-precision without --polymesh");
+        expect("tgv --fv-precision fp64 --dry-run", 1, "--fv-precision is not a tgv flag");
+        // the EXPERIMENTAL coupled prototype (plan_perf_5 P0b): opt-in, FP64 only
+        const std::string c64 = "flow --polymesh " + cav + " --fv-precision fp64";
+        expect(c64 + " --fv-coupled 0 --dry-run", 0, "fv: --fv-coupled 0");
+        expect(c64 + " --fv-coupled 20 --fv-coupled-eta 0.3 --fv-coupled-alpha 0.7 --fv-coupled-check --dry-run", 0,
+               "fv: --fv-coupled with its tuning flags");
+        expect("flow --polymesh " + cav + " --fv-coupled 0 --dry-run", 2, "fv: --fv-coupled in FP32");
+        expect(c64 + " --fv-coupled -1 --dry-run", 2, "fv: --fv-coupled -1");
+        expect(c64 + " --fv-coupled 0 --fv-coupled-eta 1 --dry-run", 2, "fv: --fv-coupled-eta 1");
+        expect(c64 + " --fv-coupled 0 --fv-coupled-eta 0 --dry-run", 2, "fv: --fv-coupled-eta 0");
+        expect(c64 + " --fv-coupled 0 --fv-coupled-alpha 0 --dry-run", 2, "fv: --fv-coupled-alpha 0");
+        expect(c64 + " --fv-coupled 0 --fv-coupled-alpha 1.5 --dry-run", 2, "fv: --fv-coupled-alpha 1.5");
+        expect(c64 + " --fv-coupled-eta 0.3 --dry-run", 2, "fv: --fv-coupled-eta without --fv-coupled");
+        expect(c64 + " --fv-coupled-check --dry-run", 2, "fv: --fv-coupled-check without --fv-coupled");
+        expect(c64 + " --fv-coupled --dry-run", 1, "fv: --fv-coupled without a value");
+        expect("flow --body cylinder --fv-coupled 0 --dry-run", 2, "--fv-coupled without --polymesh");
+        expect("tgv --fv-coupled 0 --dry-run", 1, "--fv-coupled is not a tgv flag");
+        // --dry-run states the precision: FP32 by default, FP64 when named.
+        for (const auto& [flag, want] : {std::pair{"", "  precision  FP32 (default"},
+                                         std::pair{" --fv-precision fp64", "  precision  FP64 (--fv-precision fp64"}}) {
+            const std::string cmd = "\"" DNS_BIN "\" flow --polymesh " + cav + flag + " --dry-run 2>&1";
+            std::string out;
+            if (FILE* p = popen(cmd.c_str(), "r")) {
+                char buf[512];
+                while (std::fgets(buf, sizeof buf, p)) out += buf;
+                pclose(p);
+            }
+            const bool ok = out.find(want) != std::string::npos;
+            std::printf("%-56s %s\n", (std::string("fv: --dry-run states ") + want).c_str(), ok ? "ok" : "FAIL");
+            if (!ok) ++dnstest::gFailures;
+        }
+        expect("flow --polymesh " + std::string(DNS_FV_DATA) + "/mrf2 --dry-run", 0,
+               "fv: two MRF zones + an inactive one resolve");
+        expect("flow --polymesh " + std::string(DNS_FV_DATA) + "/cavity_lim --dry-run", 0,
+               "fv: limited corrected laplacian / snGrad resolve");
+        expect("flow --polymesh " + std::string(DNS_FV_DATA) + "/sst_plate --dry-run", 0,
+               "fv: RAS kOmegaSST + wall functions resolve");
+        expect("flow --polymesh " + std::string(DNS_FV_DATA) + "/sa_skew --dry-run", 0,
+               "fv: RAS SpalartAllmaras resolves");
+        expect("flow --polymesh /nonexistent --dry-run", 3, "fv: no such case (dry-run reads it)");
+        expect("flow --polymesh /nonexistent", 3, "fv: no such case (before any device)");
+        // a case entry the solver does not reproduce: exit 3 at --dry-run
+        const auto tmp = std::filesystem::temp_directory_path() / "dns_test_errors_fv";
+        std::filesystem::remove_all(tmp);
+        std::filesystem::copy(cav, tmp, std::filesystem::copy_options::recursive);
+        {
+            std::ifstream in(tmp / "system" / "fvSchemes");
+            std::string s((std::istreambuf_iterator<char>(in)), {});
+            const auto at = s.find("bounded Gauss linear;");
+            if (at != std::string::npos) s.replace(at, 21, "Gauss limitedLinearV 1;");
+            std::ofstream(tmp / "system" / "fvSchemes", std::ios::trunc) << s;
+        }
+        expect("flow --polymesh " + tmp.string() + " --dry-run", 3, "fv: an unsupported scheme is exit 3");
+        std::filesystem::remove_all(tmp);
     }
 
     // --- 4: output ----------------------------------------------------------

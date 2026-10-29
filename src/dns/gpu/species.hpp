@@ -21,6 +21,18 @@
 
 namespace dns::gpu::species {
 
+// The species stage's interior-face diffusivity, one kernel instantiation
+// each (docs/chem.md, "LES species and TFLES"): Molecular rho D = mu_f/Pr
+// (the shipped kernel); Eddy + nut_f/Sc_t (LES); Thick FE_f mu_f/Pr +
+// (1 - Om_f) nut_f/Sc_t plus the energy correction flux (TFLES, with or
+// without LES). Selected by SpeciesView: FE set = Thick, else nut set = Eddy.
+enum class SpeciesDiff : int
+{
+    Molecular = 0,
+    Eddy = 1,
+    Thick = 2
+};
+
 // The fixed per-run arguments of the species kernels.
 struct SpeciesView
 {
@@ -41,15 +53,25 @@ struct SpeciesView
     const Real* Y[kMaxY] = {};  // the cell pass's Y_k = rhoY_k / rho
     const Real* omega = nullptr;
     const std::uint8_t* solid = nullptr; // SpeciesSetup::solid
+    // LES (DeviceComp::les()): the stage's per-cell mu_t, 1/Sc_t and the
+    // eddy conductivity scale cp/Pr_t faceFlux uses. Null nut = no LES.
+    const Real* nut = nullptr;
+    Real invSct = 0, kapLes = 0;
+    // TFLES (SpeciesSetup::tflesFE/Om; gpu/tfles.hpp): F E and the sensor.
+    // Null FE = not thickened.
+    const Real* FE = nullptr;
+    const Real* Om = nullptr;
 };
 
 // The cell pass of state s: Y_k = rhoY_k / rho into Y[k], and
 // omega = arrheniusRate(lnA, Ta, rho, Y_fuel, T) into omega (T the live
 // primitive); with ox >= 0, arrheniusRate2(lnA, Ta, rho, Y_fuel, Y_ox, T)
 // (its own instantiation). One launch. lnA == -inf writes omega == 0 exactly.
+// eof (TFLES, premixed only): omega *= eof[c], the per-cell E/F (its own
+// instantiation; null = the shipped kernel).
 void cellPass(const GpuGrid& g, const DeviceCompState& s, const Real* T,
               Real lnA, Real Ta, int fuel, int ox, Real* const Y[kMaxY],
-              Real* omega);
+              Real* omega, const Real* eof = nullptr);
 
 // The species stage: out.y[k] = ca ya + cb yb + crAt(c) (-div F_k - delta_kF
 // omega - delta_kO stoich omega), plus the heat release E += crAt(c) q omega
@@ -58,7 +80,8 @@ void cellPass(const GpuGrid& g, const DeviceCompState& s, const Real* T,
 // only. ox >= 0: the face value is Y_up + theta/2 (Y_down - Y_up) with ONE
 // theta per face, the min over species of the MC ratio (kSpeciesStage2).
 // sv.solid != null selects the walled instantiation (SpeciesSetup::solid;
-// premixed, uniform inflow only); null is the original kernel.
+// premixed, uniform inflow only); null is the original kernel. sv.FE / sv.nut
+// select the Thick / Eddy diffusivity (SpeciesDiff; premixed, no wall).
 void stage(const GpuGrid& g, ViscView vv, PrimView q, const StageCombine& cmb,
            const SpeciesCombine& sc, const SpeciesView& sv,
            DeviceCompState& out);

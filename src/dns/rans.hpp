@@ -192,22 +192,23 @@ inline constexpr double omegaWallFactor = 60.0 / beta1;
 } // namespace sst
 
 // gamma_i: 2003 fixes 5/9 and 0.44; the 1994 form derives them so that the
-// log layer balances exactly (sqrt(0.09) = 0.3 exactly).
-inline constexpr double sstGamma1(RansModel m)
+// log layer balances exactly (sqrt(0.09) = 0.3 exactly). DNS_HD: nvcc does
+// not treat a constexpr function as device code (hipcc does).
+DNS_HD inline constexpr double sstGamma1(RansModel m)
 {
     return m == RansModel::Sst2003m
                ? 5.0 / 9.0
                : sst::beta1 / sst::betaStar -
                      sst::sigmaW1 * sst::kappa * sst::kappa / 0.3;
 }
-inline constexpr double sstGamma2(RansModel m)
+DNS_HD inline constexpr double sstGamma2(RansModel m)
 {
     return m == RansModel::Sst2003m
                ? 0.44
                : sst::beta2 / sst::betaStar -
                      sst::sigmaW2 * sst::kappa * sst::kappa / 0.3;
 }
-inline constexpr double sstCdFloor(RansModel m)
+DNS_HD inline constexpr double sstCdFloor(RansModel m)
 {
     return m == RansModel::Sst2003m ? 1e-10 : 1e-20;
 }

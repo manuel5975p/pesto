@@ -507,6 +507,172 @@ Measured gfx1100 via simjob, 2026-10-28.
     Mach 0.17 at the defaults (|u|max 34 U, M 0.005); the M dependence of
     the tip not measured.
 
+### 3D premixed in turbulence (`--nz`, `--turb`, docs/chem.md "3D and turbulence")
+
+Measured gfx1100 via simjob, 2026-10-29. Numbered T1… beside the other
+flame branches.
+
+T1. **The Taylor-frozen inflow is not a Navier–Stokes solution.** The box
+    is swept in frozen; the face imposes it through the LODI relax, so the
+    first ~l_t inside the domain is an adjustment region (pressure, the
+    sink band's D4 on mesh-scale content). Inflow-row tracking of a smooth
+    solenoidal row set: v, w residual 4.7% / 1.4% of the amplitude at 16 /
+    32 cells per wavelength (∝ k²: the transverse fluxes the LODI row keeps
+    against etaIn c/L_x); u (acoustic L5, half the rate) 6.0% / 4.4%,
+    attributed, not proven, to that rate (`gpu_flame_turb_inflow` (c)).
+T2. **The turbulence decays in transit; no forcing.** Re_t ≤ 44 at the
+    inflow, a narrow-band spectrum (kp L/2π = 2.4), no inertial range.
+    One realization of so few energetic modes is anisotropic: the runs'
+    seed-1 box has longitudinal L11 = 1.04 / 0.81 / 0.84 l_t (x / y / z,
+    mean 0.90; seed 2 mean 0.78) against the lattice expectation 0.979 —
+    seed dependence of S_T unmeasured.
+    u' at the flame (stats `uPrime`, the slab x_f − 3 l_t … x_f − 1.5 l_t)
+    is a fraction of the inflow u': 0.92 / 0.88 / 2.49 at u'_in 2 / 4 / 8
+    (upstream 8 / 16 / 16 δ_th). The IC's fresh gas is
+    age 0 everywhere while the stationary state has age x/u_in: the run
+    is not stationary before the inflow front has crossed the brush.
+T3. **The plane-mean x_f is the wrong controlled variable.** Measured: a
+    skewed brush moved x_f downstream while S_c rose; holding x_f flashed
+    the flame back into the inflow band (T2b/T3 of 2026-10-29: S_c 8, I0
+    2.2, omegaEdge 0.3–0.43). The controller holds ∫ρY dx since; the 3D
+    guard exits 8 on the leading edge.
+T4. **P1 turbulence gates: what failed** (docs/chem.md, "3D and
+    turbulence", runs R1/U2/U3 at 6 cells/δ_th, window [10, 20]). PASS: I0 =
+    1.006 / 1.006 / 1.043 ∈ [0.8, 1.2]; x_I held within 1.4 δ_D; correlations
+    within [0.5, 2]× of Peters (0.71 / 0.83 / 0.98). FAIL: (a) not stationary
+    — window halves differ 23% / 33% / 17% (gate 7%): S_T still grows at
+    u'_flame ~0.9 (developing brush + Darrieus–Landau, σ = 5, 15 δ_th box) and
+    falls in U3; tt 20–25 is all the P1 budget allowed (3–4 min each). (b) S_T
+    not strictly increasing with the MEASURED u'_flame: R1 0.917 → 1.478, U2
+    0.879 → 1.703 (equal u' within 4%; R1's upstream is 8 δ_th, U2's 16: the
+    longer transit decays u'_in 4 to u'_in 2's level). (c) U3 Tmax/Tb 1.0114
+    (gate 1.01; `Tmax` is the max of the PLANE-MEAN T, so R1/U2's 1.0019 /
+    1.0041 bound nothing pointwise — the 3D pointwise peak is not measured)
+    and unburnt pockets burning in the outflow band (omegaEdge up
+    to 0.386). (d) The plane-mean x_f in U3 wanders −6.2/+5.6 δ_D (x_I is
+    the held quantity). (e) The plan's 8 cells/δ_th, 10 + 8 δ_th box did not
+    contain the brush (15–17 δ_D past t 13.7, omegaEdge 0.51). Not measured:
+    the dependence on box width (DL), on the grid (6 vs 8 cells in 3D), on the
+    seed; a statistically converged S_T. Next: longer runs (≥ 50 τ), a wider
+    box or σ ≤ 3 to slow DL, forced turbulence or a shorter transit.
+T5. **3D yHits are the 2D FP32 inflow-row drift (§39), more cells.**
+    Hundreds to ~50000 cells per row, magnitude ≤ 39 ulp of 1 above (final
+    warning lines: R1 1 + 3.22e−6, U2 1 + 4.66e−6, U3 1 + 1.43e−6); never
+    below −1e−6 (yMin ≥ 0).
+    The stats CSV prints yMax to 6 significant digits (reads 1): the
+    magnitude is the run's warning line. Not material; counted, never
+    clamped.
+T6. **`kFlameColumns` / `kTurbColumns` are one thread per x column**, a
+    serial (k, j) loop of ny nz cells each, at stats rows only (every 200
+    steps). Not measured separately; whole-run 3.1 ms/step at 1.43 M cells
+    (176 × 90 × 90) and 5.9 ms/step at 2.53 M include them. Restructure only
+    if a profile shows > 2% of a step.
+T7. **`--nz > 1` exists for `--mode premixed` and `bunsen`** (P3, below);
+    diffusion, candle, chamber are 2D.
+
+### LES species and TFLES (`--les`, `--tfles`, docs/chem.md "LES species and TFLES")
+
+Measured gfx1100 via simjob, 2026-10-29.
+
+L1. **FAILED GATE: TFLES LES does not reproduce the DNS's turbulent flame
+    speed.** U2 case (u'_in 4, l_t 2.5 δ_th, window [10, 20]): S_T/S_T,DNS =
+    0.639 (F 2, 3 cells) / 0.612 (F 3, 2 cells) against the gates 0.85 / 0.75;
+    modelled area 0.646 / 0.629 (gates 0.8 / 0.7); brush 0.60 / 0.55 (gates
+    0.7 / 0.6); the efficiency closes nothing (Charlette − none: −0.0002 /
+    +0.0003 in S_T/S_L; the direction check fails at LES2). Diagnosis
+    (measured, not proven): the DNS at 4 cells and LES σ alone at 4 cells
+    stay within 9% of the 6-cell DNS, F 1.5 already loses 30% — the loss is
+    the THICKENING, not the grid. Ebar = 1.0000–1.024: Re_Δ = u'_Δ Δ/ν ≈ 2–5
+    sits on Charlette's viscous cutoff (f_Re), so the model says there is no
+    sub-filter wrinkling to restore — while the DNS's S_T grows through the
+    window (1.42 → 1.98), consistent with Darrieus–Landau (σ = 5) wrinkling
+    at scales the thickening stabilises (unstable band ∝ 1/(F δ)). Not
+    measured: a case with l_t ≫ F δ_th (where TFLES is meant to work), σ ≤ 3,
+    a longer window, other seeds. The P3 Bunsen (l_t 6 δ_th ≫ F δ_th) is the
+    regime the method targets; this case is not. Verifier (2026-10-29,
+    simjob 610/611): F 1.5 with `--tfles-sensor uniform` reads S_T/S_L
+    1.184 vs 1.186 dynamic (the sensor is NOT the loss; uniform F is the
+    textbook operator, laminar-exact). The DL attribution is NOT supported
+    by a weak-turbulence control (u'_in 0.25, u'_flame 0.03, 4 cells, tt 20):
+    DNS A_T/A stays 1.002–1.003 (S_T/S_L 1.02), F 1.5 1.001 — no visible
+    DL growth from small seeds in 20 τ_F; the mechanism behind the DNS's
+    growing S_T at u'_flame 0.9 remains open.
+L2. **The Shvab–Zeldovich teeth's absolute gate (1e-2) is not met; the
+    floor is the scheme.** A non-reacting stirred box: the molecular DNS
+    alone has defect 1.58e-2 (MC-limited species vs central energy flux,
+    clipping at stirred extrema; 0.32 when under-resolved). The eddy fluxes at
+    Sc_t = Pr_t sit at 1.14e-2 (≤ the floor), at Sc_t 0.45 at 0.197 (×17.3);
+    the test gates relative to the floor (`gpu_tfles_teeth`).
+L3. **The sensor is a T-GATED max filter (spreads toward colder gas), not
+    the plan's symmetric dilation.** A symmetric filter could not meet the
+    coverage gate on both sides (host scan on the thickened oracle: covering
+    c = 0.01 left Ω 0.03–0.6 at 2 F δ_th past c = 0.99). Constants (Ta/2,
+    tanh 50, radius 2.5 F δ_th) are measured on the LAMINAR oracle only; in
+    turbulence a cold pocket inside burnt gas takes Ω from its hotter
+    surroundings, a burnt pocket in fresh gas takes only its own raw value —
+    unvalidated against a sensor-free reference.
+L4. **TFLES cost.** The sensor's three gated passes at radius 2.5 F δ_th/h
+    (15–19 cells) plus curl/Laplacian: F 1.5 at 4 cells 1.69 ms/step vs 1.28
+    LES alone (+32%, 0.58 M cells). A shared-memory tiled filter is the
+    candidate if P3 needs it.
+L5. **μ_t is ignored in the NSCBC rows' transverse flux and in the open-row
+    species/energy face** (open faces carry no diffusion, molecular or
+    eddy); the open-row μ_t is a copy of the neighbour row (the §17 wrap).
+    Not measured at a turbulent outflow.
+L6. **Static Charlette β = 0.5, δ_L = δ_th, Re_Δ on ν_u = Pr;** u'_Δ by
+    Colin's operator on the resolved field, not filtered. Dynamic β, Colin's
+    efficiency (needs a global Re_t) and a separate Sc_t are not built; the
+    plan's quarantined `val_turbflame_les` is not registered (the gate fails,
+    L1; numbers in docs/chem.md).
+
+### 3D turbulent slot Bunsen (`--mode bunsen --nz`, docs/chem.md "3D turbulent slot Bunsen")
+
+Measured gfx1100 via simjob 612–617, 2026-10-29.
+
+B1. **The video run is LES of a near-DNS velocity field with a 3×
+    thickened flame; no reference.** U_jet 8, u'_in 3, l_t 6 δ_th, h/η 1.06
+    at the inflow, TFLES F 3 + Charlette (Ebar 1.013: the efficiency adds
+    ~1%). Span-mean S_T/S_L 1.586, A_T/A_cone 1.424, I0 1.113 over t ∈ [18,
+    36]; no DNS of this burner exists to compare against, and P2 (L1)
+    measured TFLES at 0.61–0.64 of the DNS's S_T in the planar case. The
+    plan's U_jet 20 was not run (its cone would not fit at that S_T); the
+    plan's scout (1.5 cells, F 5) was replaced by a short scout of the
+    final grid (F·cells sets what the scout would mean).
+B2. **Tmax/T_b 1.131 at the end, ALL in the inflow band.** The pointwise
+    peak grows from ≤ 1.043 (t ≤ 27) to 1.131 (t 35.7); every cell above
+    1.03 T_b sits in rows i ≤ 12 at the jet edges (15393 cells in the last
+    frame), where the base burns in the LODI rows and the boundary heat is
+    re-added (§35); the interior (i ∈ [16, 266)) peaks at 1.025 T_b. Cause
+    (turbulent edge rows, the TFLES rate at the face, the re-added q ω) not
+    isolated; no 2D or laminar 3D control run; still growing at the end of
+    the run.
+B3. **The 3D cone measurement changed two 2D rules (3D only).** The burning
+    window of the flank crossings is ½(2F − 1) δ_th (TFLES puts the
+    reaction zone behind Tmid; the 2D 1-cell window at F 3 dropped every
+    flank row and exited 8 at t = 16.1 with burn/in 0.977); the "fewer than
+    4 burning flank rows" guard does not stop a 3D run (fit columns NaN). The
+    2D bunsen with `--tfles` keeps the 2D window (bits) — it has the same
+    latent problem, not measured.
+B4. **ST and area use the straight-line cone area** 2 hypot(xTip − xBase,
+    W/2) L_z of the SPAN-MEAN Tmid contour; the span-mean tip swings ±7 δ_D
+    (sd), so ST (sd 0.12) and area move with it while I0 (sd 0.02) does
+    not. I0 1.11 > 1 (P1's planar DNS read 1.006). The cone denominator
+    CANCELS in I0 (I0 = burn / ∫|∇c| dV), so it is not a candidate (P3
+    verifier). I0 > 1 is not a turbulence signature: the LAMINAR extruded
+    burner of `gpu_bunsen3d_extrude` (W 6, U 3, tt 2, transient) reads I0
+    1.064 (DNS) and 1.130 (TFLES 2). Candidates, not proven: tip and base
+    consumption per unit |∇c| (curvature, the burning inflow rows of B2), E > 1
+    (Ebar 1.013, at most ~1%).
+B5. **The box × J(y) is not plane-mean free** (the z-mean of each y row of
+    the box is not zero): an inflow mass-flux fluctuation, an acoustic
+    source not measured. The coflow carries no turbulence; the turbulence
+    decays over the ~14 τ_F transit to the tip (u' at the flame not
+    measured; `uPrime` is planar-only).
+B6. **Span means are host loops** over five downloaded fields (5 × 19 MB)
+    at every stats row; the run's 16.3 ms/step includes them and the
+    41 GB of volume frames (not separated). A GPU span-mean kernel is not
+    built.
+
 ### Chamber (`dns flame --mode chamber`, docs/chem.md "Chamber")
 
 Measured gfx1100 via simjob, 2026-10-28, defaults (4 cells/δ_th) and the
@@ -561,11 +727,22 @@ Measured gfx1100 via simjob, 2026-10-28, defaults (4 cells/δ_th) and the
   0.344% → 0.357% → 0.361%); the quoted 6.7% / 0.36% are the [75, 80]
   values. tt 80 does not show a flat envelope.
 
-## FaceMesh / FV path (`docs/mesh.md`, `plans/masterplan_meshsolver.md`)
+## FaceMesh / FV path (`docs/mesh.md`, `docs/fv.md`, `plans/masterplan_meshsolver.md`)
 
-56. **Phase 1 only: the FaceMesh exists, no solver runs on it.** Built and
-    pinned: polyMesh reader/writer, `fromPolyMesh` / `fromCurvMesh`,
-    orderings, `CellGraph`, `dns mesh` (`plans/verify/impl_meshsolver_p1.md`).
+56. **Phases 1–2 only: the FaceMesh and a CPU FP64 FV oracle exist, no GPU
+    solver runs on it.** Built and pinned: polyMesh reader/writer,
+    `fromPolyMesh` / `fromCurvMesh`, orderings, `CellGraph`, `dns mesh`
+    (`plans/verify/impl_meshsolver_p1.md`); `fvflux.hpp` / `fvgrad` /
+    `FvRef` (`plans/verify/impl_meshsolver_p2.md`, gates in docs/mesh.md).
+    P2 open by plan: no GPU FV kernels (P4), no scalar/species rows, no MRF
+    frame flux, no eddy viscosity, no LTS march; one `FvBc` per patch (no
+    per-face profiles). Scheme limits, stated: `Far` is a 1D characteristic
+    state (no transverse terms), `Outflow` fixes p (reflects acoustics),
+    `Inflow` is subsonic only, `Slip` keeps the normal viscous stress.
+    Unproven: the KG flux with no dissipation on snappy 2:1 meshes beyond
+    one stage (U1 is P4/P7's measurement); the G4 order is shown on a smooth
+    sinusoidal mesh only (random-perturbed meshes: checkerboard and KE
+    gates, no MMS).
     Deferred by plan: `wedge` patches and axis prisms in `fromPolyMesh`, and
     revolved structured meshes (`axisFaces`, `MirrorZ`) in `polyOf` (P8);
     decomposed meshes (`processor*`: run reconstructParMesh), non-conformal
@@ -576,6 +753,240 @@ Measured gfx1100 via simjob, 2026-10-28, defaults (4 cells/δ_th) and the
     (`runs/` is git-ignored); its checkMesh log was an 8-rank run whose face
     count (2 622 899) includes processor faces — the reconstructed mesh has
     2 600 459, which the gate pins.
+    FIXED (verifier P2): the `FvRef` diffusive dt took `max(1, γ/Pr)`, which
+    misses momentum's 4/3 normal stress: a longitudinal u checkerboard on
+    100:1 cells grew ×1.78e6 in 60 steps at Pr 2 and 7 (λΔt −2.67). Now
+    `max(4/3, γ/Pr)` (FV-only `fvDiffusivityFactor`; the structured
+    `Transport::diffusivityFactor` and every structured dt are unchanged).
+    `test_fvref` E6: decays at the bound at Pr 0.72/2/7, grows ×4.1e3 at
+    1.3× (no slack).
+
+57. **`gpu/la` (P3): its first runner customer is the incompressible FV
+    path (P5b, item 59); NK and every structured path still do not use it.** Gates
+    LA1/LA2/LA-perf/Shim pass (`docs/la.md`; report
+    `plans/verify/impl_meshsolver_p3.md`). Open by plan: device
+    assembly into `EllView` slots (P5b/P6/P7), coloured line-GS (lines are
+    line-Jacobi), `strongLines` seeded from wall faces. Measured, not fixed:
+    restarted FGMRES(30–60) STAGNATES on the Pe 1e3 recirculating cell
+    (128², upwind) with Jacobi / MC-SGS / lines (3000 it at 2e-3–7e-4) where
+    BiCGStab converges (651–1325 it) — P5b's momentum solves should default
+    to BiCGStab (OpenFOAM's `PBiCGStab` choice) or larger restarts until
+    AMG; MC-GS in natural order costs 1.86 SpMV per sweep vs 1.09 in
+    colour-major numbering (P4's global order decision). Unproven: the
+    perf numbers on a polyhedral mesh (gated on the 7-point 100³ graph only);
+    the CUDA backend RUN (compiled and linked, no NVIDIA device here).
+    P3 review defects fixed with P5: `LineSmoother::make` now rejects a line
+    set that is not a permutation (out of range / a row twice). Still open
+    from that review: Krylov with N == 0 leaves a sticky launch error,
+    `KrylovOptions::restart` above the basis is clamped silently,
+    `BlockEll::upload` compares nnz but not columns.
+
+58. **`gpu/la` AMG (P5); first customer: the P5b pressure equation (item 59)** (`docs/la.md`, report
+    `plans/verify/impl_meshsolver_p5.md`). Gates: refresh bit for bit vs the
+    host Galerkin; LA3 (Poisson 12/16/15 it 64²→1024², aspect 100 6/21 vs
+    iso 15); LA4 (FFT-PCG 14 vs AMG-PCG 15, p equal to 9.4e-8); Setup 1.83 s
+    at 6M rows. On OpenFOAM's own pressure matrix (identical fields to 1e-14)
+    AMG-PCG needs 6–7 iterations to OpenFOAM's relTol 0.01 residual where
+    serial GAMG needs 6–8 V-cycles. Measured, not fixed: the cycle is
+    LAUNCH-bound on coarse levels (~3 µs per launch; a B_G1s iteration is
+    5 ms, most of it coarse-level launches) — hipGraph capture is the lever,
+    not built (the library launches on the null stream); the coarsest dense
+    inverse is one 1024-thread block (1.4 ms at ≤ 128 unknowns, 218 ms at
+    ~1000: keep `coarseUnknowns` small; since the performance round the
+    register-resident kernel at ≤ 128: 0.51 ms at m = 114, FP64-bound on one
+    workgroup); K-cycle + Jacobi coarse levels is
+    POOR on convective block systems (B3 recirculating cell FGMRES 194 it vs
+    90 with GS coarse) — the defaults are the pressure's. The pressure
+    matrix of a real SIMPLE iteration (rAtU-weighted, non-orthogonal
+    correction in the source) is now exercised by P5b (item 59: scaled-V +
+    2 Jacobi sweeps beat the K-cycle there, 34.9 vs 45.2 ms/it on F1).
+    Unproven: AMG on HIGH-aspect
+    layered (BL) meshes beyond the synthetic aspect-100 box (the local snappy
+    meshes mA/mB/mC carry ~3.5 of 5 prism layers, max aspect 16.6–20.1, and
+    converge in 18–22 it — nothing above aspect ~20 is tested on a real mesh);
+    FP32 AMG preconditioning an FP64 solve; block AMG with the
+    masterplan's physical strength `|ṁ| + ρν|S|/d` (gates use |block|_F of
+    the values); the CUDA RUN.
+
+59. **Incompressible FV path (P5b, `docs/fv.md`): `dns flow --polymesh CASE`
+    = OpenFOAM v2606 simpleFoam (SIMPLE / SIMPLEC, laminar, MRF) on
+    the identical polyMesh, FP64 on the GPU.** Gates (report
+    `plans/verify/impl_meshsolver_p5b.md`): IF1 four blockMesh cases with
+    tight solves equal simpleFoam to ≤ 1.1e-12 of scale at every compared
+    iteration (`gpu_fv_simple`); IF2 snappy sphere Re 100 cd 8.8e-13; prop
+    F1/G1 + MRF thrust 4.3e-6 / 5.3e-6, torque 3.7e-8 / 2.0e-9 at 600 / 700
+    iterations; IF3 8.2–8.7× simpleFoam np 12 to a matched residual on F1
+    (708k), 7.9× wall on G1, but only 1.4–1.5× on the 66k sphere (launch /
+    host-sync bound; CORRECTED count: ~1470 dispatches + ~71 synchronous
+    copies per iteration on rotor2 L1, not "~40 launches + ~15 syncs").
+    PERFORMANCE ROUND (`plans/verify/impl_performance.md`, docs/fv.md
+    "Performance round"), bit-identical to the FINAL outputs: rotor2 L1
+    8.69 → 3.96 ms/it, L2 10.11 → 4.99, L1 SST 14.58 → 7.18, F1 32.02 →
+    22.07 (vs simpleFoam np 6: 5.4× / 5.9× / 6.8× / 10.9× per iteration,
+    4.4× / 4.8× / 7.3× / ≈ 10.2× to a settled CT/CQ); 905 dispatches + 21
+    syncs per L1 iteration. Not done (USER decisions,
+    `plans/masterplan_performance.md` §6): non-parity levers (stronger p
+    smoother, FP32 AMG, Anderson), a re-swept foam baseline (np / renumber),
+    the integer-ticket one-launch dots and the single-workgroup coarse tail;
+    hipGraph (needs a stream through gpu/la). Remaining L1 active iteration:
+    GPU busy ~4.2–4.6 of ~5.6 ms (launch latency + 21 syncs), the dense
+    coarsest inverse 0.5 ms of it. Semantics moved (failure paths only, no
+    bit of a successful run): a singular p AMG is reported at its first use
+    in an iteration (an iteration whose p solves all start converged builds
+    no hierarchy); a PCG solve converged at r0 no longer evaluates M r, so a
+    non-finite M r there no longer errors. Not built: PISO / PIMPLE (pimpleFoam, `ddtCorr`),
+    (RANS: built in phase BL, item 61), `fixedFluxPressure` / `totalPressure` / rotating-wall BCs,
+    `leastSquares` gradients, `pRefPoint`, restarts from a non-zero time,
+    `phi` output with cyclic patches — all rejected by name (`limited`
+    laplacian / snGrad and several MRF zones: item 60). Unproven: the
+    symmetryPlane patch uses per-face normals where OpenFOAM uses the plane's
+    mean normal (equal to rounding on a planar patch; a warped "plane" would
+    differ); a mesh with two faces between one cell pair (the ELL accumulates
+    them, untested); the CUDA backend RUN.
+    FIXED (verifier FINAL, measured on the cavity; fix round 1): (a)
+    `constant/fvOptions` / `system/fvOptions` were never opened, so a case
+    with a source ran WITHOUT it at exit 0 (simpleFoam applies it: a uniform
+    `vectorSemiImplicitSource` moved p 6.7e-2, U 2.2e-3 of scale) — now
+    rejected by name on presence (exit 3, `fvcase` C2); (b) forces
+    `e1`/`e3` were accepted and ignored: with `origin` + `e1 (0 1 0)` and no
+    `CofR`, simpleFoam writes force.dat in the rotated frame (total
+    (2.639e-5, 1.495e-4, 0)), dns wrote the global one — now rejected
+    without `CofR`; with `CofR` (OpenFOAM reads neither `origin` nor the
+    axes) CofR now wins over a stray `origin` (it was the last of the two);
+    (c) `adjustPhi`'s `totalFlux` added the boundary |phi| where OpenFOAM's
+    `sum(mag(phi))` is internal faces only — now internal only (thresholds
+    only; `gpu_fv_simple` IF1a closed cavity unchanged).
+    FIXED (re-verify FINAL, fix round 2): a forces object without `CofR`
+    and without `e1`/`e3` (`origin` only, or neither) ran at exit 0 in the
+    global frame, but simpleFoam v2606 stops on both (`No entries of the
+    type (e1, e2) or (e2, e3) or (e3, e1) found`, axesRotation.C:196;
+    `Entry 'origin' not found in dictionary ...functions/forces1`) — now
+    `CofR` is required (exit 3, `fvcase` C2 pins both forms). Every prop
+    case carries `CofR`. Kept deliberately: an EMPTY `fvOptions` (header
+    only) is rejected on presence although simpleFoam runs it source-free
+    (conservative, no parity risk).
+
+60. **FV MRF = OpenFOAM `MRFZoneList` (phase MRF, `docs/fv.md` "MRF").**
+    Several zones zone by zone (a zone/zone face gets both frame fluxes, as
+    OpenFOAM), inactive zones, `omega constant`, `nonRotatingPatches`
+    literal + regex, MRF-included faces on every non-empty patch of a zone
+    cell; `limited [corrected] ψ` laplacian / snGrad. Gates (report
+    `plans/verify/impl_meshsolver_mrf.md`): IF1e/IF1f vs simpleFoam ≤ 3.9e-13
+    of scale with tight solves (`gpu_fv_simple`); rotor2 L1/L2 (laminar
+    Re 220, the parity suite's meshes, simpleFoam + MRF np 6, 1500 it) CT
+    ≤ 1.3e-11, CQ ≤ 2.4e-13 relative, both schemes, settling at the same
+    iteration (± 1; F1 CQ ± 2); DTMB F1 converged (1200 it) CT 2.1e-9, CQ 1.2e-9.
+    Phase FINAL re-ran all prop cases cold vs simpleFoam np 12 (`--bench`,
+    `plans/verify/impl_meshsolver_final.md`, docs/fv.md "Final prop
+    parity"): rotor2 L1/L2 CT ≤ 1.1e-11, F1 2.7e-9; wall to a settled CT/CQ
+    2.6–2.9× (rotor2) and 8.4× (F1) vs simpleFoam np 12, but np 6 is
+    foam's faster setup on every mesh: rotor2 L1 2.1×, F1 ≈ 6.9×
+    (extrapolated from a 200-it np 6 bench). The
+    old rotor2 parity table (`runs/parity/report.md`, structured dns vs
+    foam Bc) is a DIFFERENT comparison (immersed staircase rotor vs
+    body-fitted) and stays as it was. Speed (performance round, item 59):
+    rotor2 L1 / L2 now 4.4× / 4.8× simpleFoam np 6 to a settled CT/CQ
+    (3.96 / 4.99 ms/it, was 2.1–2.3× at 8.6–10.3), F1 ≈ 10.2× (was ≈ 6.9×);
+    still launch / host-sync bound on rotor2. Not built:
+    overlapping MRF zones, MRF zones touching cyclic faces (both rejected),
+    time-dependent `omega`, `makeAbsolute` (unused by simpleFoam). A
+    `nonRotatingPatches` selector matching no patch is an ERROR here
+    (OpenFOAM ignores it), a zero axis likewise (OpenFOAM: Ω = 0 with phi =
+    0 on every boundary face of the zone).
+
+61. **FV RAS + boundary layers (phase BL, `docs/fv.md` "RAS", report
+    `plans/verify/impl_meshsolver_bl.md`).** kOmegaSST and SpalartAllmaras
+    as simpleFoam runs them, OpenFOAM's wall functions, meshWave /
+    exactDistance wall distance, bounded scalar transport. Gates: IF-T
+    (3 blockMesh cases, tight solves) ≤ 1.6e-10 of scale at it 100 / 400
+    (`gpu_fv_simple`); wall distance = simpleFoam's to ≤ 5e-12
+    (`fvwalldist`, local `fvwalldist_rotor`); BL-a TMR-like plate (tutorial
+    `turbulentFlatPlate` at 1/4 resolution, limitedLinear k / omega) cf
+    ≤ 2.6e-4, profiles 2.2e-5 U, drag 5.7e-6; BL-b rotor2 L1 + snappy prism
+    layers, SST + MRF, nu 5e-4 (y+ mean 0.85): CT 2.3e-8 / CQ 1.3e-9 of serial
+    simpleFoam, 12.1 s vs 39 s (np 6, `--bench`). Against simpleFoam np 12
+    (phase FINAL) CT is 2.0e-6 off: that is foam's decomposition (np 12 vs
+    serial foam moves CT 2.0e-6, nut 4.3e-3 of scale; dns = serial foam).
+    Open:
+    (a) **snappy layer coverage on rotor2 is poor**: 79% of blade faces
+        extruded but 1.52 layers on average (41% of the target thickness) —
+        snappy truncates the stacks around every unextruded spot; no tried
+        cheap setting (buffer −1, nOuterIter, medial / feature angles,
+        relaxed tet quality) raised it. A finer blade surface level or a
+        different mesher is the lever, not solver work.
+    (b) **No steady state at y+ ~ 10–20** (nu 2e-5 / 5e-5 / 1e-4 on this
+        mesh): simpleFoam's CT oscillates ±3% (SIMPLEC or SIMPLE, layers or
+        not); central U diverges at nu 2e-5. The parity gate therefore runs
+        at nu 5e-4; the unsteady regime is compared on means only (report).
+    (c) `limitedLinear` transients are not reproducible bit-wise (rounding
+        noise sets the limiter on uniform fields; CLAUDE.md) — converged
+        cases only.
+    (d) Not run: DTMB F1 with layers + SST (optional gate c), SA on a 3D /
+        MRF case, `nutk`/`omegaWallFunction` in the log region on a 3D mesh
+        (the plate covers Spalding + binomial there in 2D).
+    (e) Unproven: exactDistance on WARPED wall faces (the faces' own fan
+        triangulation vs simpleFoam's triSurface triangulation: equal on
+        planar faces only); meshWave on meshes with cyclics (rejected);
+        the CUDA backend RUN.
+62. **FV FP32 is the default (`--fv-precision fp32|fp64`, docs/fv.md
+    "Precision", report `plans/verify/impl_fv_fp32.md`).** FP64 mode is the
+    previous solver bit for bit (bit_perf 14 cases + the four full-length
+    FINAL cases); non-FV dry-runs and GPU runs byte-identical. FP32: rotor2
+    L1 / L2 / SST / F1 2.63 / 2.30 / 3.79 / 8.18 ms/it (FP64 3.98 / 4.99 /
+    7.19 / 21.88), CT ≤ 1.7e-6 of FP64 laminar, 1.25e-5 SST (its end jitter
+    is 3.0e-5), CQ ≤ 8.8e-7, settle iteration equal ± 1; reruns
+    byte-identical. Open:
+    (a) **The floors are a measured choice, not a derived bound.** The
+        task's "smallest floor that never stalls a solve to maxIter" is
+        degenerate: no solve stalled at any floor (0 … 3e-6), FP32
+        estimates keep falling below the true floor. The constants are the
+        first decade above the tail noise of rotor2 L1 / SST / F1 (U ≤
+        7.9e-7, p ≤ 6.8e-7, k 2.2e-8); another mesh's noise (normFactor
+        scaling, a larger ‖x‖/‖b‖) could sit above 1e-6 — then its tail
+        keeps iterating on noise (slower, not wrong). No per-case
+        adaptive floor.
+    (b) **The turbulence floor moves the nut FIELD**: rotor2 SST nut
+        6.8e-3 of scale (max-norm) vs FP64 at 1e-7 (k 2.1e-4, U 1.2e-4);
+        FP32 with no floors is 4.8e-5. CT / CQ only within the floor's
+        jitter. The 400-iteration sst_plate transient: nut 1.03e-2 vs FP64
+        with or without floors (gpu_fv_simple band 3e-2) — cause not
+        isolated (before the wall-function constants became float it was
+        1.5e-4 with floors, 1.0e-2 without: a transient that amplifies
+        rounding, not a floor effect).
+    (c) Small meshes stay launch / sync bound: the float kernels alone buy
+        1.52× on F1 (no-floor ms/it) but ~4% on the first 357 L1
+        iterations; the rest of the FP32 whole-run gain is the floor
+        ending the active phase early. The coarsest dense inverse is still
+        FP64 in `Amg<float>` (0.5 ms per refresh on L1).
+    (d) Not built / not run: FP32 on the CUDA backend RUN (the shim build
+        `build/cuda_shim` compiles and links dns + the FV tests; nothing
+        ran there), the flat plate BL-a and the IF2 sphere / G1 in FP32, an
+        FP64 defect correction around FP32 solves.
+63. **Coupled p-U prototype (plan_perf_5 P0a + P0b, docs/fv.md "Coupled
+    prototype"): EXPERIMENTAL, opt-in `--fv-coupled N`, FP64, laminar.**
+    P0a: SIMPLE's `iterate()` is now a composition of stage methods
+    (bit_perf 14 cases byte-identical FP32 and FP64, reruns identical).
+    P0b: inexact Picard on simpleFoam's own fixed-point residual, FGMRES(30)
+    with a linearised SIMPLEC step. G-JAC ≤ 4.5e-14 (cavity, mrf2, channel,
+    rotor2 L1); G-FP0: CT moves ≤ 6e-13 per outer from a 1500-it SIMPLE
+    state. Converged CT / CQ vs SIMPLE FP64 and simpleFoam: L1 ≤ 6.8e-11 /
+    2.3e-12. FP64 loop to settle 1e-3: L1 0.83 s (η 0.1) / 0.45 s (η 0.3)
+    vs SIMPLE 2.17 s; F1 (hybrid 30, η 0.1) 9.47 s vs 11.88 s. Open:
+    (a) **KILL GATE NOT PASSED on F1** at the measured configuration: FP32
+        projection 0.87–1.13× vs SIMPLE FP32 5.32 s (L1 1.77–1.97×, η 0.3
+        3.3×). F1 at η 0.3 is a MODEL (1.57–2.0×), not a run. Decide on one
+        F1 η 0.3 run before any P1 work.
+    (b) F1's C_K is 6.2 ms FP64 (plan model 1.35 ms FP32): CGS2 over up to
+        30 vectors of 4n = 2.83M doubles; K̄ 77 per outer to settle (292
+        on the first outer of the hybrid start). Restart length, Eisenstat–
+        Walker η, a cheaper first outer and FP32 Krylov vectors are unmeasured.
+    (c) F1's CT cannot be certified to solver tolerance: both references
+        (SIMPLE FP64 and simpleFoam, 1200 it) still drift (−6.2e-10 per
+        iteration); the coupled fixed point (probe ≤ 1e-12 / 1e-10) is
+        +2.8e-6 from them, inside the extrapolated SIMPLE limit's bracket.
+    (d) G-JAC is not exact with freestreamVelocity / freestreamPressure
+        patches (duct 1.2e-4 / 3.8e-4: their value fractions follow Ub in
+        the FD). G-PAR, G-FOAMRESTART, FP32, RAS, the CUDA backend: not built.
 
 ## Older open items (details in CLAUDE.md)
 

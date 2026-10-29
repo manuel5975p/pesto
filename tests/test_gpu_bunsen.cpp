@@ -97,6 +97,82 @@ Cone runCase(const std::string& name, const std::string& args, double t0,
     return c;
 }
 
+std::vector<char> readAll(const std::string& path)
+{
+    std::vector<char> b;
+    if (std::FILE* f = std::fopen(path.c_str(), "rb")) {
+        char buf[1 << 16];
+        std::size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0)
+            b.insert(b.end(), buf, buf + n);
+        std::fclose(f);
+    }
+    return b;
+}
+
+// extrude3d: the 2D slot Bunsen and the same burner at --nz 8 (z periodic,
+// hz = h, the IC extruded, no --turb). A z-invariant state stays z-invariant
+// bit for bit (every z difference is exactly 0), the 3D dt is the 2D one
+// (stableDt is the max over axes), so the 3D run's mid-span xy frames equal
+// the 2D frames byte for byte, and its span-mean cone (the mean of nz equal
+// floats) the 2D cone: xTip, xBase, tanA/L/R, rms, sinRatio, mFlank exactly.
+// Twice: the DNS, and TFLES F 2 where the 3D run adds LES sigma 1.35 (the
+// sigma operator is exactly 0 on a 2D field) with --efficiency none.
+void extrude3d()
+{
+    const std::string base =
+        "\"" DNS_BIN "\" flame --mode bunsen --mach 0.02 --cells-per-delta 4 "
+        "--slot-width 6 --coflow-width 3 --jet-speed 3 --tt 2 --emit stats "
+        "--emit bin --fdt 0.5 --quiet ";
+    struct Variant
+    {
+        const char *name, *both, *only3d;
+    };
+    const Variant vs[] = {
+        {"dns", "", ""},
+        {"tfles", "--tfles 2 ",
+         "--les 1.35 --sgs sigma --efficiency none "}};
+    for (const Variant& v : vs) {
+        const std::string p2 = std::string("/tmp/dns_test_bunsen_x2_") + v.name;
+        const std::string p3 = std::string("/tmp/dns_test_bunsen_x3_") + v.name;
+        const int r2 = valtest::runBinary(base + v.both + "--out " + p2);
+        const int r3 = valtest::runBinary(base + v.both + v.only3d +
+                                          "--nz 8 --out " + p3);
+        check(r2 == 0 && r3 == 0, std::string(v.name) + ": 2D and 3D runs exit 0");
+        if (r2 != 0 || r3 != 0) continue;
+        for (const char* f : {"temp", "fuel", "omega"}) {
+            const auto a = readAll(p2 + "_" + f + ".bin");
+            const auto b = readAll(p3 + "_" + f + ".bin");
+            check(!a.empty() && a == b,
+                  std::string(v.name) + ": " + f +
+                      " frames (mid-span xy plane) byte-identical to 2D (" +
+                      std::to_string(a.size()) + " / " +
+                      std::to_string(b.size()) + " bytes)");
+        }
+        const auto t2 = valtest::loadCsv(p2 + "_stats.csv");
+        const auto t3 = valtest::loadCsv(p3 + "_stats.csv");
+        check(t2 && t3, std::string(v.name) + ": stats readable");
+        if (!t2 || !t3) continue;
+        for (const char* k : {"t", "dt", "xTip", "xBase", "tanA", "tanL",
+                              "tanR", "rms", "sinRatio", "mFlank"}) {
+            const auto& a = t2->col(k);
+            const auto& b = t3->col(k);
+            bool same = a.size() == b.size() && !a.empty();
+            for (std::size_t i = 0; same && i < a.size(); ++i)
+                same = (a[i] == b[i]) || (std::isnan(a[i]) && std::isnan(b[i]));
+            check(same, std::string(v.name) + ": span-mean " + k +
+                            " equals the 2D column exactly");
+        }
+        const double s2 = t2->col("SLflank").back(), s3 = t3->col("SLflank").back();
+        check(std::abs(s3 / s2 - 1) < 1e-6,
+              std::string(v.name) + ": SLflank per unit span equals 2D to 1e-6");
+        std::printf("  %s: %zu stats rows, SLflank 2D %.9g 3D %.9g, ST %.6g, "
+                    "area %.6g, I0 %.6g\n",
+                    v.name, t2->col("t").size(), s2, s3, t3->col("ST").back(),
+                    t3->col("area").back(), t3->col("I0").back());
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -141,8 +217,10 @@ int main(int argc, char** argv)
         check(std::abs(p.mFlank - 1) < 0.05,
               "strips: flank mass burning flux within 5%");
         check(std::abs(p.burn - 1) < 0.03, "strips: burn / fuel inflow within 3%");
+    } else if (mode == "extrude3d") {
+        extrude3d();
     } else {
-        std::fprintf(stderr, "usage: test_gpu_bunsen cone|anchor\n");
+        std::fprintf(stderr, "usage: test_gpu_bunsen cone|anchor|extrude3d\n");
         return 2;
     }
     return dnstest::finish();

@@ -145,6 +145,19 @@ struct SpeciesSetup
     // and no heat release. Null = no wall: the kernel without the mask,
     // compiled separately (bit for bit the code before it).
     const std::uint8_t* solid = nullptr;
+    // Thickened flame (dns flame --tfles; gpu/tfles.hpp, docs/chem.md): DEVICE
+    // per-cell F E, E/F and the sensor Omega, owned by the caller and updated
+    // between steps. The species face diffusivity becomes F E mu/Pr + (1 -
+    // Omega) mu_t/Sc_t, the energy gets the matching correction flux, and
+    // omega (fuel and heat release) is scaled by E/F -- their own kernel
+    // instantiations. Null = not thickened (bit for bit). Premixed only.
+    const Real* tflesFE = nullptr;
+    const Real* tflesEoF = nullptr;
+    const Real* tflesOm = nullptr;
+    // TEST ONLY (gpu_tfles teeth): 1/Sc_t of the species SGS flux; 0 = 1/Pr_t
+    // (Sc_t = Pr_t, the Shvab-Zeldovich-consistent value). Never set by a
+    // runner.
+    double testInvSct = 0;
 };
 
 // An unevaluated sum hi + lo of two floats (the compensated state's words).
@@ -486,8 +499,11 @@ public:
     // buffer, read by both the species rhs and the heat release), the
     // limited species stage on faceFlux's own mass flux, and E += cr q omega,
     // all BEFORE the rhs hook. Never calling it keeps every path bit for bit.
-    // Pre: !curvilinear(), !rans(), !compensated(), !les(), !mrfActive(),
-    // 1 <= s.nY <= kMaxY, 0 <= s.fuel < s.nY. Post: step() requires
+    // LES (les()): the species face flux adds the SGS diffusivity mu_t/Sc_t,
+    // Sc_t = Pr_t (one constant; the Shvab-Zeldovich coupling of the eddy
+    // fluxes), its own kernel instantiation. Pre: !curvilinear(), !rans(),
+    // !compensated(), !mrfActive(), 1 <= s.nY <= kMaxY, 0 <= s.fuel < s.nY;
+    // les() or s.tflesFE: s.ox < 0 and no s.solid. Post: step() requires
     // state.nY == nSpecies().
     std::expected<void, hipError_t> enableSpecies(const SpeciesSetup& s);
     int nSpecies() const { return sp_.nY; } // 0 = species off

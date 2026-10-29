@@ -209,7 +209,9 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--rans-mutinf", &c.ransMutInf},
              {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
              {"--planes", &c.planes}, {"--png-down", &c.pngDown},
-             {"--vort-max", &c.vortMax}});
+             {"--vort-max", &c.vortMax}, {"--polymesh", &c.polymesh},
+             {"--fv-coupled", &c.fvCoupled}, {"--fv-coupled-eta", &c.fvCoupledEta},
+             {"--fv-coupled-alpha", &c.fvCoupledAlpha}});
     if (c.sub == Subcommand::Tgv)
         add({{"--nu", &c.nu}, {"--cfl", &c.cfl}, {"--fdt", &c.fdt}});
     if (c.sub == Subcommand::Hit)
@@ -247,6 +249,9 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--upstream", &c.upstream}, {"--downstream", &c.downstream},
              {"--inflow-speed", &c.inflowSpeed},
              {"--wrinkle", &c.wrinkle}, {"--wrinkle-modes", &c.wrinkleModes},
+             {"--turb", &c.turb}, {"--turb-length", &c.turbLength},
+             {"--frame-start", &c.frameStart},
+             {"--les", &c.les}, {"--tfles", &c.tfles},
              {"--slot-width", &c.slotWidth}, {"--jet-speed", &c.jetSpeed},
              {"--coflow-speed", &c.coflowSpeed},
              {"--coflow-width", &c.coflowWidth},
@@ -315,9 +320,13 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                          &c.flameMode});
         enums.push_back({"--reaction", {{"on", 1}, {"off", 0}},
                          &c.chamber.reaction});
+        enums.push_back({"--tfles-sensor", {{"dynamic", 0}, {"uniform", 1}},
+                         &c.tflesSensor});
+        enums.push_back({"--efficiency", {{"none", 0}, {"charlette", 1}},
+                         &c.efficiency});
     }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench
-        || c.sub == Subcommand::Channel)
+        || c.sub == Subcommand::Channel || c.sub == Subcommand::Flame)
         enums.push_back({"--sgs", enumValues(sgsModelNames()), &sgsSel});
     if (c.sub == Subcommand::Flow)
     {
@@ -331,6 +340,9 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                          {{"linear", 0}, {"asinh", 1}}, &c.vortMap});
         enums.push_back({"--speed-map",
                          {{"abs", 0}, {"delta", 1}}, &c.speedMap});
+        enums.push_back({"--fv-precision",
+                         {{"fp32", int(FvPrecision::Fp32)}, {"fp64", int(FvPrecision::Fp64)}},
+                         &c.fvPrecision});
     }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Channel)
         enums.push_back({"--wall", {{"isothermal", 1}, {"adiabatic", 0}},
@@ -369,12 +381,14 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         flags.push_back({"--ogrid", &c.ogrid});
         flags.push_back({"--temp", &c.tempFrames});
         flags.push_back({"--thin-seal", &c.thinSeal});
+        flags.push_back({"--fv-coupled-check", &c.fvCoupledCheck});
     }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Channel)
         flags.push_back({"--compensated", &c.compensated});
     if (c.sub == Subcommand::Flame) {
         flags.push_back({"--nscbc-tinflow", &c.nscbcTinflow});
         flags.push_back({"--quiescent", &c.quiescent});
+        flags.push_back({"--hold-flame", &c.holdFlame});
     }
     if (c.sub == Subcommand::Prop) flags.push_back({"--selftest", &c.selftest});
 
@@ -568,7 +582,7 @@ subcommands:
   hit     forced homogeneous isotropic turbulence (SI-configured)
   channel wall-resolved turbulent channel flow (compressible, forced)
   conv    Rayleigh-Bénard convection: heated floor, cooled lid, gravity
-  flame   single-step flames: 1D premixed, 2D slot Bunsen, 2D jet diffusion
+  flame   single-step flames: 1D/3D premixed, 2D/3D slot Bunsen, 2D jet diffusion
   bench   step-time and throughput benchmark
   prop    propeller thrust curve by BEMT or lifting line (host-only, no GPU)
   mesh    read an OpenFOAM polyMesh into a FaceMesh, report its quality
@@ -604,6 +618,43 @@ R"(dns flow — a body in a uniform free stream
 
 usage: dns flow (--body BODY | --scene FILE.toml) [grid] [physics] [far field]
                 [output]
+       dns flow --polymesh CASE [--physics incompressible] [--max-iters N]
+                [--fv-precision fp32|fp64] [--out PREFIX] [--emit stats|none]
+                [--dry-run]
+
+FV PATH (docs/fv.md)
+  --polymesh CASE    an OpenFOAM simpleFoam case directory (CASE/constant/
+                     polyMesh, CASE/0/{U,p[,nut,k,omega,nuTilda]},
+                     CASE/system, CASE/constant/{transportProperties,
+                     turbulenceProperties,MRFProperties}): OpenFOAM v2606's
+                     SIMPLE/SIMPLEC, laminar or RAS (kOmegaSST,
+                     SpalartAllmaras, wall functions), on the IDENTICAL mesh,
+                     on the GPU, gpu/la solvers (U and RAS scalars
+                     BiCGStab + MC-GS, p AMG-PCG). BCs, schemes, controls,
+                     MRF and the forces function object come from the case;
+                     every entry it does not reproduce exactly is rejected by
+                     name (exit 3). Every other flag of dns flow is rejected
+                     with it (exit 2). Writes PREFIX/<iter>/{U,p,phi[,RAS
+                     fields]} in OpenFOAM order and
+                     PREFIX/postProcessing/<forces>/0/{force,moment}.dat.
+  --max-iters N      SIMPLE iterations (default: controlDict endTime/deltaT)
+  --fv-precision P   fp32: fields, matrices, Krylov, AMG in float, every
+                     reduction in FP64; each solve stops at max(fvSolution
+                     tolerance, a MEASURED FP32 floor), relTol unchanged, the
+                     log marks a floor-limited solve (docs/fv.md
+                     "Precision"). fp64: everything in double, solves to the
+                     fvSolution tolerances -- the parity mode.         [fp32]
+  --fv-coupled N     EXPERIMENTAL prototype (plan_perf_5 P0b, docs/fv.md
+                     "Coupled prototype"): after N SIMPLE iterations, coupled
+                     p-U outer iterations on simpleFoam's own fixed-point
+                     residual (FGMRES, SIMPLEC-step preconditioner). Laminar,
+                     needs --fv-precision fp64. Stops when simpleFoam's
+                     initial residuals are at the fvSolution tolerances.
+  --fv-coupled-eta X FGMRES relative tolerance per outer iteration   [0.1]
+  --fv-coupled-alpha A  initial pseudo-time relaxation in (0, 1], ramped to
+                     1 by the residual (SER); 1 = pure Picard            [1]
+  --fv-coupled-check G-JAC: J v vs a frozen-coefficient difference of the
+                     residual at the first coupled iteration
 
 GRID
   --n N              cells along x (streamwise)                    [512]
@@ -1479,7 +1530,7 @@ R"(dns bench — step-time and throughput benchmark
 )";
     case Subcommand::Flame:
         return
-R"(dns flame — single-step flames: 1D planar premixed, a 2D slot Bunsen, or a
+R"(dns flame — single-step flames: 1D/3D premixed, a 2D or 3D slot Bunsen, or a
 2D slot-jet diffusion flame (docs/chem.md)
 
 Compressible DNS of a laminar flame held in an open x box: fresh gas enters
@@ -1503,7 +1554,7 @@ MC-limited MUSCL face value: deliberate, bounded scalar dissipation on the
 species alone (the RANS precedent). The mean flow stays central.
 
   --mode premixed|bunsen|diffusion|candle|chamber
-                       1D planar flame | 2D slot Bunsen | 2D jet diffusion
+                       1D/3D planar flame | 2D/3D slot Bunsen | 2D jet diffusion
                        flame | 2D candle | closed 2D combustion chamber
                        (own sections below)                   [premixed]
   --mach M             flame Mach number S_L/c_u, (0, 0.05]       [0.01]
@@ -1518,12 +1569,52 @@ species alone (the RANS precedent). The mean flow stays central.
   --upstream N         fresh extent in thermal thicknesses, >= 6    [12]
   --downstream N       burnt extent in thermal thicknesses, >= 4    [10]
   --ny N               periodic y cells, >= 4                        [4]
-  --nz 1               the only value (multi-D flames are P2)
+  --nz N               periodic z cells: 1, or >= 8 for a 3D premixed
+                       flame or a 3D slot Bunsen (hz = h); every other
+                       mode: 1 only                                  [1]
   --inflow-speed U     inflow velocity in S_L (1 = a stationary flame) [1]
   --wrinkle A          IC front displacement, delta_th: modes 1..N of the
                        box height, A/sqrt(N) each, phases k^2 golden;
                        0 = planar (seeds Darrieus-Landau in 2D)       [0]
   --wrinkle-modes N    number of seeded modes, [1, ny/8]              [8]
+  --turb U             3D premixed or bunsen (nz >= 8): u'/S_L of synthetic
+                       isotropic turbulence carried in with the fresh gas --
+                       a frozen periodic box (hash-seeded Fourier modes,
+                       E ~ k^4 exp(-2 (k/kp)^2)) swept through the inflow
+                       at the inflow speed (Taylor) and laid on the IC's
+                       fresh gas; bunsen: times the jet weight J(y), swept
+                       at U_jet; 0 = off                              [0]
+  --turb-length L      its integral scale l_t, delta_th; L_y, L_z >= 6 l_t,
+                       l_t >= 4 cells (needs --turb)                [2.5]
+  --seed S             the turbulence box's seed (needs --turb)       [1]
+  --hold-flame         the inflow speed tracks the consumption speed and
+                       holds the fresh-mass thickness integral(rho Y dx) at
+                       its first value: the brush stays put (needs --turb)
+  --frame-start T      no frame before t = T (needs a frame --emit)   [0]
+  --les CS             LES (3D premixed or bunsen, nz >= 8): SGS stress mu_t =
+                       rho (CS Delta)^2 op(grad u) and eddy conductivity
+                       mu_t cp/Pr_t, Pr_t 0.9, plus the species SGS flux
+                       mu_t/Sc_t, Sc_t = Pr_t; needs an explicit --sgs; mu_t
+                       on the open x rows is copied from the neighbour row;
+                       0 = DNS                                         [0]
+  --sgs smag|sigma     the SGS operator (needs --les). sigma (C 1.35) is
+                       exactly 0 on a laminar flame's 1D dilatation;
+                       Smagorinsky's |S| is not
+  --tfles F            thickened flame (premixed, bunsen; any nz), F >= 1:
+                       species/energy diffusivity F E (mu/Pr, kappa) +
+                       (1 - Omega) mu_t (1/Sc_t, cp/Pr_t), rate (E/F) omega;
+                       F = 1 + (F_max - 1) Omega per cell; the IC is the
+                       oracle thickened by F. Needs F --cells-per-delta >= 4
+                       (warns below 6); 0 = off                        [0]
+  --tfles-sensor dynamic|uniform
+                       Omega: tanh(50 w_s/w_s,max) of the rate at Ta/2,
+                       spread 2.5 F delta_th toward colder gas (T-gated
+                       max filter) | 1 everywhere (needs --tfles) [dynamic]
+  --efficiency none|charlette
+                       E: 1 | Charlette, Meneveau & Veynante 2002 (static
+                       beta 0.5, delta_L = delta_th) on Colin's u'_Delta =
+                       2 h^3 |lap curl u| (Delta/h)^(1/3); charlette needs
+                       --les (needs --tfles)   [charlette with --les, else none]
   --nscbc-etain E      inflow relax stiffness, as dns flow         [100]
   --nscbc-sink N       sink band per open face, cells; 0 = off      [16]
   --nscbc-sink-amp A   sink strength, (0, 2]                         [1]
@@ -1532,7 +1623,9 @@ species alone (the RANS precedent). The mean flow stays central.
   --dt-recompute N     steps between dt recomputations             [16]
   --profile-dt DT      <out>_profiles.csv x-profile dump interval
                        (t,x,T,rho,u,p,Y,omega); 0 = off               [0]
-  --emit png|web|bin|shm  frames: temp (T - Tu), fuel (Y), omega
+  --emit png|web|bin|shm|volume|slices
+                       frames: temp (T - Tu), fuel (Y), omega; nz > 1 adds
+                       vort (|curl u|) and speed (|u|)
   --fdt/--pdt/--wdt    frame cadences as in dns flow
 
   Rejected by name: --re, --ft (use --tt), --n (use --cells-per-delta),
@@ -1571,7 +1664,16 @@ of omega over rho_u Y_u), SLdisp (u_in - dx_f/dt), xf (mid-temperature
 crossing), dth ((Tb - Tu)/max dT/dx), Tmax, mass, energy (E + q rho Y),
 omegaEdge (max omega in the sink bands / max omega), yHits (cells with Y
 outside [-1e-6, 1 + 1e-6], counted, never clamped), yMin, yMax.
-Exit 8 when the flame drifts within band + 2 delta_th of either face.
+At nz > 1 (dth is then the plane-mean brush thickness) appended: area
+(integral of |grad c| / (L_y L_z): the flame-surface ratio A_T/A), I0 =
+SL/area, uPrime (sqrt of the mean component variance over x_f - 3 l_t ..
+x_f - 1.5 l_t; l_t = delta_th without --turb), uInflow (the inflow target),
+xFresh (integral of rho Y dx: d/dt = u_in - SL), xLead (first plane-mean
+c >= 0.05). Exit 8 when the flame drifts within band + 2 delta_th of either
+face; at nz > 1 also when xLead comes within delta_th of the inflow band.
+With --tfles (any mode that takes it) appended: Ebar (the Omega-weighted
+mean efficiency E) and FEmax (the largest F E); SL is then the consumption
+speed of the thickened rate (E/F) omega, i.e. resolved area x E x S_L.
 Bunsen: t, dt, dtChem, xTip, xBase (the Tmid isotherm on the axis / the
 lowest burning flank row), tanA, tanL, tanR, rms (least squares of the flank
 over the middle half of the cone), sinRatio (sin(alpha) U_jet / S_L; 1 =
@@ -1580,6 +1682,12 @@ mFlank (rho u.n at the flank isotherm), burn, fuelIn (the inflow face's
 rho u Y), fuelNom, burnRatio, Tmax, mass, energy, yHits, yMin, yMax, uJet.
 Exit 8 when the cone is not anchored: flash-back, blow-through, the base
 lifting past half the tip height, or fewer than 4 burning flank rows.
+3D bunsen (--nz >= 8): the cone columns are measured on the span (z) means
+(Tmax stays the pointwise peak; SLflank per unit span) and appended: ST
+(burn / the span-mean cone area 2 hypot(xTip - xBase, W/2) L_z), area
+(integral |grad c| / that area) and I0 = ST/area; frames add vort and speed.
+With --turb the IC cone and the --length bound use Damkoehler's S_T = 1 +
+u'/S_L (an upper estimate: the real cone is taller).
 
 DIFFUSION (--mode diffusion). Non-premixed: F + s O -> (1+s) P, omega =
 A rho^2 Y_F Y_O e^(-Ta/T), Y_F and Y_O carried with ONE MC limiter shared by

@@ -32,6 +32,14 @@ Semantic notes, i.e. the places where 1:1 needed a check rather than a typedef:
   cuFFT namesakes (`gpu/poisson.hip`'s `PeriodicXZWallY` plans and
   `gpu/nscbc_modal.hip`'s memory report).
 - `HIPFFT_FORWARD`/`HIPFFT_BACKWARD` are -1/+1 in both.
+- `hipMemcpyAsync` / `hipMemsetAsync` (gpu/la, the FV path) are always called
+  on stream 0, the legacy default stream in both runtimes: ordered with every
+  kernel launch, no host wait.
+- FP contraction: hipcc fuses only where `-ffp-contract=fast-honor-pragmas`
+  allows and honours `#pragma clang fp contract(off)`; nvcc's `--fmad` ignores
+  the pragma. Where a kernel must keep two roundings (gpu/la
+  `kProlongAddScaled`), the product is spelled `__dmul_rn`, which both
+  runtimes provide.
 - The headers must stay compilable by the plain HOST compiler: `dns_main.cpp`
   and the `test_gpu_*.cpp` tests are CXX TUs that include `gpu/device_util.hpp`
   and hence `hip/hip_runtime.h`. `cuda_runtime.h` is host-safe; `cub.cuh` is
@@ -59,6 +67,12 @@ Semantic notes, i.e. the places where 1:1 needed a check rather than a typedef:
   from host code, which is exactly what a transform iterator does. Reduction
   inputs are named functors (`PlainSum`, `PlainSum64`, ...); keep them that way
   and `--extended-lambda` stays unnecessary.
+- **A plain `constexpr` function is host-only to nvcc** (hipcc makes it
+  host+device implicitly). Called from a kernel it is a hard error
+  (`calling a constexpr __host__ function ... from a __global__ function`);
+  mark it `DNS_HD`, never pass `--expt-relaxed-constexpr`. Found 2026-10-29
+  (CUDA 13.3) in `dns/rans.hpp` `sstCdFloor` / `sstGamma1/2`, the only
+  error in a full CUDA build of `dns_gpu`.
 - FP64 runs at 1/32 rate on consumer GeForce. The fields are FP32 and only the
   reductions are FP64, so this shows up as a modest per-step tax rather than a
   wall: 11.1 ms/step at 128³ on the RTX 3070.

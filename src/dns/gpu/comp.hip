@@ -943,6 +943,13 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
         sv.ambientHi = sp_.ambientHi ? 1 : 0;
         sv.omega = omega_.data();
         sv.solid = sp_.solid;
+        // LES: the SGS species flux on the stage's own mu_t (nutp, imaged);
+        // TFLES: F E and the sensor (their own instantiations).
+        sv.nut = nutp;
+        sv.invSct = Real(sp_.testInvSct > 0 ? sp_.testInvSct : 1.0 / prt_);
+        sv.kapLes = kapLes;
+        sv.FE = sp_.tflesFE;
+        sv.Om = sp_.tflesOm;
         species::stage(g_, vv, q, cmb, *sc, sv, out);
     }
     if (rhsHook_) rhsHook_(s, out, cmb);
@@ -954,7 +961,7 @@ void DeviceComp::chemCellPass(const DeviceCompState& s)
     Real* Y[kMaxY] = {ycache_[0].data(), ycache_[1].data(), ycache_[2].data(),
                       ycache_[3].data()};
     species::cellPass(g_, s, T_.data(), Real(sp_.lnA), Real(sp_.Ta), sp_.fuel,
-                      sp_.ox, Y, omega_.data());
+                      sp_.ox, Y, omega_.data(), sp_.tflesEoF);
 }
 
 void DeviceComp::updateChem(const DeviceCompState& s)
@@ -994,10 +1001,14 @@ void DeviceComp::speciesInflowPin(DeviceCompState& out) const
 
 std::expected<void, hipError_t> DeviceComp::enableSpecies(const SpeciesSetup& s)
 {
-    assert(!curvilinear() && !rans() && !compensated_ && !les() && !mrf_);
+    assert(!curvilinear() && !rans() && !compensated_ && !mrf_);
     assert(s.nY >= 1 && s.nY <= kMaxY && s.fuel >= 0 && s.fuel < s.nY &&
            s.invPr > 0 && s.Ta >= 0 && s.ox < s.nY && s.ox != s.fuel &&
            s.stoich > 0);
+    // LES species and TFLES: premixed, no immersed wall (their own kernel
+    // instantiations exist only there).
+    assert(!(les() || s.tflesFE) || (s.ox < 0 && !s.solid));
+    assert(!s.tflesFE == !s.tflesEoF && !s.tflesFE == !s.tflesOm);
     const std::size_t n = g_.size();
     for (int k = 0; k < s.nY; ++k) {
         auto b = DeviceScalar::make(n);

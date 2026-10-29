@@ -9,17 +9,23 @@
 namespace dns::gpu::species {
 namespace {
 
+// Thick: the thickened flame's rate (E/F) omega, eof the per-cell E/F of
+// gpu/tfles (its own instantiation; false is the shipped kernel).
+template <bool Thick = false>
 __global__ void kChemCellPass(GpuGrid g, int nY, const Real* rho,
                               SpeciesCombine ys, const Real* T, Real lnA,
                               Real Ta, int fuel, Real* Y0, Real* Y1, Real* Y2,
-                              Real* Y3, Real* omega)
+                              Real* Y3, Real* omega, const Real* eof)
 {
     const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= g.size()) return;
     Real* Y[kMaxY] = {Y0, Y1, Y2, Y3};
     const Real r = rho[c];
     for (int k = 0; k < nY; ++k) Y[k][c] = ys.ya[k][c] / r;
-    omega[c] = arrheniusRate(lnA, Ta, r, Y[fuel][c], T[c]);
+    if constexpr (Thick)
+        omega[c] = arrheniusRate(lnA, Ta, r, Y[fuel][c], T[c]) * eof[c];
+    else
+        omega[c] = arrheniusRate(lnA, Ta, r, Y[fuel][c], T[c]);
 }
 
 // The two-reactant cell pass (SpeciesSetup::ox >= 0): arrheniusRate2.
@@ -102,6 +108,46 @@ __device__ inline Real faceY(const Real* Y, const Face& f, Real mdot,
     return mdot * yf - rhoD * (Y[f.R] - Y[f.L]) / h;
 }
 
+// The effective species rho D of an interior face (Diff != Molecular):
+// Eddy  rho D + nut_f / Sc_t (the LES sub-grid flux, nut_f = faceFlux's own
+//       face mean of mu_t);
+// Thick FE_f rho D + (1 - Om_f) nut_f / Sc_t (no SGS flux where the sensor
+//       thickens; nut null = no LES), FE_f, Om_f arithmetic face means.
+template <int Diff>
+__device__ inline Real effRhoD(const SpeciesView& sv, const Face& f, Real rhoD)
+{
+    if constexpr (Diff == int(SpeciesDiff::Eddy)) {
+        return rhoD + Real(0.5) * (sv.nut[f.L] + sv.nut[f.R]) * sv.invSct;
+    } else {
+        Real r = Real(0.5) * (sv.FE[f.L] + sv.FE[f.R]) * rhoD;
+        if (sv.nut) {
+            const Real om = Real(0.5) * (sv.Om[f.L] + sv.Om[f.R]);
+            r += (Real(1) - om) * (Real(0.5) * (sv.nut[f.L] + sv.nut[f.R])) *
+                 sv.invSct;
+        }
+        return r;
+    }
+}
+
+// Thick: the energy flux faceFlux lacks on an interior face L | R, so the
+// conductivity becomes FE kappa + (1 - Om) nut cp/Pr_t:
+//   -(FE_f - 1) kappa_f dT/dn + Om_f nut_f (cp/Pr_t) dT/dn,
+// kappa_f with faceFlux's own Sutherland face ratio. An additive flux, so the
+// correction is conservative and faceFlux is untouched.
+__device__ inline Real thickEnergyFlux(ViscView vv, PrimView q,
+                                       const SpeciesView& sv, const Face& f,
+                                       Real h)
+{
+    Real kapf = vv.kappa;
+    if (vv.sutherland) kapf *= vv.ratio(Real(0.5) * (q.T[f.L] + q.T[f.R]));
+    const Real dTn = (q.T[f.R] - q.T[f.L]) / h;
+    Real fl = -(Real(0.5) * (sv.FE[f.L] + sv.FE[f.R]) - Real(1)) * kapf * dTn;
+    if (sv.nut)
+        fl += Real(0.5) * (sv.Om[f.L] + sv.Om[f.R]) *
+              (Real(0.5) * (sv.nut[f.L] + sv.nut[f.R])) * sv.kapLes * dTn;
+    return fl;
+}
+
 // The two faces of cell c along axis a, both as L | R pairs.
 __device__ inline void cellFaces(const GpuGrid& g, int i, int a, int open,
                                  std::size_t c, const Offsets& o,
@@ -117,8 +163,11 @@ __device__ inline void cellFaces(const GpuGrid& g, int i, int a, int open,
 // Row: per-row inflow fractions (SpeciesView::yInRow); its own instantiation,
 // so the uniform-inflow kernel is the shipped code. kSolid: the immersed-wall
 // instantiation (SpeciesSetup::solid); false is the kernel as it was before
-// walls existed. Row && kSolid is not instantiated.
-template <bool Row, bool kSolid>
+// walls existed. Row && kSolid is not instantiated. Diff (SpeciesDiff): the
+// interior faces' rho D (effRhoD) and, Thick, the energy correction flux and
+// its divergence added with the heat release; Molecular is the shipped
+// kernel. kSolid && Diff != Molecular is not instantiated.
+template <bool Row, bool kSolid, int Diff = 0>
 __global__ void kSpeciesStage(GpuGrid g, ViscView vv, PrimView q,
                               StageCombine cmb, SpeciesCombine sc,
                               SpeciesView sv, Real* oy0, Real* oy1, Real* oy2,
@@ -143,6 +192,7 @@ __global__ void kSpeciesStage(GpuGrid g, ViscView vv, PrimView q,
     const Offsets o2 = offsets2At(g, i, j, k);
     const Real* uc[3] = {q.u, q.v, q.w};
     Real div[kMaxY] = {Real(0), Real(0), Real(0), Real(0)};
+    [[maybe_unused]] Real dEc = Real(0); // Thick: the energy correction
     for (int a = 0; a < 3; ++a) {
         const Real h = a == 0 ? g.hx : a == 1 ? g.hy : g.hz;
         Face fh, fl;
@@ -165,8 +215,17 @@ __global__ void kSpeciesStage(GpuGrid g, ViscView vv, PrimView q,
         const Real mo = q.rho[c] * q.u[c];
         const Real mh = openHi ? mo : faceMdot(q, uc[a], fh);
         const Real ml = openLo ? mo : faceMdot(q, uc[a], fl);
-        const Real dh = openHi ? Real(0) : faceRhoD(vv, q, sv.invPr, fh);
-        const Real dl = openLo ? Real(0) : faceRhoD(vv, q, sv.invPr, fl);
+        Real dh = openHi ? Real(0) : faceRhoD(vv, q, sv.invPr, fh);
+        Real dl = openLo ? Real(0) : faceRhoD(vv, q, sv.invPr, fl);
+        if constexpr (Diff != int(SpeciesDiff::Molecular)) {
+            if (!openHi) dh = effRhoD<Diff>(sv, fh, dh);
+            if (!openLo) dl = effRhoD<Diff>(sv, fl, dl);
+        }
+        if constexpr (Diff == int(SpeciesDiff::Thick)) {
+            const Real eh = openHi ? Real(0) : thickEnergyFlux(vv, q, sv, fh, h);
+            const Real el = openLo ? Real(0) : thickEnergyFlux(vv, q, sv, fl, h);
+            dEc -= (eh - el) / h;
+        }
         for (int s = 0; s < sv.nY; ++s) {
             const Real* Y = sv.Y[s];
             Real yin = sv.yIn[s];
@@ -191,7 +250,10 @@ __global__ void kSpeciesStage(GpuGrid g, ViscView vv, PrimView q,
         const Real r = s == sv.fuel ? div[s] - om : div[s];
         out[s][c] = cmb.ca * sc.ya[s][c] + cmb.cb * sc.yb[s][c] + cr * r;
     }
-    oE[c] += cr * (sv.q * om);
+    if constexpr (Diff == int(SpeciesDiff::Thick))
+        oE[c] += cr * (sv.q * om + dEc);
+    else
+        oE[c] += cr * (sv.q * om);
 }
 
 // The shared limiter of face f (two-reactant kernel): theta = min over the
@@ -347,9 +409,10 @@ __global__ void kSpeciesOpenFix(GpuGrid g, PrimView q, StageCombine cmb,
 
 void cellPass(const GpuGrid& g, const DeviceCompState& s, const Real* T,
               Real lnA, Real Ta, int fuel, int ox, Real* const Y[kMaxY],
-              Real* omega)
+              Real* omega, const Real* eof)
 {
     assert(s.nY >= 1 && fuel >= 0 && fuel < s.nY && ox < s.nY && ox != fuel);
+    assert(!eof || ox < 0);
     SpeciesCombine ys;
     for (int k = 0; k < s.nY; ++k) ys.ya[k] = s.y[k].data();
     ys.nY = s.nY;
@@ -360,9 +423,14 @@ void cellPass(const GpuGrid& g, const DeviceCompState& s, const Real* T,
         checkLastKernel("kChemCellPass2");
         return;
     }
-    kChemCellPass<<<launchBlocks(g.size()), blockSize>>>(
-        g, s.nY, s.rho.data(), ys, T, lnA, Ta, fuel, Y[0], Y[1], Y[2], Y[3],
-        omega);
+    if (eof)
+        kChemCellPass<true><<<launchBlocks(g.size()), blockSize>>>(
+            g, s.nY, s.rho.data(), ys, T, lnA, Ta, fuel, Y[0], Y[1], Y[2],
+            Y[3], omega, eof);
+    else
+        kChemCellPass<false><<<launchBlocks(g.size()), blockSize>>>(
+            g, s.nY, s.rho.data(), ys, T, lnA, Ta, fuel, Y[0], Y[1], Y[2],
+            Y[3], omega, nullptr);
     checkLastKernel("kChemCellPass");
 }
 
@@ -375,12 +443,38 @@ void stage(const GpuGrid& g, ViscView vv, PrimView q, const StageCombine& cmb,
     for (int s = 0; s < sv.nY; ++s) row = row || sv.yInRow[s] != nullptr;
     // The walled kernel is premixed and uniform-inflow only (the chamber).
     assert(!sv.solid || (!row && sv.ox < 0));
+    // The eddy / thickened instantiations: premixed, no wall.
+    const SpeciesDiff diff = sv.FE    ? SpeciesDiff::Thick
+                             : sv.nut ? SpeciesDiff::Eddy
+                                      : SpeciesDiff::Molecular;
+    assert(diff == SpeciesDiff::Molecular || (!sv.solid && sv.ox < 0));
+    assert(diff != SpeciesDiff::Thick || (sv.Om && sv.FE));
     auto launch = [&](auto r, auto solid) {
         kSpeciesStage<decltype(r)::value, decltype(solid)::value>
             <<<launchBlocks(g.size()), blockSize>>>(
                 g, vv, q, cmb, sc, sv, out.y[0].data(), out.y[1].data(),
                 out.y[2].data(), out.y[3].data(), out.E.data());
     };
+    auto launchD = [&](auto r, auto d) {
+        kSpeciesStage<decltype(r)::value, false, decltype(d)::value>
+            <<<launchBlocks(g.size()), blockSize>>>(
+                g, vv, q, cmb, sc, sv, out.y[0].data(), out.y[1].data(),
+                out.y[2].data(), out.y[3].data(), out.E.data());
+    };
+    using Eddy = std::integral_constant<int, int(SpeciesDiff::Eddy)>;
+    using Thick = std::integral_constant<int, int(SpeciesDiff::Thick)>;
+    if (diff == SpeciesDiff::Eddy) {
+        if (row) launchD(std::true_type{}, Eddy{});
+        else launchD(std::false_type{}, Eddy{});
+        checkLastKernel("kSpeciesStage<Eddy>");
+        return;
+    }
+    if (diff == SpeciesDiff::Thick) {
+        if (row) launchD(std::true_type{}, Thick{});
+        else launchD(std::false_type{}, Thick{});
+        checkLastKernel("kSpeciesStage<Thick>");
+        return;
+    }
     auto launch2 = [&](auto r, auto amb) {
         kSpeciesStage2<decltype(r)::value, decltype(amb)::value>
             <<<launchBlocks(g.size()), blockSize>>>(

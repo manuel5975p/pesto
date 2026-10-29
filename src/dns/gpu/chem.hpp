@@ -27,6 +27,15 @@ inline constexpr double kChemDt = 0.5;
 double chemStableDt(const DeviceComp& d, const DeviceCompState& s,
                     ReduceScratch& r);
 
+// The thickened flame's diffusive dt bound (dns flame --tfles): 0.25 h^2
+// rho_min / (diffusivityFactor (mu(T_max) max FE + max mu_t)) -- stableDt's
+// thermal form with the species/energy diffusivity F E mu + mu_t (FP64
+// reductions; mu_t only with LES). stableDt stays byte-identical; the
+// runner takes the min. Pre: fe = the DeviceTfles FE field of s (g.size());
+// d.les() => d.mut() holds s's mu_t (stableDt(s) just ran).
+double tflesStableDt(const DeviceComp& d, const DeviceCompState& s,
+                     const DeviceScalar& fe, ReduceScratch& r);
+
 // Deterministic FP64 per-x-column sums over (j, k), one thread per column,
 // fixed order: out[i * kFlameSums + q] for q =
 //   0 rho, 1 rho u, 2 T, 3 rho Y_fuel, 4 omega, 5 E + q rho Y_fuel, 6 u, 7 p,
@@ -38,5 +47,14 @@ inline constexpr int kFlameSums = 11;
 hipError_t flameColumnStats(const DeviceComp& d, const DeviceCompState& s,
                             DeviceBuffer<double>& scratch,
                             std::vector<double>& host);
+
+// The 3D flame's per-x-column sums (nz > 1 stats), same contract and order as
+// flameColumnStats: out[i * kTurbSums + q] for q = 0..2 sum u, v, w; 3..5 sum
+// u^2, v^2, w^2; 6 sum |grad Y_fuel| (central, wrap in y and z, 0 on the
+// open x rows i = 0, nx - 1) -- the co-area integrand of the flame surface.
+// Pre: d.updateChem(s) ran (primitives and the Y cache are live).
+inline constexpr int kTurbSums = 7;
+hipError_t turbColumnStats(const DeviceComp& d, DeviceBuffer<double>& scratch,
+                           std::vector<double>& host);
 
 } // namespace dns::gpu

@@ -27,6 +27,7 @@
 #include "dns/prop/bemt.hpp"
 #include "dns/prop/liftline.hpp"
 #include "dns/rans_label.hpp"
+#include "dns/fvsimple.hpp"
 #include "dns/remap.hpp"
 #include "dns/scene.hpp"
 #include "dns/taylor_green.hpp"
@@ -44,6 +45,7 @@
 #include "dns/gpu/runner_channel.hpp"
 #include "dns/gpu/runner_conv.hpp"
 #include "dns/gpu/runner_flame.hpp"
+#include "dns/gpu/runner_fv.hpp"
 #include "dns/gpu/runner_chamber.hpp"
 #include "dns/gpu/runner_rb.hpp"
 #include "dns/gpu/comp.hpp"
@@ -113,6 +115,7 @@ RunOutput::Config outputConfig(const Case& c, const std::string& simJson,
     oc.wdt = c.wdt;
     oc.planesPerAxis = c.planes;
     oc.pngDown = c.pngDown;
+    oc.frameStart = c.frameStart;
     oc.simJson = simJson;
     return oc;
 }
@@ -777,6 +780,36 @@ int runFlowSequenced(const Case& c, const RawConfig& raw, const Scene* scene,
 
 #endif // DNS_WITH_GPU
 
+// dns flow --polymesh CASE (docs/fv.md): Acquire = the OpenFOAM case (exit 3
+// before any device), then the GPU SIMPLE run (gpu/runner_fv).
+int runFvFlow(const Case& c)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    auto L = loadFvCase(c.fvCase);
+    if (!L) return die(exitInput, L.error());
+    if (!haveGpu(c)) return die(exitNoGpu, "no GPU device (dns flow is GPU-only)");
+#if DNS_WITH_GPU
+    if (!c.quiet)
+        std::printf("# FV case read in %.2f s\n%s", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                    describeFoamCase(L->c).c_str());
+    const gpu::FvRunSpec sp{c.outPrefix,
+                            c.fvMaxIters,
+                            c.quiet,
+                            !c.emit.contains(Emit::None),
+                            fvNumerics(c.fvPrecision),
+                            c.fvCoupled,
+                            gpu::FvCoupledOpts{c.fvCoupledEta, c.fvCoupledAlpha, c.fvCoupledCheck}};
+    auto r = gpu::runFvSimple(sp, *L);
+    if (!r) return die(r.error().code, r.error().message);
+    std::printf("done: %ld iterations%s, %.2f ms/iteration\n", r->steps, r->converged ? " (converged)" : "",
+                r->msPerStep);
+    return 0;
+#else
+    (void)t0;
+    return exitNoGpu;
+#endif
+}
+
 int runFlow(const Case& c, [[maybe_unused]] const RawConfig& raw, const Scene* scene)
 {
     // Input before device: a bad mesh is exit 3 on every machine, GPU or not.
@@ -1045,6 +1078,16 @@ int runFlame(const Case& c)
     if (c.flameDiffusion) diffusionIC(c, host, rhoY);
     else if (c.flameBunsen) bunsenIC(c, host, rhoY[0]);
     else flameIC(c, host, rhoY[0]);
+    // --turb: the frozen box (hash-seeded, host FP64), laid on the IC's
+    // fresh gas and handed to the runner for the inflow sweep.
+    std::array<std::vector<double>, 3> turbBoxHost;
+#if DNS_WITH_FFTW
+    if (c.flameTurb > 0) {
+        turbBoxHost = turbBox(flameTurbSpec(c));
+        if (c.flameBunsen) addBunsenTurbulence(c, turbBoxHost, rhoY[0], host);
+        else addTurbulence(c, turbBoxHost, host);
+    }
+#endif
 
     FrameGeometry fg = FrameGeometry::centred(g, 1.0);
     fg.mask.assign(g.size(), 1.0f);
@@ -1177,23 +1220,57 @@ int runFlame(const Case& c)
     rr.dtRecompute = c.dtRecompute;
     rr.profileDt = c.profileDt;
     rr.label = flameRunLabel(c);
+    if (c.flameTurb > 0) {
+        rr.turbBox = std::move(turbBoxHost);
+        rr.turbNbx = c.flameTurbNbx;
+        rr.uPrime = c.flameTurb;
+        rr.lt = c.flameTurbL;
+        rr.hold = c.flameHold;
+    }
+    // Flame LES and TFLES (docs/chem.md, "LES species and TFLES").
+    if (c.lesLabel) {
+        rr.csLes = c.cs;
+        rr.sgs = c.sgsModel;
+    }
+    if (c.flameTfles > 0) {
+        rr.tflesOn = true;
+        TflesSetup& ts = rr.tfles;
+        ts.F = c.flameTfles;
+        ts.uniform = c.flameTflesUniform;
+        ts.charlette = c.flameCharlette;
+        ts.deltaL = c.flameEig.dthOverDD;
+        ts.nuU = c.prandtl; // mu = Pr, rho_u = 1
+        const double thetaS = kTflesTaFraction * c.flameModel.theta();
+        ts.TaS = thetaS * Tu;
+        ts.lnAs = -tflesSensorLogMax(sig, thetaS);
+        ts.dilate = c.flameTflesDilate;
+    }
     if (c.flameBunsen) {
         // The slot burner: per-row inflow (dns/bunsen.hpp) and p = p0 at the
         // outflow (the cone's pressure jump is O(M^2) of p0, not the 1D one).
         rr.bunsen = true;
         rr.geom = c.bunsen;
         rr.pB = Tu;
-        for (int j = 0; j < g.ny; ++j) {
-            const BunsenInflowRow in = bunsenInflow(c.bunsen, (j + 0.5) * g.hy);
-            const double T = Tu * in.t, rho = Tu / T; // p0 = Tu, R = 1
-            rr.rowU.push_back(in.u);
-            rr.rowJet.push_back(in.jet);
-            rr.rowTarget.push_back(c.nscbcThermalInflow ? 1.0 / (kRgasBox * T)
-                                                        : rho);
-            rr.rowRho.push_back(rho);
-            rr.rowY.push_back(in.Y);
-        }
+        // Rows at j + ny k: the z-invariant slot repeated over the span.
+        for (int k = 0; k < g.nz; ++k)
+            for (int j = 0; j < g.ny; ++j) {
+                const BunsenInflowRow in =
+                    bunsenInflow(c.bunsen, (j + 0.5) * g.hy);
+                const double T = Tu * in.t, rho = Tu / T; // p0 = Tu, R = 1
+                rr.rowU.push_back(in.u);
+                rr.rowJet.push_back(in.jet);
+                rr.rowTarget.push_back(
+                    c.nscbcThermalInflow ? 1.0 / (kRgasBox * T) : rho);
+                rr.rowRho.push_back(rho);
+                rr.rowY.push_back(in.Y);
+            }
         rr.sp.yInRow[0] = rr.rowY;
+        // --turb: the inflow sees the box times the jet weight J(y) (the
+        // coflow stays laminar); the IC's own field took Y (above).
+        if (c.flameTurb > 0)
+            for (auto& comp : rr.turbBox)
+                for (std::size_t q = 0; q < comp.size(); ++q)
+                    comp[q] *= rr.rowJet[q / std::size_t(rr.turbNbx)];
     }
 
     auto res = gpu::runFlame(g, host, std::span(rhoY, 1), rr, *out);
@@ -1785,6 +1862,12 @@ int main(int argc, char** argv)
         // Phase 1.5 for `dns mesh` (the --scene precedent): the manifest
         // names the input file's facts, read without bulk data.
         if (c->sub == Subcommand::Mesh) return runMeshManifest(*c);
+        if (c->sub == Subcommand::Flow && !c->fvCase.empty()) {
+            auto fc = loadFoamCaseManifest(c->fvCase);
+            if (!fc) return die(exitInput, fc.error());
+            std::fputs(describeFoamCase(*fc).c_str(), stdout);
+            return 0;
+        }
         return 0;
     }
 
@@ -1801,7 +1884,9 @@ int main(int argc, char** argv)
     // Phases 3 and 4.
     switch (c->sub)
     {
-    case Subcommand::Flow: return runFlow(*c, *raw, scene ? &*scene : nullptr);
+    case Subcommand::Flow:
+        if (!c->fvCase.empty()) return runFvFlow(*c);
+        return runFlow(*c, *raw, scene ? &*scene : nullptr);
     case Subcommand::Tgv: return runTgv(*c);
     case Subcommand::Hit: return runHit(*c);
     case Subcommand::Bench: return runBench(*c);

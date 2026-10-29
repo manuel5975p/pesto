@@ -35,6 +35,15 @@ template <int N> struct Dual
         for (int k = 0; k < N; ++k) r.d[k] = a.d[k] * h;
         return r;
     }
+    // a^b for a constant exponent (the FV characteristic far state's
+    // isentropic ratios, dns/fvflux.hpp). Pre: a.v > 0.
+    friend DNS_HD Dual pow(const Dual& a, double b)
+    {
+        Dual r(::pow(a.v, b));
+        const double h = b * r.v / a.v;
+        for (int k = 0; k < N; ++k) r.d[k] = a.d[k] * h;
+        return r;
+    }
 };
 
 template <int N> DNS_HD inline Dual<N> operator+(Dual<N> a, const Dual<N>& b)

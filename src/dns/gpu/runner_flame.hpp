@@ -18,8 +18,11 @@
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/run_result.hpp"
 #include "dns/output.hpp"
+#include "dns/sgs.hpp"
+#include "dns/tfles.hpp"
 #include "dns/transport.hpp"
 
+#include <array>
 #include <expected>
 #include <span>
 #include <string>
@@ -79,7 +82,58 @@ struct FlameRun
     // normalised by the ambient column's mean. quiescent: no flame guard.
     bool candle = false, quiescent = false;
     double gravity = 0, hydroLo = 0, hydroHi = 0;
+
+    // 3D premixed in turbulence (--turb; docs/chem.md, "3D and turbulence").
+    // turbBox = turbBox(flameTurbSpec) (turbNbx x ny x nz, i fastest); empty
+    // = no turbulent inflow, the laminar runner bit for bit. Each step the
+    // inflow face samples the box at the swept distance X = sum u_in dt
+    // (gpu/flame_turb.hpp -> DeviceCompNscbc::setTurbulentInflow). uPrime and
+    // lt (box units) set the uPrime stats slab and the frame scales. hold: the
+    // inflow-speed controller (kHold*) holding the fresh-mass thickness at its
+    // first-row value. At nz > 1 the stats append area, I0, uPrime, uInflow,
+    // xFresh, xLead, the frames add vort, speed, and exit 8 fires when the
+    // brush's leading edge reaches the inflow band (flash-back).
+    // Bunsen at nz > 1 (docs/chem.md, "3D turbulent slot Bunsen"): rows at
+    // j + ny k; turbBox is the box times the row's jet weight J (dns_main);
+    // the sweep runs at U_jet (+ pulse); the cone is measured on span-mean
+    // fields; stats append ST, area, I0; frames add vort, speed.
+    std::array<std::vector<double>, 3> turbBox;
+    int turbNbx = 0;
+    double uPrime = 0, lt = 0;
+    bool hold = false;
+
+    // LES (--les CS --sgs M; premixed, nz > 1; docs/chem.md, "LES species and
+    // TFLES"): the SGS stress and eddy conductivity of DeviceComp, the species
+    // SGS flux mu_t/Sc_t (Sc_t = Pr_t), and mu_t on the open x rows copied
+    // from their neighbours (mutCopyOpenXHook). csLes == 0 = the DNS runner
+    // bit for bit.
+    double csLes = 0;
+    SgsModel sgs = SgsModel::Sigma;
+    // TFLES (--tfles F): gpu/tfles updated from each step's input state, its
+    // F E, E/F, Omega handed to the species kernels; the diffusive dt bound
+    // tflesStableDt min-ed in; stats append Ebar (the Omega-weighted mean E)
+    // and FEmax. false = the runner bit for bit.
+    bool tflesOn = false;
+    TflesSetup tfles;
 };
+
+// --hold-flame: at every stats row u_in <- S_ema - (x_I - x_I0)/kHoldTau,
+// x_I = integral of rho Y dx / (rho_u Y_u) the fresh-mass thickness (exactly
+// dx_I/dt = u_in - S_c: inflow minus consumption, whatever the brush's
+// shape), x_I0 its first-row value, S_ema the consumption speed's moving
+// average over kHoldEmaTau. Rate-limited to kHoldMaxRate * (time since the
+// last row), clamped to [kHoldUMin, kHoldUMax]. Units: flame times, S_L.
+// MEASURED (2026-10-29, u'_in 4, 6 cells): holding the plane-mean T crossing
+// x_f instead failed -- the brush skewed, x_f moved DOWNSTREAM while S_c rose
+// 2.2 -> 3, the controller cut u_in to 1.16 and the leading edge flashed back
+// into the inflow band (S_c 8, I0 2.2). Constants chosen, not bracketed.
+inline constexpr double kHoldTau = 2.0;
+inline constexpr double kHoldEmaTau = 1.0;
+inline constexpr double kHoldMaxRate = 1.0;
+inline constexpr double kHoldUMin = 0.5, kHoldUMax = 10.0;
+// The 3D flash-back guard: exit 8 when the plane-mean progress c = (T - Tu)/
+// (Tb - Tu) first reaches kLeadC within one delta_th of the inflow band.
+inline constexpr double kLeadC = 0.05;
 
 // `ic` + `rhoY` (one vector per species, sp.nY of them) from flameIC (1D),
 // bunsenIC or diffusionIC. 1D: exit 8 when the flame drifts within band + 2

@@ -10,7 +10,9 @@
 #include "dns/remap.hpp"
 #include "dns/scene.hpp"
 #include "dns/steady_stop.hpp"
+#include "dns/tfles.hpp"
 #include "dns/transport.hpp"
+#include "dns/turb_ic.hpp"
 #include "dns/units.hpp"
 
 #include <algorithm>
@@ -987,6 +989,154 @@ std::optional<ConfigError> chamberFlagScope(const RawConfig& r, bool chamber)
                        "only applies to --mode chamber");
 }
 
+// The 3D-turbulence flags exist for --mode premixed and bunsen (docs/chem.md,
+// "3D and turbulence", "3D turbulent slot Bunsen"); every other mode rejects
+// them by name. --hold-flame (the planar brush's inflow control) is
+// premixed-only: the slot burner's jet speed is the experiment.
+std::optional<ConfigError> turbFlagScope(const RawConfig& r, bool premixed,
+                                         bool bunsen)
+{
+    if (premixed) return std::nullopt;
+    if (bunsen)
+        return rejectGiven(r, {"--hold-flame"},
+                           "only applies to --mode premixed (the slot "
+                           "burner's jet speed is fixed)");
+    return rejectGiven(r, {"--turb", "--turb-length", "--hold-flame", "--seed"},
+                       "only applies to --mode premixed and bunsen (3D, --nz "
+                       ">= 8)");
+}
+
+// --turb on a validated flame box (c.grid, c.flameCells set): the l_t bounds
+// (>= 4 cells, <= L/6 of both periodic axes), the Mach bound on uMax + 3 u'
+// (uName names uMax in the message), then c.flameTurb, flameTurbL,
+// flameTurbNbx (= nz: L_bx = L_z) and the h/eta warning. Pre: r.turb > 0.
+std::optional<ConfigError> flameTurbSetup(const RawConfig& r, Case& c,
+                                          double uMax, const char* uName)
+{
+    assert(r.turb > 0);
+    const double dth = c.flameEig.dthOverDD, h = dth / c.flameCells;
+    const double lt = r.turbLength * dth;
+    if (!(std::isfinite(r.turbLength) && lt >= 4 * h))
+        return err(2, "--turb-length",
+                   std::format("must be >= 4 cells ({:.4g} thermal "
+                               "thicknesses at --cells-per-delta {:g})",
+                               4.0 / c.flameCells, c.flameCells));
+    // kp/k0 = 0.40 L/l_t: 6 l_t puts the spectral peak on the 2.4th
+    // lattice shell of the shortest periodic axis.
+    const int ny = c.grid.ny, nz = c.grid.nz;
+    if (ny * h < 6 * lt || nz * h < 6 * lt)
+        return err(2, "--turb-length",
+                   std::format("must be <= L/6 of both periodic axes "
+                               "({:.4g} thermal thicknesses: --ny {} "
+                               "--nz {} at --cells-per-delta {:g})",
+                               std::min(ny, nz) * h / (6 * dth), ny, nz,
+                               c.flameCells));
+    const double uM = uMax + 3 * r.turb;
+    if (uM * c.mach > 0.3)
+        return err(2, "--turb", std::format("the fresh gas Mach M ({} + 3 "
+                                            "u') = {:.3g} exceeds 0.3",
+                                            uName, uM * c.mach));
+    c.flameTurb = r.turb;
+    c.flameTurbL = lt;
+    c.flameTurbNbx = nz; // L_bx = L_z
+    const TurbNumbers tn = turbNumbers(r.turb, lt, c.prandtl, dth);
+    if (h / tn.eta > 2 && !c.lesLabel)
+        c.warnings.push_back(std::format(
+            "h/eta = {:.3g} at the inflow (Re_t = {:.3g}): the "
+            "velocity field is under-resolved -- not a DNS",
+            h / tn.eta, tn.ReT));
+    return std::nullopt;
+}
+
+// LES species and the thickened flame (docs/chem.md, "LES species and
+// TFLES") exist for --mode premixed and bunsen; diffusion, candle and
+// chamber reject every flag of it by name.
+std::optional<ConfigError> lesTflesFlagScope(const RawConfig& r, bool premixed)
+{
+    if (premixed) return std::nullopt;
+    return rejectGiven(r, {"--les", "--sgs", "--tfles", "--tfles-sensor",
+                           "--efficiency"},
+                       "only applies to --mode premixed and bunsen (LES "
+                       "species and the thickened flame are premixed-only)");
+}
+
+// Flame LES (--les, --sgs) and TFLES (--tfles, --tfles-sensor,
+// --efficiency) into c.cs/sgsModel/lesLabel and c.flameTfles*. Runs after the
+// --nz rules; the resolution rule (F --cells-per-delta >= 4) and the
+// dilation radius are the caller's (they need the grid). Pre: premixed or
+// bunsen.
+std::optional<ConfigError> flameLesTfles(const RawConfig& r, Case& c,
+                                         bool bunsen)
+{
+    if (!(std::isfinite(r.les) && r.les >= 0))
+        return err(2, "--les", "must be finite and >= 0 (0 = DNS)");
+    if (r.given.contains("--sgs") && r.les == 0)
+        return err(2, "--sgs", "selects the SGS model for --les; give --les CS "
+                               "(> 0) or drop --sgs");
+    if (r.les > 0) {
+        if (r.nz == 1)
+            return err(2, "--les", bunsen
+                                       ? "needs --nz >= 8 (a 3D slot Bunsen): "
+                                         "2D LES is regularized 2D Euler, not a "
+                                         "filtered turbulent field (--tfles "
+                                         "alone thickens the 2D cone)"
+                                       : "needs --nz >= 8 (a 3D premixed "
+                                         "flame): 2D LES is regularized 2D "
+                                         "Euler, not a filtered turbulent "
+                                         "field");
+        if (!r.given.contains("--sgs"))
+            return err(2, "--les", "needs an explicit --sgs in dns flame: "
+                                   "--sgs sigma --les 1.35 recommended -- "
+                                   "D_sigma is exactly 0 on a laminar flame's "
+                                   "1D dilatation, Smagorinsky's |S| is not "
+                                   "(it diffuses a laminar flame)");
+        c.cs = r.les;
+        c.sgsModel = r.sgs;
+        c.lesLabel = true;
+    }
+    if (!(std::isfinite(r.tfles) && (r.tfles == 0 || (r.tfles >= 1 &&
+                                                       r.tfles <= 20))))
+        return err(2, "--tfles", "must be 0 (off) or in [1, 20] (the "
+                                 "thickening factor F)");
+    if (r.tfles == 0) {
+        if (auto e = rejectGiven(r, {"--tfles-sensor", "--efficiency"},
+                                 "needs --tfles F (>= 1)");
+            e)
+            return e;
+        return std::nullopt;
+    }
+    const bool charlette = r.given.contains("--efficiency")
+                               ? r.efficiency == 1
+                               : c.lesLabel;
+    if (charlette && !c.lesLabel)
+        return err(2, "--efficiency", "charlette needs --les (the sub-grid "
+                                      "velocity of a filtered field; without "
+                                      "LES give --efficiency none)");
+    c.flameTfles = r.tfles;
+    c.flameTflesUniform = r.tflesSensor == 1;
+    c.flameCharlette = charlette;
+    return std::nullopt;
+}
+
+// --frame-start (every flame mode): frames begin at T; it needs a frame kind
+// to delay. Pre: c.emit and c.tEnd resolved.
+std::optional<ConfigError> resolveFrameStart(const RawConfig& r, Case& c)
+{
+    if (!r.given.contains("--frame-start")) return std::nullopt;
+    if (!(std::isfinite(r.frameStart) && r.frameStart >= 0 &&
+          r.frameStart < c.tEnd))
+        return err(2, "--frame-start", "must be in [0, --tt)");
+    const bool frames = std::ranges::any_of(c.emit, [](Emit e) {
+        return e == Emit::Bin || e == Emit::Volume || e == Emit::Slices ||
+               e == Emit::Png || e == Emit::Web || e == Emit::Shm;
+    });
+    if (!frames)
+        return err(2, "--frame-start", "needs a frame --emit (bin, volume, "
+                                       "slices, png, web or shm)");
+    c.frameStart = r.frameStart;
+    return std::nullopt;
+}
+
 std::expected<Case, ConfigError> finishChamber(const RawConfig& r, Case c)
 {
     const auto& f = r.chamber;
@@ -1181,15 +1331,34 @@ std::expected<void, ConfigError> bunsenGeometry(const RawConfig& r, Case& c,
                                          "thermal thicknesses at "
                                          "--cells-per-delta {:g})",
                                          1.0 / cells, cells));
-    const double coneH = 0.5 * r.slotWidth *
-                         std::sqrt(r.jetSpeed * r.jetSpeed - 1.0); // delta_th
+    // --turb: the cone of Damkoehler's S_T = S_L (1 + u'/S_L) -- an UPPER
+    // estimate of S_T (a shorter cone), so the IC and the --length bound are
+    // a floor; the run measures its own tip (stats xTip, exit 8 past the
+    // outflow band). Without --turb the laminar cone, as before.
+    const double sT = r.turb > 0 ? damkohlerST(r.turb) : 1.0;
+    if (r.turb > 0 && !(r.jetSpeed > 1.25 * sT))
+        return bad(2, "--turb", std::format(
+                                    "the turbulent flame speed estimate S_T = "
+                                    "S_L (1 + u'/S_L) = {:.4g} leaves no cone "
+                                    "at --jet-speed {:g} (needs U_jet > 1.25 "
+                                    "S_T): lower --turb or raise --jet-speed",
+                                    sT, r.jetSpeed));
+    const double coneH =
+        r.turb > 0
+            ? 0.5 * r.slotWidth *
+                  std::sqrt((r.jetSpeed / sT) * (r.jetSpeed / sT) - 1.0)
+            : 0.5 * r.slotWidth *
+                  std::sqrt(r.jetSpeed * r.jetSpeed - 1.0); // delta_th
     const double len = r.flameLength < 0 ? std::ceil(1.25 * coneH + 8)
                                          : r.flameLength;
     if (!(std::isfinite(len) && len >= coneH + 4))
         return bad(2, "--length", std::format(
-                                      "must be >= the ideal cone height + 4 = "
+                                      "must be >= the {} cone height + 4 = "
                                       "{:.4g} thermal thicknesses (the tip "
                                       "and its burnt gas must fit)",
+                                      r.turb > 0 ? "turbulent (Damkoehler "
+                                                   "S_T)"
+                                                 : "ideal",
                                       coneH + 4));
     if (!(std::isfinite(r.pulse) && r.pulse >= 0 && r.pulse <= 0.5))
         return bad(2, "--pulse", "must be in [0, 0.5] (fraction of the jet "
@@ -1204,9 +1373,22 @@ std::expected<void, ConfigError> bunsenGeometry(const RawConfig& r, Case& c,
                                    cells - 1e-9));
     const int ny = 2 * half;
     const int nx = int(std::ceil(len * cells - 1e-9)) + 2 * nb;
-    auto box = makeBox(nx, ny, 1, nx * h, ny * h, 1.0);
+    // 3D (--nz >= 8): z periodic at hz = h -- one span period of an infinite
+    // slot; nz == 1 keeps hz = 1.
+    auto box = makeBox(nx, ny, r.nz, nx * h, ny * h,
+                       r.nz == 1 ? 1.0 : r.nz * h);
     if (!box) return std::unexpected(box.error());
     c.grid = *box;
+    if (r.turb > 0) {
+        if (auto e = flameTurbSetup(r, c, r.jetSpeed, "U_jet"); e)
+            return std::unexpected(*e);
+        c.warnings.push_back(std::format(
+            "--turb {:g} with --mode bunsen: the IC cone and the --length "
+            "bound use Damkoehler's S_T = {:.4g} S_L (an upper estimate: a "
+            "slower-burning cone is taller -- watch xTip; exit 8 when the tip "
+            "reaches the outflow band)",
+            r.turb, sT));
+    }
     BunsenGeom& b = c.bunsen;
     b.W = r.slotWidth * dth;
     b.uJet = r.jetSpeed;
@@ -1326,8 +1508,11 @@ std::expected<Case, ConfigError> validateDiffusion(const RawConfig& r, Case c)
                              "the grid is --cells-per-unit)");
         e)
         return std::unexpected(*e);
+    if (auto e = turbFlagScope(r, false, false); e) return std::unexpected(*e);
+    if (auto e = lesTflesFlagScope(r, false); e) return std::unexpected(*e);
     if (r.nz != 1)
-        return bad(2, "--nz", "must be 1: multi-D flames are P2 (docs/chem.md)");
+        return bad(2, "--nz", "must be 1: 3D --mode diffusion/candle is not "
+                              "built");
     c.mach = r.given.contains("--mach")
                  ? r.mach
                  : (candle ? kCandleMachDefault : kDiffMachDefault);
@@ -1614,8 +1799,42 @@ std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
                                       "only applies to --mode bunsen");
         e)
         return std::unexpected(*e);
-    if (r.nz != 1)
-        return bad(2, "--nz", "must be 1: multi-D flames are P2 (docs/chem.md)");
+    const bool premixed = !bunsen && !chamber;
+    if (auto e = turbFlagScope(r, premixed, bunsen); e)
+        return std::unexpected(*e);
+    if (auto e = lesTflesFlagScope(r, !chamber); e) return std::unexpected(*e);
+    if (chamber && r.nz != 1)
+        return bad(2, "--nz", "must be 1: 3D --mode chamber is not built");
+    if (r.nz != 1 && r.nz < 8)
+        return bad(2, "--nz", bunsen ? "must be 1 or >= 8 (a 3D slot Bunsen: "
+                                       "z periodic, hz = h)"
+                                     : "must be 1 or >= 8 (a 3D premixed "
+                                       "flame: z periodic, hz = h)");
+    if (premixed || bunsen) {
+        if (!(std::isfinite(r.turb) && r.turb >= 0 && r.turb <= 20))
+            return bad(2, "--turb", "must be in [0, 20] (u'/S_L; 0 = off)");
+        const bool turb = r.turb > 0;
+        if (turb && r.nz == 1)
+            return bad(2, "--turb", "needs --nz >= 8: 2D turbulence is not "
+                                    "turbulence");
+#if !DNS_WITH_FFTW
+        if (turb)
+            return bad(2, "--turb", "needs FFTW: this binary was built "
+                                    "without it (DNS_WITH_FFTW)");
+#endif
+        if (!turb)
+            if (auto e = rejectGiven(r, {"--turb-length", "--hold-flame"},
+                                     "needs --turb > 0");
+                e)
+                return std::unexpected(*e);
+        if (!turb)
+            if (auto e = rejectGiven(r, {"--seed"},
+                                     "only seeds the --turb box in dns flame");
+                e)
+                return std::unexpected(*e);
+    }
+    if (!chamber)
+        if (auto e = flameLesTfles(r, c, bunsen); e) return std::unexpected(*e);
     if (!bunsen && r.ny < 4) return bad(2, "--ny", "must be >= 4 (periodic y)");
     c.mach = chamber && !r.given.contains("--mach") ? 0.02 : r.mach;
     if (!(finitePos(c.mach) && c.mach <= 0.05))
@@ -1636,7 +1855,16 @@ std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
                                 "110.4 K needs a dimensional anchor)");
     if (!c.sutherland && r.given.contains("--tinf"))
         return bad(2, "--tinf", "only anchors --visc sutherland");
-    if (!(std::isfinite(r.cellsPerDelta) && r.cellsPerDelta >= 4))
+    // TFLES: the THICKENED flame is what the grid resolves (F delta_th).
+    if (c.flameTfles > 0) {
+        if (!(std::isfinite(r.cellsPerDelta) && r.cellsPerDelta > 0 &&
+              c.flameTfles * r.cellsPerDelta >= 4))
+            return bad(2, "--cells-per-delta",
+                       std::format("must be > 0 with --tfles F * "
+                                   "--cells-per-delta >= 4 (cells across the "
+                                   "thickened flame; F = {:g})",
+                                   c.flameTfles));
+    } else if (!(std::isfinite(r.cellsPerDelta) && r.cellsPerDelta >= 4))
         return bad(2, "--cells-per-delta", "must be >= 4");
     if (!(std::isfinite(r.upstream) && r.upstream >= 6))
         return bad(2, "--upstream", "must be >= 6 thermal thicknesses");
@@ -1696,11 +1924,31 @@ std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
     } else {
         const int nx = int(std::ceil((c.flameUp + c.flameDown) * c.flameCells -
                                      1e-9)) + 2 * nb;
-        auto box = makeBox(nx, r.ny, 1, nx * h, r.ny * h, 1.0);
+        // 3D: z periodic at the same spacing (hz = h); nz == 1 keeps hz = 1.
+        auto box = makeBox(nx, r.ny, r.nz, nx * h, r.ny * h,
+                           r.nz == 1 ? 1.0 : r.nz * h);
         if (!box) return std::unexpected(box.error());
         c.grid = *box;
         c.flameXf0 = nb * h + c.flameUp * dth;
         c.uInf = c.flameUIn;
+        if (r.turb > 0) {
+            if (auto e = flameTurbSetup(r, c, c.flameUIn, "U_in"); e)
+                return std::unexpected(*e);
+            c.flameHold = r.holdFlame;
+        }
+    }
+    if (c.flameTfles > 0) {
+        // The sensor's max filter: kTflesDilate thickened thermal
+        // thicknesses, in cells.
+        c.flameTflesDilate =
+            int(std::ceil(kTflesDilate * c.flameTfles * c.flameCells - 1e-9));
+        const double thick = c.flameTfles * c.flameCells;
+        if (thick < 6)
+            c.warnings.push_back(std::format(
+                "--tfles {:g} at --cells-per-delta {:g}: {:.3g} cells across "
+                "the thickened flame (below 6: the laminar flame speed carries "
+                "the grid's error; docs/chem.md)",
+                c.flameTfles, c.flameCells, thick));
     }
     c.n = c.grid.nx;
     c.h = h;
@@ -1732,11 +1980,15 @@ std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
               .re = c.re,
               .mach = c.mach,
               .frameDt = c.fdt,
+              // Flame LES: the .json carries Cs and the model like every
+              // other LES run (DNS: 0 / false, the pre-LES bytes).
+              .cs = c.lesLabel ? c.cs : 0.0,
+              .les = c.lesLabel,
               .body = c.flameBunsen ? "slot Bunsen flame" : "premixed flame",
               .farField = "nscbc",
               .physics = name(c.physics),
               .kick = 0.0,
-              .sgs = "",
+              .sgs = c.lesLabel ? name(c.sgsModel) : "",
               .rans = "",
               .steady = ""};
     c.meta.setGrid(c.grid);
@@ -3801,6 +4053,55 @@ std::string describeHit(const Case& c)
         c.seed, emits.empty() ? std::string("none") : emits, c.outPrefix);
 }
 
+// dns flow --polymesh CASE (docs/fv.md): the case IS the OpenFOAM case
+// (phase 1.5 / 3 read it); here only the flags. Allowed: --polymesh,
+// --physics incompressible, --out, --max-iters, --emit stats|none,
+// --fv-precision, --backend, --quiet, --dry-run. Every other flag is
+// rejected by name.
+std::expected<Case, ConfigError> validateFvFlow(const RawConfig& r, Case c)
+{
+    static const char* const allowed[] = {"--polymesh",     "--physics",          "--out",
+                                          "--max-iters",    "--emit",             "--fv-precision",
+                                          "--backend",      "--quiet",            "--dry-run",
+                                          "--fv-coupled",   "--fv-coupled-eta",   "--fv-coupled-alpha",
+                                          "--fv-coupled-check"};
+    for (const auto& g : r.given)
+        if (std::ranges::none_of(allowed, [&](const char* a) { return g == a; }))
+            return bad(2, "--polymesh",
+                       g + " is not a flag of the FV path: the OpenFOAM case dictionaries (0/, system/, "
+                           "constant/) define the mesh, physics and numerics (docs/fv.md)");
+    if (r.polymesh.empty()) return bad(2, "--polymesh", "needs an OpenFOAM case directory");
+    if (r.physics != Physics::Incompressible)
+        return bad(2, "--physics", "--polymesh needs --physics incompressible (the compressible FV path, "
+                                   "masterplan P4/P7, is not built)");
+    if (c.outPrefix.empty()) return bad(2, "--out", "output prefix must not be empty");
+    for (const Emit e : c.emit)
+        if (e != Emit::Stats && e != Emit::None)
+            return bad(2, "--emit", "the FV path writes OpenFOAM time directories and stats only "
+                                    "(--emit stats | none)");
+    if (r.given.contains("--max-iters") && r.maxIters < 1) return bad(2, "--max-iters", "must be >= 1");
+    c.fvCase = r.polymesh;
+    c.fvMaxIters = r.given.contains("--max-iters") ? r.maxIters : 0;
+    c.fvPrecision = FvPrecision(r.fvPrecision);
+    // the EXPERIMENTAL coupled prototype (plan_perf_5 P0b)
+    const bool cpl = r.given.contains("--fv-coupled");
+    for (const char* f : {"--fv-coupled-eta", "--fv-coupled-alpha", "--fv-coupled-check"})
+        if (r.given.contains(f) && !cpl) return bad(2, f, "tunes the coupled prototype: only with --fv-coupled");
+    if (cpl) {
+        if (r.fvCoupled < 0) return bad(2, "--fv-coupled", "SIMPLE iterations before the switch: must be >= 0");
+        if (c.fvPrecision != FvPrecision::Fp64)
+            return bad(2, "--fv-coupled", "the P0b prototype is FP64 only: add --fv-precision fp64");
+        if (!(r.fvCoupledEta > 0 && r.fvCoupledEta < 1)) return bad(2, "--fv-coupled-eta", "must be in (0, 1)");
+        if (!(r.fvCoupledAlpha > 0 && r.fvCoupledAlpha <= 1))
+            return bad(2, "--fv-coupled-alpha", "must be in (0, 1]");
+        c.fvCoupled = r.fvCoupled;
+        c.fvCoupledEta = r.fvCoupledEta;
+        c.fvCoupledAlpha = r.fvCoupledAlpha;
+        c.fvCoupledCheck = r.fvCoupledCheck;
+    }
+    return c;
+}
+
 } // namespace
 
 std::expected<Case, ConfigError> validate(const RawConfig& r)
@@ -3826,6 +4127,14 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         c.meshOrder = r.meshOrder;
         return c;
     }
+    // flow --polymesh: the incompressible FV path takes its whole case from
+    // the OpenFOAM dictionaries; every structured-solver flag is rejected.
+    if (r.sub == Subcommand::Flow && r.given.contains("--polymesh"))
+        return validateFvFlow(r, std::move(c));
+    if (r.given.contains("--fv-precision"))
+        return bad(2, "--fv-precision", "selects the arithmetic of the FV path: only with --polymesh");
+    for (const char* f : {"--fv-coupled", "--fv-coupled-eta", "--fv-coupled-alpha", "--fv-coupled-check"})
+        if (r.given.contains(f)) return bad(2, f, "the coupled prototype of the FV path: only with --polymesh");
 
     if (c.outPrefix.empty())
         return bad(2, "--out", "output prefix must not be empty");
@@ -3850,7 +4159,12 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         return validatePeriodic(r, std::move(c));
     if (r.sub == Subcommand::Channel) return validateChannel(r, std::move(c));
     if (r.sub == Subcommand::Conv) return validateConv(r, std::move(c));
-    if (r.sub == Subcommand::Flame) return validateFlame(r, std::move(c));
+    if (r.sub == Subcommand::Flame) {
+        auto f = validateFlame(r, std::move(c));
+        if (f)
+            if (auto e = resolveFrameStart(r, *f); e) return std::unexpected(*e);
+        return f;
+    }
     return validateFlow(r, std::move(c));
 }
 
@@ -3915,14 +4229,18 @@ std::string flowRunLabel(const Case& c)
 namespace {
 
 // " | 2D slot Bunsen: ..." -- the burner and its anchoring, named.
-std::string bunsenLabel(const BunsenGeom& b, double sigma)
+// lz: the span (box units) at nz > 1, 0 = the 2D burner (its text verbatim).
+std::string bunsenLabel(const BunsenGeom& b, double sigma, double lz)
 {
     auto kind = [&](double t) {
         return t >= sigma ? "burnt" : t > 1 ? "warm inert" : "cold inert";
     };
     return std::format(
-        " | 2D slot Bunsen: U_jet {:g} S_L, coflow {} (T/Tu {:g}) at {:g} "
+        " | {}: U_jet {:g} S_L, coflow {} (T/Tu {:g}) at {:g} "
         "S_L{}",
+        lz > 0 ? std::format("3D slot Bunsen (spanwise periodic L_z={:.3g} W)",
+                             lz / b.W)
+               : std::string("2D slot Bunsen"),
         b.uJet, kind(b.tCo), b.tCo, b.uCo,
         b.pilot > 0 ? std::format(", {} pilot strips (T/Tu {:g}) at {:g} S_L",
                                   kind(b.tPilot), b.tPilot, b.uPilot)
@@ -3964,14 +4282,70 @@ std::string flameRunLabel(const Case& c)
                                                    : "")
                     : std::string());
     }
+    // 3D (nz > 1) and --turb add to the bracket; nz == 1 reads as it did.
+    std::string dim, kind = "DNS";
+    if (c.grid.nz > 1) {
+        dim = std::format("; 3D nz={}", c.grid.nz);
+        if (c.flameTurb > 0) {
+            const double dth = c.flameEig.dthOverDD;
+            const TurbNumbers tn =
+                turbNumbers(c.flameTurb, c.flameTurbL, c.prandtl, dth);
+            dim += std::format(
+                ", synthetic HIT {}inflow u'/S_L={:g}, l_t={:.4g} delta_th "
+                "(frozen hash-seeded box{}, Taylor-swept, seed {}; Re_t={:.3g}, "
+                "h/eta={:.3g} at the inflow){}",
+                c.flameBunsen ? "jet " : "", c.flameTurb, c.flameTurbL / dth,
+                c.flameBunsen ? " x jet weight J" : "", c.seed, tn.ReT,
+                c.h / tn.eta,
+                c.flameHold ? "; flame held by inflow control" : "");
+            if (c.h / tn.eta > 2 && !c.lesLabel)
+                kind = std::format("UNDER-RESOLVED DNS (h/eta={:.3g})",
+                                   c.h / tn.eta);
+        }
+    }
+    // LES and the thickened flame replace "DNS" (docs/chem.md, "LES species
+    // and TFLES"): the SGS model with its constant, the species SGS flux,
+    // then F, the sensor and the efficiency.
+    const std::string les =
+        c.lesLabel
+            ? std::format("LES [{}={:g}; species SGS flux mu_t/Sc_t, "
+                          "Sc_t=Pr_t=0.9{}]",
+                          c.sgsModel == SgsModel::Sigma ? "sigma-model Csigma"
+                                                        : "Smagorinsky Cs",
+                          c.cs,
+                          "; mu_t on the open x rows copied from the "
+                          "neighbour row")
+            : std::string();
+    const std::string tfles =
+        c.flameTfles > 0
+            ? std::format(
+                  "TFLES [F={:g}, {}, {}{}]", c.flameTfles,
+                  c.flameTflesUniform
+                      ? "uniform sensor (Omega=1)"
+                      : std::format("dynamic sensor (rate at Ta/2, tanh {:g}, "
+                                    "spread {:g} F delta_th toward colder gas)",
+                                    kTflesSensorBeta, kTflesDilate),
+                  c.flameCharlette
+                      ? std::format("Charlette 2002 efficiency beta={:g} "
+                                    "(delta_L=delta_th), u'_Delta by Colin's "
+                                    "operator",
+                                    kCharletteBeta)
+                      : std::string("no efficiency (E=1)"),
+                  c.lesLabel ? "" : ", no SGS model")
+            : std::string();
+    if (!les.empty() && !tfles.empty()) kind = les + " + " + tfles;
+    else if (!les.empty()) kind = les;
+    else if (!tfles.empty()) kind = "thickened flame " + tfles;
     return std::format(
-        "DNS [premixed single-step, calorically perfect, Le=1, "
-        "M_flame={:g} (inflated; CH4/air 1.15e-3)] species: MC-limited MUSCL "
+        "{} [premixed single-step, calorically perfect, Le=1, "
+        "M_flame={:g} (inflated; CH4/air 1.15e-3){}] species: MC-limited MUSCL "
         "on the central mass flux (bounded scalar transport; mean flow "
         "central){}",
-        c.mach,
-        c.flameBunsen ? bunsenLabel(c.bunsen, c.flameModel.sigma)
-                      : std::string());
+        kind, c.mach, dim,
+        c.flameBunsen
+            ? bunsenLabel(c.bunsen, c.flameModel.sigma,
+                          c.grid.nz > 1 ? c.grid.nz * c.grid.hz : 0.0)
+            : std::string());
 }
 
 std::string chamberRunLabel(const Case& c)
@@ -4050,6 +4424,33 @@ std::string Case::describe() const
                            "  polymesh   {}\n"
                            "  order      {}\n",
                            polyMeshDir, cellOrderNames()[std::size_t(meshOrder)]);
+    if (sub == Subcommand::Flow && !fvCase.empty())
+    {
+        const FvNumerics num = fvNumerics(fvPrecision);
+        const std::string prec =
+            fvPrecision == FvPrecision::Fp64
+                ? std::string("FP64 (--fv-precision fp64: the parity mode, solves to the fvSolution tolerances)")
+                : std::format("FP32 (default; FP64 reductions; solve floors U {:g}, p {:g}, turbulence {:g}: "
+                              "absolute tolerance max(fvSolution, floor), relTol unchanged)",
+                              num.floors.U, num.floors.p, num.floors.s);
+        return std::format("case:\n"
+                           "  mode       incompressible FV path: OpenFOAM simpleFoam (SIMPLE/SIMPLEC) on the "
+                           "identical polyMesh, {}, GPU [FV path, body-fitted]\n"
+                           "  precision  {}\n"
+                           "  polymesh   {}\n"
+                           "  iterations {}\n"
+                           "  out        {}\n{}",
+                           fvPrecisionName(fvPrecision), prec, fvCase,
+                           fvMaxIters > 0 ? std::to_string(fvMaxIters) : std::string("controlDict endTime"),
+                           outPrefix,
+                           fvCoupled < 0
+                               ? std::string()
+                               : std::format("  algorithm  coupled p-U PROTOTYPE, EXPERIMENTAL (plan_perf_5 P0b) "
+                                             "after {} SIMPLE iterations: FGMRES(30) relTol {:g}, alpha_c {:g} "
+                                             "(SER){}\n",
+                                             fvCoupled, fvCoupledEta, fvCoupledAlpha,
+                                             fvCoupledCheck ? ", G-JAC check" : ""));
+    }
     if (sub == Subcommand::Hit) return describeHit(*this);
     if (sub == Subcommand::Flame && flameDiffusion)
     {
@@ -4149,6 +4550,123 @@ std::string Case::describe() const
             nscbcSink, nscbcSinkAmp, tEnd, cfl, std::min(dtAc, dtTh), dtAc, dtTh,
             flameRunLabel(*this), outPrefix);
     }
+    // The premixed modes' turbulence / LES / TFLES lines (--mode premixed and
+    // bunsen; empty without those flags).
+    auto flameTurbLesText = [&]() {
+        const double dth = flameEig.dthOverDD;
+        std::string turbText;
+        if (flameTurb > 0) {
+            const TurbNumbers tn = turbNumbers(flameTurb, flameTurbL, prandtl, dth);
+            const double kp = turbPeak(flameTurbL);
+            turbText = std::format(
+                "  turbulence frozen synthetic HIT box {} x {} x {} (L_bx = L_z), "
+                "seed {}, swept through the inflow at {} (Taylor)\n"
+                "             u'/S_L = {:.4g}  l_t = {:.4g} delta_th = {:.4g} "
+                "delta_D ({:.3g} cells)  kp L_z/(2 pi) = {:.3g}\n"
+                "             Re_t = u' l_t/nu = {:.4g}  eta = {:.4g}  h/eta = "
+                "{:.3g}  tau_t = l_t/u' = {:.4g}\n"
+                "             Ka = (u'/S_L)^1.5 (l_t/delta_th)^-0.5 = {:.4g}  Da "
+                "= (l_t/delta_th)/(u'/S_L) = {:.4g}  (inflow values; u' decays "
+                "toward the flame)\n"
+                "             S_T/S_L: Peters 1999 {:.4g}, Damkoehler 1 + u'/S_L "
+                "{:.4g} (report-only, at the inflow u')\n"
+                "             {}; {}\n",
+                flameTurbNbx, grid.ny, grid.nz, seed,
+                flameBunsen ? "U_jet, times the jet weight J(y)" : "u_in",
+                flameTurb, flameTurbL / dth, flameTurbL, flameTurbL / h,
+                kp * grid.nz * h / (2 * std::numbers::pi), tn.ReT, tn.eta,
+                h / tn.eta, tn.tauT, tn.Ka, tn.Da,
+                petersST(flameTurb, flameTurbL, 1.0), damkohlerST(flameTurb),
+                flameBunsen ? "IC fresh gas carries the box times Y (the "
+                              "fresh fraction)"
+                            : "IC fresh gas carries the box up to x_f0 - 1.5 l_t",
+                flameBunsen
+                    ? std::format("Re_jet = U W/nu = {:.4g}",
+                                  bunsen.uJet * bunsen.W / prandtl)
+                    : std::string(flameHold
+                                      ? "--hold-flame: u_in tracks the "
+                                        "consumption speed, the fresh-mass "
+                                        "thickness held at its first value"
+                                      : "u_in fixed"));
+        }
+        // LES / TFLES (docs/chem.md, "LES species and TFLES").
+        if (lesLabel)
+            turbText += std::format(
+                "  les        mu_t = rho (C Delta)^2 op(grad u), C = {:g} ({}), "
+                "Delta = h; eddy conductivity mu_t cp/Pr_t, species SGS flux "
+                "mu_t/Sc_t, Sc_t = Pr_t = 0.9;\n"
+                "             mu_t on i = 0, nx-1 copied from i = 1, nx-2\n",
+                cs, sgsModel == SgsModel::Sigma ? "sigma" : "Smagorinsky");
+        if (flameTfles > 0)
+            turbText += std::format(
+                "  tfles      F_max = {:g}: {:.4g} cells across the thickened "
+                "flame (F --cells-per-delta); sensor {}\n"
+                "             efficiency {}; IC = the oracle thickened by "
+                "F_max; dt also bounded by 0.25 h^2 rho_min/(gamma/Pr (mu F E "
+                "+ mu_t))\n",
+                flameTfles, flameTfles * flameCells,
+                flameTflesUniform
+                    ? std::string("uniform (Omega = 1)")
+                    : std::format("dynamic: tanh({:g} w_s/w_s,max), w_s the "
+                                  "rate at Ta/2, spread toward colder gas by "
+                                  "a T-gated max filter of radius {} cells",
+                                  kTflesSensorBeta, flameTflesDilate),
+                flameCharlette ? std::format("Charlette 2002 (beta {:g}, "
+                                             "delta_L = delta_th, Re_Delta on "
+                                             "nu_u = Pr), u'_Delta = Colin "
+                                             "2 h^3 |lap curl u| (Delta/h)^(1/3)",
+                                             kCharletteBeta)
+                               : std::string("none (E = 1)"));
+        return turbText;
+    };
+    if (sub == Subcommand::Flame && flameBunsen && grid.nz > 1)
+    {
+        // 3D slot Bunsen (docs/chem.md, "3D turbulent slot Bunsen").
+        const double sig = flameModel.sigma, dth = flameEig.dthOverDD;
+        const BunsenGeom& b = bunsen;
+        const double dtAc = cfl * h / (std::sqrt(sig) / mach + sig * b.uJet);
+        const double dtTh = 0.25 * h * h * (1.0 / sig) /
+                            (prandtl * std::max(1.0, kGammaAir / prandtl));
+        return std::format(
+            "case:\n"
+            "  mode       3D slot Bunsen flame{} (dns flame --mode bunsen "
+            "--nz {})\n"
+            "  model      single step F -> P, calorically perfect (gamma 1.4), "
+            "equal W, Le = 1\n"
+            "             sigma = Tb/Tu = {:.6g}  beta = {:.6g}  theta = Ta/Tu "
+            "= {:.6g}  Pr = {:.4g}\n"
+            "  oracle     Lambda = {:.10g}  delta_th/delta_D = {:.6g}\n"
+            "  units      rho_u = S_L = R = 1, delta_D = 1, Tu = p0 = {:.6g}\n"
+            "  grid       {} x {} x {} = {:.4g} M cells  h = {:.6g} = "
+            "delta_th/{:.4g}  box {:.6g} x {:.6g} x {:.6g}  [x jet axis, y "
+            "periodic, z periodic span = {:.3g} W]\n"
+            "  burner     slot W = {:.4g} delta_th; jet u = {:.4g} S_L (jet "
+            "Mach {:.3g}); coflow {:.4g} delta_th per side, T = {:.4g} Tu, u "
+            "= {:.4g} S_L\n"
+            "  cone       IC/--length cone height {:.4g} delta_th{}; box length "
+            "{:.4g} delta_th past the bands\n"
+            "{}"
+            "  stats      span means (z) feed the cone measurement; ST = burn / "
+            "(2 flank L_z), area = integral |grad c| / (2 flank L_z), I0 = "
+            "ST/area\n"
+            "  boundary   x-lo NSCBC per-row inflow, etaIn {:.4g}; x-hi p = "
+            "p0; sink {} cells\n"
+            "  run        tt = {:.6g} flame times  cfl = {:.3g}  dt est {:.3e} "
+            "(acoustic {:.3e}, thermal {:.3e})\n"
+            "  label      {}\n"
+            "  out        {}\n",
+            flameTurb > 0 ? " in synthetic turbulence" : "", grid.nz, sig,
+            flameModel.beta, flameModel.theta(), prandtl, flameEig.Lambda, dth,
+            flameTu, grid.nx, grid.ny, grid.nz,
+            double(grid.nx) * grid.ny * grid.nz * 1e-6, h, flameCells,
+            grid.nx * h, grid.ny * h, grid.nz * h, grid.nz * h / b.W,
+            b.W / dth, b.uJet, b.uJet * mach, b.wCo / dth, b.tCo, b.uCo,
+            b.coneH / dth,
+            flameTurb > 0 ? " (Damkoehler S_T = S_L (1 + u'/S_L))" : " (ideal)",
+            grid.nx * h / dth - 2.0 * nscbcSink / flameCells,
+            flameTurbLesText(), nscbcEtaIn, nscbcSink, tEnd, cfl,
+            std::min(dtAc, dtTh), dtAc, dtTh, flameRunLabel(*this), outPrefix);
+    }
     if (sub == Subcommand::Flame && flameBunsen)
     {
         const double sig = flameModel.sigma, dth = flameEig.dthOverDD;
@@ -4216,9 +4734,12 @@ std::string Case::describe() const
         const double dtAc = cfl * h / (std::sqrt(sig) / mach + sig * flameUIn);
         const double dtTh = 0.25 * h * h * (1.0 / sig) /
                             (prandtl * std::max(1.0, kGammaAir / prandtl));
+        // 3D (nz > 1): the grid's z, and the turbulence groups with --turb.
+        const bool d3 = grid.nz > 1;
+        const std::string turbText = flameTurbLesText();
         return std::format(
             "case:\n"
-            "  mode       1D freely propagating premixed flame (dns flame "
+            "  mode       {} (dns flame "
             "--mode premixed)\n"
             "  model      single step F -> P, calorically perfect (gamma 1.4), "
             "equal W, Le = 1\n"
@@ -4229,10 +4750,11 @@ std::string Case::describe() const
             "  units      rho_u = S_L = R = 1, delta_D = 1, Tu = p0 = "
             "1/(gamma M^2) = {:.6g}, q = cp (sigma-1) Tu = {:.6g}\n"
             "  transport  {}\n"
-            "  grid       {} x {} x 1  h = {:.6g} = delta_th/{:.4g}  box "
-            "{:.6g} x {:.6g}  [native 2D, y periodic]\n"
+            "  grid       {} x {} x {}  h = {:.6g} = delta_th/{:.4g}  box "
+            "{:.6g} x {:.6g}{}\n"
             "  flame      x_f0 = {:.6g} ({:.4g} delta_th fresh + {} sink "
             "cells), {:.4g} delta_th burnt{}\n"
+            "{}"
             "  boundary   x NSCBC: inflow u = {:.4g} S_L (etaIn {:.4g}), "
             "outflow p = p_b = p0 - {:.4g}; species carried in at Y = 1\n"
             "             sink {} cells, amp {:.3g}\n"
@@ -4240,6 +4762,9 @@ std::string Case::describe() const
             "dt est {:.3e} (acoustic {:.3e}, thermal {:.3e})\n"
             "  label      {}\n"
             "  out        {}\n",
+            d3 ? (flameTurb > 0 ? "3D premixed flame in synthetic turbulence"
+                                : "3D planar premixed flame")
+               : "1D freely propagating premixed flame",
             sig, flameModel.beta, flameModel.theta(), prandtl,
             flameEig.Lambda, dth, flameTu,
             kGammaAir / (kGammaAir - 1) * (sig - 1) * flameTu,
@@ -4247,7 +4772,10 @@ std::string Case::describe() const
                                      "(Tu = {:.6g} K)",
                                      flameModel.sOverTu, tinfK)
                        : std::string("constant mu = Pr, lambda = cp"),
-            grid.nx, grid.ny, h, flameCells, grid.nx * h, grid.ny * h,
+            grid.nx, grid.ny, grid.nz, h, flameCells, grid.nx * h, grid.ny * h,
+            d3 ? std::format(" x {:.6g}  [3D, y and z periodic, hz = h]",
+                             grid.nz * h)
+               : std::string("  [native 2D, y periodic]"),
             flameXf0, flameUp, nscbcSink, flameDown,
             flameWrinkle > 0
                 ? std::format("\n             wrinkle {:.4g} delta_th over "
@@ -4255,7 +4783,7 @@ std::string Case::describe() const
                               flameWrinkle, flameWrinkleModes,
                               grid.ny * h / flameWrinkleModes / dth)
                 : std::string(),
-            flameUIn, nscbcEtaIn,
+            turbText, flameUIn, nscbcEtaIn,
             flameUIn * flameUIn * (sig - 1), nscbcSink, nscbcSinkAmp, ft,
             tEnd, cfl, std::min(dtAc, dtTh), dtAc, dtTh,
             flameRunLabel(*this), outPrefix);

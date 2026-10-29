@@ -76,7 +76,12 @@ __global__ void kCentreTable(Focal1D f, double h, int n, double* out)
 // instantiation, so the uniform-target kernel is the shipped code.
 // Hydro: the ambient hydrostatic incoming waves (Config::hydroLo/Hi: gLo,
 // gHi), its own instantiation too.
-template <class Remap, bool Comp, bool Prof, bool Hydro = false>
+// Turb: per-row turbulent inflow fluctuations (setTurbulentInflow: tdu, tdv,
+// tdw at j + ny k) -- the u target gains tdu, the inflow shear waves relax v,
+// w toward tdv, tdw instead of 0. Its own instantiation; zero rows give the
+// non-Turb arithmetic bit for bit (x + 0 = x, v - 0 = v - 0).
+template <class Remap, bool Comp, bool Prof, bool Hydro = false,
+          bool Turb = false>
 __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
                             Real gam, PrimView q,
                             int openY, int openZ, int fr, Real invLx, Real invLy,
@@ -88,6 +93,7 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
                             StageCombine cmb, const Real* linHi,
                             const Real* inU, const Real* inJ, const Real* inR,
                             Real pls, Real gLo, Real gHi,
+                            const Real* tdu, const Real* tdv, const Real* tdw,
                             Real* orho, Real* omx, Real* omy, Real* omz,
                             Real* oE)
 {
@@ -277,10 +283,19 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
             // same arithmetic, bit-identical. Softening it makes the inflow
             // transparent to vorticity and entropy without letting the
             // freestream sag.
+            // Turb: the swept box's row fluctuations (pot is off with it, so
+            // tgt[t1] = tgt[t2] = 0 is replaced, not added to).
+            Real vT1 = tgt[t1], vT2 = tgt[t2];
+            if constexpr (Turb) {
+                const std::size_t row = std::size_t(j) + std::size_t(g.ny) * k;
+                uIn = uIn + tdu[row];
+                vT1 = tdv[row];
+                vT2 = tdw[row];
+            }
             L1 = (un - cs) * (dp_ - r * cs * dun);
             L2 = etaInS * cs * c2 * invL[0] * (r - rIn);
-            L3 = etaInS * cs * invL[0] * (vc[t1] - tgt[t1]);
-            L4 = etaInS * cs * invL[0] * (vc[t2] - tgt[t2]);
+            L3 = etaInS * cs * invL[0] * (vc[t1] - vT1);
+            L4 = etaInS * cs * invL[0] * (vc[t2] - vT2);
             L5 = etaIn * omM2 * r * c2 * invL[0] * (un - uIn);
             if constexpr (Hydro) L5 += (un + cs) * gLo;
         } else { // outflow / lateral far field
@@ -397,6 +412,8 @@ struct InflowRows
 {
     const Real *u = nullptr, *jet = nullptr, *rho = nullptr;
     double pulse = 0;
+    // setTurbulentInflow's row fluctuations; null = the non-Turb kernels.
+    const Real *tu = nullptr, *tv = nullptr, *tw = nullptr;
 };
 
 bool hydroOn(const DeviceCompNscbc::Config& c)
@@ -423,9 +440,9 @@ void launchNscbc(const GpuGrid& g, const DeviceCompNscbc::Config& c, double u,
     // Doublet strength tracks the ramped freestream: 2D u a^2, 3D u a^3 / 2.
     const double a2 = c.aBody * c.aBody;
     const double dbl = g.nz == 1 ? u * a2 : 0.5 * u * a2 * c.aBody;
-    auto launch = [&](auto comp, auto prof, auto hydro) {
+    auto launch = [&](auto comp, auto prof, auto hydro, auto turb) {
         kNscbcCells<Remap, decltype(comp)::value, decltype(prof)::value,
-                    decltype(hydro)::value>
+                    decltype(hydro)::value, decltype(turb)::value>
             <<<launchBlocks(nb), blockSize>>>(
             g, R, cv, viscView(d.transport()), Real(c.gamma), q, int(c.openY),
             int(c.openZ), c.floorRows,
@@ -438,23 +455,35 @@ void launchNscbc(const GpuGrid& g, const DeviceCompNscbc::Config& c, double u,
             Real(dbl), Real(c.xc), Real(c.yc), Real(c.zc),
             Real(c.thermalInflow ? 1.0 / (c.Rgas * c.TInf) : 0.0), cmb, linHi,
             rows.u, rows.jet, rows.rho, Real(rows.pulse), Real(c.hydroLo),
-            Real(c.hydroHi), out.rho.data(),
+            Real(c.hydroHi), rows.tu, rows.tv, rows.tw, out.rho.data(),
             out.mx.data(), out.my.data(), out.mz.data(), out.E.data());
     };
     internal::withCompensation(cmb, [&](auto comp) {
         // Per-row targets exist on the uniform mesh only (make() refuses
         // them otherwise), so only that instantiation is compiled; the
-        // hydrostatic waves ride per-row targets only (make() again).
+        // hydrostatic waves ride per-row targets only (make() again); so do
+        // the turbulent rows (setTurbulentInflow), never with Hydro.
         if constexpr (std::is_same_v<Remap, IdentityRemap>) {
+            const bool turb = rows.tu != nullptr;
             if (rows.u) {
                 if (hydroOn(c))
-                    launch(comp, std::true_type{}, std::true_type{});
+                    launch(comp, std::true_type{}, std::true_type{},
+                           std::false_type{});
+                else if (turb)
+                    launch(comp, std::true_type{}, std::false_type{},
+                           std::true_type{});
                 else
-                    launch(comp, std::true_type{}, std::false_type{});
+                    launch(comp, std::true_type{}, std::false_type{},
+                           std::false_type{});
+                return;
+            }
+            if (turb) {
+                launch(comp, std::false_type{}, std::false_type{},
+                       std::true_type{});
                 return;
             }
         }
-        launch(comp, std::false_type{}, std::false_type{});
+        launch(comp, std::false_type{}, std::false_type{}, std::false_type{});
     });
     checkLastKernel("kNscbcCells");
 }
@@ -542,6 +571,11 @@ void DeviceCompNscbc::apply(const DeviceComp& d, const DeviceCompState& s,
     }
     InflowRows rows;
     if (inU_.size()) rows = {inU_.data(), inJ_.data(), inR_.data(), pulse_};
+    assert(!(tu_ && (hydroOn(c_) || c_.potCorrect)) &&
+           "turbulent inflow rows: no hydrostatic waves, no potential targets");
+    rows.tu = tu_;
+    rows.tv = tv_;
+    rows.tw = tw_;
     launchNscbc(g_, c_, u_, cInf_, Q_, d, s, out, cmb, IdentityRemap{},
                 CurvView{}, lin, rows);
 }
@@ -568,6 +602,7 @@ void DeviceCompNscbc::apply(const DeviceComp& d, const DeviceCompState& s,
                             const TanhStretchY& remap) const
 {
     assert(!inU_.size() && "per-row inflow targets: uniform mesh only");
+    assert(!tu_ && "turbulent inflow rows: uniform mesh only");
     CurvView cv;
     if (!curvViewOf(d, cv)) return;
     launchNscbc(g_, c_, u_, cInf_, Q_, d, s, out, cmb, remap, cv, nullptr);
@@ -578,6 +613,7 @@ void DeviceCompNscbc::apply(const DeviceComp& d, const DeviceCompState& s,
                             const AxisRemap3& remap) const
 {
     assert(!inU_.size() && "per-row inflow targets: uniform mesh only");
+    assert(!tu_ && "turbulent inflow rows: uniform mesh only");
     CurvView cv;
     if (!curvViewOf(d, cv)) return;
     if (ctab_.size() == 0) {
