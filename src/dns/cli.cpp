@@ -280,6 +280,12 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--holder-height", &c.chamber.holder},
              {"--clearance", &c.chamber.clearance},
              {"--inject-ramp", &c.chamber.ramp}});
+    if (c.sub == Subcommand::Flame) // --mode candle --wick (validator scopes)
+        add({{"--wick-width", &c.wickWidth}, {"--wick-height", &c.wickHeight},
+             {"--wick-temp", &c.wickTemp}, {"--fuel-rate", &c.fuelRate},
+             {"--candle-width", &c.candleWidth},
+             {"--candle-height", &c.candleHeight},
+             {"--soot-form", &c.sootForm}, {"--soot-ox", &c.sootOx}});
     if (c.sub == Subcommand::Prop)
         add({{"--planform", &c.planform}, {"--polar", &c.polar},
              {"--thin-cd0", &c.thinCd0}, {"--thin-alpha0", &c.thinAlpha0},
@@ -324,6 +330,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                          &c.tflesSensor});
         enums.push_back({"--efficiency", {{"none", 0}, {"charlette", 1}},
                          &c.efficiency});
+        enums.push_back({"--soot", {{"on", 1}, {"off", 0}}, &c.soot});
     }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench
         || c.sub == Subcommand::Channel || c.sub == Subcommand::Flame)
@@ -389,6 +396,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         flags.push_back({"--nscbc-tinflow", &c.nscbcTinflow});
         flags.push_back({"--quiescent", &c.quiescent});
         flags.push_back({"--hold-flame", &c.holdFlame});
+        flags.push_back({"--wick", &c.wick});
     }
     if (c.sub == Subcommand::Prop) flags.push_back({"--selftest", &c.selftest});
 
@@ -1759,6 +1767,43 @@ ignition 4. g = 0 is --mode diffusion bit for bit.
   uOutMin (min u on the top row; < 0 = air drawn in); pMean over the ambient
   column. Measured: H ~ Q^1.19 over W 0.5-1 (local 1.30 at 0.75-1; Roper's
   buoyant slot 4/3); W >= 1.25 oscillates slowly (period ~13 l/U).
+
+WICK CANDLE (--mode candle --wick). The candle above with a REAL wick: an
+immersed isothermal ghost-wall body -- a candle block (wax top at x_top, at
+T0) with a wick standing up from it (at the fuel's vaporisation temperature
+--wick-temp) -- in quiescent air (the slow coflow), gravity -x. Fuel vapour
+(Y_F = --fuel-y) leaves the wick surface: a volumetric source band on the
+fluid cells beside the wick, rho += S, E += S cp T_wick, rho Y_F += S, total
+--fuel-rate per unit depth (FIXED: not tied to the wick heat flux, which is
+measured). Species flux through every wall face is zero (the two-reactant
+walled kernel). SOOT (--soot on): one equation for rho Y_s, formation
+A_f rho Y_F e^(-50 T0/T) (fuel -> soot), oxidation A_ox rho^2 Y_s Y_O
+e^(-60 T0/T) with the fuel's stoichiometry and heat; no diffusion, no
+thermophoresis, no radiation; constants TUNED FOR APPEARANCE. Its own
+runner; the slot candle is untouched. Lengths in l, temperatures in T0.
+  --wick               switch (only with --mode candle)
+  --wick-width W       >= 4 cells (two mirror cells per side)       [0.75]
+  --wick-height H      above the wax top, >= 2 cells                   [2]
+  --wick-temp T        wick wall T/T0, [1, sigma] (vaporisation)       [2]
+  --fuel-rate Q        fuel vapour mass per unit time and depth, (0, 20] [1]
+  --candle-width W     body width, > wick width + 4 cells              [6]
+  --candle-height H    body height (1 l of air below it), >= 4 cells   [4]
+  --coflow-width W     air beside the body per side, >= 2            [9.5]
+  --soot on|off        the soot species                              [on]
+  --soot-form DA       A_f e^(-Ta_f/T_ad) l/U, (0, 1e6]               [10]
+  --soot-ox DA         A_ox rho0 e^(-Ta_ox/T_ad) l/U, (0, 1e6]       [2e5]
+  --damkohler DA       the main step's, as above        [5e4 with --wick]
+  Rejected with --wick: --slot-width, --slot-edge, --pilot-width,
+  --pilot-speed, --pulse, --pulse-freq, --ignition, --quiescent; the wick
+  flags without it. IC: the hydrostatic column, a closed Burke-Schumann sheet
+  around the wick (Z = e^(-d/0.5 l) to 4 l above the tip). Stats: t, dt,
+  dtChem, dtSoot, xTip, height (above the wick tip), half, xBase, xSoot (top
+  of the sooting zone), Tmax, burn, fuelInj, fuelInjCum, fuel, sootForm,
+  sootOx, soot, fuelOut, sootOut, fuelBal ((burn + sootForm + fuelOut)/inj),
+  sootBal ((sootOx + sootOut)/sootForm), qWick, qBody (conduction into the
+  wick / body), qWickRatio (qWick / (Q q)), mass, energy, pMean, sootMax,
+  fvMax (ppm), hits, uMax, uOutMin. Frames: temp, fuel, oxid, omega, soot
+  (rho Y_s), sootox.
 
 --mode chamber: a closed 2D combustion chamber (docs/chem.md, "Chamber").
 An immersed ADIABATIC ghost-wall body -- back wall, straight section,

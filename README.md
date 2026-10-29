@@ -66,7 +66,7 @@ DNS 13.6 ms/step (1234 Mcell/s), Smagorinsky 15.6, σ 16.0, 1.46 GiB.
 | `hit` | forced homogeneous isotropic turbulence, SI-configured, h = 1.5 η | `dns hit --help` |
 | `channel` | wall-resolved compressible channel; `--les`, `--rans` | `docs/channel.md`, `docs/rans.md` |
 | `conv` | Rayleigh–Bénard convection, compressible or Boussinesq | below |
-| `flame` | single-step flames: premixed against its FP64 oracle (1D; 3D at `--nz >= 8`, in synthetic inflow turbulence with `--turb`, as LES with `--les --sgs` and a thickened flame `--tfles`; or a slot Bunsen cone, `--mode bunsen`, 2D or 3D with the same turbulence/LES/TFLES flags); a 2D slot-jet diffusion flame, F + s O → P, against the Burke–Schumann sheet (`--mode diffusion`); the same flame under gravity from a wick, a 2D candle (`--mode candle`); a closed 2D combustion chamber with a nozzle jet (`--mode chamber`) | `docs/chem.md` |
+| `flame` | single-step flames: premixed against its FP64 oracle (1D; 3D at `--nz >= 8`, in synthetic inflow turbulence with `--turb`, as LES with `--les --sgs` and a thickened flame `--tfles`; or a slot Bunsen cone, `--mode bunsen`, 2D or 3D with the same turbulence/LES/TFLES flags); a 2D slot-jet diffusion flame, F + s O → P, against the Burke–Schumann sheet (`--mode diffusion`); the same flame under gravity from a wick, a 2D candle (`--mode candle`), with an immersed wick, fuel from its surface and soot (`--mode candle --wick`); a closed 2D combustion chamber with a nozzle jet (`--mode chamber`) | `docs/chem.md` |
 | `bench` | step time, Mcell/s and the VRAM this process allocates | `dns bench --help` |
 | `prop` | propeller thrust curve by BEMT or lifting line, host-only | below |
 | `mesh` | read an OpenFOAM polyMesh into a FaceMesh, report counts and checkMesh-equivalent quality, host-only | `docs/mesh.md` |
@@ -152,6 +152,13 @@ build/dns flame --mode diffusion --tt 80 --emit stats
 # 2D candle: the diffusion flame under gravity from a low-Peclet wick, steady
 # by tt ~20 (~100 s for tt 30); fire_video.py --gamma 3 --smooth 4
 build/dns flame --mode candle --tt 30 --emit stats
+
+# 2D WICK candle: an immersed isothermal wick + candle body (ghost wall), fuel
+# vapour from the wick surface, soot (one-equation, appearance-tuned) formed
+# inside and burned out at the tip; steady by tt ~5 (~45 s for tt 10); the
+# physically coloured render (soot Planck x CIE -> sRGB, CH* blue)
+build/dns flame --mode candle --wick --tt 10 --emit stats --emit bin --fdt 0.05 --out w
+python3 tools/chem/candle_render.py w --out candle.mp4 --png candle.png
 
 # closed 2D combustion chamber: premixed injector, wedge flame holder,
 # nozzle jet into a cold coflow; 4 cells per thermal thickness (~37 s), video
@@ -715,6 +722,6 @@ Tiers, labels, tolerances, the quarantine and anchor regeneration:
 | `docs/mesh.md` | FaceMesh: the polyMesh subset accepted and rejected, the geometry definition, cyclic/2D/ordering rules, `CellGraph`, `dns mesh`, test meshes; the FV face physics (flux, gradients, boundary kinds, Σ-form dt) and its FP64 oracle `FvRef` with the measured gates |
 | `docs/fv.md` | the incompressible FV path (`dns flow --polymesh`): simpleFoam's SIMPLE/SIMPLEC + MRF + RAS (kOmegaSST, SpalartAllmaras, wall functions, meshWave / exact wall distance) verbatim, BCs and schemes accepted, constraint-patch semantics, OpenFOAM's solver stop, outputs, prism-layer meshing, the IF1/IF2/IF3/IF-T/BL parity and wall-time numbers |
 | `docs/la.md` | `gpu/la`: block shapes, the sliced-ELL layout, smoothers, line sets, Krylov solvers and batched FP64 dots, the FP32-iterate floor, the measured LA1/LA2/LA-perf gates |
-| `docs/chem.md` | `dns flame`: model C0, the phase-plane oracle vs Cantera, species scheme, hook order, measured S_L; the 2D slot Bunsen (per-row inflow, pilot anchoring, measured cone); the slot-jet diffusion flame; the 2D candle (gravity, hydrostatic NSCBC, height vs fuel flow); the `--mode chamber` combustion chamber and its balances; 3D premixed flames in synthetic turbulence (generator, Taylor-swept inflow, hold controller, S_T/area/I0); LES species (SGS flux, Sc_t = Pr_t) and the thickened flame (TFLES: sensor, Charlette efficiency, laminar and LES-vs-DNS measurements); the 3D turbulent slot Bunsen LES (span-mean cone, ST/area/I0, the volume renderer) |
+| `docs/chem.md` | `dns flame`: model C0, the phase-plane oracle vs Cantera, species scheme, hook order, measured S_L; the 2D slot Bunsen (per-row inflow, pilot anchoring, measured cone); the slot-jet diffusion flame; the 2D candle (gravity, hydrostatic NSCBC, height vs fuel flow); the wick candle (immersed wick, fuel source, soot, the physical render); the `--mode chamber` combustion chamber and its balances; 3D premixed flames in synthetic turbulence (generator, Taylor-swept inflow, hold controller, S_T/area/I0); LES species (SGS flux, Sc_t = Pr_t) and the thickened flame (TFLES: sensor, Charlette efficiency, laminar and LES-vs-DNS measurements); the 3D turbulent slot Bunsen LES (span-mean cone, ST/area/I0, the volume renderer) |
 | `src/compat/cuda/README.md` | the CUDA header shim |
 | `docs/archive/` | historical plans and analyses |

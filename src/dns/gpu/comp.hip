@@ -950,6 +950,10 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
         sv.kapLes = kapLes;
         sv.FE = sp_.tflesFE;
         sv.Om = sp_.tflesOm;
+        sv.soot = sp_.soot;
+        sv.sootDiff = Real(sp_.sootDiff);
+        sv.omegaF = sootF_.data();
+        sv.omegaOx = sootO_.data();
         species::stage(g_, vv, q, cmb, *sc, sv, out);
     }
     if (rhsHook_) rhsHook_(s, out, cmb);
@@ -960,6 +964,15 @@ void DeviceComp::chemCellPass(const DeviceCompState& s)
     assert(nSpecies() > 0 && s.nY == nSpecies());
     Real* Y[kMaxY] = {ycache_[0].data(), ycache_[1].data(), ycache_[2].data(),
                       ycache_[3].data()};
+    if (sp_.soot >= 0) {
+        const species::SootRates sr{sp_.soot,          Real(sp_.sootLnAf),
+                                    Real(sp_.sootTaf), Real(sp_.sootLnAox),
+                                    Real(sp_.sootTaox), sootF_.data(),
+                                    sootO_.data()};
+        species::cellPassSoot(g_, s, T_.data(), Real(sp_.lnA), Real(sp_.Ta),
+                              sp_.fuel, sp_.ox, sr, Y, omega_.data());
+        return;
+    }
     species::cellPass(g_, s, T_.data(), Real(sp_.lnA), Real(sp_.Ta), sp_.fuel,
                       sp_.ox, Y, omega_.data(), sp_.tflesEoF);
 }
@@ -1028,6 +1041,17 @@ std::expected<void, hipError_t> DeviceComp::enableSpecies(const SpeciesSetup& s)
         if (auto e = b->upload(f.data()); e != hipSuccess)
             return std::unexpected(e);
         yinRow_[k] = std::move(*b);
+    }
+    if (s.soot >= 0) {
+        // Soot rides the two-reactant kernel only (its own instantiation).
+        assert(s.ox >= 0 && s.soot < s.nY && s.soot != s.fuel &&
+               s.soot != s.ox && s.sootDiff >= 0);
+        auto f = DeviceScalar::make(n);
+        if (!f) return std::unexpected(f.error());
+        auto x = DeviceScalar::make(n);
+        if (!x) return std::unexpected(x.error());
+        sootF_ = std::move(*f);
+        sootO_ = std::move(*x);
     }
     sp_ = s;
     return allocStages(0);

@@ -48,6 +48,7 @@
 #include "dns/gpu/runner_fv.hpp"
 #include "dns/gpu/runner_chamber.hpp"
 #include "dns/gpu/runner_rb.hpp"
+#include "dns/gpu/runner_wick.hpp"
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/runner_comp.hpp"
 #include "dns/gpu/derived.hpp"
@@ -1066,9 +1067,107 @@ int runChamberCase(const Case& c)
 #endif
 }
 
+// --mode candle --wick (docs/chem.md, "Wick candle"): the immersed candle
+// body + wick, fuel from the wick surface, soot.
+int runWickCase(const Case& c)
+{
+    if (!haveGpu(c))
+        return die(exitNoGpu, "no GPU device (dns flame is GPU-only)");
+#if DNS_WITH_GPU
+    const auto& g = c.grid;
+    const DiffusionModel& m = c.diff;
+    const WickSpec& s = c.wick;
+    const double T0 = c.flameTu, gx = c.flameGravity;
+    gpu::WickRun rr;
+    rr.regions = wickRegions(g, s);
+    CompState host;
+    std::vector<double> rhoY[3];
+    wickIC(c, host, rhoY);
+
+    FrameGeometry fg = FrameGeometry::centred(g, 1.0);
+    fg.mask.resize(g.size());
+    for (std::size_t i = 0; i < g.size(); ++i)
+        fg.mask[i] = rr.regions[i] == std::uint8_t(WickRegion::Solid) ? 0.0f
+                                                                      : 1.0f;
+    auto out = RunOutput::make(
+        outputConfig(c, std::format("{{\"app\":\"dns\",\"flame\":\"wick\","
+                                    "\"stoich\":{},\"zst\":{},\"sigma\":{},"
+                                    "\"Da\":{},\"mach\":{},\"gravity\":{},"
+                                    "\"h\":{},\"yc\":{},\"xTop\":{},"
+                                    "\"wick\":{},\"soot\":{}",
+                                    m.s, m.zst(), m.sigma, m.Da, c.mach, gx,
+                                    c.h, s.yc, s.xTop, s.wWick, c.wickSoot)),
+        c.meta, g, std::move(fg));
+    if (!out) return die(exitOutput, out.error());
+
+    rr.tr = Transport::air(c.prandtl, T0, c.tinfK, c.prandtl, kGammaAir,
+                           kRgasBox, c.sutherland);
+    rr.sp.nY = c.wickSoot ? 3 : 2;
+    rr.sp.fuel = 0;
+    rr.sp.ox = 1;
+    rr.sp.stoich = m.s;
+    rr.sp.lnA = m.lnA();
+    rr.sp.Ta = m.theta() * T0;
+    rr.sp.q = rr.tr.cp() * T0 * m.qOverCpT0();
+    rr.sp.invPr = 1.0 / c.prandtl;
+    rr.sp.openX = true;
+    if (c.wickSoot) {
+        rr.sp.soot = 2;
+        rr.sp.sootLnAf = c.soot.lnAf(m.sigma);
+        rr.sp.sootTaf = c.soot.thetaF * T0;
+        rr.sp.sootLnAox = c.soot.lnAox(m.sigma);
+        rr.sp.sootTaox = c.soot.thetaOx * T0;
+        rr.sp.sootDiff = 0.0;
+    }
+    // The ambient column (R T0 = p0 = T0): the inflow rows' density at
+    // p_a(h/2), the outflow target p_a at the last row, and the hydrostatic
+    // dp/dx = -g rho_a for the NSCBC waves.
+    const double pIn = candleAmbientP(T0, gx, T0, 0.5 * g.hx);
+    rr.pOut = candleAmbientP(T0, gx, T0, (g.nx - 0.5) * g.hx);
+    rr.hydroLo = -gx * pIn / T0;
+    rr.hydroHi = -gx * rr.pOut / T0;
+    rr.sp.ambientHi = true;
+    rr.sp.yHi[1] = m.yO2;
+    std::vector<double> rowYF, rowYO, rowYS;
+    for (int j = 0; j < g.ny; ++j) {
+        rr.rowU.push_back(c.bunsen.uCo);
+        rr.rowJet.push_back(0.0);
+        rr.rowTarget.push_back(c.nscbcThermalInflow ? 1.0 / (kRgasBox * T0)
+                                                    : pIn / T0);
+        rowYF.push_back(0.0);
+        rowYO.push_back(m.yO2);
+        rowYS.push_back(0.0);
+    }
+    rr.sp.yInRow[0] = rowYF;
+    rr.sp.yInRow[1] = rowYO;
+    if (c.wickSoot) rr.sp.yInRow[2] = rowYS;
+    rr.diff = m;
+    rr.spec = s;
+    rr.T0 = T0;
+    rr.gravity = gx;
+    rr.uCo = c.bunsen.uCo;
+    rr.etaIn = c.nscbcEtaIn;
+    rr.thermalInflow = c.nscbcThermalInflow;
+    rr.sinkNb = c.nscbcSink;
+    rr.sinkAmp = c.nscbcSinkAmp;
+    rr.cfl = c.cfl;
+    rr.tEnd = c.tEnd;
+    rr.dtRecompute = c.dtRecompute;
+    rr.label = wickRunLabel(c);
+    const std::span<const std::vector<double>> ry(rhoY,
+                                                  std::size_t(rr.sp.nY));
+    auto res = gpu::runWick(g, host, ry, rr, *out);
+    if (!res) return die(res.error().code, res.error().message);
+    return reportDone(*res, *out);
+#else
+    return exitNoGpu;
+#endif
+}
+
 int runFlame(const Case& c)
 {
     if (c.chamberMode) return runChamberCase(c);
+    if (c.flameWick) return runWickCase(c);
     if (!haveGpu(c))
         return die(exitNoGpu, "no GPU device (dns flame is GPU-only)");
 #if DNS_WITH_GPU

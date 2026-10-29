@@ -87,6 +87,7 @@ add_library(dns_core
     src/dns/vtk_writer.cpp
     src/dns/walldist.cpp
     src/dns/webframes.cpp
+    src/dns/wick.cpp
 )
 target_include_directories(dns_core PUBLIC src)
 # cgltf (trimesh.cpp) + toml++ (scene.cpp); SYSTEM mutes third-party warnings.
@@ -188,6 +189,7 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/runner_rb.hip
     src/dns/gpu/runner_incomp.hip
     src/dns/gpu/runner_periodic.hip
+    src/dns/gpu/runner_wick.hip
     src/dns/gpu/species.hip
     src/dns/gpu/tfles.hip
     src/dns/gpu/timestepper.hip
@@ -430,7 +432,7 @@ if(BUILD_TESTING)
         fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport
         rotor focal cli_defaults comp_axis_permute rans rans_channel1d
         steady_stop blockband channel_line pseudo_time flow_rans_config precond
-        host_threads flame1d flame_config bunsen diffusion candle chamber_config
+        host_threads flame1d flame_config bunsen diffusion candle wick chamber_config
         polymesh facemesh fvref la amg fvcase fvwalldist tfles)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini turb_ic)
@@ -854,6 +856,19 @@ if(BUILD_TESTING)
         # then the reacting fuel/energy balance, the nozzle against the
         # isentropic estimate, and anchoring. Two runs, ~2 min.
         dns_gpu_bin_test(gpu_chamber 600)
+        # --mode candle --wick (docs/chem.md, "Wick candle"): the immersed
+        # wick + candle body, fuel from the wick surface, soot. inert: the
+        # walls leak no fuel (~5 s); flame: anchored, fuel and soot balances,
+        # soot burned out at the tip, the wick heated (~30 s).
+        add_executable(test_gpu_wick tests/test_gpu_wick.cpp)
+        target_link_libraries(test_gpu_wick PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_wick PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_wick dns)
+        add_test(NAME gpu_wick_inert COMMAND test_gpu_wick inert)
+        add_test(NAME gpu_wick_flame COMMAND test_gpu_wick flame)
+        set_tests_properties(gpu_wick_inert gpu_wick_flame
+            PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 
 
         # --- Physical validation suite (docs/validation.md) -----------------

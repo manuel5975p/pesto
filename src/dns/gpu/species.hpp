@@ -61,6 +61,13 @@ struct SpeciesView
     // Null FE = not thickened.
     const Real* FE = nullptr;
     const Real* Om = nullptr;
+    // Soot (SpeciesSetup::soot >= 0, two-reactant kernel): its slot, its
+    // diffusivity factor on rho D, and the cell pass's formation and
+    // oxidation rates.
+    int soot = -1;
+    Real sootDiff = 0;
+    const Real* omegaF = nullptr;
+    const Real* omegaOx = nullptr;
 };
 
 // The cell pass of state s: Y_k = rhoY_k / rho into Y[k], and
@@ -73,6 +80,23 @@ void cellPass(const GpuGrid& g, const DeviceCompState& s, const Real* T,
               Real lnA, Real Ta, int fuel, int ox, Real* const Y[kMaxY],
               Real* omega, const Real* eof = nullptr);
 
+// The soot rates of the cell pass (SpeciesSetup::soot): slot, formation
+// ln A and Ta, oxidation ln A and Ta, and the two output buffers.
+struct SootRates
+{
+    int soot;
+    Real lnAf, Taf, lnAox, Taox;
+    Real* omegaF;
+    Real* omegaOx;
+};
+
+// cellPass with ox >= 0 plus the soot rates, one launch: omega_f =
+// arrheniusRate(lnAf, Taf, rho, Y_F, T), omega_ox = arrheniusRate2(lnAox,
+// Taox, rho, Y_s, Y_O, T). Pre: ox >= 0, soot slot distinct from fuel and ox.
+void cellPassSoot(const GpuGrid& g, const DeviceCompState& s, const Real* T,
+                  Real lnA, Real Ta, int fuel, int ox, const SootRates& sr,
+                  Real* const Y[kMaxY], Real* omega);
+
 // The species stage: out.y[k] = ca ya + cb yb + crAt(c) (-div F_k - delta_kF
 // omega - delta_kO stoich omega), plus the heat release E += crAt(c) q omega
 // on the SAME omega (fused into this launch; nothing in between reads E). Run
@@ -80,8 +104,13 @@ void cellPass(const GpuGrid& g, const DeviceCompState& s, const Real* T,
 // only. ox >= 0: the face value is Y_up + theta/2 (Y_down - Y_up) with ONE
 // theta per face, the min over species of the MC ratio (kSpeciesStage2).
 // sv.solid != null selects the walled instantiation (SpeciesSetup::solid;
-// premixed, uniform inflow only); null is the original kernel. sv.FE / sv.nut
-// select the Thick / Eddy diffusivity (SpeciesDiff; premixed, no wall).
+// premixed: uniform inflow only; two-reactant: the per-row ambient-top
+// candle kernel only); null is the original kernel. sv.FE / sv.nut select the
+// Thick / Eddy diffusivity (SpeciesDiff; premixed, no wall). sv.soot >= 0 (two-
+// reactant, walled) adds the soot slot: formation -omega_f from the fuel,
+// +omega_f - omega_ox into soot, -stoich omega_ox from the oxidizer, E +=
+// q (omega + omega_ox); soot's face value is its OWN MC-limited MUSCL value
+// (it never votes in the shared theta) with diffusion sootDiff * rho D.
 void stage(const GpuGrid& g, ViscView vv, PrimView q, const StageCombine& cmb,
            const SpeciesCombine& sc, const SpeciesView& sv,
            DeviceCompState& out);

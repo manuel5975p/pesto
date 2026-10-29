@@ -2,6 +2,7 @@
 
 #include "dns/transport.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <numbers>
@@ -235,6 +236,47 @@ void addTurbulence(const Case& c, const std::array<std::vector<double>, 3>& box,
                 q.my[cc] = r * v;
                 q.mz[cc] = r * ww;
             }
+}
+
+void wickIC(const Case& c, CompState& q, std::vector<double> (&rhoY)[3])
+{
+    assert(c.sub == Subcommand::Flame && c.flameWick);
+    const Grid& g = c.grid;
+    const WickSpec& s = c.wick;
+    const double p0 = c.flameTu, gx = c.flameGravity;
+    q = CompState::zeros(g);
+    rhoY[0].assign(g.size(), 0.0);
+    rhoY[1].assign(g.size(), 0.0);
+    if (c.wickSoot) rhoY[2].assign(g.size(), 0.0);
+    else rhoY[2].clear();
+    for (int j = 0; j < g.ny; ++j)
+        for (int i = 0; i < g.nx; ++i) {
+            const double x = (i + 0.5) * g.hx, y = (j + 0.5) * g.hy;
+            const std::size_t cc = g.idx(i, j, 0);
+            const double p = candleAmbientP(p0, gx, p0, x); // R T0 = p0
+            const bool solid = wickSdf(s, x, y) < 0;
+            double Z = 0;
+            if (!solid && x > s.xTop) {
+                // Distance to the wick box alone (the body's top is not a
+                // fuel source).
+                const double dx =
+                    std::max({s.xTop - s.wWick - x, x - s.xTip(), 0.0});
+                const double dy =
+                    std::max(std::abs(y - s.yc) - 0.5 * s.wWick, 0.0);
+                const double w =
+                    0.5 * (1.0 - std::tanh((x - (s.xTip() + kWickIcAbove)) /
+                                           0.5));
+                Z = std::exp(-std::hypot(dx, dy) / kWickIcDecay) * w;
+            }
+            const SheetState st = burkeSchumann(c.diff, Z);
+            const double t = solid ? 1.0 : st.t;
+            const double r = p / (p0 * t);
+            q.rho[cc] = r;
+            q.E[cc] = p / (kGammaAir - 1);
+            if (solid) continue;
+            rhoY[0][cc] = r * st.YF;
+            rhoY[1][cc] = r * st.YO;
+        }
 }
 
 } // namespace dns
