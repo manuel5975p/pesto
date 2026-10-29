@@ -692,7 +692,10 @@ in 3D is higher; the Tmax/Tb gate below is on the plane mean.
 **Labels.** `DNS [premixed …, M_flame=…; 3D nz=N, synthetic HIT inflow
 u'/S_L=…, l_t=… delta_th (frozen hash-seeded box, Taylor-swept, seed …;
 Re_t=…, h/eta=… at the inflow); flame held by inflow control]`; h/η > 2 at
-the inflow → `UNDER-RESOLVED DNS (h/eta=…)` and a warning. `--dry-run`
+the inflow → `UNDER-RESOLVED DNS (h/eta=…)` and a warning. Every premixed label
+(1D–3D, Bunsen, chamber, wick) names `sigma=…` and `Zeldovich beta=…` after
+`Le=1` ONLY when they differ from the defaults 5 and 8 (default labels byte
+for byte as before; stdout only). `--dry-run`
 prints Re_t, η, h/η, τ_t, Ka = (u'/S_L)^1.5 (l_t/δ_th)^−0.5, Da =
 (l_t/δ_th)/(u'/S_L) and the report-only Peters 1999 / Damköhler S_T/S_L.
 
@@ -724,8 +727,13 @@ first rows on — the consumption speed is the flame surface times S_L at Le =
 1. S_T rises with u'_in (1.48, 1.70, 3.05) and sits at 0.71 / 0.83 / 0.98 of
 Peters at the measured u'. What does NOT hold (issues.md T4): the runs are
 NOT stationary — S_T still grows across the window at u'_flame ~0.9 (halves
-+26% / +39%: a developing brush plus Darrieus–Landau at σ = 5 in a 15 δ_th box)
-and falls in U3 (−16%); the window-halves gate (7%) fails in all three. S_T is
++26% / +39%) and falls in U3 (−16%); the window-halves gate (7%) fails in all
+three. Measured since (TPRI lesgap, "Why TFLES misses the U2 DNS" below): the
+15 δ_th box is 24.0 δ_D ≈ 1.15 λ_c at σ 5, so its box mode is
+Darrieus–Landau-UNSTABLE (+0.048 / +0.057 /τ at 4 / 6 cells, 2D single mode),
+and the U2 S_T depends on the seed (4-cell mean over [20, 80): 1.912 seed 1,
+3.325 seed 2, ×1.74), the box width (2× L_y, L_z: 3.090 vs 2.118 over [20,
+40), ×1.46) and the 10 τ block (1.69–2.30, tt 80). S_T is
 not strictly increasing with the MEASURED u'_flame: R1 and U2 reach u' 0.92 /
 0.88 (the longer upstream of U2 decays its stronger inflow turbulence to the
 same level) with S_T 1.48 / 1.70 — non-stationary noise at equal u', not a
@@ -878,21 +886,225 @@ grid, so the LES grids are 1/2 and 1/3 of it with F 2 and 3, 6 thickened
 cells each.) **The plan's LES-vs-DNS gates FAIL** (issues.md L1): S_T 0.64 /
 0.61 of the DNS (gates within 15% / 25%), modelled area 0.65 / 0.63 (20% /
 30%), brush 0.60 / 0.55 (30% / 40%); the efficiency closes nothing (C − N:
-−0.0002 / +0.0003 in S_T/S_L). What the numbers say: resolution alone is not
-the loss (4 cells DNS / LES-σ within 9% of the 6-cell DNS); THICKENING is
-(F 1.5 already −30%), and the Charlette efficiency is ~1 here because Re_Δ =
-u'_Δ Δ/ν ~ 2–5 sits on its viscous cutoff (f_Re) — while the DNS's S_T
-grows through the window (halves 1.42 → 1.98), consistent with
-Darrieus–Landau wrinkling (σ = 5, unstable band ∝ 1/(F δ)) that a
-wrinkling-factor model does not represent (unproven: a u'_in 0.25 control
-shows no DL growth in 20 τ_F, A_T/A 1.003; F 1.5 with the UNIFORM sensor
-reads 1.184 vs 1.186 dynamic, so the sensor is not the loss; issues.md
-L1). Internally the LES is
+−0.0002 / +0.0003 in S_T/S_L). Resolution alone is not the loss (4 cells
+DNS / LES-σ within 9% of the 6-cell DNS); THICKENING is (F 1.5 already
+−30%); the sensor is not (F 1.5 with the UNIFORM sensor reads 1.184 vs 1.186
+dynamic). Why: the next subsection (the box mode). Internally the LES is
 consistent: I0 = S_T/(A_T/A) = 0.996 / 1.002, resolved A_T ≤ A_T,DNS.
 
 Regenerate: `runs/flames/turb/p2/les.sh` and `les2.sh` (2.1 + 1.3 min GPU),
 then `tools/chem/turb_stats.py PREFIX --t0 10 --t1 20 --sl S_L(grid) --mach
 0.02`.
+
+### Why TFLES misses the U2 DNS: the Darrieus–Landau box mode (TPRI lesgap, 2026-10-29)
+
+Plan `plans/masterplan_lesgap.md`, report `plans/verify/impl_lesgap.md`;
+gfx1100, simjob. Not a code defect, and not closable by an efficiency
+function.
+
+**TFLES stretches the DL dispersion relation by F**: s_F(k) = s_1(F k)/F,
+so the neutral wavelength becomes F λ_c. Single 2D wrinkle mode (`--wrinkle
+0.5 --wrinkle-modes 1`, upstream / downstream 16, `--inflow-speed 1`, M 0.02,
+tt 20, frames every 0.5 from t = 0 (frame k = the first step with t ≥ k·0.5;
+41 frames); s = slope of ln a over t ∈ [4, 16], a = mode 1 of
+x_I(y) = h Σ_i Y; [2, 10] fit in brackets; `tools/chem/wrinkle_rate.py`),
+σ 5, rates in 1/τ:
+
+| λ (δ_D) | DNS 6 cells | DNS 4 cells | F 1.5 @ 4 | F 2 @ 3 | F 3 @ 2 |
+|---|---|---|---|---|---|
+| 12.0 (ny 30, all at 4 cells) | – | −0.62 (−0.85) | −0.52 | −0.60 | −0.57 |
+| **24.0 (the U2 box, 15 δ_th)** | **+0.057 (+0.054)** | **+0.048 (+0.032)** | **−0.051** | **−0.19** | **−0.39** |
+| 48.1 | – | +0.047 (+0.039) | +0.054 | +0.024 | −0.038 |
+
+(λ 12 and F 3 @ λ 24 are fit-limited: a reaches ~0 within 6 τ. The verifier
+re-timed the frames: the first lesgap tables put frame k at (k+1)·0.5, one
+frame late, which moved these rates by up to 0.04 at the fit-limited entries
+and ≤ 0.002 elsewhere; no conclusion changed.) Scaling: s_F2(λ 48) = +0.024
+vs s_1(λ 24)/2 = +0.024 (4 cells) / +0.029 (6 cells); two estimates of s_1
+at λ 16 (F 1.5 at λ 24: −0.077; F 3 at λ 48: −0.11) agree in sign and size.
+λ_c ≈ 21 δ_D ≈ 13 δ_th at σ 5 (4–6 cells, interpolated), so the TFLES
+cutoffs are ≈ 31 / 42 / 63 δ_D at F 1.5 / 2 / 3: the U2 box mode grows in
+the DNS and decays under every thickening. Pinned by `gpu_tfles_dl`.
+
+**The missing area is RESOLVED, mostly the box mode** (`tools/chem/
+front_filter.py` on the U2 seed-1 volumes; Pope's Gaussian exp(−6x²/Δ²), Δ in
+δ_th, Ξ_Δ = A/A_Δ; shell 1 = the box fundamental):
+
+| t | DNS A | Ξ(1.5 δ_th) | Ξ(2) | Ξ(3) | shell-1 share | rms x_I (δ_D) |
+|---|---|---|---|---|---|---|
+| 10 | 1.197 | 1.009 | 1.015 | 1.032 | 0.76 | 2.18 |
+| 14 | 1.600 | 1.015 | 1.026 | 1.058 | 0.86 | 4.35 |
+| 20 | 2.186 | 1.024 | 1.042 | 1.093 | 0.84 | 6.51 |
+
+At t = 20 the LES's resolved A against the DNS's A filtered at its Δ = F δ_th:
+F 1.5 1.298 / 2.135 (0.61, Ebar 1.00001), F 2 1.143 / 2.097 (0.545, Ebar
+1.0004), F 3 1.059 / 2.000 (0.53, Ebar 1.024); rms x_I 2.9 / 2.0 / 1.2 δ_D
+against the DNS's 6.5. A ~40% deficit at resolved scales against ≤ 9%
+sub-filter: a perfect efficiency (E = Ξ_Δ) lifts LES2-C from 0.64 to ≤ ~0.66
+of the DNS.
+
+**The σ 5 U2 reference is not a statistic** (`runs/flames/lesgap/a1`; S_T
+normalized by the grid's laminar S_L, 10 τ block means):
+
+| run | [10,20) | [20,30) | [30,40) | [40,50) | [50,60) | [60,70) | [70,80) | mean from t = 20 |
+|---|---|---|---|---|---|---|---|---|
+| DNS 6c s1 (tt 60) | 1.695 | 2.283 | 1.949 | 1.675 | 1.641 | | | 1.887 [20,60) |
+| DNS 4c s1 | 1.823 | 2.304 | 1.931 | 1.831 | 1.691 | 2.022 | 1.694 | 1.912 |
+| LES2-C s1 | 1.086 | 1.097 | 1.056 | 1.065 | 1.063 | 1.057 | 1.063 | 1.067 (0.558×) |
+| DNS 4c s2 | 2.351 | 2.669 | 3.476 | 3.388 | 3.507 | 3.424 | 3.485 | 3.325 |
+| LES2-C s2 | 1.179 | 1.108 | 1.204 | 1.126 | 1.198 | 1.145 | 1.186 | 1.161 (0.349×) |
+| DNS 4c, 2× width (120²) | 2.386 | 3.246 | 2.934 | | | | | 3.090 [20,40) |
+| LES2-C, 2× width (90²) | 1.188 | 1.575 | 2.354 | | | | | still growing |
+
+The ratio does not converge with a longer window (0.558× / 0.349× per seed
+over [20, 80)); the wide LES grows because its 48 δ_D box mode is
+DL-unstable at F 2 (+0.024). I0 0.98–1.09 in every block.
+
+**σ and l_t** (analyst 3, `a3`; laminar S_L at σ 2 below):
+
+| case | window | DNS 4c | F 1.5 @ 4 | F 2 @ 3 | F 3 @ 2 |
+|---|---|---|---|---|---|
+| U2 σ 5, l_t 2.5 (P2) | [10, 20] | 1.835 | 0.646× | 0.593× | 0.568× |
+| U2 σ 2, l_t 2.5 | [10, 20] | 1.358 (halves 1.24 / 1.47) | 0.882× | – | – |
+| σ 5, l_t 6 (box 57.7 δ_D), tt 30 | [10, 30] | 3.073 (halves 2.71 / 3.43) | – | 0.785× | 0.565× (E = 1: 0.566×) |
+| σ 5, l_t 6 | [5, 12] | 1.591 | – | 0.829× | 0.755× |
+| σ 2, l_t 6, tt 12 | [5, 12] | 1.358 | – | 0.936× | 0.897× |
+
+The l_t 6 ordering is DL again: 57.7 δ_D is above F 2's cutoff (unstable at
+F 2: 0.785×) and at F 3's (≈ neutral: 0.565×).
+
+**Why the u'_in 0.25 control (P2 verifier) saw no DL.** The box-mode rate is
+only +0.05/τ (×2.7 in 20 τ from a tiny seed) and the area excess is second
+order in the amplitude: ~1e-3 is expected. In the u' 4 runs the turbulence
+seeds 1.4–2.2 δ_D of front amplitude by t = 8–10, and the box mode grows from
+there.
+
+**Laminar extruded Bunsen** (P3 burner flags, nz 8, tt 6, TFLES 3,
+Charlette): FEmax = 5.196 = 3√3 and Ebar 1.0048; its E = 1 twin reads area
+0.9447 vs 0.9442. Colin's operator saturates E on LAMINAR jet shear, so
+"FEmax 3√3 every row" is not a turbulence signature (issues.md B1).
+
+### LES vs DNS at σ* = 2 (the DL-stable U2 box; TPRI lesgap, 2026-10-29)
+
+**σ* selection** (2D dispersion scan, `runs/flames/lesgap/mp/disp/disp.sh`,
+λ = 15 δ_th(σ) = the U2 width, s over [4, 16], [2, 10] in brackets; δ_th/δ_D
+= 1.64959 at σ 3, 1.7953 at σ 2):
+
+| run | λ | s (1/τ) |
+|---|---|---|
+| σ 3 DNS 6 | 15 δ_th = 24.7 δ_D | +0.0098 (+0.0020) |
+| σ 3 DNS 4 | 15 δ_th | −0.0007 (−0.0105) |
+| σ 2 DNS 6 | 15 δ_th = 26.9 δ_D | −0.0159 (−0.0231) |
+| σ 2 DNS 4 | 15 δ_th | −0.0194 (−0.0257) |
+| σ 2 DNS 4 | 30 δ_th = 53.9 δ_D | +0.0105 (+0.0061) |
+| σ 2 F 2 @ 3 | 15 δ_th | −0.1119 (−0.1230) |
+| σ 2 F 2 @ 3 | 30 δ_th | −0.0137 (−0.0199) |
+| σ 2 F 3 @ 2 | 15 δ_th | −0.2228 (−0.2251) |
+
+(Frame k at t = k·0.5, verifier-corrected as above.) σ 3 is not DL-stable at
+the U2 width (the 6-cell rate is +0.010), σ 2 is (both grids ≤ −0.01):
+**σ* = 2**. Scaling at σ 2: s(F 2, λ 30) / (s(DNS 4, λ 15)/2) = 1.411 (gate
+[0.6, 1.4]: FAILS, marginally; it read 1.397, a pass, with the frames one
+late — at σ 2 the λ 30 and λ 15 rates are both small, so the ratio is
+fragile; issues.md L8). Note that at σ 2 the thickened flame still damps the
+box mode 5.8× (F 2) and 11.5× (F 3) faster than the DNS.
+
+**Runs** (`runs/flames/lesgap/mp/camp/camp.sh`; U2 flags `--upstream 16
+--downstream 16 --hold-flame --inflow-speed 1.2 --turb 4 --mach 0.02
+--expansion 2`, grids as P2 (DNS6 90², DNS4 60² sink 11, LES2 = σ 1.35 + TFLES
+2 @ 3 cells 45² sink 8, LES4 = TFLES 3 @ 2 cells 30² sink 5), window [20, 40],
+S_T = SL / laminar S_L of the grid at σ 2 (M 0.02, tt 40, [20, 40]): 6 cells
+0.995855, 4 cells 1.007845, F 2 @ 3 0.996470, F 3 @ 2 0.995677). Labels read
+`DNS [premixed single-step, …, Le=1, sigma=2, M_flame=0.02 …; 3D nz=90,
+synthetic HIT inflow u'/S_L=4, l_t=2.5 delta_th (… seed 1; Re_t=24.9,
+h/eta=0.744 at the inflow) …]` and `LES [sigma-model Csigma=1.35; …] + TFLES
+[F=2, dynamic sensor (…), Charlette 2002 efficiency beta=0.5 (delta_L=
+delta_th), u'_Delta by Colin's operator|no efficiency (E=1)] [premixed …,
+sigma=2, …; h/eta=1.49 …]` (F 3: h/eta 2.23).
+
+| run | S_T/S_L | halves | A_T/A | I0 | brush (δ_D) | u'_flame | Ebar | FEmax |
+|---|---|---|---|---|---|---|---|---|
+| DNS6 s1 | 1.459 | 1.518 / 1.401 | 1.421 | 1.027 | 7.73 | 0.924 | – | – |
+| DNS6 s2 | 2.761 | 2.856 / 2.668 | 2.542 | 1.086 | 12.48 | 1.409 | – | – |
+| DNS4 s1 | 1.590 | 1.582 / 1.599 | 1.531 | 1.039 | 8.42 | 0.952 | – | – |
+| DNS4 s2 | 2.759 | 2.938 / 2.579 | 2.502 | 1.102 | 12.78 | 1.421 | – | – |
+| LES2-C s1 | 1.212 | 1.243 / 1.181 | 1.190 | 1.018 | 8.14 | 0.803 | 1.0157 | 2.83 |
+| LES2-C s2 | 1.410 | 1.427 / 1.393 | 1.372 | 1.028 | 11.10 | 1.168 | 1.0367 | 2.83 |
+| LES2-N s1 | 1.210 | 1.243 / 1.180 | 1.188 | 1.019 | 8.07 | 0.814 | 1 | 2.00 |
+| LES4-C s1 | 1.107 | 1.130 / 1.087 | 1.091 | 1.015 | 7.54 | 0.788 | 1.0956 | 5.20 |
+| LES4-C s2 | 1.155 | 1.194 / 1.118 | 1.118 | 1.033 | 8.22 | 1.111 | 1.1467 | 5.20 |
+| LES4-N s1 | 1.109 | 1.132 / 1.089 | 1.094 | 1.014 | 7.54 | 0.787 | 1 | 3.00 |
+
+Seed spread |s1 − s2|/mean: DNS6 0.62, DNS4 0.54, LES2-C 0.15, LES4-C 0.04 —
+the seed dependence survives in a DL-STABLE box: it is the realization, not
+DL alone. The seed-2 reruns with volumes reproduce every stats row byte for
+byte.
+
+**Gates** (paired per seed; a gate passes only if it holds for both):
+
+| # | gate | seed 1 | seed 2 | verdict |
+|---|---|---|---|---|
+| G1 | DNS6 halves ≤ 7% | 8.0% | 6.8% | FAIL (s1) |
+| G2 | DNS4/DNS6 ∈ [0.90, 1.10] | 1.090 | 0.999 | pass |
+| G3 | LES2-C/DNS6 ≥ 0.85 | 0.831 | 0.511 | FAIL |
+| G3e | LES2-C excess ≥ 0.64 | 0.461 | 0.233 | FAIL |
+| G4 | LES4-C/DNS6 ≥ 0.75 | 0.759 | 0.418 | FAIL (s2) |
+| G4e | LES4-C excess ≥ 0.39 | 0.234 | 0.088 | FAIL |
+| G5 | Ebar A_T,LES/A_T,DNS: LES2 ±20%, LES4 ±30% | 0.851 / 0.841 | 0.559 / 0.504 | FAIL (s2) |
+| G6 | brush/DNS: LES2 ±30%, LES4 ±40% | 1.053 / 0.976 | 0.890 / 0.659 | pass |
+| G7 | \|LES4-C − DNS\| < \|LES4-N − DNS\| (s1) | 0.3515 vs 0.3496 | – | FAIL (expected); LES2: 0.2472 vs 0.2484, pass |
+| G8 | I0 ∈ [0.8, 1.2], window means | 1.014–1.102 over all 10 runs | | pass (per row 0.971–1.223: DNS4 s2 rows exceed) |
+| G9 | LES2-C/DNS4 [40, 80] − [20, 40] within ±0.05 (report) | 0.813 − 0.762 = +0.051 | – | FAIL (marginal) |
+
+Verdict: seed 1 is INCONCLUSIVE (G1, reference non-stationary); seed 2 has G1
+and G2 passing and fails G3, G3e, G4, G4e, G5 — **a non-DL gap remains** at
+σ 2. The DL box mode explains the σ 5 numbers; it does not explain these.
+
+**Sub-filter share at σ 2** (front_filter on the d6 volumes, t = 20 / 30 /
+40, means): Ξ(2 δ_th) = 1.040 (s1) / 1.073 (s2), Ξ(3 δ_th) = 1.079 / 1.153.
+The LES's resolved A over the DNS's A filtered at Δ = F δ_th: LES2 0.83 /
+0.84 / 0.96 (s1), 0.63 / 0.58 / 0.53 (s2); LES4 0.79 / 0.81 / 0.95 (s1),
+0.57 / 0.52 / 0.47 (s2). Shell-1 (box mode) share of the DNS front variance
+0.70–0.86; rms x_I 2.0–4.0 (s1) / 6.3–9.0 δ_D (s2) against LES2 1.6–2.6 /
+3.0–4.1. The most an efficiency could restore: S_T,LES Ξ_Δ / S_T,DNS = 0.863
+/ 0.548 (LES2), 0.819 / 0.482 (LES4); with the plan's /Ebar: 0.850 / 0.529,
+0.748 / 0.420. So the deficit is again at resolved scales, mostly the box
+mode, which the DNS holds at 3–9 δ_D rms although it is linearly DL-stable
+(−0.02/τ): turbulence forces it, and the thickened front relaxes it 5.8–11.5×
+faster (s_F(k) = s_1(F k)/F). Second contributor, not separated: u'_flame is
+13–15% (s1) / 17–21% (s2) lower on the LES grids (l_t = 7.5 / 5 cells; the
+s2 DNS value is inflated by the brush's leading edge in the `uPrime` slab,
+issues.md T2).
+
+**The efficiency does not reach the consumption speed.** At σ 2 Ebar is
+1.016 / 1.096 (F 2 / F 3, s1) and 1.037 / 1.147 (s2) — at or above the
+a-priori Ξ_Δ at F 3 — yet C − N moves S_T by +0.0012 (F 2) and −0.0019
+(F 3), I0 1.0155 vs 1.0144. Ebar is an Ω-weighted mean over the sensor
+region, which extends 2.5 F δ_th into the turbulent fresh gas; a cell-local
+E > 1 in the preheat zone with E ≈ 1 at the reaction layer would explain it
+(not measured: E is not in the frames). Next TPRI (issues.md L9).
+
+**TFLES-regime point** (Step 3b, `runs/flames/lesgap/mp/lt6/lt6.sh`: σ 2, l_t
+6 δ_th, upstream 28, downstream 20, box 36 δ_th = 64.6 δ_D = 6 l_t, tt 30;
+LES with σ 1.35 + Charlette): the DNS4 (214 × 144²) exits 8 at t
+26.9 (flash-back guard: the brush reached the inflow band; 119 s), so the
+window is [10, 26.5]: DNS4 2.471 (halves 1.90 / 3.01), F 2 @ 3 1.883 (0.762×, Ebar
+1.009), F 3 @ 2 1.606 (0.650×, Ebar 1.072); [10, 20]: 1.989 / 0.841× /
+0.740×; [5, 12]: 1.336 / 0.936× / 0.898× (a3's tt-12 ratios; a3's 1.358
+above is the same run plus its final t = 12 stats row). The 64.6 δ_D
+box is DL-unstable at σ 2 in the DNS (λ 53.9: +0.011) and stable at F 2 (λ
+53.9: −0.014), so this point carries the same box-mode bias; the ratio falls
+as the DNS's S_T grows. No 6-cell reference. Report only.
+
+**`val_turbflame_les` is not registered** (G3–G5 fail at σ*; P2's decision
+stands).
+
+Regenerate: `runs/flames/lesgap/mp/{disp/disp.sh, lam/lam.sh, camp/camp.sh,
+camp2/camp2.sh, lt6/lt6.sh}` (simjob --gpu; 0.3 + 0.2 + 5.4 + 2.0 + 3.2 min),
+then `runs/flames/lesgap/mp/camp/gates.py`, `tools/chem/turb_stats.py PREFIX
+--t0 20 --t1 40 --sl S_L(grid) --mach 0.02 --sigma 2 --lt 4.488`,
+`tools/chem/wrinkle_rate.py PREFIX --ny N --cells C --dth 1.7953`,
+`tools/chem/front_filter.py PREFIX --n N --cells C --dth 1.7953 --t-first 20`.
 
 ## 3D turbulent slot Bunsen (`--mode bunsen --nz N`)
 
@@ -993,7 +1205,11 @@ returns H up to burn/in and the jet profile): a cone of S_T 1.586 at U 8 is
 (W/2) √((U/S_T)² − 1) = 59.3 δ_th tall; measured 57.3. Likewise A_cone cancels
 in I0 = burn / ∫|∇c| dV; the laminar extruded burner of
 `gpu_bunsen3d_extrude` already reads I0 1.06 (DNS) / 1.13 (TFLES 2), so I0 >
-1 is not a turbulence effect (issues.md B4). Damköhler (1 + u'_in) 4, Peters 1999 4.23 at the
+1 is not a turbulence effect (issues.md B4). At σ 5 the burner's span (2W
+= 48 δ_th ≈ 77 δ_D) admits Darrieus–Landau modes that TFLES 3 suppresses
+below ~63 δ_D ("Why TFLES misses the U2 DNS"), so this S_T is a TFLES number
+with that bias; FEmax = 3√3 also occurs in the LAMINAR extruded burner
+(Ebar 1.0048). Damköhler (1 + u'_in) 4, Peters 1999 4.23 at the
 INFLOW u' (u' at the flame not measured; the box decays in transit, ~14 τ_F
 to the tip): no literature band is claimed. FEmax = 3 √3 every row: E
 saturates at F^β = √3 somewhere (Charlette's Δ/δ_L − 1 branch); Ebar 1.013 —
@@ -1226,6 +1442,7 @@ visualization, labelled so; not the default).
 | `gpu_flame_les_species` | GPU API | uniform Y exact under Eddy / Thick; conservation vs the DNS's drift; the open-row μ_t image (σ and Smagorinsky) |
 | `gpu_tfles_teeth` | GPU API | Shvab–Zeldovich defect at Sc_t = Pr_t ≤ the DNS floor, ×10 at Sc_t 0.45; TFLES + LES within 2× the floor |
 | `gpu_tfles_1d` | GPU binary | laminar TFLES S_L (L1a/b/c), 3D LES σ bitwise S_L, Smagorinsky shift (~75 s) |
+| `gpu_tfles_dl` | GPU binary | Darrieus–Landau under thickening, σ 5, one 2D wrinkle mode: the U2 width grows in the DNS at 4 cells (s ≥ +0.02/τ; +0.0479), decays at F 2 (≤ −0.10; −0.1909); twice the width at F 2 grows at half the DNS rate (ratio in [0.6, 1.4]; 1.00) (~10 s) |
 
 ## Chamber (`--mode chamber`)
 

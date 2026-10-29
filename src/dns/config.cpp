@@ -4482,12 +4482,20 @@ std::string flameRunLabel(const Case& c)
     if (!les.empty() && !tfles.empty()) kind = les + " + " + tfles;
     else if (!les.empty()) kind = les;
     else if (!tfles.empty()) kind = "thickened flame " + tfles;
+    // sigma and beta are named only when not the model's default, so every
+    // default label reads byte for byte as before (TPRI lesgap).
+    const PremixedModel defModel{};
+    std::string model;
+    if (c.flameModel.sigma != defModel.sigma)
+        model += std::format(", sigma={:g}", c.flameModel.sigma);
+    if (c.flameModel.beta != defModel.beta)
+        model += std::format(", Zeldovich beta={:g}", c.flameModel.beta);
     return std::format(
-        "{} [premixed single-step, calorically perfect, Le=1, "
+        "{} [premixed single-step, calorically perfect, Le=1{}, "
         "M_flame={:g} (inflated; CH4/air 1.15e-3){}] species: MC-limited MUSCL "
         "on the central mass flux (bounded scalar transport; mean flow "
         "central){}",
-        kind, c.mach, dim,
+        kind, model, c.mach, dim,
         c.flameBunsen
             ? bunsenLabel(c.bunsen, c.flameModel.sigma,
                           c.grid.nz > 1 ? c.grid.nz * c.grid.hz : 0.0)

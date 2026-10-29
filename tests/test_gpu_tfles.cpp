@@ -29,8 +29,17 @@
 //            |S_L(L1a) - S_L(L1c)| <= 2e-3, |S_L(L1b)/S_L(L1a) - 1| <= 1%.
 //            L2: L1b in 3D (nz = ny = 16) with LES sigma + Charlette:
 //            |S_L - S_L(L1b)| <= 2e-4; the Smagorinsky twin's shift reported.
+//   dl       (binary) gpu_tfles_dl: thickening stretches the Darrieus-Landau
+//            dispersion relation by F, s_F(k) = s_1(F k) / F (docs/chem.md,
+//            "Why TFLES misses the U2 DNS"; issues.md L8). One 2D wrinkle
+//            mode at sigma 5 (tt 20, frames every 0.5): the U2 box width
+//            (15 delta_th = 24 delta_D, about 1.15 lambda_c) GROWS in the DNS
+//            at 4 cells and DECAYS under TFLES F 2, while twice that width at
+//            F 2 grows at half the DNS rate. The rate s is the slope of ln a
+//            over t in [4, 16], a = mode 1 of x_I(y) = sum_i Y (FP64 DFT),
+//            as tools/chem/wrinkle_rate.py.
 //
-// Usage: test_gpu_tfles bits|sensor|species|teeth|lam. No device -> 77.
+// Usage: test_gpu_tfles bits|sensor|species|teeth|lam|dl. No device -> 77.
 #include "dns/comp.hpp"
 #include "dns/config.hpp"
 #include "dns/flame1d.hpp"
@@ -48,6 +57,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -700,6 +710,96 @@ void lam()
                                          "the 1D TFLES S_L to 2e-4");
 }
 
+// --- dl ----------------------------------------------------------------------
+
+// The number after "key": in the run's flat .json; NaN if absent.
+double jsonNumber(const std::string& js, const std::string& key)
+{
+    const std::string k = "\"" + key + "\":";
+    const std::size_t p = js.find(k);
+    if (p == std::string::npos) return NAN;
+    return std::strtod(js.c_str() + p + k.size(), nullptr);
+}
+
+// Growth rate of a single 2D wrinkle mode of ny cells' wavelength.
+double wrinkleRate(const std::string& name, const std::string& args, int ny)
+{
+    const std::string prefix = runDns(
+        "dl_" + name, "--upstream 16 --downstream 16 --inflow-speed 1 --tt 20 "
+                      "--mach 0.02 --wrinkle 0.5 --wrinkle-modes 1 --emit stats "
+                      "--emit bin --fdt 0.5 --ny " +
+                          std::to_string(ny) + " " + args);
+    const std::string js = slurp(prefix + ".json");
+    const double nxd = jsonNumber(js, "nx"), fdt = jsonNumber(js, "frameDt");
+    const std::string raw = slurp(prefix + "_fuel.bin");
+    if (!(nxd > 0 && fdt > 0)) {
+        check(false, name + ": nx and frameDt in the .json");
+        return NAN;
+    }
+    const std::size_t nx = std::size_t(nxd), per = nx * std::size_t(ny);
+    const std::size_t nf = raw.size() / (sizeof(float) * per);
+    std::vector<float> Y(nf * per);
+    std::memcpy(Y.data(), raw.data(), Y.size() * sizeof(float));
+    // Least squares of ln a(t) over the frames with t in [4, 16].
+    double st = 0, sa = 0, stt = 0, sta = 0, a0 = NAN, aEnd = NAN;
+    int n = 0;
+    for (std::size_t f = 0; f < nf; ++f) {
+        double re = 0, im = 0;
+        for (int j = 0; j < ny; ++j) {
+            double xi = 0;
+            for (std::size_t i = 0; i < nx; ++i)
+                xi += Y[f * per + std::size_t(j) * nx + i];
+            const double ph = 2 * std::numbers::pi * j / ny;
+            re += xi * std::cos(ph);
+            im -= xi * std::sin(ph);
+        }
+        const double a = 2 * std::hypot(re, im) / ny;
+        // Frame f is the first step with t >= f fdt (cadence starts at
+        // frameStart 0; 41 frames over tt 20 at fdt 0.5).
+        const double t = fdt * double(f);
+        if (f == 0) a0 = a;
+        aEnd = a;
+        if (t < 4 || t > 16) continue;
+        const double la = std::log(a);
+        st += t;
+        sa += la;
+        stt += t * t;
+        sta += t * la;
+        ++n;
+    }
+    const double s = (n * sta - st * sa) / (n * stt - st * st);
+    std::printf("  %-6s ny %3d: %zu frames, a(t_end)/a(t_0) = %.3f, s = %+.4f / "
+                "tau over [4, 16] (%d frames)\n",
+                name.c_str(), ny, nf, aEnd / a0, s, n);
+    check(n >= 20, name + ": >= 20 frames in the fit window");
+    return s;
+}
+
+void dl()
+{
+    std::printf("Darrieus-Landau under thickening (sigma 5, one wrinkle mode)\n");
+    const double dns = wrinkleRate("m_dns4", "--cells-per-delta 4 --nscbc-sink 11",
+                                   60);
+    const double f2 = wrinkleRate("m_f2", "--cells-per-delta 3 --nscbc-sink 8 "
+                                          "--tfles 2",
+                                  45);
+    const double w2 = wrinkleRate("W_f2", "--cells-per-delta 3 --nscbc-sink 8 "
+                                          "--tfles 2",
+                                  90);
+    const double ratio = w2 / (dns / 2);
+    std::printf("  s(W_f2) / (s(m_dns4) / 2) = %.3f (s_F(k) = s_1(F k) / F: 1)\n",
+                ratio);
+    check(dns >= 0.02, "the DNS's U2-width mode grows (s >= +0.02 / tau)");
+    check(f2 <= -0.10, "TFLES F 2 damps the same mode (s <= -0.10 / tau)");
+    check(ratio >= 0.6 && ratio <= 1.4,
+          "twice the width at F 2 grows at half the DNS rate (ratio in [0.6, 1.4])");
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator("/tmp", ec))
+        if (e.path().filename().string().rfind("dns_test_tfles_dl_", 0) == 0)
+            fs::remove(e.path(), ec);
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -711,8 +811,9 @@ int main(int argc, char** argv)
     else if (mode == "species") species();
     else if (mode == "teeth") teeth();
     else if (mode == "lam") lam();
+    else if (mode == "dl") dl();
     else {
-        std::printf("usage: test_gpu_tfles bits|sensor|species|teeth|lam\n");
+        std::printf("usage: test_gpu_tfles bits|sensor|species|teeth|lam|dl\n");
         return EXIT_FAILURE;
     }
     return dnstest::finish();

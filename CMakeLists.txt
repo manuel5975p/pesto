@@ -795,8 +795,10 @@ if(BUILD_TESTING)
         add_test(NAME gpu_flame_les_species COMMAND test_gpu_tfles species)
         add_test(NAME gpu_tfles_teeth COMMAND test_gpu_tfles teeth)
         add_test(NAME gpu_tfles_1d COMMAND test_gpu_tfles lam)
+        # Darrieus-Landau under thickening: s_F(k) = s_1(F k)/F (~15 s).
+        add_test(NAME gpu_tfles_dl COMMAND test_gpu_tfles dl)
         set_tests_properties(gpu_tfles_bits gpu_tfles_sensor
-            gpu_flame_les_species gpu_tfles_teeth
+            gpu_flame_les_species gpu_tfles_teeth gpu_tfles_dl
             PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
         set_tests_properties(gpu_tfles_1d PROPERTIES TIMEOUT 600
             SKIP_RETURN_CODE 77)
