@@ -81,6 +81,43 @@ void flameIC(const Case& c, CompState& q, std::vector<double>& rhoY)
                   q, rhoY);
 }
 
+namespace {
+
+// The round nozzle's IC: bunsenIC's per-cell expressions with the profile and
+// the cone distance taken at r = hypot(y - yc, z - zc) (no z extrusion).
+void bunsenRoundIC(const Case& c, CompState& q, std::vector<double>& rhoY)
+{
+    const Grid& g = c.grid;
+    const BunsenGeom& b = c.bunsen;
+    const double sig = c.flameModel.sigma, Tu = c.flameTu, p0 = Tu;
+    for (int k = 0; k < g.nz; ++k) {
+        const double z = (k + 0.5) * g.hz;
+        for (int j = 0; j < g.ny; ++j) {
+            const double y = (j + 0.5) * g.hy;
+            const BunsenInflowRow in = bunsenInflowAt(b, y, z);
+            const double m = p0 / (Tu * in.t) * in.u;
+            for (int i = 0; i < g.nx; ++i) {
+                const double x = (i + 0.5) * g.hx;
+                const double dc = c.flameTfles > 1
+                                      ? bunsenConeDistanceAt(b, x, y, z) / c.flameTfles
+                                      : bunsenConeDistanceAt(b, x, y, z);
+                const double tf = flameProfile(c.flameEig.tab, dc);
+                const double t = tf * in.jet + b.tPilot * in.pilot + b.tCo * in.co;
+                const double Y = (sig - tf) / (sig - 1.0) * in.jet;
+                const double rho = p0 / (Tu * t);
+                const double u = m / rho;
+                const std::size_t cc = g.idx(i, j, k);
+                q.rho[cc] = rho;
+                q.mx[cc] = rho * u;
+                q.E[cc] = p0 / (kGammaAir - 1) + 0.5 * rho * u * u;
+                rhoY[cc] = rho * Y;
+            }
+        }
+    }
+}
+
+} // namespace
+
 void bunsenIC(const Case& c, CompState& q, std::vector<double>& rhoY)
 {
     assert(c.sub == Subcommand::Flame && c.flameBunsen &&
@@ -90,6 +127,10 @@ void bunsenIC(const Case& c, CompState& q, std::vector<double>& rhoY)
     const double sig = c.flameModel.sigma, Tu = c.flameTu, p0 = Tu;
     q = CompState::zeros(g);
     rhoY.assign(g.size(), 0.0);
+    if (b.round) {
+        bunsenRoundIC(c, q, rhoY);
+        return;
+    }
     for (int j = 0; j < g.ny; ++j) {
         const double y = (j + 0.5) * g.hy;
         const BunsenInflowRow in = bunsenInflow(b, y);

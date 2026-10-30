@@ -623,6 +623,16 @@ Measured gfx1100 via simjob, 2026-10-28.
     (below their quoted digits); the C++ shoot itself not probed. The port
     produced a garbage table there before (kept integrating dead lanes in
     record mode; now stops as dns does).
+70. **The round-nozzle cone is 27–43% shorter than the ideal cone, cause
+    not separated** (found 2026-10-30, `--nozzle round`, docs/chem.md
+    "Round-nozzle Bunsen"). Laminar DNS, 4 cells/δ_th: U 5, D 12 tip 21.5
+    vs 29.4 δ_th (ST 1.35); U 10, D 6 tip 17 vs 30 (ST 1.63). Tip curvature
+    vs tip resolution (4 cells) not separated: no grid study. The periodic
+    jet lattice (one box apart) not probed. No GPU test pins the round path
+    (host: profile/cone = slot at r, config rejections); slot bit identity
+    holds by construction (the slot entry points are the old functions,
+    `test_bunsen`; `gpu_bunsen3d_extrude`, `gpu_bunsen_cone`,
+    `gpu_bunsen_anchor` green), no base-vs-branch run byte compare.
 
 ### 3D premixed in turbulence (`--nz`, `--turb`, docs/chem.md "3D and turbulence")
 

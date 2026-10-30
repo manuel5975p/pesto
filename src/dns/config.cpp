@@ -1373,6 +1373,16 @@ std::expected<void, ConfigError> bunsenGeometry(const RawConfig& r, Case& c,
                                    cells - 1e-9));
     const int ny = 2 * half;
     const int nx = int(std::ceil(len * cells - 1e-9)) + 2 * nb;
+    // --nozzle round: the jet axis at (yc, zc) of a square periodic y-z box;
+    // zc a cell face like yc (nz = ny even).
+    const bool round = r.nozzle == 1;
+    if (round && r.nz != ny)
+        return bad(2, "--nozzle", std::format(
+                                      "round needs --nz = ny = {} (a square "
+                                      "periodic y-z box around the round jet; "
+                                      "ny is set by --slot-width, "
+                                      "--pilot-width, --coflow-width)",
+                                      ny));
     // 3D (--nz >= 8): z periodic at hz = h -- one span period of an infinite
     // slot; nz == 1 keeps hz = 1.
     auto box = makeBox(nx, ny, r.nz, nx * h, ny * h,
@@ -1403,6 +1413,8 @@ std::expected<void, ConfigError> bunsenGeometry(const RawConfig& r, Case& c,
     b.coneH = coneH * dth;
     b.pulse = r.pulse;
     b.pulseFreq = r.pulseFreq;
+    b.round = round;
+    b.zc = round ? half * h : 0.0;
     c.flameBunsen = true;
     c.uInf = r.jetSpeed;
     return {};
@@ -1941,7 +1953,7 @@ std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
                                        "--coflow-temp", "--pilot-width",
                                        "--pilot-temp", "--pilot-speed",
                                        "--slot-edge", "--length", "--pulse",
-                                       "--pulse-freq"},
+                                       "--pulse-freq", "--nozzle"},
                                       "only applies to --mode bunsen");
         e)
         return std::unexpected(*e);
@@ -4384,9 +4396,12 @@ std::string bunsenLabel(const BunsenGeom& b, double sigma, double lz)
     return std::format(
         " | {}: U_jet {:g} S_L, coflow {} (T/Tu {:g}) at {:g} "
         "S_L{}",
-        lz > 0 ? std::format("3D slot Bunsen (spanwise periodic L_z={:.3g} W)",
-                             lz / b.W)
-               : std::string("2D slot Bunsen"),
+        b.round ? std::format("3D round-nozzle Bunsen (diameter D, periodic "
+                              "square y-z box {:.3g} D)",
+                              lz / b.W)
+        : lz > 0 ? std::format("3D slot Bunsen (spanwise periodic L_z={:.3g} W)",
+                               lz / b.W)
+                 : std::string("2D slot Bunsen"),
         b.uJet, kind(b.tCo), b.tCo, b.uCo,
         b.pilot > 0 ? std::format(", {} pilot strips (T/Tu {:g}) at {:g} S_L",
                                   kind(b.tPilot), b.tPilot, b.uPilot)
@@ -4821,7 +4836,9 @@ std::string Case::describe() const
                 "{:.4g} (report-only, at the inflow u')\n"
                 "             {}; {}\n",
                 flameTurbNbx, grid.ny, grid.nz, seed,
-                flameBunsen ? "U_jet, times the jet weight J(y)" : "u_in",
+                !flameBunsen   ? "u_in"
+                : bunsen.round ? "U_jet, times the jet weight J(r)"
+                               : "U_jet, times the jet weight J(y)",
                 flameTurb, flameTurbL / dth, flameTurbL, flameTurbL / h,
                 kp * grid.nz * h / (2 * std::numbers::pi), tn.ReT, tn.eta,
                 h / tn.eta, tn.tauT, tn.Ka, tn.Da,
@@ -4878,7 +4895,7 @@ std::string Case::describe() const
                             (prandtl * std::max(1.0, kGammaAir / prandtl));
         return std::format(
             "case:\n"
-            "  mode       3D slot Bunsen flame{} (dns flame --mode bunsen "
+            "  mode       3D {} Bunsen flame{} (dns flame --mode bunsen "
             "--nz {})\n"
             "  model      single step F -> P, calorically perfect (gamma 1.4), "
             "equal W, Le = 1\n"
@@ -4888,32 +4905,40 @@ std::string Case::describe() const
             "  units      rho_u = S_L = R = 1, delta_D = 1, Tu = p0 = {:.6g}\n"
             "  grid       {} x {} x {} = {:.4g} M cells  h = {:.6g} = "
             "delta_th/{:.4g}  box {:.6g} x {:.6g} x {:.6g}  [x jet axis, y "
-            "periodic, z periodic span = {:.3g} W]\n"
-            "  burner     slot W = {:.4g} delta_th; jet u = {:.4g} S_L (jet "
+            "periodic, z periodic {} = {:.3g} W]\n"
+            "  burner     {} = {:.4g} delta_th; jet u = {:.4g} S_L (jet "
             "Mach {:.3g}); coflow {:.4g} delta_th per side, T = {:.4g} Tu, u "
             "= {:.4g} S_L\n"
             "  cone       IC/--length cone height {:.4g} delta_th{}; box length "
             "{:.4g} delta_th past the bands\n"
             "{}"
-            "  stats      span means (z) feed the cone measurement; ST = burn / "
-            "(2 flank L_z), area = integral |grad c| / (2 flank L_z), I0 = "
-            "ST/area\n"
+            "{}"
             "  boundary   x-lo NSCBC per-row inflow, etaIn {:.4g}; x-hi p = "
             "p0; sink {} cells\n"
             "  run        tt = {:.6g} flame times  cfl = {:.3g}  dt est {:.3e} "
             "(acoustic {:.3e}, thermal {:.3e})\n"
             "  label      {}\n"
             "  out        {}\n",
+            b.round ? "round-nozzle" : "slot",
             flameTurb > 0 ? " in synthetic turbulence" : "", grid.nz, sig,
             flameModel.beta, flameModel.theta(), prandtl, flameEig.Lambda, dth,
             flameTu, grid.nx, grid.ny, grid.nz,
             double(grid.nx) * grid.ny * grid.nz * 1e-6, h, flameCells,
-            grid.nx * h, grid.ny * h, grid.nz * h, grid.nz * h / b.W,
-            b.W / dth, b.uJet, b.uJet * mach, b.wCo / dth, b.tCo, b.uCo,
-            b.coneH / dth,
+            grid.nx * h, grid.ny * h, grid.nz * h,
+            b.round ? "(square y-z box) L_z" : "span", grid.nz * h / b.W,
+            b.round ? "round nozzle, diameter D" : "slot W", b.W / dth, b.uJet,
+            b.uJet * mach, b.wCo / dth, b.tCo, b.uCo, b.coneH / dth,
             flameTurb > 0 ? " (Damkoehler S_T = S_L (1 + u'/S_L))" : " (ideal)",
             grid.nx * h / dth - 2.0 * nscbcSink / flameCells,
-            flameTurbLesText(), nscbcEtaIn, nscbcSink, tEnd, cfl,
+            flameTurbLesText(),
+            b.round ? "  stats      the AXIAL plane z = zc (mean of the two planes "
+                      "either side) feeds the cone measurement; ST = burn / (pi R "
+                      "hypot(H, R)), R = D/2, area = integral |grad c| / that, I0 = "
+                      "ST/area; SLflank NaN (per unit span)\n"
+                    : "  stats      span means (z) feed the cone measurement; ST = "
+                      "burn / (2 flank L_z), area = integral |grad c| / (2 flank "
+                      "L_z), I0 = ST/area\n",
+            nscbcEtaIn, nscbcSink, tEnd, cfl,
             std::min(dtAc, dtTh), dtAc, dtTh, flameRunLabel(*this), outPrefix);
     }
     if (sub == Subcommand::Flame && flameBunsen)

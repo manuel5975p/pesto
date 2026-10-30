@@ -331,6 +331,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         enums.push_back({"--efficiency", {{"none", 0}, {"charlette", 1}},
                          &c.efficiency});
         enums.push_back({"--soot", {{"on", 1}, {"off", 0}}, &c.soot});
+        enums.push_back({"--nozzle", {{"slot", 0}, {"round", 1}}, &c.nozzle});
     }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench
         || c.sub == Subcommand::Channel || c.sub == Subcommand::Flame)
@@ -1663,6 +1664,12 @@ Lengths in delta_th, speeds in S_L, temperatures as T/Tu.
   --pulse A            jet speed modulation u_jet (1 + A sin 2 pi f t),
                        [0, 0.5]                                       [0]
   --pulse-freq F       its frequency f, 1/tau (needs --pulse)
+  --nozzle slot|round  slot: z-invariant (the span periodic); round: a
+                       circular nozzle of DIAMETER --slot-width on the axis
+                       of a square periodic y-z box, profiles in r =
+                       hypot(y - yc, z - zc); needs --nz = ny (the burner's
+                       box). The cone is measured on the axial plane
+                       z = zc; SLflank is NaN (per unit span)       [slot]
   Rejected by name with bunsen: --upstream, --downstream, --inflow-speed,
   --wrinkle, --wrinkle-modes, --ny (the burner sets the box), --profile-dt;
   and the bunsen flags without it.

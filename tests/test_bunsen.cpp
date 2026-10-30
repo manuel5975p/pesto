@@ -5,6 +5,7 @@
 #include "dns/bunsen.hpp"
 #include "check.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <format>
@@ -93,6 +94,52 @@ int main()
         check(std::abs(bunsenConeDistance(b, b.coneH / 2, b.yc) +
                        0.5 * b.W / 2 * std::sqrt(1 - sa * sa)) < 1e-12,
               "axis point at half height: distance (W/4) cos alpha");
+    }
+    // --nozzle: the slot through the (y, z) entry points is the old profile
+    // bit for bit at any z; the round nozzle is the slot's profile at r =
+    // hypot(y - yc, z - zc), axisymmetric, and its cone the slot's meridian.
+    {
+        BunsenGeom s = geom(19.2, 5, 28.8);
+        int same = 0, n = 0;
+        for (double y = 0.25; y < 57.6; y += 0.7)
+            for (const double z : {0.3, 11.0, 40.0}) {
+                const auto a = bunsenInflow(s, y), b = bunsenInflowAt(s, y, z);
+                same += a.u == b.u && a.t == b.t && a.Y == b.Y && a.jet == b.jet &&
+                        a.pilot == b.pilot && a.co == b.co &&
+                        bunsenConeDistance(s, 3.0, y) ==
+                            bunsenConeDistanceAt(s, 3.0, y, z);
+                ++n;
+            }
+        check(same == n, std::format("slot: the (y, z) entry points equal the "
+                                     "slot functions bit for bit ({}/{})",
+                                     same, n));
+        BunsenGeom r = s;
+        r.round = true;
+        r.zc = s.yc;
+        const auto c0 = bunsenInflowAt(r, r.yc, r.zc);
+        check(std::abs(c0.u - 5) < 1e-12 && std::abs(c0.Y - 1) < 1e-12,
+              "round: u = U_jet on the axis");
+        // Off-axis point at radius rr, every direction: the slot's value at
+        // y = yc + rr (to rounding of hypot).
+        double dmax = 0, cmax = 0;
+        for (const double rr : {2.0, 9.6, 12.5, 20.0})
+            for (int q = 0; q < 16; ++q) {
+                const double a = 2 * 3.141592653589793 * q / 16;
+                const double y = r.yc + rr * std::cos(a), z = r.zc + rr * std::sin(a);
+                const auto p = bunsenInflowAt(r, y, z),
+                           e = bunsenInflow(s, s.yc + rr);
+                dmax = std::max({dmax, std::abs(p.u - e.u), std::abs(p.t - e.t),
+                                 std::abs(p.Y - e.Y)});
+                cmax = std::max(cmax, std::abs(bunsenConeDistanceAt(r, 4.0, y, z) -
+                                               bunsenConeDistance(s, 4.0, s.yc + rr)));
+            }
+        check(dmax < 1e-12 && cmax < 1e-12,
+              std::format("round: axisymmetric, the slot's profile and cone at "
+                          "r (max |diff| {:.2g}, {:.2g})",
+                          dmax, cmax));
+        check(bunsenInflowAt(r, r.yc + 9.6, r.zc + 9.6).Y < 0.5 &&
+                  bunsenInflow(s, s.yc + 9.6).Y > 0.49,
+              "round: a corner of the slot's jet band is coflow (r > W/2)");
     }
     // measureCone on the runner's own geometry: h = delta_th / cells with
     // delta_th = 1.60165, W = 12 delta_th, coflow W per side, flame 1 delta_th.

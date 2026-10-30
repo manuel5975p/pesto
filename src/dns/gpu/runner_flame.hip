@@ -24,6 +24,7 @@
 #include <format>
 #include <numbers>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace dns::gpu {
@@ -254,6 +255,15 @@ std::expected<RunStats, RunError> runFlame(
             m[q] = float(s / g.nz);
         }
     };
+    // Round nozzle: the plane through the jet axis z = zc (a cell face, nz
+    // even): the mean of the k = nz/2 - 1 and nz/2 planes, in FP64.
+    auto axialPlane = [&](const std::vector<float>& f, std::vector<float>& m) {
+        const std::size_t plane2 = std::size_t(g.nx) * g.ny;
+        const std::size_t k0 = plane2 * std::size_t(g.nz / 2 - 1), k1 = k0 + plane2;
+        m.resize(plane2);
+        for (std::size_t q = 0; q < plane2; ++q)
+            m[q] = float(0.5 * (double(f[q + k0]) + double(f[q + k1])));
+    };
     DeviceBuffer<double> tflesScratch;
     std::vector<double> tfs;
     // A stats row: the mode's base columns, then (TFLES) Ebar, FEmax.
@@ -398,6 +408,13 @@ std::expected<RunStats, RunError> runFlame(
             // cells/delta_th the 2D window of 1 cell dropped every flank
             // row of the span-mean cone). F = 1 is the 2D window.
             const double Fw = r.tflesOn ? r.tfles.F : 1.0;
+            // Round nozzle: the cone of the AXIAL plane (the mean of the
+            // two k planes either side of zc, a cell face), not the span
+            // mean -- a z mean of a round flame smears jet into coflow.
+            if (r.geom.round)
+                for (auto [f, mm] : {std::pair{&Th, &Tm}, {&Rh, &Rm}, {&Uh, &Um},
+                                     {&Vh, &Vm}, {&Wh, &Wm}})
+                    axialPlane(*f, *mm);
             m.cone = measureCone(Tm, g.nx, g.ny, hx, Tmid, r.geom.yc, Wm,
                                  int(std::ceil(0.5 * (2 * Fw - 1) * r.dth / hx)));
             m.mFlank = flankMassFlux(m.cone, Rm, Um, Vm, g.nx, hx);
@@ -408,7 +425,9 @@ std::expected<RunStats, RunError> runFlame(
                     m.fuelIn += double(Rh[c]) * Uh[c] * r.rowY[row] * g.hy * g.hz;
                 }
             const double Lz = g.nz * g.hz;
-            if (m.cone.ok) {
+            // SLflank is per unit SPAN of a slot flank: undefined for the
+            // round cone (its ST below is the flank-area mean).
+            if (m.cone.ok && !r.geom.round) {
                 double w = 0;
                 for (int i = m.cone.iLo; i <= m.cone.iHi; ++i) w += col(i, 4);
                 const double cosA = 1.0 / std::hypot(1.0, m.cone.tanA);
@@ -422,9 +441,14 @@ std::expected<RunStats, RunError> runFlame(
                 double a = 0;
                 for (int i = 0; i < g.nx; ++i)
                     a += ts[std::size_t(i) * kTurbSums + 6] * dV;
+                // Slot: two flanks of span Lz; round: the circular cone's
+                // lateral area pi R hypot(H, R), R = W/2.
                 const double aCone =
-                    2.0 * std::hypot(m.cone.xTip - m.cone.xBase,
-                                     0.5 * r.geom.W) * Lz;
+                    r.geom.round
+                        ? std::numbers::pi * 0.5 * r.geom.W *
+                              std::hypot(m.cone.xTip - m.cone.xBase, 0.5 * r.geom.W)
+                        : 2.0 * std::hypot(m.cone.xTip - m.cone.xBase,
+                                           0.5 * r.geom.W) * Lz;
                 m.ST = m.burn / aCone; // rho_u Y_u = 1
                 m.area = a / aCone;
             }

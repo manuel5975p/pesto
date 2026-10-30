@@ -11,10 +11,18 @@
 
 namespace dns {
 
-BunsenInflowRow bunsenInflow(const BunsenGeom& b, double y)
+namespace {
+
+// The burner's radial coordinate: |y - yc| for the slot (z-invariant),
+// hypot(y - yc, z - zc) for the round nozzle.
+double burnerR(const BunsenGeom& b, double y, double z)
+{
+    return b.round ? std::hypot(y - b.yc, z - b.zc) : std::abs(y - b.yc);
+}
+
+BunsenInflowRow inflowAtR(const BunsenGeom& b, double r)
 {
     assert(b.edge > 0);
-    const double r = std::abs(y - b.yc);
     const double jet = 0.5 * (1.0 - std::tanh((r - 0.5 * b.W) / b.edge));
     const double co =
         0.5 * (1.0 + std::tanh((r - 0.5 * b.W - b.pilot) / b.edge));
@@ -23,12 +31,11 @@ BunsenInflowRow bunsenInflow(const BunsenGeom& b, double y)
             jet + b.tPilot * p + b.tCo * co, jet, jet, p, co};
 }
 
-double bunsenConeDistance(const BunsenGeom& b, double x, double y)
+double coneDistanceAtR(const BunsenGeom& b, double x, double r)
 {
     assert(b.W > 0 && b.coneH > 0);
     // In the (x, r) half plane the flank is the segment P0 = (0, W/2) ->
     // P1 = (coneH, 0); inside = r below the flank line for 0 <= x <= coneH.
-    const double r = std::abs(y - b.yc);
     const double ax = b.coneH, ar = -0.5 * b.W;
     const double L2 = ax * ax + ar * ar;
     const double s = std::clamp((x * ax + (r - 0.5 * b.W) * ar) / L2, 0.0, 1.0);
@@ -37,6 +44,30 @@ double bunsenConeDistance(const BunsenGeom& b, double x, double y)
     const bool inside = x >= 0 && x <= b.coneH &&
                         r < 0.5 * b.W * (1.0 - x / b.coneH);
     return inside ? -d : d;
+}
+
+} // namespace
+
+BunsenInflowRow bunsenInflow(const BunsenGeom& b, double y)
+{
+    assert(!b.round);
+    return inflowAtR(b, std::abs(y - b.yc));
+}
+
+BunsenInflowRow bunsenInflowAt(const BunsenGeom& b, double y, double z)
+{
+    return inflowAtR(b, burnerR(b, y, z));
+}
+
+double bunsenConeDistance(const BunsenGeom& b, double x, double y)
+{
+    assert(!b.round);
+    return coneDistanceAtR(b, x, std::abs(y - b.yc));
+}
+
+double bunsenConeDistanceAt(const BunsenGeom& b, double x, double y, double z)
+{
+    return coneDistanceAtR(b, x, burnerR(b, y, z));
 }
 
 namespace {

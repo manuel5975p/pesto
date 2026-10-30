@@ -1350,11 +1350,12 @@ int runFlame(const Case& c)
         rr.bunsen = true;
         rr.geom = c.bunsen;
         rr.pB = Tu;
-        // Rows at j + ny k: the z-invariant slot repeated over the span.
+        // Rows at j + ny k: the z-invariant slot repeated over the span, or
+        // the round nozzle's r(y, z) profile.
         for (int k = 0; k < g.nz; ++k)
             for (int j = 0; j < g.ny; ++j) {
                 const BunsenInflowRow in =
-                    bunsenInflow(c.bunsen, (j + 0.5) * g.hy);
+                    bunsenInflowAt(c.bunsen, (j + 0.5) * g.hy, (k + 0.5) * g.hz);
                 const double T = Tu * in.t, rho = Tu / T; // p0 = Tu, R = 1
                 rr.rowU.push_back(in.u);
                 rr.rowJet.push_back(in.jet);

@@ -1674,6 +1674,35 @@ equals ∫ j dV to 1.0000 / 0.99996 / 0.9968 at θ 0 / 25 / 40°, the z seam to
 render; regenerate: the command above (simjob --gpu, ~10 min), then
 `runs/flames/turb3d/render.sh` (simjob --cpu, ~2 min).
 
+## Round-nozzle Bunsen (`--mode bunsen --nozzle round`)
+
+`--nozzle round` (3D only, `--nz` = ny): a circular nozzle of DIAMETER
+`--slot-width` on the axis (yc, zc) of a square periodic y-z box; the slot's
+inflow profile, pilot and IC cone are evaluated at r = hypot(y − yc, z − zc)
+(`bunsenInflowAt`, `bunsenConeDistanceAt`; the slot entry points are the old
+functions bit for bit, `test_bunsen`). The cone is measured on the AXIAL
+plane z = zc (mean of the planes k = nz/2 − 1, nz/2, FP64), not the span
+mean (an axisymmetric cone's span mean is not a cone); ST = burn / (π R
+hypot(H, R)), R = D/2; `SLflank` is NaN (per unit span). The periodic box
+holds a lattice of jets one box apart (jet interaction not measured).
+Files: `bunsen`, `config` (`bunsenGeometry`), `flame1d` (`bunsenRoundIC`),
+`dns_main` (rows), `runner_flame` (`axialPlane`).
+
+The round cone is SHORTER than the ideal cone (measured, laminar DNS):
+U 10, D 6 δ_th, 4 cells/δ_th, cold
+coflow + 3 δ_th pilot at the jet speed, nz 96 (1.84 M cells, simjob 725, 82
+s): steady, burn/in 1.00, tip 17 δ_th = 2.8 D vs the ideal (D/2) √(U² − 1)
+= 30, ST 1.63. U 5, D 12 (nz 120): tip 21.5 vs 29.4, ST 1.35. Not
+separated: curvature vs resolution at the tip.
+
+Renders: `tools/chem/flame_room.py` (inside Blender: `blender -b
+--factory-startup --python tools/chem/flame_room.py -- PREFIX --out DIR
+[...]`, `--help`): Cycles path tracing of the `--emit volume` ω field as an
+emission-only VDB in a small lab (bench, burner `--burner slot|round`,
+props), proxy lights per height band, AgX; ~4–5.5 s/frame at 1080p on
+gfx1100. `tools/chem/flame_dnsvid.py`: 2×2 slice video (∫ω dz light, |∇×u|,
+|u|, T).
+
 ## Wick candle (`--mode candle --wick`)
 
 The candle above with a REAL wick: `dns/wick.{hpp,cpp}` (geometry, regions,

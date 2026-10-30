@@ -387,6 +387,57 @@ int main()
                   "S_T");
         }
     }
+    // --nozzle round: the same burner in a square periodic y-z box.
+    {
+        const std::vector<std::string> base{
+            "flame", "--mode", "bunsen", "--slot-width", "6", "--coflow-width",
+            "6", "--cells-per-delta", "4"};
+        auto with = [&](std::vector<std::string> extra) {
+            auto a = base;
+            a.insert(a.end(), extra.begin(), extra.end());
+            return a;
+        };
+        auto s = runCli(with({"--nz", "16"}));
+        check(s && !s->bunsen.round && s->bunsen.zc == 0,
+              "--nozzle absent: the slot (round false, zc 0)");
+        const int ny = s ? s->grid.ny : 0;
+        auto z = runCli(with({"--nz", "16", "--nozzle", "slot"}));
+        check(z && s && z->describe() == s->describe() &&
+                  flameRunLabel(*z) == flameRunLabel(*s),
+              "--nozzle slot is the default case (dry-run and label)");
+        auto r = runCli(with({"--nz", std::to_string(ny), "--nozzle", "round"}));
+        check(r && r->bunsen.round && r->grid.nz == ny && r->grid.ny == ny &&
+                  r->grid.nx == s->grid.nx && r->bunsen.zc == r->bunsen.yc &&
+                  r->bunsen.coneH == s->bunsen.coneH,
+              "--nozzle round: nz = ny, axis at (yc, zc = yc), the slot's nx "
+              "and IC cone");
+        if (r) {
+            const std::string d = r->describe(), l = flameRunLabel(*r);
+            check(l.find("3D round-nozzle Bunsen (diameter D, periodic square "
+                         "y-z box") != std::string::npos &&
+                      l.find("3D slot Bunsen") == std::string::npos,
+                  "round label names the round nozzle, not the slot");
+            check(d.find("3D round-nozzle Bunsen flame (dns flame") !=
+                          std::string::npos &&
+                      d.find("round nozzle, diameter D = 6 delta_th") !=
+                          std::string::npos &&
+                      d.find("the AXIAL plane z = zc") != std::string::npos,
+                  "round dry-run: mode, burner and stats lines");
+        }
+        auto t = runCli(with({"--nz", std::to_string(ny), "--nozzle", "round",
+                              "--jet-speed", "8", "--turb", "1",
+                              "--turb-length", "2"}));
+        check(t && t->describe().find("jet weight J(r)") != std::string::npos,
+              "round --turb dry-run: the jet weight is J(r)");
+        rejects(with({"--nz", "16", "--nozzle", "round"}), 2, "--nozzle",
+                "--nozzle round with nz != ny rejected");
+        rejects(with({"--nozzle", "round"}), 2, "--nozzle",
+                "--nozzle round in 2D (nz 1) rejected");
+        rejects({"flame", "--nozzle", "round"}, 2, "--nozzle",
+                "--nozzle rejected by name without --mode bunsen");
+        rejects(with({"--nz", "16", "--nozzle", "oval"}), 1, "--nozzle",
+                "--nozzle oval: a CLI error");
+    }
     rejects({"flame", "--mode", "bunsen", "--nz", "16", "--turb", "3",
              "--jet-speed", "4.5"},
             2, "--turb", "bunsen --turb: U_jet <= 1.25 S_T (no cone) rejected");

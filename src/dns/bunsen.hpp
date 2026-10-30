@@ -26,6 +26,11 @@ struct BunsenGeom
     double coneH = 0;      // ideal cone height (W/2) sqrt(uJet^2 - 1)
     double pulse = 0;      // jet speed modulation amplitude (fraction of uJet)
     double pulseFreq = 0;  // its frequency (1/tau)
+    // Round nozzle (--nozzle round, 3D): W is the DIAMETER, the jet axis
+    // (yc, zc), every profile a function of r = hypot(y - yc, z - zc), z
+    // periodic like y. false = the slot (r = |y - yc|, z-invariant).
+    bool round = false;
+    double zc = 0;
 };
 
 // The x-lo inflow state at height y: speed u, temperature ratio t = T/Tu,
@@ -41,13 +46,20 @@ struct BunsenInflowRow
 {
     double u, t, Y, jet, pilot, co;
 };
+// Pre: b.edge > 0, !b.round.
 BunsenInflowRow bunsenInflow(const BunsenGeom& b, double y);
+// The same profile at (y, z): r = |y - yc| (slot: bunsenInflow bit for bit)
+// or hypot(y - yc, z - zc) (round). Pre: b.edge > 0.
+BunsenInflowRow bunsenInflowAt(const BunsenGeom& b, double y, double z);
 
 // Signed distance from (x, y) to the ideal cone: the two flanks from
 // (0, yc +- W/2) to the tip (coneH, yc), positive on the burnt side
 // (outside the cone or past the tip), negative inside the fresh core.
-// Pre: b.W > 0, b.coneH > 0.
+// Pre: b.W > 0, b.coneH > 0, !b.round.
 double bunsenConeDistance(const BunsenGeom& b, double x, double y);
+// The same in the meridional (x, r) plane at (y, z) (the round nozzle's
+// circular cone; slot: bunsenConeDistance bit for bit). Pre: as above.
+double bunsenConeDistanceAt(const BunsenGeom& b, double x, double y, double z);
 
 // The cone read off a temperature field T (FP32, cell (i, j) at i + nx j,
 // x = (i + 1/2) h, y = (j + 1/2) h, square cells h) at the isotherm Tmid.

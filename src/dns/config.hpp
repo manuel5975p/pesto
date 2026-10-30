@@ -311,6 +311,7 @@ struct RawConfig
     double flameLength = -1;    // x extent beyond the bands; < 0 = auto
     double pulse = 0;           // jet speed modulation amplitude (fraction)
     double pulseFreq = 0;       // its frequency, 1/tau
+    int nozzle = 0;             // --nozzle slot (0) | round (1, 3D: W = diameter)
     // --mode diffusion (2D slot jet diffusion flame; dns/diffusion.hpp).
     // Lengths in l = D0/U_jet, speeds in U_jet; the burner flags above keep
     // their names (slot width = the jet Peclet number).
