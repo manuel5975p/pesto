@@ -3,7 +3,7 @@
 Spec of the single-step premixed flame, of the two-reactant diffusion
 flame (`--mode diffusion`) and of the candle (`--mode candle`, the diffusion
 flame under gravity). Plan and measurements:
-`plans/chem_plan.md`, `plans/impl_chem.md`. Open items: `issues.md` §30–53, T1–T7, L1–L6.
+`plans/chem_plan.md`, `plans/impl_chem.md`. Open items: `issues.md` §30–53, §64–69, T1–T7, L1–L6.
 
 ## Model C0
 
@@ -145,8 +145,9 @@ Exit 8 when x_f comes within band + 2 δ_th of either face.
 is laid row by row at x_f0 + Σ_{k=1..N} (A/√N) cos(2πky/L_y + φ_k), φ_k =
 2π frac(k² · golden) (deterministic; a LINEAR phase in k sums the modes into
 one bump). x momentum only, so the start relaxes acoustically. A = 0 is the
-planar IC bit for bit. It seeds Darrieus–Landau; nothing about the wrinkled
-front is validated (no linear-growth-rate test yet).
+planar IC bit for bit. It seeds Darrieus–Landau; the single-mode linear
+growth rate is measured against reactingFoam and Matalon–Matkowsky (G2b,
+"Against OpenFOAM reactingFoam"); no ctest pins it.
 
 `yMin`, `yMax` (appended columns) give the overshoot MAGNITUDE the count
 hides. Measured (2026-10-28, M 0.02, 8 cells, `--ny 256 --wrinkle 1
@@ -234,6 +235,11 @@ t ∈ [20, 30]; window halves agree to ≤ 3e-3):
 | 5 | 12 | 12.00° | 1.03998 | 1.00365 | 1.00443 | 0.99963 |
 | 5 | 16 | 11.98° | 1.03799 | 1.00291 | 1.00343 | 0.99941 |
 
+(These rows carry the default ρ-target inflow: under the cone's +0.56%
+inflow overpressure the fresh jet enters 0.59% hot, which alone lifts
+sinRatio by 1.8% and SLflank by 0.95% at U 5, 8 cells; `--nscbc-tinflow`
+holds T_row — G2a below, issues.md §66.)
+
 The cone-angle relation reads 2–5% HIGH and converges to that (U 5:
 +4.7/+4.0/+3.8% at 8/12/16 cells): the fresh gas decelerates ahead of the
 flank (the cone's own displacement), so U_jet overstates the approach
@@ -294,6 +300,434 @@ sink + ghost wall), `conv`, `channel` 3D and `channel --rans sa-neg
 vs 2.33/2.34 branch.
 
 Cost: 15 cells, M 0.01, tt 10: 56346 steps, 0.20 ms/step, 11.3 s wall.
+
+## Against OpenFOAM reactingFoam (G1: 1D laminar premixed, 2026-10-30)
+
+The C0 model in OpenFOAM v2606 `reactingFoam` on the IDENTICAL cells,
+both solvers generated from one case spec. Full record:
+`plans/verify/impl_foamflame_G1.md`.
+
+**Tooling** (`tools/chem/foam_flame.py`, package `tools/chem/foamflame/`;
+numpy only, reference only — never a build dependency): `model.py` (a numpy
+port of the P0 oracle — Λ 3656401.0984807 vs dns' 3656401.098, δ_th/δ_D
+1.6016509 — and `si_map`, the ONE box → SI mapping), `writer.py` (the v2606
+case dictionaries), `cases.py` (CASES: one dict per case; a geometry = five
+functions: grid, IC, patch BCs, blockMesh, probes), `observe.py` (one
+measurement code path for both solvers, the runner's own definitions). `setup
+CASE` writes `runs/flames/foam/CASE/` (foam cases, dns argv); `run CASE`
+dry-runs dns, then submits ONE GPU job (one step per rung) and ONE CPU job
+(blockMesh per case, then the reactingFoam runs side by side, serial each,
+`--np` at a time); `compare CASE` prints the table and writes
+`compare.json`. A new case is a dict; a new geometry its five functions and
+its `measure()`.
+
+**SI mapping** (`si_map`; inputs Tu 300 K, p0 101325 Pa, W 28.014 for F and
+P, M = S_L/c_u 0.01, δ_D 1e-4 m): R 296.797, cp = 3.5 R = 1038.788 J/kg/K,
+c_u 353.065 m/s, S_L = M c_u = 3.53065 m/s, ρ_u 1.137984 kg/m³, κ = ρ_u cp
+S_L δ_D = 0.417366, μ = Pr κ/cp = 2.89283e-4 Pa s (constant), τ = δ_D/S_L =
+2.83234e-5 s, A = Λ/τ = 1.290946e11 /s, Ta = θ Tu = 15000 K, Hf_F = q = cp
+(σ − 1) Tu = 1.246546e6 J/kg (Hf_P 0). Box quantity × unit = SI (lengths δ_D,
+times τ, speeds S_L, densities ρ_u, p × p0/p0_box, T × Tu/Tu_box).
+
+**Model, checked in the v2606 source:**
+
+| item | OpenFOAM | file |
+|---|---|---|
+| rate | `irreversibleArrheniusReaction` "F = P", beta 0: kf = A e^(−Ta/T); ω_i = kf max(c_F, 0), RR_F = −W kf ρY/W = −A ρ Y e^(−Ta/T) | `specie/reaction/reactionRate/ArrheniusReactionRate/ArrheniusReactionRateI.H`, `chemistryModel/.../StandardChemistryModel.C` (`omega`, `calculate`) |
+| heat release | Qdot = −Σ Hc_i RR_i = Hf_F ω | `StandardChemistryModel.C` (`Qdot`), `specie/thermo/hConst/hConstThermoI.H` (Hc = Hf, Hs = Cp (T − Tref)) |
+| gas | `hePsiThermo`, `reactingMixture`, `const` transport, `hConst`, `sensibleEnthalpy`, `perfectGas`; equal W, Cp, μ, Pr ⇒ composition-free R, cp, μ, κ; T from h by Newton, exact for hConst (`thermo/thermoI.H`, tol 1e-4 T0: one exact step) | `basic/psiThermo/hePsiThermo.C`, `transport/const/constTransportI.H` (κ = Cp μ/Pr, alphah = μ/Pr) |
+| rate evaluation | `integrateReactionRate false`: the instantaneous rate at the current PIMPLE iterate (`calculate()`), so converged outer correctors = implicit Euler on the whole system (no dt-dependent splitting error in a steady flame) | `combustionModels/laminar/laminar.C` |
+| Le = 1 | **reactingFoam's YEqn diffuses Y with `muEff` (Sc = 1, Le = 1/Pr = 1.39)**, h with `alphaEff` = κ/cp; no thermophysicalTransport model in this solver. The case adds `+ fvm::laplacian(alphaEff − muEff, Y)` (coded `scalarCodedSource`, `system/fvOptions`) ⇒ ρD = κ/cp exactly | `applications/solvers/combustion/reactingFoam/YEqn.H`, `TurbulenceModels/compressible/ThermalDiffusivity/ThermalDiffusivity.H`, `basic/heThermo/heThermo.C` (`alphahe`) |
+| Y scheme | `MUSCL` limiter = clamp(min(2r, (r+1)/2), 0, 2) = MC; r = 2 d·∇Y_P/(Y_N − Y_P) − 1 with Gauss-linear ∇Y = the classic r on a uniform 1D row; face = Y_up + ψ (Y_lin − Y_up) = dns' MC-MUSCL | `limitedSchemes/MUSCL/MUSCL.H`, `LimitedScheme/NVDTVD.H`, `limitedSurfaceInterpolationScheme.C` |
+| per-field schemes | `multivariateSelection` and plain multivariate apply ONE limiter (the min over Y and h) to every field; `multivariateIndependent` gives each its own | `multivariateSchemes/*` |
+
+**What matches exactly:** the cells (dns' h = δ_th/N, nx = (12 + 10) N +
+2·16, x_f0, cubic cells, one row; dns y periodic ny 4 = foam one cell,
+`empty`), the IC (dns' `premixedState` of the oracle at the cell centres:
+p = p0 − m²(1/ρ0 − 1), u = m/ρ, m = 0.98), every model constant, Le = 1,
+constant μ, γ 1.4, M 0.01 (both compressible: same O(M²) physics), the
+Y face interpolant on interior faces (dns goes first order where the upwind
+cell is a boundary cell; Y is uniform there), the observables (one code
+path).
+
+**What differs (not removable):**
+
+- inflow: dns NSCBC (u relaxed to 0.98, T relaxed, etaIn 100, p free, Y
+  carried in, no face diffusion) + a 16-cell sink band; foam fixedValue U,
+  T, Y, zeroGradient p, Fick/Fourier through the face (zero: uniform fresh
+  gas). dns' fresh u wanders (sd 5e-4 S_L), foam's is exact.
+- outflow: dns NSCBC p → p_b = p0 − u_in²(σ − 1) + 16-cell sink band; foam
+  `waveTransmissive` p (γ 1.4, p_inf = p_b, l_inf = box length), U, T, Y
+  zeroGradient. foam's band cells are plain interior.
+- mean flow: dns explicit central (KG face flux) on total E, FP32; foam
+  pressure-based PIMPLE, `Gauss linear` U, K and h (variant `mclin`),
+  Rhie–Chow (ddtCorr), sensible h with K and dpdt, FP64. foam's energy
+  equation has NO viscous work div(τ·u) (O(M²); drops out between plateaus).
+- time: dns SSP-RK3 at acoustic CFL 0.4 (dt 3.7e-4 / 1.9e-4 / 9.3e-5 τ);
+  foam implicit Euler, fixed dt 1e-3 τ (convective Co 0.023 / 0.047 / 0.093,
+  acoustic Co 1.0 / 2.1 / 4.2), 3 outer × 2 pressure correctors, every solve
+  to 1e-14 (DIC/DILU are exact on a tridiagonal row: 1 iteration).
+
+**Protocol** both: `--inflow-speed 0.98 --tt 20`, mean over t ∈ [10, 20]
+(dns stats rows / foam `volIntegrate(Qdot)` every 10 steps over the probed
+ρY at the reference column; profiles: dns every 0.1 τ, foam 0.5 τ).
+
+**Measured** (S_L consumption; δ_th = (Tb − Tu)/max dT/dx vs the oracle
+1.60165; T_b at 2.5–3.5 δ_th behind x_f, exact energy balance −9.6e-5; Δp
+vs the measured-state Rankine–Hugoniot jump; L∞ of θ over |ξ| ≤ 5 δ_th vs
+the oracle at the solver's own cells):
+
+| N | solver (scheme) | S_L | S_L halves | δ_th/or − 1 | T_b/σTu − 1 | Δp/RH − 1 | L∞ θ | L∞ ω/ω_max |
+|---|---|---|---|---|---|---|---|---|
+| 7.5 | dns (central, Y MC) | 1.016856 | 1.016862 / 1.016850 | −2.956e-2 | −8.6e-5 | −1.28e-2 (§65) | 9.88e-3 | 5.50e-2 |
+| 7.5 | foam mclin (U, h linear, Y MUSCL) | 1.015386 | 1.015414 / 1.015357 | −3.121e-2 | −9.0e-5 | −3.4e-5 | 1.00e-2 | 5.49e-2 |
+| 7.5 | foam mcmc (U linear, h, Y MUSCL) | 0.993611 | 0.993584 / 0.993638 | −2.38e-3 | −9.5e-5 | +4.4e-6 | 3.58e-3 | 1.12e-2 |
+| 15 | dns | 1.003021 | 1.003040 / 1.003003 | −6.515e-3 | −1.07e-4 | +2.0e-4 | 2.05e-3 | 1.24e-2 |
+| 15 | foam mclin | 1.002978 | 1.002988 / 1.002969 | −6.809e-3 | −9.4e-5 | −7.3e-6 | 2.17e-3 | 1.25e-2 |
+| 15 | foam mcmc | 0.997593 | 0.997595 / 0.997591 | +7.16e-4 | −9.5e-5 | −5e-8 | 9.67e-4 | 3.79e-3 |
+| 30 | dns | 1.000336 | 1.000103 / 1.000570 | −1.359e-3 | −8.0e-5 | −2.3e-3 | 4.23e-4 | 2.72e-3 |
+| 30 | foam mclin | 1.000189 | 1.000194 / 1.000185 | −1.173e-3 | −9.55e-5 | +1.3e-6 | 3.52e-4 | 1.97e-3 |
+| 30 | foam mcmc | 0.998850 | 0.998852 / 0.998848 | +6.67e-4 | −9.6e-5 | +3.0e-6 | 3.35e-4 | 1.69e-3 |
+
+| ladder | S_L order p | S_L Richardson (p) / (2) | δ_th p | δ_th Richardson | L∞ θ p |
+|---|---|---|---|---|---|
+| dns | 2.365 | 0.99969 / 0.99944 | 2.160 | 1.60186 | 2.27 |
+| foam mclin | 2.153 | 0.99938 / 0.99926 | 2.114 | 1.60248 | 2.11 |
+| foam mcmc | 1.664 | 0.99943 / 0.99927 | — (non-monotone) | 1.60269 (p 2) | 2.05 |
+
+dns vs foam mclin at equal mesh, profiles aligned at x_f (foam cubic-
+interpolated onto dns' offsets; the same interpolation of the oracle is the
+floor): L∞ θ 7.7e-4 / 1.6e-4 / 2.0e-4, Y 9.7e-4 / 1.8e-4 / 2.7e-4, u (as
+(u − u_in)/(σ − 1)) 7.1e-3 / 1.6e-3 / 1.2e-3 (dns' wandering inflow
+velocity), ω 1.3e-2 / 8.4e-4 / 1.0e-3 (floor 1.0e-2 / 6.5e-4 / 1.4e-4) at
+7.5 / 15 / 30. At 7.5 and 15 cells every dns − foam difference is below
+both solvers' own oracle error (the L∞ columns above); at 30 cells θ and ω
+are below, Y sits between (2.7e-4 vs 3.1e-4 dns / 2.2e-4 foam) and u at
+dns' own (1.22e-3 vs 1.21e-3 / 0.84e-3: dns' wandering inflow velocity).
+S_L dns − foam +1.47e-3 / +4.3e-5 / +1.47e-4 (the 30 cell one inside dns'
+own window-half spread, issues §31).
+
+Reading:
+
+- **Converged S_L at M 0.01 = 0.9995 ± 0.0002 from three independent
+  ladders** (Richardson 0.99926–0.99969): the O(M²) offset of the low-Mach
+  oracle. The M-ladder estimate above (−3.9e-4 → 0.99961) sits inside dns'
+  own range (0.99944 / 0.99969) but 2.3–3.5e-4 above foam's (0.99926–0.99943),
+  i.e. the FP64 code does not pin the offset tighter than ±2e-4. foam's energy
+  equation lacks the viscous work div(τ·u), an O(M²) term (~1e-4 of the heat
+  flux in the flame, estimate) of a size that could move S_L by that much —
+  not separated.
+- **The +1.7% at 7.5 cells is the Y/energy scheme mismatch, not the dns**:
+  foam with the same mismatch (Y MC, h central) reads +1.54%; foam with h on
+  the SAME limiter (Shvab–Zeldovich consistent) reads −0.64%, δ_th within
+  0.24%, but converges at order 1.66 (the limiter clips the h profile).
+- **Time-converged foam**: dt/2 moves S_L +4e-6, 6 outer correctors +7e-6
+  (15 cells).
+- **Le matters**: stock reactingFoam (ρD = μ, Le 1.39) at 15 cells reads
+  S_L 1.137843 (+13.4% vs Le 1), δ_th −12.3%.
+- **foam conserves energy across the flame to 1.1e-5 / 3e-6 / 8e-7 q and
+  its Δp is the Rankine–Hugoniot jump to 3.4e-5 / 7e-6 / 1e-6** (7.5 / 15 /
+  30); T_b/σTu → −9.55e-5 (exact −9.6e-5).
+  dns: the flame is energy-exact within its sd (1–2e-5 q), but the burnt gas
+  heats by ~1e-4 q over the next 6 δ_th (issues §64) and its fresh pressure
+  is not flat at 7.5 cells (issues §65). Neither moves S_L.
+
+Cost (job server): dns GPU 14.8 / 23.0 / 45.5 s (0.20–0.26 ms/step; 56k /
+113k / 225k acoustic steps); foam 1 core each, 20 000 implicit steps:
+exec 26.0 / 39.7 / 45.2 s (mclin; + ~8 s of dynamicCode compile for the
+Le = 1 fvOption), the 8 runs (two ladders + two checks) side by side in one
+78 s CPU job.
+
+### G2a: 2D slot Bunsen (2026-10-30)
+
+Full record `plans/verify/impl_foamflame_G2.md`; tooling as G1 plus the
+geometries `bunsen2d` / `wrinkle2d` (`foamflame/cases.py`) and
+`foamflame/observe2d.py` (numpy port of `measureCone`, `flankMassFlux` and
+the runner's SLflank/burn/fuelIn; both solvers through it).
+
+**Case.** `--mode bunsen` defaults (W 12 δ_th, U_jet 5, burnt coflow T/Tu
+= σ at 1 S_L, coflow 12 δ_th per side, edge 0.25 δ_th), M 0.02, 8 cells:
+392 × 288 cells, h = δ_th/8, every dns cell a foam cell (the 16-cell sink
+bands are plain interior cells in foam). foam IC = `bunsenIC` (ported;
+dns' frame 0, one step in, agrees to median 6e-7 Tu, 99% < 7.5e-4 Tu, the
+rest is the first step at the inflow row and the flame).
+
+| item | dns | foam |
+|---|---|---|
+| inflow | per-row NSCBC: u target, ENTROPY target = the row's DENSITY ρ = 1/t (default) or T_row held (`--nscbc-tinflow`), etaIn 100, Y_row carried, no face diffusion | fixedValue U, T, Y per face = the same `bunsenInflow` rows; zeroGradient p; Fourier/Fick through the face |
+| outflow | NSCBC p → p0, sink 16 | `waveTransmissive` p → p0 (lInf = box), zeroGradient U, T, Y |
+| y | periodic | `cyclic` |
+| mean flow | explicit central KG, FP32, SSP-RK3 at acoustic CFL 0.4 (dt 5.5e-4 τ) | PISO (nOuter 1, nCorr 2), Euler, dt 4e-3 τ (Co ≤ 0.25), FP64; U, h `linear`, Y MUSCL (`mclin`) |
+
+nOuter 1 is a cost decision: nOuter 3 at dt 2e-3 τ is 0.135 s/step on 14
+ranks (25 τ = 1690 s); nOuter 1 at dt 4e-3 τ is 0.042 s/step on 12. The
+steady cone is the fixed point of either (the chemistry source lags one
+step, dt·k_chem ≈ 0.7 at the peak rate); the time-step dependence of foam's
+fixed point (Rhie–Chow ddtCorr) was NOT measured here.
+
+**Window.** The cone rings with a ~10 τ convective period (dns: tip 38 → 45
+→ 44.6 δ_D, sinRatio swing 0.05 / 0.015 / 0.003 at t ≈ 5 / 15 / 25), so
+nothing is steady before t ≈ 20. Window [20, 25] (its dns means sit within
+1.5e-3 of [20, 30], xTip 1.7e-3 relative; [15, 20] is 8.7e-3 off in
+sinRatio); foam runs to t = 25.
+
+**The port** reproduces dns' own stats row at t = 30 to the csv's 6 digits
+(xTip −9.7e-7, tanA −1.5e-6, sinRatio +4.4e-6, SLflank +4e-9, burn
++3e-7 relative). mFlank and fuelIn cannot be read from dns' 2D frames (no ρ,
+u, v): dns' values are its stats; the port is checked on a drawn cone with
+ρ u = 5, v = 0 (mFlank = U sin α to 3e-15).
+
+**Measured** (mean over [20, 25], halves in brackets; dns "frames" = the
+port on dns' integer-τ frames, the same sampling as foam's dumps; hw0 = the
+fitted flank half-width at x = 0, tipOff = xTip − hw0/tanA, both port-only):
+
+| | dns (ρ-target inflow, default) | dns `--nscbc-tinflow` | foam mclin |
+|---|---|---|---|
+| xTip (δ_D) | 44.6455 (44.627 / 44.665) | 45.5378 (45.527 / 45.548) | 43.7155 (43.633 / 43.798) |
+| tan α | 0.21441 | 0.21043 | 0.21025 |
+| sinRatio | 1.04823 (1.05112 / 1.04520) | 1.02961 (1.03463 / 1.02483) | 1.02876 (1.02630 / 1.03121) |
+| SLflank | 1.00695 | 0.99742 | 1.00392 |
+| mFlank | 1.00868 | 0.99823 | 1.00304 |
+| burnRatio | 0.99861 | 1.00080 | 1.00318 (face flux + Fick: 0.99966) |
+| Tmax/T_ad | 1.00365 (at the coflow INFLOW row) | 1.00025 | 1.00002 |
+| hw0 (δ_D) | 10.611 | 10.640 | 10.267 |
+| tipOff (δ_D) | −4.85 | −4.96 | −5.12 |
+| inflow-row T/T_row − 1 (jet / coflow) | +5.86e-3 / +3.79e-3 | +1.4e-6 / +2e-7 | 0 (fixed) |
+
+dns [20, 30] (the docs' "Measured" window): sinRatio 1.04679, SLflank
+1.00698, mFlank 1.00833, burnRatio 1.00003 — the table above in this file
+reproduced digit for digit.
+
+Reading:
+
+- **The inflow pressure rises 0.56% (jet) / 0.33% (coflow) above p0 in
+  BOTH solvers** (foam p at the inlet cells: +5.59e-3 / +3.29e-3 p0). dns'
+  default entropy target is the row DENSITY, so its fresh jet enters 0.59%
+  hot and the burnt coflow 0.38% hot (the box's Tmax sits there). The oracle
+  with Tu × 1.0059 (ρ_u held) burns 1.1% faster. With `--nscbc-tinflow`
+  (T held, as foam's fixedValue T) dns' flank angle equals foam's: sinRatio
+  1.02961 vs 1.02876 (+8.3e-4), tan α 0.21043 vs 0.21025 — inside the
+  window-half spreads (sinRatio halves differ by 9.8e-3 dns, 4.9e-3 foam),
+  so "equal within the ringing", not to 8e-4. The default inflates
+  sinRatio by +1.8%, SLflank by +0.95% (issues.md §66).
+- **The remaining difference is the BASE, not the flank**: at equal α
+  foam's straight flank meets the exit plane 0.37 δ_D (1.9 cells, 3.5%)
+  closer to the axis (hw0 10.27 vs 10.64), hence a 4% shorter cone (xTip
+  43.72 vs 45.54). The flank speeds differ by −0.64% (SLflank) / −0.48%
+  (mFlank), dns `--nscbc-tinflow` below foam. The flame base sits on the
+  inflow face, where the two boundaries differ in kind (foam conducts heat
+  and diffuses fuel through the face — 0.22% of the fuel enters by Fick —
+  dns' open face carries none); unattributed, issues.md §67.
+- foam is not as settled: its sinRatio halves differ by 4.9e-3 (the
+  ringing drifts out of phase with dns' after t ≈ 10).
+- Fields at t = 25 (θ = (T − Tu)/(T_b − Tu); |u| from the z-extruded nz 8
+  twin, whose temp frames equal the 2D run's BYTE FOR BYTE through t = 20):
+  dns − foam L∞ θ 0.42 (L2 2.2e-2) at the TIP (x 44.75 δ_D on the axis: a
+  tip-position shift, not a field error); |u| L∞ 2.26 S_L (L2 0.22) on the
+  INFLOW ROW at the jet edge (x 0.30, y 19.52: dns' row-0 u sits +2.1–2.4
+  S_L above its target there, issues.md §68), 2.24 at the tip past the
+  bands; dns `--nscbc-tinflow` − foam L∞ θ 0.62 (L2 3.4e-2), at the tip.
+
+Cost: dns 0.372 ms/step (2D, 51k steps, 18.4 s for tt 30), nz 8 twin 1.70
+ms/step (69.5 s for tt 25); foam 6250 steps, 279 s wall on 12 MPI ranks
+(exec 259 s).
+
+### G2b: Darrieus–Landau linear growth (2026-10-30)
+
+**Case.** σ 5, β 8, Pr 0.72, M 0.02, `--upstream 16 --downstream 16
+--inflow-speed 1 --ny 240 --wrinkle 0.02 --wrinkle-modes 1` at 8 cells:
+288 × 240 cells, λ = L_y = 30 δ_th = 48.05 δ_D (2.1 λ_c), initial front
+amplitude 0.032 δ_D (kA = 0.004). foam: the same cells, `flameIC` ported
+(frame-0 agreement median 5e-7 Tu, amplitude 0.0320330 vs 0.0320319),
+inlet fixedValue U = S_L, T, Y; outlet waveTransmissive p → p0 − 4 (the
+1D's), cyclic y; PISO nOuter 1, dt 4e-3 τ (Co ≤ 0.10), fields every 0.5 τ.
+Amplitude a = mode 1 of x_I(y) = h Σ_i Y (`wrinkle_rate.py`'s) and of the
+mid-T isoline x_T(y); s = least-squares slope of ln a; dns frame k at t =
+k·0.5.
+
+**Theory** (Matalon, Fluid Dyn. Res. 50 (2018) 051412, eq. (19) + appendix
+= Matalon & Matkowsky 1982, constant transport): s = ω_DL S_L k − l_f B1
+S_L k² (B2 multiplies Le_eff − 1 = 0; B3 = 0 for constant viscosity),
+ω_DL = (√(σ³ + σ² − σ) − σ)/(σ + 1), B1 = (σ/2) [(σ + 1 + 2ω_DL) σ ln σ/(σ −
+1) + σ − 1]/(σ + (σ + 1)ω_DL), l_f = D_th,u/S_L = δ_D. O(k l_f), large β.
+σ 5: ω_DL 1.17360, B1 4.31688, λ_c = 2π B1/ω_DL = 23.11 δ_D (the lesgap
+dispersion scan interpolated ≈ 21).
+
+| run | s(x_I) [8, 20] | s(x_T) [8, 20] | s(x_I) [4, 16] | long fit |
+|---|---|---|---|---|
+| dns 8 cells | 0.08837 (rms ln 0.002) | 0.08342 | 0.08434 | [8, 32] 0.08832 |
+| foam mclin 8 cells | 0.08733 (rms ln 0.002) | 0.08255 | 0.08320 | — (tt 20) |
+| dns 6 cells (ny 180) | — | — | — | [16, 32] 0.08621 |
+| Matalon–Matkowsky | 0.07965 | | | |
+| inviscid Landau (upper bound) | 0.15347 | | | |
+
+- **dns − foam −1.2% in the rate** (0.08837 vs 0.08733), local rates
+  (per 2 τ) agree to ≤ 0.002 at every t; θ L∞ at t = 20 1.8e-2 (L2 2.2e-3).
+  The dns 6 → 8 cell change is +2.2%: the solver difference sits inside one
+  solver's own grid sensitivity.
+- **Both are 10–11% ABOVE Matalon–Matkowsky** and 43% below inviscid
+  Landau: k l_f = 0.13, β = 8 and the O(k²) truncation of the theory; the
+  sign (finite-β, O(k³) terms) is not established here. The measured rate
+  is a clean exponential from t ≈ 8 at 8 cells (local s 0.085–0.089 to t
+  32); at 6 cells it swings 0.04–0.12 over t 0–16 before settling (the [4,
+  16] fit of the lesgap tables is transient-limited at coarse grids).
+- σ 2 (dns only, λ = 36 δ_th = 64.6 δ_D ≈ 2 λ_c, ny 288, tt 32): s(x_I)
+  [8, 32] 0.01503, [16, 32] 0.01518 vs Matalon–Matkowsky 0.01904 (−21%),
+  inviscid 0.03766 (λ_c 31.97 δ_D). foam not run (CPU budget).
+
+Cost: dns 0.36 ms/step (32 τ, 8 cells); foam 5000 steps, 160 s wall on 8
+ranks (exec 142 s).
+
+### G3a: 2D slot-jet diffusion flame (2026-10-30)
+
+Full record `plans/verify/impl_foamflame_G3.md`; tooling as G1/G2 plus the
+geometries `diffusion2d` / `candle2d` (`foamflame/cases.py`: ports of
+`diffusionInflow`, `burkeSchumann`, `diffusionIC`, `candleAmbientP`, the
+config.cpp grid), `foamflame/observejet.py` (`measureJet` verbatim + the
+runner's diffusion stats row), `model.si_map_diff`.
+
+**Case.** `--mode diffusion` defaults (W 16 l, s 1, Y_F1 = Y_O2 = 1, Z_st
+0.5, σ 5, β 5, Da 1000, M 0.05, coflow 16 l at 1 U, edge 3 l), 4 cells/l:
+416 × 192, h = l/4. SI (T0 300 K, p0 101325 Pa, W 28.014, l = 1 mm): U
+17.653 m/s, μ = Pr ρ0 U l = 1.44642e-2 Pa s, reaction `F + O^1 = 2P`
+(the `^1` matters: OpenFOAM's order defaults to the stoichiometric
+coefficient — `F + 3.4O^1` for the candle), A = A_box (U/l)/ρ0 × W
+(kmol units) = 2.25115e11 m³/kmol/s, Ta 9375 K, Hf_F = q = 2.49309e6 J/kg.
+foam carries a passive tracer Zt = 1e-3 Z (Le 1, inlet Z(y)): the carried
+check of Z(Y_F, Y_O). Full amplitude is impossible: `multiComponentMixture`
+divides every Y by ΣY at construction and the pure fuel stream has no inert
+to displace (a Zt = Z run halved the fuel core, measured).
+
+| item | dns | foam |
+|---|---|---|
+| inflow | per-row NSCBC on the first CELL (x = h/2): u → u_row, ρ → 1/t_row (etaIn 100), p free; ρY_k PINNED to the Burke–Schumann row after the overwrite (ω = 0 there: Y_F Y_O = 0); no face diffusion; row-0 T free (0.896 T_ad peak) | per-face fixedValue U, T, Y_F, Y_O, Zt = the same row at the FACE (x = 0), zeroGradient p; Fourier/Fick through the face; the first cell is interior (it burns) |
+| outflow | NSCBC p → p0, anchor σ 4, sink 16 | waveTransmissive p → p0 (lInf = box), zeroGradient U, T, Y |
+| species scheme | ONE MC limiter shared by the voters (≥ 2^-24), central E | `mclin`: multivariateIndependent (each species its own MUSCL, h linear); `mvsel`: multivariateSelection {F, O MUSCL; Zt, P, h `blended 2`} = one shared limiter, but applied to h too (foam's `div(phi,Yi_h)` is ONE weight field for Y and h: shared species limiter AND central h is not expressible) |
+| time | SSP-RK3, acoustic CFL 0.4 (dt 2.0e-3 l/U), explicit chemistry | PISO nOuter 1 / nCorr 2, dt 0.025 l/U (Co 0.52; dt × J = 0.63 with dns' dtChem = 0.5/J = 0.020), lagged explicit source |
+
+Protocol: both from `diffusionIC` (the row extruded), dns tt 80 (the
+`gpu_diffusion_jet` run), foam tt 75; window [60, 75] (dns [60, 75] vs [60,
+80]: tip 5.4e-4 apart). One measurement path: `measure_jet` + the runner's
+row on dns' frames reproduces dns' own t = 80 row (tip −1.4e-8, half
+−3.9e-7, burn −2.7e-7, TmaxIn +3.3e-6); fuelIn (face 0|1, central mdot ×
+central Y − ρD ∂Y/∂x), fuelOut, pMean of dns are its stats (no ρ, u in 2D
+frames). Tst = T on the Z_st isoline averaged over x ∈ [¼, ¾] tip.
+
+| [60, 75] | dns (etaIn 100, default) | dns `--nscbc-etain 1000` | foam mclin | foam mvsel | Burke–Schumann |
+|---|---|---|---|---|---|
+| tip (l) | 51.199 (51.117 / 51.286) | 47.543 (47.427 / 47.653) | 47.217 (47.290 / 47.144) | 47.171 | 70.34 (constant ρ: a scale) |
+| Z_st half-width at tip/2 | 7.7727 | 7.6686 | 7.6692 | 7.6589 | |
+| tip / (2 half) | 3.2935 | 3.0999 | 3.0784 | 3.0795 | |
+| fuelIn (face 0\|1) | 9.6168 | 8.9888 | 8.9590 | 8.9452 | |
+| foam inflow face: ρuY + Fick | — | — | 8.5421 + 0.4447 | 8.5459 + 0.5183 | nominal ρ_row u Y 8.4667 |
+| burn (∫ω) | 9.6221 | 8.9900 | 8.9446 | 9.0239 | |
+| burn / fuelIn | 1.00055 | 1.00015 | 0.99839 (face 0.99530) | 1.00880 (face 0.99556) | 1 |
+| tip / fuelIn | 5.3240 | 5.2891 | 5.2704 | 5.2733 | |
+| TmaxIn / T_ad | 0.98625 | 0.98561 | 0.98488 | 0.98438 | 1 |
+| T at Z_st (mid flame) / T_ad | 0.94755 | 0.94707 | 0.94655 | 0.94623 | 1 |
+| same, base (4 l past the band) | 0.90047 | 0.90471 | 0.90532 | 0.90456 | 1 |
+| Z at max ω | 0.4873 | 0.4975 | 0.4867 | 0.4869 | Z_st 0.5 |
+| base (row) | 0.25 (row 1: row 0 pinned) | 0.25 | 0 | 0 | |
+| pMean (box p/p0) | 1.00128 | 1.00122 | 1.00498 | 1.00536 | |
+| max \|H\| rows i = 0 / 1 / 4 | 0.350 / 0.205 / 0.073 | 0.131 / 0.071 / 0.030 | 4.7e-4 / 7.4e-4 / 1.2e-3 | 1.1e-4 / 2.9e-4 / 6.4e-4 | 0 |
+| max \|H\| past the bands | 0.0162 | 0.0194 | 0.0528 (flame x ≤ 64: ≤ 0.0034) | 0.0512 | 0 |
+| max \|Z(Y_F, Y_O) − Zt\| (L2) | — | — | 4.2e-7 (5.9e-8) | 1.6e-10 (3.5e-11) | 0 |
+| Z range / hits | [2.53e-5, 0.99478] / 0 | same / 0 | [3.46e-5, 0.99354] / 0 | [4.02e-5, 0.99326] / 0 | |
+
+H = T/T0 − 1 + (q/cp T0)(Y_F − Y_F1 Z) (Shvab–Zeldovich, 0 at Le 1).
+Fields at t = 75 vs foam mclin (past the bands): dns default Z L∞ 2.16e-2
+(L2 1.17e-2), θ L∞ 4.28e-2 (L2 2.35e-2), both on the axis below the tip
+(x 45 / 41); dns etaIn 1000 Z
+L∞ 1.11e-2 (L2 2.80e-3), θ L∞ 2.99e-2 (L2 7.44e-3), both at the outflow
+corner (x 99.9).
+
+Reading:
+
+- **The default dns jet is 8.4% longer than foam's because its inflow
+  passes 7.3% more fuel** (fuelIn 9.617 vs 8.959; tip per fuel −1.0%). The
+  per-row NSCBC at etaIn 100 lets the inflow mass flux overshoot its target:
+  the convective part of dns' face-0|1 fuel flux is 9.27 against the
+  nominal 8.467 of the row it relaxes to (and 8.385 for its own row-0 T at
+  p0): the excess is in the row's u. It scales with the relax:
+  `--nscbc-etain` 20 / 100 / 1000 → fuelIn 11.115 / 9.617 / 8.989, tip
+  60.29 / 51.20 / 47.54; `--nscbc-tinflow` does not move it (9.665, 51.52).
+  The bunsen rows overshoot the same way (G2a fuelIn/fuelNom 1.032 default,
+  1.038 tinflow, 1.010 at etaIn 1000; foam 1.005). **Mechanism (verified
+  2026-10-30, `plans/verify/verify_foamflame.md`)**: a STEADY LODI inflow
+  cell has dp/dt = du/dt = 0, so its relaxed wave must cancel the row's own
+  transverse sources: L5 = S_p + ρc S_u, i.e. u − u_row = (S_p + ρc S_u)
+  L_x/(etaIn (1 − M²) ρc²). The row carries the Burke–Schumann T(y) (bunsen:
+  the cold-jet/burnt-coflow T step, plus the re-added q ω): its y conduction
+  alone, S_p = (γ − 1) κ ∂²T/∂y² from dns' row-0 frames, predicts the fuel
+  excess 0.96 / 0.10 / 0.97 vs measured 0.89 / 0.10 / 0.90 (etaIn 100 /
+  1000 / tinflow; 4.1 vs 2.7 at etaIn 20, nonlinear), bunsen 3.8 vs 3.3 /
+  0.42 vs 0.44. The parameter is etaIn/L_x: `--length 160` (L_x 168) at
+  etaIn 161.5 reproduces the default (fuelIn 9.623 vs 9.617, tip 51.53 vs
+  51.20), at etaIn 100 the excess grows ×1.50 (fuelIn 9.983, tip 53.39).
+  Direct: the bunsen nz 8 twin's row-0 |u| is +2.1–2.4 S_L above u_row at
+  the jet edge (+50%), −1.6e-3 on the axis. issues.md §68.
+- **At etaIn 1000 dns and foam agree to ≤ 0.7%** (one mesh, no ladder:
+  not shown to be discretization error): tip −0.7%,
+  half-width 0.00%, fuelIn −0.3%, TmaxIn −0.07%, sheet T −0.05%, Z field
+  L2 2.8e-3. What remains differs in kind: dns' pinned row is a CELL that
+  cannot burn (base row 1, x_ω,max 1.58 vs 1.38 l), foam's fixed FACE
+  half a cell upstream conducts and diffuses through it (5% of foam's fuel
+  enters by Fick, 0.445 of 8.987; dns' 0|1 diffusion 0.345 of 9.617);
+  foam's box sits 0.4% above p0 (waveTransmissive vs the σ 4 anchor).
+- **The flame sheet burns at 0.947 T_ad mid-flame, 0.985 T_ad at its
+  hottest** in all four runs (Da 1000: the finite-rate deficit; `gpu_diffusion_heat`'s
+  Da^(−1/3) law), with ω peaking at Z = 0.487–0.497 vs Z_st 0.5.
+- **The scheme choice is invisible here**: mclin vs mvsel tip −0.10%, burn
+  +0.9%. Independent MC limiters cost Z(Y) − Zt 4.2e-7 only: in FP64 a
+  consumed reactant is EXACTLY 0 (clamp) and OpenFOAM's r of a uniform field
+  is 1999 (limiter 2, no vote), so per-species limiters differ only inside
+  the reaction zone; dns' FP32 noise reactants (~1e-40) are what forced its
+  2^-24 vote threshold (§44). The shared limiter (mvsel) holds Zt to 1.6e-10.
+- **Shvab–Zeldovich**: foam's fixed face is exact (H 5e-4 on the first
+  row) where dns' pinned row carries 0.35 (§45; 0.13 at etaIn 1000, 0.85 at
+  20). Past the bands foam's H grows to 0.023–0.053 over the last 30 l
+  before its zeroGradient outflow (≤ 0.0034 in the flame); dns 0.016
+  (window mean of the max, sitting on the first cell past the inflow band
+  or the last before the outflow band; 0.014 without the last 10 l).
+- **Settling**: dns rings (tip 55.0 → 50.9 → 52.3 → 51.3 by t 48, then
+  ±0.15); foam creeps monotonically (62.4 at t 32 → 47.55 at 60 → 47.12 at
+  68 → 47.14 at 72): its window halves differ by 3e-3.
+- **Time-converged foam** (restarted from t = 60, compared on [64, 68]):
+  dt/2 moves tip −9.3e-5, half +3.2e-5, TmaxIn −1.8e-5, burn/in −2.0e-4,
+  pMean +1.2e-4; nOuter 3 tip +4.4e-5, half +7.5e-5, TmaxIn −1.2e-4, burn/in
+  −1.0e-4 — the lagged chemistry at dt J 0.63 and PISO's ddtCorr are below
+  2e-4 on every observable. foam's own fuel budget (burn / face inflow)
+  closes to 0.9953 independent of dt and nOuter (not attributed). nOuter 3
+  raises the tracer check max |Z(Y_F, Y_O) − Zt| 4.2e-7 → 4.8e-5 (dt/2:
+  unchanged) — not attributed either.
+
+Cost: dns 0.373 ms/step (2D, tt 80, 15.5 s); foam 3000 steps, 243 s wall
+per variant on 7 ranks, the two variants concurrently (14 ranks, job 267
+s); the checks (8 l/U each, concurrent) 53 / 75 s.
+
+### G3b: candle (built, the flame not compared; 2026-10-30)
+
+reactingFoam has no gravity; `rhoReactingBuoyantFoam` (same source tree)
+solves p_rgh = p − ρ g·x with heRhoThermo but takes reactingFoam's YEqn.H
+and EEqn.H, whose energy equation has NO ρ U·g (buoyantPimpleFoam's has;
+dns' E gains −g m_x): the twin adds it as a coded fvOption on h (v2606
+registers g as a `meshObjects::gravity` on Time — a mesh lookup fails — and
+the buoyant solver needs `fluxRequired { p_rgh; }`). Hydrostatic faces:
+inlet fixedValue U, T, Y + p_rgh `fixedFluxPressure`; top p_rgh
+`prghPressure` at the ambient static p_a(L) (dns: NSCBC p → p_a(x_out) with
+the hydrostatic incoming wave), U `pressureInletOutletVelocity` (normal
+inflow, tangential 0: dns' v → 0), T, Y `inletOutlet` with ambient air
+(dns: ρ → ρ_a, yHi = air); IC p = p_a(x). At rest (`--quiescent`, 4 cells/l,
+tt 10): foam max |u| 1.35e-6 U, |p/p_a − 1| ≤ 2.3e-8 (p_rgh is
+well-balanced; its inlet is a u = 0 wall); dns max |u| 8.7e-4 U.
+
+The flame comparison was NOT run: foam at the documented 8 cells/l (57.6k
+cells, dt ≤ 2e-3 l/U for the chemistry, 16.5k steps) is ~11 min CPU; at 4
+cells/l (16k cells, 0.016 s/step, ~4 min) the dns candle is no longer the
+documented steady flame (tip 10.29 mean, 7.79–11.31 over [20, 30], std 0.93
+over [15, 30] vs 0.27 at 8 cells; Z hits up to 10025 at t 0.34), so window
+means of two flapping flames compare phase. The case dict (`G3b`, ladder
+[4]) runs as is; a budgeted run is `ladder [8]`.
 
 ## 2D slot-jet diffusion flame (`--mode diffusion`)
 

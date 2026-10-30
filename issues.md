@@ -445,8 +445,10 @@ Measured gfx1100 via simjob, 2026-10-28.
     row keeps transverse conduction against the entropy relax (etaIn c/L,
     etaIn 100): steady default jet, H = T/T0 − 1 + (q/cp T0)(Y_F − Y_F1 Z)
     is −0.351 at i = 0, 0.206 at i = 1, 0.074 at i = 4, ≤ 0.0095 past the
-    band. Not fixed; a stiffer --nscbc-etain not measured on the final
-    code. The species pin on that row
+    band. Not fixed. A stiffer --nscbc-etain (G3a, 2026-10-30): max |H| at
+    i = 0 / 1 / 4 0.350 / 0.205 / 0.073 (100) → 0.131 / 0.071 / 0.030
+    (1000), 0.85 at i = 0 for 20; it also moves the jet's fuel inflow 7%
+    (§68). foam's fixed inlet face: 5e-4. The species pin on that row
     (`speciesInflowPin`) is a consistency choice; its isolated effect was
     not measured. The re-added boundary heat is 0 there (pinned sheet: ω 0).
 46. **Outflow anchor σ 4 for the jet is a constant, no flag.** At the
@@ -458,6 +460,10 @@ Measured gfx1100 via simjob, 2026-10-28.
     ρ²D varies); no counterflow/strained flame vs Cantera; the jet tip is a
     regression pin (51.2 l measured vs the constant-density Burke–Schumann
     70.3 l, which D ∝ T shortens — a variable-density estimate not built).
+    Grounded against reactingFoam on the identical mesh (G3a, docs/chem.md):
+    agreement to 0.7% in tip, 0.0% in half-width, 0.07% in TmaxIn once dns'
+    inflow is stiff (etaIn 1000); at the default the tip is 8.4% long (§68).
+    The candle (G3b) is not grounded: foam twin built, flame not run (CPU).
     The heated Tmax extrapolation assumes the Da^(−1/3) law (measured ratio
     2.275, not 2). The jet does not flicker unforced (Re = W/Pr ≈ 22, no
     gravity; gravity exists in `--mode candle`, §49–53); `--pulse` opens
@@ -507,6 +513,116 @@ Measured gfx1100 via simjob, 2026-10-28.
     = 2e−3 at M 0.005 is the candidate). The Mach is inflated: buoyant
     Mach 0.17 at the defaults (|u|max 34 U, M 0.005); the M dependence of
     the tip not measured.
+64. **The 1D flame's burnt gas heats up downstream of the flame** (found
+    against OpenFOAM reactingFoam FP64 on the identical mesh, 2026-10-30,
+    docs/chem.md "Against OpenFOAM reactingFoam",
+    `plans/verify/impl_foamflame_G1.md`). The flame itself is
+    energy-exact: the total enthalpy H = cp T + u_rel²/2 + qY gained from the
+    fresh reference column to 2.5–3.5 δ_th behind x_f is +8e-6 / −1e-5 /
+    +3e-5 q (7.5 / 15 / 30 cells, sd 1–2e-5; foam +1.1e-5 / +3e-6 / +8e-7),
+    T_b/(σTu) − 1 there −8.6e-5 / −1.07e-4 / −8.0e-5 vs the exact −9.6e-5.
+    Behind that, at constant p, T climbs a STATIONARY ramp and saturates
+    (15 cells, `--downstream 20`, T at ξ = 3/5/7/9/12/15/18 δ_th: 35711.8,
+    35713.3, 35713.4, 35714.6, 35716.2, 35716.6, 35716.8; foam flat to
+    0.1): H at 8–9 δ_th is +1.24e-4 /
+    +8.5e-5 / +2.13e-4 q (foam +2.2e-5 / +6e-6 / +2e-6). Same with the sink
+    off (+9.6e-5) or 32 cells (+1.21e-4) at 15 cells; at 30 cells `--cfl 0.2`
+    LOWERS it (+1.58e-4 vs +2.14e-4, window [6, 12]) with twice the steps,
+    so it is not a per-step FP32 bias. S_L is unaffected (the heating sits
+    behind the reaction zone; dns − foam S_L +4e-5 / +1.5e-4 at 15 / 30).
+    Unattributed.
+65. **The dns fresh pressure is not flat at 7.5 cells/δ_th** (same
+    comparison): the time-mean p 3–6 δ_th ahead of the flame sits +0.061
+    (1.6% of Δp) above the reference column's, so Δp read at the reference
+    column is 1.28e-2 BELOW the measured-state Rankine–Hugoniot jump
+    (momentum check p_u − p_b vs m Δu: −1.23e-2, sd 4e-3 over 101 dumps);
+    +2.0e-4 / −2.3e-3 at 15 / 30 cells. foam: −3.4e-5 / −7e-6 / +1e-6, p
+    flat to 1e-4. Not the 6-digit profile output (0.13% of Δp) nor aliasing
+    (0.5 and 0.1 τ dump cadences agree). Candidate: the 16-cell inflow band
+    is 2.1 δ_th wide at 7.5 cells and the reference column sits 2 δ_th past
+    it; not measured.
+66. **The bunsen inflow holds DENSITY, so the fresh jet enters hot** (found
+    against reactingFoam, G2a, 2026-10-30, docs/chem.md "G2a",
+    `plans/verify/impl_foamflame_G2.md`). The cone raises the inflow
+    pressure 0.56% (jet) / 0.33% (coflow) above p0 — both solvers agree
+    (foam inlet cells +5.59e-3 / +3.29e-3 p0). The default per-row NSCBC
+    entropy target is the row's density, so T = p/ρ enters +5.86e-3 (jet) /
+    +3.79e-3 (coflow) high (the box's Tmax, 1.0037 T_ad, sits on the coflow
+    inflow row). The oracle at Tu × 1.0059 burns 1.1% faster. Measured, U 5,
+    8 cells, [20, 25]: sinRatio 1.04823 → 1.02961 with `--nscbc-tinflow`
+    (foam 1.02876), SLflank 1.00695 → 0.99742, mFlank 1.00868 → 0.99823,
+    xTip 44.65 → 45.54. Every bunsen "Measured" row in docs/chem.md carries
+    it. Not changed (no src edits in that task): decide whether bunsen
+    should default to `--nscbc-tinflow` (the diffusion/candle rows hold
+    density too: on the jet `--nscbc-tinflow` moves tip 51.20 → 51.52,
+    fuelIn 9.617 → 9.665 (G3a); the candle not measured).
+67. **Bunsen flame base: dns `--nscbc-tinflow` vs foam, 3.5% wider base,
+    0.5–0.6% faster foam flank** (same comparison). At equal flank angle
+    (tan α 0.21043 vs 0.21025) the fitted flank's half-width at the exit
+    plane is 10.640 (dns) vs 10.267 δ_D (foam, 1.9 cells narrower), so the
+    cone is 4.0% shorter in foam (xTip 43.72 vs 45.54); SLflank 0.99742 vs
+    1.00392, mFlank 0.99823 vs 1.00304. Candidate: the inflow face itself,
+    where the base sits — foam's fixedValue T, Y conduct heat and diffuse
+    fuel through the burner face (0.22% of the fuel enters by Fick), dns'
+    open face carries no diffusion. Not attributed (needs a foam inlet
+    without face diffusion, or a dns lip). foam's window is not quite steady
+    (sinRatio halves 1.0263 / 1.0312). NOT the §68 inflow overshoot alone:
+    `--nscbc-tinflow --nscbc-etain 1000` (job 682) brings fuelIn/fuelNom
+    1.038 → 1.010 but moves xTip 45.54 → 45.00, tan α 0.21043 → 0.21275,
+    hw0 10.640 → 10.652 (foam 43.72, 0.21025, 10.267). The base sits where
+    §68's row-0 u overshoot peaks (jet edge +2.1–2.4 S_L at etaIn 100,
+    ~10× less at 1000), yet hw0 does not move with it: not the base gap.
+68. **The per-row NSCBC inflow at the default etaIn 100 overshoots its mass
+    flux** (found against reactingFoam, G3a, 2026-10-30, docs/chem.md "G3a",
+    `plans/verify/impl_foamflame_G3.md`). Default diffusion jet (W 16, 4
+    cells/l, [60, 75]): fuel through face 0|1 9.617 vs foam's 8.959 (fixed
+    face; nominal ρ_row u_row Y_row 8.467 + Fick), tip 51.20 vs 47.22 l
+    (+8.4%; tip per fuel −1.0%). `--nscbc-etain` 20 / 100 / 1000: fuelIn
+    11.115 / 9.617 / 8.989, tip 60.29 / 51.20 / 47.54 (foam −0.7% of the
+    last); `--nscbc-tinflow` 9.665 / 51.52 (not the entropy target). The
+    convective part (9.27) exceeds the nominal row by 9.5% while the row's
+    own T at p0 would carry 8.385: the excess is in the inflow row's u.
+    The bunsen rows do the same: G2a fuelIn/fuelNom 1.032 (default), 1.038
+    (tinflow), 1.010 (tinflow + etaIn 1000); foam 1.005. So the
+    `gpu_diffusion_jet` pin (tip 51.17 ± 5%), the anchoring map and every
+    bunsen/jet "Measured" row in docs/chem.md carry an etaIn-dependent
+    inflow ~3% (bunsen) / ~7% (jet) above its nominal fuel flow; the candle
+    rows (same machinery) not measured.
+    **Attributed** (`plans/verify/verify_foamflame.md`, 2026-10-30): the
+    STEADY LODI inflow cell (`kNscbcCells<…, Prof>`) has dp/dt = du/dt = 0,
+    so L1 + L5 = 2 S_p and L5 − L1 = 2ρc S_u, where S_p, S_u are the
+    pressure/velocity rates of everything the overwrite keeps or the hook
+    adds on that row (transverse y fluxes; the bunsen's re-added q ω). Hence
+    u − u_row = (S_p + ρc S_u) L_x / (etaIn (1 − M²) ρc²): zero only if the
+    row has no transverse source. The per-row targets put a T(y) step in
+    the row (Burke–Schumann sheet; bunsen cold jet vs burnt coflow), whose
+    y conduction S_p = (γ − 1) κ ∂²T/∂y² heats the fuel-side rows. From
+    dns' row-0 frames that term alone predicts the fuel excess 0.96 / 0.10
+    / 0.97 vs measured 0.89 / 0.10 / 0.90 (jet etaIn 100 / 1000 / tinflow;
+    4.1 vs 2.7 at etaIn 20: nonlinear), bunsen 3.8 vs 3.3 (etaIn 100) and
+    0.42 vs 0.44 (1000). The parameter is etaIn/L_x, as the formula says:
+    `--length 160` (L_x 168 vs 104) at etaIn 161.5 gives fuelIn 9.623 vs
+    9.617, tip 51.53 vs 51.20; at etaIn 100 fuelIn 9.983 (excess ×1.50),
+    tip 53.39 (jobs 683). Direct: the bunsen nz 8 twin's row-0 |u| is
+    +2.1–2.4 S_L above u_row at the jet edge (y 19.3–19.7, +50%), −1.6e-3
+    on the axis (prediction +2.7–5.0 at the edge, correlation 0.82 over the
+    rows). NOT the flame's back-pressure (a row without transverse source
+    returns u_row exactly whatever L1 is), NOT the entropy target, NOT the
+    species pin. Options (not decided, no src edit): a stiffer default
+    etaIn (error ∝ 1/etaIn; 1000 ran at the same dt), a relax rate per cell
+    instead of per box length (the error grows with L_x), or a row without
+    transverse conduction.
+69. **The P0 eigenvalue is not round-off-determined at σ 2, β 8** (found
+    2026-10-30, `plans/verify/verify_foamflame.md`, in the numpy port
+    `tools/chem/foamflame/model.py`, same shoot/bracket algorithm as
+    `dns/chem.cpp`, n 2e4). The cold-end "too fast" test flips 61 times
+    across Λ ∈ [4.7246e8, 4.7263e8]: the port bisects to Λ 472623348.6
+    (δ_th/δ_D 1.794901), dns prints 472463262.4 (1.7953) — 3.4e-4 in Λ,
+    1.7e-4 in S_L, 2e-4 in δ_th. σ 5 is unaffected (port = dns to the
+    printed digits). Moves the σ 2 lesgap / G2b normalisation by ≤ 2e-4
+    (below their quoted digits); the C++ shoot itself not probed. The port
+    produced a garbage table there before (kept integrating dead lanes in
+    record mode; now stops as dns does).
 
 ### 3D premixed in turbulence (`--nz`, `--turb`, docs/chem.md "3D and turbulence")
 
