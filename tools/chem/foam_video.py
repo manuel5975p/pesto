@@ -149,6 +149,70 @@ CFG = {
     },
 }
 
+# Fast jets (docs/chem.md "fast jets", "thin, fast nozzles"): the Bunsens are
+# dense reruns (fdt 0.09 = 30 / 40 foam steps); the jets read the committed
+# runs' own 1 l/U frames.
+_FOOT_BUNSEN = [
+    "dns: compressible Navier-Stokes, explicit central KG flux, FP32, SSP-RK3 "
+    "at acoustic CFL 0.4; species MC-MUSCL; per-row NSCBC inflow WITH "
+    "--nscbc-tinflow (row T held, as foam's fixedValue T), NSCBC outflow p → "
+    "p0, 16-cell sink bands; fields from a k plane of the z-extruded nz 8 twin.",
+    "OpenFOAM v2606 reactingFoam (mclin): PISO nOuter 1 nCorr 2, Euler dt {dt} "
+    "τ, FP64; U, h Gauss linear, Y MUSCL; fixedValue U, T, Y inflow rows, "
+    "zeroGradient p; waveTransmissive p outlet; cyclic y; |∇×u| by central "
+    "differences of U.",
+    "Mesh: {nx} × {ny} cells, h = δ_th/8 = 0.200 δ_D, every dns cell a foam "
+    "cell. Model: single step F → P, σ 5, β 8, Pr 0.72, Le 1, constant μ, M "
+    "{M} (jet Mach {Mj}).   τ = δ_D/S_L.",
+]
+_FOOT_JET = [
+    "dns: compressible Navier-Stokes, explicit central KG flux, FP32, SSP-RK3 "
+    "at acoustic CFL 0.4; species MC-MUSCL, ONE limiter shared by the species; "
+    "per-row NSCBC inflow (u, ρ), species pinned to the Burke–Schumann row, "
+    "--nscbc-etain 1000 | 100 = default; NSCBC outflow p → p0, 16-cell sink "
+    "bands. No velocity panels: dns --mode diffusion is 2D only and writes no "
+    "velocity frames.",
+    "OpenFOAM v2606 reactingFoam (mclin): PISO nOuter 1 nCorr 2, Euler dt 0.025 "
+    "τ, FP64; U, h Gauss linear, each species its own MUSCL; per-face "
+    "fixedValue U, T, Y inlet, waveTransmissive p outlet (lInf = box/4), "
+    "cyclic y.",
+    "Mesh: {nx} × {ny} cells, h = l/4. Model: F + O → 2P, ω = A ρ² Y_F Y_O "
+    "e^(−Ta/T), T_ad/T0 5, β 5, Da 1000, Pr 0.72, Le 1, constant μ, M 0.2 (jet "
+    "Mach).   τ = l/U_jet.",
+]
+for _c, _U, _W, _M, _nx, _ny, _dt in (("G4b", 15, 12, 0.02, 1000, 288, "3e-3"),
+                                      ("G4c", 20, 6, 0.015, 696, 144, "2.25e-3")):
+    CFG[_c] = {
+        "kind": "bunsen", "fdt": 0.09, "fps": 20, "unit": "τ",
+        "window": (20.0, 25.0), "tmax": 25.0,
+        "runs": [("dns", "dns  --nscbc-tinflow", f"{_c}/dns_tinflow_nz8"),
+                 ("foam", "OpenFOAM reactingFoam", f"{_c}/foam_mclin")],
+        "fields": ["theta", "vort", "speed"],
+        "title": f"{_c}  2D slot Bunsen, fast jet: dns vs OpenFOAM reactingFoam, "
+                 "identical mesh",
+        "subtitle": f"U_jet {_U} S_L, W {_W} δ_th, jet Mach {_U * _M:.2g}, burnt "
+                    "coflow (T/Tu 5) at 1 S_L; 8 cells per δ_th",
+        "foot": [s.format(dt=_dt, nx=_nx, ny=_ny, M=_M, Mj=f"{_U * _M:.2g}")
+                 for s in _FOOT_BUNSEN],
+    }
+for _c, _W, _nx, _ny, _tt, _win, _yl, _ts, _ys in (
+        ("G5", 16, 416, 192, 240, (200.0, 240.0), (40.0, 70.0), 20, 5),
+        ("G6", 8, 152, 160, 120, (80.0, 120.0), (6.0, 12.0), 10, 1)):
+    CFG[_c] = {
+        "kind": "jet", "fdt": 1.0, "fps": 15, "unit": "τ",
+        "tmax": float(_tt), "window": _win, "ylim": _yl, "tstep": _ts, "ystep": _ys,
+        "runs": [("dns", "dns  etaIn 1000", f"../{_c}/dns_c4_etain1000"),
+                 ("foam", "OpenFOAM", f"../{_c}/foam_mclin_c4"),
+                 ("dns100", "dns  etaIn 100 (default)", f"../{_c}/dns_c4")],
+        "fields": ["theta", "omega", "Z"],
+        "title": f"{_c}  2D slot-jet diffusion flame at jet Mach 0.2: dns vs "
+                 "OpenFOAM reactingFoam, identical mesh",
+        "subtitle": f"W {_W} l, fuel jet and oxidizer coflow at 1 U, Z_st 0.5 "
+                    "(white line), Da 1000; the box's acoustic mode settles "
+                    "slowly at M 0.2",
+        "foot": [s.format(nx=_nx, ny=_ny) for s in _FOOT_JET],
+    }
+
 FIELD_TITLE = {"theta": "temperature  θ = (T − T_u)/(T_b − T_u)",
                "vort": "vorticity  |∇×u|  [S_L/δ_D]  (√ scale)",
                "speed": "speed  |u|  [S_L]",
@@ -584,11 +648,15 @@ def plot_bunsen(img, k):
     c, S, P = G["ctx"], G["series"], G["lay"]["plot"]
     t = np.arange(c.nf) * c.fdt
     lo, hi = G["ylim"]
-    ax = Axes(P[0], P[1], P[2], P[3], (0, c.nf * c.fdt), (lo, hi))
-    ax.frame(img, range(0, 26, 5), range(int(lo), int(hi) + 1, 5), "t  [τ]",
-             "cone tip height  x_tip  [δ_D]")
-    ax.shade(img, 20, 25, FG, 0.06)
-    put_text(img, "window [20, 25]", *ax.px(22.5, hi)[:1], P[1] + 4, 13, DIM, "c")
+    w0, w1 = c.cfg.get("window", (20.0, 25.0))
+    tmax = c.cfg.get("tmax", 25.0)
+    ystep = 5 if hi - lo <= 60 else 10
+    ax = Axes(P[0], P[1], P[2], P[3], (0, max(c.nf * c.fdt, tmax)), (lo, hi))
+    ax.frame(img, range(0, int(tmax) + 1, 5), range(int(lo), int(hi) + 1, ystep),
+             "t  [τ]", "cone tip height  x_tip  [δ_D]")
+    ax.shade(img, w0, w1, FG, 0.06)
+    put_text(img, f"window [{w0:g}, {w1:g}]", *ax.px(0.5 * (w0 + w1), hi)[:1],
+             P[1] + 4, 13, DIM, "c")
     for key in ("foam", "dns"):
         ax.line(img, t[:k + 1], S[key]["xTip"][:k + 1], COL[key], LW[key])
         X, Y = ax.px(t[k], S[key]["xTip"][k])
@@ -596,10 +664,13 @@ def plot_bunsen(img, k):
     y = P[1] + P[3] + 56
     for key, lab, ref in (("dns", "dns --nscbc-tinflow", G["ref"].get("dns")),
                           ("foam", "OpenFOAM mclin", G["ref"].get("foam"))):
-        put_text(img, f"{lab}:  x_tip {S[key]['xTip'][k]:6.2f} δ_D" +
-                 (f"   (docs/chem.md mean [20, 25]: {ref:.2f})" if ref else ""),
-                 P[0], y, 16, COL[key], bold=True)
-        y += 24
+        put_text(img, f"{lab}:  x_tip {S[key]['xTip'][k]:6.2f} δ_D", P[0], y, 16,
+                 COL[key], bold=True)
+        if ref:
+            y += 22
+            put_text(img, f"docs/chem.md mean [{w0:g}, {w1:g}]: {ref:.2f}", P[0] + 16,
+                     y, 15, COL[key])
+        y += 28
 
 
 def plot_wrinkle(img, k):
@@ -647,11 +718,17 @@ def plot_jet(img, k):
     c, S, P = G["ctx"], G["series"], G["lay"]["plot"]
     t = np.arange(c.nf) * c.fdt
     lo, hi = G["ylim"]
-    ax = Axes(P[0], P[1], P[2], P[3], (0, 76), (lo, hi))
-    ax.frame(img, range(0, 76, 5), range(int(lo), int(hi) + 1, 5), "t  [τ = l/U]",
-             "flame tip (Z_st on the axis)  x_tip  [l]   (no tip before t ≈ 26: the "
-             "IC's extruded sheet; off scale above 65 until it settles)")
-    ax.shade(img, 60, 75, FG, 0.06)
+    tmax = c.cfg.get("tmax", 75.0)
+    w0, w1 = c.cfg.get("window", (60.0, 75.0))
+    note = ("(no tip before t ≈ 26: the IC's extruded sheet; off scale above 65 "
+            "until it settles)" if "tmax" not in c.cfg else
+            f"(no closed tip until the IC's sheet flushes; off scale above {hi:g} "
+            "until it settles)")
+    ax = Axes(P[0], P[1], P[2], P[3], (0, tmax + 1), (lo, hi))
+    ax.frame(img, range(0, int(tmax) + 1, c.cfg.get("tstep", 5)),
+             range(int(lo), int(hi) + 1, c.cfg.get("ystep", 5)), "t  [τ = l/U]",
+             f"flame tip (Z_st on the axis)  x_tip  [l]   {note}")
+    ax.shade(img, w0, w1, FG, 0.06)
     for key in ("foam", "dns100", "dns"):
         ax.line(img, t[:k + 1], S[key]["xTip"][:k + 1], COL[key], LW[key])
         if np.isfinite(S[key]["xTip"][k]):
@@ -659,7 +736,8 @@ def plot_jet(img, k):
             dot(img, X, Y, COL[key], 5)
     x = P[0] + P[2] + 30
     y = P[1] + 10
-    put_text(img, "x_tip now  (docs/chem.md mean [60, 75])", x, y, 15, DIM)
+    w0, w1 = c.cfg.get("window", (60.0, 75.0))
+    put_text(img, f"x_tip now  (docs/chem.md mean [{w0:g}, {w1:g}])", x, y, 15, DIM)
     y += 28
     for key, lab, _ in c.cfg["runs"]:
         v = S[key]["xTip"][k]
@@ -688,6 +766,25 @@ def layout(c, foot_top):
     kind = c.cfg["kind"]
     runs = c.cfg["runs"]
     fields = c.cfg["fields"]
+    if kind == "bunsen" and c.nx > 2.5 * c.ny:
+        # a tall cone: one row, a field group of (dns, foam) panels, full height
+        nr = len(runs)
+        x0, y0, igap, ggap = 30, 140, 6, 30
+        ph = foot_top - 84 - y0
+        pw = int(round(c.ny * ph / c.nx))
+        gw = nr * pw + (nr - 1) * igap
+        panels, cbars = [], []
+        for g, f in enumerate(fields):
+            gx = x0 + g * (gw + ggap)
+            for r, (key, _, _) in enumerate(runs):
+                panels.append({"run": key, "field": f, "x": gx + r * (pw + igap),
+                               "y": y0, "label": {"dns": "dns tinflow",
+                                                  "foam": "OpenFOAM"}[key]})
+            cbars.append({"field": f, "x": gx, "y": y0 + ph + 34, "w": gw})
+        right = x0 + 3 * gw + 2 * ggap
+        px0 = right + 90
+        return {"ph": ph, "pw": pw, "panels": panels, "labels": [], "cbars": cbars,
+                "plot": (px0, y0 + 30, W - 40 - px0, ph - 200), "right": right}
     if kind in ("bunsen", "wrinkle"):
         # 2 rows (dns, foam) x 3 field columns, colour bars under the columns
         y0, gap = 112, 10
@@ -831,7 +928,7 @@ def cmd_render(name, workers, fps, out_dir):
         ys = np.concatenate([series[key]["xTip"] for key in keys])
         cfg["ylim"] = (5 * math.floor(np.nanmin(ys) / 5), 5 * math.ceil(np.nanmax(ys) / 5))
     if c.cfg["kind"] == "jet":   # the settled flames; the start transient runs off scale
-        cfg["ylim"] = (40.0, 65.0)
+        cfg["ylim"] = c.cfg.get("ylim", (40.0, 65.0))
     if c.cfg["kind"] == "wrinkle":
         lam = c.ny * c.h
         th = observe2d.dl_theory(c.sigma, 2 * math.pi / lam)
@@ -999,6 +1096,23 @@ def cmd_check(name):
         out["dns_s_xI_8_19.5"] = {"rerun": observe2d.growth(tn, an, (8.0, 19.5))[0],
                                   "committed_frames": observe2d.growth(to, ao, (8.0, 19.5))[0],
                                   "committed_8_20": old["rates"]["8-20"]["aI"][0]}
+    elif name in ("G4b", "G4c"):
+        # dns: nz 8 mid-span vs the committed 2D tinflow twin (fdt 1: t 0, 9, 18)
+        out["dns_vs_dns_c8_tinflow"] = check_dns(c, "dns", os.path.join(
+            R, "dns_c8_tinflow", "flame"), 1.0)
+        out["foam"] = check_foam(c, "foam", os.path.join(R, "foam_mclin_c8"))
+        rows = {}
+        for t_si, d in observe2d.foam_times(os.path.join(R, "foam_mclin_c8")):
+            t = round(t_si / c.unit_s, 6)
+            k = int(round(t / c.fdt))
+            if abs(k * c.fdt - t) > 1e-6 or k not in c.foam["foam"]:
+                continue
+            f = c.frame("foam", k)
+            ob, _ = observe2d.bunsen_obs(f["T"], f["omega"], c.h, c.Tref, c.sigma,
+                                         c.m["yc"], c.m["geom"]["uJet"], c.o.dth)
+            rows.setdefault("t", []).append(t)
+            rows.setdefault("xTip", []).append(ob["xTip"])
+        out["foam_xTip_at_committed_dumps"] = rows
     else:
         for key, old in (("dns", "dns_c4_etain1000"), ("dns100", "dns_c4")):
             out[f"{key}_frames"] = check_dns(c, key, os.path.join(R, old, "flame"), 1.0)

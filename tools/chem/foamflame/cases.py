@@ -266,6 +266,157 @@ CASES = {
         },
         "si": {"T0": 300.0, "p0": 101325.0, "W": 28.014, "l": 1e-3},
     },
+    # Fast jets: G2a / G3a at higher jet speed and jet Mach (the ambient
+    # pressure is scaled out of the model: p0 only sets the SI map).
+    "G4a": {
+        "title": "2D slot Bunsen, U_jet 10 (jet Mach 0.2), burnt coflow",
+        "geometry": "bunsen2d",
+        "model": {"sigma": 5.0, "beta": 8.0, "Pr": 0.72, "mach": 0.02},
+        "species": ["F", "P"],
+        "reactions": ["F = P"],
+        # G2a's burner at twice the jet speed: cone 59.7 delta_th, length 83
+        # past the bands (696 x 288 cells); the cone's flow-through time
+        # H/U stays ~10 tau, so G2a's window
+        "burner": {"slot": 12, "jet": 10},
+        "box": {"sink": 16},
+        "tt": 30.0,
+        "window": (20.0, 25.0),
+        "ladder": [8],
+        "fdt": 1.0,
+        "foam_write_dt": 1.0,
+        "write_precision": 10,
+        "dns": [],
+        # dns twins (label, run-dir suffix, flags): G2a's T-held inflow
+        # (foam's fixedValue T) and its stiff relax (the inflow overshoot,
+        # issues.md 68)
+        "twins": [("dns_tinflow", "_tinflow", "--nscbc-tinflow"),
+                  ("dns_tinflow_etain1000", "_tinflow_etain1000",
+                   "--nscbc-tinflow --nscbc-etain 1000")],
+        # G2a's dt 4e-3 tau at twice the speed: Co <= ~0.5 (G3a ran 0.52)
+        "foam": {
+            "dt": 4e-3, "n_outer": 1, "n_corr": 2, "np": 12, "max_runtime": 1500,
+            "variants": {"mclin": {"yscheme": "MUSCL", "hscheme": "linear",
+                                   "tt": 25.0}},
+        },
+        "si": {"Tu": 300.0, "p0": 101325.0, "W": 28.014, "dD": 1e-4},
+    },
+    "G4b": {
+        "title": "2D slot Bunsen, U_jet 15 (jet Mach 0.3, the guard), burnt coflow",
+        "geometry": "bunsen2d",
+        "model": {"sigma": 5.0, "beta": 8.0, "Pr": 0.72, "mach": 0.02},
+        "species": ["F", "P"],
+        "reactions": ["F = P"],
+        # cone 89.8 delta_th, length 121 (1000 x 288 cells)
+        "burner": {"slot": 12, "jet": 15},
+        "box": {"sink": 16},
+        "tt": 30.0,
+        "window": (20.0, 25.0),
+        "ladder": [8],
+        "fdt": 1.0,
+        "foam_write_dt": 1.0,
+        "write_precision": 10,
+        "dns": [],
+        "twins": [("dns_tinflow", "_tinflow", "--nscbc-tinflow"),
+                  ("dns_tinflow_etain1000", "_tinflow_etain1000",
+                   "--nscbc-tinflow --nscbc-etain 1000")],
+        # dt 3e-3 tau: Co ~0.4 at three times G2a's speed
+        "foam": {
+            "dt": 3e-3, "n_outer": 1, "n_corr": 2, "np": 12, "max_runtime": 1750,
+            "variants": {"mclin": {"yscheme": "MUSCL", "hscheme": "linear",
+                                   "tt": 25.0}},
+        },
+        "si": {"Tu": 300.0, "p0": 101325.0, "W": 28.014, "dD": 1e-4},
+    },
+    "G5": {
+        "title": "2D slot-jet diffusion flame, jet Mach 0.2 (G3a at 4x its Mach)",
+        "geometry": "diffusion2d",
+        "model": {"s": 1.0, "yF1": 1.0, "yO2": 1.0, "sigma": 5.0, "beta": 5.0,
+                  "Da": 1000.0, "Pr": 0.72, "mach": 0.2},
+        "species": ["F", "O", "Zt", "P"],
+        "burner": {"slot": 16.0, "coflow_width": 16.0, "coflow_speed": 1.0,
+                   "edge": 3.0},
+        "box": {"sink": 16},
+        "ladder": [4],
+        # the box's acoustic period 2L/c is ~42 l/U at M 0.2 (G3a's ~10):
+        # at tt 80 both still rang (dns pMean halves 0.93 / 1.09 over [60,
+        # 75]; foam p/p0 2.03 at t 20, 1.57 at 75, fuel leaving, lInf = box)
+        "tt": 240.0,
+        "window": (200.0, 240.0),
+        "fdt": 1.0,
+        "foam_write_dt": 1.0,
+        "write_precision": 10,
+        "dns": [],
+        "extra_dns": [("dns etaIn 1000", "dns_c4_etain1000", "--nscbc-etain 1000"),
+                      ("dns tinflow", "dns_c4_tinflow", "--nscbc-tinflow")],
+        # G3a's dt (convective Co 0.52; PISO is implicit in the acoustics),
+        # one variant on 12 ranks; outlet lInf = box/4 (G3a: box), nearer
+        # dns' sigma-4 outflow anchor
+        "foam": {
+            "dt": 0.025, "n_outer": 1, "n_corr": 2, "np": 12, "lInf_frac": 0.25,
+            "max_runtime": 900,
+            "variants": {
+                "mclin": {"yscheme": "MUSCL", "hscheme": "linear", "tt": 240.0}},
+        },
+        "si": {"T0": 300.0, "p0": 101325.0, "W": 28.014, "l": 1e-3},
+    },
+    "G4c": {
+        "title": "2D slot Bunsen, thin slot 6, U_jet 20 (the --jet-speed cap), "
+                 "jet Mach 0.3",
+        "geometry": "bunsen2d",
+        # M 0.015: U 20 x M at G4b's 0.3 guard
+        "model": {"sigma": 5.0, "beta": 8.0, "Pr": 0.72, "mach": 0.015},
+        "species": ["F", "P"],
+        "reactions": ["F = P"],
+        # half G4b's slot at 4/3 its speed: cone 59.9 delta_th, length 83
+        # (696 x 144 cells); flow-through H/U 3 tau
+        "burner": {"slot": 6, "jet": 20},
+        "box": {"sink": 16},
+        "tt": 30.0,
+        "window": (20.0, 25.0),
+        "ladder": [8],
+        "fdt": 1.0,
+        "foam_write_dt": 1.0,
+        "write_precision": 10,
+        "dns": [],
+        "twins": [("dns_tinflow", "_tinflow", "--nscbc-tinflow"),
+                  ("dns_tinflow_etain1000", "_tinflow_etain1000",
+                   "--nscbc-tinflow --nscbc-etain 1000")],
+        # G4b's Co at 4/3 the speed
+        "foam": {
+            "dt": 2.25e-3, "n_outer": 1, "n_corr": 2, "np": 12, "max_runtime": 1200,
+            "variants": {"mclin": {"yscheme": "MUSCL", "hscheme": "linear",
+                                   "tt": 25.0}},
+        },
+        "si": {"Tu": 300.0, "p0": 101325.0, "W": 28.014, "dD": 1e-4},
+    },
+    "G6": {
+        "title": "2D slot-jet diffusion flame, thin slot 8, jet Mach 0.2",
+        "geometry": "diffusion2d",
+        "model": {"s": 1.0, "yF1": 1.0, "yO2": 1.0, "sigma": 5.0, "beta": 5.0,
+                  "Da": 1000.0, "Pr": 0.72, "mach": 0.2},
+        "species": ["F", "O", "Zt", "P"],
+        # G5 at half the slot: sheet tip 17.6 l, length 30 (152 x 96 cells);
+        # box acoustic period 2L/c ~15 l/U (G5 ~42)
+        "burner": {"slot": 8.0, "coflow_width": 16.0, "coflow_speed": 1.0,
+                   "edge": 3.0},
+        "box": {"sink": 16},
+        "ladder": [4],
+        "tt": 120.0,
+        "window": (80.0, 120.0),
+        "fdt": 1.0,
+        "foam_write_dt": 1.0,
+        "write_precision": 10,
+        "dns": [],
+        "extra_dns": [("dns etaIn 1000", "dns_c4_etain1000", "--nscbc-etain 1000"),
+                      ("dns tinflow", "dns_c4_tinflow", "--nscbc-tinflow")],
+        "foam": {
+            "dt": 0.025, "n_outer": 1, "n_corr": 2, "np": 4, "lInf_frac": 0.25,
+            "max_runtime": 600,
+            "variants": {
+                "mclin": {"yscheme": "MUSCL", "hscheme": "linear", "tt": 120.0}},
+        },
+        "si": {"T0": 300.0, "p0": 101325.0, "W": 28.014, "l": 1e-3},
+    },
 }
 
 # the two-reactant geometries (model C1: no premixed oracle, si_map_diff)
@@ -647,7 +798,8 @@ def foam_bcs_diffusion2d(spec, _oracle, si, m):
     if "Zt" in sp:
         vals["Zt"] = ZT_EPS * Z
     vals[sp[-1]] = np.maximum(0.0, 1.0 - sum(vals[s] for s in sp[:-1]))
-    L = m["nx"] * m["h"] * si["l"]
+    # waveTransmissive relaxes p at w/lInf; lInf = box x `lInf_frac` (1: G3a)
+    L = m["nx"] * m["h"] * si["l"] * spec["foam"].get("lInf_frac", 1.0)
     zg = writer.bc("zeroGradient")
     cy = writer.bc("cyclic")
     inlet = {"U": writer.bc("fixedValue", U), "T": writer.bc("fixedValue", t * si["T0"]),

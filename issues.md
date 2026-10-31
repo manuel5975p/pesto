@@ -555,7 +555,12 @@ Measured gfx1100 via simjob, 2026-10-28.
     it. Not changed (no src edits in that task): decide whether bunsen
     should default to `--nscbc-tinflow` (the diffusion/candle rows hold
     density too: on the jet `--nscbc-tinflow` moves tip 51.20 → 51.52,
-    fuelIn 9.617 → 9.665 (G3a); the candle not measured).
+    fuelIn 9.617 → 9.665 (G3a); the candle not measured). GROWS with the
+    jet speed (G4a/G4b, docs/chem.md "fast jets"): default vs T-held tip
+    −2.0% / −6.1% / −12.2% at U_jet 5 / 10 / 15, sinRatio +1.8% / +3.6% /
+    +11.5%; T-held is within 0.6–2.1% of foam's tip. Not the speed
+    alone: G4c (slot 6, U 20, jet Mach 0.3 as G4b) −8.4% (G4b −12.2%),
+    T-held −0.3% vs foam.
 67. **Bunsen flame base: dns `--nscbc-tinflow` vs foam, 3.5% wider base,
     0.5–0.6% faster foam flank** (same comparison). At equal flank angle
     (tan α 0.21043 vs 0.21025) the fitted flank's half-width at the exit
@@ -633,6 +638,20 @@ Measured gfx1100 via simjob, 2026-10-28.
     holds by construction (the slot entry points are the old functions,
     `test_bunsen`; `gpu_bunsen3d_extrude`, `gpu_bunsen_cone`,
     `gpu_bunsen_anchor` green), no base-vs-branch run byte compare.
+71. **At jet Mach 0.2 the diffusion jet's inflow mass flux depends on the
+    inflow BC kind** (found 2026-10-30, G5, docs/chem.md "fast jets"). The
+    box raises the inflow pressure 7.3% (jet; ∝ γM², G3a ~0.5%). foam's
+    inlet (fixedValue T, zeroGradient p) lets ρ_in follow p: fuelIn 9.48;
+    dns holds ρ (entropy target): 9.03 at etaIn 1000, 9.83 at 100 (the §68
+    overshoot). Tip per fuel agrees to +0.6% / −1.0%; the tips differ
+    +4.3% / −5.6%. Not decided which inflow is the intended problem.
+    `--nscbc-tinflow` does NOT reproduce foam's inlet: fuelIn 10.70
+    (+12.9%), tip 58.33 (+15.2%), tip per fuel +2.1%, at pMean 1.022 — the
+    excess is more than the pressure; not separated from §68's overshoot
+    (tinflow at etaIn 1000 not run). G6 (slot 8, same M): every dns
+    variant within 2.4% per fuel, tips +4.2 / −0.6 / +8.1%. foam's lInf = box outlet
+    pressurized the box ×2 at M 0.2 (fixed with lInf = box/4); foam still
+    drifts −2.4% over [200, 240].
 
 ### 3D premixed in turbulence (`--nz`, `--turb`, docs/chem.md "3D and turbulence")
 

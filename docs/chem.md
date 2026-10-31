@@ -729,6 +729,121 @@ over [15, 30] vs 0.27 at 8 cells; Z hits up to 10025 at t 0.34), so window
 means of two flapping flames compare phase. The case dict (`G3b`, ladder
 [4]) runs as is; a budgeted run is `ladder [8]`.
 
+### G4a / G4b / G5: fast jets (2026-10-30)
+
+G2a and G3a at higher jet speed and jet Mach (the model has no absolute
+pressure: p0 only sets the SI map, so "high pressure" = high jet speed).
+Same meshes per case, same protocol; dns twins run from the case dict
+(`twins` / `extra_dns`, `foam_flame.py run CASE --dns`). simjob 728–735.
+
+**Bunsen** (G2a burner, M 0.02, 8 cells; window [20, 25], foam tt 25, dns
+tt 30): G4a U_jet 10 (jet Mach 0.2, 696 × 288, foam dt 4e-3 τ), G4b U_jet 15
+(jet Mach 0.3 = the guard, 1000 × 288, foam dt 3e-3 τ). Ideal cone 59.7 /
+89.8 δ_th = 95.6 / 143.8 δ_D.
+
+| | dns default | dns `--nscbc-tinflow` | tinflow + etaIn 1000 | foam mclin |
+|---|---|---|---|---|
+| G4a xTip (δ_D) | 86.64 | 92.23 | 92.45 | 90.31 (92.40 / 88.23) |
+| G4a sinRatio | 1.1049 | 1.0664 | 1.0684 | 1.0780 (1.108 / 1.048) |
+| G4a SLflank | 1.0422 | 1.0149 | 1.0093 | 1.0017 |
+| G4a burnRatio | 0.9955 | 1.0061 | 1.0106 | 0.9951 |
+| G4b xTip (δ_D) | 125.91 | 143.48 | 145.52 | 142.67 (148.45 / 136.90) |
+| G4b sinRatio | 1.1317 | 1.0153 | 0.9962 | 0.9803 |
+| G4b SLflank | 1.1016 | 1.0450 | 1.0381 | 1.0440 |
+| G4b Tmax/Tu | 31.32 | 30.24 | 30.15 | 30.14 |
+
+- **T-held dns vs foam: tip +2.1% (U 10), +0.6% (U 15)**, flank angle and
+  SLflank inside the window halves. NOT steady: the tip halves differ 2–5%
+  (U 10) and up to 8% (foam U 15); flank rms 0.07 / 0.28 (G2a 0.03). The
+  tip SHEDS fresh-gas pockets (videos at 0.09 τ, `foam_video.py render
+  G4b|G4c`): it grows, pinches off a pocket and drops ~15 δ_D, a sawtooth
+  of period ~3–5 τ, dns and foam in phase (G4c too). Equal "within the
+  shedding" only; a mean needs several periods. A deterministic cycle, not
+  amplified noise: the foam video rerun differs from the committed run by
+  a FLAT 1–5e-7 (G4b) / 0.5–9e-8 (G4c) of field max over all 25 dumps
+  (`foam_video.py check`), no growth across ~6 pinch-offs.
+- **The default (density-held) inflow's error grows with the jet speed**:
+  tip −2.0% (G2a U 5, vs the T-held twin), −6.1% (U 10), −12.2% (U 15);
+  sinRatio +1.8% / +3.6% / +11.5%; the jet enters hot (U 15 Tmax 31.3 vs
+  30.2 Tu). issues.md §66.
+- foam's inflow pressure rises with the speed: +2.1% / +0.79% (jet /
+  coflow) at U 10, +5.4% / +5.2% at U 15 (G2a +0.56%). foam burn/fuelIn at
+  U 15 1.054: its fuel inventory not steady over the window.
+- Cost: dns 0.47 / 0.58 ms/step (75 s / 100 s for the three runs); foam 453
+  s / 922 s on 12 ranks.
+
+**Diffusion jet** G5 = G3a at jet Mach 0.2 (G3a 0.05; the dns cap), 4
+cells/l. The box's acoustic period 2L/c is ~42 l/U (G3a ~10): at tt 80
+neither solver was steady (dns pMean halves 0.93 / 1.09 over [60, 75]; foam,
+waveTransmissive lInf = box, pressurized to p/p0 2.03 at t 20, 1.57 at 75,
+fuel leaving; `runs/flames/foam/G5_tt80`). Rerun: tt 240, window [200,
+240], foam lInf = box/4 (`lInf_frac`).
+
+| [200, 240] | dns (etaIn 100) | dns etaIn 1000 | foam mclin |
+|---|---|---|---|
+| tip (l) | 52.814 (52.91 / 52.72) | 47.785 | 50.626 (51.22 / 50.00) |
+| Z_st half-width | 7.8135 | 7.6525 | 7.7175 |
+| fuelIn | 9.8257 | 9.0334 | 9.4785 (face 9.083 + Fick 0.425) |
+| tip / fuelIn | 5.3751 | 5.2898 | 5.3412 |
+| burnRatio | 1.0030 | 1.0027 | 1.0027 |
+| pMean | 1.0226 | 1.0180 | 1.0068 |
+| foam inflow p/p0 − 1 (jet / coflow) | — | — | +0.073 / +0.047 |
+| Tst / T_ad | 0.9664 | 0.9643 | 0.9406 |
+| H rows i = 0 | 0.59 | 0.26 | 6.5e-4 |
+
+Fields at t 240 vs foam: dns Z L∞ 1.34e-2 (L2 8.6e-3), θ L∞ 4.5e-2 (L2
+3.2e-2); etaIn 1000 Z L∞ 1.46e-2 (L2 6.5e-3).
+
+- **The tip per unit fuel agrees: dns +0.6% (default), −1.0% (etaIn
+  1000)**; the tips differ by the fuel flux (+4.3% / −5.6%). Unlike G3a
+  (foam = etaIn 1000 to 0.7%), foam's fuelIn sits between the two: its
+  inlet holds T with zeroGradient p, and the box raises the inflow p 7.3%
+  (∝ γM², 16× G3a's) → ρ_in and the fuel flux rise with it; dns' row holds
+  ρ (the entropy target). Different inflow problems at M 0.2, issues.md §71.
+- foam is still drifting (tip halves −2.4%); dns flat to 0.4%.
+- Cost: dns 0.375 ms/step (93 s, two runs); foam 9600 steps, 354 s on 12
+  ranks.
+- G5 `--nscbc-tinflow` twin (job 740): tip 58.33 (+15.2% vs foam), fuelIn
+  10.70 (+12.9%), tip/fuelIn 5.452 (+2.1%), pMean 1.022, Tst/T_ad 0.939;
+  Z L∞ 3.95e-2. Holding T does not give foam's inflow (issues.md §71).
+
+### G4c / G6: thin, fast nozzles (2026-10-31)
+
+simjob 736–739. **G4c** = slot 6 δ_th at U_jet 20 (the `--jet-speed` cap),
+M 0.015 (jet Mach 0.3, as G4b), 696 × 144, foam dt 2.25e-3 τ; ideal cone
+59.9 δ_th = 95.9 δ_D, flow-through 3 τ. Window [20, 25].
+
+| G4c | dns default | dns tinflow | tinflow + etaIn 1000 | foam mclin |
+|---|---|---|---|---|
+| xTip (δ_D) | 79.03 | 86.30 | 87.10 | 86.55 (86.32 / 86.77) |
+| sinRatio | 1.1300 | 1.0556 | 1.0551 | 1.0274 |
+| SLflank | 1.0629 | 1.0201 | 1.0068 | 1.0168 |
+| burnRatio | 0.9907 | 1.0039 | 1.0038 | 1.0051 |
+| Tmax/Tu | 16.34 | 15.99 | 16.01 | 15.96 |
+
+- **T-held dns vs foam: tip −0.3% (+0.6% with etaIn 1000)**; foam's tip is
+  steadier than G4b's (halves ±0.3%). sinRatio +2.7% over foam.
+- Default inflow −8.4% vs T-held (G4b −12.2% at the same jet Mach): §66
+  is not set by U or jet Mach alone.
+- Cost: dns 0.38 ms/step; foam 333 s on 12 ranks.
+
+**G6** = G5 at slot 8 l (jet Mach 0.2), 152 × 160 cells, tt 120, window
+[80, 120], foam lInf = box/4, np 4.
+
+| G6 [80, 120] | dns (etaIn 100) | dns etaIn 1000 | dns tinflow | foam mclin |
+|---|---|---|---|---|
+| tip (l) | 8.227 | 7.847 | 8.541 | 7.898 (7.88 / 7.92) |
+| fuelIn | 2.691 | 2.591 | 2.787 | 2.638 |
+| tip / fuelIn | 3.057 | 3.028 | 3.065 | 2.994 |
+| pMean | 1.0078 | 1.0073 | 1.0045 | 1.0114 |
+| Tst / T_ad | 0.909 | 0.912 | 0.900 | 0.908 |
+
+- Tips vs foam +4.2% / −0.6% / +8.1%; per fuel +2.1% / +1.1% / +2.4%. As
+  G3a, foam = dns etaIn 1000 (tip 0.6%, fuel 1.8%); the short box keeps the
+  inflow pressure low (foam pIn +8.3% jet but pMean 1.011).
+- Fields at t 120 vs foam: Z L∞ 1.4e-2 / 8.6e-3 / 2.5e-2.
+- Cost: dns 0.26 ms/step; foam 71 s on 4 ranks.
+
 ## 2D slot-jet diffusion flame (`--mode diffusion`)
 
 `dns/diffusion.{hpp,cpp}` (core: model, Burke–Schumann state, inflow,

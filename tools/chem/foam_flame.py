@@ -70,9 +70,23 @@ def context(name):
 
 
 def dns_runs(spec, root):
-    return [(f"dns_c{N:g}", N, cases.dns_argv(
+    """(run dir, N, argv): the ladder, then the dns twins -- bunsen `twins`
+    (label, dir suffix, flags) per rung, two-reactant `extra_dns` (label,
+    dir, flags) on the first rung."""
+    runs = [(f"dns_c{N:g}", N, cases.dns_argv(
         spec, N, os.path.join(root, f"dns_c{N:g}", "flame")))
         for N in spec["ladder"]]
+    for _, suf, flags in spec.get("twins", []):
+        for N in spec["ladder"]:
+            d = f"dns_c{N:g}{suf}"
+            runs.append((d, N, cases.dns_argv(spec, N, os.path.join(root, d, "flame"))
+                         + flags.split()))
+    if spec["geometry"] in cases.DIFF_GEOMS:
+        N = spec["ladder"][0]
+        for _, d, flags in spec.get("extra_dns", []):
+            runs.append((d, N, cases.dns_argv(spec, N, os.path.join(root, d, "flame"))
+                         + flags.split()))
+    return runs
 
 
 def cmd_setup(name):
@@ -136,6 +150,7 @@ def cmd_run(name, do_dns, do_foam, np_, only):
                                text=True)
             if p.returncode:
                 sys.exit(f"dry-run {run}: rc {p.returncode}\n{p.stderr}")
+            os.makedirs(os.path.join(root, run), exist_ok=True)  # a twin added later
             with open(os.path.join(root, run, "dryrun.txt"), "w") as f:
                 f.write(p.stdout)
         if runs:
@@ -170,7 +185,8 @@ def cmd_run(name, do_dns, do_foam, np_, only):
             steps.append({"exe": "/bin/bash", "args": [script],
                           "verify": [{"path": os.path.join(FOAM_BIN, solver)}]})
             job = {"label": f"foamflame {name} foam", "resource": "cpu",
-                   "max_runtime_s": 1200, "max_mem_mb": 8192, "cwd": root,
+                   "max_runtime_s": spec["foam"].get("max_runtime", 1200),
+                   "max_mem_mb": 8192, "cwd": root,
                    "steps": steps}
             rc |= submit_spec(job, os.path.join(root, f"job_foam{tag}.json"), True)
     sys.exit(rc)
@@ -285,7 +301,10 @@ def cmd_compare(name):
     if spec["geometry"] != "1d":
         from foamflame import observe2d
         if spec["geometry"] == "bunsen2d":
-            res = observe2d.compare_bunsen(spec, o, si, root)
+            tw = spec.get("twins")
+            res = (observe2d.compare_bunsen(spec, o, si, root) if tw is None else
+                   observe2d.compare_bunsen(spec, o, si, root, [("dns", None)] + [
+                       (lab, suf) for lab, suf, _ in tw]))
             txt = observe2d.table_bunsen(res)
         else:
             ex = [(n, os.path.join(root, d), N, ny, sg, dth)
