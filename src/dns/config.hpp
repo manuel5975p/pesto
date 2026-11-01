@@ -22,6 +22,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace dns {
@@ -30,7 +31,10 @@ enum class Subcommand { Flow, Tgv, Hit, Bench, Channel, Conv, Prop, Flame, Mesh 
 // `dns flame --mode` values (RawConfig::flameMode); 0 premixed, 1 bunsen,
 // 2 diffusion, 3 candle.
 inline constexpr int kFlameModeChamber = 4;
-enum class Physics { Incompressible, Compressible };
+// LowMach: the zero-Mach variable-density flame solver (`dns flame` only,
+// masterplan real_bunsen S4; docs/chem.md "Low-Mach"). Every other subcommand
+// rejects it by name; dns-ui maps indices 0/1 only.
+enum class Physics { Incompressible, Compressible, LowMach };
 enum class FarField { Tunnel, Fringe, Sponge, Nscbc, Periodic };
 enum class Backend { Cpu, Gpu, Auto };
 enum class BodyKind { None, Cylinder, Sphere, Cube, Lens, Fence, Floor, Mesh, Scene };
@@ -280,6 +284,15 @@ struct RawConfig
                                 // 3 candle, kFlameModeChamber
     double expansion = 5.0;     // sigma = Tb / Tu
     double zeldovich = 8.0;     // beta
+    // --equivalence PHI: the rich two-reactant premixed jet (model C2,
+    // dns/chem.hpp PartialPremixModel; with --stoich, --ox-y). 0 = off.
+    double equivalence = 0;
+    // --sl-law gri30 (0, default with --equivalence) | onestep (1): the C2b
+    // A(phi) law (dns/chem.hpp PhiRateLaw) or the uncorrected step (S1).
+    int slLaw = 0;
+    // --mix-phi PHI: the 1D/3D premixed --equivalence flame burns the jet
+    // diluted with air to PHI (A, q, Ta the jet's). 0 = the jet itself.
+    double mixPhi = 0;
     double cellsPerDelta = 15;  // cells per oracle delta_th
     double upstream = 12, downstream = 10; // fresh / burnt extents
     double inflowSpeed = 1.0;   // inflow speed / S_L
@@ -290,11 +303,34 @@ struct RawConfig
     double turbLength = 2.5;    // --turb-length: integral scale, delta_th
     bool holdFlame = false;     // --hold-flame: inflow-speed controller
     double frameStart = 0;      // --frame-start: no frame before this time
+    // Checkpoint / restart (dns/checkpoint.hpp; dns flame's runFlame):
+    // --checkpoint-dt T (model time between checkpoints; absent = none),
+    // --wall-limit SEC (stop at a checkpoint before SEC of wall time; < 0 =
+    // none), --restart PREFIX (continue that run; must equal --out).
+    double checkpointDt = 0, wallLimit = -1;
+    std::string restart;
+    // Phase 1.5 (main): the --restart checkpoint's t, read from its header
+    // (< 0: no restart). validate() rejects a --tt not past it.
+    double restartT = -1;
+    // The case-defining flags the user gave, (name, canonical value), sorted
+    // -- cli::parse; dns/checkpoint.hpp CaseFlags (what a restart must match).
+    std::vector<std::pair<std::string, std::string>> caseFlags;
     // Thickened flame (docs/chem.md, "LES species and TFLES"; premixed and
     // bunsen). --tfles F (>= 1; 0 = off), --tfles-sensor dynamic|uniform
     // (0 | 1), --efficiency none|charlette (0 | 1; default charlette with
     // --les, else none).
     double tfles = 0;
+    // --chem-dt K (--physics lowmach): the chemistry dt bound K / max J;
+    // default = kLmChemDtDefault (dns/lowmach.hpp, lowmach_config pins the
+    // equality; the compressible solver keeps gpu/chem.hpp kChemDt).
+    double chemDt = 1.0;
+    // --dt-rule bounds (0) | cell (1) (--physics lowmach, masterplan
+    // real_bunsen S9): absent = cell on the burner, bounds elsewhere.
+    int dtRule = 0;
+    // --si-delta-d MM / --si-sl M_PER_S (low-Mach burner, S9): the model's
+    // delta_D and S_L in SI units -- the dry-run's SI echo, the label and the
+    // .json "si" record only; no physics.
+    double siDeltaD = 0, siSL = 0;
     int tflesSensor = 0;
     int efficiency = 0;
     // --mode bunsen (2D slot burner; docs/chem.md). Lengths in delta_th,
@@ -312,6 +348,14 @@ struct RawConfig
     double pulse = 0;           // jet speed modulation amplitude (fraction)
     double pulseFreq = 0;       // its frequency, 1/tau
     int nozzle = 0;             // --nozzle slot (0) | round (1, 3D: W = diameter)
+    // --laterals periodic (0) | open (1): the low-Mach burner's y (and, round,
+    // z) faces (masterplan real_bunsen S6).
+    int laterals = 0;
+    // --rim LIP / --tube-length L / --rim-temp R (masterplan real_bunsen S8,
+    // low-Mach burner only): the immersed isothermal tube; delta_th, T/Tu.
+    double rim = 0;             // lip thickness; 0 = no tube
+    double tubeLength = -1;     // tube inside the box below the exit; < 0 = 7.5
+    double rimTemp = 1;         // T_wall / Tu
     // --mode diffusion (2D slot jet diffusion flame; dns/diffusion.hpp).
     // Lengths in l = D0/U_jet, speeds in U_jet; the burner flags above keep
     // their names (slot width = the jet Peclet number).
@@ -579,6 +623,25 @@ public:
     // so mu = Pr (lambda_u = cp) and A = Lambda. Tu = p0 = 1/(gamma M^2).
     PremixedModel flameModel;
     PremixedEigen flameEig;     // the oracle: Lambda, delta_th, profile table
+    // --equivalence (model C2): the rich premixed jet on the two-reactant
+    // step; flameModel keeps sigma (the inner flame's), beta, Pr, Sutherland
+    // and flameEig is premixedEigen2's (Lambda2: A of arrheniusRate2).
+    // false = model C0, bit for bit.
+    bool flamePremix2 = false;
+    PartialPremixModel premix;
+    // Model C2b (--sl-law gri30, the --equivalence default): the A(phi) law
+    // normalised to C(jet) = 1. n == 0: the uncorrected step (--sl-law
+    // onestep), bit for bit S1's model.
+    PhiRateLaw<double> premixLaw;
+    // --mix-phi: the burnt premix's phi (0 = the jet's). flameEig is then
+    // premixedEigen2At's: Lambda the JET's (the run's A), tab.m = S_L(mix)/
+    // S_L(jet), the table that flame's.
+    double premixMixPhi = 0;
+    // The premix the 1D/3D flame burns: the jet's phi, or --mix-phi's.
+    double premixBurnPhi() const
+    {
+        return premixMixPhi > 0 ? premixMixPhi : premix.phi;
+    }
     double flameTu = 0;         // unburnt temperature = p0
     double flameCells = 0;      // cells per delta_th
     double flameUp = 0, flameDown = 0; // fresh / burnt extents, delta_th
@@ -599,6 +662,13 @@ public:
     bool flameHold = false;
     // --frame-start: frames (every kind) begin at this time; 0 = from t = 0.
     double frameStart = 0;
+    // Checkpoint / restart (dns/checkpoint.hpp; premixed, bunsen, diffusion,
+    // candle): checkpointDt 0 = none, wallLimit < 0 = none, restartPrefix
+    // empty = a fresh run, caseFlags = RawConfig::caseFlags (the signature a
+    // checkpoint carries and a restart must match).
+    double checkpointDt = 0, wallLimit = -1;
+    std::string restartPrefix;
+    std::vector<std::pair<std::string, std::string>> caseFlags;
     // Flame LES (--les CS --sgs M; premixed, nz >= 8) rides cs, sgsModel and
     // lesLabel above. TFLES (--tfles F): flameTfles = F_max (0 = off; 1 is a
     // run of the thickened kernels at no thickening), flameTflesUniform: the
@@ -606,6 +676,37 @@ public:
     // LES), flameTflesDilate: the sensor's max-filter radius in cells. The IC
     // lays the oracle profile thickened by F (x/F).
     double flameTfles = 0;
+    // --physics lowmach (masterplan real_bunsen S4): the chemistry dt factor
+    // (--chem-dt) and the cells the FFT-size rule added downstream (nx even,
+    // nx/2 7-smooth: the x DCT-IV's complex length).
+    double lmChemDt = 1.0;
+    // --dt-rule cell (S9, issues LM10): the per-cell positivity bound joins
+    // the three separate bounds (DeviceLowMach::positivityDt). Default true
+    // on the low-Mach burner (its old default overshot T and Y at 4
+    // cells/delta_th: measured), false on the planar flame (S4 bit for bit).
+    bool lmDtCell = false;
+    // --si-delta-d / --si-sl (S9): delta_D in METRES and S_L in m/s; 0 =
+    // absent (no SI echo, the label and .json as before).
+    double siDeltaD = 0, siSL = 0;
+    int lmNxPad = 0;
+    // --mode bunsen --physics lowmach: cells added to ny (both coflows) for
+    // the FFT-size rule.
+    int lmNyPad = 0;
+    // --laterals open (masterplan real_bunsen S6, low-Mach burner only): the
+    // y faces (and z with --nozzle round) are traction-free p = 0 faces
+    // entraining the quiescent ambient (T = Tu, Y = air with --equivalence,
+    // else inert); false = periodic, the S5 solver bit for bit. lmInert:
+    // --reaction off on the low-Mach burner (no chemistry, the IC the rows
+    // extruded: the Bickley jet's case).
+    bool lmOpenY = false, lmOpenZ = false;
+    bool lmInert = false;
+    // --gravity G on the low-Mach burner (masterplan real_bunsen S7): g along
+    // -x in S_L^2/delta_D (box units); buoyancy (rho - rho_a) g, rho_a the
+    // Tu ambient. 0 (absent) = the S6 solver bit for bit.
+    double lmGravity = 0;
+    // --rim (masterplan real_bunsen S8): the immersed isothermal tube; its
+    // geometry rides bunsen.rimLip / xRim / tRim (dns/lowmach.hpp lmTubeSdf).
+    bool lmRim = false;
     bool flameTflesUniform = false;
     bool flameCharlette = false;
     int flameTflesDilate = 0;
@@ -699,6 +800,7 @@ public:
 
 private:
     Case() = default;
+    std::string describeCase() const; // describe() without the checkpoint lines
     friend std::expected<Case, ConfigError> validate(const RawConfig&);
 };
 

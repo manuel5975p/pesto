@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <format>
 #include <string>
 #include <vector>
 
@@ -586,5 +587,203 @@ int main()
     rejects({"flame", "--mode", "candle", "--efficiency", "none"}, 2,
             "--efficiency", "--efficiency rejected by name with --mode candle");
     rejects({"conv", "--tfles", "2"}, 1, "--tfles", "--tfles is not a conv flag");
+
+    // --equivalence (model C2, masterplan real_bunsen S1): the rich two-
+    // reactant premixed jet.
+    {
+        auto c = runCli({"flame", "--equivalence", "1.3", "--expansion",
+                         "6.88", "--visc", "sutherland", "--tinf", "298"});
+        check(c.has_value(), "--equivalence 1.3 validates (defaults s 3.99, "
+                             "Y_O2 0.233)");
+        if (c) {
+            check(c->flamePremix2 && c->premix.s == 3.99 &&
+                      c->premix.yO2 == 0.233 && c->premix.phi == 1.3 &&
+                      c->premix.sigma == 6.88 && c->flameModel.sigma == 6.88,
+                  "C2 model resolved (phi, s, Y_O2, sigma)");
+            const std::string d = c->describe();
+            std::printf("%s", d.c_str());
+            check(d.find("Lambda2 = ") != std::string::npos &&
+                      d.find("Y_F,rem = ") != std::string::npos &&
+                      d.find("Z_st = ") != std::string::npos &&
+                      d.find("sigma_st = ") != std::string::npos &&
+                      d.find("S_L(phi)/S_L(jet)") != std::string::npos &&
+                      d.find(" 1.3:1 ") != std::string::npos &&
+                      d.find("species carried in at Y_F = 0.0705584, Y_O = "
+                             "0.21656") != std::string::npos,
+                  "dry-run: Lambda2, Y_F,rem, Z_st, sigma_st, the S_L(phi) "
+                  "table, the inflow composition");
+            check(flameRunLabel(*c).starts_with(
+                      "DNS [partially premixed two-reactant F + 3.99 O -> "
+                      "4.99 P (rich jet phi=1.3") &&
+                      flameRunLabel(*c).find("unit S_L at phi") !=
+                          std::string::npos,
+                  "label: partially premixed two-reactant, unit S_L at phi");
+            // The IC: Z = 1 everywhere, Y_O = Y_O1 s_p, Y_F = Y_F,rem + Y_O/s.
+            CompState q = CompState::zeros(c->grid);
+            std::vector<double> ry[2];
+            flameIC2(*c, q, ry);
+            double zErr = 0, yoMin = 1, yoMax = 0;
+            for (std::size_t k = 0; k < q.rho.size(); ++k) {
+                const double yf = ry[0][k] / q.rho[k], yo = ry[1][k] / q.rho[k];
+                zErr = std::max(zErr,
+                                std::abs(c->premix.mixtureFraction(yf, yo) - 1));
+                yoMin = std::min(yoMin, yo);
+                yoMax = std::max(yoMax, yo);
+            }
+            std::printf("  C2 IC: max|Z - 1| %.2e, Y_O in [%.3g, %.6g]\n", zErr,
+                        yoMin, yoMax);
+            check(zErr < 1e-14 && yoMin >= 0 && yoMin < 1e-6 &&
+                      std::abs(yoMax / c->premix.yO1() - 1) < 1e-6,
+                  "C2 IC: Z = 1 to 1e-14, Y_O from Y_O1 (fresh) to 0 (burnt)");
+        }
+        auto s = runCli({"flame", "--equivalence", "1.5", "--stoich", "4",
+                         "--ox-y", "0.25", "--sl-law", "onestep"});
+        check(s && s->premix.s == 4 && s->premix.yO2 == 0.25 &&
+                  s->premixLaw.n == 0,
+              "--stoich and --ox-y accepted with --equivalence --sl-law "
+              "onestep (no law)");
+        // The default premixed case is untouched by the new flag's code.
+        auto d = runCli({"flame"});
+        check(d && !d->flamePremix2, "no --equivalence: model C0");
+    }
+    rejects({"flame", "--equivalence", "1.0"}, 2, "--equivalence",
+            "--equivalence 1.0 rejected (rich premix only)");
+    rejects({"flame", "--equivalence", "1.7"}, 2, "--equivalence",
+            "--equivalence 1.7 rejected (above 1.6)");
+    rejects({"flame", "--mode", "bunsen", "--equivalence", "1.3"}, 2,
+            "--equivalence", "--equivalence with bunsen needs lowmach");
+    rejects({"flame", "--mode", "diffusion", "--equivalence", "1.3"}, 2,
+            "--equivalence", "--equivalence with diffusion rejected");
+    rejects({"flame", "--mode", "candle", "--equivalence", "1.3"}, 2,
+            "--equivalence", "--equivalence with candle rejected");
+    rejects({"flame", "--mode", "chamber", "--equivalence", "1.3"}, 2,
+            "--equivalence", "--equivalence with chamber rejected");
+    for (const char* f : {"--fuel-y", "--damkohler", "--cells-per-unit",
+                          "--ignition"})
+        rejects({"flame", "--equivalence", "1.3", f, "1"}, 2, f,
+                std::string(f) + " rejected with --equivalence");
+    rejects({"flame", "--equivalence", "1.3", "--stoich", "0"}, 2, "--stoich",
+            "--stoich 0 rejected with --equivalence");
+    rejects({"flame", "--equivalence", "1.3", "--ox-y", "1.5"}, 2, "--ox-y",
+            "--ox-y 1.5 rejected with --equivalence");
+    rejects({"flame", "--equivalence", "1.3", "--nz", "16", "--ny", "16",
+             "--les", "1.35", "--sgs", "sigma"},
+            2, "--les", "--les rejected with --equivalence");
+    rejects({"flame", "--equivalence", "1.3", "--tfles", "2"}, 2, "--tfles",
+            "--tfles rejected with --equivalence");
+    rejects({"flame", "--equivalence", "1.3", "--nz", "16", "--ny", "16",
+             "--turb", "1"},
+            2, "--turb", "--turb rejected with --equivalence");
+    rejects({"flame", "--stoich", "2"}, 2, "--stoich",
+            "--stoich without --equivalence still rejected in premixed");
+    rejects({"flame", "--zeldovich", "2", "--expansion", "1.5"}, 2,
+            "--zeldovich", "beta 2 sigma 1.5: no inert preheat zone, by name");
+
+    // Model C2b (masterplan real_bunsen S1b): --sl-law gri30 is the
+    // --equivalence default; --mix-phi burns the jet diluted with air.
+    {
+        const std::vector<std::string> jet = {
+            "flame", "--equivalence", "1.3", "--expansion", "6.88", "--visc",
+            "sutherland", "--tinf", "298"};
+        auto with = [&](std::vector<std::string> extra) {
+            std::vector<std::string> a = jet;
+            a.insert(a.end(), extra.begin(), extra.end());
+            return a;
+        };
+        auto g = runCli(jet);
+        auto o = runCli(with({"--sl-law", "onestep"}));
+        check(g && o && g->premixLaw.n == 26 && o->premixLaw.n == 0,
+              "--sl-law: gri30 by default (26 nodes), onestep = no law");
+        if (g && o) {
+            check(g->flameEig.Lambda == o->flameEig.Lambda &&
+                      g->flameEig.tab.x == o->flameEig.tab.x,
+                  "the law leaves the jet's Lambda2 and IC table bit for bit "
+                  "(C(jet) = 1)");
+            check(std::abs(phiRateC(g->premixLaw, g->premix, 1.3) - 1) < 1e-12,
+                  "C(jet) = 1");
+            const std::string d = g->describe(), lab = flameRunLabel(*g);
+            check(d.find("S_L law C2b (--sl-law gri30)") != std::string::npos &&
+                      d.find("C2b S_L(phi)/S_L(jet)") != std::string::npos &&
+                      d.find(" 0.8:1.155 ") != std::string::npos &&
+                      d.find(" 1.6:0.3423") != std::string::npos &&
+                      d.find("uncorrected one-step S_L(phi)/S_L(jet)") !=
+                          std::string::npos,
+                  "dry-run: the C2b line, its S_L table (GRI's at the "
+                  "nodes) and the uncorrected one");
+            check(lab.find("S_L(phi) law C2b") != std::string::npos &&
+                      flameRunLabel(*o).find("uncorrected one-step") !=
+                          std::string::npos,
+                  "label names the law (or the uncorrected step)");
+        }
+        // --mix-phi: lean 0.8 and rich 1.2.
+        for (const double mp : {0.8, 1.2}) {
+            auto m = runCli(with({"--mix-phi", std::format("{:g}", mp)}));
+            check(m && m->premixMixPhi == mp && m->premixBurnPhi() == mp,
+                  std::format("--mix-phi {:g} validates", mp));
+            if (!m || !g) continue;
+            PartialPremixModel b = m->premix;
+            b.phi = mp;
+            const double ratio = mp == 0.8 ? 0.26711442 / 0.23123712
+                                           : 0.32777164 / 0.23123712;
+            check(m->flameEig.Lambda == g->flameEig.Lambda &&
+                      std::abs(m->flameEig.tab.m / ratio - 1) < 1e-9,
+                  std::format("--mix-phi {:g}: the jet's Lambda2, oracle "
+                              "S_L ratio = GRI's {:.4f}",
+                              mp, ratio));
+            const std::string d = m->describe();
+            check(d.find(std::format("--mix-phi {:g}: burns the jet diluted",
+                                     mp)) != std::string::npos &&
+                      d.find(std::format("species carried in at Y_F = {:.6g}, "
+                                         "Y_O = {:.6g}",
+                                         b.yF1(), b.yO1())) !=
+                          std::string::npos,
+                  std::format("--mix-phi {:g}: dry-run line, inflow "
+                              "composition",
+                              mp));
+            // The IC: Z = Z(mix) everywhere; the deficient reactant from
+            // fresh to 0, the other to its leftover.
+            CompState q = CompState::zeros(m->grid);
+            std::vector<double> ry[2];
+            flameIC2(*m, q, ry);
+            const double zMix = m->premix.mixtureFraction(b.yF1(), b.yO1());
+            double zErr = 0, fMin = 1, oMin = 1, tMax = 0;
+            for (std::size_t k = 0; k < q.rho.size(); ++k) {
+                const double yf = ry[0][k] / q.rho[k], yo = ry[1][k] / q.rho[k];
+                zErr = std::max(zErr,
+                                std::abs(m->premix.mixtureFraction(yf, yo) - zMix));
+                fMin = std::min(fMin, yf);
+                oMin = std::min(oMin, yo);
+                tMax = std::max(tMax, m->flameTu / q.rho[k]);
+            }
+            const double defMin = mp < 1 ? fMin : oMin;
+            const double remMin = mp < 1 ? oMin : fMin;
+            const double rem = mp < 1 ? b.yOrem() : b.yFrem();
+            std::printf("  --mix-phi %g IC: max|Z - Z_mix| %.2e, deficient "
+                        "min %.2e, leftover %.6g (expect %.6g)\n",
+                        mp, zErr, defMin, remMin, rem);
+            check(zErr < 1e-13 && defMin >= 0 && defMin < 1e-6 &&
+                      std::abs(remMin / rem - 1) < 1e-6,
+                  std::format("--mix-phi {:g} IC: Z = Z_mix, deficient "
+                              "reactant to 0, the other to its leftover",
+                              mp));
+        }
+    }
+    rejects({"flame", "--equivalence", "1.3", "--stoich", "4"}, 2, "--stoich",
+            "--stoich != 3.99 rejected under the default --sl-law gri30");
+    rejects({"flame", "--equivalence", "1.3", "--ox-y", "0.21"}, 2, "--ox-y",
+            "--ox-y != 0.233 rejected under the default --sl-law gri30");
+    rejects({"flame", "--sl-law", "gri30"}, 2, "--sl-law",
+            "--sl-law without --equivalence rejected by name");
+    rejects({"flame", "--mode", "diffusion", "--sl-law", "onestep"}, 2,
+            "--sl-law", "--sl-law with --mode diffusion rejected by name");
+    rejects({"flame", "--mix-phi", "0.8"}, 2, "--mix-phi",
+            "--mix-phi without --equivalence rejected by name");
+    rejects({"flame", "--equivalence", "1.3", "--sl-law", "cantera"}, 1,
+            "--sl-law", "--sl-law cantera: not a choice");
+    for (const char* bad : {"0.5", "0.59", "1", "1.005", "1.4"})
+        rejects({"flame", "--equivalence", "1.3", "--mix-phi", bad}, 2,
+                "--mix-phi",
+                std::string("--mix-phi ") + bad +
+                    " rejected ([0.6, jet phi], |phi - 1| >= 0.01)");
     return dnstest::finish();
 }

@@ -114,6 +114,22 @@ build/dns conv --rayleigh 5e4 --n 96 --ny 48 --nz 1
 # 1D premixed flame, 15 cells per thermal thickness, M 0.01 (~11 s)
 build/dns flame --inflow-speed 0.98 --tt 20 --emit stats
 
+# the same flame on the LOW-MACH solver (the M -> 0 limit: P0 constant, MAC
+# mass-flux projection, face inflow / p = 0 outflow; ~10 s, S_L 0.998274;
+# --equivalence 1.3 for the rich C2b jet; --chem-dt K the chemistry dt factor
+# [1]; --mach/--nscbc-*/--les/--tfles/--turb and modes other than premixed
+# rejected; docs/chem.md "Low-Mach")
+build/dns flame --physics lowmach --inflow-speed 0.98 --tt 20 --emit stats
+
+# the rich phi 1.3 slot Bunsen on the low-Mach solver, anchored on a REAL
+# cold tube rim (--rim: an immersed staircase wall, no-slip, isothermal,
+# impermeable; Poiseuille jet, room draft, open laterals; ~22 s; docs/chem.md
+# "Low-Mach rim"; --rim-temp, --tube-length; --gravity 0.0241 = real g)
+build/dns flame --mode bunsen --physics lowmach --equivalence 1.3 \
+  --expansion 6.88 --visc sutherland --tinf 298 --prandtl 0.41 \
+  --slot-width 14 --jet-speed 6 --rim 1.4 --laterals open --coflow-width 6 \
+  --cells-per-delta 4 --chem-dt 0.5 --tt 40 --emit stats
+
 # 3D premixed flame in synthetic inflow turbulence (u'/S_L 4, l_t 2.5 delta_th,
 # frozen hash-seeded box swept in at u_in), the fresh mass held by the inflow
 # controller; 224 x 90 x 90 at 6 cells per delta_th, ~95 s (docs/chem.md, 3D;
@@ -165,6 +181,13 @@ python3 tools/chem/candle_render.py w --out candle.mp4 --png candle.png
 build/dns flame --mode chamber --tt 80 --emit stats --emit bin --fdt 0.5 --out c
 python3 tools/chem/chamber_video.py c --out chamber.mp4 --png chamber.png
 
+# a flame run longer than one 1800 s simjob: checkpoints every 5 flame times,
+# each job stops at a checkpoint before 1700 s and the next resumes it; the
+# chained outputs equal one uninterrupted run byte for byte (docs/chem.md
+# "Checkpoint and restart"; premixed / bunsen / diffusion / candle)
+tools/chem/chain.sh runs/flames/long/r 4 -- flame --mode bunsen --tt 200 \
+  --checkpoint-dt 5 --emit stats --emit bin --fdt 0.5
+
 # a multi-object scene
 build/dns flow --scene examples/tandem_cylinders.toml
 ```
@@ -184,7 +207,8 @@ cli/config (parse + validate, pure)  [+ dns/scene, dns/remap, dns/sgs, dns/rans]
     → gpu/{tunnel,bodyforce,les,rans,cutpoisson,cutflux,derived,comp_channel,comp_conv,boussinesq}
       [+ gpu/la/{blockell,smooth,krylov,amg}: the sparse solver library (P3, P5)]
       [+ gpu/fv_simple: incompressible FV SIMPLE on gpu/la (P5b)]
-      → gpu/runner_{incomp,comp,channel,conv,rb,ogrid,fv}   (the time / iteration loops)
+      [+ gpu/lm_poisson, gpu/lowmach: the low-Mach flame solver (dns/lowmach config)]
+      → gpu/runner_{incomp,comp,channel,conv,rb,ogrid,fv,lowmach}   (the time / iteration loops)
         → output (RunOutput, the one artefact sink; the FV path writes
           OpenFOAM time directories through dns/foamio)
 ```

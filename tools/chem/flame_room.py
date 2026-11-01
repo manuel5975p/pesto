@@ -1,31 +1,48 @@
 #!/usr/bin/env python3
-"""Path-traced render of a 3D `dns flame --mode bunsen --nz N` run as a slot
-burner in a small room (Blender Cycles, run INSIDE Blender):
+"""Path-traced render of a 3D `dns flame --mode bunsen --nz N` run as a burner
+in a small room (Blender Cycles, run INSIDE Blender):
 
   blender -b --factory-startup --python tools/chem/flame_room.py -- PREFIX
       --out DIR [--first F --last F --stride S] [--res 1920x1080]
       [--samples 256] [--device gpu|cpu] [--tile 2] [--height 0.30] ...
 
-Per frame: the --emit volume omega field (sink bands cropped in x) becomes a
-sparse VDB grid `emission` = max(omega, 0)/omega_ref (omega_ref: the 99.9th
-percentile over a sample of frames, FIXED, so the light flickers with the
-burn rate); x (the jet axis) is world up, y across the slot, z the span. z is
-periodic, so the box is tiled --tile times along the span (seamless) and the
-burner slot ends where the volume ends.
+Per frame: the --emit volume omega field (cropped in x: --bands cells at both
+ends, or --crop-lo / --crop-hi) becomes sparse VDB grids, omega_ref (the
+99.9th percentile over a sample of frames) FIXED so the light flickers with
+the burn rate; x (the jet axis) is world up, y across, z the span.
+
+ONE colour (compressible runs, no findex): grid `emission` = max(omega,
+0)/omega_ref in turb_render.chemi_rgb's colour. TWO cones (a low-Mach
+--equivalence burner: the run wrote `findex`): grids `em_pre` = max(omega,
+0) w_p(xi)/ref and `em_dif` = max(omega, 0)(1 - w_p)/ref split by
+dns::lmPremixedWeight (the ONE definition, ported in flame_room_lib), each
+its own Emission node: the inner premixed cone CH* + rich C2* (blue-green),
+the outer diffusion cone the CO2* continuum (violet-blue) at EQUAL radiant
+power per unit omega times --dif-gain (a display choice; flame_room_lib's
+docstring states the colour basis). Burnt gas is not drawn (CO2/H2O radiate
+in the IR): the light is omega > 0 only; no soot (laminar phi 1.3).
+
+Scale: --height (m) = the cropped box height; with --height 0 the run's .json
+gives it (the "rim" record's h x the "si" record's deltaD, `dns ...
+--si-delta-d MM --si-sl M_PER_S`): REAL scale. --crop-lo auto = the rim's top
+face (the low-Mach run has no sink bands: --bands 0). --burner round draws a
+steel Bunsen tube: inner/outer radius from the json "rim" (real ID/OD) when
+present (else the jet width from the fuel field), its top at the rim, an air
+collar with two air holes, a cast base and the gas inlet. The slot burner is
+a steel block with the dark slot; z is periodic there, so the box is tiled
+--tile times along the span (seamless).
 
 The volume is an emission-only medium (density 0: a premixed flame's gas is
-transparent) in the chemiluminescence colour of turb_render.chemi_rgb (CH*,
-C2*, CO2* continuum). Cycles does not light-sample volume emission, so the
-room is lit by PROXY point lights, hidden from camera and glossy rays: one per
-(height band, span tile) at that band's omega-weighted centroid, radius its
-spread, power its share of the volume's emitted power. The volume itself is
-hidden from diffuse rays (no double count); camera, glossy and transmission
-rays see the real field. Burnt gas is not drawn (CO2/H2O emit in the IR).
+transparent). Cycles does not light-sample volume emission, so the room is
+lit by PROXY point lights, hidden from camera and glossy rays: one per
+(height band, span tile) at that band's power-weighted centroid, radius its
+spread, power its share of the volume's emitted power, colour the
+power-weighted mix of the two cones. The volume itself is hidden from diffuse
+rays (no double count); camera, glossy and transmission rays see the field.
 
 Writes DIR/vdb/f####.vdb (deleted after use unless --keep-vdb) and
 DIR/f####.png; mp4 assembly is the caller's (ffmpeg)."""
 import argparse
-import json
 import math
 import os
 import sys
@@ -35,6 +52,8 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from turb_render import chemi_rgb  # noqa: E402
+from flame_room_lib import (Run, cone_colours, crop_lo, light_proxies,  # noqa: E402
+                            omega_ref, real_scale, split, tube_geometry)
 
 import bpy  # noqa: E402
 import openvdb as vdb  # noqa: E402
@@ -52,14 +71,30 @@ def parse():
     ap.add_argument("--samples", type=int, default=256)
     ap.add_argument("--device", choices=("gpu", "cpu"), default="gpu")
     ap.add_argument("--bands", type=int, default=16, help="sink band cells cropped at both x ends")
+    ap.add_argument("--crop-lo", default=None,
+                    help="cells cropped at x-lo: an int, or 'auto' = the json rim's top "
+                         "face (low-Mach --rim runs) [--bands]")
+    ap.add_argument("--crop-hi", type=int, default=None, help="cells cropped at x-hi [--bands]")
     ap.add_argument("--tile", type=int, default=1,
                     help="span copies (z is periodic; > 1 shows the repeat at most angles)")
     ap.add_argument("--tile-mode", choices=("periodic", "mirror"), default="periodic",
                     help="periodic: exact copies (seamless); mirror: every other copy z-reversed "
                          "(continuous, kinked at the seam, hides the repeat)")
     ap.add_argument("--t0", type=float, default=0.0, help="time of frame 0 (the run's --frame-start)")
-    ap.add_argument("--height", type=float, default=0.30, help="world height of the cropped box, m")
+    ap.add_argument("--height", type=float, default=0.30,
+                    help="world height of the cropped box, m; 0 = the run's real scale "
+                         "(json rim h x si deltaD)")
+    ap.add_argument("--delta-d", type=float, default=0.0,
+                    help="with --height 0: the model's delta_D in mm when the json has no "
+                         "si record [the json's]")
     ap.add_argument("--emit", type=float, default=60.0, help="volume emission strength at omega_ref")
+    ap.add_argument("--cones", choices=("auto", "two", "one"), default="auto",
+                    help="two: premixed / diffusion split by the flame index (needs "
+                         "<prefix>_findex.bin); one: the single chemiluminescence colour "
+                         "[auto: two when findex exists]")
+    ap.add_argument("--dif-gain", type=float, default=1.0,
+                    help="outer (diffusion) cone emission per unit omega relative to the "
+                         "inner at equal radiant power (a DISPLAY choice)")
     ap.add_argument("--light-gain", type=float, default=40.0,
                     help="proxy light power / volume estimate (appearance-tuned, not radiometric)")
     ap.add_argument("--light-bands", type=int, default=6)
@@ -78,30 +113,15 @@ def parse():
     ap.add_argument("--burner", choices=("slot", "round"), default="slot",
                     help="the run's nozzle: slot block or round Bunsen tube (dns flame "
                          "--nozzle); round needs --tile 1")
+    ap.add_argument("--burner-height", type=float, default=0.14,
+                    help="round: the tube's rim above the bench, m (a lab Bunsen ~0.14)")
     ap.add_argument("--props", choices=("on", "off"), default="on",
                     help="glassware and a ring stand on the bench")
     ap.add_argument("--lens", type=float, default=40.0, help="focal length, mm")
+    ap.add_argument("--fstop", type=float, default=4.0, help="aperture f-number (depth of field)")
     ap.add_argument("--exposure", type=float, default=0.0, help="view transform exposure, stops")
     ap.add_argument("--keep-vdb", action="store_true")
     return ap.parse_args(argv)
-
-
-class Run:
-    """The --emit volume files of one dns run (nz, ny, nx float32 per frame)."""
-
-    def __init__(self, prefix):
-        self.prefix = prefix
-        m = json.load(open(prefix + ".json"))
-        self.nx, self.ny, self.nz, self.frames = m["nx"], m["ny"], m["nz"], m["frames"]
-        self.fdt = m.get("frameDt", 1.0)
-        self.n3 = self.nx * self.ny * self.nz
-        size = os.path.getsize(prefix + "_omega.bin")
-        on_disk = size // (4 * self.n3)  # a run still writing has frames 0 in its json
-        self.frames = min(self.frames, on_disk) if self.frames > 0 else on_disk
-
-    def omega(self, f):
-        a = np.fromfile(self.prefix + "_omega.bin", "<f4", self.n3, offset=4 * self.n3 * f)
-        return a.reshape(self.nz, self.ny, self.nx)
 
 
 # ---------------------------------------------------------------- scene ----
@@ -128,8 +148,8 @@ def box(name, lo, hi, material):
     return o
 
 
-def cylinder(name, x, y, z0, r, h, material, fill=True):
-    bpy.ops.mesh.primitive_cylinder_add(vertices=96, radius=r, depth=h,
+def cylinder(name, x, y, z0, r, h, material, fill=True, vertices=96):
+    bpy.ops.mesh.primitive_cylinder_add(vertices=vertices, radius=r, depth=h,
                                         end_fill_type="NGON" if fill else "NOTHING",
                                         location=(x, y, z0 + h / 2))
     o = bpy.context.active_object
@@ -139,35 +159,60 @@ def cylinder(name, x, y, z0, r, h, material, fill=True):
     return o
 
 
-def bunsen_tube(top, hb, d, steel, dark):
-    """A Bunsen burner on the bench: base disc, gas inlet, tube of inner
-    diameter d (the run's nozzle) whose rim is at top + hb, an air collar,
-    the dark bore at the rim. The axis is the world z axis through 0."""
+def tube(name, z0, h, ri, ro, material):
+    """A hollow tube (inner radius ri, outer ro) standing on z0, height h: an
+    open cylinder of radius ro solidified inward by ro - ri."""
+    o = cylinder(name, 0, 0, z0, ro, h, material, fill=False, vertices=128)
+    sol = o.modifiers.new("wall", "SOLIDIFY")
+    sol.thickness = ro - ri
+    sol.offset = -1.0  # inward: the outer surface stays at ro
+    sol.use_even_offset = True
+    return o
+
+
+def bunsen_tube(top, hb, ri, ro, steel, dark):
+    """A lab Bunsen burner on the bench: a cast base (dark enamel), the gas
+    inlet (brass barb + hose), the air collar with two air holes, and the
+    steel tube of inner radius ri / outer radius ro (the run's real ID/OD)
+    whose rim is at top + hb; the bore dark below the rim. Axis = world z."""
     brass = mat("brass", (0.78, 0.6, 0.32), 0.28, metal=1.0)
-    rt = 0.5 * d + 0.0015
-    cylinder("base", 0, 0, top, max(0.045, 2.2 * rt), 0.014, steel)
-    cylinder("base_boss", 0, 0, top + 0.014, 1.5 * rt, 0.02, steel)
-    tube = cylinder("tube", 0, 0, top + 0.034, rt, hb - 0.034, brass, fill=False)
-    sol = tube.modifiers.new("wall", "SOLIDIFY")
-    sol.thickness = 0.0015
-    cylinder("collar", 0, 0, top + 0.040, rt + 0.0035, 0.018, steel)
-    cylinder("bore", 0, 0, top + hb - 0.02, 0.5 * d, 0.019, dark)
-    bpy.ops.mesh.primitive_cylinder_add(vertices=32, radius=0.005, depth=0.06,
-                                        location=(0.045, 0.0, top + 0.024),
+    cast = mat("enamel", (0.03, 0.035, 0.05), 0.35, spec=0.6)
+    chrome = mat("tube_steel", (0.72, 0.72, 0.74), 0.18, metal=1.0)
+    rb = max(0.04, 6.0 * ro)
+    cylinder("base", 0, 0, top, rb, 0.010, cast)
+    bpy.ops.mesh.primitive_cone_add(vertices=96, radius1=0.75 * rb, radius2=1.8 * ro,
+                                    depth=0.018, location=(0, 0, top + 0.010 + 0.009))
+    bpy.ops.object.shade_smooth()
+    bpy.context.active_object.data.materials.append(cast)
+    zc = top + 0.028  # the collar (air regulator) sits on the base's boss
+    rc = ro + 0.0025
+    cylinder("collar", 0, 0, zc, rc, 0.022, steel)
+    # Two air holes through the collar (dark discs set into its surface).
+    for s in (-1.0, 1.0):
+        bpy.ops.mesh.primitive_cylinder_add(vertices=32, radius=0.0045, depth=0.002,
+                                            location=(0.0, s * (rc - 0.0006), zc + 0.011),
+                                            rotation=(math.pi / 2, 0, 0))
+        bpy.context.active_object.data.materials.append(dark)
+    tube("tube", zc, top + hb - zc, ri, ro, chrome)
+    cylinder("bore", 0, 0, top + hb - 0.03, 0.999 * ri, 0.028, dark)
+    # Gas inlet: a brass barb out of the base boss, the hose along the bench.
+    bpy.ops.mesh.primitive_cylinder_add(vertices=32, radius=0.0045, depth=0.05,
+                                        location=(0.035, 0.0, top + 0.016),
                                         rotation=(0, math.pi / 2, 0))
     bpy.ops.object.shade_smooth()
     bpy.context.active_object.data.materials.append(brass)
     bpy.ops.mesh.primitive_cylinder_add(vertices=32, radius=0.0065, depth=0.5,
-                                        location=(0.32, 0.0, top + 0.0075),
+                                        location=(0.30, 0.0, top + 0.0075),
                                         rotation=(0, math.pi / 2, 0))
     bpy.ops.object.shade_smooth()
     bpy.context.active_object.data.materials.append(mat("hose", (0.5, 0.08, 0.04), 0.5))
 
 
-def build_room(burner_top, slot_w, burner_y, burner_x, kind="slot"):
+def build_room(burner_top, slot_w, burner_y, burner_x, kind="slot", tube_r=None):
     """Room 4.0 x 3.4 x 2.6 m, lab bench, burner whose rim is at z =
     burner_top, centred at the origin: a slot burner (x = span, y = across
-    the slot) or a round Bunsen tube of diameter slot_w (kind round)."""
+    the slot) or a round Bunsen tube (kind round; tube_r = (ri, ro), else
+    the jet diameter slot_w with a 1.5 mm wall)."""
     wall = mat("plaster", (0.62, 0.60, 0.57), 0.9, spec=0.3)
     floor = mat("concrete", (0.18, 0.18, 0.19), 0.55)
     bench = mat("epoxy", (0.035, 0.037, 0.04), 0.22)
@@ -190,7 +235,8 @@ def build_room(burner_top, slot_w, burner_y, burner_x, kind="slot"):
             box("bench_leg", (sx - 0.025, sy - 0.025, 0), (sx + 0.025, sy + 0.025, top - 0.04), leg)
     hb = burner_top - top
     if kind == "round":
-        bunsen_tube(top, hb, slot_w, steel, dark)
+        ri, ro = tube_r if tube_r else (0.5 * slot_w, 0.5 * slot_w + 0.0015)
+        bunsen_tube(top, hb, ri, ro, steel, dark)
         return top
     # Burner: steel body, a plenum below, the dark slot recessed in its top.
     box("burner_plenum", (-burner_x / 2 - 0.02, -burner_y / 2 - 0.02, top),
@@ -249,22 +295,33 @@ def build_props(top, burner_x, burner_y):
     bpy.context.active_object.data.materials.append(steel)
 
 
-def flame_material(rgb, strength):
+def flame_material(channels):
+    """An emission-only volume: one Emission node per (grid name, rgb,
+    strength), summed."""
     m = bpy.data.materials.new("chemiluminescence")
     m.use_nodes = True
     nt = m.node_tree
     nt.nodes.clear()
     out = nt.nodes.new("ShaderNodeOutputMaterial")
-    em = nt.nodes.new("ShaderNodeEmission")
-    at = nt.nodes.new("ShaderNodeAttribute")
-    at.attribute_name = "emission"
-    mul = nt.nodes.new("ShaderNodeMath")
-    mul.operation = "MULTIPLY"
-    mul.inputs[1].default_value = strength
-    em.inputs["Color"].default_value = (*rgb, 1.0)
-    nt.links.new(at.outputs["Fac"], mul.inputs[0])
-    nt.links.new(mul.outputs[0], em.inputs["Strength"])
-    nt.links.new(em.outputs["Emission"], out.inputs["Volume"])
+    acc = None
+    for name, rgb, strength in channels:
+        em = nt.nodes.new("ShaderNodeEmission")
+        at = nt.nodes.new("ShaderNodeAttribute")
+        at.attribute_name = name
+        mul = nt.nodes.new("ShaderNodeMath")
+        mul.operation = "MULTIPLY"
+        mul.inputs[1].default_value = strength
+        em.inputs["Color"].default_value = (*rgb, 1.0)
+        nt.links.new(at.outputs["Fac"], mul.inputs[0])
+        nt.links.new(mul.outputs[0], em.inputs["Strength"])
+        if acc is None:
+            acc = em.outputs["Emission"]
+        else:
+            add = nt.nodes.new("ShaderNodeAddShader")
+            nt.links.new(acc, add.inputs[0])
+            nt.links.new(em.outputs["Emission"], add.inputs[1])
+            acc = add.outputs["Shader"]
+    nt.links.new(acc, out.inputs["Volume"])
     return m
 
 
@@ -312,7 +369,7 @@ def camera(a):
     cam.lens = a.lens
     cam.dof.use_dof = True
     cam.dof.focus_distance = a.distance
-    cam.dof.aperture_fstop = 4.0
+    cam.dof.aperture_fstop = a.fstop
     o = bpy.data.objects.new("cam", cam)
     bpy.context.scene.collection.objects.link(o)
     bpy.context.scene.camera = o
@@ -345,45 +402,18 @@ def vec_to_euler(fwd):
 
 # ---------------------------------------------------------------- frames ---
 
-def omega_ref(run, frames, x0, x1):
-    pick = frames[:: max(1, len(frames) // 8)]
-    vals = [np.percentile(np.maximum(run.omega(f)[:, :, x0:x1], 0), 99.9) for f in pick]
-    return float(np.median(vals))
-
-
-def write_vdb(path, em, voxel, origin):
-    """em indexed (x_world, y_world, z_world) = (span, across, up)."""
-    g = vdb.FloatGrid()
-    g.copyFromArray(em, tolerance=1e-4)
-    g.name = "emission"
-    g.transform = vdb.createLinearTransform(voxelSize=voxel)
-    g.background = 0.0
-    vdb.write(path, grids=[g])
-    return origin
-
-
-def light_proxies(em, voxel, origin, nband, tile_n, power_per_unit):
-    """[(location, radius, power W)] per (height band, span tile)."""
-    nzt, ny, nx = em.shape[0] // tile_n, em.shape[1], em.shape[2]
+def write_vdb(path, grids, voxel):
+    """grids {name: array indexed (x_world, y_world, z_world) = (span,
+    across, up)}."""
     out = []
-    edges = np.linspace(0, nx, nband + 1).astype(int)
-    xs = (np.arange(nzt) + 0.5) * voxel
-    ys = (np.arange(ny) + 0.5) * voxel
-    zs = (np.arange(nx) + 0.5) * voxel
-    for t in range(tile_n):
-        blk = em[t * nzt:(t + 1) * nzt]
-        for b in range(nband):
-            w = blk[:, :, edges[b]:edges[b + 1]]
-            s = float(w.sum())
-            if s <= 0:
-                continue
-            px = (w.sum((1, 2)) @ xs) / s
-            py = (w.sum((0, 2)) @ ys) / s
-            pz = (w.sum((0, 1)) @ zs[edges[b]:edges[b + 1]]) / s
-            sy = math.sqrt(max((w.sum((0, 2)) @ ys ** 2) / s - py ** 2, 0.0))
-            loc = origin + np.array([px + t * nzt * voxel, py, pz])
-            out.append((loc, max(sy, 2 * voxel), power_per_unit * s * voxel ** 3))
-    return out
+    for name, em in grids.items():
+        g = vdb.FloatGrid()
+        g.copyFromArray(em, tolerance=1e-4)
+        g.name = name
+        g.transform = vdb.createLinearTransform(voxelSize=voxel)
+        g.background = 0.0
+        out.append(g)
+    vdb.write(path, grids=out)
 
 
 def main():
@@ -393,27 +423,45 @@ def main():
     frames = list(range(a.first, last + 1, a.stride))
     if not frames:
         sys.exit(f"flame_room: no frames in [{a.first}, {last}] ({run.frames} written)")
+    two = a.cones == "two" or (a.cones == "auto" and run.has("findex"))
+    if two and not run.has("findex"):
+        sys.exit("flame_room: --cones two needs <prefix>_findex.bin (a low-Mach "
+                 "--equivalence burner)")
     w, h = (int(v) for v in a.res.split("x"))
-    x0, x1 = a.bands, run.nx - a.bands
+    x0 = crop_lo(run, a.crop_lo) if a.crop_lo is not None else a.bands
+    x1 = run.nx - (a.crop_hi if a.crop_hi is not None else a.bands)
     X = x1 - x0
-    voxel = a.height / X
+    voxel = real_scale(run, a.height, X, 1e-3 * a.delta_d)
+    if voxel is None:
+        sys.exit("flame_room: --height 0 needs the run's json rim record and its si "
+                 "record (dns ... --rim ... --si-delta-d MM --si-sl M_PER_S) or "
+                 "--delta-d MM")
+    height = voxel * X
     span = a.tile * run.nz * voxel
     across = run.ny * voxel
     os.makedirs(os.path.join(a.out, "vdb"), exist_ok=True)
+    print(f"flame_room: crop x [{x0}, {x1}) = {X} cells, voxel {voxel * 1e3:.4g} mm, "
+          f"height {height * 1e3:.4g} mm, {'two cones' if two else 'one colour'}", flush=True)
 
     bpy.ops.wm.read_factory_settings(use_empty=True)
     setup_render(a, w, h)
-    # The slot width from the run's inflow: the burner geometry is W = 24 by
-    # default; read the json if the runner recorded it, else the jet's |Y| row.
+    tube_r = tube_geometry(run, voxel) if a.burner == "round" else None
+    # The slot width: the jet's fuel-fed inflow cells, unless the json's tube.
     slot_w = slot_width(run) * voxel
-    burner_top = 0.90 + (0.14 if a.burner == "round" else 0.12)
-    top = build_room(burner_top, slot_w, across, span, a.burner)
+    burner_top = 0.90 + (a.burner_height if a.burner == "round" else 0.12)
+    top = build_room(burner_top, slot_w, across, span, a.burner, tube_r)
     if a.props == "on":
         build_props(top, span, across)
     origin = np.array([-span / 2, -across / 2, burner_top])
-    rgb = chemi_rgb()
-    rgb = tuple(float(c) for c in rgb / rgb.max())
-    fm = flame_material(rgb, a.emit)
+    if two:
+        ci, co = cone_colours()
+        chans = [("em_pre", ci, a.emit), ("em_dif", co, a.emit * a.dif_gain)]
+        print(f"flame_room: inner {np.round(ci, 3)}, outer {np.round(co, 3)} x dif-gain "
+              f"{a.dif_gain:g}", flush=True)
+    else:
+        rgb = chemi_rgb()
+        chans = [("emission", tuple(float(c) for c in rgb / rgb.max()), a.emit)]
+    fm = flame_material(chans)
 
     # Emission strength S per unit volume radiates S * 4 pi per steradian-
     # integrated unit (Cycles volume emission is isotropic radiance density).
@@ -421,7 +469,7 @@ def main():
     ref = omega_ref(run, frames, x0, x1)
     # Round: aim lower by default, the tube and its base belong in the frame.
     frac = a.target if a.target >= 0 else (0.15 if a.burner == "round" else 0.45)
-    target = (0.0, 0.0, burner_top + frac * a.height)
+    target = (0.0, 0.0, burner_top + frac * height)
     cam = camera(a)
     if a.ambient > 0:
         ld = bpy.data.lights.new("fill", "AREA")
@@ -435,11 +483,18 @@ def main():
     vol_obj, proxies = None, []
     for f in frames:
         om = run.omega(f)[:, :, x0:x1]  # (nz, ny, X)
-        em = np.maximum(om, 0) / ref
-        copies = [em if c % 2 == 0 or a.tile_mode == "periodic" else em[::-1] for c in range(a.tile)]
-        em = np.ascontiguousarray(np.concatenate(copies, 0))  # (span, across, up)
+        if two:
+            pre, dif = split(om, run.field("findex", f)[:, :, x0:x1], ref)
+            planes = {"em_pre": pre, "em_dif": dif}
+        else:
+            planes = {"emission": (np.maximum(om, 0) / ref).astype(np.float32)}
+        grids = {}
+        for name, em in planes.items():
+            copies = [em if c % 2 == 0 or a.tile_mode == "periodic" else em[::-1]
+                      for c in range(a.tile)]
+            grids[name] = np.ascontiguousarray(np.concatenate(copies, 0))  # (span, across, up)
         path = os.path.join(a.out, "vdb", f"f{f:04d}.vdb")
-        write_vdb(path, em.astype(np.float32), voxel, origin)
+        write_vdb(path, grids, voxel)
         vd = bpy.data.volumes.new(f"flame{f:04d}")  # a fresh datablock per frame: no grid cache
         vd.filepath = path
         vd.materials.append(fm)
@@ -458,12 +513,14 @@ def main():
         for o in proxies:
             bpy.data.objects.remove(o, do_unlink=True)
         proxies = []
-        for i, (loc, rad, pw) in enumerate(light_proxies(em, voxel, origin, a.light_bands,
-                                                           a.tile, power_per_unit)):
+        gains = [(s / a.emit, rgb) for _, rgb, s in chans]
+        for i, (loc, rad, pw, col) in enumerate(
+                light_proxies(list(grids.values()), gains, voxel, origin, a.light_bands,
+                              a.tile, power_per_unit)):
             ld = bpy.data.lights.new(f"flame{i}", "POINT")
             ld.energy = pw
             ld.shadow_soft_size = rad
-            ld.color = rgb
+            ld.color = col
             lo = bpy.data.objects.new(f"flame{i}", ld)
             lo.location = tuple(loc)
             lo.visible_camera = False
@@ -483,12 +540,11 @@ def main():
 
 def slot_width(run):
     """Slot width in cells: the fuel-fed run of the inflow column (mid-span),
-    read off the first frame's fuel field at x = 0 (Y > 0.5)."""
-    fn = run.prefix + "_fuel.bin"
-    if not os.path.exists(fn):
+    read off the first frame's fuel field at x = 0 (Y > 0.5 Y_max)."""
+    if not run.has("fuel"):
         return 24 * 2.5
-    a = np.fromfile(fn, "<f4", run.n3).reshape(run.nz, run.ny, run.nx)
-    return float((a[run.nz // 2, :, 0] > 0.5).sum())
+    a = run.field("fuel", 0)[run.nz // 2, :, 0]
+    return float((a > 0.5 * a.max()).sum()) if a.max() > 0 else 24 * 2.5
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 
 namespace dns::gpu {
@@ -161,6 +162,81 @@ void centreVelocity(const GpuGrid& g, const DeviceField& U, DeviceScalar& u,
     kCentreVelocity<<<launchBlocks(g.size()), blockSize>>>(
         g, U.u.data(), U.v.data(), U.w.data(), u.data(), v.data(), w.data());
     checkLastKernel("centreVelocity");
+}
+
+namespace {
+
+template <bool OY, bool OZ>
+__global__ void kFlameIndex(GpuGrid g, const Real* yf, const Real* yo, Real floor,
+                            Real* out)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= g.size()) return;
+    int i, j, k;
+    decompose(g, c, i, j, k);
+    // x: central inside, one-sided at the two x ends (no wrap).
+    const int il = i > 0 ? i - 1 : i, ir = i + 1 < g.nx ? i + 1 : i;
+    const Real hx2 = Real(ir - il) * g.hx;
+    const std::size_t cl = gidx(g, il, j, k), cr = gidx(g, ir, j, k);
+    // y, z: periodic central, or (open laterals, S6) one-sided at the ends.
+    int jm = j - 1, jp = j + 1, km = k - 1, kp = k + 1;
+    if constexpr (OY) {
+        jm = j > 0 ? j - 1 : j;
+        jp = j + 1 < g.ny ? j + 1 : j;
+    }
+    if constexpr (OZ) {
+        km = k > 0 ? k - 1 : k;
+        kp = k + 1 < g.nz ? k + 1 : k;
+    }
+    const std::size_t cym = gidx(g, i, jm, k), cyp = gidx(g, i, jp, k);
+    const std::size_t czm = gidx(g, i, j, km), czp = gidx(g, i, j, kp);
+    const Real fx = (yf[cr] - yf[cl]) / hx2, ox = (yo[cr] - yo[cl]) / hx2;
+    Real fy, oy, fz, oz;
+    if constexpr (OY) {
+        const Real hy2 = Real(jp - jm) * g.hy;
+        fy = (yf[cyp] - yf[cym]) / hy2;
+        oy = (yo[cyp] - yo[cym]) / hy2;
+    } else {
+        fy = (yf[cyp] - yf[cym]) / (2 * g.hy);
+        oy = (yo[cyp] - yo[cym]) / (2 * g.hy);
+    }
+    if constexpr (OZ) {
+        const Real hz2 = Real(kp - km) * g.hz;
+        fz = (yf[czp] - yf[czm]) / hz2;
+        oz = (yo[czp] - yo[czm]) / hz2;
+    } else {
+        fz = (yf[czp] - yf[czm]) / (2 * g.hz);
+        oz = (yo[czp] - yo[czm]) / (2 * g.hz);
+    }
+    const Real nf = std::sqrt(fx * fx + fy * fy + fz * fz);
+    const Real no = std::sqrt(ox * ox + oy * oy + oz * oz);
+    out[c] = nf < floor || no < floor ? Real(0)
+                                      : (fx * ox + fy * oy + fz * oz) / (nf * no);
+}
+
+} // namespace
+
+void flameIndexCentred(const GpuGrid& g, const DeviceScalar& YF,
+                       const DeviceScalar& YO, DeviceScalar& out, bool openY,
+                       bool openZ)
+{
+    Real h = std::min(g.hx, g.hy);
+    if (g.nz > 1) h = std::min(h, g.hz);
+    const Real floor = Real(std::ldexp(1.0, -24)) / h;
+    const auto n = launchBlocks(g.size());
+    if (openY && openZ)
+        kFlameIndex<true, true><<<n, blockSize>>>(g, YF.data(), YO.data(), floor,
+                                                  out.data());
+    else if (openY)
+        kFlameIndex<true, false><<<n, blockSize>>>(g, YF.data(), YO.data(), floor,
+                                                   out.data());
+    else if (openZ)
+        kFlameIndex<false, true><<<n, blockSize>>>(g, YF.data(), YO.data(), floor,
+                                                   out.data());
+    else
+        kFlameIndex<false, false><<<n, blockSize>>>(g, YF.data(), YO.data(), floor,
+                                                    out.data());
+    checkLastKernel("flameIndexCentred");
 }
 
 } // namespace dns::gpu

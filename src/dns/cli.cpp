@@ -100,6 +100,28 @@ Emit emitOf(string_view s, bool& ok)
     return Emit::None;
 }
 
+// emitOf's inverse (the case signature's --emit spelling).
+string_view emitName(Emit e)
+{
+    switch (e) {
+    case Emit::Stats: return "stats";
+    case Emit::Bin: return "bin";
+    case Emit::Png: return "png";
+    case Emit::Web: return "web";
+    case Emit::Shm: return "shm";
+    case Emit::Volume: return "volume";
+    case Emit::Slices: return "slices";
+    case Emit::Vtk: return "vtk";
+    case Emit::Error: return "error";
+    case Emit::Spectrum: return "spectrum";
+    case Emit::Snapshot: return "snapshot";
+    case Emit::Surface: return "surface";
+    case Emit::Mesh: return "mesh";
+    case Emit::None: return "none";
+    }
+    return "?";
+}
+
 // The --help texts; defined at the end of this file.
 std::string help(Subcommand);
 std::string helpTop();
@@ -244,6 +266,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     if (c.sub == Subcommand::Flame)
         add({{"--ny", &c.ny}, {"--mach", &c.mach},
              {"--expansion", &c.expansion}, {"--zeldovich", &c.zeldovich},
+             {"--equivalence", &c.equivalence}, {"--mix-phi", &c.mixPhi},
              {"--prandtl", &c.prandtl}, {"--tinf", &c.tinf},
              {"--cells-per-delta", &c.cellsPerDelta},
              {"--upstream", &c.upstream}, {"--downstream", &c.downstream},
@@ -270,7 +293,12 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--dt-recompute", &c.dtRecompute},
              {"--profile-dt", &c.profileDt},
              {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
-             {"--planes", &c.planes}, {"--png-down", &c.pngDown}});
+             {"--planes", &c.planes}, {"--png-down", &c.pngDown},
+             {"--checkpoint-dt", &c.checkpointDt},
+             {"--wall-limit", &c.wallLimit}, {"--restart", &c.restart},
+             {"--chem-dt", &c.chemDt}, {"--rim", &c.rim},
+             {"--tube-length", &c.tubeLength}, {"--rim-temp", &c.rimTemp},
+             {"--si-delta-d", &c.siDeltaD}, {"--si-sl", &c.siSL}});
     if (c.sub == Subcommand::Flame) // --mode chamber (validator scopes them)
         add({{"--inject-speed", &c.chamber.injectSpeed},
              {"--coflow", &c.chamber.coflow},
@@ -332,6 +360,11 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                          &c.efficiency});
         enums.push_back({"--soot", {{"on", 1}, {"off", 0}}, &c.soot});
         enums.push_back({"--nozzle", {{"slot", 0}, {"round", 1}}, &c.nozzle});
+        enums.push_back({"--laterals", {{"periodic", 0}, {"open", 1}},
+                         &c.laterals});
+        enums.push_back({"--sl-law", {{"gri30", 0}, {"onestep", 1}},
+                         &c.slLaw});
+        enums.push_back({"--dt-rule", {{"bounds", 0}, {"cell", 1}}, &c.dtRule});
     }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench
         || c.sub == Subcommand::Channel || c.sub == Subcommand::Flame)
@@ -494,6 +527,46 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     c.nscbcAbc = NscbcAbc(abcSel);
     // prop's --out is an optional CSV path: absent = no file. mesh has none.
     if (!c.given.contains("--out") && !hostOnly) c.out = string(sub);
+
+    // The case signature (dns/checkpoint.hpp CaseFlags): every GIVEN flag but
+    // the ones a later job of the same run may change, at its FINAL value in
+    // one canonical spelling, sorted by name.
+    {
+        static constexpr std::string_view kNotCase[] = {
+            "--tt",   "--checkpoint-dt", "--wall-limit", "--restart",
+            "--out",  "--quiet",         "--dry-run",    "--backend"};
+        auto caseFlag = [&](string_view n) {
+            return c.given.contains(string(n)) &&
+                   std::ranges::find(kNotCase, n) == std::end(kNotCase);
+        };
+        for (const auto& o : opts) {
+            if (!caseFlag(o.name)) continue;
+            string v;
+            std::visit([&](auto* t) {
+                using T = std::remove_pointer_t<decltype(t)>;
+                if constexpr (std::is_same_v<T, string>) v = *t;
+                else if constexpr (std::is_same_v<T, bool>) v = *t ? "on" : "off";
+                else v = std::format("{}", *t);
+            }, o.target);
+            c.caseFlags.emplace_back(o.name, v);
+        }
+        for (const auto& e : enums) {
+            if (!caseFlag(e.name)) continue;
+            auto hit = std::ranges::find_if(
+                e.values, [&](auto& p) { return p.second == *e.target; });
+            c.caseFlags.emplace_back(
+                e.name, hit != e.values.end() ? string(hit->first)
+                                              : std::to_string(*e.target));
+        }
+        for (const auto& [n, p] : flags)
+            if (caseFlag(n)) c.caseFlags.emplace_back(n, string());
+        if (caseFlag("--emit")) {
+            string v;
+            for (const Emit e : c.emit) v += (v.empty() ? "" : ",") + string(emitName(e));
+            c.caseFlags.emplace_back("--emit", v);
+        }
+        std::ranges::sort(c.caseFlags);
+    }
     if (c.sub == Subcommand::Mesh && c.polymesh.empty())
         return err("dns mesh requires --polymesh DIR (a constant/polyMesh directory)");
     return c;
@@ -1570,6 +1643,30 @@ species alone (the RANS precedent). The mean flow stays central.
                        (warns above 0.02, the measured ladder top)
   --expansion SIGMA    Tb/Tu, (1, 10]                                [5]
   --zeldovich BETA     Zeldovich number, [2, 20]                     [8]
+  --equivalence PHI    rich premixed jet on the TWO-reactant step F + s O ->
+                       (1+s) P (model C2; premixed mode, and bunsen with
+                       --physics lowmach: the partially premixed burner, air
+                       coflow, rich-product pilots): fuel + air at
+                       PHI, [1.05, 1.6]; Y_F1 = f/(1+f), Y_O1 = Y_O2/(1+f),
+                       f = PHI Y_O2/s; O deficient, Y_F,rem = (PHI-1) Y_O1/s
+                       left; --expansion is the inner flame's Tb/Tu (fixes
+                       q), A = Lambda2 burns the jet at S_L = 1. With it
+                       --stoich (3.99) and --ox-y (0.233); --les, --tfles,
+                       --turb rejected                       [off: model C0]
+  --sl-law gri30|onestep
+                       with --equivalence: gri30 = model C2b, omega = A C(xi)
+                       rho^2 Y_F Y_O e^(-Ta/T), ln C a clamped cubic spline
+                       in the mixture fraction xi = (s Y_F - Y_O + Y_O2)/(s +
+                       Y_O2) calibrated by the FP64 oracle so the premixed
+                       S_L(phi)/S_L(jet) is GRI-3.0 CH4/air's (phi 0.5..1.7
+                       nodes, C(jet) = 1); CH4/air only (--stoich 3.99,
+                       --ox-y 0.233). onestep = the uncorrected step, whose
+                       S_L RISES with phi on the rich side         [gri30]
+  --mix-phi PHI        with --equivalence (premixed mode): burn the jet
+                       diluted with air to PHI, [0.6, jet phi], |PHI-1| >=
+                       0.01 -- the rim's mixtures; A, q, Ta stay the jet's,
+                       so S_L reads S_L(PHI)/S_L(jet) (the oracle's printed)
+                                                             [off: the jet]
   --prandtl PR         molecular Prandtl number (Le = 1)          [0.72]
   --visc constant|sutherland                                 [constant]
   --tinf K             Tu in kelvin; required with sutherland
@@ -1636,9 +1733,114 @@ species alone (the RANS precedent). The mean flow stays central.
                        frames: temp (T - Tu), fuel (Y), omega; nz > 1 adds
                        vort (|curl u|) and speed (|u|)
   --fdt/--pdt/--wdt    frame cadences as in dns flow
+  --checkpoint-dt T    write <out>_ckpt.bin at the first step boundary at or
+                       past every multiple of T (model time; never a clipped
+                       step): state, loop state, output lengths. A run
+                       stopped there and resumed with --restart equals the
+                       uninterrupted run byte for byte (every output but the
+                       .json timing). premixed/bunsen/diffusion/candle only;
+                       --emit stats|bin|volume|slices|png|shm
+  --wall-limit SEC     stop at a checkpoint once SEC of wall time has passed
+                       or the next checkpoint would end past it; exit 0,
+                       .json "complete": false (needs --checkpoint-dt)
+  --restart PREFIX     continue the run PREFIX from <PREFIX>_ckpt.bin; must
+                       equal --out; every case-defining flag must match the
+                       checkpoint's (exit 3 naming the first difference) and
+                       the binary must be the one that wrote it; --tt may
+                       grow (> the checkpoint's t). Chains:
+                       tools/chem/chain.sh
 
   Rejected by name: --re, --ft (use --tt), --n (use --cells-per-delta),
-  --physics incompressible (no low-Mach branch yet).
+  --physics incompressible.
+
+LOW-MACH (--physics compressible|lowmach, default compressible). lowmach =
+the zero-Mach variable-density solver (the M -> 0 limit: P0 constant, rho T
+= P0/R, no acoustics): MAC staggered, SSP-RK3 with a mass-flux projection
+per stage (one spectral Poisson solve), temperature predictor, rho and
+species on the projected flux (mass and a uniform Y exact). Box units Tu =
+P0 = 1. Boundaries are FACE conditions: x-lo inflow face (m, T, Y fixed,
+convective + diffusive flux), x-hi outflow p = 0. --mode premixed (1D/2D/
+3D, --equivalence included) and --mode bunsen (slot 2D/3D, --nozzle round;
+the inflow face per row; no sink bands, so --length is the whole box; dt
+recomputed every step by default). With --equivalence the burner is
+PARTIALLY PREMIXED: the jet the rich premix, the coflow AIR (cold by
+default), pilot strips the jet's burnt products; the pilot/air edge and
+the IC's products/air interface are laid as their Burke-Schumann state.
+Bunsen stats: the cone (xTip, xBase, tanA/L/R, rms, sinRatio, SLflank,
+mFlank), burn, fuelIn (the face's exact flux), fuelNom, burnRatio, Tmax,
+mass, massErr, yHits, yMin, yMax, divErr, eosErr, pcgIt, uMax; with
+--equivalence xTipOut (the outer cone: the axis Z = Z_st crossing),
+fuelOut, burnPre / burnDif (omega split by the Takeno flame index,
+w_p = smoothstep(-0.2, 0.2, xi)), preFrac, zMin, zMax; nz > 1: ST. Frames
+temp, fuel, [oxid,] omega, [findex,] speed. Rejected by name with it:
+--mach, --nscbc-*, --les/--sgs, --tfles*, --efficiency, --turb*,
+--hold-flame, --seed, --pulse*. ny, nz: FFT sizes (prime factors <= 7);
+nx is rounded up so nx/2 is (the extra cells go downstream); a bunsen ny
+is widened into the coflow. Checkpoints carry the solver name
+flame-lowmach. cfl default 0.8 (convective, the cell's own density).
+  --chem-dt K          chemistry dt bound K / max J (cp-form Jacobian),
+                       (0, 2.5]                                       [1]
+  --dt-rule bounds|cell
+                       bounds: dt = min(convective, diffusive, chemistry),
+                       each its own maximum over the box (S4-S8). cell: also
+                       dt <= 1 / max_c (2 C_c + D_c), the explicit transport
+                       step's positivity bound of T and Y summed IN each cell
+                       (C the convective rate, x2 for the MC limiter; D the
+                       cell's own diffusion rate): the hot, fast products
+                       hold both at once. Stats add dtPos.
+                                               [cell on bunsen, else bounds]
+  --si-delta-d MM --si-sl M_PER_S
+                       (bunsen) the model's delta_D (mm) and S_L (m/s): an SI
+                       ECHO only -- the dry-run prints D, U, h, the box and
+                       tube in mm, nu, Re_D, g, tau; the label and the .json
+                       ("si": deltaD in m, SL) carry them (the renderer's real
+                       scale). No physics. Both or neither.            [off]
+  --laterals periodic|open
+                       the burner's y faces (and z around --nozzle round;
+                       the slot's z is its periodic span): open = traction-
+                       free p = 0 faces (the pressure solve's Dirichlet DD
+                       kind), m_n from the projection; an INFLOW face draws
+                       the quiescent ambient (T = Tu, air with --equivalence,
+                       else Y = 0; tangential u = 0; face p = -rho u_n^2/2,
+                       the backflow stabilization), an outflow face is zero
+                       gradient; no diffusion through it. The x-hi backflow
+                       then takes the ambient too. --coflow-width = the air
+                       clearance from the jet/pilot edge to the face. Stats
+                       add mdotLat (net in through the laterals), uLatMin,
+                       uLatMax (outward normal velocity there); fuelOut counts
+                       the laterals.                             [periodic]
+  --gravity G          (bunsen) g along -x in S_L^2/delta_D, [0, 100]: the
+                       jet axis points UP; buoyancy (rho - rho_a) g on the x
+                       faces, rho_a the Tu ambient (its hydrostatic pressure
+                       lives in p, so the open faces' p = 0 is the ambient's).
+                       Real CH4/air phi 1.3 at the M1 mapping: 0.0241. With
+                       periodic laterals: a lattice of plumes (warned).
+                       Dry-run prints Fr, Ri, the free-fall speed.  [0 = off]
+  --rim LIP            (bunsen) the REAL tube rim: an immersed no-slip,
+                       impermeable, isothermal tube wall of thickness LIP
+                       delta_th (>= 4 cells) around the jet (ID = --slot-
+                       width; the slot's two lips), standing on the inflow
+                       face; STAIRCASE (a cell is solid when its centre is
+                       in the wall; every MAC face touching it closed: the
+                       pressure solve's face codes, then an apertured FP32
+                       PCG preconditioned by the spectral solve). Jet rows
+                       the developed Poiseuille profile (bulk --jet-speed),
+                       outside the room draft --coflow-speed [0.4] of cold
+                       room air; no pilot: --pilot-*, --coflow-temp,
+                       --slot-edge, --pulse* rejected by name. Stats add
+                       xRimBase (flame base above the rim), rBase, qRim
+                       (conduction into the tube), the json "rim". [off]
+  --tube-length L      (--rim) tube below the exit inside the box, delta_th,
+                       >= 8 cells; --length is the box above it      [7.5]
+  --rim-temp R         (--rim) the wall's T/Tu, [1, 3]                  [1]
+  --reaction on|off    off: an INERT burner (no chemistry; the IC the inflow
+                       rows extruded, no cone guards): the Bickley jet [on]
+  --profile-dt T       burner jet profiles every T: <out>_jet.csv per x
+                       column t, x, uc (axis u), Tc, Yc, J = int rho u^2,
+                       P = int p, M = int rho u, Q = int u, b (u = uc/2
+                       half-width), Qj (Q within 3 b of the axis); the
+                       slot per unit span on the span mean, the round over
+                       the cross-section, b on the axial plane       [0]
 
 BUNSEN (--mode bunsen). x is the jet axis: the x-lo face is the burner exit,
 a per-row NSCBC inflow of a slot jet of fresh gas (Y = 1, T = Tu) between

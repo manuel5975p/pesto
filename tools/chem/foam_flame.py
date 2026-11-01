@@ -69,18 +69,34 @@ def context(name):
     return spec, o, si, os.path.join(ROOT, name)
 
 
+def drop_flags(argv, drop):
+    """argv without each flag of `drop` and its one value (a twin on another
+    solver: --physics lowmach rejects --mach and --nscbc-sink by name)."""
+    out, k = [], 0
+    while k < len(argv):
+        if argv[k] in drop:
+            k += 2
+            continue
+        out.append(argv[k])
+        k += 1
+    return out
+
+
 def dns_runs(spec, root):
     """(run dir, N, argv): the ladder, then the dns twins -- bunsen `twins`
-    (label, dir suffix, flags) per rung, two-reactant `extra_dns` (label,
-    dir, flags) on the first rung."""
+    (label, dir suffix, flags[, flags dropped from the case's argv]) per
+    rung, two-reactant `extra_dns` (label, dir, flags) on the first rung."""
     runs = [(f"dns_c{N:g}", N, cases.dns_argv(
         spec, N, os.path.join(root, f"dns_c{N:g}", "flame")))
         for N in spec["ladder"]]
-    for _, suf, flags in spec.get("twins", []):
+    for tw in spec.get("twins", []):
+        _, suf, flags = tw[:3]
+        drop = tw[3] if len(tw) > 3 else ()
         for N in spec["ladder"]:
             d = f"dns_c{N:g}{suf}"
-            runs.append((d, N, cases.dns_argv(spec, N, os.path.join(root, d, "flame"))
-                         + flags.split()))
+            argv = drop_flags(cases.dns_argv(spec, N, os.path.join(root, d, "flame")),
+                              drop)
+            runs.append((d, N, argv + flags.split()))
     if spec["geometry"] in cases.DIFF_GEOMS:
         N = spec["ladder"][0]
         for _, d, flags in spec.get("extra_dns", []):
@@ -304,7 +320,7 @@ def cmd_compare(name):
             tw = spec.get("twins")
             res = (observe2d.compare_bunsen(spec, o, si, root) if tw is None else
                    observe2d.compare_bunsen(spec, o, si, root, [("dns", None)] + [
-                       (lab, suf) for lab, suf, _ in tw]))
+                       (t[0], t[1]) for t in tw]))
             txt = observe2d.table_bunsen(res)
         else:
             ex = [(n, os.path.join(root, d), N, ny, sg, dth)

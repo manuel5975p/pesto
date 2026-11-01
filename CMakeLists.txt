@@ -37,6 +37,7 @@ add_library(dns_core
     src/dns/bodies.cpp
     src/dns/bunsen.cpp
     src/dns/channel_line.cpp
+    src/dns/checkpoint.cpp
     src/dns/chem.cpp
     src/dns/cli.cpp
     src/dns/casegeom.cpp
@@ -56,6 +57,7 @@ add_library(dns_core
     src/dns/facemesh.cpp
     src/dns/fieldpng.cpp
     src/dns/flame1d.cpp
+    src/dns/lowmach.cpp
     src/dns/turb_ic.cpp
     src/dns/flow_ic.cpp
     src/dns/geometry.cpp
@@ -123,7 +125,10 @@ target_link_libraries(dns_prop PUBLIC dns_core PRIVATE Threads::Threads)
 
 # The one executable. Everything else in apps/ was deleted by the
 # recomposition; `dns <subcommand>` covers the whole former 15-binary surface.
-add_executable(dns apps/dns_main.cpp)
+# sha256.cpp (self-contained, the job server's): the checkpoint's binary
+# fingerprint (dns/checkpoint.hpp; a restart reproduces a run only on the
+# binary that started it).
+add_executable(dns apps/dns_main.cpp src/jobs/sha256.cpp)
 target_link_libraries(dns PRIVATE dns_core dns_prop)
 
 # The simulation job server and its client (docs/jobs.md). Linux + systemd
@@ -174,8 +179,11 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/la/krylov.hip
     src/dns/gpu/la/smooth.hip
     src/dns/gpu/les.hip
+    src/dns/gpu/lm_poisson.hip
+    src/dns/gpu/lowmach.hip
     src/dns/gpu/ogrid_bc.hip
     src/dns/gpu/poisson.hip
+    src/dns/gpu/poisson_sep.hip
     src/dns/gpu/rans.hip
     src/dns/gpu/reductions.hip
     src/dns/gpu/rotortable.hip
@@ -188,6 +196,7 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/runner_ogrid.hip
     src/dns/gpu/runner_rb.hip
     src/dns/gpu/runner_incomp.hip
+    src/dns/gpu/runner_lowmach.hip
     src/dns/gpu/runner_periodic.hip
     src/dns/gpu/runner_wick.hip
     src/dns/gpu/species.hip
@@ -432,8 +441,8 @@ if(BUILD_TESTING)
         fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport
         rotor focal cli_defaults comp_axis_permute rans rans_channel1d
         steady_stop blockband channel_line pseudo_time flow_rans_config precond
-        host_threads flame1d flame_config bunsen diffusion candle wick chamber_config
-        polymesh facemesh fvref la amg fvcase fvwalldist tfles)
+        host_threads flame1d flame_config lowmach_config restart_config bunsen diffusion candle wick chamber_config
+        polymesh facemesh fvref la amg fvcase fvwalldist tfles poisson_sep)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini turb_ic)
     endif()
@@ -449,6 +458,11 @@ if(BUILD_TESTING)
     # The Cantera reference of the chemistry oracle (tools/chem/cantera_flame.py).
     target_compile_definitions(test_flame1d PRIVATE
         DNS_CHEM_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/chem")
+    # (e) sweeps 802 oracle solves (~140 s CPU, threaded: ~15 s on 20 cores).
+    set_tests_properties(flame1d PROPERTIES TIMEOUT 600)
+    # Checkpoint / restart host side (dns/checkpoint.hpp): its own scratch dir.
+    target_compile_definitions(test_restart_config PRIVATE
+        DNS_TEST_DIR="${CMAKE_CURRENT_BINARY_DIR}/restart_config_tmp")
     # Charlette's efficiency against tools/chem/tfles_eff.py (docs/chem.md).
     target_compile_definitions(test_tfles PRIVATE
         DNS_CHEM_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/chem")
@@ -460,6 +474,13 @@ if(BUILD_TESTING)
         add_test(NAME turb_render_selftest COMMAND ${DNS_PYTHON3}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/chem/turb_render.py --selftest)
         set_tests_properties(turb_render_selftest PROPERTIES TIMEOUT 120)
+        # The room renderer's numpy half (tools/chem/flame_room_lib.py, S9):
+        # the lmPremixedWeight port, the two-cone split, the colours, the
+        # proxy power. Host, seconds (flame_room_split checks it against
+        # the solver's own sums).
+        add_test(NAME flame_room_selftest COMMAND ${DNS_PYTHON3}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/chem/flame_room_lib.py --selftest)
+        set_tests_properties(flame_room_selftest PROPERTIES TIMEOUT 120)
     endif()
     # FaceMesh (docs/mesh.md): the checked-in polyMesh fixtures and their
     # checkMesh logs (tools/mesh/make_test_meshes.sh). facemesh_mb is the
@@ -652,6 +673,18 @@ if(BUILD_TESTING)
         add_test(NAME gpu_la_perf COMMAND test_gpu_la perf)
         set_tests_properties(gpu_la1 gpu_la2 gpu_la_perf PROPERTIES SKIP_RETURN_CODE 77
             TIMEOUT 180)
+        # Separable Poisson + the apertured low-Mach PCG (masterplan real_bunsen
+        # S3, docs/la.md "Separable Poisson"): sep = every kind combination vs
+        # the host FP64 solve, eigenmodes, 2D vs z-extruded, determinism; apert
+        # = annulus tube PCG, closed faces, FP32 floor vs FP64; perf = ms/solve
+        # at the final-case grid and half scale (meaningful under simjob --bench).
+        add_executable(test_gpu_poisson_sep tests/test_gpu_poisson_sep.cpp)
+        target_link_libraries(test_gpu_poisson_sep PRIVATE dns_gpu)
+        add_test(NAME gpu_poisson_sep COMMAND test_gpu_poisson_sep sep)
+        add_test(NAME gpu_poisson_apert COMMAND test_gpu_poisson_sep apert)
+        add_test(NAME gpu_poisson_sep_perf COMMAND test_gpu_poisson_sep perf)
+        set_tests_properties(gpu_poisson_sep gpu_poisson_apert gpu_poisson_sep_perf
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
         # gpu/la AMG (docs/la.md, masterplan_meshsolver P5): refresh vs the host
         # Galerkin restatement on every shape + determinism; LA3 h-independence
         # and anisotropy; LA4 AMG-PCG vs the FFT-PCG cut-cell solve; AMG-PCG on
@@ -769,6 +802,127 @@ if(BUILD_TESTING)
         add_test(NAME gpu_flame3d_planar COMMAND test_gpu_flame1d 3d)
         set_tests_properties(gpu_flame1d_grid gpu_flame1d_mach gpu_flame1d_suth
             gpu_flame3d_planar PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        # dns flame --equivalence (model C2, masterplan real_bunsen S1): the
+        # rich two-reactant 1D flame against premixedEigen2 and beside the
+        # single-reactant flame, 7.5 / 15 cells; Z = 1 (4 runs, ~25 s).
+        add_executable(test_gpu_flame_rich1d tests/test_gpu_flame_rich1d.cpp)
+        target_link_libraries(test_gpu_flame_rich1d PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_flame_rich1d PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_flame_rich1d dns)
+        add_test(NAME gpu_flame_rich1d COMMAND test_gpu_flame_rich1d)
+        # S1b: the C2b A(phi) law end to end -- the jet and --mix-phi 0.7 /
+        # 1.05 / 1.2 (+ 1.2 uncorrected) against the oracle ratio (5 runs).
+        add_test(NAME gpu_flame_rich1d_law COMMAND test_gpu_flame_rich1d law)
+        set_tests_properties(gpu_flame_rich1d gpu_flame_rich1d_law
+            PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        # dns flame checkpoint / restart (masterplan real_bunsen S2): every
+        # runFlame mode stopped at each checkpoint and resumed (1 + 3
+        # restarts) equals the straight run byte for byte; junk past a
+        # checkpoint, a grown --tt, rejections by name, SIGINT.
+        add_executable(test_gpu_restart_flame tests/test_gpu_restart_flame.cpp)
+        target_link_libraries(test_gpu_restart_flame PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_restart_flame PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_restart_flame dns)
+        add_test(NAME gpu_restart_flame COMMAND test_gpu_restart_flame)
+        set_tests_properties(gpu_restart_flame
+            PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        # dns flame --physics lowmach (masterplan real_bunsen S4): the zero-
+        # Mach solver through its API (passive Y bitwise, mass = the FP64
+        # tally, rest, reruns), the 1D flame through the binary (grid ladder
+        # + rh, rich C2b, chemistry dt, Shvab-Zeldovich vs compressible), and
+        # S2's restart byte rule on runLowMach.
+        add_executable(test_gpu_lowmach tests/test_gpu_lowmach.cpp)
+        target_link_libraries(test_gpu_lowmach PRIVATE dns_gpu)
+        add_test(NAME gpu_lowmach_passive COMMAND test_gpu_lowmach)
+        add_executable(test_gpu_lowmach_1d tests/test_gpu_lowmach_1d.cpp)
+        target_link_libraries(test_gpu_lowmach_1d PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_lowmach_1d PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_lowmach_1d dns)
+        add_test(NAME gpu_lowmach_1d COMMAND test_gpu_lowmach_1d grid)
+        add_test(NAME gpu_lowmach_rich COMMAND test_gpu_lowmach_1d rich)
+        add_test(NAME gpu_lowmach_chemdt COMMAND test_gpu_lowmach_1d chemdt)
+        add_test(NAME gpu_lowmach_sz COMMAND test_gpu_lowmach_1d sz)
+        add_executable(test_gpu_lowmach_restart tests/test_gpu_lowmach_restart.cpp)
+        target_link_libraries(test_gpu_lowmach_restart PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_lowmach_restart PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_lowmach_restart dns)
+        add_test(NAME gpu_lowmach_restart COMMAND test_gpu_lowmach_restart)
+        set_tests_properties(gpu_lowmach_passive gpu_lowmach_1d gpu_lowmach_rich
+            gpu_lowmach_chemdt gpu_lowmach_sz gpu_lowmach_restart
+            PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        # The low-Mach Bunsen (masterplan real_bunsen S5): G2a vs the
+        # compressible M 0.01/0.02 and reactingFoam, the nz 8 extrusion ==
+        # 2D bytewise, the partially premixed slot (two flames, flame index
+        # split, closed outer cone), the round-nozzle smoke.
+        add_executable(test_gpu_lowmach_bunsen tests/test_gpu_lowmach_bunsen.cpp)
+        target_link_libraries(test_gpu_lowmach_bunsen PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_lowmach_bunsen PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_lowmach_bunsen dns)
+        add_test(NAME gpu_lowmach_bunsen2d COMMAND test_gpu_lowmach_bunsen g2a)
+        add_test(NAME gpu_lowmach_extrude COMMAND test_gpu_lowmach_bunsen extrude)
+        add_test(NAME gpu_lowmach_rich2d COMMAND test_gpu_lowmach_bunsen rich)
+        add_test(NAME gpu_lowmach_round COMMAND test_gpu_lowmach_bunsen round)
+        # S6: open laterals -- the Bickley jet (+ no confinement, periodic
+        # confined) and the open partially premixed slot.
+        add_test(NAME gpu_lowmach_bickley COMMAND test_gpu_lowmach_bunsen bickley)
+        add_test(NAME gpu_lowmach_openrich COMMAND test_gpu_lowmach_bunsen openrich)
+        set_tests_properties(gpu_lowmach_bunsen2d gpu_lowmach_extrude
+            gpu_lowmach_rich2d gpu_lowmach_round gpu_lowmach_bickley
+            gpu_lowmach_openrich
+            PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        # S7: gravity on the low-Mach solver (API) -- the isothermal box at
+        # rest exactly, the stratified column hydrostatically balanced, a hot
+        # blob rising; the laminar plane plume's similarity exponents,
+        # amplitudes and conserved buoyancy flux; the candle cross-check.
+        add_executable(test_gpu_lowmach_gravity tests/test_gpu_lowmach_gravity.cpp)
+        target_link_libraries(test_gpu_lowmach_gravity PRIVATE dns_gpu)
+        add_test(NAME gpu_lowmach_hydro COMMAND test_gpu_lowmach_gravity hydro)
+        add_test(NAME gpu_lowmach_plume COMMAND test_gpu_lowmach_gravity plume)
+        add_test(NAME gpu_lowmach_candle COMMAND test_gpu_lowmach_gravity candle)
+        set_tests_properties(gpu_lowmach_hydro gpu_lowmach_plume gpu_lowmach_candle
+            PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        # S8: the immersed isothermal tube rim -- the developed channel
+        # between two lips (profile, dp/dx, wall shear, closed faces exact),
+        # conduction against the isothermal wall (the linear fixed point,
+        # qRim closure), impermeability (closed faces 0, the tube untouched,
+        # a passive Y bitwise, tallies, the PCG warm gate, rerun bytes), and
+        # the 2D rich slot anchoring on the cold rim (binary).
+        add_executable(test_gpu_lowmach_rim tests/test_gpu_lowmach_rim.cpp)
+        target_link_libraries(test_gpu_lowmach_rim PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_lowmach_rim PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_lowmach_rim dns)
+        add_test(NAME gpu_lowmach_channel COMMAND test_gpu_lowmach_rim channel)
+        add_test(NAME gpu_lowmach_rim_cond COMMAND test_gpu_lowmach_rim cond)
+        add_test(NAME gpu_lowmach_rim_imperm COMMAND test_gpu_lowmach_rim imperm)
+        add_test(NAME gpu_lowmach_rim_anchor COMMAND test_gpu_lowmach_rim anchor)
+        set_tests_properties(gpu_lowmach_channel gpu_lowmach_rim_cond
+            gpu_lowmach_rim_imperm gpu_lowmach_rim_anchor
+            PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        # S9: the real-burner integration smoke (round + rim + open + g +
+        # --equivalence + the cell dt rule + SI echo; finite stats, bounded,
+        # volumes, the flame-index split = burnPre/burnDif, one restart) and
+        # the renderer's Python port of lmPremixedWeight against its output.
+        add_executable(test_gpu_burner_round tests/test_gpu_burner_round.cpp)
+        target_link_libraries(test_gpu_burner_round PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_burner_round PRIVATE
+            DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_burner_round dns)
+        add_test(NAME gpu_burner_round COMMAND test_gpu_burner_round)
+        set_tests_properties(gpu_burner_round PROPERTIES TIMEOUT 300
+            SKIP_RETURN_CODE 77 FIXTURES_SETUP burner_round_out)
+        if(DNS_PYTHON3)
+            add_test(NAME flame_room_split COMMAND ${DNS_PYTHON3}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/chem/flame_room_lib.py --selftest
+                /tmp/dns_test_burner_round/br/straight/r)
+            set_tests_properties(flame_room_split PROPERTIES TIMEOUT 120
+                SKIP_RETURN_CODE 77 FIXTURES_REQUIRED burner_round_out)
+        endif()
         # dns flame 3D (docs/chem.md, "3D and turbulence"): the z-extruded 2D
         # flame bitwise per k plane at a fixed dt (extrude); the turbulent
         # inflow instantiation, zero rows bit for bit, the row lerp bitwise,

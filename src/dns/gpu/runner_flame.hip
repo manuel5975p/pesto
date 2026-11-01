@@ -9,6 +9,7 @@
 #include "dns/gpu/derived.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "dns/gpu/flame_turb.hpp"
+#include "dns/gpu/internal/checkpoint.hpp"
 #include "dns/gpu/internal/frame_scratch.hpp"
 #include "dns/gpu/internal/run_loop.hpp"
 #include "dns/gpu/reductions.hpp"
@@ -32,6 +33,60 @@ namespace dns::gpu {
 using internal::fail;
 using internal::finishTiming;
 
+namespace {
+
+// runFlame's loop state: EVERY host variable the time loop carries from one
+// step to the next, and therefore the checkpoint's "loop.*" records
+// (fields(); gpu/internal/checkpoint.hpp). A loop variable kept outside this
+// struct is not checkpointed and breaks the restart byte rule silently
+// (masterplan real_bunsen K12; gpu_restart_flame is the proof).
+struct FlameLoop
+{
+    double t = 0.0;
+    long steps = 0;
+    internal::StatsCadence cad;
+    internal::ProfileSchedule prof;
+    double dtStab = 0.0, dtChem = 0.0;
+    int sinceDt = 1 << 30;
+    bool bindChem = false;
+    double xfPrev = NAN, tPrev = 0;
+    double lastHits = 0, lastMin = 0, lastMax = 1;
+    // --turb: the swept distance (FP64 host) and the current inflow target
+    // (held over a step; --hold-flame moves it at stats rows).
+    double sweep = 0, uNow, sEma, tCtl = 0, xI0 = NAN;
+
+    explicit FlameLoop(const FlameRun& r)
+        : cad{r.statsEvery}, prof(r.profileDt), uNow(r.uIn), sEma(r.uIn)
+    {
+    }
+
+    template <class F>
+    void fields(F&& f)
+    {
+        f("t", t);
+        f("steps", steps);
+        f("cad.lastLog", cad.lastLog);
+        f("cad.lastPrint", cad.lastPrint);
+        f("prof.next", prof.next);
+        f("dtStab", dtStab);
+        f("dtChem", dtChem);
+        f("sinceDt", sinceDt);
+        f("bindChem", bindChem);
+        f("xfPrev", xfPrev);
+        f("tPrev", tPrev);
+        f("lastHits", lastHits);
+        f("lastMin", lastMin);
+        f("lastMax", lastMax);
+        f("sweep", sweep);
+        f("uNow", uNow);
+        f("sEma", sEma);
+        f("tCtl", tCtl);
+        f("xI0", xI0);
+    }
+};
+
+} // namespace
+
 std::expected<RunStats, RunError> runFlame(
     const Grid& g, const CompState& ic,
     std::span<const std::vector<double>> rhoY, const FlameRun& r,
@@ -42,6 +97,7 @@ std::expected<RunStats, RunError> runFlame(
     const bool rows = r.bunsen || r.diffusion;
     assert(r.csLes == 0 || (g.nz > 1 && !r.diffusion));
     assert(!r.tflesOn || !r.diffusion);
+    const CheckpointPolicy& cp = r.ckpt;
     // csLes == 0: DeviceComp::make(g, tr), the DNS solver bit for bit.
     auto dev = DeviceComp::make(g, r.tr, r.csLes, r.sgs);
     auto red = ReduceScratch::make();
@@ -141,6 +197,13 @@ std::expected<RunStats, RunError> runFlame(
             return fail(6, "initial condition upload failed");
     if (auto h = internal::checkDevice("the initial condition"); !h)
         return std::unexpected(h.error());
+    // --restart: the checkpoint's state replaces the IC, bit for bit.
+    if (cp.restart) {
+        if (auto e = internal::loadCompState(*cp.restart, *ds); !e)
+            return std::unexpected(e.error());
+        if (auto h = internal::checkDevice("the restart state"); !h)
+            return std::unexpected(h.error());
+    }
 
     const double hx = g.hx, dV = g.cellVolume();
     const int nb = r.sinkNb;
@@ -163,6 +226,11 @@ std::expected<RunStats, RunError> runFlame(
     if (d3)
         cols1d.insert(cols1d.end(), {"area", "I0", "uPrime", "uInflow",
                                      "xFresh", "xLead"});
+    // --equivalence: the mixture fraction's range over the box, after the
+    // 1D (and 3D) columns.
+    assert(!r.premix2 || (!rows && !r.tflesOn && r.sp.nY == 2 && r.sp.ox == 1));
+    const std::size_t n1d = cols1d.size();
+    if (r.premix2) cols1d.insert(cols1d.end(), {"zMin", "zMax"});
     // Bunsen: the cone (measureCone) -- tip, base, flank tan(alpha) from the
     // half-width and each side, the fit residual, the kinematic check
     // sin(alpha) U_jet / S_L (1 = the ideal cone), the flank consumption
@@ -219,6 +287,14 @@ std::expected<RunStats, RunError> runFlame(
     // by ITS rho Y (the fresh state the flame actually burns), and the
     // displacement speed uses its velocity.
     const int iRef = std::min(g.nx - 1, nb + int(std::lround(2 * r.dth / hx)));
+    // --restart: every output back to its checkpointed length (the series
+    // below then append, without a header).
+    if (cp.restart) {
+        auto at = outputResume(*cp.restart);
+        if (!at) return fail(3, "--restart: " + at.error());
+        // The checkpointed outputs are the restart's INPUT: exit 3.
+        if (auto e = out.resumeAt(*at); !e) return fail(3, e.error());
+    }
     if (auto e = out.declareSeries("stats", cols); !e) return fail(4, e.error());
     if (!rows) {
         const std::string pcols[] = {"t", "x", "T", "rho", "u", "p", "Y", "omega"};
@@ -242,6 +318,7 @@ std::expected<RunStats, RunError> runFlame(
         double area = NAN, uPrime = NAN, xFresh = NAN, xLead = NAN;
         double Ebar = NAN, FEmax = NAN; // TFLES
         double ST = NAN;                // 3D bunsen (area: the cone's)
+        double zMin = NAN, zMax = NAN;  // --equivalence
     };
     // 3D bunsen: the span (z) means of the downloaded fields, k ascending in
     // FP64, onto the nx x ny plane measureCone reads.
@@ -494,8 +571,23 @@ std::expected<RunStats, RunError> runFlame(
         }
         m.dth = peak > 0 ? dTflame / peak : 0;
         m.omegaEdge = wmax > 0 ? wedge / wmax : 0;
-        // Consumption speed: integral of omega over the fresh rho Y.
-        const double ryRef = col(iRef, 3) / plane;
+        // Consumption speed: integral of omega over the fresh rho Y (model
+        // C2: the burnable part, rho (Y_F - Y_F,rem)).
+        const double ryRef =
+            col(iRef, 3) / plane - r.yFBurnt * (col(iRef, 0) / plane);
+        if (r.premix2) {
+            for (auto* v : {&YFh, &YOh}) v->resize(g.size());
+            if (dev->speciesY(0).download(YFh.data()) != hipSuccess ||
+                dev->speciesY(1).download(YOh.data()) != hipSuccess)
+                return fail(6, "field download failed");
+            m.zMin = HUGE_VAL;
+            m.zMax = -HUGE_VAL;
+            for (std::size_t c = 0; c < g.size(); ++c) {
+                const double z = r.premix.mixtureFraction(YFh[c], YOh[c]);
+                m.zMin = std::min(m.zMin, z);
+                m.zMax = std::max(m.zMax, z);
+            }
+        }
         m.SL = ryRef > 0 ? m.SL / ryRef : NAN;
         m.uRef = col(iRef, 6) / plane;
         m.pRef = col(iRef, 7) / plane;
@@ -623,23 +715,86 @@ std::expected<RunStats, RunError> runFlame(
     };
 
     RunStats st;
-    double t = 0.0;
-    internal::StatsCadence cad{r.statsEvery};
-    double dtStab = 0.0, dtChem = 0.0;
-    int sinceDt = 1 << 30;
-    internal::ProfileSchedule prof(r.profileDt);
-    double xfPrev = NAN, tPrev = 0;
+    // The loop state (FlameLoop: the checkpoint's "loop.*"), under the names
+    // the loop body has always used.
+    FlameLoop L(r);
+    double& t = L.t;
+    long& steps = L.steps;
+    internal::StatsCadence& cad = L.cad;
+    internal::ProfileSchedule& prof = L.prof;
+    double &dtStab = L.dtStab, &dtChem = L.dtChem;
+    int& sinceDt = L.sinceDt;
+    bool& bindChem = L.bindChem;
+    double &xfPrev = L.xfPrev, &tPrev = L.tPrev;
+    double &lastHits = L.lastHits, &lastMin = L.lastMin, &lastMax = L.lastMax;
+    double &sweep = L.sweep, &uNow = L.uNow, &sEma = L.sEma, &tCtl = L.tCtl,
+           &xI0 = L.xI0;
     const double guard = nb * hx + 2 * r.dth;
     const double Lx = g.nx * hx;
-    double lastHits = 0, lastMin = 0, lastMax = 1;
+    // --restart: the loop where the checkpoint left it; the freestream the
+    // --hold-flame controller last set.
+    long steps0 = 0;
+    if (cp.restart) {
+        if (auto e = internal::loadLoop(*cp.restart, L); !e)
+            return fail(3, "--restart: " + e.error());
+        steps0 = steps;
+        nsc.setFreestream(uNow);
+    }
     const auto wall0 = std::chrono::steady_clock::now();
-    bool bindChem = false;
-    // --turb: the swept distance (FP64 host) and the current inflow target
-    // (held over a step; --hold-flame moves it at stats rows).
-    double sweep = 0, uNow = r.uIn, sEma = r.uIn, tCtl = 0, xI0 = NAN;
+
+    // --checkpoint-dt: the next checkpoint at ckK * every (the first step
+    // boundary at or past it); tCk the last checkpoint's t; the wall clock
+    // of the job (from main's start) and of the last checkpoint interval.
+    using Clock = std::chrono::steady_clock;
+    long ckK = 0;
+    double tCk = cp.restart ? t : -1.0;
+    auto ckAdvance = [&] {
+        ckK = long(std::floor(t / cp.every)) + 1;
+        while (double(ckK) * cp.every <= t) ++ckK;
+    };
+    if (cp.every > 0) ckAdvance();
+    const Clock::time_point jobStart =
+        cp.wallStart == Clock::time_point{} ? wall0 : cp.wallStart;
+    Clock::time_point lastCk = jobStart;
+    auto seconds = [](Clock::duration d) {
+        return std::chrono::duration<double>(d).count();
+    };
+    auto writeCheckpoint = [&]() -> std::expected<void, RunError> {
+        Checkpoint ck;
+        ck.putText("binary", cp.binary);
+        ck.putText("solver", "flame-compressible");
+        ck.putText("case", cp.caseText);
+        const std::int64_t grid[4] = {g.nx, g.ny, g.nz, r.sp.nY};
+        ck.putI64("grid", grid);
+        ck.putF64("t", t);
+        ck.putI64("steps", steps);
+        ck.putI64("restarts", cp.restarts);
+        internal::saveLoop(ck, L);
+        auto at = out.resumePoint();
+        if (!at) return fail(4, "checkpoint: " + at.error());
+        putOutputResume(ck, *at);
+        if (auto e = internal::saveCompState(ck, *ds); !e)
+            return std::unexpected(e.error());
+        if (auto e = ck.write(checkpointPath(cp.prefix)); !e)
+            return fail(4, "checkpoint: " + e.error());
+        tCk = t;
+        return {};
+    };
+    bool stopped = false; // a checkpoint stop: the run is incomplete
 
     while (t < r.tEnd) {
-        if (stopRequested()) break;
+        if (stopRequested()) {
+            // SIGINT / SIGTERM with checkpoints on: keep this step boundary
+            // (the previous step's outputs are all written).
+            if (cp.every > 0 && t > tCk) {
+                if (auto e = writeCheckpoint(); !e) return std::unexpected(e.error());
+                std::printf("checkpoint: t=%.9g steps=%ld (%s; resume with "
+                            "--restart %s)\n",
+                            t, steps, stopReason(), cp.prefix.c_str());
+                stopped = true;
+            }
+            break;
+        }
         // TFLES: F E, E/F, Omega of this step's input state, held over its
         // three stages (and read by the dt bound below).
         if (tf) {
@@ -671,9 +826,9 @@ std::expected<RunStats, RunError> runFlame(
         dev->step(*ds, Real(dt));
         t += dt;
         sweep += uSweep * dt;
-        ++st.steps;
+        ++steps;
 
-        const bool statsDue = cad.due(st.steps, t, r.tEnd);
+        const bool statsDue = cad.due(steps, t, r.tEnd);
         const bool profDue = !rows && prof.due(t, r.tEnd);
         if (statsDue || profDue) {
             auto m = measure();
@@ -704,7 +859,7 @@ std::expected<RunStats, RunError> runFlame(
                                       jm.hits,    1.0 + jetNow(t),
                                       m->uMax,    m->uOutMin};
                 emitRow(row, m->Ebar, m->FEmax);
-                if (cad.printDue(st.steps, t, r.tEnd)) {
+                if (cad.printDue(steps, t, r.tEnd)) {
                     std::printf(
                         "t=%.3f/%.3f tip=%.4g base=%.4g half=%.4g "
                         "Tmax/Tad=%.5f (past band %.5f) burn/in=%.4f "
@@ -721,9 +876,9 @@ std::expected<RunStats, RunError> runFlame(
                                     m->uOutMin);
                     std::printf("\n");
                     std::fflush(stdout);
-                    cad.printed(st.steps);
+                    cad.printed(steps);
                 }
-                cad.logged(st.steps);
+                cad.logged(steps);
             } else if (statsDue && r.bunsen) {
                 const ConeMeasure& c = m->cone;
                 const double sinA = c.ok ? c.tanA / std::hypot(1.0, c.tanA)
@@ -748,7 +903,7 @@ std::expected<RunStats, RunError> runFlame(
                 } else {
                     emitRow(row, m->Ebar, m->FEmax);
                 }
-                if (cad.printDue(st.steps, t, r.tEnd)) {
+                if (cad.printDue(steps, t, r.tEnd)) {
                     std::printf(
                         "t=%.3f/%.3f tip=%.3f base=%.3f alpha=%.3f deg "
                         "sin(a)U/SL=%.5f SLflank=%.5f mFlank=%.5f "
@@ -767,9 +922,9 @@ std::expected<RunStats, RunError> runFlame(
                         std::printf(" Ebar=%.4f FEmax=%.4f", m->Ebar, m->FEmax);
                     std::printf("\n");
                     std::fflush(stdout);
-                    cad.printed(st.steps);
+                    cad.printed(steps);
                 }
-                cad.logged(st.steps);
+                cad.logged(steps);
             } else if (statsDue) {
                 const double dxf = std::isfinite(xfPrev) && t > tPrev
                                        ? (m->xf - xfPrev) / (t - tPrev)
@@ -786,10 +941,17 @@ std::expected<RunStats, RunError> runFlame(
                                       m->SL / m->area, m->uPrime,
                                       uNow,         m->xFresh,
                                       m->xLead};
-                emitRow(row, m->Ebar, m->FEmax);
+                if (r.premix2) {
+                    rowBuf3.assign(std::begin(row),
+                                   std::begin(row) + std::ptrdiff_t(n1d));
+                    rowBuf3.insert(rowBuf3.end(), {m->zMin, m->zMax});
+                    emitRow(rowBuf3, m->Ebar, m->FEmax);
+                } else {
+                    emitRow(row, m->Ebar, m->FEmax);
+                }
                 xfPrev = m->xf;
                 tPrev = t;
-                if (cad.printDue(st.steps, t, r.tEnd)) {
+                if (cad.printDue(steps, t, r.tEnd)) {
                     std::printf("t=%.3f/%.3f SL=%.6f xf=%.4f dth=%.4f "
                                 "Tmax/Tb=%.5f omegaEdge=%.2e yHits=%g dt=%.2e%s",
                                 t, r.tEnd, m->SL, m->xf, m->dth,
@@ -802,11 +964,14 @@ std::expected<RunStats, RunError> runFlame(
                                     m->xFresh, m->xLead);
                     if (tf)
                         std::printf(" Ebar=%.4f FEmax=%.4f", m->Ebar, m->FEmax);
+                    if (r.premix2)
+                        std::printf(" Z=1%+.2e..1%+.2e", m->zMin - 1,
+                                    m->zMax - 1);
                     std::printf("\n");
                     std::fflush(stdout);
-                    cad.printed(st.steps);
+                    cad.printed(steps);
                 }
-                cad.logged(st.steps);
+                cad.logged(steps);
                 // --hold-flame: u_in tracks the consumption speed (EMA over
                 // kHoldEmaTau) and pulls the fresh-mass thickness back to its
                 // first-row value over kHoldTau, rate-limited; held over the
@@ -891,9 +1056,33 @@ std::expected<RunStats, RunError> runFlame(
                                    m->xf));
         }
         if (out.wantsAnyFrame(t)) writeFrame(t);
+        // --checkpoint-dt: at the end of the step (its row, profile and
+        // frame written), never at tEnd. --wall-limit: stop here once the
+        // job's wall clock has passed the limit or would pass it before the
+        // next checkpoint (the last interval's wall time ahead).
+        if (cp.every > 0 && t < r.tEnd && t >= double(ckK) * cp.every) {
+            if (auto e = writeCheckpoint(); !e) return std::unexpected(e.error());
+            ckAdvance();
+            const Clock::time_point now = Clock::now();
+            const double elapsed = seconds(now - jobStart);
+            const double interval = seconds(now - lastCk);
+            lastCk = now;
+            if (cp.wallLimit >= 0 &&
+                (elapsed >= cp.wallLimit || elapsed + interval > cp.wallLimit)) {
+                std::printf("checkpoint: t=%.9g steps=%ld (incomplete; resume "
+                            "with --restart %s)\n",
+                            t, steps, cp.prefix.c_str());
+                stopped = true;
+                break;
+            }
+            std::printf("checkpoint: t=%.9g steps=%ld -> %s\n", t, steps,
+                        checkpointPath(cp.prefix).c_str());
+        }
     }
     if (auto h = internal::checkDevice("the end of the run", &*red); !h)
         return std::unexpected(h.error());
+    // A checkpointed run's .json says whether it reached --tt.
+    if (cp.active()) out.setCompletion(!stopped && t >= r.tEnd, cp.restarts);
     if (lastHits > 0 && r.diffusion)
         std::fprintf(stderr,
                      "dns: warning: %g cells with Z, Y_F or Y_O outside "
@@ -908,7 +1097,9 @@ std::expected<RunStats, RunError> runFlame(
                      lastHits, lastMin, lastMax - 1,
                      (lastMax - 1) / std::ldexp(1.0, -23));
     std::printf("label: %s\n", r.label.c_str());
-    finishTiming(st, wall0, out);
+    // ms/step over THIS job's steps (a restart's steps0 came before it).
+    st.steps = steps;
+    finishTiming(st, wall0, out, steps0);
     st.tStop = t;
     return st;
 }

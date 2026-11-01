@@ -76,6 +76,11 @@ struct RunOutput::Impl
     int frames = 0, pngIdx = 0, vtkIdx = 0;
     double msPerStep = 0;
     bool moved = false;
+    // --restart: the file suffixes resumeAt() truncated; their streams open
+    // in append mode (series without a header).
+    std::set<std::string> resumed;
+    // setCompletion(): the checkpointed run's "complete" / "restarts".
+    std::optional<std::pair<bool, long>> completion;
 
     // The first write failure of the run, reported once on stderr when it
     // happens and returned by finish(). The run itself continues: a full disk
@@ -117,7 +122,7 @@ struct RunOutput::Impl
             "{{\"nx\":{},\"ny\":{},\"nz\":{},\"frames\":{},\"frameDt\":{},"
             "\"D\":{},\"re\":{},\"mach\":{},\"cs\":{},\"les\":{},\"sgs\":\"{}\","
             "\"body\":\"{}\",\"far\":\"{}\",\"physics\":\"{}\",\"kick\":{},"
-            "\"msPerStep\":{}{}{}{}{}{}{}}}\n",
+            "\"msPerStep\":{}{}{}{}{}{}{}{}{}{}}}\n",
             meta.nx, meta.ny, meta.nz, frames, meta.frameDt, meta.D, meta.re,
             meta.mach, meta.cs, meta.les ? 1 : 0, meta.sgs, meta.body,
             meta.farField, meta.physics, meta.kick, msPerStep,
@@ -125,7 +130,12 @@ struct RunOutput::Impl
             key("ransMode", meta.ransMode), key("ransInflow", meta.ransInflow),
             meta.wedgeDeg > 0 ? std::format(",\"wedgeDeg\":{}", meta.wedgeDeg)
                               : std::string(),
-            key("state", meta.state));
+            key("state", meta.state),
+            meta.rim.empty() ? std::string() : ",\"rim\":" + meta.rim,
+            meta.si.empty() ? std::string() : ",\"si\":" + meta.si,
+            completion ? std::format(",\"complete\":{},\"restarts\":{}",
+                                     completion->first, completion->second)
+                       : std::string());
     }
 
     void writeJson() const
@@ -153,8 +163,10 @@ struct RunOutput::Impl
         auto it = bins.find(name);
         if (it != bins.end()) return it->second;
         auto& f = bins[name];
-        const std::string path = cfg.prefix + "_" + name + ".bin";
-        f.open(path, std::ios::binary);
+        const std::string suffix = "_" + name + ".bin";
+        const std::string path = cfg.prefix + suffix;
+        f.open(path, resumed.contains(suffix) ? std::ios::binary | std::ios::app
+                                              : std::ios::binary);
         if (!f)
             std::fprintf(stderr, "dns: warning: cannot open '%s'; those frames "
                                  "will not be written\n", path.c_str());
@@ -292,6 +304,75 @@ RunOutput::~RunOutput()
 
 int RunOutput::frames() const { return p_->frames; }
 void RunOutput::setMsPerStep(double ms) { p_->msPerStep = ms; }
+void RunOutput::setCompletion(bool complete, long restarts)
+{
+    p_->completion = std::pair{complete, restarts};
+}
+
+std::expected<OutputResume, std::string> RunOutput::resumePoint()
+{
+    auto& p = *p_;
+    OutputResume at;
+    // Lengths from the filesystem after the flush: an append-mode stream's
+    // tellp() is not its length before its first write.
+    auto add = [&](std::ofstream& f, const std::string& suffix)
+        -> std::expected<void, std::string> {
+        const std::string path = p.cfg.prefix + suffix;
+        f.flush();
+        if (!f) return std::unexpected(std::format("write failed on '{}'", path));
+        std::error_code ec;
+        const auto n = std::filesystem::file_size(path, ec);
+        if (ec)
+            return std::unexpected(
+                std::format("cannot stat '{}': {}", path, ec.message()));
+        at.files.emplace_back(suffix, std::uint64_t(n));
+        return {};
+    };
+    for (auto& [n, f] : p.series)
+        if (auto r = add(f, "_" + n + ".csv"); !r) return std::unexpected(r.error());
+    for (auto& [n, f] : p.bins)
+        if (f.is_open())
+            if (auto r = add(f, "_" + n + ".bin"); !r)
+                return std::unexpected(r.error());
+    std::ranges::sort(at.files);
+    at.frames = p.frames;
+    at.pngIdx = p.pngIdx;
+    at.nextFrame = p.nextFrame;
+    at.nextPng = p.nextPng;
+    at.nextWeb = p.nextWeb;
+    return at;
+}
+
+std::expected<void, std::string> RunOutput::resumeAt(const OutputResume& at)
+{
+    auto& p = *p_;
+    for (const auto& [suffix, len] : at.files) {
+        const std::string path = p.cfg.prefix + suffix;
+        std::error_code ec;
+        const auto n = std::filesystem::file_size(path, ec);
+        if (ec)
+            return std::unexpected(std::format(
+                "--restart: the checkpointed output '{}' is unreadable ({})",
+                path, ec.message()));
+        if (n < len)
+            return std::unexpected(std::format(
+                "--restart: '{}' holds {} bytes, fewer than the checkpoint's "
+                "{} (rows written before the checkpoint were lost)",
+                path, n, len));
+        std::filesystem::resize_file(path, len, ec);
+        if (ec)
+            return std::unexpected(std::format("--restart: cannot truncate "
+                                               "'{}': {}",
+                                               path, ec.message()));
+        p.resumed.insert(suffix);
+    }
+    p.frames = at.frames;
+    p.pngIdx = at.pngIdx;
+    p.nextFrame = at.nextFrame;
+    p.nextPng = at.nextPng;
+    p.nextWeb = at.nextWeb;
+    return {};
+}
 
 void RunOutput::updateMask(std::span<const float> mask)
 {
@@ -462,12 +543,19 @@ RunOutput::declareSeries(std::string_view name, std::span<const std::string> col
 {
     if (!has(p_->cfg.kinds, Emit::Stats)) return {};
     const std::string key(name);
-    const std::string path = p_->cfg.prefix + "_" + key + ".csv";
+    const std::string suffix = "_" + key + ".csv";
+    const std::string path = p_->cfg.prefix + suffix;
     auto& f = p_->series[key];
     // Re-declaring a series reopens it: opening an already-open stream would
     // set failbit and silently swallow every subsequent row.
     if (f.is_open()) f.close();
     f.clear();
+    // --restart: the truncated file keeps its header and rows; append.
+    if (p_->resumed.contains(suffix)) {
+        f.open(path, std::ios::app);
+        if (!f) return std::unexpected(std::format("cannot append to '{}'", path));
+        return {};
+    }
     f.open(path);
     if (!f) return std::unexpected(std::format("cannot write '{}'", path));
     if (!comment.empty()) f << "# " << comment << '\n';

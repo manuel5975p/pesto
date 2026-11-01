@@ -13,6 +13,8 @@
 #pragma once
 
 #include "dns/bunsen.hpp"
+#include "dns/checkpoint.hpp"
+#include "dns/chem.hpp"
 #include "dns/comp.hpp"
 #include "dns/diffusion.hpp"
 #include "dns/gpu/comp.hpp"
@@ -115,6 +117,25 @@ struct FlameRun
     // and FEmax. false = the runner bit for bit.
     bool tflesOn = false;
     TflesSetup tfles;
+
+    // --equivalence (model C2, dns/chem.hpp PartialPremixModel): the 1D/3D
+    // premixed runner on nY 2 (fuel 0, ox 1, the two-reactant kernels). SL's
+    // fresh reference is the fuel the flame CAN burn, rho (Y_F - yFBurnt) at
+    // the reference column, yFBurnt = Y_F,rem (0 = model C0: x - 0 is the
+    // old expression bit for bit). premix2 appends zMin, zMax: the mixture
+    // fraction's range over the box (Z = 1 everywhere in the jet's own
+    // flame: an exact coupling function reads 1 to the FP32 walk).
+    double yFBurnt = 0;
+    bool premix2 = false;
+    PartialPremixModel premix;
+
+    // Checkpoint / restart (dns/checkpoint.hpp; docs/chem.md "Checkpoint and
+    // restart"). Off (every == 0, no restart) = the runner bit for bit: a
+    // checkpoint is taken at the END of a step (after its stats row, profile
+    // and frame) at the first boundary at or past k every, never at tEnd (the
+    // clipped last step), so a resumed job starts a fresh step; the
+    // wall-limit stop and SIGINT stop there too (no forced end-of-run row).
+    CheckpointPolicy ckpt;
 };
 
 // --hold-flame: at every stats row u_in <- S_ema - (x_I - x_I0)/kHoldTau,

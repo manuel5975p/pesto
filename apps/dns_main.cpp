@@ -10,6 +10,7 @@
 // onto the library's geometry sources, initial conditions and runners.
 #include "dns/cli.hpp"
 #include "dns/casegeom.hpp"
+#include "dns/checkpoint.hpp"
 #include "dns/config.hpp"
 #include "dns/flame1d.hpp"
 #include "dns/flow_ic.hpp"
@@ -19,6 +20,7 @@
 #include "dns/geometry.hpp"
 #include "dns/hit_ic.hpp"
 #include "dns/interrupt.hpp"
+#include "dns/lowmach.hpp"
 #include "dns/meshio.hpp"
 #include "dns/meshsdf.hpp"
 #include "dns/ogrid.hpp"
@@ -37,6 +39,7 @@
 #include "dns/units.hpp"
 #include "dns/vtk_writer.hpp"
 #include "dns/walldist.hpp"
+#include "jobs/sha256.hpp"
 
 #if DNS_WITH_GPU
 #include "dns/gpu/device_util.hpp"
@@ -45,6 +48,7 @@
 #include "dns/gpu/runner_channel.hpp"
 #include "dns/gpu/runner_conv.hpp"
 #include "dns/gpu/runner_flame.hpp"
+#include "dns/gpu/runner_lowmach.hpp"
 #include "dns/gpu/runner_fv.hpp"
 #include "dns/gpu/runner_chamber.hpp"
 #include "dns/gpu/runner_rb.hpp"
@@ -1164,18 +1168,233 @@ int runWickCase(const Case& c)
 #endif
 }
 
-int runFlame(const Case& c)
+// Checkpoint / restart facts main gathers for runFlame (dns/checkpoint.hpp):
+// the binary's sha256 (only when a checkpoint flag is given), the job's start
+// (--wall-limit counts from it), and phase 1.5's restart count.
+struct CheckpointContext
 {
-    if (c.chamberMode) return runChamberCase(c);
-    if (c.flameWick) return runWickCase(c);
+    std::string binary;
+    std::chrono::steady_clock::time_point start;
+    long restarts = 0;
+};
+
+// The checkpoint policy of a flame run (both solvers), and its --restart
+// checkpoint read whole (phase 3: the run's INPUT, exit 3) with its grid
+// and species count against the case.
+std::expected<std::optional<Checkpoint>, int>
+readFlameRestart(const Case& c, int nY)
+{
+    if (c.restartPrefix.empty()) return std::optional<Checkpoint>{};
+    const auto& g = c.grid;
+    const std::string path = checkpointPath(c.restartPrefix);
+    auto ck = Checkpoint::read(path);
+    if (!ck) return std::unexpected(die(exitInput, "--restart: " + ck.error()));
+    auto f = checkpointFacts(*ck);
+    if (!f)
+        return std::unexpected(
+            die(exitInput, "--restart: " + path + ": " + f.error()));
+    if (f->nx != g.nx || f->ny != g.ny || f->nz != g.nz || f->nY != nY)
+        return std::unexpected(die(
+            exitInput, std::format("--restart: {} holds a {} x {} x {} grid "
+                                   "with {} species, the case {} x {} x {} "
+                                   "with {}",
+                                   path, f->nx, f->ny, f->nz, f->nY, g.nx,
+                                   g.ny, g.nz, nY)));
+    return std::optional<Checkpoint>(std::move(*ck));
+}
+
+CheckpointPolicy flamePolicy(const Case& c, const CheckpointContext& ckx,
+                             const std::optional<Checkpoint>& restart)
+{
+    CheckpointPolicy policy;
+    policy.every = c.checkpointDt;
+    policy.wallLimit = c.wallLimit;
+    policy.wallStart = ckx.start;
+    policy.prefix = c.outPrefix;
+    policy.binary = ckx.binary;
+    policy.caseText = caseFlagsText(c.caseFlags);
+    policy.restart = restart ? &*restart : nullptr;
+    policy.restarts = ckx.restarts;
+    return policy;
+}
+
+// dns flame --physics lowmach (masterplan real_bunsen S4): the premixed
+// 1D/2D/3D flame on the zero-Mach solver (gpu/runner_lowmach.hpp). Box units
+// Tu = P0 = R = rho_u = 1 (c.flameTu), mu = Pr, lambda = cp, rho D = 1.
+int runLowMachCase(const Case& c, [[maybe_unused]] const CheckpointContext& ckx)
+{
     if (!haveGpu(c))
         return die(exitNoGpu, "no GPU device (dns flame is GPU-only)");
 #if DNS_WITH_GPU
     const auto& g = c.grid;
+    const int nY = c.flamePremix2 ? 2 : 1;
+    auto restart = readFlameRestart(c, nY);
+    if (!restart) return restart.error();
+    const LowMachState ic = lowmachIC(c);
+    FrameGeometry fg = FrameGeometry::centred(g, 1.0);
+    fg.mask.assign(g.size(), 1.0f);
+    // S8: the tube (the one solid map: frames grey it out, the solver's
+    // pressure codes derive from it).
+    std::vector<std::uint8_t> solid = c.lmRim ? lmTubeSolid(c.bunsen, g)
+                                              : std::vector<std::uint8_t>{};
+    for (std::size_t q = 0; q < solid.size(); ++q)
+        if (solid[q]) fg.mask[q] = 0.0f;
+    const double sig = c.flamePremix2 ? c.premix.sigmaAt(c.premixBurnPhi())
+                                      : c.flameModel.sigma;
+    const BunsenGeom& bg = c.bunsen;
+    // S8: the tube for the renderer (box units: rim top x, inner and outer
+    // radius, cell size, wall T/Tu) -- the .json and the web manifest.
+    const std::string rimJson =
+        c.lmRim ? std::format("{{\"x\":{},\"ri\":{},\"ro\":{},\"h\":{},\"T\":{}}}",
+                              bg.xRim, 0.5 * bg.W, 0.5 * bg.W + bg.rimLip, c.h,
+                              bg.tRim)
+                : std::string();
+    RunMeta meta = c.meta;
+    meta.rim = rimJson;
+    // S9: the SI echo (--si-delta-d, --si-sl) for the renderer's real scale.
+    if (c.siDeltaD > 0)
+        meta.si = std::format("{{\"deltaD\":{:.9g},\"SL\":{:.9g}}}", c.siDeltaD, c.siSL);
+    auto out = RunOutput::make(
+        outputConfig(c, std::format("{{\"app\":\"dns\",\"flame\":\"{}\","
+                                    "\"physics\":\"lowmach\",\"model\":\"{}\","
+                                    "\"sigma\":{},\"beta\":{},\"Lambda\":{},"
+                                    "\"mach\":0{}",
+                                    c.flameBunsen ? "bunsen" : "premixed",
+                                    c.flamePremix2 ? "C2" : "C0", sig,
+                                    c.flameModel.beta, c.flameEig.Lambda,
+                                    c.flameBunsen
+                                        ? std::format(
+                                              ",\"nozzle\":\"{}\",\"W\":{},"
+                                              "\"uJet\":{},\"yc\":{},\"zc\":{},"
+                                              "\"dth\":{},\"phi\":{},\"zst\":{}{}{}",
+                                              bg.round ? "round" : "slot", bg.W,
+                                              bg.uJet, bg.yc, bg.zc,
+                                              c.flameEig.dthOverDD,
+                                              c.flamePremix2 ? c.premix.phi : 0.0,
+                                              c.flamePremix2 ? c.premix.zst() : 0.0,
+                                              c.lmOpenY || c.lmInert
+                                                  ? std::format(
+                                                        ",\"laterals\":\"{}\","
+                                                        "\"reaction\":{}",
+                                                        c.lmOpenY ? "open"
+                                                                  : "periodic",
+                                                        c.lmInert ? "false"
+                                                                  : "true")
+                                                  : std::string(),
+                                              c.lmGravity > 0
+                                                  ? std::format(",\"gravity\":{}",
+                                                                c.lmGravity)
+                                                  : std::string()) +
+                                              (c.lmRim ? ",\"rim\":" + rimJson
+                                                       : std::string())
+                                        : std::string())),
+        meta, g, std::move(fg));
+    if (!out) return die(exitOutput, out.error());
+
+    const double Tu = c.flameTu; // 1
+    gpu::LowMachRun rr;
+    gpu::LowMachSetup& sp = rr.sp;
+    // mu = Pr at Tref = Tu: lambda_u = mu cp / Pr = cp (delta_D = 1).
+    sp.tr = Transport::air(c.prandtl, Tu, c.tinfK, c.prandtl, kGammaAir,
+                           kRgasBox, c.sutherland);
+    sp.prGas = Tu; // P0/R, rho_u = 1
+    sp.nY = 1;
+    sp.fuel = 0;
+    sp.lnA = std::log(c.flameEig.Lambda);
+    sp.Ta = c.flameModel.theta() * Tu;
+    sp.qcp = (sig - 1) * Tu; // C0: q = cp (sigma - 1) Tu
+    sp.mIn = c.flameUIn;     // rho_u u_in
+    sp.TIn = Tu;
+    sp.yIn[0] = 1.0;
+    if (c.flamePremix2) {
+        // Model C2 / C2b: the two-reactant step, q per unit fuel = cp Tu
+        // (sigma - 1) s / Y_O1, the burnt premix carried in (--mix-phi).
+        const PartialPremixModel& pm = c.premix;
+        PartialPremixModel burn = pm;
+        burn.phi = c.premixBurnPhi();
+        sp.nY = 2;
+        sp.ox = 1;
+        sp.stoich = pm.s;
+        sp.qcp = Tu * pm.qOverCpTu();
+        sp.yIn[0] = burn.yF1();
+        sp.yIn[1] = burn.yO1();
+        sp.law = c.premixLaw;
+        sp.zS = pm.s;
+        sp.zO2 = pm.yO2;
+        sp.zDen = pm.s * pm.yFrem() + pm.yO2;
+        rr.yFBurnt = burn.phi > 1 ? burn.yFrem() : 0.0;
+        rr.premix2 = true;
+        rr.premix = pm;
+    }
+    if (c.flameBunsen) {
+        // The burner (masterplan real_bunsen S5): the x-lo face per row j + ny
+        // k (lmInflowRow); the scalars are the jet's.
+        rr.bunsen = true;
+        rr.geom = bg;
+        sp.mIn = bg.uJet;
+        // S6: open laterals draw the quiescent room air (T = Tu; air with
+        // --equivalence, else inert); --reaction off = no chemistry.
+        sp.openY = c.lmOpenY;
+        sp.openZ = c.lmOpenZ;
+        sp.ambT = Tu;
+        sp.ambY[0] = 0.0;
+        sp.ambY[1] = c.flamePremix2 ? c.premix.yO2 : 0.0;
+        // S7: gravity along -x against that ambient (rho_a = P0/(R Tu)).
+        sp.gravity = c.lmGravity;
+        if (c.lmInert) sp.lnA = -HUGE_VAL;
+        rr.inert = c.lmInert;
+        // S8: the immersed isothermal tube.
+        rr.rim = c.lmRim;
+        sp.solid = std::move(solid);
+        sp.wallT = Tu * bg.tRim;
+        for (int k = 0; k < g.nz; ++k)
+            for (int j = 0; j < g.ny; ++j) {
+                const LmInflowRow in =
+                    lmInflowRow(c, (j + 0.5) * g.hy, (k + 0.5) * g.hz);
+                sp.rowM.push_back(in.m);
+                sp.rowT.push_back(Tu * in.t);
+                sp.rowY[0].push_back(in.yF);
+                if (c.flamePremix2) sp.rowY[1].push_back(in.yO);
+            }
+    }
+    rr.sigma = sig;
+    rr.uIn = c.flameUIn;
+    rr.dth = c.flameEig.dthOverDD;
+    rr.cfl = c.cfl;
+    rr.chemK = c.lmChemDt;
+    rr.dtCell = c.lmDtCell;
+    rr.tEnd = c.tEnd;
+    rr.dtRecompute = c.dtRecompute;
+    rr.profileDt = c.profileDt;
+    rr.label = flameRunLabel(c);
+    rr.ckpt = flamePolicy(c, ckx, *restart);
+    auto res = gpu::runLowMach(g, ic, rr, *out);
+    if (!res) return die(res.error().code, res.error().message);
+    return reportDone(*res, *out);
+#else
+    return exitNoGpu;
+#endif
+}
+
+int runFlame(const Case& c, [[maybe_unused]] const CheckpointContext& ckx)
+{
+    if (c.chamberMode) return runChamberCase(c);
+    if (c.flameWick) return runWickCase(c);
+    if (c.physics == Physics::LowMach) return runLowMachCase(c, ckx);
+    if (!haveGpu(c))
+        return die(exitNoGpu, "no GPU device (dns flame is GPU-only)");
+#if DNS_WITH_GPU
+    const auto& g = c.grid;
+    // --restart: the whole checkpoint is this run's input (exit 3), read
+    // before any output is touched; phase 1.5 checked its binary and case.
+    auto restart = readFlameRestart(c, c.flameDiffusion || c.flamePremix2 ? 2 : 1);
+    if (!restart) return restart.error();
+    const CheckpointPolicy policy = flamePolicy(c, ckx, *restart);
     CompState host = CompState::zeros(g);
     std::vector<double> rhoY[2];
     if (c.flameDiffusion) diffusionIC(c, host, rhoY);
     else if (c.flameBunsen) bunsenIC(c, host, rhoY[0]);
+    else if (c.flamePremix2) flameIC2(c, host, rhoY);
     else flameIC(c, host, rhoY[0]);
     // --turb: the frozen box (hash-seeded, host FP64), laid on the IC's
     // fresh gas and handed to the runner for the inflow sweep.
@@ -1207,6 +1426,18 @@ int runFlame(const Case& c)
                                  "\"beta\":{},\"Da\":{},\"mach\":{}",
                                  c.diff.s, c.diff.zst(), c.diff.sigma,
                                  c.diff.beta, c.diff.Da, c.mach)
+                   : c.flamePremix2
+                   ? std::format("{{\"app\":\"dns\",\"flame\":\"premixed\","
+                                 "\"model\":\"C2\",\"phi\":{},\"stoich\":{},"
+                                 "\"yO2\":{},\"yF1\":{},\"yO1\":{},"
+                                 "\"yFrem\":{},\"zst\":{},\"sigmaSt\":{},"
+                                 "\"sigma\":{},\"beta\":{},\"Lambda\":{},"
+                                 "\"mach\":{}",
+                                 c.premix.phi, c.premix.s, c.premix.yO2,
+                                 c.premix.yF1(), c.premix.yO1(),
+                                 c.premix.yFrem(), c.premix.zst(),
+                                 c.premix.sigmaSt(), c.flameModel.sigma,
+                                 c.flameModel.beta, c.flameEig.Lambda, c.mach)
                    : std::format("{{\"app\":\"dns\",\"flame\":\"premixed\","
                                  "\"sigma\":{},\"beta\":{},\"Lambda\":{},"
                                  "\"mach\":{}",
@@ -1287,12 +1518,16 @@ int runFlame(const Case& c)
         }
         rr.sp.yInRow[0] = rr.rowY;
         rr.sp.yInRow[1] = rr.rowYO;
+        rr.ckpt = policy;
         auto res = gpu::runFlame(g, host, rhoY, rr, *out);
         if (!res) return die(res.error().code, res.error().message);
         return reportDone(*res, *out);
     }
 
-    const double Tu = c.flameTu, sig = c.flameModel.sigma;
+    const double Tu = c.flameTu;
+    // --mix-phi: the burnt state is that premix's (q stays the jet's).
+    const double sig = c.flamePremix2 ? c.premix.sigmaAt(c.premixBurnPhi())
+                                      : c.flameModel.sigma;
     gpu::FlameRun rr;
     // mu = Pr at Tref = Tu: lambda_u = mu cp / Pr = cp (delta_D = 1).
     rr.tr = Transport::air(c.prandtl, Tu, c.tinfK, c.prandtl, kGammaAir,
@@ -1305,6 +1540,27 @@ int runFlame(const Case& c)
     rr.sp.invPr = 1.0 / c.prandtl;
     rr.sp.openX = true;
     rr.sp.yIn[0] = 1.0;
+    if (c.flamePremix2) {
+        // Model C2: the rich jet on the two-reactant step (kChemCellPass2,
+        // kSpeciesStage2<false, false>); q per unit fuel = cp Tu (sigma - 1)
+        // s/Y_O1, fresh Y_F1, Y_O1 carried in.
+        // Model C2b (--sl-law gri30): the A(phi) law rides the cell pass
+        // (kChemCellPass2Phi) and chemStableDt. --mix-phi: the premix
+        // carried in is the jet diluted with air (lean: all its fuel burns).
+        const PartialPremixModel& pm = c.premix;
+        PartialPremixModel burn = pm;
+        burn.phi = c.premixBurnPhi();
+        rr.sp.nY = 2;
+        rr.sp.ox = 1;
+        rr.sp.stoich = pm.s;
+        rr.sp.q = rr.tr.cp() * Tu * pm.qOverCpTu();
+        rr.sp.yIn[0] = burn.yF1();
+        rr.sp.yIn[1] = burn.yO1();
+        rr.sp.phiRate = c.premixLaw;
+        rr.yFBurnt = burn.phi > 1 ? burn.yFrem() : 0.0;
+        rr.premix2 = true;
+        rr.premix = pm;
+    }
     rr.Tu = Tu;
     rr.sigma = sig;
     rr.uIn = c.flameUIn;
@@ -1373,7 +1629,9 @@ int runFlame(const Case& c)
                     comp[q] *= rr.rowJet[q / std::size_t(rr.turbNbx)];
     }
 
-    auto res = gpu::runFlame(g, host, std::span(rhoY, 1), rr, *out);
+    rr.ckpt = policy;
+    auto res = gpu::runFlame(g, host, std::span(rhoY, c.flamePremix2 ? 2 : 1),
+                             rr, *out);
     if (!res) return die(res.error().code, res.error().message);
     return reportDone(*res, *out);
 #else
@@ -1878,6 +2136,9 @@ int runMesh(const Case& cs)
 
 int main(int argc, char** argv)
 {
+    // --wall-limit counts the whole job, from here.
+    CheckpointContext ckx;
+    ckx.start = std::chrono::steady_clock::now();
     // Before anything allocates or opens a file: a stop signal must unwind
     // through the destructors, not terminate mid-step.
     dns::installInterruptHandler();
@@ -1945,6 +2206,47 @@ int main(int argc, char** argv)
         scene = std::move(*s);
     }
 
+    // Phase 1.5 for checkpoints (the --scene precedent): the binary's
+    // fingerprint, and --restart's checkpoint HEADER (no fields) against this
+    // invocation -- solver, binary, every case-defining flag: a mismatch is
+    // exit 3 by name. Its t feeds validate()'s --tt rule.
+    if (raw->sub == Subcommand::Flame &&
+        (raw->given.contains("--checkpoint-dt") || raw->given.contains("--restart")))
+    {
+        auto h = jobs::sha256File("/proc/self/exe");
+        if (!h) return die(exitInput, "checkpoint: cannot fingerprint the dns "
+                                      "binary: " + h.error());
+        ckx.binary = *h;
+    }
+    if (raw->sub == Subcommand::Flame && raw->given.contains("--restart"))
+    {
+        const std::string path = checkpointPath(raw->restart);
+        auto ck = Checkpoint::read(path, true);
+        if (!ck) return die(exitInput, "--restart: " + ck.error());
+        auto f = checkpointFacts(*ck);
+        if (!f) return die(exitInput, "--restart: " + path + ": " + f.error());
+        // The solver the checkpoint belongs to, per --physics.
+        const char* solver = raw->physics == Physics::LowMach
+                                 ? kLowMachSolverName
+                                 : kFlameCompSolverName;
+        if (f->solver != solver)
+            return die(exitInput, std::format("--restart: {} is a '{}' "
+                                              "checkpoint; this run is {}",
+                                              path, f->solver, solver));
+        if (f->binary != ckx.binary)
+            return die(exitInput,
+                       std::format("--restart: {} was written by a different "
+                                   "dns binary (sha256 {} vs this {}): a "
+                                   "restart reproduces a run only on the "
+                                   "binary that started it",
+                                   path, f->binary, ckx.binary));
+        if (auto d = caseFlagsDiff(f->caseFlags, raw->caseFlags))
+            return die(exitInput,
+                       "--restart: case differs from the checkpoint: " + *d);
+        raw->restartT = f->t;
+        ckx.restarts = f->restarts + 1;
+    }
+
     // Phase 2: validate.
     auto c = validate(*raw);
     if (!c)
@@ -1993,7 +2295,7 @@ int main(int argc, char** argv)
     case Subcommand::Channel: return runChannel(*c);
     case Subcommand::Conv: return runConv(*c);
     case Subcommand::Prop: return runProp(*c);
-    case Subcommand::Flame: return runFlame(*c);
+    case Subcommand::Flame: return runFlame(*c, ckx);
     case Subcommand::Mesh: return runMesh(*c);
     }
     return 1;

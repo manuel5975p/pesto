@@ -627,7 +627,10 @@ Measured gfx1100 via simjob, 2026-10-28.
     printed digits). Moves the σ 2 lesgap / G2b normalisation by ≤ 2e-4
     (below their quoted digits); the C++ shoot itself not probed. The port
     produced a garbage table there before (kept integrating dead lanes in
-    record mode; now stops as dns does).
+    record mode; now stops as dns does). **Cause found and fixed by §72**
+    (2026-10-31): the cold-boundary difficulty — σ 2 β 8 was no eigenvalue
+    of the uncut march at all (Λ ∝ 1/n); with the adaptive cutoff both dns
+    and the port give 503116277.2 (δ_th/δ_D 1.72336), n-converged 4e-8.
 70. **The round-nozzle cone is 27–43% shorter than the ideal cone, cause
     not separated** (found 2026-10-30, `--nozzle round`, docs/chem.md
     "Round-nozzle Bunsen"). Laminar DNS, 4 cells/δ_th: U 5, D 12 tip 21.5
@@ -652,6 +655,397 @@ Measured gfx1100 via simjob, 2026-10-28.
     variant within 2.4% per fuel, tips +4.2 / −0.6 / +8.1%. foam's lInf = box outlet
     pressurized the box ×2 at M 0.2 (fixed with lInf = box/4); foam still
     drifts −2.4% over [200, 240].
+72. **FIXED (2026-10-31, masterplan real_bunsen S1): the P0 oracle's
+    bracket bisected spurious verdicts** (docs/chem.md "The bracket and the
+    cold boundary"). Two defects. (a) Non-monotone "too fast": a shot far
+    above the root collapses onto p* = λqω/(m cp), where RK4 (h J > 2.785)
+    bounced p to a positive cold residual; one such shot on the halving path
+    gave Λ a power of two — σ 6.5 Sutherland 298 K printed Λ 16383.95 (2^14,
+    δ_th/δ_D 5.13; correct 941442.56, 4.378), σ 6.88 42008.4 (45.5;
+    correct 882657.41, 4.507), i.e. CH4's real φ-1.3 σ. 9 (constant λ) + 6
+    (Sutherland) of 401 σ in 2..10 at β 8 were hit, more at other β. Fix:
+    a stiff step (h J > 1; slow shots peak at 2.2e-3) is too fast; a scan
+    of 2^−60..2^20 must show ONE transition (else an error by name); the
+    bisection runs on the shipped [lo, 1]/[1, hi] bracket, so every
+    well-posed Λ is bit for bit (`flame1d` (g); dry-run diff of defaults,
+    bunsen, chamber, diffusion, candle, σ 3, β 6/10, σ 7.5 Sutherland:
+    identical; the bit-identity suite — 1D, Sutherland 1D, 3D planar,
+    bunsen 2D, round 3D, diffusion, candle, chamber, wick — every output
+    byte-identical). (b) The cold-boundary difficulty: where the unburnt
+    rate is not negligible (β 8 σ ≲ 2.6), captured fast shots end with a
+    positive residual and the uncut march drifted as 1/n. Fix: the adaptive
+    cutoff (`kColdCut`); a cut above 1e-4 of the rise is an error by name.
+    **Changes a shipped number**: σ 2 β 8 (the lesgap / G2b DL campaign,
+    §69) Λ 472463262.4 → 503116277.2 (+6.5%), δ_th/δ_D 1.7953 → 1.72336.
+    GPU (15 cells, M 0.01, sliding): old Λ burns at S 0.9747, new 1.0023 —
+    the new Λ is the solver's S_L = 1; those campaigns normalised by their
+    measured grid S_L (their ratios survive), their δ_th-scaled lengths
+    (box, l_t, λ) used 1.7953 (4% off). No other docs row used an affected
+    (σ, β, Sutherland) — the Sutherland rows are σ 5 / 7.5 at 300 K
+    (unchanged), the round real-burner baseline (job 746) σ 7.5 constant
+    (unchanged). Newly REJECTED (were 1/n garbage): β 8 σ ≤ 1.70, β 6 ≤
+    2.20, β 4 ≤ 3.25, β 3 ≤ 4.25, β 2 ≤ 6.20. The numpy port carries the
+    same fix.
+73. **The one-step model cannot match CH4's δ_th/δ_D, nor its rich S_L(φ)
+    trend** (masterplan real_bunsen D1/D4, found 2026-10-31). (a) δ_th/δ_D:
+    model C0 4.51 (σ 6.88 Sutherland), C2 (two-reactant φ 1.3) 4.71; GRI-3.0
+    CH4/air φ 1.3 6.40 (`tests/data/chem/ch4_gri30.csv`; the plan's 8.0
+    was from the starred 0.70 mm / 0.0877 mm). Of Re, Pe and D/δ_th at most
+    two can be real (mapping M1: Pe 1/1.36 of real with C2's 4.71, Pr_eff
+    = ν/(S_L δ_D,model) = 0.52). (b) The C2 model's S_L(φ) at fixed A, q, Ta
+    RISES with φ (0.755 at φ 1.05, 1.174 at 1.6, rel. to 1.3) where GRI-3.0
+    FALLS (1.634, 0.342): the rate ∝ Y_F Y_O starves as Y_F,rem → 0 toward
+    φ 1. The masterplan's D4 ("model and CH4 both burn faster there: right
+    sign") is wrong in sign; the rim's edge flame (leaner mixture) will burn
+    SLOWER than CH4's. **(b) FIXED by model C2b (S1b, 2026-10-31,
+    docs/chem.md "Model C2b")**: ω = A C(ξ) ρ² Y_F Y_O e^(−Ta/T), ln C a
+    clamped cubic spline in the fuel/air mixture fraction ξ (the
+    Shvab–Zeldovich coupling function) on 26 GRI-3.0 nodes φ 0.5–1.7,
+    calibrated by the FP64 oracle (lean branch added), C(jet) = 1;
+    `--sl-law gri30` is the `--equivalence` default (`onestep` keeps the
+    uncorrected step). S_L(φ)/S_L(1.3) = GRI's at the nodes (4e-15),
+    ≤ 0.34% at the held-out rows 0.575–1.575; GPU (`gpu_flame_rich1d_law`,
+    `--mix-phi` 0.7 / 1.05 / 1.2, 15 cells) within 0.4% of the oracle.
+    STILL OPEN: (a) δ_th/δ_D (unchanged: C only scales the rate); T_ad(φ)
+    is the one-step's (−16% at φ 0.6, −6.5% at 1, +10% at 1.6 vs GRI; no
+    variable cp), so σ of a lean edge flame is low; the outer sheet now
+    burns at C(Z_st) = 5.46 × the jet's A (its Da is the law's); and the
+    FP32 coupling-function walk reaches the rate (d ln S/dZ = −7.3 at φ
+    1.3: 1D jet −2.3e-3 vs the uncorrected step at 30 cells, Z up to
+    1 + 4.6e-4).
+74. **Checkpoint / restart built on `runFlame` only; its byte rule rests on
+    one struct** (masterplan real_bunsen S2, 2026-10-31, docs/chem.md
+    "Checkpoint and restart"). `--checkpoint-dt` / `--wall-limit` /
+    `--restart` + `tools/chem/chain.sh`; `gpu_restart_flame` proves the
+    byte rule on premixed 1D (+ junk past a checkpoint), `--equivalence`,
+    bunsen 2D `--pulse` (+ PNG), round 3D, TFLES 3D, candle, `--turb
+    --hold-flame`, a grown `--tt`, SIGINT. OPEN: (a) `--wick` and `--mode
+    chamber` (own runners) are rejected by name, not wired; plain `--mode
+    diffusion` is covered only through the candle case (same runner). (b)
+    `--emit web`/`vtk` are rejected with the flags (the web manifest lives
+    in one process). (c) **K12**: every host variable the loop carries must
+    be a `FlameLoop` member listed in `fields()`; one added outside it is
+    not checkpointed and breaks the byte rule SILENTLY — only the chained
+    test catches it (a new mode or stats column needs a case there). (d) A
+    checkpoint is pinned to the binary's sha256 (exit 3 on any rebuild): a
+    chain must finish on the binary that started it. (e) simjob's timeout
+    (SIGTERM, 10 s grace) writes a checkpoint, but the job reads rc 124 and
+    `chain.sh` stops; continue with `--resume`. (f) The wall-limit stop
+    predicts the next interval from the LAST interval's wall time only
+    (an interval that slows down, e.g. frames starting at `--frame-start`,
+    can still overrun the simjob cap: keep the interval well under T − W).
+75. **Low-Mach pressure solve (masterplan real_bunsen S3, docs/la.md
+    "Separable Poisson"): the FP32 PCG's TRUE residual floors at 1.3e-5 –
+    5e-5 of |b|, and the tube's projection costs ~2x the plan's budget.**
+    `LmPressure` (apertured PCG, spectral preconditioner) on the annulus
+    tube: the recursive residual reaches 1e-6 in 12–16 iterations cold, 6–11
+    warm, but the FP64-measured residual stops at 3.3–3.8x the pure FP32
+    storage floor (residual of float(x_FP64): 3.5e-6 – 1.3e-5), at or below
+    the estimate ε_f32 |A| |x| / |b|; the solution still converges to the
+    FP64 one (max error 4e-7 of max at tol 1e-6, 2.5e-6 at 1e-5, 4e-5 at
+    1e-4). K5 (EOS drift): after the projection div m − D* carries this
+    floor (projected max|div m| / max|div m*| 3e-5 – 9e-5) — mass stays
+    exact (telescoping), the EOS does not; S4 must measure eosErr against
+    it. K6 / cost: at 384 x 176 x 176 one PCG iteration is ~2.9 ms (spectral
+    1.45 + operator 0.45 + Krylov ~1), warm solves 9–11 it = 30–35 ms, i.e.
+    ~100 ms/step for three stages vs the plan's ~45 ms (its "1 + 6
+    iterations x 2.2 ms"). OPEN: the real warm start (extrapolated phi) and
+    tol (1e-5 saves ~2 it/solve) are S4/S8's to measure; deflation of the
+    tube-surface modes or a fused Krylov step are the levers if S8 needs
+    them. Without a solid the solve is one direct spectral pass (1.45 ms).
+76. **FIXED (2026-10-31, S3): `gpu_cutcell2d` failed "w stays zero" with a
+    run-to-run varying error (5.3e-6, 2.3e-6, 4.4e-7) and PCG iteration
+    count (nz 8: 19 vs 12).** The test warm-started `projectCut` from an
+    uninitialised `hipMalloc` phi (`runner_incomp` zeroes it, line 138); a
+    fresh process got different garbage. The test now zeroes phi: w is 0.0
+    exactly, 16 iterations every run. No solver change.
+77. **`amg_setup` fails its wall-time gate under `ctest -j 8`** (found in
+    S6, not caused: no la code touched): "[FAIL] 6M setup (lineRatio 4) <=
+    3 s (3.094201 s)" twice in the host suite at -j 8 (simjob --cpu); alone
+    it passes (9 s total). A timing gate in a parallel suite is
+    load-dependent; OPEN: run it serially (RUN_SERIAL) or gate on a ratio.
+
+### Low-Mach (`--physics lowmach`, docs/chem.md "Low-Mach" / "Low-Mach Bunsen" / "Low-Mach open laterals" / "Low-Mach gravity" / "Low-Mach rim" / "Low-Mach dt rule, real-burner scouts, renderer"; masterplan real_bunsen S4–S9)
+
+LM1. **FIXED (2026-10-31, S4): the FP32 state dropped the preheat zone's
+    sub-ulp increments** — the flame lagged: Shvab–Zeldovich defect growing
+    with the step count (4.8e-5 / 3.3e-4 / 7.7e-4 at 7.5 / 15 / 30 cells),
+    mass off the tally by 3e-5 – 5e-4, S_L −1.2e-3 grid-independent and
+    dt-dependent. ρ and ρY_k are now compensated (Kahan low words,
+    `combineWord2`; kernels read hi): SZ ≤ 1.4e-6, S_L dt-independent to
+    1e-6, Z exact to 2e-7 (K15: the compressible walk is 1.7e-4). OPEN: m
+    and p are plain; in 1D m is constraint-determined, but the ROTATIONAL
+    part of m in 2D/3D accumulates in plain FP32 — measure on the S5 jet
+    (a vorticity budget) before trusting long 3D runs.
+LM2. **The dynamic pressure carries an FP32 floor ∝ 1/dt.** The stage
+    targets D read the ulp-quantized T through the diffusion term (k δT/h²)
+    and the multiplier p reads them over cr: the p jump's row rms is 0.17% /
+    1.0% / 6.5% of the jump at 7.5 / 15 / 30 cells (white in time, not
+    acoustic); the window mean is within 1.1e-3 of ρ_u S² (σ − 1). The
+    plan's "rms ≤ 1e-6" is not an FP32 number. No effect on the flow found
+    (1D: m constraint-determined; multi-D: a gradient, removed by the next
+    projection). Lever if p itself is needed: T differences from the
+    compensated words in R_T. eosErr 1.0–1.4e-7, divErr/max|D| ≤ 1e-5.
+LM3. **Observed order 1.66, not the plan's 1.8**: the MC limiter sets T's
+    face value (shared with the species so H = T + (q/cp) Y_F rides one
+    formula), and the heat release reads T. The Richardson limit 1.000121
+    agrees with the compressible ladder's M → 0 limit 1.000079 to 4e-5; at
+    15 cells the two schemes' errors have opposite signs (−0.17% vs +0.34%),
+    so the plan's "within 1.5e-3 at 15 cells" is not met (the converged
+    numbers are the comparison: `gpu_lowmach_1d`).
+LM4. **K3 (the T predictor rides m^(s), the species m^(s+1)) is O(dt²):**
+    SZ 8.6e-7 at 15 cells (dt 5.4e-4) but 2.5e-4 on the M1 grid (4 cells,
+    dt 1.4e-2). The real-Bunsen runs (S9/S10) must report the SZ column;
+    the fallback is a second predictor-corrector pass (2× projections).
+LM5. **K1 resolved without S4b**: explicit chemistry with the cp-form
+    Jacobian binds 1.43× below diffusion at K 0.5 on the M1 grid and not at
+    K 1 (S moves 3.1e-5); the default `--chem-dt` is 1. Point-implicit
+    chemistry is not built; re-check if a finer M2 grid or a stiffer rate
+    makes chemistry bind.
+LM6. **What S4–S8 do not have** (rejected by name): the rim off the
+    low-Mach burner (S8's `--rim`; the bunsen is S5's, open laterals S6's,
+    gravity S7's -- `--gravity` on the burner only, not the planar flame);
+    `--pulse` on the
+    low-Mach burner; `--mach`, `--nscbc-*` (no NSCBC, no sink);
+    LES/TFLES/`--turb`; with PERIODIC laterals the outflow's BACKFLOW
+    still carries the cell's own scalars (S6's ambient backflow +
+    stabilization exist only with `--laterals open`, where an ambient is
+    defined); the tangential inflow is no-slip (antimirror). ny, nz must be 7-smooth; nx
+    is rounded up downstream. dns-ui maps physics 0/1 only (LowMach = 2
+    never reaches the editor; this build has no UI, `--check` not run).
+LM7. **Cost** (3D planar, 128² × ~210, 8 cells/δ_th): 2.87 ns/cell-step vs
+    the compressible's 2.33 at M 0.02, but 526 vs 1536 steps per τ — 2.3×
+    cheaper per flame time at M 0.02, ~18× at the true Mach (1D 15 cells,
+    10 τ: compressible 480k steps / 95 s, drifting −4e-4 per 2.5 τ in FP32;
+    low-Mach ~18.5k steps / ~5 s). **S5: 3D diffusion-bound runs now take
+    1.5× the steps** (the 3D positivity bound 1/6 h²/D, LM10), ~790
+    steps per τ for that case (not re-measured). Burner (S5): 2D 113k cells
+    0.51–0.68 ms/step (4.5–6 ns/cell-step, launch-bound small grid; dt every
+    step + the stats rows' host passes), round 3D 573k 2.7 ms (4.7 ns), 4.6M
+    18.4 ms (4.0 ns: C2 + flame index + per-step dt over S4's 2.87). The
+    bunsen stats row downloads ~10 full fields and loops them on the host in
+    FP64: at the final 11.9M cells budget ~0.3 s per row (S9: measure, or
+    raise the stats cadence).
+LM8. **FIXED (2026-10-31, S5): T rode the shared limiter WITHOUT voting**,
+    so where no species votes (every |d2| < 2^-24) its face value was θ = 2
+    = the DOWNWIND value. In the `--equivalence` jet core (Y_F 0.07: ulp 7e-9
+    below the vote threshold) an odd-even T wiggle grew from rounding (T
+    0.47 Tu at x 52 δ_D, t 2.4) and diverged the 2D partially premixed
+    burner. T now votes (one θ: H still rides one linear face formula; T
+    itself TVD). 1D ladder unchanged to the printed digits; the rh p jump's
+    window mean −1.1e-3 → −3.0e-3 of ρ_u S² (σ − 1) (gate widened to 4e-3:
+    the burnt gas' ulp noise now first-order at its extrema).
+LM9. **G2a: the low-Mach cone agrees with reactingFoam, the compressible
+    solver sits 2–3% off both** (docs/chem.md "Low-Mach Bunsen"): low-Mach
+    vs compressible M → 0 (M 0.01/0.02 T-held etaIn 1000, M²): xTip −1.9%,
+    sinRatio −2.6% (the plan's 1% gate NOT met; the test gates 3%), SLflank
+    +0.16%, mFlank +0.04%; low-Mach vs foam (identical 392 × 288 mesh):
+    xTip +0.48%, sinRatio −0.44%, θ field L2 4.6e-3 (compressible 0.022).
+    Not the sink band (`--nscbc-sink 0`: 44.69 / 1.0484), not the inflow's
+    fuel flux (compressible 92.98 = foam's burn; low-Mach 92.44). OPEN:
+    which compressible ingredient (LODI inflow row, Mach) tilts its flank;
+    the compressible G2a's own foam gap (+2.1% default, +4.2% T-held) was
+    already recorded (§66–68).
+LM10. **SETTLED (2026-11-01, S9): `--dt-rule cell`, the burner's default**
+    (docs/chem.md "Low-Mach dt rule ..."): dt also ≤ 1/max_c (2 C_c + D_c),
+    the explicit transport step's per-cell positivity bound (MC ×2 on the
+    convective rate, the cell's own diffusivity), K = 1. Bounded (0 hits,
+    Tmax ≤ σ_st after the IC transient) on every case below that the old
+    default was not (2D rim slot U 6 / 10, 3D pilot round g 0 and real g)
+    and on the half-scale real burner; 1.2× (3D) – 1.5× (2D) the old
+    default's steps, 1.3× fewer than `--chem-dt 0.5`; K 1.5 is NOT bounded
+    (1.6e3 / 1.9e4 hits); chemistry in the sum costs 1.5× and bounds
+    nothing more. The planar flame keeps `--dt-rule bounds` (S4 bit for
+    bit); `--dt-rule bounds` on the burner = the S8 binary byte for byte.
+    History: **4 cells/δ_th 3D is not bounded at the default dt** (S5, round
+    nozzle, C2 + pilots): explicit convection + diffusion positivity. At the
+    diffusion-bound dt 0.0091 the inner tip overshoots T (7.6–8.1 vs σ_st
+    6.98) and undershoots Y_O (−5e-5 .. −7e-3, 2e4–5e4 cells); `--chem-dt
+    0.5` (dt 0.0055) or `--cfl 0.3` is bounded (Tmax 6.95, 0 hits); 8 cells
+    is bounded at the defaults once the 3D diffusive coefficient is 1/6 (at
+    1/4, Σ_a 2D dt/h² = 1.5: T 8.6 at 8 cells). The principled bound is the
+    per-cell positivity dt ≤ 1/(2 Σ|u_a|/h_a + Σ 2D/h_a² (+ J)) (MC needs
+    2× the upwind CFL); not built (it would move every S4 number). **The
+    final case is 3D at 4 cells: S9 must pick the dt rule (or `--chem-dt
+    0.5`) before the half-scale scout.** S6 data point (open round, D 6,
+    U 3, pilots 1.5 at U, 4 cells, default `--chem-dt 1`): dt 0.0071 is
+    CONVECTIVE-bound (cfl 0.8; dtDiff 0.0097, dtChem 0.0116) and Y_O
+    undershoots in up to 11156 cells (T stays ≤ σ_st); `--chem-dt 0.5`
+    (dt 0.0055) has 0 hits — at U 3 it is the MC convective positivity,
+    not diffusion, that the default violates. S7 data point: under
+    gravity the same burner at `--chem-dt 0.5` is CONVECTIVE-bound below
+    the chemistry dt (dt 0.0032 at real g, 0.0038 at 4x, vs dtChem
+    0.0058; the buoyant plume is faster than the jet) and bounded (0 hits,
+    t 200): S9's dt rule must include the plume's speed. **S8 data (the
+    rim, no pilot)**: 2D rich slot U 10, 4 cells: default (cfl 0.8) Tmax
+    8.42 (σ_st 6.98), 2.0e4 hits, Y_F min −9e-3; `--cfl 0.4` 7.27 / 1.9e4 /
+    −9.5e-6; `--cfl 0.2` 7.18 / 18 / −2.9e-7; `--chem-dt 0.5` 7.20 / **0** /
+    −2.4e-7 (the hits sit in the products near the outflow, not at the
+    rim); every U ≥ 6 overshoots at the default (U 6: Tmax 7.14, 6390
+    hits; `--chem-dt 0.5` 7.06, 0 -- `gpu_lowmach_rim_anchor` runs it), U ≤
+    4 undershoots ≤ 4e-5 only; 8 cells: 0 hits at the defaults. 3D round tube (D 6, U 4, open,
+    real g): bounded at the DEFAULT dt (0 hits, Tmax 6.973, dt 0.0092
+    diffusion-bound) and at `--chem-dt 0.5`. So `--chem-dt 0.5` is the
+    measured safe rule at 4 cells in both; the 2D slot at U ≥ 6 needs it.
+LM11. **The partially premixed outer cone is long**: Z_st 0.78 sounds close
+    to the jet, but the products of a W 12 / U 5 / 3 δ_th-pilot slot need
+    ~(W/2 + pilot)² U/D to dilute to it (~180 δ_th): open at 45 δ_th, still
+    growing at 410 δ_D in a 424 δ_D box. `gpu_lowmach_rich2d` uses W 4, U 3,
+    pilots 1.5 (outer tip 80 δ_D, closed, steady). The round nozzle closes
+    faster (radial dilution); S9's half-scale scout must check xTipOut fits.
+    preFrac 0.727 (2D), not 1/φ = 0.769: the base's triple flame and the
+    cone's lean-mixing edge carry ξ < 0 (the index's split, not a
+    leak: burnRatio 0.99987). **S6: open laterals do not fix it in 2D**
+    (LM13); the round nozzle's outer tip is box-independent at ~42 δ_D
+    (D 6 δ_th, U 3: periodic 41.84, open 42.57 / 41.99 at clearance 3 / 6).
+LM13. **2D partially premixed slot: open laterals LENGTHEN or OPEN the
+    outer cone** (S6, docs/chem.md "Low-Mach open laterals"). rich2d's
+    burner, window [150, 200]: periodic clearance 6 closes at 80.09 δ_D,
+    open clearance 6 at 90.47, open 3 / 2 never (NaN); room air (coflow
+    0) never; W 12 / U 5 / pilots 3 never (238 of mdotIn 348 leaves
+    sideways). The flame's dilatation pushes gas OUT through the
+    laterals (net mdotLat −27 … −238; at clearance ≤ 3 every lateral face
+    flows out) and a planar jet entrains weakly, so the coflow air the
+    periodic box held beside the jet leaves. The periodic box's closure is
+    a confinement artefact too (the coflow air is forced to mix). OPEN:
+    the real burner's dilution is buoyancy-driven (S7: the plume
+    accelerates and entrains); the slot comparison is not the real case's
+    question — the 3D round is (it closes regardless, LM11). Also: an open
+    box needs t ~ 100 τ for the starting-jet head to leave (at t 40 the
+    box drained mass at −115/τ, every column moving). **S7 (gravity,
+    docs/chem.md "Low-Mach gravity", `runs/s7/lm13.sh`): REAL g (0.0241
+    S_L²/δ_D, Fr 19.8) does NOT close what the open box left open** —
+    clearance 6: 90.47 → 82.40 (periodic 80.09), the lateral outflow ×2.7
+    smaller (−32.1 → −11.8); clearance 3 / 2 and W 12: still open. Only
+    4–12× real g turns the laterals into a net INflow (+83 … +122), closes
+    the 2D cone (62–74 δ_D) and makes it FLICKER (xTipOut swings 17–50 δ_D,
+    periods 18–36 τ). 3D round: 42.57 → 42.15 at real g (steady to t 200),
+    41.46 at 4×, no flicker. OPEN for S9: the real burner (D 16 δ_th, U 6.5)
+    is ~2.7× larger, so buoyancy over its box (u_ff ∝ sqrt(g L)) matters
+    more there than in these scouts; the 2D slot stays a poor proxy.
+LM14. **Bickley at Re 30 sits 1–9% off the similarity solution; at Re 60
+    half of that** (S6, `gpu_lowmach_bickley` runs Re 60): u_c^-3 slope
+    0.989 / 0.984, b^1.5 0.954 / 0.976, Qj³ 0.908 / 0.967, dQj/dx
+    exponent −0.767 / −0.680 (Re 30 / 60) — the O(1/Re) higher-order
+    boundary-layer terms. J is NOT conserved, J + P is (0.55% / 0.36%
+    along the box): a wall-issued jet hands momentum flux to the wall
+    suction of its entrainment flow (Schneider 1985), P(x-lo) = −0.25 /
+    −0.12 J_in; Bickley holds with K = the far-field J. Not measured: the
+    round jet's Schlichting solution (the plan did not ask; S9's round
+    scouts could use the same jet profiles).
+LM12. **The burner IC is not the projected flow**: the first projection
+    sets velocities up to ~2× the IC's in the products; Y_F undershoots to
+    −8e-4 for t < 5 τ on G2a (clean from 5.2), and mass vs the FP64 tally
+    carries a constant −4.7e-8 (2D G2a) / −1.2e-7 (rich) from the first
+    rows (the adjustment's FP32 divergence rounding; flat afterwards).
+    `--dt-recompute` defaults to 1 on the burner (16 diverged the 4-cell
+    partially premixed slot within 50 steps). LM1's vorticity budget is not
+    measured; the G2a cone is steady to 1e-5 over [20, 25] (no visible drift
+    from the plain-FP32 rotational m on 16k steps).
+LM15. **Candle cross-check: the plan's gate (low-Mach tip within 5% of the
+    compressible candle's 10.79 l) is NOT met — −34.8%** (S7,
+    `gpu_lowmach_candle`, docs/chem.md "Low-Mach gravity"). Low-Mach tip
+    7.029 (steady), burn 0.887; compressible default 10.785; its D10
+    variant (`--nscbc-tinflow --nscbc-etain 1000`) 8.031 (unsteady 7.36 –
+    8.33), burn 1.037. Per unit burned fuel 7.92 vs 7.74 (+2.3%, the test's
+    gate). At Pe = 1 the length follows the fuel each INFLOW passes: the
+    low-Mach face's convective nominal is 0.405 and Fick through the face
+    carries 54% of what burns (the Burke–Schumann sheet sits on the exit
+    plane; first-order face gradient over h/2 — grid-dependent, not
+    measured on a ladder); the compressible LODI row overshoots (§68). At g
+    0 the gap is larger: low-Mach 10.41 vs compressible default 25.31
+    (fuelIn 1.105). Compressible-side, found, not investigated: the candle's
+    fuel budget does not close (burnRatio 1.12 at etaIn 1000, 1.03
+    default) and zMax reads 0.851953 constant in both variants, above the
+    rows' max Z 0.772 (a maximum-principle violation somewhere in the
+    pinned row / band). OPEN: which inflow is right at Pe 1 needs the foam
+    candle twin (G3b, built, not run) or a face-gradient ladder.
+LM16. **Gravity is the S7 `Grav` instantiation only; no buoyancy in T**
+    (by design: P0 constant, no pressure work; the compressible E term −g
+    m_x is O(M²)). The face density is the one the face velocity reads
+    (`rhoX`), so a backflow face at x-hi buoys as ambient (0). With
+    PERIODIC laterals the ambient ρ_a is still the Tu room air (warned: a
+    lattice of plumes; a burnt coflow is then buoyant everywhere). Not
+    built: gravity on the planar flame (`--mode premixed`), a tilted g, a
+    stratified ambient.
+LM17. **The rim is a STAIRCASE, not the plan's sub-cell ghost view** (S8,
+    docs/chem.md "Low-Mach rim"): a cell is solid when its centre is in the
+    wall (`lmTubeSolid`), every MAC face touching it is closed (m = 0, the
+    pressure codes), no-slip by the antimirror of the closed tangential
+    neighbour, isothermal by the face conduction ρD(T_w)(T_c − T_w)/(h/2).
+    Exact for grid-aligned walls (the slot's lips: the developed channel
+    holds to 6.4e-7 U, dp/dx = the discrete curvature to 7e-6, wall shear
+    = −dp/dx W/2 to 1e-6; the linear conduction profile to 2.4e-7). The
+    ROUND tube's circle is a staircase: first-order wall position, its
+    Poiseuille rows (analytic, renormalized to the staircase area) are not
+    the scheme's steady state and re-develop in the tube. OPEN for S9: the
+    final tube is 57 cells across (wall-position error ≤ h/2 = 0.9% of
+    R_i); a sub-cell isothermal/no-slip ghost view (gpu/ghostfill's image
+    rule on MAC faces + a cell-centred T instantiation) if the 3D base or
+    qRim moves with the staircase phase (shift the axis by h/2 and
+    compare). Not covered: the stratified column with a tube in it (S7's
+    note) -- the rest case is trivially exact; a tilted/stratified test
+    would need a T_w matching the column.
+LM18. **The cold rim anchors the model's rich φ 1.3 slot at EVERY admissible
+    jet speed** (S8, `runs/s8/map`, 2D, M1 mapping, W 14, lip 1.4, open,
+    tt 40): U 1.5 … 20 at 4 cells all anchored over the lip, stand-off
+    0.62–0.87 δ_th (4 cells; the base row is a cell centre) → 0.69 at 8
+    cells (U 6) = 0.42 mm at M1; no flash-back at U 1.5 (the validator's
+    floor), no blow-off at U 20 (cones above U 10 still within their first
+    flow-through at t 40: the BASE settles in ~15 τ). `--rim-temp 1.5`
+    moves the base < 1 cell (rBase 35.0 vs 37.0) and halves qRim. The
+    limits are the MODEL's (one-step quench at Pe 0.6×, D1/K7) -- not a
+    CH4 flash-back/blow-off map. OPEN: U < 1.5 (validator), longer runs at
+    U ≥ 10, 3D limits; preFrac 0.92–0.98 in 2D (outer cone open, LM13); in
+    3D round 0.7998.
+LM19. **The apertured PCG costs 2.5× the direct path at the final grid**
+    (S8): 392 × 180 × 180 with the rim 171 ms/step vs 69 with pilots (direct
+    solve), pcgIt 6–14 per stage solve warm (≤ 15 everywhere measured; 13
+    cold), 3D 389k cells 7.4 ms/step (launch-bound). Section 5 at 100 τ =
+    11k–20k steps ≈ 1900–3400 s (2 simjobs). Levers (not built): `pcgTol`
+    1e-5 (S3: −2 it/solve; an API knob, no flag), deflation of the tube
+    modes, a fused Krylov step.
+LM20. **The 2D rim slot's IC transient leaves the bounds for t < 10–15 τ,
+    at ANY dt** (S9, `runs/s9/dt`): T up to 7.2 (σ_st 6.977) and Y_O above
+    the air's (Z down to −1.2e-2) with the cell rule, `--chem-dt 0.5`,
+    `--cfl 0.2` and at dt 0.0037 alike; both return inside the bounds by t
+    15–20 and stay (yHits counts only Y outside [−1e-6, 1 + 1e-6], so Y_O
+    > Y_O2 is not a hit: watch zMin). The 3D round burner shows it 30× weaker
+    (scout A: Tmax 7.013 at t 1.7, Z ≥ −1.8e-7). Cause not isolated: the
+    unprojected IC (LM12) and its Burke–Schumann products column against
+    the air. Harmless for the S10 frames (t ≥ 130); OPEN if an early-time
+    field is ever quoted.
+LM21. **The real burner's outer cone is ~4× the half-scale one: the plan's
+    62 mm box is too short** (S9 scouts, docs/chem.md "Low-Mach dt rule,
+    real-burner scouts, renderer"). Half scale (D 5 mm, U 6.5, 1.5 D half
+    box, tt 160): inner tip 19.31 δ_th above the rim (11.9 mm), outer 39.88
+    (24.7 mm). The inner cone scales with D at fixed U, the outer with the
+    jet's volume flux (Roper L_f ∝ Q): full scale ~39 δ_th (24 mm) and
+    ~160 δ_th (~99 mm) -- section 5's 62 mm (100 δ_th) would cut the outer
+    cone; S10 runs --length 200 (124 mm, 840 × 196 × 196 = 32.3M cells).
+    **The lateral box biases the outer tip** (K10): 2 D vs 1.5 D half box
+    −3.7% over [140, 160] (−5.0% over [120, 160]) while the 2 D box is still
+    swinging ±3% at t 160; inner cone, base, preFrac ≤ 0.1%. Above the
+    plan's 3% gate; S10 keeps 1.5 D (2 D doubles the case to 61M cells, ~19
+    jobs, and does not settle in the same time) and quotes the outer tip as
+    1.5 D-box value with a −4 ± 1% box bias. OPEN: the converged box
+    dependence (a 2.5 D scout, tt ≥ 250), Pe 0.74× real (D1) shortening the
+    model's outer cone vs CH4's.
+LM22. **The outer tip's slow transient** (S9 scouts): after the starting
+    head the outer tip overshoots (+5% at t 35), dips (−7% at 48) and
+    settles over ~100 τ at half scale, phase-locked to a box-scale lateral
+    mass-flux swing (mdotLat ±5e4 → ±3e3, period ~30 τ); the inner cone and
+    the base settle by t 15. Full scale (2× the box, 4× the outer cone) is
+    expected ~2× slower: S10 runs tt 160 with frames from t 130; its
+    xTipOut column decides whether the clip is the settled burner (a
+    drifting tip is reported, not hidden).
+LM23. **`--emit volume` cannot be restricted to channels**: the low-Mach
+    burner writes temp, fuel, oxid, omega, findex, speed every frame; the
+    renderer reads omega + findex only. S10 at 840 × 196 × 196 (32.3M
+    cells, 129 MB per channel-frame) × 121 frames = 94 GB, of which 31 GB
+    the renderer needs; the rest serves `flame_dnsvid` / diagnostics or is
+    deleted after. Not built: a `--frame-fields` selector (a viewer-format
+    question, docs/viewer-format.md).
 
 ### 3D premixed in turbulence (`--nz`, `--turb`, docs/chem.md "3D and turbulence")
 

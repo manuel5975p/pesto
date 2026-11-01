@@ -10,9 +10,12 @@
 
 #include "dns/gpu/device_buffer.hpp"
 #include "dns/gpu/index.hpp"
+#include "dns/septransform.hpp"
 
+#include <cstdint>
 #include <expected>
 #include <memory>
+#include <string>
 
 namespace dns::gpu {
 
@@ -53,6 +56,57 @@ public:
 private:
     struct Impl;
     explicit DevicePoissonSolver(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+};
+
+// A separable box: nx x ny x nz cells, i fastest, NO ghost ring (the boundary
+// sits on the box faces), uniform spacing per axis, one boundary kind per axis
+// (dns/septransform.hpp). nz == 1 is the 2D restriction: z carries no stencil
+// and must be SepKind::Periodic (the wrap cancels it, CLAUDE.md "2D").
+struct SepBox
+{
+    int nx = 0, ny = 0, nz = 1;
+    double hx = 1, hy = 1, hz = 1;
+    SepKind kx = SepKind::Periodic, ky = SepKind::Periodic, kz = SepKind::Periodic;
+
+    std::size_t size() const { return std::size_t(nx) * ny * nz; }
+    // Every non-degenerate axis owns a zero mode: L is singular (constants).
+    bool singular() const
+    {
+        return sepHasZeroMode(kx) && sepHasZeroMode(ky) && (nz == 1 || sepHasZeroMode(kz));
+    }
+};
+
+// Exact inverse of the 7-point FD Laplacian on a SepBox (masterplan
+// real_bunsen S3, docs/la.md "Separable Poisson"): per axis DHT (Periodic),
+// DCT-II (NN), DST-II (DD) or DCT-IV (ND), each one batched complex hipFFT
+// pass with pre/post kernels from dns/septransform.hpp; FP32 fields, FP64
+// eigenvalues and twiddles rounded once. DevicePoissonSolver is untouched.
+class SeparablePoisson
+{
+public:
+    // Plans + tables for the box. Error by name: nx or ny < 2, nz < 1, nz == 1
+    // with a non-periodic z, an odd ND axis, h <= 0, a device / hipFFT failure.
+    static std::expected<SeparablePoisson, std::string> make(const SepBox& box);
+
+    SeparablePoisson(SeparablePoisson&&) noexcept;
+    SeparablePoisson& operator=(SeparablePoisson&&) noexcept;
+    ~SeparablePoisson();
+
+    // L p = scale rhs. keep (optional, per cell): rhs reads 0 where keep == 0
+    // and p is written 0 there (the apertured preconditioner's fluid mask).
+    // Singular box: the zero mode is dropped (rhs's mean ignored, p zero-mean).
+    // Pre: device arrays of box().size(); rhs may alias p. Deterministic.
+    void solve(const Real* rhs, Real* p, Real scale = Real(1),
+               const std::uint8_t* keep = nullptr);
+
+    // First failure (launch, FFT) of any solve so far; sticky.
+    hipError_t status() const;
+    const SepBox& box() const;
+
+private:
+    struct Impl;
+    explicit SeparablePoisson(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
 };
 

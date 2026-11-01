@@ -974,7 +974,8 @@ void DeviceComp::chemCellPass(const DeviceCompState& s)
         return;
     }
     species::cellPass(g_, s, T_.data(), Real(sp_.lnA), Real(sp_.Ta), sp_.fuel,
-                      sp_.ox, Y, omega_.data(), sp_.tflesEoF);
+                      sp_.ox, Y, omega_.data(), sp_.tflesEoF,
+                      sp_.phiRate.n > 0 ? &sp_.phiRate : nullptr);
 }
 
 void DeviceComp::updateChem(const DeviceCompState& s)
@@ -1022,6 +1023,8 @@ std::expected<void, hipError_t> DeviceComp::enableSpecies(const SpeciesSetup& s)
     // instantiations exist only there).
     assert(!(les() || s.tflesFE) || (s.ox < 0 && !s.solid));
     assert(!s.tflesFE == !s.tflesEoF && !s.tflesFE == !s.tflesOm);
+    // The C2b law: the plain two-reactant cell pass only (its own kernel).
+    assert(s.phiRate.n == 0 || (s.ox >= 0 && s.soot < 0 && s.phiRate.n >= 2));
     const std::size_t n = g_.size();
     for (int k = 0; k < s.nY; ++k) {
         auto b = DeviceScalar::make(n);

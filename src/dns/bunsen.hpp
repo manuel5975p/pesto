@@ -31,6 +31,14 @@ struct BunsenGeom
     // periodic like y. false = the slot (r = |y - yc|, z-invariant).
     bool round = false;
     double zc = 0;
+    // The low-Mach tube rim (masterplan real_bunsen S8, --rim; dns/lowmach.hpp
+    // lmTubeSdf): a wall of thickness rimLip around the jet (inner radius W/2,
+    // outer W/2 + rimLip; the slot's two lips at |y - yc|), standing on the
+    // inflow face up to x = xRim, at T/Tu = tRim. rimLip 0 = no tube.
+    double rimLip = 0;
+    double xRim = 0;
+    double tRim = 1;
+    double rimScale = 1; // the Poiseuille rows' normalization (lmPoiseuilleScale)
 };
 
 // The x-lo inflow state at height y: speed u, temperature ratio t = T/Tu,

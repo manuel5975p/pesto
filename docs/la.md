@@ -464,3 +464,94 @@ per-iteration cost (5.0 ms/it on B_G1s at 1e-8: 90 ms / 18).
 - FP64 defect correction around an FP32 solve (a composition the caller owns).
 - `strongLines` seeded from wall faces (graph weights only).
 - hipGraph capture; multi-GPU.
+
+## Separable Poisson + the apertured low-Mach PCG (`plans/real_bunsen` S3)
+
+The pressure library of the low-Mach solver (masterplan real_bunsen D9). Not
+part of the sparse-matrix layer: a direct spectral solve on a uniform box, and
+a matrix-free PCG on `Krylov<float>` around it. `DevicePoissonSolver` /
+`PoissonBc` (gpu/poisson.hip) are untouched.
+
+| file | content |
+|---|---|
+| `dns/septransform.hpp` | `SepKind`, eigenpairs (`sepTheta`, `sepEigen`, `sepBasis`, `sepNorm`), the per-element pre/post steps of every fast transform and the two-lines-per-FFT packing (`sepPack`, `sepSplit`, `sepJoin`); host + device, ONE definition |
+| `gpu/poisson.hpp`, `gpu/poisson_sep.hip` | `SepBox`, `SeparablePoisson` (a new TU: poisson.hip is byte-unchanged) |
+| `gpu/lm_poisson.{hpp,hip}` | `LmPressure`: face codes (`kLmFace*`, `kLmSolid`), `apply` (float / double), `solve` (direct or PCG) |
+
+**Box.** nx × ny × nz cells, x fastest, NO ghost ring: the boundary sits on
+the box faces. One kind per axis, the 2nd-order 7-point operator with a ghost
+rule per face:
+
+| kind | lo / hi face | transform | eigenvalue of −L (θ_k) | FFT length |
+|---|---|---|---|---|
+| Periodic | wrap | DHT (cas) | 2πk/n | n (two lines packed) |
+| NN | Neumann / Neumann | DCT-II (Makhoul) | πk/n | n (packed) |
+| DD | p = 0 / p = 0 | DST-II = DCT-II of (−1)^j x, reversed | π(k+1)/n | n (packed) |
+| ND | Neumann / p = 0 | DCT-IV, n EVEN | π(k+½)/n | n/2 |
+
+λ_k = (2 sin(θ_k/2)/h)² in FP64, rounded once. nz == 1 is the 2D restriction
+(z untransformed, its kind must be Periodic — anything else is an error by
+name, as is an odd ND axis). Every non-ND axis packs two real lines into one
+complex FFT (RealIn: FFT(a + ib), split by conjugate symmetry; RealOut:
+Makhoul's inverse spectra are Hermitian, so FFT(Va + iVb) = va + ivb). Lines
+pair along y on the x pass, along x on the y and z passes — NEVER along z, so a
+z-extruded box pairs exactly the 2D lines and solves bit for bit like the 2D
+box per plane. The spectral scale is fused into the last forward post; the
+singular box (every axis Periodic/NN) drops the zero mode (zero-mean p).
+`solve(rhs, p, scale, keep)`: L p = scale rhs, keep-masked in the first pre
+and the last post (the PCG preconditioner's fluid restriction); rhs may alias p.
+
+**LmPressure.** `make(box, solid)`: a face couples two cells iff both are
+fluid (interior or periodic wrap face); boundary faces follow the kind
+(Neumann 0, Dirichlet 2 x_c/h²). A = −L_ap on fluid rows, identity on solid
+rows (SPD); b = −rhs on fluid, 0 on solid; M = −(box spectral solve) restricted
+to the fluid cells, so solid entries never leave 0. Stop: recursive |r| ≤ tol
+|b| (tol relative to the RHS, so a warm start pays only for its defect).
+Rejected by name: a solid with no Dirichlet face, and fluid cells enclosed by
+solid away from every Dirichlet face (host flood fill: phi undetermined). No
+solid: one direct spectral solve (bitwise `SeparablePoisson`). The face codes
+are THE face-open definition the low-Mach flux kernels must read.
+
+**Gates (gfx1100, HIP, simjob 784–799).** `poisson_sep` (host, 1 s): every
+basis vector an eigenvector to 6e-15 of λ_max, fast vs direct sums ≤ 1.5e-15
+of Σ|x| (packed vs plain 3e-16), separable vs dense LU ≤ 2.6e-14 for all 64
+kind triples on 6×8×10 (and 5×7×9, 7×6×5, 9×4×6, 2D). `gpu_poisson_sep` (4 s):
+every kind triple on 24×20×16, 18×15×9, 8×6×12, 24×20×1, 16×9×1 vs the host
+FP64 solve of the same float rhs ≤ 6.2e-7 of max (gate 1e-6), manufactured
+smooth solutions ≤ 4.6e-6 (1e-5); every eigenmode of four 8×6×4 boxes:
+device λ to 3.9e-7; nz 1 vs nz 8 extruded BITWISE per plane; reruns, a second
+instance, in-place solves and keep/scale byte-identical. `gpu_poisson_apert`
+(4 s): annulus tube (r 16–20 cells, rim 24) on the x-lo face of 64×96×96, x
+ND, y/z Periodic or DD, plus a 2D slot 128×96:
+
+| case | cold its (tol 1e-6) | warm 1e-2 / 1e-3 rhs change | projected max\|div m\|/max\|div m*\| | TRUE residual (FP64) at tol 1e-6 | storage floor | max\|x − x64\| |
+|---|---|---|---|---|---|---|
+| 64×96×96 ND/P/P | 16 | 11 / 9 | 9.3e-5 | 5.0e-5 | 1.3e-5 | 4.5e-7 |
+| 64×96×96 ND/DD/DD | 15 | 11 / 9 | 3.6e-5 | 1.3e-5 | 3.5e-6 | 3.1e-7 |
+| 128×96 (2D) ND/DD | 12 | 9 / 6 | 2.9e-5 | 1.5e-5 | 4.6e-6 | 2.4e-7 |
+
+Closed faces carry exactly 0 flux, solid phi is 0.0, device operator == the
+host FP64 operator, PCG reruns and two fresh processes byte-identical (FNV
+hashes of separable and PCG cold/warm solves). Tolerance sweep (ND/DD/DD):
+tol 1e-3 / 1e-4 / 1e-5 / 1e-6 = 8 / 10 / 13 / 15 iterations, solution error
+2.4e-4 / 4.3e-5 / 2.4e-6 / 3.1e-7 of max. **FP32 floor**: the recursive
+residual keeps falling (4e-9 at 19 it) while the true residual stops at
+3.3–3.8× the storage floor (the residual of float(x_FP64)), below the reported
+`floorRel` = ε_f32 |A| |x| / |b| (|A| ≤ 4 Σ 1/h², Gershgorin). A tol below
+~1e-5 buys solution accuracy (to ~4e-7), not residual (issues.md §75).
+
+**Speed** (`gpu_poisson_sep_perf`, simjob --bench, x ND):
+
+| grid | y/z | ms/solve |
+|---|---|---|
+| 384×176×176 (final case, 11.9 M) | P / DD | 1.40 / 1.45 |
+| 384×180×180 | DD | 1.67 |
+| 192×88×88 (half scale) | P / DD | 0.40 / 0.32 |
+| 192×90×90 | DD | 0.29 |
+
+Packing two lines per FFT and the fused scale took the full grid from 2.55 to
+1.45 ms (rocprofv3: the y/z passes were 480 µs each way, the scale 173 µs).
+176 = 2⁴·11 is not slow on rocFFT (K11). The real tube at full scale (ID 57,
+lip 6, 30 cells below the rim, 35 520 solid cells): cold 14 iterations 43.7
+ms, warm 11 / 9 iterations 35 / 30 ms, operator apply 0.45 ms (~2.9 ms per
+PCG iteration); half scale 14 / 11 / 8 iterations, 10.5 / 8.7 / 6.9 ms.

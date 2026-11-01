@@ -75,10 +75,13 @@ struct SpeciesView
 // primitive); with ox >= 0, arrheniusRate2(lnA, Ta, rho, Y_fuel, Y_ox, T)
 // (its own instantiation). One launch. lnA == -inf writes omega == 0 exactly.
 // eof (TFLES, premixed only): omega *= eof[c], the per-cell E/F (its own
-// instantiation; null = the shipped kernel).
+// instantiation; null = the shipped kernel). law (ox >= 0 only): the C2b
+// rate, arrheniusRate2(lnA + phiRateLn(law, Y_F, Y_O), ...) in FP32 (its own
+// kernel; null = the shipped one).
 void cellPass(const GpuGrid& g, const DeviceCompState& s, const Real* T,
               Real lnA, Real Ta, int fuel, int ox, Real* const Y[kMaxY],
-              Real* omega, const Real* eof = nullptr);
+              Real* omega, const Real* eof = nullptr,
+              const PhiRateLaw<double>* law = nullptr);
 
 // The soot rates of the cell pass (SpeciesSetup::soot): slot, formation
 // ln A and Ta, oxidation ln A and Ta, and the two output buffers.

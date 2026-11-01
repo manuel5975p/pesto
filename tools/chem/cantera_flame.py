@@ -16,6 +16,18 @@ Writes
                                          first-order upwind)
 
 Usage: cantera_flame.py [OUTDIR]   (default: tests/data/chem next to this repo)
+
+--real mode (masterplan real_bunsen S1, docs/chem.md "Model C2"): the REAL
+CH4/air flame the partially premixed burner is calibrated against -- GRI-3.0
+(Cantera's gri30.yaml, mixture-averaged transport), Tu 298 K, 1 atm, phi
+1.0..1.6. Per phi: S_L (the finest rung of a refinement ladder), T_ad (the
+equilibrium HP state), the burnt T of the flame's last point, delta_th =
+(T_b - Tu)/max dT/dx, and the unburnt alpha_u = lambda/(rho cp), nu_u =
+mu/rho, delta_D = alpha_u/S_L. Writes tests/data/chem/ch4_gri30.csv.
+
+Usage: cantera_flame.py --real [OUTDIR] [--phis 0.6,0.65,...]
+(--phis: only those, merged into the existing csv by phi; S1b added the lean
+side 0.6..0.95 and the off-node checks the A(phi) calibration is judged on.)
 """
 import json
 import os
@@ -107,5 +119,85 @@ def main():
                                           "SL_richardson")}))
 
 
+REAL_TU, REAL_PHIS = 298.0, (1.0, 1.05, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6)
+
+
+def real_flame(phi):
+    """GRI-3.0 CH4/air at phi, Tu 298 K, 1 atm: one row of ch4_gri30.csv."""
+    g = ct.Solution("gri30.yaml")
+    P = ct.one_atm
+    g.set_equivalence_ratio(phi, "CH4", {"O2": 1.0, "N2": 3.76})
+    g.TP = REAL_TU, P
+    yF = float(g.Y[g.species_index("CH4")])
+    yO = float(g.Y[g.species_index("O2")])
+    rho_u, cp_u = g.density, g.cp_mass
+    alpha_u = g.thermal_conductivity / (rho_u * cp_u)
+    nu_u = g.viscosity / rho_u
+    eq = ct.Solution("gri30.yaml")
+    eq.TPX = g.TPX
+    eq.equilibrate("HP")
+    f = ct.FreeFlame(g, width=0.03)
+    f.transport_model = "mixture-averaged"
+    f.set_max_grid_points(f.flame, 4000)
+    f.set_refine_criteria(ratio=3, slope=0.07, curve=0.14, prune=0)
+    f.solve(loglevel=0, auto=True)
+    ladder = []
+    for crit in (0.04, 0.02, 0.01):
+        f.set_refine_criteria(ratio=2, slope=crit, curve=crit, prune=0)
+        f.solve(loglevel=0, refine_grid=True)
+        ladder.append(float(f.velocity[0]))
+    T = np.asarray(f.T)
+    x = np.asarray(f.grid)
+    dth = (T[-1] - T[0]) / np.max(np.diff(T) / np.diff(x))
+    SL = ladder[-1]
+    row = {"phi": phi, "SL": SL, "SL_prev": ladder[-2], "Tad": eq.T,
+           "Tb": float(T[-1]), "sigma_ad": eq.T / REAL_TU,
+           "dth": float(dth), "alpha_u": alpha_u, "nu_u": nu_u,
+           "dD": alpha_u / SL, "dth_over_dD": float(dth) * SL / alpha_u,
+           "yCH4": yF, "yO2": yO, "points": len(x)}
+    print(" ".join(f"{k}={v:.6g}" for k, v in row.items()), flush=True)
+    return row
+
+
+def real(out, phis, merge):
+    """Rows at phis; merge=True keeps the csv's rows at other phi (one
+    simjob per subset: a flame is ~20 s, the lean ones longer)."""
+    path = os.path.join(out, "ch4_gri30.csv")
+    old = {}
+    if merge and os.path.exists(path):
+        with open(path) as fh:
+            lines = [l.strip() for l in fh if not l.startswith("#")]
+        keys = lines[0].split(",")
+        for l in lines[1:]:
+            vals = [float(v) for v in l.split(",")]
+            old[round(vals[0], 6)] = dict(zip(keys, vals))
+    for phi in phis:
+        old[round(phi, 6)] = real_flame(phi)
+    rows = [old[k] for k in sorted(old)]
+    keys = list(rows[-1])
+    with open(path, "w") as fh:
+        fh.write(f"# Cantera {ct.__version__} gri30.yaml, mixture-averaged, "
+                 f"Tu {REAL_TU} K, 1 atm (tools/chem/cantera_flame.py --real)\n")
+        fh.write(",".join(keys) + "\n")
+        for r in rows:
+            fh.write(",".join(f"{r[k]:.8g}" for k in keys) + "\n")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--real":
+        # --real [OUTDIR] [--phis a,b,c]: --phis runs only those and MERGES
+        # them into the existing csv (sorted by phi).
+        args = sys.argv[2:]
+        phis, merge = REAL_PHIS, False
+        if "--phis" in args:
+            k = args.index("--phis")
+            phis = tuple(float(v) for v in args[k + 1].split(","))
+            merge = True
+            del args[k:k + 2]
+        here = os.path.dirname(os.path.abspath(__file__))
+        out = args[0] if args else os.path.join(
+            here, "..", "..", "tests", "data", "chem")
+        os.makedirs(out, exist_ok=True)
+        real(out, phis, merge)
+    else:
+        main()

@@ -48,6 +48,13 @@ struct RunMeta
     double wedgeDeg = 0;
     // "compensated" on a --compensated time march, "" (key absent) otherwise.
     std::string state{};
+    // The low-Mach tube rim (--rim, masterplan real_bunsen S8): a JSON object
+    // {"x","ri","ro","h","T"} (box units) the renderer builds its tube from;
+    // "" = key absent (every other .json reads as it did).
+    std::string rim{};
+    // The SI echo of the low-Mach burner (--si-delta-d, --si-sl; S9): a JSON
+    // object {"deltaD" (m), "SL" (m/s)} the renderer scales by; "" = absent.
+    std::string si{};
 
     // The six grid fields from the grid the artefacts are written on.
     void setGrid(const Grid& g)

@@ -20,12 +20,18 @@ GAMMA = 1.4
 RR = 8314.46261815324
 
 _S0, _S1 = 1e-9, 1 - 1e-7   # dns/chem.cpp kS0, kS1
+_STIFF, _COLD = 1.0, 0.5      # dns/chem.cpp kStiffStep, dns/chem.hpp kColdCut
+_CUT_RISE = 1e-4              # dns/chem.hpp kColdCutMaxRise
+_SCAN = (-60, 20)             # dns/chem.cpp kScanLo, kScanHi
 
 
 def _shoot(m, theta, sigma, n, record=False):
     """dns/chem.cpp shoot() in the non-dimensional problem (Tu = 1, rho = 1/T,
-    cp = lambda = A = 1), vectorized over an array of mass fluxes m.
-    Returns (tooFast bool array, table or None)."""
+    cp = lambda = A = 1), vectorized over an array of mass fluxes m: too fast
+    = p hits 0, a stiff step (h J > _STIFF) or a negative cold residual; the
+    rate is cut where p*/(m cp (T - Tu)) climbs back above _COLD past the
+    preheat zone (issues.md 72). Returns (tooFast bool array, table or None,
+    the cut T of lane 0 or 0, lane 0 reached the preheat zone)."""
     m = np.atleast_1d(np.asarray(m, float))
     Tu, Tb = 1.0, sigma
     dT = Tb - Tu
@@ -35,13 +41,17 @@ def _shoot(m, theta, sigma, n, record=False):
     u0 = math.log(_S0 / (1 - _S0))
     u1 = math.log(_S1 / (1 - _S1))
     h = (u1 - u0) / n
+    cut = np.zeros(m.shape, bool)
+    phase = np.zeros(m.shape, int)
+    tcut = np.zeros(m.shape)
 
     def rhs(u, p):
         s = 1 / (1 + math.exp(-u))
         T = Tb - dT * s
         dTdu = -dT * s * (1 - s)
         om = (1 / T) * s * math.exp(-theta / T)
-        return (m - q * om / p) * dTdu, dTdu / p
+        g = np.where(cut, 0.0, q * om)
+        return (m - g / p) * dTdu, dTdu / p, g, s
 
     p = a * dT * _S0
     x = np.zeros_like(m)
@@ -52,16 +62,27 @@ def _shoot(m, theta, sigma, n, record=False):
     for k in range(n):
         u = u0 + k * h
         with np.errstate(all="ignore"):
-            k1p, k1x = rhs(u, p)
+            k1p, k1x, g, s = rhs(u, p)
+            dTdu = dT * s * (1 - s)
+            dead |= h * g * dTdu / (p * p) > _STIFF
+            c = g / (m * (m * dT * (1 - s)))
+            phase = np.where((phase == 0) & (k1p < 0), 1, phase)
+            pre = (phase == 1) & (c <= _COLD)
+            now = (phase == 2) & ~cut & (c > _COLD)
+            phase = np.where(pre, 2, phase)
+            if now.any():
+                cut = cut | now
+                tcut = np.where(now, Tb - dT * s, tcut)
+                k1p, k1x, g, s = rhs(u, p)
             p2 = p + 0.5 * h * k1p
             dead |= ~(p2 > 0)
-            k2p, k2x = rhs(u + 0.5 * h, p2)
+            k2p, k2x, _, _ = rhs(u + 0.5 * h, p2)
             p3 = p + 0.5 * h * k2p
             dead |= ~(p3 > 0)
-            k3p, k3x = rhs(u + 0.5 * h, p3)
+            k3p, k3x, _, _ = rhs(u + 0.5 * h, p3)
             p4 = p + h * k3p
             dead |= ~(p4 > 0)
-            k4p, k4x = rhs(u + h, p4)
+            k4p, k4x, _, _ = rhs(u + h, p4)
             p = p + h / 6 * (k1p + 2 * k2p + 2 * k3p + k4p)
             x = x + h / 6 * (k1x + 2 * k2x + 2 * k3x + k4x)
             dead |= ~(p > 0)
@@ -73,7 +94,7 @@ def _shoot(m, theta, sigma, n, record=False):
             tab.append((Tb - dT * s, x[0], p[0]))
     Tend = Tb - dT * _S1
     resid = p - m * (Tend - Tu)
-    return dead | (resid < 0), tab
+    return dead | (resid < 0), tab, float(tcut[0]), bool(phase[0] == 2)
 
 
 def hermite(x, xs, Ts, Gs):
@@ -97,13 +118,20 @@ class Oracle:
     def __init__(self, sigma=5.0, beta=8.0, n=20000):
         self.sigma, self.beta = sigma, beta
         self.theta = beta * sigma * sigma / (sigma - 1.0)
-        lo = hi = 1.0
-        if _shoot(1.0, self.theta, sigma, n)[0][0]:
-            while _shoot(lo, self.theta, sigma, n)[0][0]:
-                lo *= 0.5
+        # dns/chem.cpp's bracket: one slow -> fast transition over 2^-60 ..
+        # 2^20, then the shipped [lo, 1] / [1, hi] (issues.md 72).
+        ks = np.arange(_SCAN[0], _SCAN[1] + 1)
+        fast = _shoot(np.ldexp(1.0, ks), self.theta, sigma, n)[0]
+        flips = np.flatnonzero(fast[1:] != fast[:-1])
+        if fast[0] or not fast[-1] or len(flips) != 1:
+            raise ValueError(f"flame eigenvalue: no unique bracket "
+                             f"(transitions {len(flips)})")
+        lo = math.ldexp(1.0, int(ks[flips[0]]))
+        hi = 2 * lo
+        if hi <= 1:
+            hi = 1.0
         else:
-            while not _shoot(hi, self.theta, sigma, n)[0][0]:
-                hi *= 2
+            lo = 1.0
         # multisection: 63 interior points per pass (dns bisects; same limit)
         while hi - lo > 1e-15 * hi:
             ms = np.linspace(lo, hi, 65)[1:-1]
@@ -115,7 +143,12 @@ class Oracle:
                 break
             lo, hi = nlo, nhi
         m1 = 0.5 * (lo + hi)
-        _, tab = _shoot(m1, self.theta, sigma, n, record=True)
+        _, tab, self.tCut, pre = _shoot(m1, self.theta, sigma, n, record=True)
+        if not pre:
+            raise ValueError("flame eigenvalue: no inert preheat zone")
+        if self.tCut > 0 and self.tCut - 1 > _CUT_RISE * (sigma - 1):
+            raise ValueError("flame eigenvalue: cold-boundary difficulty "
+                             "(cut above 1e-4 of the rise)")
         T, x, p = (np.array(c[::-1]) for c in zip(*tab))
         G = p.copy()                  # lambda = 1: dT/dx = p
         Tm = 0.5 * (1 + sigma)

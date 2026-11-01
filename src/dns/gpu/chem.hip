@@ -52,6 +52,30 @@ struct ChemRate2
     }
 };
 
+// ChemRate2 with the C2b law (SpeciesSetup::phiRate): k = e^(lnA + ln C(xi)
+// - Ta/T), ln C in FP64 from the cell's unfloored Y_F, Y_O (the cell pass's
+// arguments). A separate functor: ChemRate2 stays the shipped one.
+struct ChemRate2Phi
+{
+    const Real *rho, *mx, *my, *mz, *E, *rf, *ro;
+    double gamma, Rgas, lnA, Ta, q, cv, s;
+    PhiRateLaw<double> law;
+    __host__ __device__ double operator()(int c) const
+    {
+        const double r = rho[c];
+        const double ke = 0.5 * (double(mx[c]) * mx[c] + double(my[c]) * my[c] +
+                                 double(mz[c]) * mz[c]) / r;
+        const double p = (gamma - 1.0) * (double(E[c]) - ke);
+        const double T = p / (r * Rgas);
+        const double YF = rf[c] / r, YO = ro[c] / r;
+        const double yf = fmax(YF, 0.0), yo = fmax(YO, 0.0);
+        const double k = exp(lnA + phiRateLn(law, YF, YO) - Ta / T);
+        const double J =
+            k * r * (yo + s * yf + q * yf * yo * Ta / (cv * T * T));
+        return isfinite(J) ? J : HUGE_VAL;
+    }
+};
+
 __global__ void kFlameColumns(GpuGrid g, const Real* rho, const Real* mx,
                               const Real* E, const Real* ry, const Real* T,
                               const Real* omega, const Real* u, const Real* p,
@@ -199,6 +223,15 @@ double chemStableDt(const DeviceComp& d, const DeviceCompState& s,
     if (!std::isfinite(sp.lnA)) return HUGE_VAL; // no reaction
     const Transport& tr = d.transport();
     const double cv = tr.Rgas / (tr.gamma - 1.0);
+    if (sp.ox >= 0 && sp.phiRate.n > 0) {
+        const ChemRate2Phi f2{s.rho.data(), s.mx.data(), s.my.data(),
+                              s.mz.data(),  s.E.data(),  s.y[sp.fuel].data(),
+                              s.y[sp.ox].data(), tr.gamma, tr.Rgas, sp.lnA,
+                              sp.Ta, sp.q, cv, sp.stoich, sp.phiRate};
+        const double J = internal::reduce(r, d.grid().size(), f2,
+                                          rocprim::maximum<double>(), 0.0);
+        return J > 0 ? kChemDt / J : HUGE_VAL;
+    }
     if (sp.ox >= 0) {
         const ChemRate2 f2{s.rho.data(), s.mx.data(), s.my.data(),
                            s.mz.data(),  s.E.data(),  s.y[sp.fuel].data(),

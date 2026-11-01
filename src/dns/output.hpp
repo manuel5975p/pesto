@@ -11,12 +11,14 @@
 #include "dns/field.hpp"
 #include "dns/grid.hpp"
 
+#include <cstdint>
 #include <expected>
 #include <memory>
 #include <set>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace dns {
@@ -63,6 +65,17 @@ struct FrameGeometry
         fg.D = D;
         return fg;
     }
+};
+
+// Where a run's artefacts stood at a checkpoint (dns/checkpoint.hpp): every
+// open series and frame stream's byte length (by file suffix, "_stats.csv",
+// "_temp.bin") and the frame cadences. A restart truncates each file to its
+// length (a job killed after its checkpoint left extra rows) and appends.
+struct OutputResume
+{
+    std::vector<std::pair<std::string, std::uint64_t>> files; // ascending
+    int frames = 0, pngIdx = 0;
+    double nextFrame = 0, nextPng = 0, nextWeb = 0;
 };
 
 class RunOutput
@@ -177,6 +190,19 @@ public:
     int frames() const;
     // Recorded in the final .json. Call before finish() / destruction.
     void setMsPerStep(double);
+    // A checkpointed run's .json gains "complete" and "restarts" (absent
+    // otherwise: every other run's .json reads exactly as before).
+    void setCompletion(bool complete, long restarts);
+
+    // Flushes every stream and reports where each stands (checkpoint).
+    // Fails when a stream is in a failed state (its length means nothing).
+    [[nodiscard]] std::expected<OutputResume, std::string> resumePoint();
+    // Restart: truncates every file of `at` to its recorded length (an error
+    // names a file that is missing or SHORTER: its rows were lost) and
+    // restores the cadences. Series declared and frame streams opened
+    // afterwards APPEND to those files (no header); a stream not in `at`
+    // is created fresh as usual. Call before declareSeries / the first frame.
+    [[nodiscard]] std::expected<void, std::string> resumeAt(const OutputResume& at);
 
 private:
     // Per-kind cadences behind wantsAnyFrame(). The live shared-memory bridge

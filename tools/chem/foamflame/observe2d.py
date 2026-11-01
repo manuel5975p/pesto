@@ -384,6 +384,11 @@ def compare_bunsen(spec, o, si, root, dns_runs=(("dns", None),
             continue
         st = csv_cols(pre + "_stats.csv")
         fr, fdt, meta = dns_frames(pre, nx, ny)
+        if meta.get("physics") == "lowmach":
+            # the low-Mach solver's box has Tu = 1 (no Mach): its temp frame
+            # (T - Tu) and Tmax into the compressible box units of TuBox
+            fr["temp"] = fr["temp"] * np.float32(Tu)
+            st["Tmax"] = st["Tmax"] * Tu
         r = {"stats": _means(st, win, BUNSEN_Q),
              "frames": _dns_frame_rows(fr, fdt, win, h, Tu, sig, b, o.dth),
              "ms_per_step": meta.get("msPerStep"), "t_end": float(st["t"][-1])}

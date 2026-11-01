@@ -227,15 +227,17 @@ inline double wallGradientPinned(double f1, double f2, double d1, double d2)
 }
 
 // Wall-clock ms/step, recorded on the stats and handed to the output sink.
-// Identical in every runner.
+// Identical in every runner. stepsBefore: steps a restarted job inherited
+// (not timed by wall0).
 inline void finishTiming(RunStats& st,
                          std::chrono::steady_clock::time_point wall0,
-                         RunOutput& out)
+                         RunOutput& out, long stepsBefore = 0)
 {
+    const long n = st.steps - stepsBefore;
     st.msPerStep = std::chrono::duration<double, std::milli>(
                        std::chrono::steady_clock::now() - wall0)
                        .count()
-                   / double(st.steps ? st.steps : 1);
+                   / double(n ? n : 1);
     out.setMsPerStep(st.msPerStep);
 }
 

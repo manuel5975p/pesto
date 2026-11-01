@@ -47,6 +47,20 @@ void curlMagCentred(const GpuGrid&, const DeviceScalar& u, const DeviceScalar& v
 void speedCentred(const GpuGrid&, const DeviceScalar& u, const DeviceScalar& v,
                   const DeviceScalar& w, DeviceScalar& out);
 
+// The Takeno flame index xi = grad Y_F . grad Y_O / (|grad Y_F| |grad Y_O|)
+// per cell (masterplan real_bunsen S5, D14): +1 where both reactants fall
+// toward the same side (premixed burning), -1 across a diffusion sheet. xi
+// := 0 where either |grad Y| < 2^-24 / h_min (the shared limiter's vote
+// threshold: below it a gradient is FP32 noise). Central differences, y and
+// z periodic, x ONE-SIDED at i = 0 and nx - 1 (x is an inflow/outflow axis,
+// never wrapped); at nz == 1 the z differences cancel by address
+// arithmetic. In Real; |xi| <= 1 up to rounding (a pure-x pair is exactly
+// +-1). openY/openZ (the low-Mach open laterals, S6): that axis one-sided at
+// its ends like x (false: the periodic stencil bit for bit). Pre: nx >= 2.
+void flameIndexCentred(const GpuGrid&, const DeviceScalar& YF,
+                       const DeviceScalar& YO, DeviceScalar& out,
+                       bool openY = false, bool openZ = false);
+
 // Cell-centred velocity from the conservative compressible state: q = m / rho,
 // with rho <= 0 treated as 1 (the host loop's guard; a non-positive density is
 // a numerical failure the caller reports separately).

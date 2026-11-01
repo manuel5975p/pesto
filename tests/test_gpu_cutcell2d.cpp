@@ -57,6 +57,9 @@ bool runProjected(const Grid& g, const CutGeometry& cut, gpu::PoissonBc bc,
                      hipGetErrorString(poisson.error()));
         return false;
     }
+    // projectCut warm-starts from phi: zero it as runner_incomp does (an
+    // uninitialised hipMalloc start made the result differ run to run).
+    (void)hipMemset(scr->phi.data(), 0, g.size() * sizeof(gpu::Real));
     (void)gpu::uploadField(U0, *dU);
     gpu::maskSolidFaces(gg, *dCut, *dU);
     const int it = gpu::projectCut(gg, *dCut, *poisson, gpu::Real(0.01), *dU, *scr);

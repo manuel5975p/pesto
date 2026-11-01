@@ -40,6 +40,22 @@ double flameWrinkle(double A, int N, double y, double Ly);
 // likewise on the cone distance). Pre: c.sub == Flame.
 void flameIC(const Case& c, CompState& q, std::vector<double>& rhoY);
 
+// The --equivalence IC (model C2): flameIC's state (the premixedEigen2
+// profile), its progress s_p = rhoY/rho re-read as the two reactants: Y_O =
+// Y_O1 s_p, Y_F = Y_F,rem + Y_O/s (Shvab-Zeldovich, Le = 1); a lean
+// --mix-phi premix Y_F = Y_F1 s_p, Y_O = Y_O,rem + s Y_F (its Y_F1, Y_O1,
+// burnt Tb). rhoY[0] = rho Y_F, rhoY[1] = rho Y_O (resized).
+// Pre: c.flamePremix2.
+void flameIC2(const Case& c, CompState& q, std::vector<double> (&rhoY)[2]);
+
+// flameIC2's progress -> reactants rule on its own (shared with the low-Mach
+// IC): rhoY[1] = rho s_p on entry; on return rhoY[0] = rho Y_F, rhoY[1] = rho
+// Y_O of the burnt premix (rich: Y_O = Y_O1 s_p, Y_F = Y_F,rem + Y_O/s; lean:
+// Y_F = Y_F1 s_p, Y_O = Y_O,rem + s Y_F). Pre: c.flamePremix2, rho and rhoY[1]
+// of one size.
+void premix2Reactants(const Case& c, const std::vector<double>& rho,
+                      std::vector<double> (&rhoY)[2]);
+
 // The `dns flame --mode bunsen` IC: the oracle profile on the signed distance
 // to the ideal cone (bunsenConeDistance), t_f; blended by the inflow
 // profile's weights J, P, C of y: T/Tu = t_f J + tPilot P + tCo C, Y =

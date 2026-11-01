@@ -2,6 +2,7 @@
 
 #include "dns/chem.hpp"
 #include "dns/gpu/device_util.hpp"
+#include "dns/gpu/internal/species_face.hpp"
 
 #include <cassert>
 #include <type_traits>
@@ -42,6 +43,24 @@ __global__ void kChemCellPass2(GpuGrid g, int nY, const Real* rho,
     omega[c] = arrheniusRate2(lnA, Ta, r, Y[fuel][c], Y[ox][c], T[c]);
 }
 
+// kChemCellPass2 with the C2b law (SpeciesSetup::phiRate): omega =
+// arrheniusRate2(lnA + ln C(xi), ...), xi from the cell's Y_F, Y_O.
+__global__ void kChemCellPass2Phi(GpuGrid g, int nY, const Real* rho,
+                                  SpeciesCombine ys, const Real* T, Real lnA,
+                                  Real Ta, int fuel, int ox,
+                                  PhiRateLaw<Real> law, Real* Y0, Real* Y1,
+                                  Real* Y2, Real* Y3, Real* omega)
+{
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= g.size()) return;
+    Real* Y[kMaxY] = {Y0, Y1, Y2, Y3};
+    const Real r = rho[c];
+    for (int k = 0; k < nY; ++k) Y[k][c] = ys.ya[k][c] / r;
+    const Real yf = Y[fuel][c], yo = Y[ox][c];
+    omega[c] = arrheniusRate2(lnA + phiRateLn(law, yf, yo), Ta, r, yf, yo,
+                              T[c]);
+}
+
 // kChemCellPass2 plus the soot rates (SpeciesSetup::soot): formation from the
 // fuel, first order in rho Y_F; oxidation by the oxidizer, rho^2 Y_s Y_O.
 // Both floor their Y (the state is never clamped).
@@ -79,27 +98,15 @@ __device__ inline Offsets offsets2At(const GpuGrid& g, int i, int j, int k)
     return o;
 }
 
-// Monotonized-central slope: 0 unless d1, d2 share a sign, else
-// sign * min(2|d1|, 2|d2|, |d1 + d2|/2). Exactly 0 on a uniform field.
-__device__ inline Real mcSlope(Real d1, Real d2)
-{
-    if (!(d1 * d2 > Real(0))) return Real(0);
-    const Real m = fminf(fminf(Real(2) * fabsf(d1), Real(2) * fabsf(d2)),
-                         Real(0.5) * fabsf(d1 + d2));
-    return d1 > Real(0) ? m : -m;
-}
+// The face formula (Face, mcSlope, the shared limiter, faceY2) lives in
+// gpu/internal/species_face.hpp, read by the low-Mach solver too (D7).
+using internal::Face;
+using internal::faceY2;
+using internal::kVoteJump;
+using internal::mcSlope;
 
 // One interior face L | R along `axis` (R = L + one step): the mass flux in
-// faceFlux's own expression, rho D, and the stencil cells LL = L - 1,
-// RR = R + 1. firstL/firstR: that upwind side has no second neighbour (an
-// open face's boundary cell: its LL/RR would wrap across the domain), so the
-// face goes first order when its upwind cell is that side.
-struct Face
-{
-    std::size_t L, R, LL, RR;
-    bool firstL, firstR;
-};
-
+// faceFlux's own expression.
 __device__ inline Real faceMdot(PrimView q, const Real* un, const Face& f)
 {
     const Real rm = Real(0.5) * (q.rho[f.L] + q.rho[f.R]);
@@ -277,57 +284,14 @@ __global__ void kSpeciesStage(GpuGrid g, ViscView vv, PrimView q,
         oE[c] += cr * (sv.q * om);
 }
 
-// The shared limiter of face f (two-reactant kernel): theta = min over the
-// VOTING species of mcSlope(d1, d2) / d2, in [0, 2] (2 = none votes). The
-// face value Y_up + theta/2 d2 is LINEAR in Y across species: an affine
-// combination of the species (the coupling functions, the mixture fraction)
-// is transported exactly by the same formula, whatever theta is. A voter
-// keeps its own TVD bound (theta <= its own MC ratio; Sweby's region is
-// star-shaped toward 0). A species votes iff |d2| >= kVoteJump = 2^-24 (the
-// FP32 resolution of a unit mass fraction): a reactant consumed to ~1e-40
-// on the far side of the sheet carries sign-flipping rounding noise whose
-// "extrema" (theta = 0) forced first-order upwind on EVERY species across
-// the whole far side -- measured on the advected layer (gpu_diffusion_mix)
-// Z 5.0e-3 below the analytic erf at the slab centre with every species
-// voting, max error 1.5e-3 with the threshold. A non-voter moves at most |d2| <
-// 2^-24 past its own neighbours per face, and votes again once it varies.
-inline constexpr float kVoteJump = 0x1p-24f;
-// Soot: the soot slot never votes (it is in no coupling function; it keeps
-// its own MC limiter, faceY).
+// The shared limiter of face f (two-reactant kernel; species_face.hpp's
+// sharedThetaOf). Soot: the soot slot never votes (it is in no coupling
+// function; it keeps its own MC limiter, faceY).
 template <bool Soot = false>
 __device__ inline Real sharedTheta(const SpeciesView& sv, const Face& f,
                                    Real mdot)
 {
-    // Upwind cell = an open-face boundary cell (no second neighbour): the
-    // CENTRAL face value (theta 1, between the two cells, so bounded) -- the
-    // premixed kernel's first-order upwind there is a convective-flux
-    // mismatch mdot (Y_R - Y_L)/2 against the central energy flux.
-    if (mdot >= Real(0) ? f.firstL : f.firstR) return Real(1);
-    Real th = Real(2);
-    for (int s = 0; s < sv.nY; ++s) {
-        if constexpr (Soot)
-            if (s == sv.soot) continue;
-        const Real* Y = sv.Y[s];
-        Real d1, d2;
-        if (mdot >= Real(0)) {
-            d1 = f.firstL ? Real(0) : Y[f.L] - Y[f.LL];
-            d2 = Y[f.R] - Y[f.L];
-        } else {
-            d1 = f.firstR ? Real(0) : Y[f.R] - Y[f.RR];
-            d2 = Y[f.L] - Y[f.R];
-        }
-        if (fabsf(d2) >= kVoteJump) th = fminf(th, mcSlope(d1, d2) / d2);
-    }
-    return th;
-}
-
-__device__ inline Real faceY2(const Real* Y, const Face& f, Real mdot,
-                              Real th, Real rhoD, Real h)
-{
-    const Real yf = mdot >= Real(0)
-                        ? Y[f.L] + Real(0.5) * th * (Y[f.R] - Y[f.L])
-                        : Y[f.R] + Real(0.5) * th * (Y[f.L] - Y[f.R]);
-    return mdot * yf - rhoD * (Y[f.R] - Y[f.L]) / h;
+    return internal::sharedThetaOf(sv.Y, sv.nY, Soot ? sv.soot : -1, f, mdot);
 }
 
 // The two-reactant species stage (SpeciesSetup::ox >= 0): kSpeciesStage
@@ -494,13 +458,21 @@ __global__ void kSpeciesOpenFix(GpuGrid g, PrimView q, StageCombine cmb,
 
 void cellPass(const GpuGrid& g, const DeviceCompState& s, const Real* T,
               Real lnA, Real Ta, int fuel, int ox, Real* const Y[kMaxY],
-              Real* omega, const Real* eof)
+              Real* omega, const Real* eof, const PhiRateLaw<double>* law)
 {
     assert(s.nY >= 1 && fuel >= 0 && fuel < s.nY && ox < s.nY && ox != fuel);
     assert(!eof || ox < 0);
+    assert(!law || (ox >= 0 && law->n >= 2));
     SpeciesCombine ys;
     for (int k = 0; k < s.nY; ++k) ys.ya[k] = s.y[k].data();
     ys.nY = s.nY;
+    if (law) {
+        kChemCellPass2Phi<<<launchBlocks(g.size()), blockSize>>>(
+            g, s.nY, s.rho.data(), ys, T, lnA, Ta, fuel, ox,
+            law->as<Real>(), Y[0], Y[1], Y[2], Y[3], omega);
+        checkLastKernel("kChemCellPass2Phi");
+        return;
+    }
     if (ox >= 0) {
         kChemCellPass2<<<launchBlocks(g.size()), blockSize>>>(
             g, s.nY, s.rho.data(), ys, T, lnA, Ta, fuel, ox, Y[0], Y[1], Y[2],

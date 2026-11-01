@@ -87,6 +87,16 @@ CASES = {
         "foam_write_dt": 1.0,
         "write_precision": 10,
         "dns": [],
+        # dns twins (label, run-dir suffix, flags, flags dropped): the
+        # compressible T-held inflow, and the LOW-MACH solver (masterplan
+        # real_bunsen S5) on the identical 392 x 288 mesh (--length 49: no
+        # sink bands, the bands' 32 cells are box), its frames/Tmax in Tu = 1
+        # units (scaled by TuBox in the comparison); tt 25 = foam's end, so
+        # the field differences at t 25 come from its own last frame
+        "twins": [("dns_tinflow", "_tinflow", "--nscbc-tinflow"),
+                  ("dns_lowmach", "_lowmach",
+                   "--physics lowmach --length 49 --tt 25",
+                   ("--mach", "--nscbc-sink", "--tt"))],
         # foam cost (scout jobs 660, 661, 113k cells): nOuter 3 at dt 2e-3
         # tau = 0.135 s/step on 14 ranks (25 tau = 1690 s, over budget);
         # nOuter 1 (PISO, 2 pressure correctors) at dt 4e-3 tau = 0.042 s/step

@@ -73,12 +73,46 @@ void flameIC(const Case& c, CompState& q, std::vector<double>& rhoY)
                       q, rhoY);
         return;
     }
-    premixedState(c.grid, kGammaAir, c.flameTu, c.flameModel.sigma, c.flameUIn,
+    // --equivalence: the burnt premix's Tb (--mix-phi's; the jet's sigma
+    // exactly otherwise).
+    const double sigma = c.flamePremix2 ? c.premix.sigmaAt(c.premixBurnPhi())
+                                        : c.flameModel.sigma;
+    premixedState(c.grid, kGammaAir, c.flameTu, sigma, c.flameUIn,
                   [&](double x, double y) {
                       return flameProfile(
                           tab, x - xf - flameWrinkle(A, c.flameWrinkleModes, y, Ly));
                   },
                   q, rhoY);
+}
+
+void premix2Reactants(const Case& c, const std::vector<double>& rho,
+                      std::vector<double> (&rhoY)[2])
+{
+    assert(c.flamePremix2 && rho.size() == rhoY[1].size());
+    PartialPremixModel pm = c.premix;
+    pm.phi = c.premixBurnPhi();
+    rhoY[0].resize(rhoY[1].size());
+    if (pm.phi > 1) {
+        const double yO1 = pm.yO1(), yFrem = pm.yFrem();
+        for (std::size_t k = 0; k < rhoY[1].size(); ++k) {
+            rhoY[1][k] *= yO1;                               // rho Y_O
+            rhoY[0][k] = yFrem * rho[k] + rhoY[1][k] / pm.s; // rho Y_F
+        }
+        return;
+    }
+    // Lean (--mix-phi < 1): F deficient, Y_F = Y_F1 s_p, Y_O = Y_O,rem + s Y_F.
+    const double yF1 = pm.yF1(), yOrem = pm.yOrem();
+    for (std::size_t k = 0; k < rhoY[1].size(); ++k) {
+        rhoY[0][k] = rhoY[1][k] * yF1;                     // rho Y_F
+        rhoY[1][k] = yOrem * rho[k] + pm.s * rhoY[0][k];   // rho Y_O
+    }
+}
+
+void flameIC2(const Case& c, CompState& q, std::vector<double> (&rhoY)[2])
+{
+    assert(c.flamePremix2);
+    flameIC(c, q, rhoY[1]); // rho s_p
+    premix2Reactants(c, q.rho, rhoY);
 }
 
 namespace {

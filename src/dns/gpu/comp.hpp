@@ -3,6 +3,7 @@
 // the exact 2D restriction. GPU-only header.
 #pragma once
 
+#include "dns/chem.hpp"
 #include "dns/comp.hpp"
 #include "dns/cutcell.hpp"
 #include "dns/transport.hpp"
@@ -171,6 +172,12 @@ struct SpeciesSetup
     int soot = -1;
     double sootLnAf = 0, sootTaf = 0, sootLnAox = 0, sootTaox = 0;
     double sootDiff = 0;
+    // Model C2b (two-reactant kernel, no soot; dns/chem.hpp PhiRateLaw): the
+    // rate's pre-exponential times C(xi), the mixture-fraction law that
+    // makes the premixed S_L(phi) follow GRI-3.0 CH4/air -- in the cell pass
+    // and in chemStableDt's J. n == 0 = off: the kernels without it, bit for
+    // bit.
+    PhiRateLaw<double> phiRate = {};
 };
 
 // An unevaluated sum hi + lo of two floats (the compensated state's words).
