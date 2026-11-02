@@ -14,6 +14,14 @@
 
 namespace dns {
 
+// One point of the low-Mach premixed state at t = T/Tu (box units, below):
+// premixedState's expressions, shared with the FV IC (dns/fvflame).
+struct PremixedPoint
+{
+    double rho, u, E, Y;
+};
+PremixedPoint premixedPoint(double gamma, double Tu, double sigma, double m, double t);
+
 // The low-Mach premixed state of a temperature profile t(x, y) = T/Tu on the
 // cell centres (x along the grid's x axis, k-uniform), in box units
 // (rho_u = R = 1, Tu = p0): the isobaric density rho0 = Tu/T, then the

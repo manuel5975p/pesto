@@ -134,7 +134,7 @@ std::expected<FvFaceGeom, std::string> fvFaceGeom(const FaceMesh& fm, FvFaceGrad
 }
 
 std::expected<FvGradWeights, std::string> fvGradWeights(const FaceMesh& fm, const FvFaceGeom& geom,
-                                                        FvGradScheme scheme, int threads)
+                                                        FvCellGrad scheme, int threads)
 {
     const std::size_t nC = std::size_t(fm.nC), nI = std::size_t(fm.nI), nF = nI + std::size_t(fm.nB);
     FvGradWeights w;
@@ -143,7 +143,7 @@ std::expected<FvGradWeights, std::string> fvGradWeights(const FaceMesh& fm, cons
         w.own[std::size_t(k)].assign(nF, 0.0);
         w.nei[std::size_t(k)].assign(nI, 0.0);
     }
-    if (scheme == FvGradScheme::GreenGauss) {
+    if (scheme == FvCellGrad::GreenGauss) {
         const int nw = workerCount(threads, nF);
         forBlocks(nw, nF, [&](int, std::size_t lo, std::size_t hi) {
             for (std::size_t f = lo; f < hi; ++f) {

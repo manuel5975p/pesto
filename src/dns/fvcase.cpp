@@ -1353,6 +1353,57 @@ std::expected<void, string> readMrf(const Dict& d, const PolyManifest& man, Foam
     return {};
 }
 
+// fv::options: exactly ONE active constant specific momentum source on every
+// cell, explicit part only. Everything else simpleFoam would apply is rejected.
+std::expected<void, string> readFvOptions(const Dict& d, const string& file, FoamCase& c)
+{
+    const string pre = file + ": fv::options (sources / constraints) are not supported";
+    for (const Entry& e : d.entries) {
+        if (e.key == "FoamFile") continue;
+        if (e.directive) return Err(pre + ": directive '" + e.key + "'");
+        if (!e.dict) return Err(pre + ": entry '" + e.key + "' is not a source dictionary");
+        const Dict& s = *e.dict;
+        auto type = needWord(s, "type");
+        if (!type) return Err(type.error());
+        if (*type != "vectorSemiImplicitSource")
+            return Err(pre + ": type '" + *type + "' (vectorSemiImplicitSource only)");
+        if (auto r = onlyKeys(s, {"type", "active", "selectionMode", "volumeMode", "sources", "injectionRateSuSp"},
+                              file + "/" + e.key);
+            !r)
+            return Err(pre + ": " + r.error());
+        if (const Entry* a = s.find("active")) {
+            auto v = foam::switchOf(s, *a);
+            if (!v) return Err(v.error());
+            if (!*v) return Err(pre + ": an inactive source (remove it)");
+        }
+        for (const auto& [key, want] : {std::pair{"selectionMode", "all"}, {"volumeMode", "specific"}}) {
+            auto w = needWord(s, key);
+            if (!w) return Err(w.error());
+            if (*w != want) return Err(pre + ": " + key + " '" + *w + "' (" + want + " only)");
+        }
+        const Entry* src = s.find("sources");
+        if (!src) src = s.find("injectionRateSuSp");
+        if (!src || !src->dict) return Err(pre + ": '" + e.key + "' needs a 'sources' dictionary");
+        const Dict& q = *src->dict;
+        if (auto r = onlyKeys(q, {"U"}, file + "/" + e.key + "/sources"); !r) return Err(pre + ": " + r.error());
+        const Entry* u = q.find("U");
+        if (!u) return Err(pre + ": '" + e.key + "' has no U source");
+        // ((Sx Sy Sz) Sp)
+        const auto& t = u->value;
+        std::size_t pos = 1;
+        if (t.size() < 2 || !t[0].is('(')) return Err(pre + ": U source must be ((Sx Sy Sz) Sp)");
+        auto v = foam::vectorOf(q, t, pos, u->line, "U");
+        if (!v) return Err(v.error());
+        if (pos + 2 != t.size() || t[pos].kind != Token::Number || !t[pos + 1].is(')'))
+            return Err(pre + ": U source must be ((Sx Sy Sz) Sp)");
+        if (t[pos].num != 0) return Err(pre + ": an implicit coefficient Sp != 0");
+        if (c.uSource) return Err(pre + ": a second U source");
+        c.uSource = FvVec3{(*v)[0], (*v)[1], (*v)[2]};
+    }
+    if (!c.uSource) return Err(pre + ": no source in the file");
+    return {};
+}
+
 } // namespace
 
 const char* fvUBcName(FvUBc b)
@@ -1370,9 +1421,6 @@ const char* fvPBcName(FvPBc b)
 
 std::expected<FoamCase, string> parseFoamCase(const FoamCaseTexts& t, const PolyManifest& man)
 {
-    // fv::options (fvOptions.C reads constant/ then system/): sources/constraints simpleFoam applies.
-    for (const char* f : {"constant/fvOptions", "system/fvOptions"})
-        if (t.contains(f)) return Err(string(f) + ": fv::options (sources / constraints) are not supported");
     FoamCase c;
     c.patches.resize(man.patches.size());
     for (std::size_t i = 0; i < man.patches.size(); ++i) {
@@ -1478,6 +1526,14 @@ std::expected<FoamCase, string> parseFoamCase(const FoamCaseTexts& t, const Poly
     if (!mrf) return Err(mrf.error());
     if (haveMrf)
         if (auto r = readMrf(*mrf, man, c); !r) return Err(r.error());
+    // fv::options (fvOptions.C reads constant/ then system/): sources/constraints simpleFoam applies.
+    for (const char* f : {"constant/fvOptions", "system/fvOptions"}) {
+        bool haveOpt = false;
+        auto o = parseText(t, f, false, haveOpt);
+        if (!o) return Err(o.error());
+        if (haveOpt)
+            if (auto r = readFvOptions(*o, f, c); !r) return Err(r.error());
+    }
     if (c.solverP.solver == "GAMG")
         c.notes.push_back("p: OpenFOAM GAMG -> gpu/la AMG-PCG; OpenFOAM's tolerance/relTol stop reproduced (FP32: "
                           "at max(tolerance, floor)), its iterates are not");
@@ -1630,6 +1686,10 @@ std::string describeFoamCase(const FoamCase& c)
             s += std::format("  RAS solve   nuTilda {} tol {:g} relTol {:g} relax {}\n", r.solverNuTilda.solver,
                              r.solverNuTilda.tolerance, r.solverNuTilda.relTol, rx(r.relaxNuTilda));
     }
+    if (c.uSource)
+        s += std::format("  source      U ({:g} {:g} {:g}) per unit mass on every cell (fvOptions "
+                         "vectorSemiImplicitSource)\n",
+                         (*c.uSource)[0], (*c.uSource)[1], (*c.uSource)[2]);
     for (const FvMrfZone& m : c.mrf) {
         if (!m.active) {
             s += std::format("  MRF         {} INACTIVE\n", m.name);

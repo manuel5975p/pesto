@@ -1,0 +1,785 @@
+# The compressible FV family
+
+Explicit compressible DNS, LES and RANS on any `FaceMesh`, on the GPU. First phase
+of "every solver on every mesh": no per-mesh fork, one solver, one loop.
+
+| route | command | mesh |
+|---|---|---|
+| polyMesh | `dns flow --physics compressible --polymesh DIR --bc FILE.toml --re R --mach M --tt T` | any polyMesh `FaceMesh::fromPolyMesh` reads (`docs/mesh.md`) |
+| O-grid | `dns flow --physics compressible --solver fv --ogrid --body BODY ...` | `fromCurvMesh` of the structured solver's own nodes, fluid rows only |
+| box | `dns flow --physics compressible --solver fv --body none [--stretch B\|--focal BOX] ...` | `fromCurvMesh` of the uniform, stretched or focal mesh |
+
+`dns flow --polymesh CASE` alone stays OpenFOAM simpleFoam (`docs/fv.md`),
+byte for byte.
+
+A flame: `dns flame --solver fv` and `dns flame --polymesh DIR --bc FILE`, "Species", "Diffusion flame".
+
+Source: `src/dns/gpu/fv_comp.{hpp,hip}` (solver),
+`src/dns/gpu/runner_fvcomp.{hpp,hip}` (loop), `src/dns/fvcomp_config.*` (the
+`--bc` file, pure), `src/dns/fvcomp_case.*` (FvBc table, freestream),
+`src/dns/fvraster.*` (frame plane). Physics: `src/dns/fvflux.hpp`.
+
+## Scheme
+
+The FvRef scheme (`docs/mesh.md`, "The FV face physics"), device instantiation
+of the same templates, the same pass order:
+
+    primitives -> boundary states -> cell gradients of u, v, w, T -> [mu_t]
+      -> face fluxes F[5][nI + nB] (materialized) -> gather + stage
+
+- **R in {float, double} from one source** (`FvCompImpl<R>`, `--fv-precision`,
+  FP32 default). Tables are narrowed once; dt is an exact min; tallies and
+  budgets are downloaded and summed in ascending index in FP64. Own-index writes,
+  no FP atomics: reruns are byte-identical.
+- **SSP-RK3**, fused: `out = ca a + cb b + cr R(b)`, `ca = 1 - cb` (Sterbenz).
+  Three state buffers. Stage 3 writes `q1` and swaps, so an output never aliases
+  `a`: a later rhs hook may re-read it, and no caller holds a raw device pointer
+  across a step.
+- **dt**: FvRef's Sigma forms per cell (`2 cfl V / Sum(|u.S| + c|S|)`,
+  `diff rho V / (mu max(4/3, gamma/Pr) Sum corr.S)`), with `mu_t` at its own factor
+  `max(4/3, gamma/Pr_t)`. Recomputed every `--dt-recompute` steps (16), margin
+  0.95, as the structured loops. A bad cell is named: `FV state diverged: rho R p P
+  at cell C` (exit 7).
+- **Empty faces are compacted out** of the face tables and the CSR, which stays
+  ascending. Device CSR entries carry the gather code `f << 1 | side`, the gradient
+  operand (`other` cell or `~b`) and weights.
+- **`--compensated`** (FP32): the structured two-word state, hi + lo per state
+  word, `internal::combineWord2`, a compile-time kernel instantiation. See
+  "FP32 on a steady flow". FP64 rejects it (exit 2).
+
+**Quiet start.** `--ramp`: the IC at rest, the freestream raised by exact
+Galilean boosts over `[0, ramp]` with the Far/Inflow rows of the table following,
+as `runner_ogrid`. Default as the structured flow on `--solver fv`, 0 on a
+polyMesh (name it: a mesh with walls wants it).
+
+**LES.** `--les C --sgs smag|sigma`: `mu_t = rho C^2 Delta^2 op(grad u)`
+(`sgsRate`, the structured operators), `Delta^2 = V^(2/3)`, 2D: cell area
+(`curvDelta2`'s rule). Face mean into `mu`, `mu_t cp / Pr_t` into `kappa`, Pr_t
+0.9 (the structured `prt_`). `grad u` is the FV cell gradient. A Wall face carries
+the molecular stress only (`mu_t` odd across the wall), a Slip face the owner's
+`mu_t`. Sigma is rejected on a 2D mesh by name (exit 2): `nz == 1`, or an `empty`
+patch in the manifest. Label: `LES <model> C=...`.
+
+**Forces.** Wall (and `force = true` Slip) faces, from the state at the row:
+gauge pressure force `(p_P - p_inf) S`, viscous `-tau.S`, heat into the body.
+FP64 sums. cd/cl/cs on `direction`/`lift`, `refArea` = `L x depth` on a 2D mesh,
+`D x span` on an O-grid, `reference.area` on a 3D polyMesh (required with a
+tally). Stats: `t,dt,cd,cl,cs,heat,machMax,cdf,clf,mass,energy,kinetic`.
+
+**Frames.** An unstructured mesh has no raster, so every FV frame on any mesh is
+a uniform plane (`FvRaster`): nearest centroid as a first guess, then a walk
+across faces to the containing cell; value per pixel, no blending; mask 0 outside
+the mesh, so a body is a hole. 2D: the mesh plane. 3D: the z mid-plane.
+`--frame-box a,b,c,d`, `--frame-n N`. Channels: `vort` (2D) or `curl`, `speed` or
+`dspeed`. `--emit stats|bin|png|web|shm`. Rejected by name: `volume`, `slices`,
+`vtk`, `surface`, `mesh`, `spectrum`, `snapshot`, `error`.
+
+## The `--bc` file
+
+Read in phase 1.5 (the `--scene` precedent), strict: an unknown table, key or
+kind, a wrong type, exit 3 by name. `--dry-run` reads it and the manifest, no GPU.
+
+```toml
+[reference]                # all optional
+length = 1.0               # L in Re = rho U L / mu, the time unit of --tt
+area = 0.5                 # force reference; default L x depth (2D); 3D: required with a tally
+direction = [1, 0, 0]      # freestream
+lift = [0, 1, 0]           # normal to direction
+
+[patch.NAME]               # one per non-cyclic, non-empty mesh patch
+type = "wall"              # wall | slip | inflow | outflow | far | empty
+thermal = "isothermal"     # wall: adiabatic (default) | isothermal
+twall = 1.1                # T_w / T_inf
+u = [0, 0, 0]              # wall velocity / U
+omega = [0, 0, 0]          # wall rotation
+origin = [0, 0, 0]
+force = true               # wall default true, slip default false
+# inflow: u (default the freestream), t (T / T_inf)
+# outflow: p (p / p_inf), tback (T / T_inf at backflow)
+```
+
+Bound against the patch list: an unbound patch, a binding with no patch, a bound
+cyclic (an internal face), `wedge`: exit 3 by name. `examples/fvcomp_cyl2d_snappy.toml`.
+
+Box units: rho 1, U 1, `p = 1/(gamma M^2)`, `T = p`, `mu = L/Re`.
+
+## CLI: what is rejected
+
+`--solver fv`: allow-list in `config.cpp`, every other flag exit 2 by name: all
+`--nscbc-*`, `--pot`, `--rotor-*`, `--thin-seal`,
+`--penalize`, `--cut-flux`, `--temp`, `--scene`. An immersed body exit 2 (FV has no
+immersed wall). The revolved O-grid exit 2 (P8). `--solver fv` dispatches on
+`--physics`: `compressible` is this path, the default is `docs/fvincomp.md`. On
+the polyMesh route likewise; `--re --mach --tt --bc` required, `--solver fv`
+implied. `--physics` picks the `--bc` parser: an incompressible file's `kind`,
+`[initial]` or `reference.u` is exit 3 by name. `--bc`, `--tt` off the polyMesh route, `--fv-precision`, `--frame-*`
+off the FV routes: exit 2. Box faces are `Far`, `--noslip` y `Wall`, `--far
+periodic` cyclic: the structured far-field machinery does not exist here, and
+`--dry-run` says so in its `patches` line.
+
+## RANS
+
+`--rans sa-neg|sst-2003m|sst-vm` on every route with a wall: `--solver fv --ogrid`,
+`--solver fv --body none --noslip`, `--polymesh DIR --bc FILE`. The closures are
+`dns/rans.hpp`, the ONE home of every constant (SA-neg with ft2, SST-2003m,
+SST-Vm); the algebra on a face is `dns/fvrans.hpp`, shared by FvRef and the device.
+OpenFOAM's RAS of `gpu/fv_simple` is a separate model and is untouched. Label:
+`RANS SA-neg -- URANS (time-accurate)` or `-- steady (local time stepping:
+pseudo-time, not time-accurate)`, plus `[exact wall distance, scalars first-order
+upwind]`. `--rans none`: no scalar row, no pass, no buffer.
+
+**Passes.** State rows 5.. hold rho nu~ | rho k, rho omega. Per stage, after the
+velocity and T gradients: specific scalars (SA: nu~, rho; SST: k, omega) -> their
+boundary values -> their LSQ gradients -> `mu_t`, F1, cell terms (`kFvRansCell`)
+-> the mean-flow faces (the LES instantiation: `mu_t` rides `nut`, Pr_t 0.9) ->
+mean gather -> scalar faces -> scalar gather, point-implicit (`pointImplicit`,
+`pointImplicitDelta` on the two-word state).
+
+**Faces.** Convection first-order upwind of the specific scalar on `F[0]`, the
+mean flow's own mass flux, so a uniform specific scalar 2^-13 stays exactly uniform
+(R4). Coefficients are formed on the face: SA `rho_f (nu_f + nu~_f fn(chi_f))`,
+SST `mu_f + sigma(F1_f) mu_t,f` with F1, `mu_t` face means. Gradient: the FV
+corrected face gradient. Cell terms read FV cell gradients: `Omega`, `S` from the
+velocity LSQ gradient; SA's cb2 and grad rho terms, SST's `grad k . grad omega`.
+
+**Boundaries are face fluxes, as everywhere on this path.**
+
+| kind | gradient's face value | scalar flux |
+|---|---|---|
+| Wall | nu~ 0, k 0, `omega_w = 60 mu_w/(beta1 rho_w d1^2)`; SA rho: `rho_w` | no convection; `-(mu_w/sigma) grad nu~.S`, `-mu_w grad(k, omega).S`: `mu_t` EXACTLY 0 on the face |
+| Slip | the owner's | 0 |
+| Inflow, Outflow, Far | upwind on the boundary velocity: the owner's leaving, `phi_inf` entering | `F[0] phi_b`, no diffusion |
+
+`rho_w`: the EOS at `T_w`, isothermal; the owner's, adiabatic (the mean wall state
+holds `rho_P` either way, so this is the scalars' own). `mu_w`: `bndViscous`'s.
+`d1`: the owner cell's wall distance. **The wall face's mean-flow flux is the laminar
+one, bit for bit, whatever `mu_t`** (R5).
+
+**Wall distance.** `fvRansWallDistance` (`dns/fvcomp_case`): exact, nearest point on
+the faces of the Wall-KIND patches (`--bc` decides, not the polyMesh type word),
+FaceMesh centroid, `dns/fvwalldist`'s BVH. meshWave is not used: it refuses cyclics.
+Every route the same. On an O-grid this is not `ogridWallDistance` (node-mean
+centroid, discrete polyline): a truncation-order difference.
+
+**dt.** FvRef's Sigma bound with `mu_t` at `max(4/3, gamma/Pr_t)`, SA also `rho
+max(nu, K)/sigma` (`saDtDiffusivity`). SST's `mu_t` is the cell's own, not the
+structured upper bound. A non-finite `mu_t` is a diverged cell.
+
+**Guard.** SST `k >= 0`, `omega >= floor rho`: counted (`floorHits`, stats column),
+never silent. `nu~` is never clipped. Stats append `mutMax`, SST `floorHits`.
+
+**`--steady TOL`.** Local time stepping: `DeviceFvComp::localDt` makes `lts[c] =
+dt_c/dtRef`, every stage writer (mean gather, force, scalar gather) reads `cr
+lts[c]`; a compile-time kernel instantiation, off = the kernels bit for bit. FP32
+marches the two-word state, as the structured solver. Stops on `steadyFloor`: cd,
+cdf observables, kinetic energy and the scalars' integrals monitors. Exit 8 past
+`--steady-steps`. Needs a tallied wall. LTS conserves `Sum V rho / lts`: the
+channel's mass drifts (+1.4e-5 at ny 32 from the oracle, shrinking with h), and the
+channel's steady equations are a one-parameter family in mass, so the oracle is
+solved AT the march's mass. A certified `--steady` stop on an external flow is NOT
+measured: below.
+
+**The drive.** `FvCompConfig::bodyForce`: constant force per volume, `m + f`, `E +
+f.u`, the oracle's channel force; a pass after the mean gather, none at 0. Library
+only: no CLI route to a body force on this path.
+
+### RANS verification
+
+Agreement proves the port, not the physics. `gpu_fv_rans`
+(`tests/test_gpu_fv_rans.cpp`), `tools/fv/rans_ladder.sh`:
+
+| solver pair | mesh | quantity | expected relation | measured |
+|---|---|---|---|---|
+| R1 FV(FP64) vs FvRef, 3 closures | box_cyclic (adiabatic, isothermal moving walls); cyl2d_snappy (spinning isothermal wall, inflow, outflow, slip, far, Sutherland); SA both signs, force on | every RANS pass, mean fluxes, rhs, 3 steps, dt | rounding <= 1e-13 | rhs 1.5e-15, boundary values 7.1e-16, scalar gradients 8.4e-16, mu_t 4.6e-16, F1 1.5e-15, cell terms 4.2e-16, scalar fluxes 3.0e-16, mean fluxes 1.4e-15, steps 9.4e-16, dt 1.1e-16 |
+| R2 FV(FP32) vs FP64 | same | rhs, 3 steps | <= 1e-3, 2e-5 | 1.2e-6, 4.7e-7 |
+| R3 nu~ 0 / k 0 vs laminar FV | same, 3 closures, FP32, FP32 compensated, FP64 | mean rows after 20 steps, dt | bitwise | memcmp equal |
+| R4 uniform specific scalar 2^-13, transport | same, FP32, FP64 | phi after 40 steps | bitwise | 0 |
+| R5 RANS vs laminar wall face | same, 3 closures | wall F, all 5 rows; mass | bitwise; 0 | equal; 0 |
+| R6 rerun | same, 3 closures, both precisions | 20 steps; floor hits | bytes equal; 0 | equal; 0 |
+| R7 compensated vs FP64 | cyl2d_snappy, dt 2% of stable, 2000 steps | state | <= 0.2 x plain | 5.5e-7 / 5.4e-7 / 5.4e-7 (plain 1.3e-4 / 1.4e-4 / 1.0e-4) |
+| FV(FP64) vs `rans_channel1d`, SA-neg | channel Re_tau 180, M 0.2, beta 2, ny 32 / 64 / 128, 4 x ny on a cyclic + empty FaceMesh | ub at the oracle at the march's mass | order 2 | -4.226e-3 / -1.049e-3 / -2.634e-4 (2.01, 1.99) |
+| same, SST-2003m | same | ub | order 2 | -3.764e-3 / -9.048e-4 / -2.307e-4 (2.06, 1.97) |
+| same, SST-Vm | same | ub | order 2 | -3.778e-3 / -9.079e-4 / -2.315e-4 (2.06, 1.97) |
+| same, u+ profile, 3 closures | same | max over rows, of u_c | order 2 | SA 4.25e-3 / 1.06e-3 / 2.65e-4; 2003m 3.88e-3 / 9.35e-4 / 2.37e-4; Vm 3.90e-3 / 9.38e-4 / 2.38e-4 |
+| same, scalar profile | same | nu~ (SA), k (SST), max of scalar | order 2 | SA 2.98e-3 / 6.64e-4 / 1.77e-4; 2003m 1.32e-2 / 3.25e-3 / 8.08e-4; Vm 1.33e-2 / 3.27e-3 / 8.11e-4 |
+| same, wall stress | same | tau_w vs 1 | fixed point | 1.00000004 (the stop's tail, ub within 2e-8): the force balance, not a free number |
+| same, SA-neg | Re_tau 1000, beta 3, ny 64 / 128 / 192 | ub | order 2 | -1.959e-3 / -4.886e-4 / -2.175e-4 (2.00, 2.00) |
+| same, SST-2003m | Re_tau 1000, beta 3, ny 64 / 128 | ub | order 2 | -1.392e-3 / -3.292e-4 (2.08). ny 192 NOT MEASURED: the ORACLE stops at resid 3.1e-11 > tol 1e-11 in 400 iterations (exit 1): `test_gpu_fv_rans channel sst-2003m 1000 192 3` |
+| R8 (`gpu_fv_rans_channel`) | Re_tau 180, ny 24 / 48, 3 closures | ub | order >= 1.5 | 1.98 / 1.98 / 2.04, hits 0 |
+| FV vs structured O-grid, SA-neg, both compensated, URANS | Re 1e4, M 0.2, far 20 D, beta 4, 128x50 / 256x98 / 512x194, y+ max 1.8 / 0.84 / 0.41 | cd at t 8.283 (impulsive transient, not shedding) | order 2 | 0.863346, 0.867796 / 0.898745, 0.898583 / 0.905894, 0.905847: +4.45e-3 / -1.62e-4 / -4.7e-5. Sign change on rung 1, then 1.79. cd itself still moves 0.8% between the last two |
+| same | same | cdf | none claimed | 0.0222309, 0.0222456 / 0.024095, 0.024106 / 0.0243343, 0.0243419: +1.5e-5 / +1.1e-5 / +7.6e-6: shrinks at ~0.5, order NOT established |
+| same | same | mu_t max / mu | none claimed | 230.7, 228.8 / 276.6, 276.2 / 304.0, 303.9 |
+| same, SST-2003m | same | cd at t 8.283 | order 2 | 0.802099, 0.880578 / 0.825073, 0.823702 / 0.799611, 0.799144: +7.85e-2 / -1.37e-3 / -4.67e-4. Rung 1 is off the asymptote (y+ max 1.7, the two disagree 10%); last pair order 1.55. cd itself non-monotone: not asymptotic |
+| FV vs structured O-grid `--steady 1e-3`, SA-neg | Re 1e3, M 0.2, 128x50, beta 4 | stop; cd, cdf mean, last half of 1e6 iterations | converged limit | NEITHER certifies: both exit 8, cd jitter 3-5%, no steady wake (the known LTS sawtooth). Means, of a limit cycle, not a limit: structured 1.0831, 0.09662; FV 1.0461, 0.09394 |
+| `--rans none` FV and every other path vs baseline binary | `comp_bit_identity.sh`: 10 runs, stats and fields | bytes | bitwise | identical, files non-empty (0 failures) |
+
+Order 1.5 in R8 is a gate set AFTER the ladder (X4's value), not a measured margin.
+The channel starts FROM the oracle: it pins the fixed point, not a cold start. FV's
+ub sits below the oracle at every rung: on a stretched mesh LSQ and central cell
+gradients differ, and the wall cell's LSQ gradient is one-sided where the oracle's
+ghost is an image. That difference converges at 2, so it is truncation, not a gap.
+FP64 only: an FP32 channel is not on this table.
+
+
+Compared with care: `gpu_sst`, `gpu_sa_wedge`, `gpu_precond` fail at baseline
+(issues 78(h)) and were not read as oracles.
+
+## Combinations
+
+Species (`dns flame`), RANS (`dns flow`) and gravity (`dns conv`) share `gpu/fv_comp`,
+`FvRef` and one stage (`gatherStage`: mean rows, gravity, drive, species, scalars). They
+were built apart and no gate composes them, so a pair is refused, never run. Rule: a pair
+goes live with its test in the same commit.
+
+| Pair | Decision | Refused at | Why |
+|---|---|---|---|
+| species + RANS | rejected | `--rans` is no `dns flame` flag (exit 1); `--bc` `y`, `burnt`, `reference.origin` on `dns flow`, `dns conv` (exit 2); `FvRef::make` (exit 3) | rows 5.. have two users; no turbulent scalar flux or TFLES analogue |
+| species + gravity | rejected | `--gravity` off the `dns flame --solver fv` allow-list (exit 2); `FvRef::make` | no combustion gate under gravity; an open face has no hydrostatic ambient |
+| species + LES | rejected | allow-list; `DeviceFvComp::make` | no species SGS flux |
+| species + `bodyForce` | rejected | no CLI spelling; `FvRef::make` | untested |
+| RANS + gravity | rejected | `--rans` is no `dns conv` flag, `dns flow` has no `--gravity`; `FvRef::make` | no buoyancy term in the closures |
+| gravity + LES | rejected | no `--les` on `dns conv`; `DeviceFvComp::make` | no buoyancy term in the SGS model |
+| gravity + `bodyForce` | rejected | no CLI spelling; `FvRef::make` | untested |
+| species + `--steady` | rejected | no `--steady` on `dns flame`; `localDt` | `kFvChem` takes the bare cr: the fixed point would move with lts |
+| gravity + `--steady` | rejected | no `--steady` on `dns conv`; `localDt` | `kFvGravity` takes the bare cr |
+| species + `--compensated`, FP64 | allowed | | S3, S4 in plain FP32, compensated, FP64 (`gpu_fv_flame`) |
+| gravity + `--compensated`, FP64 | allowed | | `gpu_fv_conv`; compensated is the FP32 default on that route |
+| RANS + `--compensated`, FP64, `--steady` | allowed | | `gpu_fv_rans`; FP32 `--steady` forces the two-word state; FP32 on the channel fixed point: not run (issues.md 84d) |
+
+`--compensated --fv-precision fp64` is rejected on every route (`fvCompCommon`).
+`tests/test_fv_comp.cpp` `comboGate` pins each spelling and each `FvRef::make` refusal.
+
+## Cross-verification
+
+OpenFOAM is absent here: the structured solver is the oracle. **This table is
+the template every later phase fills in.** Relation: *bitwise*, *rounding* (the
+schemes are pinned equal, growth is a bug), *order p* (the discretizations differ
+legitimately, the difference must shrink at p), *converged limit* (two different
+models, compared at convergence, never bitwise).
+
+| solver pair | mesh | quantity | expected relation | measured |
+|---|---|---|---|---|
+| `gpu_fv_comp` FV(FP64) vs FvRef | box_cyclic, box_refined, cyl2d_snappy | rhs, every pass, 3 steps | rounding | ≤ 2.2e-15 |
+| FV(FP64) vs `Comp::rhs` | uniform periodic 8x6x5 | rhs | rounding | 3.0e-15 |
+| FV(FP64) vs `Comp` (X1) | TGV 32³, M 0.3, Re 200, same dt | state, step 1 / 100 / 400 | rounding, no growth | 9.7e-14 / 1.6e-14 / 6.1e-14 |
+| FV(FP32) vs `DeviceComp` (X1) | same | state, step 1 / 100 / 400 | rounding: ≤ 3 x structured FP32 vs FP64 | 5.2e-5 / 4.9e-6 / 8.6e-6 (own 3.8e-5 / 3.9e-6 / 7.0e-6) |
+| FV(FP32) vs `DeviceComp` LES smag Cs 0.17 (X2) | TGV 32³, Re 2000 | state, step 400; mu_t | rounding: ≤ 3 x FV FP32 vs FP64 | 1.6e-5 (own 1.6e-5); mu_t 1.4e-5 of max |
+| same, sigma Csigma 1.35 (X2) | same | state, step 400; mu_t | rounding | 3.2e-5 (own 2.5e-5); mu_t 1.7e-4 of max |
+| FV(FP64) vs `Comp` curvilinear (X3) | sinusoidal periodic 2D, N 32 / 64 / 128 | rhs; state at t 0.1 | order 2 | rhs 3.8e-4 / 9.5e-5 / 2.4e-5 (2.00); state 1.5e-5 / 3.9e-6 / 9.8e-7 (1.99) |
+| FV vs structured O-grid, both compensated (X4) | Re 40, M 0.2, 64x32 / 128x64 / 256x128 | cd at t 12.6, before the wake reaches the far row | order 2 | 2.98e-3 / 8.0e-4 / 2.5e-4 (1.90, 1.68) |
+| same (`comp_ladder`) | Re 40, 96x48 / 192x96 / 384x192, far 20 D | cd at t 10 | order 2 | 9.8e-4 / 4.0e-4 / 1.2e-4 (1.29, 1.74) |
+| same (X5, `gpu_fv_far`) | Re 40, M 0.2, 96x48 / 192x96 / 384x192, far 20 D | settled cd, window means flat to 3e-6 | order 2 | structured 1.565929, 1.566620, 1.56685; FV 1.564501, 1.566207, 1.56669: -1.43e-3 / -4.13e-4 / -1.6e-4 (1.79, 1.37). 384x192 stopped by the 290 s cap at t 59.46, both read at that t, FV still moving 2e-5 per 7 t |
+| same | Re 40, M 0.1, 96x48 / 192x96, far 20 D | settled cd | order 2 | -1.43e-3 / -4.13e-4 (1.79), same as M 0.2 |
+| same | Re 40, M 0.2, 192x96, far 10 / 20 / 40 / 80 D | settled cd difference | h error | -6.9e-4 / -4.1e-4 / -5.5e-4 / -1.18e-3 (was +1.35e-2 / +5.8e-3 / +2.3e-3 / +1.5e-4). The rise past 20 D is the wall cell: at fixed ny, h1 grows with R |
+| same | Re 40, M 0.1, far 80 D, 128x64 / 192x96 | settled cd | order 2 | 1.51104, 1.51112; 1.50826, 1.50995: -2.8e-3 / -1.2e-3 (2.1) |
+| same | Re 40, M 0.1, far 160 D, 128x64 / 192x96 | settled cd | order 2 | 1.51051, 1.50800; 1.49988, 1.50405: -1.06e-2 / -4.0e-3 (2.4) |
+| same | Re 100, trip 0.05, 48x24 / 96x48 / 192x96, far 20 D | mean cd, t 200-316 | order 2 | 1.471937, 1.469549 / 1.386270, 1.385530 / 1.378701, 1.378607: -2.39e-3 / -7.4e-4 / -9.4e-5 (1.69, 2.98) |
+| same | same | St | order 2 | 0.19551, 0.19612 / 0.17509, 0.17521 / 0.16769, 0.16772: 6.1e-4 / 1.2e-4 / 3e-5 (2.3, 2.0). St itself moves 4% between the last two rungs: not asymptotic |
+| same | same | cl rms, t 200-316 | none claimed | 0.271402, 0.270738 / 0.203835, 0.203496 / 0.235742, 0.235656: 6.6e-4 / 3.4e-4 / 8.6e-5. cl rms itself non-monotone in h, window not shown to be a limit cycle |
+| immersed `DeviceComp` ghost wall vs FV body-fitted | Re 40: 40 D box NSCBC vs 40 D diameter disc, not the same domain | cd | converged limit, two walls | immersed 12.8 cells/D 1.5714 (flat t 64-80, cl 0.03), 25.6 cells/D 1.5791 at t 51 and still falling. FV 384x192 1.5729. CONVERGENCE NOT MEASURED |
+| plain FP32 vs FP64 (FV) | Re 40, 128x64 | cd, settled | "FP32 on a steady flow" | 1.5665-1.5764 vs 1.571630 |
+
+Orders above rest on 3 levels and nothing finer. Finer rungs: "not measured",
+see "Reproducing the long numbers".
+
+
+### What differs between the schemes, and what must not
+
+Equal on a uniform periodic box: everything. LSQ gradients are central
+differences, `AlongD` is the compact normal gradient (G1, X1).
+
+Different on a curvilinear mesh: FV cell gradients are least squares, structured
+ones come through metrics; a FaceMesh volume is OpenFOAM's pyramids, not
+`CurvMetrics::vol` (warp order); `C` is the pyramid centroid. Truncation order, so
+the difference is O(h^2) (X3).
+
+Different at a wall: FV's wall face is a flux of the boundary state, `p_P`, the
+face gradient corrected along `d` from the owner's LSQ gradient. The structured
+wall is a ghost row with an antimirrored image, a face mean, tangential derivatives
+exactly 0. Both second order on cd (X4).
+
+Different at the far boundary: FV `Far` is the 1D characteristic state on the
+face, nonlinear, sharp upwind switch, no viscous flux. The structured O-grid far
+row is the linearized LODI state as a reflected ghost row, tanh blend, viscous
+flux through the face. Equal to first order on an entropy wave since the fix
+below; the differences left are measured there and do not reach cd.
+
+### Far gap
+
+**Closed: it was a bug in `Far`.** The settled cd used to plateau under h (+4.8e-3,
++5.8e-3, +6.0e-3 at 96 / 192 / 384, far 20 D). The outgoing invariant read `c_P`,
+but `u_n + 2c/(gamma-1)` is invariant only at constant entropy. The wake is warm
+(`dT/T ~ (gamma-1) M^2 du/U`), so the row read the entropy wave as an acoustic
+wave: `2/(gamma-1) dc = M du` against the true `du`, a spurious pressure and
+normal velocity across the wake, relative size M. The term now reads the
+ISENTROPIC sound speed of the pressure, `cF (p_P/p_F)^((gamma-1)/(2 gamma))`, and
+the boundary p comes from `cb/cF`, density from the upwind entropy. A pure entropy
+wave leaves p and u_n untouched (`test_fvref`, exact).
+
+Each row of the old `Far` swapped for the structured one, FV 96x48, Re 40, M 0.2,
+far 20 D, structured 1.565929:
+
+| FV far row | cd | FV - structured |
+|---|---|---|
+| old `Far` | 1.570760 | +4.83e-3 |
+| + viscous flux through the far face | 1.57082 | +4.89e-3 |
+| structured LODI state, Euler flux | 1.564491 | -1.44e-3 |
+| + tanh band 1e-2 -> 1e-4 | 1.564492 | -1.44e-3 |
+| + viscous flux | 1.56457 | -1.36e-3 |
+| + reflected ghost, KG flux (the structured row entire) | 1.56457 | -1.36e-3 |
+| `Far`, isentropic `c` (the fix) | 1.564501 | -1.43e-3 |
+
+The whole structured row and the one-term fix agree to 7e-5; viscous flux, band and
+ghost form are worth 8e-5 at most. The prediction "relative size M" held: 192x96
+old gap +5.8e-3 at M 0.2, +3.0e-3 at M 0.1; fixed gap -4.13e-4 at both. Fixed gap
+vs h and R: table above. The old 80 D +1.5e-4 was a sign crossing, not agreement.
+
+What stays: FV and the structured row are still two forms of one characteristic
+model (nonlinear vs linear, face vs ghost). Neither answers the source term of a
+drag wake, so cd carries a D/R blockage on both, the same size now: 1.6545, 1.5662,
+1.5348, 1.5230 at 10, 20, 40, 80 D (FV, 192x96, M 0.2). No R -> infinity limit is
+extrapolated. Past 20 D at fixed `--ny` the wall cell grows with R (h1 7.5e-3,
+3.0e-2, 6.1e-2 at 20, 80, 160 D, n 128), so an R ladder there is also an h ladder.
+
+
+### FP32 on a steady flow
+
+A plain FP32 state drops every update below `ulp(q)/2`: `E ~ 45` at M 0.2, `ulp`
+3.8e-6, `dt` 4e-4, so a residual under 5e-3 is not applied. On a steady cylinder
+that is not a floor but a slow limit cycle:
+
+| O-grid 128 x 64, Re 40, M 0.2 | cd |
+|---|---|
+| FV FP32 plain | wanders 1.5665-1.5764 with period ~250 (t units), total mass pulsing 2.7e-4, to t 900 |
+| FV FP64 | 1.571630, 6 digits flat from t 55 to t 222, cl 1e-12 |
+| structured FP32 plain | 1.5650-1.5665 over t 150-944 |
+| structured `--compensated` | 1.56624 at t 96 |
+
+A number off a settled FV flow in plain FP32 is not a number. Use `--compensated`
+(gate O11: at dt 2% of stable, 4000 steps, 8.2e-7 vs FP64 where plain sits at
+1.8e-4) or `--fv-precision fp64`.
+
+## Species
+
+`dns flame --solver fv` (the flags' uniform box) and `dns flame --polymesh DIR --bc
+FILE` (any polyMesh): the premixed one-step flame of model C0 (`docs/chem.md`) on
+FaceMesh. One solver, one loop: `runFvComp` with `FvCompRun::flame`. `FvChem` in
+`dns/fvflux.hpp`; `nY == 0` launches no species kernel and is the solver byte for byte.
+
+Passes, FvRef's and the device's:
+
+    primitives -> boundary states -> Y, omega -> boundary Y -> [u v w T gradients]
+      -> mean fluxes -> grad Y -> species fluxes on F[0] -> gather every row -> the step
+
+- **State** `[5 + nY][nC]`, up to 4 species. Flux rows `5 + nY` wide. The mean-flow
+  kernels are the ones they were; they stride by `nV`.
+- **Convection**: the species rides the face's own `F[0]`, read out of the flux row,
+  so a uniform Y gives `F_Y = Y F_rho` and the mass flux is one number.
+- **Face value** (`fvFaceY`): upwind on `mdot`, `Y_up + MC(d1, d2)/2`, `d2 = Y_down -
+  Y_up`, `d1` the VIRTUAL upwind difference `2 grad Y_up . r - d2`, `r` up to down
+  (Darwish-Moukalled). LSQ's gradient on a uniform mesh is central, so `d1 = Y_up -
+  Y_upup`: the structured `faceY` stencil, to rounding (`fv_comp`, 1e-15). An
+  unstructured mesh has no second neighbour; this is the same limiter with the only
+  second difference it has.
+- **Diffusion**: `rho D = mu / Pr` at the face's own mu, the corrected face gradient
+  of Y. Le = 1.
+- **The step**: ONE omega per stage (`arrheniusRate`, the structured expression), read
+  by the fuel row and by `E`. The rate floors Y, the state is never clamped, `yHits`
+  counts `Y` outside `[-1e-6, 1 + 1e-6]`.
+- **Boundaries** (`fvBoundaryY`): an open face's flux is `mdot Y_b`, `Y_b` the row's
+  `y[s]` where `mdot` comes in, the owner's where it leaves, no diffusion (the
+  structured `ScalarBoundary` rule). Wall, Slip: `mdot` 0, zero gradient, no flux.
+- **The gather**: species rows go through the same `kFvGather` source as the mean rows
+  (`First`, `Count` template arguments), then `kFvChem` adds `-cr omega` and `+cr q
+  omega`. Two kernels of different shape fused `cb X + cr R` into different FMAs:
+  a compensated uniform Y walked off rho's bits, or a compensated passive species moved
+  the mean flow (S3, S4 caught both). Same source, the rows scale bit for bit.
+- **dt**: `min(stableDt, 0.5 / max J)`, `J` the structured `chemStableDt`, FP64 from
+  the state words. Species diffuse under the thermal factor `max(4/3, gamma/Pr)`
+  already.
+
+**Open faces of the flame.** No NSCBC and no sink on a FaceMesh. x-lo is `Far` at the
+fresh state (absorbs acoustics), x-hi `Outflow` at the burnt pressure `p_b = p0 - m^2
+(sigma - 1)`. An `Inflow` + `Outflow` pair would be a closed organ pipe.
+
+**`--bc` for a flame.** The file of "The `--bc` file", plus:
+
+```toml
+[reference]
+direction = [0.94, 0.34, 0]  # the flame normal, burnt side +; the freestream
+origin = [0, 0, 0]           # s = (C - origin) . direction; the flame sits at s = --upstream delta_th
+[patch.in]
+type = "far"                 # far, inflow, outflow
+y = [1.0]                    # mass fractions an incoming face carries
+[patch.out]
+type = "outflow"
+burnt = true                 # p = p_b, T_back = T_b; excludes p and tback
+```
+
+A `dns flow` file with any of `y`, `burnt`, `reference.origin` is exit 2 by name.
+
+**Stats.** The structured runner's columns, same names, then `burn`, `fuel`:
+`FvFlameProbe` (`dns/fvflame`) bins cells by centroid into slabs normal to `direction`,
+width the mean `|d . dir|`, so on a Cartesian mesh a slab IS a structured column and
+the x_f, delta_th (parabolic peak), S_L formulas are `runner_flame`'s. `energy` is
+`Sum V (E + q rho Y)`. `--profile-dt` writes slab means. Frames: `temp`, `fuel`,
+`omega`. Exit 8 when x_f comes within 2 delta_th of an end.
+
+Rejected by name on this route: every `--nscbc-*`, `--les`, `--tfles`, `--turb`,
+`--hold-flame`, `--equivalence`, `--mode` other than premixed, checkpoints; the mesh
+flags with `--polymesh`. `--physics lowmach` on this route is `docs/fvincomp.md`
+"Low-Mach". Off it: `--bc`, `--fv-precision`,
+`--compensated`, `--frame-*`.
+
+### Species cross-verification
+
+Same table rules as "Cross-verification". S_L is the mean over [7, 14], delta_th the
+oracle's 1.60165 at sigma 5, beta 8, Pr 0.72, M 0.01 unless stated, u_in 0.98.
+
+| solver pair | mesh | quantity | expected relation | measured |
+|---|---|---|---|---|
+| FV(FP64) vs FvRef (S1) | box_cyclic, box_refined, cyl2d_snappy | rhs, Y, omega, grad Y, boundary Y, fluxes, 3 steps, chem dt | rounding, 1e-13 | rhs 5.5e-16 / 3.3e-15 / 4.0e-15; species flux 1.6e-16 / 1.6e-16 / 3.8e-16; 3 steps 3.8e-16 / 5.6e-16 / 5.7e-16; grad Y 0 / 5.9e-16 / 2.1e-16; chem dt 0 |
+| FV(FP32) vs FV(FP64) (S2) | same | rhs; 3 steps | O2's bounds 2e-5, 2e-6 | 1.1e-6 / 4.9e-6 / 3.7e-6; 2.3e-7 / 2.8e-7 / 3.7e-7 |
+| uniform Y 0.25, 0.5 (S3) | same, every boundary kind, 40 steps | rho Y vs Y rho | bitwise | bitwise: FP32, FP32 compensated, FP64 |
+| passive species vs nY 0 (S4) | same, 40 steps | mean rows | bitwise | bitwise, all three |
+| burning box (S5) | uniform periodic, box_cyclic walls, box_refined; 16-56% of the fuel burnt | mass, E + q rho Y, passive rho Y; Sum V R_Y + Sum V omega | rounding, 1e-13 | mass 2.9e-15; E + q rho Y 2.2e-15 / 3.6e-15 / 5.1e-15; passive 1.6e-15 / 2.9e-15 / 2.0e-15; budget 9.8e-16 / 2.2e-16 / 1.1e-15 |
+| FV(FP32) vs structured `kSpeciesStage` (S8) | uniform periodic 128x32, burning, M 0.05, same dt, 400 steps | full state | rounding: <= 3 x FV FP32 vs FP64 | 3.3e-5 (own 4.1e-5); structured vs FV FP64 4.6e-5 |
+| FV(FP64) vs oracle | 1D box, 7.5 / 15 / 30 cells per delta_th | S_L - 1 | order 2 with an O(M^2) offset | +1.69e-2, +3.47e-3, +4.37e-4 (2.28, 2.99); about the offset `1 - gamma M^2 (sigma - 1)` (-5.6e-4): 1.75e-2, 4.03e-3, 9.97e-4 (2.12, 2.01). Spans in the window 2.9e-4, 8.0e-5, 2.0e-5 |
+| same | same | delta_th - oracle | order 2 | -4.84e-2, -1.05e-2, -1.79e-3 (2.20, 2.55) |
+| FV(FP64) vs structured (FP32) | same mesh, M 0.01 | S_L | not rounding: FP32 floor and the fresh state, below | 1.016873 vs 1.016933, 1.003472 vs 1.003104, 1.000437 vs 1.000054: -6.0e-5, +3.7e-4, +3.8e-4 |
+| same | same | delta_th | same | 1.55325 vs 1.55488, 1.59115 vs 1.59111, 1.59986 vs 1.59982: -1.6e-3, +3.6e-5, +3.9e-5 |
+| FV `--compensated` vs FV(FP64) | 15 cells | S_L, delta_th, 20 flame times | rounding | 1.003447, 1.003447; 1.59072, 1.59073 |
+| polyMesh reader vs fromCurvMesh | same box through `tools/chem/fv_flame_mesh.py`, FP64 | S_L, delta_th, x_f | bitwise to the printed digits | 1.003447, 1.59073, 20.4096, equal |
+| rotated 30 deg vs planar | 7.5 / 15 / 30, ny 16 / 32 / 64, FP64 | S_L; delta_th | rounding of the geometry | -5.1e-8, 0, -1.3e-8; +1.2e-5, -1.8e-6, +1.7e-7 |
+| sheared 30 deg (every face non-orthogonal) vs planar | same | S_L | order 2 | -3.50e-3, -9.40e-4, -2.38e-4 (1.89, 1.98) |
+| same | same | delta_th | order 2 | -2.12e-2, -5.38e-3, -1.25e-3 (1.98, 2.11) |
+| wavy, flame crossing i lines (A 2 h) vs planar | same | S_L | order >= 2 | +1.18e-3, +3.21e-5, +6.0e-7 (5.2, 5.7) |
+| same | same | delta_th (slab read across curved i lines) | order 2 | +2.10e-2, +4.25e-3, +9.48e-4 (2.30, 2.16) |
+| shear + wavy + rotate 20 deg vs planar | same | S_L | order 2 | -1.99e-3, -9.05e-4, -2.37e-4 (1.14, 1.94): the first rung is two errors of opposite sign |
+| same | same | delta_th | order 2 | +4.4e-4, -1.31e-3, -3.04e-4: sign change, last 2.11 |
+
+All rows: 0 cells outside `[-1e-6, 1 + 1e-6]`. Orders rest on 3 levels.
+
+**FV vs structured is not rounding end to end, and why.** The interior is (S8). Three
+things are not:
+
+1. **Plain FP32 at M 0.01 cannot resolve S_L below ~1e-3.** FV FP32 reads 1.017040,
+   1.003167, 1.001623 at its dt, 1.016802, 1.003884, 1.000168 at `--cfl 0.8` (the
+   structured dt), FP64 1.016873, 1.003472, 1.000437: non-monotone in dt and h, spread
+   7e-4 at one mesh, and the window span grows to 1.6e-3 at 30 cells. `E ~ 1.8e4`,
+   `ulp 2e-3`, and the state lands on quantized fresh temperatures (TFresh 7143.36 vs
+   7142.91). The structured flame has no FP64 and no compensated species: its numbers carry
+   this (structured S_L spans 4e-4 to 1e-3).
+   `--compensated` or FP64 on the FV path has no such floor.
+2. **The boundary sets the fresh state.** At M 0.05, where FP32 is clean on FV (FV32
+   vs FV64 ≤ 1.1e-4), structured NSCBC holds rho, FV `Far` holds entropy: TFresh
+   286.146 vs 285.786 at 7.5 cells. `--nscbc-tinflow` moves the structured flame to
+   285.634. S_L follows T_u at 3.5e-3 per unit T (`dln S/dln T ~ 1.0`), measured on the
+   structured pair, stable across h and u_in.
+3. **Structured S_L at the finest rung is noisy.** Read off at FV's fresh T (linear
+   between the two structured inflows):
+
+   | M 0.05 | FV(FP64) - structured at FV's T_u | structured window span |
+   |---|---|---|
+   | u_in 0.98, 7.5 / 15 / 30 cells | -4e-5, -9e-6, +8e-4 | 6.6e-4, 1.9e-4, 9.3e-4 |
+   | u_in 0.90, 7.5 / 15 / 30 cells | +3.4e-4, +7.8e-5, -5.3e-4 | 7.5e-4, 7.2e-4, 1.0e-3 |
+
+   The 30-cell gap changes sign with u_in and sits inside the span. It moves 3e-4 with
+   `--nscbc-sink 0|16|32` (0.987973, 0.987782, 0.987665) and a 21-flame-time window moves
+   it -5e-4. FV spans 8.7e-5 there. p differs too (structured 286.03 vs FV 285.84 at 30
+   cells): FV forced to the structured p moves S_L +1.1e-4. Stated gap: at a matched
+   fresh state FV and structured agree to the structured run's own window span, ≤ 1e-3.
+   No order is claimed on this difference. Better is not measurable with a plain FP32
+   NSCBC structured flame.
+
+The FV ladder at M 0.05 (`--fv-precision fp64`): S_L 1.004004, 0.991129, 0.988211,
+delta_th 1.58090, 1.61690, 1.62581. S_L heads for `1 - gamma M^2 (sigma - 1)` = 0.986,
+the O(M^2) offset of `docs/chem.md`.
+
+Not measured (dropped by the 3-level rule): a 60-cell rung of any row:
+
+    tools/chem/fv_flame_ladder.py --cells 60 --tt 14 --meshes rot,shear,wavy,all
+
+## Diffusion flame
+
+`dns flame --mode diffusion --solver fv` (the structured box as a FaceMesh) and `dns flame
+--mode diffusion --polymesh DIR --bc FILE` (any polyMesh): model C1 of `docs/chem.md`, F +
+s O -> (1 + s) P, on the species passes above. One solver, one loop: `runFvComp` with
+`FvCompRun::jet`. Candle, chamber, bunsen, wick, `--pulse`: exit 2 by name.
+
+- **`FvChem::ox >= 0`**: omega = A rho^2 Y_F Y_O e^(-Ta/T) (`arrheniusRate2`, floors both Y),
+  oxidizer `-s omega`, E `+q omega`, ONE omega. `kFvSpCell`, `kFvSpFace`, `kFvSpBndFace`,
+  `kFvChem` take a `Two` argument: `ox < 0` is the premixed instantiation, bit for bit.
+- **ONE limiter per face** (`fvThetaVote`, `fvFaceYShared`): theta = min over the species
+  with |d2| >= 2^-24 of MC(d1, d2)/d2, in [0, 2], d1 the virtual upwind difference of
+  `fvFaceY`. The face value `Y_up + theta/2 (Y_down - Y_up)` is linear in Y, and so are
+  the LSQ gradient, Fick and the boundary value, so every affine combination rides the
+  same formula. The structured kernel's "boundary cell: theta 1" has no FV twin: `d1`
+  exists next to a boundary too.
+- **Per-face rows** (the FvBc table's design): `FvConfig::bcRow`, one row of `bc` per
+  boundary face, extra rows after the patch rows, same kind as the patch (`make` refuses
+  anything else). `BndRow::bc` always held a row, the kernels did not change.
+  `fvJetRows`: a row per face of a `jet = true` Inflow patch, `diffusionInflow` at the
+  face centre: u, T, Y_F, Y_O of the Burke-Schumann sheet.
+- **The inflow is a fixed FACE** (`FvBc::diffusive`): u, T and Y on the face whatever
+  the sign of mdot, Fick, Fourier and stress through it (`fvBoundaryFlux`,
+  `kFvSpBndFace`). That is foam's G3a inflow (`docs/chem.md`), not the structured pinned
+  first cell: the first cell is interior, it burns (`xBase` 0). What each alternative
+  did, FP64 (4 cells/l, the last row 4.5, t 120-160):
+
+  | inflow | fuelIn | tip | |
+  |---|---|---|---|
+  | `Far` rows (the premixed recipe) | 7.95 | 42.97 | 6% under the nominal rho u Y: u_b sags under the flame's pressure, a soft inflow does not hold a jet |
+  | `Inflow`, no face diffusion | 8.51 | 46.1 | nominal rho u Y 8.4667: the 5% foam takes by Fick never enters |
+  | `Inflow`, `diffusive` | 8.951 | 47.24 | foam mclin 8.959, 47.217 (4 cells/l); structured etaIn 1000 8.986, 47.59 |
+
+- **Outflow**: `Outflow` at p0, T_back T0, `ownY` (a backflow face carries the owner's
+  Y, docs/chem.md item 4), `characteristic`: while the flow leaves, p_out with the
+  owner's entropy and outgoing invariant, so a cell below p0 slows its own efflux. The plain
+  row drains it at p0's density instead: at 30 deg shear, cells 3 from the outflow fell to
+  rho 6e-4, p 0.5 at t 23 and dt collapsed; rotated and planar never reached it. Inflow +
+  Outflow is an organ pipe: the start rings p/p0 +-5%, it decays with an e-fold of ~30 l/U,
+  so read a jet past t 100, not at the structured window. No growth at these Da.
+- **`--bc`**: `[patch.in] type = "inflow"`, `jet = true` (excludes u, t, y);
+  `reference.direction` the jet, `reference.lift` lateral, `reference.origin` the slot's
+  centre on the inflow plane. `jet = true` with no `--mode diffusion`, or the mode with no
+  jet patch: exit 2. `tools/chem/fv_flame_mesh.py --jet`.
+- **Probe** (`FvJetProbe`, `dns/fvflame`): `measureJet`'s numbers on slabs along `dir` (a
+  Cartesian mesh's rows, `test_fv_comp` pins tip, half, base to `measureJet`), the axis the
+  cells within the mean |d.lift| of y = yc, y wrapped to the lateral period (a sheared
+  cyclic mesh leaves the slot's y). `fuelIn` the open patches' species flux, Fick included;
+  `fuelOut` the Outflow's. Columns: the structured jet's.
+
+### Diffusion flame verification
+
+| pair | mesh | quantity | expected | measured |
+|---|---|---|---|---|
+| FV(FP64) vs FvRef (D1) | box_cyclic, box_refined, cyl2d_snappy, a row per open face (inflow `diffusive`, outflow `ownY`, `characteristic`) | rhs; omega; grad Y; species flux; 3 steps; chem dt | rounding, 1e-13 | 5.5e-16 / 3.3e-15 / 4.0e-15; 1.4e-16 / 2.6e-16 / 2.6e-16; 0 / 5.4e-16 / 2.0e-16; 1.7e-16 / 1.8e-16 / 2.7e-16; 5.0e-16 / 8.0e-16 / 7.5e-16; 0 |
+| FV(FP32) vs FV(FP64) (D1) | same | rhs; 3 steps | O2's 2e-5, 2e-6 | 1.1e-6 / 4.9e-6 / 3.7e-6; 2.1e-7 / 2.9e-7 / 3.7e-7 |
+| uniform Y, passive (D2 = S3, S4, ox 1) | same, 40 steps, FP32, compensated, FP64 | rho Y vs Y rho; mean rows vs nY 0 | bitwise | bitwise, all three |
+| burning box (D3) | uniform periodic, box_cyclic walls, box_refined; 4.8-20% burnt | mass; E + q rho Y_F; rho (Y_F - Y_O/s) of gross; tracer; Sum V R_F + Sum V omega; Sum V R_O + s Sum V omega | rounding, 1e-13 | 4.0e-15 / 2.2e-15 / 2.7e-15; 3.6e-15 / 4.0e-15 / 3.8e-15; 1.1e-15 / 3.7e-16 / 7.4e-16; 3.8e-15 / 2.4e-15 / 1.3e-15; 9.7e-15 / 4.3e-16 / 2.0e-16; 3.3e-15 / 4.3e-16 / 4.0e-16 |
+| Z(Y) vs tracer (`gpu_fv_flame_mix`, `gpu_diffusion_mix`'s layer) | uniform 256^2, FP32 | max difference: reacting; passive; per-species limiter | FP32 walk 6.4e-5, 5.5e-5; contrast > 30 x | 8.9e-6; 2.8e-5; 1.226e-3 (43 x; structured 8.3e-6, 1.4e-5, 1.226e-3) |
+| same | sinusoidal 0.02 | same | same | 9.3e-6; 1.7e-5; 1.92e-3 (115 x) |
+| Z vs the analytic erf | uniform; sinusoidal | max | 3e-3 | 1.46e-3 (structured 1.460e-3); 1.89e-3. Z in [8.88e-2, 1 - 8.83e-2], no bound broken |
+| FV(FP64) vs structured etaIn 1000, jet, same mesh | 2, 3, 4.5 cells/l, t 160, last quarter | tip | first order: the structured row is a pinned CELL at h/2 | 47.958 vs 47.233, 47.729 vs 47.239, 47.593 vs 47.242: +0.725, +0.490, +0.352 (order 0.97, 0.81); linear limit +0.05 |
+| same | same | half-width | shrinks | 7.7145 vs 7.6544, 7.6880 vs 7.6782, 7.6701 vs 7.6634: +0.060, +0.010, +0.007 (FV's own values are not monotone: the tip/2 slab) |
+| same | same | TmaxIn / T_ad; fuelIn | none claimed (a stated boundary gap) | 0.9853 vs 0.9846, 0.9854 vs 0.9844, 0.9854 vs 0.9843; 8.994 vs 8.978, 8.989 vs 8.960, 8.986 vs 8.951 |
+| FV(FP64) vs structured default | same | tip; fuelIn | NOT the same inflow: the etaIn 100 row overshoots (`docs/chem.md` G3a) | 51.449, 51.236, 51.163; +4.22, +4.00, +3.92 l; 9.635, 9.621, 9.618 |
+| FV vs foam mclin (from `docs/chem.md`, not rerun; foam 4 cells/l, FV 4.5) | one mesh each | tip; half; fuelIn; TmaxIn/T_ad; burn/in | same inflow model | 47.24 vs 47.217; 7.663 vs 7.669; 8.951 vs 8.959; 0.9843 vs 0.9849; 0.99992 vs 0.99839 |
+| FV alone | 2, 3, 4.5 cells/l | tip; TmaxIn/T_ad; burn/in; hits | converging | 47.233, 47.239, 47.242; 0.98464, 0.98441, 0.98433; 1.00004, 0.99999, 0.99992; 0. span of tip in the window 0.15, 0.12, 0.10: the ring |
+| rotated 30 deg vs planar | 2, 3, 4.5 cells/l | tip; half; TmaxIn | rounding of the geometry | 0, -4.8e-6, -6.5e-6; 0, 4.1e-7, 4.6e-7; 0, -4.9e-8 rel, 0 |
+| sheared 30 deg vs planar | 2, 3 cells/l | tip; half; TmaxIn rel | order 2 | -0.700, -0.342 (1.77); +8.1e-3, -1.9e-2; +3.5e-3, +1.7e-3 (1.8). **4.5 DIVERGED**, below |
+| wavy 2 h vs planar | 3 cells/l, one rung | tip; half; TmaxIn rel | small | +4.1e-6; +4.4e-4; +6.4e-6 |
+| polyMesh reader vs fromCurvMesh | 3 cells/l, FP64 | tip, half, fuelIn | bitwise to the digits | 47.2391, 7.6782, 8.9596, equal |
+| FV `--compensated`, plain FP32 vs FP64 | 3 cells/l | tip; TmaxIn | rounding | 47.2391, 47.2373 vs 47.2391; 1406.305, 1406.240 vs 1406.305 |
+| frames | 2 cells/l, `--emit bin` | temp, fuel, oxid, omega | 4 channels | written |
+
+Stated gaps. The structured row pins a CELL, this one a FACE: burn base 0 vs 0.25, a first-order
+tip offset. No sink: the ring above. The interior is not compared to rounding: no
+two-reactant S8 was built (the premixed S8 covers the passes they share).
+
+**Sheared jets are NOT stable to the end.** 30 deg, FP64: 3 cells/l diverges at t 308.7, 4.5
+cells/l at t 155.9 (dt falls 3x per 200 steps), 2 cells/l survives t 160, not run past it.
+Blow-up time ~ h^1.7, so a rate of a diffusive kind; `dtChem` falls for ~70 l/U first.
+At 4.5, t 155.6: a sawtooth, cell to cell p 3.7 vs 569, rho 4.5e-3 vs 0.68, at x 6 on the lean
+side of the sheet, Z ~ 0.25, away from any boundary. Not the outflow evacuation (fixed: that
+one reached t 23). The Fourier symbols of the corrected Laplacian and of the stress operator
+have no growing mode at 0-45 deg with constant coefficients, so it needs the variable state.
+Cause NOT isolated (issues.md 78c). Rotated, wavy: no sign of it. Numbers on a sheared jet are
+read before the blow-up, and the 4.5 rung is not in the table.
+
+Not measured (dropped by the 3-level rule and the 295 s cap): a finer rung:
+
+    tools/chem/fv_jet_ladder.py --cells 6 --tt 160 --meshes rot,shear
+
+    dns flame --mode diffusion --polymesh SHEAR_4.5 --bc SHEAR_4.5/bc.toml --tt 160 --fv-precision fp64   # diverges at t 155.9
+
+## Gates
+
+`fv_comp` (host, `tests/test_fv_comp.cpp`): the `--bc` parser, the binding, the
+FvBc table, the CLI routes and rejections, the raster, the flame route, `fvFaceY` vs
+the structured stencil (1e-15), `FvFlameProbe`, FvRef species at 1 vs 4 threads,
+`FvJetProbe` vs `measureJet` (1e-5, FP32 fields), the shared limiter's linearity and vote, the
+characteristic Outflow's entropy and invariant.
+
+`fvref` adds W1, W2 ("Gravity").
+
+`gpu_fv_comp` (device vs FP64 oracle, `tests/test_gpu_fv_comp.cpp`):
+
+| gate | measured | bound |
+|---|---|---|
+| O1 double vs FvRef, box_cyclic (adiabatic; isothermal moving wall) | rhs 3.5e-16, gradients 0, fluxes 1.5e-16, 3 RK3 steps 4.2e-16, dt 0 | 1e-13 |
+| O1 box_refined (split faces, Sutherland) | rhs 2.2e-15, gradients 1.2e-15, fluxes 2.5e-16, steps 5.8e-16, dt 0 | 1e-13 |
+| O1 cyl2d_snappy (spinning isothermal wall, inflow, outflow, slip, far) | rhs 1.1e-15, gradients 3.2e-16, fluxes 2.5e-16, steps 6.4e-16, dt 1.1e-16 | 1e-13 |
+| O2 float vs double, same meshes | rhs 9.1e-7 / 3.3e-6 / 1.3e-6, 3-step state 2.5e-7 / 3.2e-7 / 2.9e-7 | 2e-5, 2e-6 |
+| O3 device (double) vs `Comp::rhs`, uniform periodic | 3.0e-15 | 1e-13 |
+| O4 freestream, cyl2d_snappy, every patch Far | FP64 max\|rhs\| 2.0e-14, 100 steps 1.4e-15; FP32 1.2e-5, 100 steps 6.9e-7 (Sum S rounds, p/V amplifies; noise, stated) | 1e-12; 5e-5, 2e-6 |
+| O5 rerun, 40 steps, 3 meshes, both precisions | memcmp equal | exact |
+| O6 adiabatic wall, cyl2d_snappy, both precisions | 32 faces, mass and energy flux 0 | exactly 0 |
+| O7 2D, both precisions | z flux, rhs, d/dz, rho w after 20 steps 0 | exactly 0 |
+| O8 inviscid KE, box_refined | KE rate - pressure work 1.4e-16 (uniform p), 6.7e-17 (random p); 20 steps: mass 6.7e-16, energy 4.4e-16, momentum 6.9e-18 | 1e-13; 1e-14, 1e-13 |
+| O9 LES vs host restatement on FvRef's gradients, curvilinear box | smag mu_t 3.4e-16, rhs 4.4e-15; sigma mu_t 2.0e-13, rhs 4.8e-15. The bound on mu_t is 3 x the host operator's own response to 1 ulp of grad u (3.4e-16, 2.0e-13): sigma's conditioning, measured in the gate | see left; 1e-12 |
+| O10 tally, uniform p on a closed wall | force 0, 5.6e-17; viscous 0 | 1e-12 |
+| O11 compensated vs FP64, dt 2% of stable, 4000 steps | 8.2e-7 (plain 1.8e-4), rerun identical | 0.2 x plain |
+
+
+`gpu_fv_flame` (S1-S8, table in "Species cross-verification"; D1-D3, "Diffusion flame";
+`gpu_fv_flame1d`: the binary at 7.5 cells, S_L 1.01681, delta_th 1.56669, 0 hits at t 12,
+bounds 2%, 3%; `gpu_fv_flame_mix`; `gpu_fv_flame_jet`: the binary at defaults, FP64, t 80,
+window [60, 80]: tip 47.23, TmaxIn/T_ad 0.98475, burn/in 0.9975, out/in 3.5e-11, p/p0 1.0017,
+bands gpu_diffusion_jet's, no tip pin: the ring is still in that window):
+`tests/test_gpu_fv_flame.cpp`.
+
+`gpu_fv_cross` (X1-X3), `gpu_fv_ladder` (X4, every route's smoke run), `gpu_fv_far`
+(X5, settled gap, 95 s: 192x96 -4.1e-4 <= 6e-4, order 1.80 >= 1.5):
+`tests/test_gpu_fv_cross.cpp`.
+
+## Gravity: `dns conv --solver fv`
+
+```
+dns conv --solver fv [--physics compressible] --n N --ny M [--nz K] [--sides periodic|closed]
+         --rayleigh RA [--mach M] [--dtemp E] [--tt T] [--mesh-perturb A [--mesh-perturb-kind sine|random]]
+         [--fv-precision fp32|fp64] [--frame-n N] [--frame-box ...]
+dns conv --polymesh DIR --bc FILE.toml --ny BINS [same physics flags]
+```
+
+Same physics as `gpu/comp_conv`, no Boussinesq: buoyancy is rho(T) g through the EOS.
+`FvCompConfig::gravity` is two additive passes, `faceFlux` and `kFvGather` untouched:
+
+- `kFvGravFace`, after the fluxes, on every internal face (`fvGravityFace`): `(g.d/2)
+  rho_f S` on momentum, `(g.d/2) mdot` on E, d = C_nei - C_own, mdot = `F[0]`.
+- `kFvGravity`, after the gather: ascending CSR faces, BOTH cells add the term, unsigned
+  (a source, not a flux), over V.
+- `rho_f` (`fvHydroRho`): `L(p_P, p_N) / (R L(T_P, T_N))`, L the log mean, series near
+  equal arguments (`fvLogFactor`). FvRef carries all of it.
+- Isothermal plates are FvBc rows, `fvBoundaryFlux`, no ghost. Side walls are
+  FaceMesh walls, adiabatic to exactly 0.
+- IC: `convHydroAt`, `convTripAt` at the cell centres. The box is a FaceMesh with its
+  floor at y = 0 (`dns/fvconv`); `--polymesh` is the same route, y up, plates flat at
+  y = 0 and 1, wall `twall` equal to the flags' (floor `1 + dtemp/2`, lid
+  `1 - dtemp/2`), else exit 3 by name. wall, slip, empty, cyclic only: an open face has
+  no hydrostatic ambient. Moving walls, `[reference]`: rejected. `--ny` on a polyMesh =
+  height bins of the plane statistics, required; `--n`, `--nz` belong to the mesh.
+- Rejected by name: `--hot-patch` (not built), `--planes`, every flag off the allow-list.
+
+Stats: `nuBot, nuTop, nuFlux, urms, KE` are `runner_conv`'s on height bins (a bin is a
+row on the box), `nuBotF, nuTopF` the conservative wall-face conduction, plus
+`machMax, mass, energy`.
+
+**FP32 is compensated by default here.** `--cfl` means 2x less dt than the structured
+solver (the Sigma form), so a plain state drops 2x the updates: Nu 3.671 / 3.698 plain vs
+3.745 / 3.728 compensated vs 3.745 / 3.729 FP64, 192 x 96. `--compensated` costs nothing
+measured (50.6 vs 50.8 s). 96 x 48: 3.7685 plain, 3.7782 compensated, 3.7781 FP64.
+
+**Well balanced, on any mesh.** The KG pressure sum of a closed cell is `Sum (p_N - p_P)/2
+S`: that closure is the whole scheme's gradient, and on a random mesh its operator `T =
+(1/V) Sum d S/2` is not the identity (zeroth order). A cell source `rho g` cannot balance
+`T grad p` (it was 1.1% Uff, flat). So gravity takes the pressure's own form: the same sum
+over the same faces, `T rho g`, and the rest residual is `Sum (p_N - p_P - rho_f g.d)/2 S`.
+What is left is one face relation, and it must be path independent, else no field solves
+it on a loop of cells. A mean of two rho is not. With log means: T = T0 + a h(x),
+`ln(p_N/p_P) = g.d/(R L(T))` integrates dp/dh = -rho g EXACTLY for T linear in the height
+h, a = 0 included, on any pair of points; `p_N - p_P = L(p) ln(p_N/p_P)`. So:
+
+- **The conduction state at cell centroids is an exact fixed point of the discrete
+  equations on ANY mesh**, FP64 to rounding (W1, C8). Conduction closes too: a linear T has
+  an exact LSQ gradient, an exact corrected face gradient, Sum S = 0 (constant kappa). Not
+  exact: Sutherland (kappa(T): a nonlinear conduction T), a curved adiabatic wall (a
+  linear T is not adiabatic there), any non-linear T(h): truncation there, order 2 in
+  the face's height step, not a fixed forcing.
+- **A Wall or Slip face adds nothing.** Its hydrostatic image (`dp = rho_P g.r`, the
+  structured plates') and that face's share of the term are one number, opposite: the wall
+  cell's normal balance is `-(p_1 - p_0)/(2h) + rho_f g/2`, which the old pair spelled with
+  rho_P. So there is no image pass; the force tally reads p_P as before.
+- **`Sum V (E + rho phi)` telescopes** on a closed box, phi = -g.x (W2): mass flux `F[0]`
+  times the same `g.d/2`. Not `g.m` of a cell. Kinetic energy and that energy term are
+  consistent to O(h^2), as the KG pressure work.
+- **The buoyancy of a perturbation carries T too**: on a random mesh T(rho' g - grad p'),
+  not the true force. It was already T grad p'. Effect at Ra 5e4: the table.
+- Uniform mesh: `(rho_f,j+1/2 + rho_f,j-1/2)/2 g` against the structured `rho_j g`,
+  O(h^2) apart; Nu below. g = 0 launches neither pass: the solver byte for byte.
+
+FP32 floor: the state is two-word but the fluxes are FP32, so `p Sum S` and the sum's own
+rounding leave `eps p/h`, a frozen forcing, 1.2e-6 to 2.2e-6 urms; FP64 rounding, 2.5e-15.
+
+| pair | mesh | quantity | expected | measured |
+|---|---|---|---|---|
+| FV(FP64) vs FvRef + gravity (C1) | sine 0.08 24 x 12 | rhs, 3 steps | rounding, gate 1e-13 | 6.7e-15 of 3.5, 1.8e-15 of 2.6 |
+| conduction state, FvRef (W1) | uniform, sine 0.08, random ±0.3 h, 24 x 12, T linear and isothermal | max\|rhs\| | rounding of p/h | 2.7e-14 to 3.7e-14, bound 9.6e-14 |
+| `Sum V (E + rho phi)`, mass, FvRef (W2) | random ±0.3 h, closed, adiabatic, 200 steps of a sloshing state | relative change | rounding, gate 1e-13 | 1.8e-15, 8.9e-16 |
+| rest (old face mean -> this form), urms / Uff (Uff 0.0561), kick 0, Ra 1000, t 20 x H/Uff, FP32 compensated | uniform 64 x 32 | urms | rounding-level | 3.8e-6 -> 2.7e-6; structured 5.3e-6 |
+| same | sine 0.08, 32, 64, 128 | urms | floor | 6.4e-4, 1.5e-4, 6.7e-5 -> 3.2e-5, 3.2e-5, 3.9e-5 (the FP32 floor, no h trend) |
+| same | random ±0.3 h, 64 x 32 | urms; machMax; nuFlux; nuBotF, nuTopF | floor | 1.1e-2 -> 2.1e-5; 2.4e-3 -> 2.6e-6; 0.613 -> 1.00001; 0.998, 1.002 -> 0.999997, 1.000000 |
+| same, FP64 | random ±0.3 h, 64 x 32 | urms; machMax; nuFlux | rounding | 1.1e-2 -> 4.4e-14; 2.4e-3 -> 2.0e-14; 1.000000 |
+| same, FP64, 3D (C8's sibling) | random ±0.3 h, 32 x 16 x 16, t 2 | urms | rounding | 2.4e-3 absolute -> 3.8e-15 absolute |
+| subcritical | uniform 64 x 32, Ra 1000, kick 0.02 (C5) | Nu, urms end | Nu 1 to 1% | 1.0000 / 1.0000, 1.9e-6 absolute at t 40 |
+| FV vs structured, Ra 5e4 2D | 48 x 24, 96 x 48, 192 x 96, t 40 | tail nuBot | shrinks | FV 3.926, 3.777, 3.745 (old form 3.914, 3.778, 3.745); structured 3.940, 3.774, 3.736; diff -0.35%, +0.09%, +0.25%. Not monotone: 3 rungs of a time mean, structured plain FP32 |
+| anchor | 96 x 48 | nuBot | 3.79 (issue); gate 2% vs structured | 3.777 FV (was 3.778); 3.774 structured |
+| heat balance | same 3 rungs | spread of nuBot, nuTop, nuFlux / nuBot | < 5% | 1.7%, 0.4%, 0.4% |
+| face vs gradient Nu | same | nuBotF vs nuBot | first order at the wall | 3.857, 3.769, 3.744 vs 3.926, 3.777, 3.745 |
+| FV compressible vs FV Boussinesq | 96 x 48 | nuBot | 15% (`gpu_rb`) | 3.777 vs 3.960: 4.7% |
+| closed sides | 96 x 48 aspect 2 | nuBot, nuTop, nuFlux | structured | FV 3.380, 3.277, 3.322 (was 3.381, 3.278, 3.323); structured 3.386, 3.273, 3.325 |
+| non-orthogonal Ra 5e4 | sine 0.05, 96 x 48 | nuBot, nuTop, nuFlux | uniform's | 3.775, 3.785, 3.732; face 3.764, 3.746 |
+| critical Ra | 64 x 32, periodic, kick 0.02, t 80 | urms trend | ~1708 bracket | Ra 1600 2.8e-4, 1.6e-4, 9.2e-5 decays; Ra 1900 1.2e-3, 2.6e-3, 3.7e-3 grows |
+| random Ra 5e4, settled (old -> this form) | random ±0.3 h, 96 x 48, t 120 H/Uff, last 60% | nuBotF, nuTopF; nuFlux | uniform same run 3.733, 3.733; 3.733 | 3.714, 3.798 -> 3.752, 3.757 (+0.6%); **-4.67 -> 3.763**. nuBot, nuTop read 3.93, 3.94: bins smear (81e) |
+| same | random ±0.3 h, 192 x 96 | same | uniform 192 at t 120: not measured | 3.605, 3.624; 1.44 -> 3.613, 3.609; 3.600. New run cut by the 295 s cap at t 2003 of 2138 (106 of 120 H/Uff). 3.5% below the 96 x 48 random run; urms 1.32e-2 vs 1.51e-2: a different roll state is suspected, not shown |
+| settling | random ±0.3 h, 96 x 48, same run | nuBotF, nuTopF, windows of H/Uff | none claimed | this form 3.26, 3.20 over t 16-40, 3.72, 3.75 over t 40-60, flat after; the old form 3.63, 3.71, then 3.72, 3.79: read a random mesh past t 60 |
+| `--polymesh` = box (C6) | sine 0.05, 32 x 16, binary polyMesh | stats rows | bytes | identical |
+| byte | `dns.fvbase2` vs this tree: g = 0 paths | `tools/fv/comp_bit_identity.sh` | identical | 24 cases identical, 0 failures, FV flame at nY 1 included; g != 0 FV results move on purpose |
+
+Max non-orthogonality at 64 x 32: sine 0.05 26.2 deg, sine 0.08 40.6 deg, random 0.3 60.0 deg. 3D ran as smokes only:
+48 x 24 x 24 closed t 4 finite, onset not reached. No 3D Nu is quoted.
+
+## Performance
+
+O-grid 256x128 (32 640 fluid cells), Re 40, gfx1201, ms/step: FV plain 0.182, FV
+`--compensated` 0.186, structured plain 0.107: FV costs 1.70x the structured O-grid
+per step, compensation 1.02x. 384x192 compensated: FV 0.197, structured 0.120.
+Launch-bound at this size (six launches per stage). Cell order is Morton, not
+compared with Source / colour. FP64 operations in the float kernels
+(`fvPrimOf`'s `T(gamma - 1.0)`) not profiled.
+
+## Reproducing the long numbers
+
+    simjob submit --gpu -t 280 -m 8192 --wait -- build/test_gpu_fv_cross far
+    tools/fv/comp_ladder.py --re 40 --ft 3 --levels 96:50,192:98,384:194 --compensated
+    tools/fv/comp_ladder.py --re 40 --ft 3 --levels 192:98 --far 10 --compensated
+    tools/fv/comp_ladder.py --re 40 --ft 5 --levels 192:98 --far 40 --compensated
+    tools/fv/comp_ladder.py --re 40 --ft 7 --levels 192:98 --far 80 --compensated
+    tools/fv/comp_ladder.py --re 100 --ft 10 --trip 0.05 --st-from 200 --levels 48:26,96:50,192:98 --compensated
+    dns flow --physics compressible --body cylinder --n 512 --ny 512 --dr 40 --re 40 --mach 0.2 --ft 2.5 --compensated --emit stats --out /tmp/dns/imm/b512
+    dns flow --physics compressible --body cylinder --n 1024 --ny 1024 --dr 40 --re 40 --mach 0.2 --ft 1.6 --compensated --emit stats --out /tmp/dns/imm/b1024
+    tools/fv/comp_bit_identity.sh BASE_BINARY build/dns
+
+The settled rows stop on a flat cd, not on `--ft`: `tools/fv/flat_stop.py CSV TOL SPAN
+TMIN -- dns flow ...` under simjob sends SIGTERM when two adjacent SPAN windows' mean
+cd agree to TOL (3e-6, 20, 40 at M 0.2; 1e-5 at M 0.1).
+
+Not measured (dropped to keep every GPU job under 5 minutes; the orders quoted
+rest on the three levels above):
+
+    tools/fv/comp_ladder.py --re 40 --ft 3 --levels 384:194 --compensated --limit 1800   # to a flat cd
+    tools/fv/comp_ladder.py --re 40 --ft 1.5 --levels 768:386 --compensated --limit 1800
+    tools/fv/comp_ladder.py --re 100 --ft 10 --trip 0.05 --st-from 200 --levels 384:194 --compensated --limit 1800
+    dns flow --physics compressible --body cylinder --n 1024 --ny 1024 --dr 16 --re 40 --mach 0.2 --ft 5 --compensated --emit stats --out /tmp/dns/imm/n1024
+
+## Hooks for later phases
+
+Not built here, shaped for:
+
+- **Scalars**: the species pattern: rows after the mean flow, own kernels, `F[0]`,
+  `kFvGather<.., First, Count>`.
+- **Per-face boundary data**: `FvConfig::bcRow` (built, "Diffusion flame"): any patch
+  profile is rows of the patch's kind; a time-dependent row is `setBc` on that row.
+- **A frame flux (MRF)**: `fvMeanFlux`'s `wS`, 0 today.
+- **Implicit**: `kFvDt` is per cell.
+
+## Not built
+
+`wedge` / axisymmetric meshes (P8), MRF, `--hot-patch` (per-face wall T), open patches
+under gravity, every flame mode but premixed C0 and diffusion C1 (bunsen, candle, chamber,
+wick, `--equivalence`), the jet's `--pulse`, species LES, TFLES,
+turbulent inflow, flame checkpoints, moving meshes, immersed bodies on a FaceMesh, a
+checkpoint, `--temp`,
+frames other than one plane, the CUDA run (compiled through the shim only on a
+machine with nvcc). `issues.md` item 78.

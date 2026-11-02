@@ -263,7 +263,7 @@ int main()
         expect("flow --polymesh " + cav + " --fv-precision fp16 --dry-run", 1, "fv: unknown --fv-precision value");
         expect("flow --polymesh " + cav + " --fv-precision --dry-run", 1, "fv: --fv-precision without a value");
         expect("flow --body cylinder --fv-precision fp64 --dry-run", 2, "--fv-precision without --polymesh");
-        expect("tgv --fv-precision fp64 --dry-run", 1, "--fv-precision is not a tgv flag");
+        expect("tgv --fv-precision fp64 --dry-run", 2, "--fv-precision without --solver fv on tgv");
         // the EXPERIMENTAL coupled prototype (plan_perf_5 P0b): opt-in, FP64 only
         const std::string c64 = "flow --polymesh " + cav + " --fv-precision fp64";
         expect(c64 + " --fv-coupled 0 --dry-run", 0, "fv: --fv-coupled 0");

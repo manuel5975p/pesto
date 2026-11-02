@@ -3342,6 +3342,26 @@ With it, Tmax rises above Tb in the holder's base recirculation: 1.046 Tb
 (4 cells, saturated) and 1.013 Tb (6 cells, t = 75) -- cause not isolated
 (C2).
 
+## FV path (`--solver fv`, `--polymesh DIR --bc FILE`)
+
+The premixed flame of model C0 on any FaceMesh. Spec, verification table and the
+gaps against the structured flame: `docs/fvcomp.md` "Species". Same model, same units,
+same IC, same stats columns. Face value restated on an unstructured mesh with a
+virtual upwind difference, identical on a uniform mesh. No NSCBC, no sink: fresh `Far`,
+burnt `Outflow`. Rotated 30 deg: S_L 5e-8 off planar; sheared 30 deg: order 2.
+Plain FP32 at M 0.01 scatters S_L ~1e-3 on BOTH solvers: quote FV in FP64 or
+`--compensated`.
+
+`--mode diffusion` (model C1) on any FaceMesh: `docs/fvcomp.md` "Diffusion flame":
+one limiter shared per face, the jet's row per FACE (a fixed face, Fick and Fourier
+through it: foam's G3a inflow, not the pinned first cell). Candle, chamber, bunsen,
+wick exit 2 by name.
+
+`--physics lowmach` on either route: the low-Mach stage on faces, `docs/fvincomp.md`
+"Low-Mach": same units, same IC on the box, same stats columns, the 1D flame equal to
+the structured low-Mach flame on the same mesh. Planar C0 only; the burner, `--rim`,
+open laterals, gravity, `--equivalence`, checkpoints exit 2 by name.
+
 ## Not built
 
 Le ≠ 1 (`--lewis` unregistered until an oracle exists), curvilinear,

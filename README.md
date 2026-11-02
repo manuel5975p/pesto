@@ -61,7 +61,7 @@ DNS 13.6 ms/step (1234 Mcell/s), Smagorinsky 15.6, σ 16.0, 1.46 GiB.
 
 | sub | purpose | spec |
 |---|---|---|
-| `flow` | a body (or scene) in a uniform free stream: forces, wake, frames; or an OpenFOAM simpleFoam case (`--polymesh CASE [--fv-precision fp32\|fp64]`) | below, `docs/scene.md`, `docs/fv.md` |
+| `flow` | a body (or scene) in a uniform free stream: forces, wake, frames; or an OpenFOAM simpleFoam case (`--polymesh CASE [--fv-precision fp32\|fp64]`), or that solver on a structured mesh (`--solver simple [--export CASE]`), or the time-accurate FV solver of `--physics` on any mesh (`--polymesh DIR --bc FILE.toml`, `--solver fv --ogrid`) | below, `docs/scene.md`, `docs/fv.md`, `docs/fvstructured.md`, `docs/fvincomp.md`, `docs/fvcomp.md` |
 | `tgv` | Taylor–Green vortex: 2D analytic check or 3D Re 1600 benchmark | `dns tgv --help` |
 | `hit` | forced homogeneous isotropic turbulence, SI-configured, h = 1.5 η | `dns hit --help` |
 | `channel` | wall-resolved compressible channel; `--les`, `--rans` | `docs/channel.md`, `docs/rans.md` |
@@ -120,6 +120,8 @@ build/dns flame --inflow-speed 0.98 --tt 20 --emit stats
 # [1]; --mach/--nscbc-*/--les/--tfles/--turb and modes other than premixed
 # rejected; docs/chem.md "Low-Mach")
 build/dns flame --physics lowmach --inflow-speed 0.98 --tt 20 --emit stats
+# the same flame on a FaceMesh (or --polymesh DIR --bc FILE; docs/fvincomp.md "Low-Mach")
+build/dns flame --physics lowmach --solver fv --inflow-speed 0.98 --tt 20 --emit stats
 
 # the rich phi 1.3 slot Bunsen on the low-Mach solver, anchored on a REAL
 # cold tube rim (--rim: an immersed staircase wall, no-slip, isothermal,
@@ -165,6 +167,10 @@ build/dns flame --mode bunsen --jet-speed 8 --slot-width 24 --coflow-width 16 \
 # (~15 s for tt 80); same video tool
 build/dns flame --mode diffusion --tt 80 --emit stats
 
+# the same jet on a FaceMesh (--polymesh DIR --bc FILE: any mesh; docs/fvcomp.md
+# "Diffusion flame"): shared limiter, a fixed Burke-Schumann inflow face per row
+build/dns flame --mode diffusion --solver fv --fv-precision fp64 --tt 160 --emit stats
+
 # 2D candle: the diffusion flame under gravity from a low-Peclet wick, steady
 # by tt ~20 (~100 s for tt 30); fire_video.py --gamma 3 --smooth 4
 build/dns flame --mode candle --tt 30 --emit stats
@@ -207,8 +213,10 @@ cli/config (parse + validate, pure)  [+ dns/scene, dns/remap, dns/sgs, dns/rans]
     → gpu/{tunnel,bodyforce,les,rans,cutpoisson,cutflux,derived,comp_channel,comp_conv,boussinesq}
       [+ gpu/la/{blockell,smooth,krylov,amg}: the sparse solver library (P3, P5)]
       [+ gpu/fv_simple: incompressible FV SIMPLE on gpu/la (P5b)]
+      [+ gpu/fv_comp: compressible FV DNS/LES/RANS on FaceMesh (docs/fvcomp.md)]
+      [+ gpu/fv_incomp: time-accurate incompressible FV on FaceMesh (docs/fvincomp.md)]
       [+ gpu/lm_poisson, gpu/lowmach: the low-Mach flame solver (dns/lowmach config)]
-      → gpu/runner_{incomp,comp,channel,conv,rb,ogrid,fv,lowmach}   (the time / iteration loops)
+      → gpu/runner_{incomp,comp,channel,conv,rb,ogrid,fv,fvcomp,fvincomp,fvlowmach,lowmach}   (the time / iteration loops)
         → output (RunOutput, the one artefact sink; the FV path writes
           OpenFOAM time directories through dns/foamio)
 ```
@@ -237,6 +245,17 @@ confined box, FFT/DCT-preconditioned CG on the fluid subspace with cut cells.
 The pressure BC follows `--far`. `--steady TOL` marches until
 `max|du/dt|·D/U² < TOL` (only below the shedding onset); `--seq` converges on a
 grid ladder, changing only the initial guess.
+
+**Compressible FV on any FaceMesh (`dns flow --physics compressible --solver fv`
+or `--polymesh DIR --bc FILE.toml`, `docs/fvcomp.md`).** Explicit DNS/LES/RANS of the
+structured scheme (Kennedy-Gruber, SSP-RK3) on the O-grid, a body-free box or an
+OpenFOAM polyMesh, FP32 by default, cross-verified against the structured solver.
+
+**simpleFoam on the structured meshes (`dns flow --solver simple`,
+`docs/fvstructured.md`).** Uniform, `--stretch`, `--focal`, `--ogrid` (2D, 3D,
+revolved wedge and full revolution): the mesh goes through `polyOf`, a full
+OpenFOAM case is generated, the unchanged case loader reads it; `--export CASE`
+stops there. Laminar, SA, SST, MRF.
 
 **Incompressible FV on an OpenFOAM mesh (`dns flow --polymesh CASE`,
 `docs/fv.md`).** OpenFOAM v2606 simpleFoam (SIMPLE / SIMPLEC, laminar, MRF)
@@ -630,6 +649,10 @@ A layer between no-slip isothermal plates (hot floor, cold lid), gravity in
 −y, lateral faces `--sides periodic|closed`. Box units: H = 1, T_ref = 1,
 R = ρ_ref = 1.
 
+`--solver fv` runs both models on a FaceMesh, `--polymesh DIR --bc FILE --ny BINS`
+on any mesh with flat plates (`docs/fvcomp.md` "Gravity", `docs/fvincomp.md`
+"Temperature"); Ra 5e4 Nu within 0.3% of the structured solvers at 96 x 48 and 192 x 96.
+
 **`--physics compressible`** (default, `gpu/comp_conv` + `runner_conv`).
 Buoyancy is ρ(T)·g through the EOS — one source term (`addGravity`) on the
 RHS hook; there is no Boussinesq approximation in this branch. The IC is the
@@ -744,6 +767,7 @@ Tiers, labels, tolerances, the quarantine and anchor regeneration:
 | `docs/viewer-format.md` | web frame format, run `.json`, `_surface.csv`, `--emit mesh` |
 | `docs/jobs.md` | `simjobd` / `simjob`: the job server every GPU/CPU run goes through |
 | `docs/mesh.md` | FaceMesh: the polyMesh subset accepted and rejected, the geometry definition, cyclic/2D/ordering rules, `CellGraph`, `dns mesh`, test meshes; the FV face physics (flux, gradients, boundary kinds, Σ-form dt) and its FP64 oracle `FvRef` with the measured gates |
+| `docs/fvincomp.md` | the time-accurate incompressible FV solver (`--solver fv`, `--bc`): collocated SSP-RK3 + per-stage projection on any FaceMesh, skew-symmetric convection, DNS and LES, the `--bc` table, the FV-vs-MAC verification table |
 | `docs/fv.md` | the incompressible FV path (`dns flow --polymesh`): simpleFoam's SIMPLE/SIMPLEC + MRF + RAS (kOmegaSST, SpalartAllmaras, wall functions, meshWave / exact wall distance) verbatim, BCs and schemes accepted, constraint-patch semantics, OpenFOAM's solver stop, outputs, prism-layer meshing, the IF1/IF2/IF3/IF-T/BL parity and wall-time numbers |
 | `docs/la.md` | `gpu/la`: block shapes, the sliced-ELL layout, smoothers, line sets, Krylov solvers and batched FP64 dots, the FP32-iterate floor, the measured LA1/LA2/LA-perf gates |
 | `docs/chem.md` | `dns flame`: model C0, the phase-plane oracle vs Cantera, species scheme, hook order, measured S_L; the 2D slot Bunsen (per-row inflow, pilot anchoring, measured cone); the slot-jet diffusion flame; the 2D candle (gravity, hydrostatic NSCBC, height vs fuel flow); the wick candle (immersed wick, fuel source, soot, the physical render); the `--mode chamber` combustion chamber and its balances; 3D premixed flames in synthetic turbulence (generator, Taylor-swept inflow, hold controller, S_T/area/I0); LES species (SGS flux, Sc_t = Pr_t) and the thickened flame (TFLES: sensor, Charlette efficiency, laminar and LES-vs-DNS measurements); the 3D turbulent slot Bunsen LES (span-mean cone, ST/area/I0, the volume renderer) |

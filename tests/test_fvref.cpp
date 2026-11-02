@@ -18,6 +18,7 @@
 #include "dns/comp.hpp"
 #include "dns/curvmesh.hpp"
 #include "dns/dual.hpp"
+#include "dns/fvconv.hpp"
 #include "dns/fvflux.hpp"
 #include "dns/fvgrad.hpp"
 #include "check.hpp"
@@ -88,7 +89,7 @@ std::vector<FvBc> bcFor(const FaceMesh& fm, const std::function<FvBc(const MeshP
     return v;
 }
 
-FvConfig config(Transport tr, std::vector<FvBc> bc, FvGradScheme gs = FvGradScheme::LeastSquares,
+FvConfig config(Transport tr, std::vector<FvBc> bc, FvCellGrad gs = FvCellGrad::LeastSquares,
                 FvFaceGradRule rule = FvFaceGradRule::AlongD, double alpha = 1.0)
 {
     FvConfig c;
@@ -137,6 +138,13 @@ double maxAbs(const double* a, std::size_t n)
 // ---------------------------------------------------------------------------
 // G1: scheme equality with dns::Comp on a uniform periodic box.
 
+double maxAbsOf(const double* v, std::size_t n)
+{
+    double m = 0.0;
+    for (std::size_t i = 0; i < n; ++i) m = std::max(m, std::abs(v[i]));
+    return m;
+}
+
 void g1()
 {
     std::printf("G1 FvRef::rhs vs Comp::rhs on uniform periodic boxes (hx != hy != hz)\n");
@@ -145,17 +153,17 @@ void g1()
         const char* tag;
         int nz;
         Transport tr;
-        FvGradScheme gs;
+        FvCellGrad gs;
         CellOrder order;
     };
     const Case cases[] = {
-        {"3D mu 0.05, LSQ, Morton", 5, Transport::constant(kGamma, 0.05), FvGradScheme::LeastSquares, CellOrder::Morton},
+        {"3D mu 0.05, LSQ, Morton", 5, Transport::constant(kGamma, 0.05), FvCellGrad::LeastSquares, CellOrder::Morton},
         {"3D Sutherland, LSQ, colour", 5, Transport::air(0.05, 0.9, 288.15, 0.72, kGamma, 1.0, true),
-         FvGradScheme::LeastSquares, CellOrder::ColourMajor},
-        {"3D mu 0.05, Green-Gauss, source", 5, Transport::constant(kGamma, 0.05), FvGradScheme::GreenGauss,
+         FvCellGrad::LeastSquares, CellOrder::ColourMajor},
+        {"3D mu 0.05, Green-Gauss, source", 5, Transport::constant(kGamma, 0.05), FvCellGrad::GreenGauss,
          CellOrder::Source},
-        {"3D inviscid", 5, Transport::constant(kGamma, 0.0), FvGradScheme::LeastSquares, CellOrder::Morton},
-        {"2D (nz 1) mu 0.05, LSQ", 1, Transport::constant(kGamma, 0.05), FvGradScheme::LeastSquares,
+        {"3D inviscid", 5, Transport::constant(kGamma, 0.0), FvCellGrad::LeastSquares, CellOrder::Morton},
+        {"2D (nz 1) mu 0.05, LSQ", 1, Transport::constant(kGamma, 0.05), FvCellGrad::LeastSquares,
          CellOrder::Morton},
     };
     std::mt19937_64 rng(11);
@@ -378,7 +386,7 @@ struct DampResult
 DampResult damping(const FaceMesh& fm, const Grid& g, FvFaceGradRule rule, double alpha)
 {
     Laplacian L{fm, orDie(fvFaceGeom(fm, rule, alpha), "geom"), {}};
-    L.w = orDie(fvGradWeights(fm, L.geom, FvGradScheme::LeastSquares), "lsq");
+    L.w = orDie(fvGradWeights(fm, L.geom, FvCellGrad::LeastSquares), "lsq");
     const std::size_t nC = std::size_t(fm.nC);
     std::vector<double> cb(nC), Lx;
     for (std::size_t c = 0; c < nC; ++c) {
@@ -634,7 +642,7 @@ void e1()
             const std::size_t f = std::size_t(fm.nI) + b;
             phiB[b] = phiAt(fm.Cf[0][f], fm.Cf[1][f], fm.Cf[2][f]);
         }
-        for (const FvGradScheme gs : {FvGradScheme::LeastSquares, FvGradScheme::GreenGauss}) {
+        for (const FvCellGrad gs : {FvCellGrad::LeastSquares, FvCellGrad::GreenGauss}) {
             const FvFaceGeom geom = orDie(fvFaceGeom(fm, FvFaceGradRule::AlongD, 1.0), m.tag);
             const FvGradWeights w = orDie(fvGradWeights(fm, geom, gs), m.tag);
             std::array<std::vector<double>, 3> gr;
@@ -644,7 +652,7 @@ void e1()
             for (std::size_t c = 0; c < phi.size(); ++c)
                 err = std::max(err, std::hypot(gr[0][c] - a[0], gr[1][c] - a[1], gr[2][c] - a[2]));
             err /= std::hypot(a[0], a[1], a[2]);
-            if (gs == FvGradScheme::LeastSquares)
+            if (gs == FvCellGrad::LeastSquares)
                 check(err <= 1e-12, std::format("{}: least squares exact, max |g - a| / |a| = {:.2e}", m.tag, err));
             else
                 std::printf("  %s: Green-Gauss max |g - a| / |a| = %.3e (not exact off the line of centres; "
@@ -888,6 +896,25 @@ void e5()
                                   "{:.2e} <= 1e-8",
                                   wf));
 
+    // An entropy wave at the free pressure and normal velocity: a hot, light
+    // parcel leaving. The boundary sees no acoustic amplitude: p and u_n are
+    // the upwind side's, entropy is the parcel's. Reading c_P in the outgoing
+    // invariant failed this (docs/fvcomp.md "Far gap", cd +0.38%).
+    {
+        const double Sx[3] = {1.0, 0.0, 0.0};
+        const double pF = 1.0 / kGamma;
+        FvBc fb;
+        fb.kind = FvBcKind::Far;
+        const double qfs[5] = {1.0, 0.1, 0.0, 0.0, pF / (kGamma - 1.0) + 0.005};
+        std::copy(qfs, qfs + 5, fb.qFar);
+        const double r = 0.9; // same p, T up 11%
+        const FvPrim<double> Ph = fvPrimOf(r, r * 0.1, r * 0.05, 0.0, pF / (kGamma - 1.0) + 0.5 * r * 0.0125, kGamma, 1.0);
+        const FvPrim<double> Bh = fvBoundaryState(fb, Ph, Sx, Cf, kGamma, 1.0);
+        const double err = std::max({std::abs(Bh.p - pF), std::abs(Bh.u[0] - 0.1), std::abs(Bh.rho - r),
+                                     std::abs(Bh.u[1] - 0.05)});
+        check(err <= 1e-14, std::format("far: entropy wave leaves with no acoustic response, {:.2e} <= 1e-14", err));
+    }
+
     // float: the same templates, single precision.
     const float Sf[3] = {0.3f, -0.7f, 0.2f};
     const FvPrim<float> Af = fvPrimOf(float(qL[0]), float(qL[1]), float(qL[2]), float(qL[3]), float(qL[4]), kGamma, 1.0);
@@ -909,6 +936,87 @@ void e5()
 
 int mms(); // G4, below
 
+// Well-balanced gravity (docs/fvcomp.md "Gravity"). W1: T linear in the height + ln p
+// its hydrostatic integral, cell values only, is a fixed point on the random mesh:
+// rhs = rounding of the pressure gradient. Isothermal too. W2: an arbitrary state in a
+// closed adiabatic box: sum V (E + rho phi) and mass hold to rounding over a march.
+void wellBalanced()
+{
+    const double R = 1.0, gam = 1.4, gy = 0.05, H = 1.0;
+    const Grid g = Grid::make(24, 14, 1, 2.0, H + 2.0 / 12.0, 1.0);
+    for (FvPerturb kind : {FvPerturb::None, FvPerturb::Sine, FvPerturb::Random}) {
+        auto fm = fvConvBox(g, false, kind, kind == FvPerturb::Sine ? 0.08 : 0.3);
+        check(fm.has_value(), "W1 mesh");
+        if (!fm) return;
+        for (const double a : {-0.1, 0.0}) {
+            const double Tb = 1.0;
+            std::vector<FvBc> bc;
+            for (const MeshPatch& p : fm->patches) {
+                FvBc b;
+                b.kind = p.type == FoamPatchType::Empty ? FvBcKind::Empty : FvBcKind::Wall;
+                b.isothermal = b.kind == FvBcKind::Wall;
+                b.tWall = Tb + a * (p.name == "floor" ? 0.0 : H);
+                bc.push_back(b);
+            }
+            const FvConfig cfg{.tr = Transport::constant(gam, 0.02), .bc = bc, .gravity = {0.0, -gy, 0.0}};
+            auto ref = FvRef::make(*fm, cfg);
+            check(ref.has_value(), "W1 FvRef");
+            if (!ref) return;
+            FvState s = FvState::zeros(fm->nC), r;
+            double p1 = 0.0;
+            for (std::size_t c = 0; c < std::size_t(fm->nC); ++c) {
+                const double y = fm->C[1][c], T = Tb + a * y;
+                const double p = a != 0.0 ? std::pow(T / Tb, -gy / (R * a)) : std::exp(-gy * y / (R * Tb));
+                s.var(0)[c] = p / (R * T);
+                s.var(4)[c] = p / (gam - 1.0);
+                p1 = std::max(p1, p);
+            }
+            ref->rhs(s, r);
+            double e = 0.0;
+            for (int v = 0; v < 5; ++v) e = std::max(e, maxAbsOf(r.var(v), std::size_t(fm->nC)));
+            const double bound = 8e-15 * p1 / (2.0 / 24.0);
+            std::printf("  W1 mesh %d, dT/dy %g: max|rhs| %.3e (rounding of p/h %.3e)\n", int(kind), a, e, bound);
+            check(e <= bound, "W1 the hydrostatic state is a fixed point");
+        }
+    }
+    auto fm = fvConvBox(g, false, FvPerturb::Random, 0.3);
+    check(fm.has_value(), "W2 mesh");
+    if (!fm) return;
+    std::vector<FvBc> bc;
+    for (const MeshPatch& p : fm->patches) {
+        FvBc b;
+        b.kind = p.type == FoamPatchType::Empty ? FvBcKind::Empty : FvBcKind::Wall;
+        bc.push_back(b);
+    }
+    auto ref = FvRef::make(*fm, {.tr = Transport::constant(gam, 0.02), .bc = bc, .gravity = {0.0, -0.3, 0.0}});
+    check(ref.has_value(), "W2 FvRef");
+    if (!ref) return;
+    FvState s = FvState::zeros(fm->nC);
+    for (std::size_t c = 0; c < std::size_t(fm->nC); ++c) {
+        const double x = fm->C[0][c], y = fm->C[1][c];
+        const double rho = 1.0 + 0.1 * std::sin(3 * x) * std::cos(4 * y), u = 0.1 * std::sin(std::numbers::pi * x);
+        s.var(0)[c] = rho;
+        s.var(1)[c] = rho * u;
+        s.var(4)[c] = 1.0 / (gam - 1.0) + 0.5 * rho * u * u;
+    }
+    auto total = [&](const FvState& q, double& mass) {
+        double e = 0.0;
+        mass = 0.0;
+        for (std::size_t c = 0; c < std::size_t(fm->nC); ++c) {
+            e += fm->V[c] * (q.var(4)[c] + q.var(0)[c] * 0.3 * fm->C[1][c]);
+            mass += fm->V[c] * q.var(0)[c];
+        }
+        return e;
+    };
+    double m0, m1;
+    const double e0 = total(s, m0);
+    ref->march(s, 0.2 * *ref->stableDt(s), 200);
+    const double e1 = total(s, m1);
+    std::printf("  W2 random mesh, 200 steps: energy + potential %.3e, mass %.3e\n", std::abs(e1 / e0 - 1), std::abs(m1 / m0 - 1));
+    check(std::abs(e1 / e0 - 1) <= 1e-13, "W2 sum V (E + rho phi) holds to rounding");
+    check(std::abs(m1 / m0 - 1) <= 1e-13, "W2 mass holds to rounding");
+}
+
 int main(int argc, char** argv)
 {
     if (argc > 1 && std::string(argv[1]) == "mms") return mms();
@@ -924,6 +1032,7 @@ int main(int argc, char** argv)
     e4();
     e5();
     e6();
+    wellBalanced();
     return dnstest::finish();
 }
 
@@ -998,7 +1107,7 @@ struct Level
 };
 
 Level mmsLevel(const Mms& mm, int N, const FvState* coarse, const FaceMesh* fmCoarse, int threads,
-               FvFaceGradRule rule, double alpha, FvGradScheme gs, FvState* keep)
+               FvFaceGradRule rule, double alpha, FvCellGrad gs, FvState* keep)
 {
     const Grid g = Grid::make(N, N, 1, 1.0, 1.0, 1.0 / N);
     const FaceMesh fm = orDie(FaceMesh::fromCurvMesh(CurvMesh::sinusoidal(g, 0.06), periodicSpec(g), CellOrder::Morton),
@@ -1097,7 +1206,7 @@ Level mmsLevel(const Mms& mm, int N, const FvState* coarse, const FaceMesh* fmCo
     return {N, {e[0], e[1], e[2], e[3]}, steps, sec, change, converged};
 }
 
-void mmsSeries(const Mms& mm, const char* tag, FvFaceGradRule rule, double alpha, FvGradScheme gs,
+void mmsSeries(const Mms& mm, const char* tag, FvFaceGradRule rule, double alpha, FvCellGrad gs,
                std::initializer_list<int> Ns, bool gate)
 {
     std::printf("  %s\n", tag);
@@ -1141,11 +1250,11 @@ int mms()
 {
     std::printf("G4 MMS: 2D compressible NS, mu 0.01 (Re ~ 36), M ~ 0.36, sinusoidal amp 0.06 periodic meshes\n");
     const Mms mm;
-    mmsSeries(mm, "LSQ + AlongD (the pinned scheme)", FvFaceGradRule::AlongD, 1.0, FvGradScheme::LeastSquares,
+    mmsSeries(mm, "LSQ + AlongD (the pinned scheme)", FvFaceGradRule::AlongD, 1.0, FvCellGrad::LeastSquares,
               {32, 64, 128}, true);
-    mmsSeries(mm, "Green-Gauss + AlongD (reported)", FvFaceGradRule::AlongD, 1.0, FvGradScheme::GreenGauss, {32, 64},
+    mmsSeries(mm, "Green-Gauss + AlongD (reported)", FvFaceGradRule::AlongD, 1.0, FvCellGrad::GreenGauss, {32, 64},
               false);
     mmsSeries(mm, "LSQ + AlongNormal alpha 4/3 (reported)", FvFaceGradRule::AlongNormal, 4.0 / 3.0,
-              FvGradScheme::LeastSquares, {32, 64}, false);
+              FvCellGrad::LeastSquares, {32, 64}, false);
     return dnstest::finish();
 }

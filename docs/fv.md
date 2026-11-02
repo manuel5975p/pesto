@@ -12,14 +12,14 @@ was measured in — with the linear solves on `gpu/la` (`docs/la.md`). The case 
 `0/U`, `0/p`, `system/{controlDict,fvSchemes,fvSolution}`,
 `constant/{transportProperties,MRFProperties,turbulenceProperties}` are read
 as OpenFOAM reads them, and every entry the solver does not reproduce exactly
-is rejected by name (exit 3): among them `constant/fvOptions` /
-`system/fvOptions` (fv::options sources simpleFoam applies; rejected on
-presence) and a forces object without `CofR` (OpenFOAM's
+is rejected by name (exit 3): among them every `constant/fvOptions` /
+`system/fvOptions` content but ONE constant specific U source (section
+fvOptions), and a forces object without `CofR` (OpenFOAM's
 `coordSystem::cartesian(dict)` then reads `origin` + `e1`/`e3` and writes
 force/moment in that rotated frame, or stops when they are missing:
 `origin` alone or nothing is an OpenFOAM error; with `CofR` OpenFOAM reads
 neither `origin` nor `e1`/`e3`, and CofR is the moment centre here too).
-An empty `fvOptions` (no sources) is rejected too: on presence, by design. The mesh is the FaceMesh (`docs/mesh.md`) in
+An empty `fvOptions` is rejected too, by design. The mesh is the FaceMesh (`docs/mesh.md`) in
 SOURCE order, i.e. OpenFOAM's own cell and face numbering, so every per-cell
 sum runs in OpenFOAM's order.
 
@@ -390,14 +390,39 @@ dns flow --polymesh CASE [--max-iters N] [--fv-precision fp32|fp64] [--out PREFI
   viscous, `rhoInf`, `CofR`, `−ρν devTwoSymm(grad U_b)` on the corrected
   boundary gradient) every iteration. `tools/fv/foamdiff.py A B` diffs two
   time directories cell by cell.
-- Every other `dns flow` flag is rejected with `--polymesh` (exit 2); so is
-  `--physics compressible` (the compressible FV path, P4/P7, is not built).
+- Every other `dns flow` flag is rejected with `--polymesh` (exit 2).
+  `--physics compressible` or `--bc` leave this path: `--polymesh DIR --bc FILE`
+  is the time-accurate FV solver of `--physics` (`docs/fvcomp.md`,
+  `docs/fvincomp.md`).
 
 Label (log and stats header): `[FV path, body-fitted, laminar, FP32]` (RAS:
 the model label and the wall-distance method, section RAS; `FP64` in the
 parity mode; the next header line states every effective tolerance), plus
 `[MRF frozen rotor: APPROXIMATION, steady rotating frame]` with an active MRF
 zone; the dry-run names each zone `[MRF frozen rotor]`.
+
+## fvOptions (one constant U source)
+
+`dns flow --solver simple`'s periodic channel needs a driver
+(`docs/fvstructured.md`), so exactly this form is read:
+
+```
+momentumSource
+{
+    type            vectorSemiImplicitSource;
+    selectionMode   all;
+    volumeMode      specific;
+    sources { U ((fx fy fz) 0); }       // injectionRateSuSp: the older key
+}
+```
+
+`fvOptions(U)` on the right of UEqn: the matrix source gains V f, so H and the
+predictor both see it (`kUForce`, a pass after `kURow`; absent = the kernels
+bit for bit). One file, one source, Sp 0, every cell. Anything else (other
+types, Sp != 0, `absolute`, a cellZone, `timeStart`, a second source, an empty
+file) is rejected by name. Pinned by the exact Poiseuille gate, not by a
+simpleFoam run (OpenFOAM absent when it was built; the semantics are
+`fvOptionList::operator()` read from memory of v2606, issues.md).
 
 ## MRF (OpenFOAM `MRFZoneList` / `MRFZone`, v2606 source)
 

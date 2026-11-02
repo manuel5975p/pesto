@@ -7,7 +7,9 @@
 #include "dns/chamber.hpp"
 #include "dns/chem.hpp"
 #include "dns/diffusion.hpp"
+#include "dns/fvcomp_config.hpp"
 #include "dns/fvprecision.hpp"
+#include "dns/fvstructured.hpp"
 #include "dns/grid.hpp"
 #include "dns/prop/spec.hpp"
 #include "dns/rans.hpp"
@@ -16,6 +18,7 @@
 #include "dns/sgs.hpp"
 #include "dns/wick.hpp"
 
+#include <array>
 #include <expected>
 #include <optional>
 #include <set>
@@ -37,6 +40,12 @@ inline constexpr int kFlameModeChamber = 4;
 enum class Physics { Incompressible, Compressible, LowMach };
 enum class FarField { Tunnel, Fringe, Sponge, Nscbc, Periodic };
 enum class Backend { Cpu, Gpu, Auto };
+// --solver (dns conv: structured | fv): the structured solvers, simpleFoam on their mesh
+// (docs/fvstructured.md), or the FV solver of --physics (docs/fvcomp.md,
+// docs/fvincomp.md). RawConfig::solver holds it as an int (the enum table's type).
+enum class SolverKind { Structured, Simple, Fv };
+// Which compressible FV route a flow case takes (docs/fvcomp.md).
+enum class FvCompMode { Off, PolyMesh, Structured };
 enum class BodyKind { None, Cylinder, Sphere, Cube, Lens, Fence, Floor, Mesh, Scene };
 // Which coefficient multiplies the Yoo-Im transverse term in the NSCBC
 // outflow's incoming acoustic amplitude. YooIm = the fixed --nscbc-beta (the
@@ -422,6 +431,23 @@ struct RawConfig
     int fvCoupled = -1;
     double fvCoupledEta = 0.1, fvCoupledAlpha = 1.0;
     bool fvCoupledCheck = false;
+    // flow --solver structured|simple|fv, tgv, conv --solver structured|fv (SolverKind).
+    int solver = 0;
+    // Compressible FV family (docs/fvcomp.md): --bc FILE (phase 1.5 parses it
+    // into fvBc under --physics compressible), --tt end time in L/U, the
+    // --frame-box window "lo0,hi0,lo1,hi1" and --frame-n pixels on its long side.
+    // The time-accurate incompressible FV solver (docs/fvincomp.md) reads the
+    // same --bc path itself, with its own schema.
+    std::string bc, frameBox;
+    std::optional<FvBcSpec> fvBc;
+    int frameN = 512;
+    double ttFv = 0;
+    // --mesh-perturb A, --mesh-perturb-kind: `dns tgv --solver fv`'s box.
+    double meshPerturb = 0;
+    int meshPerturbKind = 0;
+    // --solver simple: simpleFoam on the structured mesh the flags name
+    // (docs/fvstructured.md); --export DIR writes its case.
+    std::string exportCase;
 };
 
 // Fully resolved case. Every derived quantity is computed here, so downstream
@@ -769,6 +795,32 @@ public:
     int fvCoupled = -1;
     double fvCoupledEta = 0.1, fvCoupledAlpha = 1.0;
     bool fvCoupledCheck = false;
+    // The polyMesh of --polymesh DIR --bc FILE, both FV solvers below.
+    std::string fvMeshDir;
+    // The compressible FV family (docs/fvcomp.md). PolyMesh: the mesh and its
+    // patches come from fvMeshDir + fvBc; Structured: fromCurvMesh of the
+    // validated grid, O-grid or body-free box, fvBc generated at run time.
+    FvCompMode fvMode = FvCompMode::Off;
+    FvBcSpec fvBc;
+    std::array<double, 4> fvFrameBox{};
+    int fvFrameN = 512;
+    // dns conv --solver fv (docs/fvcomp.md, docs/fvincomp.md, --physics picks):
+    // fvConv, fvConvBins = height bins of the plane statistics; fvMeshDir empty =
+    // the structured box as a FaceMesh.
+    bool fvConv = false;
+    int fvConvBins = 0;
+    // The time-accurate incompressible FV solver (docs/fvincomp.md): flow
+    // --solver fv --ogrid, flow --polymesh DIR --bc FILE.toml (fvMeshDir,
+    // fvBcFile), tgv --solver fv (fvPerturb, fvPerturbAmp).
+    bool fvIncomp = false;
+    std::string fvBcFile;
+    int fvPerturb = 0;           // FvPerturb index
+    double fvPerturbAmp = 0, fvTol = 1e-5;
+    int fvMaxPcg = 200;
+    // flow --solver simple: the generated case (fvs.active); fvCase = its
+    // directory, fvExport non-empty = write it and stop.
+    FvStructured fvs;
+    std::string fvExport;
 
     std::string outPrefix;
     std::set<Emit> emit;
@@ -808,6 +860,12 @@ private:
 // steady march, or the axisymmetric wedge; "" for a plain DNS/LES time march
 // (whose label is the DNS/LES slot of describe()).
 std::string flowRunLabel(const Case& c);
+// The FV family's run label: path, mesh, arithmetic, DNS/LES; twoD: the mesh is
+// 2D (the polyMesh route knows it from the manifest). Pre: fvMode != Off.
+std::string fvConvLabel(const Case& c, bool twoD);
+std::string fvCompLabel(const Case& c, bool twoD);
+// flameRunLabel plus the FV path's mesh, arithmetic and scheme. Pre: c.sub == Flame.
+std::string fvFlameLabel(const Case& c);
 
 // The run label of a `dns flame` case: the model (single-step, calorically
 // perfect, Le = 1), the flame Mach number with "(inflated)" and the CH4/air

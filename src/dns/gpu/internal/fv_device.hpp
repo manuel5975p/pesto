@@ -73,6 +73,8 @@ struct Ctl
     bool consistent = false;
     R relaxU = 0; // 0: no equation relaxation
     int emptyAxis = -1;
+    bool force = false; // fvOptions: f per unit mass on the U source
+    R f[3] = {0, 0, 0};
 };
 
 // --- small device helpers ---------------------------------------------------

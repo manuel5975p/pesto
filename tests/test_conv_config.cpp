@@ -344,5 +344,34 @@ int main()
         }
     }
 
+    // --solver fv: its route, its allow-list, the structured route's rejections.
+    {
+        auto c = runCli({"conv", "--solver", "fv", "--n", "32", "--ny", "16", "--nz", "1"});
+        check(c.has_value() && c->fvConv && c->fvConvBins == 16, "conv --solver fv resolves");
+        auto b = runCli({"conv", "--solver", "fv", "--physics", "incompressible", "--tol", "1e-6"});
+        check(b.has_value() && b->fvTol == 1e-6, "conv --solver fv incompressible takes --tol");
+        check(!runCli({"conv"})->fvConv, "the default stays structured");
+        auto d = runCli({"conv", "--solver", "fv", "--physics", "incompressible", "--fv-precision", "fp64"});
+        check(d.has_value() && d->fvPrecision == dns::FvPrecision::Fp64, "conv --solver fv takes --fv-precision");
+        check(rejected({"conv", "--solver", "fv", "--hot-patch", "0.5"}, 2, "--hot-patch"), "--hot-patch is not built on FV");
+        check(rejected({"conv", "--solver", "fv", "--physics", "incompressible", "--compensated"}, 2, "--compensated"),
+              "--compensated is compressible");
+        check(rejected({"conv", "--solver", "fv", "--tol", "1e-6"}, 2, "--tol"), "--tol is incompressible on FV");
+        check(rejected({"conv", "--tol", "1e-6"}, 2, "--tol"), "--tol needs --solver fv");
+        check(rejected({"conv", "--compensated"}, 2, "--compensated"), "--compensated needs --solver fv");
+        check(rejected({"conv", "--fv-precision", "fp64"}, 2, "--fv-precision"), "--fv-precision needs --solver fv");
+        check(rejected({"conv", "--mesh-perturb", "0.05"}, 2, "--mesh-perturb"), "--mesh-perturb needs --solver fv");
+        check(rejected({"conv", "--solver", "fv", "--mesh-perturb", "0.2"}, 2, "--mesh-perturb"), "--mesh-perturb: sine bound");
+        check(rejected({"conv", "--solver", "fv", "--mesh-perturb-kind", "random"}, 2, "--mesh-perturb-kind"),
+              "--mesh-perturb-kind needs its A");
+        check(rejected({"conv", "--solver", "fv", "--bc", "x.toml"}, 2, "--bc"), "--bc needs --polymesh");
+        check(rejected({"conv", "--polymesh", "m", "--bc", "x.toml", "--physics", "incompressible"}, 2, "--ny"),
+              "--polymesh needs --ny bins");
+        check(rejected({"conv", "--polymesh", "m", "--bc", "x.toml", "--ny", "8", "--n", "32", "--physics", "incompressible"},
+                       2, "--n"),
+              "--n belongs to the mesh");
+        check(rejected({"conv", "--solver", "structured", "--polymesh", "m"}, 2, "--solver"), "--polymesh is the FV path");
+    }
+
     return dnstest::finish();
 }

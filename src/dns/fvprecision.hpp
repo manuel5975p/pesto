@@ -1,6 +1,6 @@
-// Arithmetic of the incompressible FV path (`dns flow --polymesh`, docs/fv.md
-// "Precision"): FP32 default, FP64 the parity mode, and the FP32 solve
-// floors. Pure, host-includable (cli/config and gpu/fv_simple read it).
+// Arithmetic of the FV paths (`dns flow --polymesh`, docs/fv.md "Precision";
+// the compressible family reads FvPrecision only, docs/fvcomp.md): FP32 default,
+// FP64 the parity mode, and the FP32 solve floors of the incompressible path. Pure, host-includable (cli/config and gpu/fv_simple read it).
 #pragma once
 
 #include <cstdint>

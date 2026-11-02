@@ -218,30 +218,78 @@ void channelRansIC(const Case& c, const std::vector<double>& wallDist,
             }
 }
 
-void convIC(const Case& c, double gamma, CompState& host,
-            std::vector<float>& mask)
+ConvHydro convHydroAt(const Case& c, double y)
 {
-    const auto& g = c.grid;
     const double Rgas = 1.0, H = c.convH, Tref = 1.0;
-    const double delta = 0.5 * H;                 // half-height, as the channel
     const double tFloor = meanFloorT(c);
     const double a = (c.tTop - tFloor) / H;       // conduction gradient, < 0
-    const double A = c.kick * c.uFreeFall;
-    const double alpha = 2 * pi / c.lxBox;
-    const double bz = g.nz > 1 ? 2 * pi / c.lzBox : 0.0;
-    // Closed lateral faces (--sides closed) carry the plates' ghost ring, so
-    // the trip needs the plates' treatment there too: the wall face sits one
-    // spacing in, and every stream-function factor is enveloped so the trip
-    // vanishes at it. An open axis keeps the periodic factor verbatim.
-    const bool cxS = c.closedSides, czS = c.closedSides && g.nz > 1;
-    const double x0 = cxS ? g.hx : 0.0, z0 = czS ? g.hz : 0.0;
-    const double Lx = c.lxBox, Lz = c.lzBox;
     // Hydrostatic pressure through a LINEAR temperature profile:
     // dp/dy = -p g / (R T(y)) integrates to p = pRef (T/Tref)^(-g/(R a)),
     // normalised to pRef at mid-layer where T = Tref. a != 0 is guaranteed:
     // validate() requires --dtemp > 0. It is a function of y alone, which is
     // exactly consistent with adiabatic side walls.
     const double pExp = -c.gravity / (Rgas * a);
+    const double T = tFloor + a * y;
+    const double p = c.pRef * std::pow(T / Tref, pExp);
+    return {.T = T, .p = p, .rho = p / (Rgas * T)};
+}
+
+std::array<double, 3> convTripAt(const Case& c, double x, double y, double z, bool threeD)
+{
+    const double H = c.convH;
+    const double delta = 0.5 * H;                 // half-height, as the channel
+    const double A = c.kick * c.uFreeFall;
+    const double alpha = 2 * pi / c.lxBox;
+    const double bz = threeD ? 2 * pi / c.lzBox : 0.0;
+    const bool cxS = c.closedSides, czS = c.closedSides && threeD;
+    const double Lx = c.lxBox, Lz = c.lzBox;
+    double uu = 0, vv = 0, ww = 0;
+    const double gy = y * (2 * delta - y) / (delta * delta);
+    const double gEnv = gy * gy;
+    const double dEnv = 2.0 * gy * (2 * delta - 2 * y)
+                      / (delta * delta);
+    const double ex = cxS ? sideEnv(x, Lx) : 1.0;
+    const double ez = czS ? sideEnv(z, Lz) : 1.0;
+    const double fx = (std::sin(alpha * x + 0.1)
+                    + 0.5 * std::sin(2 * alpha * x + 1.3)) * ex;
+    // d(fx * ex)/dx: the product rule term exists only where
+    // the envelope does.
+    double dfx = (alpha * std::cos(alpha * x + 0.1)
+                + alpha * std::cos(2 * alpha * x + 1.3)) * ex;
+    if (cxS)
+        dfx += (std::sin(alpha * x + 0.1)
+             + 0.5 * std::sin(2 * alpha * x + 1.3))
+             * sideEnvSlope(x, Lx);
+    const double cz = threeD ? std::cos(bz * z + 0.5) * ez
+                             : 1.0;
+    uu += A * delta * dEnv * fx * cz;   //  d psi_z / dy
+    vv -= A * delta * gEnv * dfx * cz;  // -d psi_z / dx
+    if (threeD)
+    {   // psi_x = A d gEnv cos(a x + 0.9) sin(b z + 0.2)
+        const double cx = std::cos(alpha * x + 0.9) * ex;
+        vv += A * delta * gEnv * cx * bz
+            * (std::cos(bz * z + 0.2) * ez);  //  d psi_x / dz
+        if (czS)
+            vv += A * delta * gEnv * cx
+                * std::sin(bz * z + 0.2)
+                * sideEnvSlope(z, Lz);
+        ww -= A * delta * dEnv * cx
+            * (std::sin(bz * z + 0.2) * ez); // -d psi_x / dy
+    }
+    return {uu, vv, ww};
+}
+
+void convIC(const Case& c, double gamma, CompState& host,
+            std::vector<float>& mask)
+{
+    const auto& g = c.grid;
+    const double H = c.convH;
+    // Closed lateral faces (--sides closed) carry the plates' ghost ring, so
+    // the trip needs the plates' treatment there too: the wall face sits one
+    // spacing in, and every stream-function factor is enveloped so the trip
+    // vanishes at it. An open axis keeps the periodic factor verbatim.
+    const bool cxS = c.closedSides, czS = c.closedSides && g.nz > 1;
+    const double x0 = cxS ? g.hx : 0.0, z0 = czS ? g.hz : 0.0;
     for (int k = 0; k < g.nz; ++k)
         for (int j = 0; j < g.ny; ++j)
             for (int i = 0; i < g.nx; ++i)
@@ -255,9 +303,8 @@ void convIC(const Case& c, double gamma, CompState& host,
                 // Physical height above the floor: the wall face sits at
                 // y = hy, half a cell outside the first fluid row.
                 const double y = std::clamp((j - 0.5) * g.hy, 0.0, H);
-                const double T = tFloor + a * y;
-                const double p = c.pRef * std::pow(T / Tref, pExp);
-                const double rho = p / (Rgas * T);
+                const ConvHydro h = convHydroAt(c, y);
+                const double p = h.p, rho = h.rho;
 
                 // Ghost cells belong to the wall mirror -- the two rows always,
                 // and the lateral ghost columns once that side is a wall.
@@ -267,38 +314,10 @@ void convIC(const Case& c, double gamma, CompState& host,
                 double uu = 0, vv = 0, ww = 0;
                 if (fluid)
                 {
-                    const double gy = y * (2 * delta - y) / (delta * delta);
-                    const double gEnv = gy * gy;
-                    const double dEnv = 2.0 * gy * (2 * delta - 2 * y)
-                                      / (delta * delta);
-                    const double ex = cxS ? sideEnv(x, Lx) : 1.0;
-                    const double ez = czS ? sideEnv(z, Lz) : 1.0;
-                    const double fx = (std::sin(alpha * x + 0.1)
-                                    + 0.5 * std::sin(2 * alpha * x + 1.3)) * ex;
-                    // d(fx * ex)/dx: the product rule term exists only where
-                    // the envelope does.
-                    double dfx = (alpha * std::cos(alpha * x + 0.1)
-                                + alpha * std::cos(2 * alpha * x + 1.3)) * ex;
-                    if (cxS)
-                        dfx += (std::sin(alpha * x + 0.1)
-                             + 0.5 * std::sin(2 * alpha * x + 1.3))
-                             * sideEnvSlope(x, Lx);
-                    const double cz = g.nz > 1 ? std::cos(bz * z + 0.5) * ez
-                                               : 1.0;
-                    uu += A * delta * dEnv * fx * cz;   //  d psi_z / dy
-                    vv -= A * delta * gEnv * dfx * cz;  // -d psi_z / dx
-                    if (g.nz > 1)
-                    {   // psi_x = A d gEnv cos(a x + 0.9) sin(b z + 0.2)
-                        const double cx = std::cos(alpha * x + 0.9) * ex;
-                        vv += A * delta * gEnv * cx * bz
-                            * (std::cos(bz * z + 0.2) * ez);  //  d psi_x / dz
-                        if (czS)
-                            vv += A * delta * gEnv * cx
-                                * std::sin(bz * z + 0.2)
-                                * sideEnvSlope(z, Lz);
-                        ww -= A * delta * dEnv * cx
-                            * (std::sin(bz * z + 0.2) * ez); // -d psi_x / dy
-                    }
+                    const auto trip = convTripAt(c, x, y, z, g.nz > 1);
+                    uu = trip[0];
+                    vv = trip[1];
+                    ww = trip[2];
                 }
                 else mask[q] = 0.0f;
                 host.rho[q] = rho;
@@ -311,19 +330,21 @@ void convIC(const Case& c, double gamma, CompState& host,
 }
 
 
-void rbIC(const Case& c, VectorField& U, Scalar& T, std::vector<float>& mask)
+namespace {
+
+// The Boussinesq trip's streamfunction factors, on x, y, z from the wall faces.
+struct RbTrip
 {
-    const auto& g = c.grid;
-    const double H = c.convH, delta = 0.5 * H;
-    const double tFloor = meanFloorT(c);
-    const double a = (c.tTop - tFloor) / H;   // conduction gradient, < 0
-    const double A = c.kick * c.uFreeFall;
-    const double alpha = 2 * pi / c.lxBox;
-    const double bz = g.nz > 1 ? 2 * pi / c.lzBox : 0.0;
-    // The bottom wall face is the v-face j = 1, so a cell centre sits at
-    // (j - 0.5) hy above it and a y-face at (j - 1) hy.
-    auto yc = [&](int j) { return (j - 0.5) * g.hy; };
-    auto yf = [&](int j) { return (j - 1.0) * g.hy; };
+    double H, delta, A, alpha, bz, Lx, Lz;
+    bool cxS, czS;
+
+    RbTrip(const Case& c, bool threeD)
+        : H(c.convH), delta(0.5 * c.convH), A(c.kick * c.uFreeFall), alpha(2 * pi / c.lxBox),
+          bz(threeD ? 2 * pi / c.lzBox : 0.0), Lx(c.lxBox), Lz(c.lzBox), cxS(c.closedSides),
+          czS(c.closedSides && threeD)
+    {
+    }
+
     // Envelope with gEnv = gEnv' = 0 at BOTH plates, so the trip respects
     // no-slip exactly; its curl is the velocity below.
     //
@@ -337,41 +358,86 @@ void rbIC(const Case& c, VectorField& U, Scalar& T, std::vector<float>& mask)
     // antisymmetric about mid-height and breaks it. (The compressible branch
     // needs no such term: its hydrostatic stratification breaks the symmetry
     // physically, which is why ITS nuBot - nuTop genuinely fluctuates.)
-    auto asym = [&](double y) { return 1.0 + 0.5 * std::cos(pi * y / H); };
-    auto dAsym = [&](double y) {
-        return -0.5 * (pi / H) * std::sin(pi * y / H);
-    };
-    auto gEnv = [&](double y) {
+    double asym(double y) const { return 1.0 + 0.5 * std::cos(pi * y / H); }
+    double dAsym(double y) const { return -0.5 * (pi / H) * std::sin(pi * y / H); }
+    double gEnv(double y) const
+    {
         const double q = y * (2 * delta - y) / (delta * delta);
         return q * q * asym(y);
-    };
-    auto dEnv = [&](double y) {
+    }
+    double dEnv(double y) const
+    {
         const double q = y * (2 * delta - y) / (delta * delta);
         const double dq = 2.0 * q * (2 * delta - 2 * y) / (delta * delta);
         return dq * asym(y) + q * q * dAsym(y);
-    };
+    }
     // Closed lateral faces: the same story as the plates, one axis over. The
     // wall face is the u-face i = 1 (and the w-face k = 1), so the envelope
     // evaluated at a face coordinate makes the trip's wall-normal component
     // EXACTLY zero there, and its slope makes the tangential ones vanish too.
     // Open axis: the periodic factor verbatim, hence bit-for-bit unchanged.
-    const bool cxS = c.closedSides, czS = c.closedSides && g.nz > 1;
-    const double x0 = cxS ? g.hx : 0.0, z0 = czS ? g.hz : 0.0;
-    const double Lx = c.lxBox, Lz = c.lzBox;
-    auto ex = [&](double x) { return cxS ? sideEnv(x, Lx) : 1.0; };
-    auto ez = [&](double z) { return czS ? sideEnv(z, Lz) : 1.0; };
-    auto fx = [&](double x) {
+    double ex(double x) const { return cxS ? sideEnv(x, Lx) : 1.0; }
+    double ez(double z) const { return czS ? sideEnv(z, Lz) : 1.0; }
+    double fx(double x) const
+    {
         return (std::sin(alpha * x + 0.1) + 0.5 * std::sin(2 * alpha * x + 1.3))
              * ex(x);
-    };
-    auto dfx = [&](double x) {
+    }
+    double dfx(double x) const
+    {
         double d = (alpha * std::cos(alpha * x + 0.1)
                  + alpha * std::cos(2 * alpha * x + 1.3)) * ex(x);
         if (cxS)
             d += (std::sin(alpha * x + 0.1)
                + 0.5 * std::sin(2 * alpha * x + 1.3)) * sideEnvSlope(x, Lx);
         return d;
-    };
+    }
+};
+
+} // namespace
+
+RbPoint rbPointAt(const Case& c, double x, double y, double z, bool threeD)
+{
+    const RbTrip t(c, threeD);
+    const double tFloor = meanFloorT(c);
+    const double a = (c.tTop - tFloor) / c.convH;
+    const double czU = threeD ? std::cos(t.bz * z + 0.5) * t.ez(z) : 1.0;
+    RbPoint o{.T = tFloor + a * y};
+    o.u[0] = t.A * t.delta * t.dEnv(y) * t.fx(x) * czU;
+    o.u[1] = -t.A * t.delta * t.gEnv(y) * t.dfx(x) * czU;
+    if (threeD) {
+        const double cx = std::cos(t.alpha * x + 0.9) * t.ex(x);
+        o.u[1] += t.A * t.delta * t.gEnv(y) * cx * t.bz * (std::cos(t.bz * z + 0.2) * t.ez(z));
+        if (t.czS) o.u[1] += t.A * t.delta * t.gEnv(y) * cx * std::sin(t.bz * z + 0.2) * sideEnvSlope(z, t.Lz);
+        o.u[2] = -t.A * t.delta * t.dEnv(y) * cx * (std::sin(t.bz * z + 0.2) * t.ez(z));
+    }
+    return o;
+}
+
+void rbIC(const Case& c, VectorField& U, Scalar& T, std::vector<float>& mask)
+{
+    const auto& g = c.grid;
+    const double H = c.convH;
+    const double tFloor = meanFloorT(c);
+    const double a = (c.tTop - tFloor) / H;   // conduction gradient, < 0
+    const double A = c.kick * c.uFreeFall;
+    const double delta = 0.5 * H;
+    const double alpha = 2 * pi / c.lxBox;
+    const double bz = g.nz > 1 ? 2 * pi / c.lzBox : 0.0;
+    // The bottom wall face is the v-face j = 1, so a cell centre sits at
+    // (j - 0.5) hy above it and a y-face at (j - 1) hy.
+    auto yc = [&](int j) { return (j - 0.5) * g.hy; };
+    auto yf = [&](int j) { return (j - 1.0) * g.hy; };
+    const RbTrip trip(c, g.nz > 1);
+    auto gEnv = [&](double y) { return trip.gEnv(y); };
+    auto dEnv = [&](double y) { return trip.dEnv(y); };
+    const bool cxS = c.closedSides, czS = c.closedSides && g.nz > 1;
+    const double x0 = cxS ? g.hx : 0.0, z0 = czS ? g.hz : 0.0;
+    const double Lz = c.lzBox;
+    auto ex = [&](double x) { return trip.ex(x); };
+    auto ez = [&](double z) { return trip.ez(z); };
+    auto fx = [&](double x) { return trip.fx(x); };
+    auto dfx = [&](double x) { return trip.dfx(x); };
 
     for (int k = 0; k < g.nz; ++k)
         for (int j = 0; j < g.ny; ++j)

@@ -1,0 +1,157 @@
+// A planar premixed flame on any FaceMesh (docs/fvcomp.md "Species"): the IC along
+// a direction and the structured runner's column stats, restated on slabs normal
+// to that direction. Host, geometry layer. A slab holds the cells whose centroid
+// falls in it, so a Cartesian mesh's slabs ARE the structured columns. The slot-jet
+// diffusion flame the same way: per-face inflow rows, IC, measureJet's stats.
+#pragma once
+
+#include "dns/diffusion.hpp"
+#include "dns/facemesh.hpp"
+#include "dns/fvcomp_config.hpp"
+#include "dns/fvflux.hpp"
+#include "dns/fvref.hpp"
+
+#include <array>
+#include <expected>
+#include <functional>
+#include <string>
+#include <vector>
+
+namespace dns {
+
+// One slab's FP64 means, Sum(V f)/Sum V, cells ascending.
+struct FvFlameSlab
+{
+    double s = 0, T = 0, rho = 0, u = 0, p = 0, ry = 0, omega = 0, vol = 0;
+};
+
+// One stats row: SL = burn / (A rho Y_ref), xf the mean-T mid crossing from the
+// mesh's low end, dth = (Tb - Tu)/max slope, as runner_flame's measure(), slabs
+// for columns. energy = Sum V (E + q rho Y), hits = cells with Y outside [-1e-6,
+// 1 + 1e-6]. uRef, pRef, TRef: the slab 2 delta_th inside the low end.
+struct FvFlameMeasure
+{
+    double SL = 0, xf = NAN, dth = 0, Tmax = 0, mass = 0, energy = 0, fuel = 0, burn = 0;
+    double omegaEdge = 0, hits = 0, yMin = 0, yMax = 0, uRef = 0, pRef = 0, TRef = 0;
+    std::vector<FvFlameSlab> slabs;
+};
+
+// What a probe reads off the model. dir: unit normal of the flame, burnt side +.
+struct FvFlameSpec
+{
+    std::array<double, 3> dir{1, 0, 0};
+    double Tu = 1, sigma = 5, dth = 1, gamma = 1.4, Rgas = 1, q = 0;
+    int fuel = 0;
+};
+
+// The low-Mach state's cell fields (gpu/fv_incomp DeviceFvLowMach::cells), [nC] but
+// ru [3 nC]; p is the dynamic pressure. All non-null, FaceMesh numbering.
+struct FvFlameLowMachCells
+{
+    const std::vector<double>*rho, *ry, *ru, *T, *p, *omega;
+};
+
+class FvFlameProbe
+{
+public:
+    // Slab width: the mean |d . dir| over internal faces with |d . dir| >= |d|/2,
+    // fitted to a whole number of slabs. Pre: fm outlives the probe. Errors: no
+    // such face, a mesh shorter than two slabs.
+    static std::expected<FvFlameProbe, std::string> make(const FaceMesh& fm, const FvFlameSpec& spec);
+
+    // Pre: s has the mesh's cells and the mean + species rows; omega per cell.
+    FvFlameMeasure measure(const FvState& s, const std::vector<double>& omega) const;
+
+    // The same measure of a low-Mach state: energy = Sum V (cp rho T + q rho Y), pRef
+    // and the slabs' p the dynamic pressure. Pre: spec.gamma, Rgas give that cp.
+    FvFlameMeasure measureLowMach(const FvFlameLowMachCells& q) const;
+
+    double area() const { return area_; }
+    double length() const { return hi_ - lo_; }
+    double slab() const { return h_; }
+    const FvFlameSpec& spec() const { return spec_; }
+
+private:
+    // The slab means and the flame's numbers from the slab sums.
+    void finish(FvFlameMeasure& o, std::vector<FvFlameSlab> b) const;
+
+    const FaceMesh* fm_ = nullptr;
+    FvFlameSpec spec_;
+    std::vector<int> bin_; // per cell
+    double lo_ = 0, hi_ = 0, h_ = 0, area_ = 0;
+    int nBin_ = 0;
+};
+
+// What the jet's rows, IC and probe read. dir: streamwise, lift: lateral, origin:
+// the slot's centre on the inflow plane; a point sits at x = (C - origin).dir, y =
+// (C - origin).lift + geom.yc in the structured box's coordinates, y - yc wrapped to
+// the mesh's lateral period (a sheared cyclic mesh leaves the slot's y). p0 = T0 (R 1).
+// skip: cells at each end TmaxIn ignores, in slabs.
+struct FvJetSpec
+{
+    std::array<double, 3> dir{1, 0, 0}, lift{0, 1, 0}, origin{};
+    DiffusionModel model{};
+    BunsenGeom geom{};
+    double T0 = 1, gamma = 1.4, Rgas = 1, q = 0;
+    int skip = 4;
+};
+
+// measureJet's numbers and the runner's. energy = Sum V (E + q rho Y_F), pMean the
+// volume mean p/p0; hits: cells with Z, Y_F or Y_O outside [-1e-6, 1 + 1e-6].
+struct FvJetMeasure
+{
+    double xTip = NAN, xBase = NAN, half = NAN, Tmax = 0, TmaxIn = 0, burn = 0, mass = 0, energy = 0, pMean = 0;
+    double zMin = 0, zMax = 0, yfMin = 0, yoMin = 0, hits = 0;
+};
+
+class FvJetProbe
+{
+public:
+    // Slabs of the mean |d.dir|, as FvFlameProbe's; the axis: cells within the mean
+    // |d.lift| of y = yc, the two columns either side on a Cartesian mesh. Pre: fm
+    // outlives the probe. Errors: no face along dir or lift, under four slabs.
+    static std::expected<FvJetProbe, std::string> make(const FaceMesh& fm, const FvJetSpec& spec);
+
+    // Pre: s has the mesh's cells and rows Y_F, Y_O at 5, 6; omega per cell.
+    FvJetMeasure measure(const FvState& s, const std::vector<double>& omega) const;
+
+    double length() const { return double(nBin_) * h_; }
+    const FvJetSpec& spec() const { return spec_; }
+
+private:
+    const FaceMesh* fm_ = nullptr;
+    FvJetSpec spec_;
+    std::vector<int> bin_;                 // per cell
+    std::vector<double> x_, y_;            // per cell, from the slot's inflow centre, y wrapped
+    std::vector<std::vector<int>> slabs_;  // cells per slab, ascending y
+    double h_ = 0, hLat_ = 0, lo_ = 0;
+    int nBin_ = 0;
+};
+
+// The table of a jet run: a copy of bc (a row per patch) plus one row per face of
+// every `jet` patch, diffusionInflow(y) at the face centre: its u, T, y[0], y[1] =
+// Y_F, Y_O, `diffusive`. Every Outflow row carries its owner's Y both ways and is
+// `characteristic`. faceRow: per boundary face, its row.
+struct FvJetRows
+{
+    std::vector<FvBc> bc;
+    std::vector<int> faceRow;
+};
+FvJetRows fvJetRows(const FaceMesh& fm, const FvBcSpec& spec, std::vector<FvBc> bc, const FvJetSpec& js);
+
+// y of every cell off the slot's axis, wrapped: a 2D mesh with cyclic faces has the
+// lateral period Sum V / (length along dir x depth).
+std::vector<double> fvJetLateral(const FaceMesh& fm, const FvJetSpec& js);
+
+// diffusionIC on any mesh: the inflow row at the cell's y, extruded along dir;
+// ignition > 0: the short burning column of --ignition. Rows rho, m, E, rho Y_F,
+// rho Y_O.
+FvState fvJetState(const FaceMesh& fm, const FvJetSpec& js, double ignition);
+
+// The FV state of t(s, C) = T/Tu at every cell centroid C, s = (C - origin) . dir,
+// through premixedPoint: rows rho, m, E, rho Y(fuel). Flow along dir, nY species,
+// the others 0.
+FvState fvFlameState(const FaceMesh& fm, const FvFlameSpec& spec, std::array<double, 3> origin, double m, int nY,
+                     const std::function<double(double)>& t);
+
+} // namespace dns

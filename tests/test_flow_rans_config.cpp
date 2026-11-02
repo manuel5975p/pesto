@@ -621,7 +621,7 @@ void compensated()
                 "--steady", "1e-4", "--steady-scheme", "implicit",
                 "--compensated"},
                "--compensated", "channel --compensated + implicit");
-    rejected({"conv", "--compensated"}, 1, "conv --compensated: unknown flag");
+    rejected({"conv", "--compensated"}, 2, "conv --compensated: belongs to dns conv --solver fv");
     rejected({"hit", "--compensated"}, 1, "hit --compensated: unknown flag");
 }
 

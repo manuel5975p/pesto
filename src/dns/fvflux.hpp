@@ -14,8 +14,8 @@
 //
 // Mesh-agnostic: a face is (S, d, corr) and two cell states. Eddy viscosity
 // (RANS/LES) and a rotating frame enter through the caller's mu, kappa and
-// the advected frame area flux wS; scalars and species ride F[0] (later
-// phases).
+// the advected frame area flux wS; species ride F[0] (fvFaceY, fvSpeciesFlux),
+// RANS scalars later.
 #pragma once
 
 #include "dns/dual.hpp"
@@ -29,6 +29,8 @@ namespace dns {
 
 // rho, rho u, rho v, rho w, E: the mean-flow rows of the FV state [nV][nC].
 inline constexpr int kFvMeanVars = 5;
+// Species rows the FV state can carry after the mean-flow rows.
+inline constexpr int kFvMaxSpecies = 4;
 
 // One cell's (or one boundary state's) primitives as the face flux reads
 // them; e = E / rho is the total specific energy KG averages.
@@ -74,6 +76,16 @@ DNS_HD inline void fvTransportAt(const Transport& tr, T Tf, T& mu, T& kappa)
     }
     mu = T(tr.muRef) * r;
     kappa = mu * T(tr.cp()) / T(tr.Pr);
+}
+
+// Largest diffusivity on mu/rho the FV checkerboard sees: energy gamma/Pr, momentum
+// 4/3 (the normal stress of a longitudinal checkerboard; 1 grew x1.8e6 in 60 steps at
+// Pr 2 on 100:1 cells, E6). FV-only: the structured solvers keep diffusivityFactor.
+// Pr > 0: the molecular Pr, or Pr_t for the eddy part.
+DNS_HD inline double fvDiffusivityFactor(double gamma, double Pr)
+{
+    const double a = 4.0 / 3.0, b = gamma / Pr;
+    return a > b ? a : b;
 }
 
 // How the face gradient corrects the average of the two cell gradients:
@@ -169,6 +181,79 @@ DNS_HD inline FvFlux<T> fvEulerFlux(const FvPrim<T>& b, const G S[3])
             b.rho * Un * b.e + b.p * Un};
 }
 
+// Monotonized-central slope, gpu/internal/species_face.hpp's mcSlope for any T:
+// 0 unless d1, d2 share a sign, else sign * min(2|d1|, 2|d2|, |d1 + d2|/2).
+// Exactly 0 on a uniform field.
+template <class T>
+DNS_HD inline T fvMcSlope(T d1, T d2)
+{
+    if (!(value(d1 * d2) > 0.0)) return T(0.0);
+    const T a1 = value(d1) > 0.0 ? d1 : T(0.0) - d1, a2 = value(d2) > 0.0 ? d2 : T(0.0) - d2;
+    const T s = d1 + d2;
+    const T a3 = T(0.5) * (value(s) > 0.0 ? s : T(0.0) - s);
+    T m = T(2.0) * a1;
+    const T m2 = T(2.0) * a2;
+    if (value(m2) < value(m)) m = m2;
+    if (value(a3) < value(m)) m = a3;
+    return value(d1) > 0.0 ? m : T(0.0) - m;
+}
+
+// Species face value of an internal face: upwind on mdot, Y_up + MC(d1, d2)/2
+// with d2 = Y_down - Y_up and d1 the VIRTUAL upwind difference 2 grad Y_up . r -
+// d2, r = up -> down (Darwish-Moukalled). On a uniform mesh LSQ's grad Y_up . r
+// is (Y_down - Y_upup)/2, so d1 = Y_up - Y_upup: the structured faceY (rounding,
+// docs/fvcomp.md "Species"). d, gP, gN as fvFaceGrad's. Uniform Y returns Y bit
+// for bit (g == 0, d1 == d2 == 0).
+template <class T, class G>
+DNS_HD inline T fvFaceY(T mdot, T YP, T YN, const T gP[3], const T gN[3], const G d[3])
+{
+    if (value(mdot) >= 0.0) {
+        const T d2 = YN - YP;
+        const T d1 = T(2.0) * (gP[0] * T(d[0]) + gP[1] * T(d[1]) + gP[2] * T(d[2])) - d2;
+        return YP + T(0.5) * fvMcSlope(d1, d2);
+    }
+    const T d2 = YP - YN;
+    const T d1 = T(-2.0) * (gN[0] * T(d[0]) + gN[1] * T(d[1]) + gN[2] * T(d[2])) - d2;
+    return YN + T(0.5) * fvMcSlope(d1, d2);
+}
+
+// A species votes on the shared limiter iff |d2| >= 2^-24 (the FP32 resolution of a
+// unit mass fraction): gpu/internal/species_face.hpp's kVoteJump, its reason.
+inline constexpr double kFvVoteJump = 0x1p-24;
+
+// One field's vote on the shared limiter of an internal face: min(th, MC(d1, d2)/
+// d2), (d1, d2) fvFaceY's. Start from th = 2 (none votes), fold over the fields
+// (species; the low-Mach face adds T, so T + (q/cp) Y keeps one face formula).
+template <class T, class G>
+DNS_HD inline T fvThetaVote(T th, T mdot, T YP, T YN, const T gP[3], const T gN[3], const G d[3])
+{
+    const bool up = value(mdot) >= 0.0;
+    const T d2 = up ? YN - YP : YP - YN;
+    const T s = up ? T(2.0) * (gP[0] * T(d[0]) + gP[1] * T(d[1]) + gP[2] * T(d[2]))
+                   : T(-2.0) * (gN[0] * T(d[0]) + gN[1] * T(d[1]) + gN[2] * T(d[2]));
+    const double a = value(d2) > 0.0 ? value(d2) : -value(d2);
+    if (a < kFvVoteJump) return th;
+    const T r = fvMcSlope(s - d2, d2) / d2;
+    return value(r) < value(th) ? r : th;
+}
+
+// The shared-limiter face value Y_up + th/2 (Y_down - Y_up): LINEAR in Y across
+// species, so every affine combination (coupling functions, mixture fraction)
+// rides the same formula whatever th is.
+template <class T>
+DNS_HD inline T fvFaceYShared(T mdot, T YP, T YN, T th)
+{
+    return value(mdot) >= 0.0 ? YP + T(0.5) * th * (YN - YP) : YN + T(0.5) * th * (YP - YN);
+}
+
+// Species flux through S on an internal face: the face's own mass flux times
+// the face value, minus Fick with rho D, g the corrected face gradient.
+template <class T, class G>
+DNS_HD inline T fvSpeciesFlux(T mdot, T Yf, T rhoD, const T g[3], const G S[3])
+{
+    return mdot * Yf - rhoD * (g[0] * T(S[0]) + g[1] * T(S[1]) + g[2] * T(S[2]));
+}
+
 // Boundary kinds of the FV path (masterplan §2.3). Cyclic is an internal
 // face; Empty carries no flux (the 2D restriction).
 enum class FvBcKind : std::uint8_t { Wall, Slip, Inflow, Outflow, Far, Empty };
@@ -186,13 +271,42 @@ struct FvBc
     // Inflow: velocity and temperature given; p from the outgoing acoustic
     // invariant p + rho c u_n of the owner. No viscous flux.
     double uIn[3] = {0, 0, 0}, tIn = 0;
+    // Inflow: a fixed FACE: u, T and Y diffuse through it toward the row (OpenFOAM's
+    // fixedValue; the jet's sheet sends 5% of its fuel in by Fick, docs/fvcomp.md).
+    bool diffusive = false;
     // Outflow: static pressure given; u, T zero-gradient. Backflow (u.S < 0)
     // keeps only the normal velocity and takes tBack. No viscous flux.
     double pOut = 0, tBack = 0;
+    // Outflow: subsonic characteristics while the flow leaves: entropy and the outgoing
+    // Riemann invariant of the owner, rho and u_n follow p_out. Off: rho_b = p_out/(R
+    // T_P), u_P: a cell below p_out is drained at p_out's density (a jet's outflow
+    // evacuated on a sheared mesh, docs/fvcomp.md "Diffusion flame").
+    bool characteristic = false;
     // Far: the freestream as a CONSERVED state (rho, rho u, E), so its
     // primitives come out of fvPrimOf exactly as an interior cell's do and a
     // freestream crosses the face bit for bit. No viscous flux.
     double qFar[5] = {1, 0, 0, 0, 0};
+    // Inflow, Outflow, Far: the mass fractions an INCOMING face carries; an
+    // outgoing face carries the owner's (fvBoundaryY). Other kinds: unread.
+    double y[kFvMaxSpecies] = {0, 0, 0, 0};
+    // Outflow: a backflow face carries the owner's Y too, never y (the jet's outflow:
+    // docs/chem.md item 4, y would be the jet's fuel).
+    bool ownY = false;
+};
+
+// The species rows and the one irreversible step of model C0 (docs/chem.md):
+// omega = arrheniusRate(lnA, Ta, rho, Y_fuel, T) consumes species `fuel` and
+// releases q omega into E; other species are passive. Le = 1: rho D = invPr mu.
+// nY == 0: no species row, no species pass, the solver bit for bit.
+// lnA == -inf: no reaction (omega exactly 0).
+// ox >= 0: model C1, F + s O -> (1+s) P: omega = arrheniusRate2, oxidizer -stoich
+// omega on the same omega, one shared limiter per face (fvThetaVote). ox < 0: off.
+struct FvChem
+{
+    int nY = 0, fuel = 0;
+    double lnA = 0, Ta = 0, q = 0, invPr = 1;
+    int ox = -1;
+    double stoich = 1;
 };
 
 // Wall velocity at a point. omega x (x - origin).
@@ -206,18 +320,35 @@ DNS_HD inline void fvWallVelocity(const FvBc& bc, const G x[3], double u[3])
     u[2] = bc.uWall[2] + (bc.omega[0] * r[1] - bc.omega[1] * r[0]);
 }
 
+// The species value of a boundary face: the BC row's y[s] where the open face's
+// mass flux mdot comes in, the owner's elsewhere. So a boundary species flux is
+// mdot Y_b with no diffusion: a Wall or Slip has mdot 0 and zero gradient, an
+// open face no viscous flux (the structured ScalarBoundary rule). A `diffusive`
+// Inflow: the row's on every face, plus Fick (fvSpeciesFlux of fvFaceGradBnd).
+template <class T>
+DNS_HD inline T fvBoundaryY(const FvBc& bc, int s, T YP, T mdot)
+{
+    const bool open = bc.kind == FvBcKind::Inflow || bc.kind == FvBcKind::Outflow || bc.kind == FvBcKind::Far;
+    if (bc.diffusive) return T(bc.y[s]);
+    return open && !bc.ownY && value(mdot) < 0.0 ? T(bc.y[s]) : YP;
+}
+
 // The boundary state of face (S, Cf) of owner P: what the boundary flux and
 // the gradient's boundary face values read.
 //   Wall:    rho_P, u_w(Cf), p_P (zero gradient, no two-sample
 //            extrapolation), T_w (isothermal) or T_P (adiabatic).
 //   Slip:    P with the normal velocity removed.
 //   Inflow:  u_in, T_in, p = p_P + rho_P c_P (u_n,P - u_n,in).
-//   Outflow: p_out, u_P and T_P; backflow: normal u only, T_back.
+//   Outflow: p_out, u_P and T_P; backflow: normal u only, T_back. `characteristic`,
+//            leaving: p_out, the owner's entropy and outgoing invariant.
 //   Far:     1D characteristic state between P and the freestream F (Riemann
 //            invariants u_n +- 2c/(gamma-1); entropy and tangential velocity
-//            from the upwind side; supersonic: all from the upwind side),
-//            written as DIFFERENCES from the upwind state so P == F returns
-//            F exactly.
+//            from the upwind side; supersonic: all from the upwind side).
+//            The outgoing invariant reads the ISENTROPIC sound speed of p_P,
+//            cF (p_P/p_F)^((gamma-1)/(2 gamma)), never c_P: an entropy wave
+//            carries no acoustic amplitude (c_P made a hot wake a pressure
+//            source; docs/fvcomp.md "Far gap"). Written as DIFFERENCES from
+//            the upwind state so P == F returns F exactly.
 // Pre: P.rho, P.p > 0; S nonzero.
 template <class T, class G>
 DNS_HD inline FvPrim<T> fvBoundaryState(const FvBc& bc, const FvPrim<T>& P, const G S[3],
@@ -256,6 +387,16 @@ DNS_HD inline FvPrim<T> fvBoundaryState(const FvBc& bc, const FvPrim<T>& P, cons
         return b;
     }
     case FvBcKind::Outflow: {
+        if (bc.characteristic && value(un(P.u)) >= 0.0) {
+            const T r = pow(T(bc.pOut) / P.p, 1.0 / gamma), cP = sqrt(T(gamma) * P.p / P.rho);
+            const T dun = T(2.0 / (gamma - 1.0)) * cP * (T(1.0) - pow(r, 0.5 * (gamma - 1.0)));
+            b.p = T(bc.pOut);
+            b.rho = P.rho * r;
+            b.temp = b.p / (b.rho * T(Rgas));
+            for (int k = 0; k < 3; ++k) b.u[k] = P.u[k] + dun * n[k];
+            b.e = b.p / (T(gamma - 1.0) * b.rho) + ke(b.u);
+            return b;
+        }
         if (value(un(P.u)) < 0.0) {
             const T unP = un(P.u);
             for (int k = 0; k < 3; ++k) b.u[k] = unP * n[k];
@@ -273,15 +414,14 @@ DNS_HD inline FvPrim<T> fvBoundaryState(const FvBc& bc, const FvPrim<T>& P, cons
         const T unP = un(P.u), unF = un(F.u);
         if (value(unP) >= value(cP)) return P; // supersonic outflow
         if (value(unP) <= -value(cP)) return F; // supersonic inflow
-        const T delta = (unP - unF) + T(2.0 / (gamma - 1.0)) * (cP - cF);
+        const T cPs = cF * pow(P.p / F.p, (gamma - 1.0) / (2.0 * gamma));
+        const T delta = (unP - unF) + T(2.0 / (gamma - 1.0)) * (cPs - cF);
         const T unb = unF + T(0.5) * delta;
         const T cb = cF + T(0.25 * (gamma - 1.0)) * delta;
         const FvPrim<T>& up = value(unb) >= 0.0 ? P : F;
         const T unUp = value(unb) >= 0.0 ? unP : unF;
-        const T cUp = value(unb) >= 0.0 ? cP : cF;
-        const T r = cb / cUp;
-        b.rho = up.rho * pow(r, 2.0 / (gamma - 1.0));
-        b.p = up.p * pow(r, 2.0 * gamma / (gamma - 1.0));
+        b.p = F.p * pow(cb / cF, 2.0 * gamma / (gamma - 1.0));
+        b.rho = up.rho * pow(b.p / up.p, 1.0 / gamma);
         for (int k = 0; k < 3; ++k) b.u[k] = up.u[k] + (unb - unUp) * n[k];
         b.temp = b.p / (b.rho * T(Rgas));
         b.e = up.e + (b.p / b.rho - up.p / up.rho) / T(gamma - 1.0) + (ke(b.u) - ke(up.u));
@@ -299,7 +439,8 @@ DNS_HD inline FvPrim<T> fvBoundaryState(const FvBc& bc, const FvPrim<T>& P, cons
 //   Wall:  {0, p_P S - tau.S, p_P u_w.S - u_w.(tau.S) - q}, q = kappa grad T.S
 //          isothermal, EXACTLY 0 adiabatic: no leak by construction (G7).
 //   Slip:  {0, p_P S - (n.tau.S) n, 0}: zero shear, zero heat, no work.
-//   Inflow, Outflow, Far: the Euler flux of B (no viscous flux).
+//   Inflow, Outflow, Far: the Euler flux of B (no viscous flux; a `diffusive`
+//   Inflow adds -tau.S, -u_b.(tau.S) - q as an internal face).
 //   Empty: zero.
 template <class T, class G>
 DNS_HD inline FvFlux<T> fvBoundaryFlux(const FvBc& bc, const FvPrim<T>& P, const FvPrim<T>& B,
@@ -329,12 +470,60 @@ DNS_HD inline FvFlux<T> fvBoundaryFlux(const FvBc& bc, const FvPrim<T>& P, const
                 {(P.p - tn) * T(S[0]), (P.p - tn) * T(S[1]), (P.p - tn) * T(S[2])},
                 zero};
     }
-    case FvBcKind::Inflow:
+    case FvBcKind::Inflow: {
+        FvFlux<T> f = fvEulerFlux(B, S);
+        if (!bc.diffusive || value(mu) == 0.0) return f;
+        fvTraction(gu, mu, S, ts);
+        T eflux = kappa * (gT[0] * T(S[0]) + gT[1] * T(S[1]) + gT[2] * T(S[2]));
+        for (int c = 0; c < 3; ++c) {
+            f.m[c] = f.m[c] - ts[c];
+            eflux = eflux + B.u[c] * ts[c];
+        }
+        f.E = f.E - eflux;
+        return f;
+    }
     case FvBcKind::Outflow:
     case FvBcKind::Far: return fvEulerFlux(B, S);
     case FvBcKind::Empty: break;
     }
     return {zero, {zero, zero, zero}, zero};
+}
+
+// ln(a/b)/(2 xi), xi = (a - b)/(a + b): log mean L(a, b) = (a - b)/ln(a/b) =
+// (a + b)/(2 fvLogFactor(a, b)). A series below xi^2 1e-2, exactly 1 at a == b
+// (Ismail-Roe). Pre: a, b > 0.
+template <class T>
+DNS_HD inline T fvLogFactor(T a, T b)
+{
+    using std::log;
+    const T xi = (a - b) / (a + b), u = xi * xi;
+    if (value(u) < 1e-2)
+        return T(1.0) + u * (T(1.0 / 3.0) + u * (T(1.0 / 5.0) + u * (T(1.0 / 7.0) + u * (T(1.0 / 9.0) + u * (T(1.0 / 11.0) + u * T(1.0 / 13.0))))));
+    return log(a / b) / (T(2.0) * xi);
+}
+
+// The face density of gravity: L(p_A, p_B) / (R L(T_A, T_B)). With it p_B - p_A =
+// rho_f g.d holds EXACTLY whenever T is linear in the height and ln p its
+// hydrostatic integral, isothermal included: a path-independent relation, so the
+// state is an equilibrium of ANY mesh (docs/fvcomp.md "Gravity"). Pre: p, T > 0.
+template <class T>
+DNS_HD inline T fvHydroRho(const FvPrim<T>& A, const FvPrim<T>& B, double Rgas)
+{
+    return (A.p + B.p) / ((A.temp + B.temp) * T(Rgas)) * fvLogFactor(A.temp, B.temp) / fvLogFactor(A.p, B.p);
+}
+
+// Gravity as a FACE term of an internal face, added by BOTH cells, unsigned (a
+// source, not a flux): o[0..2] = (g.d/2) rho_f S, o[3] = (g.d/2) mdot, d = C_nei -
+// C_own, mdot = F[0]. It stands against the pressure sum's own form, (p_N - p_P)/2
+// S of a closed cell, so the rest residual is (p_N - p_P - rho_f g.d)/2 S, and
+// sum V (E + rho phi) of a closed box telescopes. A Wall or Slip face adds nothing:
+// its hydrostatic image and its share of this term are one number, opposite.
+template <class T, class G>
+DNS_HD inline void fvGravityFace(T rhoF, T mdot, const double g[3], const G d[3], const G S[3], T o[4])
+{
+    const T gd = T(0.5) * (T(g[0]) * T(d[0]) + T(g[1]) * T(d[1]) + T(g[2]) * T(d[2]));
+    for (int k = 0; k < 3; ++k) o[k] = rhoF * gd * T(S[k]);
+    o[3] = mdot * gd;
 }
 
 } // namespace dns

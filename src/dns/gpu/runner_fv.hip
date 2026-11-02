@@ -218,6 +218,7 @@ std::expected<RunStats, RunError> runFvSimple(const FvRunSpec& sp, FvLoaded& L)
     // floor-limited / all solves: U components, p, turbulence scalars
     std::array<long, 3> nFloor{}, nSolves{};
     auto mark = [](const FvSolveLog& l) { return l.floorLimited ? ", floor-limited" : ""; };
+    FvForceSums lastForce{};
     for (int it = 1; it <= N; ++it) {
         if (stopRequested()) {
             std::fprintf(stderr, "dns: %s at iteration %d\n", stopReason(), it);
@@ -232,6 +233,7 @@ std::expected<RunStats, RunError> runFvSimple(const FvRunSpec& sp, FvLoaded& L)
             auto f = ds->forces();
             if (!f) return fail(7, f.error());
             fo = *f;
+            lastForce = fo;
         }
         (void)hipDeviceSynchronize();
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ti).count();
@@ -360,6 +362,11 @@ std::expected<RunStats, RunError> runFvSimple(const FvRunSpec& sp, FvLoaded& L)
         if (!fStats) return fail(4, sp.outPrefix + "_stats.csv: write failed");
     }
     rs.msPerStep = rs.steps ? msLoop / double(rs.steps) : 0.0;
+    if (fc.forces && sp.refArea > 0) {
+        const double q = 0.5 * sp.refArea;
+        std::printf("cd %.8g cdp %.8g cdf %.8g cl %.8g (rho 1, U 1, A %.8g)\n", (lastForce.fp[0] + lastForce.fv[0]) / q,
+                    lastForce.fp[0] / q, lastForce.fv[0] / q, (lastForce.fp[1] + lastForce.fv[1]) / q, sp.refArea);
+    }
     return rs;
 }
 

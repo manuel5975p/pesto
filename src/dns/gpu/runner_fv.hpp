@@ -27,6 +27,7 @@ struct FvRunSpec
     // after this many SIMPLE iterations; -1 = SIMPLE only (the default).
     int coupledAfter = -1;
     FvCoupledOpts coupled;
+    double refArea = 0;     // > 0: print cd, cl of the last iteration (rho 1, U 1)
 };
 
 // Pre: L from loadFvCase. Errors: 3 setup (case/mesh binding), 4 output,

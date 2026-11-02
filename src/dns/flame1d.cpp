@@ -9,6 +9,21 @@
 
 namespace dns {
 
+PremixedPoint premixedPoint(double gamma, double Tu, double sigma, double m,
+                            double tt)
+{
+    const double p0 = Tu; // rho_u = R = 1
+    const double T = Tu * tt;
+    const double rho0 = p0 / T;
+    const double p = p0 - m * m * (1 / rho0 - 1);
+    const double rho = p / T;
+    const double u = m / rho;
+    return {.rho = rho,
+            .u = u,
+            .E = p / (gamma - 1) + 0.5 * rho * u * u,
+            .Y = (sigma - tt) / (sigma - 1)};
+}
+
 void premixedState(const Grid& g, double gamma, double Tu, double sigma,
                    double m, const std::function<double(double, double)>& t,
                    CompState& q, std::vector<double>& rhoY)
@@ -16,22 +31,16 @@ void premixedState(const Grid& g, double gamma, double Tu, double sigma,
     assert(Tu > 0 && sigma > 1 && gamma > 1);
     q = CompState::zeros(g);
     rhoY.assign(g.size(), 0.0);
-    const double p0 = Tu; // rho_u = R = 1
     for (int j = 0; j < g.ny; ++j)
         for (int i = 0; i < g.nx; ++i) {
             const double tt = t((i + 0.5) * g.hx, (j + 0.5) * g.hy);
-            const double T = Tu * tt;
-            const double rho0 = p0 / T;
-            const double p = p0 - m * m * (1 / rho0 - 1);
-            const double rho = p / T;
-            const double u = m / rho;
-            const double Y = (sigma - tt) / (sigma - 1);
+            const PremixedPoint pt = premixedPoint(gamma, Tu, sigma, m, tt);
             for (int k = 0; k < g.nz; ++k) {
                 const std::size_t c = g.idx(i, j, k);
-                q.rho[c] = rho;
-                q.mx[c] = rho * u;
-                q.E[c] = p / (gamma - 1) + 0.5 * rho * u * u;
-                rhoY[c] = rho * Y;
+                q.rho[c] = pt.rho;
+                q.mx[c] = pt.rho * pt.u;
+                q.E[c] = pt.E;
+                rhoY[c] = pt.rho * pt.Y;
             }
         }
 }

@@ -62,6 +62,12 @@ Measured (`test_facemesh` F1/F3/F8):
 processor faces; the reconstructed mesh on disk has 2 600 459, which is what
 the FaceMesh holds.
 
+Revolved structured meshes (`polyOf`, `axisFaces` set): the two node columns
+on the axis collapse to one node per j, a quad with an edge on the axis
+becomes a triangle, the line a cell's side degenerates to is no face and no
+patch: prism cells, no axis patch, `S` never 0. Wedge (`MirrorZ`): the one real
+plane k = 1, sides `symmetry`.
+
 ## The FaceMesh contract
 
 - **Faces.** `[0, nI)` internal with `own < nei`, sorted by
@@ -232,7 +238,7 @@ state or rhs overwrite anywhere:
 | `Slip` | P with the normal velocity removed | `{0, p_P S − (n·τ·S) n, 0}`: no shear, no heat, no work |
 | `Inflow` | u_in, T_in, `p = p_P + ρ_P c_P (u_n,P − u_n,in)` (outgoing acoustic invariant) | Euler flux of the state; no viscous flux |
 | `Outflow` | p_out, u_P, T_P; backflow (`u_P·S < 0`): normal u only, T_back | Euler flux; no viscous flux |
-| `Far` | 1D characteristic state between P and the freestream (Riemann invariants `u_n ± 2c/(γ−1)`, entropy + tangential u upwind, supersonic all upwind), as differences from the upwind state: P = freestream returns the freestream bit for bit | Euler flux; no viscous flux |
+| `Far` | 1D characteristic state between P and the freestream (Riemann invariants `u_n ± 2c/(γ−1)`, outgoing `c` = the isentropic `c` of p_P, never `c_P`; entropy + tangential u upwind, supersonic all upwind), as differences from the upwind state: P = freestream returns the freestream bit for bit | Euler flux; no viscous flux |
 | `Empty` | — | none |
 | cyclic | internal face | — |
 
@@ -291,12 +297,12 @@ test 38.7–56.4 s, bitwise the same numbers each run. `fvref` takes 0.2 s.
 
 ## Not built (P1, P2)
 
-`wedge` patches and axis prisms (P8), decomposed meshes (`processor`),
-non-conformal couplings, a FaceMesh of a revolved structured mesh
-(`axisFaces`, `MirrorZ`), `meshQuality` on a `fromCurvMesh` mesh, multi-block
-builders (P12). FV path (P2 is the host oracle only): no GPU kernels (P4), no
-scalars or species rows (`fvScalarFlux`, P8/P10), no MRF frame flux (P9), no
-eddy viscosity, no LTS march (per-cell dt exists), per-face boundary data
-(profiles) not supported — one `FvBc` per patch. `Far` is 1D characteristic
+`wedge` patches (a revolved `polyOf` mesh takes `symmetry` sides and collapsed
+axis prisms, `docs/fvstructured.md`), decomposed meshes (`processor`),
+non-conformal couplings, `meshQuality` on a `fromCurvMesh` mesh, multi-block
+builders (P12). FvRef stays the host oracle; its GPU family is `gpu/fv_comp`
+(`docs/fvcomp.md`, DNS + LES on any FaceMesh). No scalars or species rows
+(`fvScalarFlux`, P8/P10), no MRF frame flux (P9), no LTS march (per-cell dt
+exists), per-face boundary data (profiles) not built — one `FvBc` row per patch. `Far` is 1D characteristic
 (no transverse terms), `Outflow` fixes p (reflects acoustics, as OpenFOAM's
 fixed p does), `Inflow` is subsonic. See `issues.md`.

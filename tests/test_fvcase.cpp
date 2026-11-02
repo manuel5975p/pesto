@@ -224,10 +224,26 @@ void testCases()
     for (const char* f : {"constant/fvOptions", "system/fvOptions"}) {
         FoamCaseTexts t = *base;
         t[f] = "src { type vectorSemiImplicitSource; selectionMode all; volumeMode specific; "
-               "sources { U ((1 0 0) 0); } }";
+               "sources { U ((1 2 3) 0); } }";
         auto r = load(data("cavity"), &t);
-        check(!r && r.error().find(f) != std::string::npos,
-              std::format("{} (simpleFoam applies it) rejected by name: {}", f, r ? "ACCEPTED" : r.error()));
+        check(r && r->uSource == FvVec3{1, 2, 3}, std::format("{}: the one built source is read", f));
+        const char* rejected[] = {
+            "",
+            "src { type meanVelocityForce; selectionMode all; Ubar (1 0 0); }",
+            "src { type vectorSemiImplicitSource; selectionMode all; volumeMode specific; sources { U ((1 0 0) 2); } }",
+            "src { type vectorSemiImplicitSource; selectionMode all; volumeMode absolute; sources { U ((1 0 0) 0); } }",
+            "src { type vectorSemiImplicitSource; selectionMode cellZone; volumeMode specific; sources { U ((1 0 0) 0); } }",
+            "src { type vectorSemiImplicitSource; selectionMode all; volumeMode specific; sources { k (1 0); } }",
+            "src { type vectorSemiImplicitSource; selectionMode all; volumeMode specific; timeStart 1; sources { U ((1 0 0) 0); } }",
+            "a { type vectorSemiImplicitSource; selectionMode all; volumeMode specific; sources { U ((1 0 0) 0); } } "
+            "b { type vectorSemiImplicitSource; selectionMode all; volumeMode specific; sources { U ((1 0 0) 0); } }",
+        };
+        for (const char* txt : rejected) {
+            t[f] = txt;
+            auto x = load(data("cavity"), &t);
+            check(!x && x.error().find(f) != std::string::npos,
+                  std::format("{} '{:.40}': {}", f, txt, x ? "ACCEPTED" : x.error()));
+        }
     }
     {
         // forces::setCoordinateSystem: without CofR, origin + e1/e3 rotate the output frame (rejected);

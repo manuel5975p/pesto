@@ -1,0 +1,128 @@
+#include "dns/fvcomp_case.hpp"
+
+#include "dns/fvwalldist.hpp"
+
+#include <algorithm>
+#include <cmath>
+
+namespace dns {
+
+FvFreestream fvFreestreamOf(double mach, double gamma, double Rgas, std::array<double, 3> dir)
+{
+    const double p = 1.0 / (gamma * mach * mach);
+    return {.rho = 1.0, .U = 1.0, .p = p, .T = p / Rgas, .gamma = gamma, .dir = dir};
+}
+
+FvBc fvBcOf(const FvPatchSpec& p, const FvFreestream& f, double frac)
+{
+    FvBc b;
+    const double u = frac * f.U;
+    std::ranges::copy(p.y, b.y);
+    switch (p.kind) {
+    case FvPatchKind::Wall:
+        b.kind = FvBcKind::Wall;
+        b.isothermal = p.isothermal;
+        b.tWall = p.tWall * f.T;
+        for (std::size_t k = 0; k < 3; ++k) {
+            b.uWall[k] = p.uWall[k] * f.U;
+            b.omega[k] = p.omega[k];
+            b.origin[k] = p.origin[k];
+        }
+        return b;
+    case FvPatchKind::Slip: b.kind = FvBcKind::Slip; return b;
+    case FvPatchKind::Inflow:
+        b.kind = FvBcKind::Inflow;
+        b.tIn = p.tIn * f.T;
+        for (std::size_t k = 0; k < 3; ++k) b.uIn[k] = p.hasU ? frac * p.uIn[k] * f.U : u * f.dir[k];
+        return b;
+    case FvPatchKind::Outflow:
+        b.kind = FvBcKind::Outflow;
+        b.pOut = p.burnt ? f.pBurnt : p.pOut * f.p;
+        b.tBack = p.burnt ? f.tBurnt : p.tBack * f.T;
+        return b;
+    case FvPatchKind::Far: {
+        b.kind = FvBcKind::Far;
+        b.qFar[0] = f.rho;
+        double ke = 0.0;
+        for (std::size_t k = 0; k < 3; ++k) {
+            const double m = f.rho * (u * f.dir[k]);
+            b.qFar[1 + k] = m;
+            ke += m * (u * f.dir[k]);
+        }
+        b.qFar[4] = f.p / (f.gamma - 1.0) + 0.5 * ke;
+        return b;
+    }
+    case FvPatchKind::Empty: b.kind = FvBcKind::Empty; return b;
+    }
+    return b;
+}
+
+std::vector<FvBc> fvBcsOf(const FaceMesh& fm, const FvBcSpec& spec, const FvFreestream& f, double frac)
+{
+    std::vector<FvBc> v;
+    v.reserve(fm.patches.size());
+    for (const MeshPatch& m : fm.patches) {
+        if (m.type == FoamPatchType::Empty) {
+            FvBc e;
+            e.kind = FvBcKind::Empty;
+            v.push_back(e);
+            continue;
+        }
+        v.push_back(fvBcOf(*std::ranges::find(spec.patches, m.name, &FvPatchSpec::name), f, frac));
+    }
+    return v;
+}
+
+std::vector<std::uint8_t> fvTallyOf(const FaceMesh& fm, const FvBcSpec& spec)
+{
+    std::vector<std::uint8_t> v(fm.patches.size(), 0);
+    for (std::size_t i = 0; i < fm.patches.size(); ++i) {
+        if (fm.patches[i].type == FoamPatchType::Empty) continue;
+        v[i] = std::ranges::find(spec.patches, fm.patches[i].name, &FvPatchSpec::name)->tallied ? 1 : 0;
+    }
+    return v;
+}
+
+std::expected<std::vector<double>, std::string> fvRansWallDistance(PolyMesh pm, const FaceMesh& fm,
+                                                                   const FvBcSpec& spec)
+{
+    for (FoamPatch& p : pm.man.patches) {
+        if (p.type == FoamPatchType::Empty || p.type == FoamPatchType::Cyclic) continue;
+        const auto it = std::ranges::find(spec.patches, p.name, &FvPatchSpec::name);
+        p.type = it != spec.patches.end() && it->kind == FvPatchKind::Wall ? FoamPatchType::Wall : FoamPatchType::Patch;
+    }
+    // fvWallDistance reads srcCell as a polyMesh cell; fromCurvMesh's holds Grid::idx,
+    // ascending in the same order, so its rank is the polyMesh cell (identity else).
+    FaceMesh ranked = fm;
+    std::vector<std::int64_t> sorted = fm.srcCell;
+    std::ranges::sort(sorted);
+    for (auto& v : ranked.srcCell) v = std::ranges::lower_bound(sorted, v) - sorted.begin();
+    auto d = fvWallDistance(pm, ranked, true, false);
+    if (!d) return std::unexpected(std::move(d.error()));
+    return std::move(d->y);
+}
+
+FvState fvWithScalars(const FvState& s, RansModel m, const std::array<double, 2>& phiInf)
+{
+    const int nT = ransScalars(m);
+    FvState o = FvState::zeros(s.nC, kFvMeanVars + nT);
+    std::ranges::copy(s.q, o.q.begin());
+    for (int e = 0; e < nT; ++e)
+        for (std::size_t c = 0; c < std::size_t(s.nC); ++c)
+            o.var(kFvMeanVars + e)[c] = s.var(0)[c] * phiInf[std::size_t(e)];
+    return o;
+}
+
+double fvMeshDepth(const FaceMesh& fm)
+{
+    if (fm.emptyAxis < 0) return 1.0;
+    const std::size_t a = std::size_t(fm.emptyAxis);
+    for (const MeshPatch& p : fm.patches)
+        if (p.type == FoamPatchType::Empty && p.count > 0) {
+            const std::size_t f = std::size_t(fm.nI + p.first);
+            return fm.V[std::size_t(fm.own[f])] / std::abs(fm.S[a][f]);
+        }
+    return 1.0;
+}
+
+} // namespace dns

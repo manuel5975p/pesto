@@ -110,6 +110,16 @@ void channelRansIC(const Case& c, const std::vector<double>& wallDist,
 void convIC(const Case& c, double gamma, CompState& state,
             std::vector<float>& mask);
 
+// One point of convIC, for a mesh that is no Grid (dns conv --solver fv). y is the
+// height above the floor, x and z measured from a closed side's wall face.
+struct ConvHydro
+{
+    double T, p, rho;
+};
+ConvHydro convHydroAt(const Case& c, double y);
+// The solenoidal trip at (x, y, z): u, v, w. Pre: 0 <= y <= H.
+std::array<double, 3> convTripAt(const Case& c, double x, double y, double z, bool threeD);
+
 // Boussinesq Rayleigh-Benard (--physics incompressible): the linear conduction
 // profile and the same solenoidal trip, on the MAC grid.
 //
@@ -127,5 +137,14 @@ void convIC(const Case& c, double gamma, CompState& state,
 // rows always, and the lateral ghost columns once those sides are walls. Pre:
 // mask sized c.grid.size() and pre-filled with 1.
 void rbIC(const Case& c, VectorField& U, Scalar& T, std::vector<float>& mask);
+
+// One collocated point of rbIC (dns conv --solver fv): the conduction T and the
+// trip, the same streamfunction with its up-down symmetry breaking term.
+struct RbPoint
+{
+    double T = 0;
+    std::array<double, 3> u{};
+};
+RbPoint rbPointAt(const Case& c, double x, double y, double z, bool threeD);
 
 } // namespace dns

@@ -232,10 +232,14 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
              {"--planes", &c.planes}, {"--png-down", &c.pngDown},
              {"--vort-max", &c.vortMax}, {"--polymesh", &c.polymesh},
+             {"--bc", &c.bc}, {"--tt", &c.ttFv}, {"--frame-box", &c.frameBox},
+             {"--frame-n", &c.frameN},
              {"--fv-coupled", &c.fvCoupled}, {"--fv-coupled-eta", &c.fvCoupledEta},
-             {"--fv-coupled-alpha", &c.fvCoupledAlpha}});
+             {"--fv-coupled-alpha", &c.fvCoupledAlpha},
+             {"--export", &c.exportCase}, {"--re-tau", &c.reTau}});
     if (c.sub == Subcommand::Tgv)
-        add({{"--nu", &c.nu}, {"--cfl", &c.cfl}, {"--fdt", &c.fdt}});
+        add({{"--nu", &c.nu}, {"--cfl", &c.cfl}, {"--fdt", &c.fdt}, {"--les", &c.les}, {"--tol", &c.tol},
+             {"--max-iters", &c.maxIters}, {"--mesh-perturb", &c.meshPerturb}});
     if (c.sub == Subcommand::Hit)
         add({{"--urms", &c.urms}, {"--nu", &c.nu}, {"--spin", &c.spin},
              {"--stats", &c.stats}, {"--fdt", &c.fdt}});
@@ -261,6 +265,9 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--tt", &c.tt}, {"--cfl", &c.cfl},
              {"--dt-recompute", &c.dtRecompute},
              {"--profile-dt", &c.profileDt},
+             {"--polymesh", &c.polymesh}, {"--bc", &c.bc}, {"--tol", &c.tol},
+             {"--max-iters", &c.maxIters}, {"--frame-box", &c.frameBox},
+             {"--frame-n", &c.frameN}, {"--mesh-perturb", &c.meshPerturb},
              {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
              {"--planes", &c.planes}, {"--png-down", &c.pngDown}});
     if (c.sub == Subcommand::Flame)
@@ -273,6 +280,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--inflow-speed", &c.inflowSpeed},
              {"--wrinkle", &c.wrinkle}, {"--wrinkle-modes", &c.wrinkleModes},
              {"--turb", &c.turb}, {"--turb-length", &c.turbLength},
+             {"--polymesh", &c.polymesh}, {"--bc", &c.bc}, {"--tol", &c.tol},
+             {"--frame-box", &c.frameBox}, {"--frame-n", &c.frameN},
              {"--frame-start", &c.frameStart},
              {"--les", &c.les}, {"--tfles", &c.tfles},
              {"--slot-width", &c.slotWidth}, {"--jet-speed", &c.jetSpeed},
@@ -366,7 +375,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                          &c.slLaw});
         enums.push_back({"--dt-rule", {{"bounds", 0}, {"cell", 1}}, &c.dtRule});
     }
-    if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench
+    if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench || c.sub == Subcommand::Tgv
         || c.sub == Subcommand::Channel || c.sub == Subcommand::Flame)
         enums.push_back({"--sgs", enumValues(sgsModelNames()), &sgsSel});
     if (c.sub == Subcommand::Flow)
@@ -381,9 +390,35 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
                          {{"linear", 0}, {"asinh", 1}}, &c.vortMap});
         enums.push_back({"--speed-map",
                          {{"abs", 0}, {"delta", 1}}, &c.speedMap});
+        enums.push_back({"--solver",
+                         {{"structured", int(SolverKind::Structured)},
+                          {"simple", int(SolverKind::Simple)},
+                          {"fv", int(SolverKind::Fv)}},
+                         &c.solver});
+    }
+    if (c.sub == Subcommand::Flame)
+        enums.push_back({"--solver",
+                         {{"structured", int(SolverKind::Structured)}, {"fv", int(SolverKind::Fv)}},
+                         &c.solver});
+    if (c.sub == Subcommand::Conv) {
+        enums.push_back({"--solver",
+                         {{"structured", int(SolverKind::Structured)}, {"fv", int(SolverKind::Fv)}},
+                         &c.solver});
+        enums.push_back({"--mesh-perturb-kind", {{"sine", 0}, {"random", 1}}, &c.meshPerturbKind});
+    }
+    if (c.sub == Subcommand::Flow || c.sub == Subcommand::Tgv || c.sub == Subcommand::Flame ||
+        c.sub == Subcommand::Conv)
+    {
         enums.push_back({"--fv-precision",
                          {{"fp32", int(FvPrecision::Fp32)}, {"fp64", int(FvPrecision::Fp64)}},
                          &c.fvPrecision});
+    }
+    if (c.sub == Subcommand::Tgv)
+    {
+        enums.push_back({"--solver",
+                         {{"structured", int(SolverKind::Structured)}, {"fv", int(SolverKind::Fv)}},
+                         &c.solver});
+        enums.push_back({"--mesh-perturb-kind", {{"sine", 0}, {"random", 1}}, &c.meshPerturbKind});
     }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Channel)
         enums.push_back({"--wall", {{"isothermal", 1}, {"adiabatic", 0}},
@@ -424,7 +459,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         flags.push_back({"--thin-seal", &c.thinSeal});
         flags.push_back({"--fv-coupled-check", &c.fvCoupledCheck});
     }
-    if (c.sub == Subcommand::Flow || c.sub == Subcommand::Channel)
+    if (c.sub == Subcommand::Flow || c.sub == Subcommand::Channel || c.sub == Subcommand::Flame ||
+        c.sub == Subcommand::Conv)
         flags.push_back({"--compensated", &c.compensated});
     if (c.sub == Subcommand::Flame) {
         flags.push_back({"--nscbc-tinflow", &c.nscbcTinflow});
@@ -703,8 +739,92 @@ usage: dns flow (--body BODY | --scene FILE.toml) [grid] [physics] [far field]
        dns flow --polymesh CASE [--physics incompressible] [--max-iters N]
                 [--fv-precision fp32|fp64] [--out PREFIX] [--emit stats|none]
                 [--dry-run]
+       dns flow --polymesh DIR --bc FILE.toml --re R --ft T [time-accurate FV]
+       dns flow --physics compressible --polymesh DIR --bc FILE.toml
+                --re R --mach M --tt T [--les C [--sgs M]] [--fv-precision P]
+       dns flow --solver fv --ogrid --body BODY [time-accurate FV]
+       dns flow --physics compressible --solver fv (--ogrid --body BODY |
+                --body none) [grid] [--les C [--sgs M]] [--fv-precision P]
+       dns flow --solver simple [--export CASE] [structured mesh flags]
 
-FV PATH (docs/fv.md)
+SOLVER ROUTES
+  --solver KIND      structured: the solvers below. simple: simpleFoam on a
+                     structured mesh. fv: the FV solver of --physics, on a
+                     FaceMesh: compressible = explicit Kennedy-Gruber,
+                     incompressible = time-accurate projection. [structured]
+  --polymesh CASE alone (no --bc, no --solver) is simpleFoam. --polymesh DIR
+  --bc FILE is a time-accurate FV run; --physics picks the solver AND the
+  --bc parser (the schemas differ, a key of the other one is an error by
+  name). --solver simple's mesh is the structured flags; it rejects both.
+
+COMPRESSIBLE FV PATH (docs/fvcomp.md)
+  --solver fv        with --physics compressible: the explicit compressible FV
+                     solver (Kennedy-Gruber face flux, least-squares gradients,
+                     SSP-RK3) on the FaceMesh of a structured mesh: --ogrid
+                     (z-extruded bodies), or --body none on the uniform,
+                     --stretch or --focal box. An immersed body is REJECTED:
+                     FV has no immersed wall. O-grid rows become Wall and Far
+                     patches; box faces Far, --noslip y Wall, --far periodic
+                     cyclic. Label says FV path.
+  --polymesh DIR     with --physics compressible: an OpenFOAM constant/polyMesh
+                     directory, or a case holding one. Needs --bc, --re, --mach.
+                     --solver fv is implied.
+  --bc FILE.toml     with --physics compressible: binds every non-cyclic,
+                     non-empty patch:
+                       [reference] length = L  area = A
+                                   direction = [1,0,0]  lift = [0,1,0]
+                       [patch.NAME] type = "wall|slip|inflow|outflow|far|empty"
+                       wall: thermal = "adiabatic|isothermal", twall (T_w/T_inf),
+                             u, omega, origin (motion), force = true|false
+                       slip: force   inflow: u, t   outflow: p, tback
+                     Velocities / U, p and T as ratios to the freestream. A
+                     missing, extra or cyclic binding is exit 3 by name.
+  --tt T             end time after the ramp, in L/U (polyMesh path; a
+                     structured --solver fv run keeps --ft).
+  --fv-precision P   fp32 | fp64 also selects this solver's arithmetic. [fp32]
+  --compensated      the two-word FP32 state: a plain FP32 state drops updates
+                     below ulp(q)/2, so a settled flow's cd wanders (0.5% on a
+                     Re 40 cylinder, docs/fvcomp.md). Rejected with fp64. On the
+                     FV family this path alone: rejected by the other two.
+  --frame-box a,b,c,d  window of the frames in the plane's two axes (default
+                     the mesh bbox). Frames on any FV mesh are this uniform
+                     plane, the containing cell's value per pixel; 3D meshes:
+                     the z mid-plane. --emit volume, slices, vtk, surface, mesh
+                     are rejected by name.
+  --frame-n N        pixels on the window's long side                   [512]
+  --rans MODEL       sa-neg|sst-2003m|sst-vm on this path, every route with a
+                     wall (--ogrid, --noslip box, a wall patch of --bc): URANS
+                     (time-accurate), docs/fvcomp.md "RANS". The structured
+                     closures, wall distance exact to the Wall patches.
+                     --rans-nutinf, --rans-kinf, --rans-mutinf as below; the
+                     polyMesh route's nu is U L / Re.
+  --steady TOL       on this path: local-time-stepping pseudo-time (FP32: the
+                     two-word state), stopped on cd, cdf and the scalars'
+                     integrals (steadyFloor); needs a tallied wall. Not
+                     time-accurate. --steady-steps is the cap, exit 8.
+
+SIMPLEFOAM ON A STRUCTURED MESH (docs/fvstructured.md)
+  --solver simple    writes the mesh (polyOf) and a full OpenFOAM case into
+                     PREFIX/ and runs it through the --polymesh path. Takes
+                     --body none (box: inlet, outlet, y --noslip | --open |
+                     free slip; --stretch, --focal) or --ogrid --body
+                     cylinder|sphere|lens|... with --ogrid-far --ogrid-beta
+                     --ogrid-wedge --nz; --rans sa-neg|sst-2003m (OpenFOAM's
+                     SpalartAllmaras ft2 on | kOmegaSST); --rotor-mach + --mach
+                     (tip / U) --rotor-frame mrf; --re, --max-iters (SIMPLE
+                     iterations, 2000), --steady TOL (residualControl),
+                     --fv-precision. Every other flow flag is rejected by name;
+                     an immersed body has no body-fitted faces and is rejected
+                     without --ogrid.
+  --export CASE      with --solver simple: write the case to CASE and stop
+                     (no GPU); dns flow --polymesh CASE runs it, simpleFoam
+                     reads it.
+  --re-tau R         with --solver simple --body none --far periodic --noslip:
+                     the plane channel, delta 1, u_tau 1, nu 1/R, driven by a
+                     unit body force (fvOptions); --ny is the fluid rows,
+                     --stretch ChannelStretchY, the oracle's y mesh.
+
+INCOMPRESSIBLE FV PATH (docs/fv.md)
   --polymesh CASE    an OpenFOAM simpleFoam case directory (CASE/constant/
                      polyMesh, CASE/0/{U,p[,nut,k,omega,nuTilda]},
                      CASE/system, CASE/constant/{transportProperties,
@@ -737,6 +857,24 @@ FV PATH (docs/fv.md)
                      1 by the residual (SER); 1 = pure Picard            [1]
   --fv-coupled-check G-JAC: J v vs a frozen-coefficient difference of the
                      residual at the first coupled iteration
+
+TIME-ACCURATE FV (docs/fvincomp.md; --physics incompressible)
+  --solver fv        (default --physics) collocated SSP-RK3 + per-stage
+                     projection on a FaceMesh, skew-symmetric central
+                     convection, AMG-PCG pressure:
+                       dns flow --solver fv --ogrid --body cylinder ...
+                       dns flow --polymesh DIR --bc FILE.toml --re R --ft T
+                     [--ogrid-far, --ogrid-beta, --ogrid-trip, --n, --ny, --nz,
+                     --re, --ft, --cfl, --les, --sgs, --tol, --max-iters,
+                     --fv-precision, --out, --emit stats|none]. No immersed
+                     wall: a body without --ogrid or --polymesh is rejected.
+                     `--polymesh CASE` alone stays simpleFoam, byte for byte.
+  --bc FILE.toml     without --physics compressible:
+                     [reference] u, length, area; [initial] u; [patch.NAME]
+                     kind = wall|slip|inflow|outflow|convective|far, u, omega,
+                     origin (wall), p (outflow, far), uc (convective), force.
+                     Re = u length / nu; --ft counts length / u; area sets
+                     cd / cl. DIR: a case or a polyMesh directory.
 
 GRID
   --n N              cells along x (streamwise)                    [512]
@@ -1349,6 +1487,13 @@ R"(dns tgv — Taylor-Green vortex
   --emit error max-norm error vs the 2D analytic solution + KE ratio
                (requires --nz 1)
   --emit slices mid-plane speed/vorticity/pressure frames
+  --solver fv  the collocated FV solver on a FaceMesh of the box
+               (docs/fvincomp.md); with it:
+    --mesh-perturb A        distort the mesh by A                    [0]
+    --mesh-perturb-kind K   sine (smooth map, A <= 0.06) | random (nodes
+                            +-A h, A <= 0.45)                     [sine]
+    --fv-precision P        fp32 | fp64                           [fp32]
+    --tol T, --max-iters N  pressure solve, --les CS, --sgs M     [1e-5, 200]
 )";
     case Subcommand::Hit:
         return
@@ -1544,6 +1689,28 @@ GRID
                      (the cold surround absorbs heat) rather than a
                      Nusselt number.                                   [1]
 
+FV PATH (docs/fvcomp.md, docs/fvincomp.md)
+  --solver structured|fv                                  [structured]
+                     fv: the same layer on a FaceMesh, both --physics:
+                     gpu/fv_comp with gravity, or gpu/fv_incomp with T and
+                     the Boussinesq face force. --sides closes on FaceMesh
+                     walls, no ghost ring. --hot-patch is not built there.
+  --polymesh DIR --bc FILE.toml
+                     any FaceMesh, y up, flat plates at y = 0 and 1. Walls
+                     name their T (compressible thermal + twall, Boussinesq
+                     t): floor and lid must equal the flags' temperatures;
+                     no T = adiabatic. wall, slip, empty, cyclic patches
+                     only; --ny = height bins of the plane statistics
+                     (required), --n and --nz belong to the mesh.
+  --mesh-perturb A   --solver fv's box, distorted, plates flat. sine (A H,
+                     A <= 0.12) or random (A h, A <= 0.45) per
+  --mesh-perturb-kind sine|random                               [sine]
+  --fv-precision fp32|fp64   arithmetic of the FV path             [fp32]
+  --compensated      two-word FP32 state, --physics compressible: ON by
+                     default here (plain FP32 reads Nu 2% low at 192 x 96)
+  --tol T, --max-iters N   pressure solve, --physics incompressible
+  --frame-n N, --frame-box lo0,hi0,lo1,hi1   the uniform frame plane
+
 PHYSICS
   --physics compressible|incompressible                 [compressible]
                      compressible: density is a state variable, the time
@@ -1588,7 +1755,9 @@ RUN LENGTH
 
 OUTPUT
   --emit stats       <out>_stats.csv (t,dt,nuBot,nuTop,nuFlux,urms,KE;
-                     incompressible adds maxDiv). nuBot/nuTop are
+                     incompressible adds maxDiv; --solver fv adds nuBotF,
+                     nuTopF, the conservative wall-face fluxes, and
+                     --emit stats|none|bin|png|web|shm). nuBot/nuTop are
                      wall-gradient Nusselt numbers, nuFlux the interior
                      heat-flux one -- all three normalised on the FULL
                      imposed drop, so quiescent conduction reads 1  [on]
@@ -1634,6 +1803,30 @@ over M 0.005-0.02. The label states the M used, always.
 SPECIES. rho Y rides EXACTLY the central mass flux of the mean flow with an
 MC-limited MUSCL face value: deliberate, bounded scalar dissipation on the
 species alone (the RANS precedent). The mean flow stays central.
+
+FV PATH (docs/fvcomp.md "Species", "Diffusion flame"; --mode premixed, model C0,
+and --mode diffusion, model C1).
+  --solver KIND        structured | fv. fv: the same flame on a FaceMesh of the
+                       flags' box: x-lo Far at the fresh state, x-hi Outflow at
+                       the burnt p, no NSCBC, no sink. Diffusion: x-lo a fixed
+                       Inflow face per Burke-Schumann row, x-hi Outflow at
+                       p0.                                       [structured]
+  --polymesh DIR       the flame on a polyMesh, --bc required; --upstream is the
+                       flame's distance from reference.origin along
+                       reference.direction. --solver fv implied.
+  --bc FILE            docs/fvcomp.md's file, plus y = [..] on far, inflow and
+                       outflow patches, burnt = true on an outflow; diffusion:
+                       jet = true on an inflow (per-face rows), reference.origin
+                       the slot's centre, lift its lateral axis.
+  --fv-precision P     fp32 | fp64 (fv path).                          [fp32]
+  --compensated        the FP32 two-word state (fv path). Plain FP32 reads S_L
+                       5e-4 low at M 0.01; --compensated matches FP64.
+  --frame-box, --frame-n  the frame plane (fv path; docs/fvcomp.md).
+  Every other flag of the structured flame is rejected by name there.
+  --physics lowmach --solver fv | --polymesh DIR --bc FILE: the planar flame on the
+                       low-Mach FV solver (docs/fvincomp.md "Low-Mach"): inflow and
+                       outflow patches, rho and rho Y compensated in FP32. Adds
+                       --chem-dt, --tol T (pressure |r| <= T |rhs|). [1e-5]
 
   --mode premixed|bunsen|diffusion|candle|chamber
                        1D/3D planar flame | 2D/3D slot Bunsen | 2D jet diffusion

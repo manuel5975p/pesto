@@ -29,7 +29,7 @@
 
 namespace dns {
 
-enum class FvGradScheme : std::uint8_t { LeastSquares, GreenGauss };
+enum class FvCellGrad : std::uint8_t { LeastSquares, GreenGauss };
 
 // Per-face geometry of the FV kernels, nI + nB entries each.
 struct FvFaceGeom
@@ -54,7 +54,7 @@ std::expected<FvFaceGeom, std::string> fvFaceGeom(const FaceMesh& fm, FvFaceGrad
 // Cell-gradient weights on differences (see the file comment).
 struct FvGradWeights
 {
-    FvGradScheme scheme{};
+    FvCellGrad scheme{};
     std::array<std::vector<double>, 3> own; // nI + nB: owner side (boundary: toward the face value)
     std::array<std::vector<double>, 3> nei; // nI: neighbour side
 };
@@ -62,7 +62,7 @@ struct FvGradWeights
 // Errors (user mesh): a singular least-squares matrix (a cell whose active
 // faces do not span the solution space).
 std::expected<FvGradWeights, std::string> fvGradWeights(const FaceMesh& fm, const FvFaceGeom& geom,
-                                                        FvGradScheme scheme, int threads = 0);
+                                                        FvCellGrad scheme, int threads = 0);
 
 // Gradient of one field over cells [lo, hi): phi per cell, phiB per boundary
 // face (read on active faces only), g[3] per cell. CSR face order, so the

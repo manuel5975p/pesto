@@ -20,6 +20,7 @@
 #include "dns/geometry.hpp"
 #include "dns/hit_ic.hpp"
 #include "dns/interrupt.hpp"
+#include "dns/fvlowmach.hpp"
 #include "dns/lowmach.hpp"
 #include "dns/meshio.hpp"
 #include "dns/meshsdf.hpp"
@@ -29,7 +30,10 @@
 #include "dns/prop/bemt.hpp"
 #include "dns/prop/liftline.hpp"
 #include "dns/rans_label.hpp"
+#include "dns/fvconv.hpp"
+#include "dns/fvincomp.hpp"
 #include "dns/fvsimple.hpp"
+#include "dns/fvstructured.hpp"
 #include "dns/remap.hpp"
 #include "dns/scene.hpp"
 #include "dns/taylor_green.hpp"
@@ -47,9 +51,12 @@
 #include "dns/gpu/reductions.hpp"
 #include "dns/gpu/runner_channel.hpp"
 #include "dns/gpu/runner_conv.hpp"
+#include "dns/gpu/runner_fvconv.hpp"
 #include "dns/gpu/runner_flame.hpp"
+#include "dns/gpu/runner_fvlowmach.hpp"
 #include "dns/gpu/runner_lowmach.hpp"
 #include "dns/gpu/runner_fv.hpp"
+#include "dns/gpu/runner_fvincomp.hpp"
 #include "dns/gpu/runner_chamber.hpp"
 #include "dns/gpu/runner_rb.hpp"
 #include "dns/gpu/runner_wick.hpp"
@@ -58,6 +65,7 @@
 #include "dns/gpu/derived.hpp"
 #include "dns/gpu/periodic_frames.hpp"
 #include "dns/gpu/runner_incomp.hpp"
+#include "dns/gpu/runner_fvcomp.hpp"
 #include "dns/gpu/runner_ogrid.hpp"
 #include "dns/gpu/runner_periodic.hpp"
 #include "dns/gpu/timestepper.hpp"
@@ -319,6 +327,39 @@ int runFlowIncompressible(const Case& c, CaseGeometry& geo,
 
 // --- flow: compressible ----------------------------------------------------
 
+// --ogrid-trip's solenoidal Gaussian vortex (runFlowOGrid states the form) on
+// the primitives pr, pu, pv, pw, pp into the conserved ic. Pre: c.ogridTrip > 0.
+void addOgridTrip(const Case& c, const CaseGeometry& geo, const CurvMesh& mesh, const std::vector<double>& pr,
+                  const std::vector<double>& pu, const std::vector<double>& pv, const std::vector<double>& pw,
+                  const std::vector<double>& pp, CompState& ic)
+{
+    const auto& g = c.grid;
+    const double gamma = kGammaAir;
+    const double A = c.ogridTrip * c.uInf, w = 0.25 * geo.D;
+    const double x0 = c.placement.cx + geo.D, y0 = c.placement.cy + 0.25 * geo.D, z0 = c.placement.cz;
+    for (int k = 0; k < g.nz; ++k)
+        for (int j = 0; j < g.ny; ++j)
+            for (int i = 0; i < g.nx; ++i)
+            {
+                double x[3] = {0, 0, 0};
+                for (int dk = 0; dk < 2; ++dk)
+                    for (int dj = 0; dj < 2; ++dj)
+                        for (int di = 0; di < 2; ++di)
+                        {
+                            const auto p = mesh.node(i + di, j + dj, k + dk);
+                            for (int a = 0; a < 3; ++a) x[a] += 0.125 * p[a];
+                        }
+                const double dx = x[0] - x0, dy = x[1] - y0, dz = x[2] - z0;
+                const double e = A * std::exp(-(dx * dx + dy * dy + dz * dz) / (w * w));
+                const std::size_t q = g.idx(i, j, k);
+                const double uu = pu[q] + 2.0 * dy / w * e, vv = pv[q] + -2.0 * dx / w * e, ww = pw[q];
+                ic.mx[q] = pr[q] * uu;
+                ic.my[q] = pr[q] * vv;
+                ic.mz[q] = pr[q] * ww;
+                ic.E[q] = pp[q] / (gamma - 1.0) + 0.5 * pr[q] * (uu * uu + vv * vv + ww * ww);
+            }
+}
+
 // --- flow: compressible on a body-fitted O-grid ------------------------------
 
 // The body IS the mesh's inner boundary, so this shares nothing with the
@@ -529,37 +570,7 @@ int runFlowOGrid(const Case& c, CaseGeometry& geo)
     // the up-down symmetry that delays shedding. cz is the span's centre, and
     // the 2D cell centre sits on it. On the uniform start it is bit for bit
     // the aeb53b9 trip (adding v = w = 0 is exact).
-    if (c.ogridTrip > 0)
-    {
-        const double A = c.ogridTrip * c.uInf, w = 0.25 * geo.D;
-        const double x0 = c.placement.cx + geo.D,
-                     y0 = c.placement.cy + 0.25 * geo.D, z0 = c.placement.cz;
-        for (int k = 0; k < g.nz; ++k)
-            for (int j = 0; j < g.ny; ++j)
-                for (int i = 0; i < g.nx; ++i)
-                {
-                    double x[3] = {0, 0, 0};
-                    for (int dk = 0; dk < 2; ++dk)
-                        for (int dj = 0; dj < 2; ++dj)
-                            for (int di = 0; di < 2; ++di)
-                            {
-                                const auto p = og->mesh.node(i + di, j + dj,
-                                                             k + dk);
-                                for (int a = 0; a < 3; ++a) x[a] += 0.125 * p[a];
-                            }
-                    const double dx = x[0] - x0, dy = x[1] - y0, dz = x[2] - z0;
-                    const double e =
-                        A * std::exp(-(dx * dx + dy * dy + dz * dz) / (w * w));
-                    const std::size_t q = g.idx(i, j, k);
-                    const double uu = pu[q] + 2.0 * dy / w * e,
-                                 vv = pv[q] + -2.0 * dx / w * e, ww = pw[q];
-                    ic.mx[q] = pr[q] * uu;
-                    ic.my[q] = pr[q] * vv;
-                    ic.mz[q] = pr[q] * ww;
-                    ic.E[q] = pp[q] / (gamma - 1.0) +
-                              0.5 * pr[q] * (uu * uu + vv * vv + ww * ww);
-                }
-    }
+    if (c.ogridTrip > 0) addOgridTrip(c, geo, og->mesh, pr, pu, pv, pw, pp, ic);
 
     const auto res = gpu::runOGrid(g, *og, ic, rr, *out);
     if (!res) return die(res.error().code, res.error().message);
@@ -803,7 +814,8 @@ int runFvFlow(const Case& c)
                             !c.emit.contains(Emit::None),
                             fvNumerics(c.fvPrecision),
                             c.fvCoupled,
-                            gpu::FvCoupledOpts{c.fvCoupledEta, c.fvCoupledAlpha, c.fvCoupledCheck}};
+                            gpu::FvCoupledOpts{c.fvCoupledEta, c.fvCoupledAlpha, c.fvCoupledCheck},
+                            c.fvs.refArea};
     auto r = gpu::runFvSimple(sp, *L);
     if (!r) return die(r.error().code, r.error().message);
     std::printf("done: %ld iterations%s, %.2f ms/iteration\n", r->steps, r->converged ? " (converged)" : "",
@@ -815,12 +827,417 @@ int runFvFlow(const Case& c)
 #endif
 }
 
+#if DNS_WITH_GPU
+// The compressible FV family's common tail (docs/fvcomp.md): the frame plane,
+// the sink, the run. Phase 3 creates every output before the device.
+// wallDist: per cell, RANS only (fvRansWallDistance).
+int runFvCompOn(const Case& c, const FaceMesh& fm, const FvBcSpec& spec, const FvFreestream& fs, const FvState& ic,
+                double D, double refArea, std::vector<double> wallDist = {})
+{
+    auto raster = FvRaster::make(fm, {.longSide = c.fvFrameN, .box = c.fvFrameBox});
+    if (!raster) return die(exitInput, raster.error());
+    FrameGeometry fg = FrameGeometry::centred(raster->grid(), D);
+    fg.mask = raster->mask();
+    RunMeta meta = c.meta;
+    meta.setGrid(raster->grid());
+    auto out = RunOutput::make(outputConfig(c, std::format("{{\"app\":\"dns\",\"re\":{},\"mach\":{}", c.re, c.mach)),
+                               meta, raster->grid(), std::move(fg));
+    if (!out) return die(exitOutput, out.error());
+    const Transport gas = Transport::air(fs.rho * fs.U * D / c.re, fs.T, c.tinfK, c.prandtl, fs.gamma, kRgasBox,
+                                         c.sutherland);
+    gpu::FvCompRun rr{.label = fvCompLabel(c, fm.dim == 2),
+                      .solver = {.tr = gas,
+                                 .bc = fvBcsOf(fm, spec, fs, 1.0),
+                                 .precision = c.fvPrecision,
+                                 .csLes = c.cs,
+                                 .sgs = c.sgsModel,
+                                 .compensated = c.compensated || (c.compSteady && c.fvPrecision != FvPrecision::Fp64),
+                                 .rans = {.model = c.rans,
+                                          .wallDist = std::move(wallDist),
+                                          .phiInf = {c.ransPhiInf[0], c.ransPhiInf[1]}},
+                                 .tallied = fvTallyOf(fm, spec),
+                                 .pRef = fs.p},
+                      .spec = spec,
+                      .fs = fs,
+                      .D = D,
+                      .refArea = refArea,
+                      .cfl = c.cfl,
+                      .tEnd = c.ramp + c.tEnd,
+                      .ramp = c.ramp,
+                      .dtRecompute = c.dtRecompute,
+                      .curlMax = c.vortMax * fs.U / D,
+                      .vortAsinh = c.vortAsinh,
+                      .speedDelta = c.speedDelta,
+                      .quiet = c.quiet,
+                      .steadyTol = c.compSteady ? c.steadyTol : 0.0,
+                      .steadySteps = c.steadySteps};
+    auto res = gpu::runFvComp(fm, c.rans == RansModel::None ? ic : fvWithScalars(ic, c.rans, rr.solver.rans.phiInf), rr,
+                              *raster, *out);
+    if (!res) return die(res.error().code, res.error().message);
+    if (auto e = out->finish(); !e) return die(exitOutput, e.error());
+    std::printf("done: %ld steps, cd=%.4f cl=%.4f, %.3f ms/step\n", res->steps, res->cd, res->cl, res->msPerStep);
+    return 0;
+}
+
+// A structured state (fluid cells of g) onto the FaceMesh numbering.
+FvState fvStateOf(const FaceMesh& fm, const CompState& q)
+{
+    FvState s = FvState::zeros(fm.nC);
+    const std::vector<double>* v[5] = {&q.rho, &q.mx, &q.my, &q.mz, &q.E};
+    for (int r = 0; r < 5; ++r)
+        for (std::size_t n = 0; n < std::size_t(fm.nC); ++n) s.var(r)[n] = (*v[r])[std::size_t(fm.srcCell[n])];
+    return s;
+}
+
+// --solver fv on an O-grid: the fluid rows through fromCurvMesh, rows 1 and
+// ny-1's node lines the Wall and Far patches. Same mesh, same IC as runFlowOGrid.
+int runFvOGrid(const Case& c, CaseGeometry& geo)
+{
+    const auto& g = c.grid;
+    const OGridSpec spec{.cx = c.placement.cx, .cy = c.placement.cy, .cz = c.placement.cz, .rFar = c.ogridRFar,
+                         .beta = c.ogridBeta, .span = c.ogridSpan};
+    auto og = buildOGrid(g, geo.sdf, spec);
+    if (!og) return die(exitInput, "o-grid: " + og.error());
+    const FoamPatchType zt = g.nz == 1 ? FoamPatchType::Empty : FoamPatchType::Cyclic;
+    const StructuredSpec ss{.lo = {0, 1, 0},
+                            .hi = {g.nx - 1, g.ny - 2, g.nz - 1},
+                            .name = {"ilo", "ihi", "wall", "far", "back", "front"},
+                            .type = {FoamPatchType::Cyclic, FoamPatchType::Cyclic, FoamPatchType::Wall,
+                                     FoamPatchType::Patch, zt, zt}};
+    auto fm = FaceMesh::fromCurvMesh(og->mesh, ss, CellOrder::Morton);
+    if (!fm) return die(exitInput, "FaceMesh: " + fm.error());
+    FvBcSpec bc{.patches = {{.name = "wall", .kind = FvPatchKind::Wall, .isothermal = c.bodyIsothermal,
+                             .tWall = c.twallRatio, .tallied = true},
+                            {.name = "far", .kind = FvPatchKind::Far}}};
+    const FvFreestream fs = fvFreestreamOf(c.mach, kGammaAir, kRgasBox, {1, 0, 0});
+    if (!haveGpu(c)) return die(exitNoGpu, "no GPU device (dns flow is GPU-only)");
+    // runFlowOGrid's start: at rest under a ramp, plus the trip.
+    auto ic = CompState::zeros(g);
+    const double u0 = c.ramp > 0 ? 0.0 : c.uInf;
+    std::vector<double> pr(g.size(), kRhoInf), pu(g.size(), u0), pv(g.size(), 0.0), pw(g.size(), 0.0),
+        pp(g.size(), fs.p);
+    for (std::size_t q = 0; q < g.size(); ++q) {
+        ic.rho[q] = kRhoInf;
+        ic.mx[q] = kRhoInf * u0;
+        ic.E[q] = fs.p / (kGammaAir - 1.0) + 0.5 * kRhoInf * u0 * u0;
+    }
+    if (c.ogridTrip > 0) addOgridTrip(c, geo, og->mesh, pr, pu, pv, pw, pp, ic);
+    std::vector<double> wd;
+    if (c.rans != RansModel::None) {
+        auto pm = FaceMesh::polyOf(og->mesh, ss);
+        if (!pm) return die(exitInput, "FaceMesh: " + pm.error());
+        auto d = fvRansWallDistance(std::move(*pm), *fm, bc);
+        if (!d) return die(exitInput, d.error());
+        wd = std::move(*d);
+    }
+    return runFvCompOn(c, *fm, bc, fs, fvStateOf(*fm, ic), geo.D, geo.D * double(g.nz) * g.hz, std::move(wd));
+}
+
+// --solver fv with --body none: the uniform, --stretch or --focal box.
+int runFvBox(const Case& c, CaseGeometry& geo)
+{
+    const auto& g = c.grid;
+    const AxisRemap3 fRemap = focalRemap(g, c.focalActive, c.focalLo, c.focalHi, c.focalW, c.focalRatio);
+    const CurvMesh mesh = c.focalActive         ? CurvMesh::fromRemap(g, fRemap)
+                          : c.stretchBeta > 0.0 ? CurvMesh::stretchedY(g, c.stretchBeta)
+                                                : CurvMesh::uniform(g);
+    const bool per = c.far == FarField::Periodic;
+    const FoamPatchType xt = per ? FoamPatchType::Cyclic : FoamPatchType::Patch;
+    const FoamPatchType yt = c.noslipY ? FoamPatchType::Wall : xt;
+    const FoamPatchType zt = g.nz == 1 ? FoamPatchType::Empty : FoamPatchType::Cyclic;
+    const StructuredSpec ss{.lo = {0, 0, 0},
+                            .hi = {g.nx - 1, g.ny - 1, g.nz - 1},
+                            .name = {"xlo", "xhi", "ylo", "yhi", "back", "front"},
+                            .type = {xt, xt, yt, yt, zt, zt}};
+    auto fm = FaceMesh::fromCurvMesh(mesh, ss, CellOrder::Morton);
+    if (!fm) return die(exitInput, "FaceMesh: " + fm.error());
+    FvBcSpec bc;
+    for (const MeshPatch& p : fm->patches) {
+        if (p.type == FoamPatchType::Empty) continue;
+        if (p.type == FoamPatchType::Wall)
+            bc.patches.push_back({.name = p.name, .kind = FvPatchKind::Wall, .isothermal = false, .tallied = true});
+        else
+            bc.patches.push_back({.name = p.name, .kind = FvPatchKind::Far});
+    }
+    if (!haveGpu(c)) return die(exitNoGpu, "no GPU device (dns flow is GPU-only)");
+    const FvFreestream fs = fvFreestreamOf(c.mach, kGammaAir, kRgasBox, {1, 0, 0});
+    const TanhStretchY yRemap{double(g.ny) * g.hy, c.stretchBeta};
+    auto host = CompState::zeros(g);
+    std::vector<float> mask(g.size(), 1.0f);
+    compressibleBodyIC(c, geo, fRemap, yRemap, kRhoInf, fs.p, kGammaAir, host, mask);
+    std::vector<double> wd;
+    if (c.rans != RansModel::None) {
+        auto pm = FaceMesh::polyOf(mesh, ss);
+        if (!pm) return die(exitInput, "FaceMesh: " + pm.error());
+        auto d = fvRansWallDistance(std::move(*pm), *fm, bc);
+        if (!d) return die(exitInput, d.error());
+        wd = std::move(*d);
+    }
+    return runFvCompOn(c, *fm, bc, fs, fvStateOf(*fm, host), geo.D, geo.D * double(g.nz) * g.hz, std::move(wd));
+}
+#endif // DNS_WITH_GPU
+
+// DIR, or the polyMesh of the case DIR.
+std::filesystem::path fvPolyDir(const std::string& dir)
+{
+    const std::filesystem::path p = std::filesystem::path(dir) / "constant" / "polyMesh";
+    return std::filesystem::exists(p / "boundary") ? p : std::filesystem::path(dir);
+}
+
+// Phase 1.5 of --polymesh + --bc: the manifest bound against the --bc file, and
+// the 2D facts config could not see. Errors as an exit code + message.
+std::expected<bool, std::pair<int, std::string>> fvPolyCheck(const Case& c)
+{
+    using Err = std::unexpected<std::pair<int, std::string>>;
+    auto man = readPolyManifest(fvPolyDir(c.fvMeshDir));
+    if (!man) return Err({exitInput, man.error()});
+    std::vector<FvMeshPatch> mp;
+    for (const FoamPatch& p : man->patches) mp.push_back({p.name, foamPatchTypeName(p.type)});
+    if (auto r = checkFvBc(c.fvBc, mp); !r) return Err({exitInput, c.fvMeshDir + ": " + r.error()});
+    const bool twoD = fvMeshIs2D(mp);
+    if (twoD && c.lesLabel && c.sgsModel == SgsModel::Sigma)
+        return Err({2, "--sgs: sigma: D_sigma is identically ZERO for any 2D flow; this mesh has `empty` patches"});
+    return twoD;
+}
+
+// dns flow --physics compressible --polymesh DIR --bc FILE.
+int runFvCompPoly(const Case& c)
+{
+    auto twoD = fvPolyCheck(c);
+    if (!twoD) return die(twoD.error().first, twoD.error().second);
+    auto pm = readPolyMesh(fvPolyDir(c.fvMeshDir));
+    if (!pm) return die(exitInput, pm.error());
+    auto fm = FaceMesh::fromPolyMesh(*pm, CellOrder::Morton);
+    if (!fm) return die(exitInput, fm.error());
+    if (!haveGpu(c)) return die(exitNoGpu, "no GPU device (dns flow is GPU-only)");
+#if DNS_WITH_GPU
+    const FvFreestream fs = fvFreestreamOf(c.mach, kGammaAir, kRgasBox, c.fvBc.dir);
+    const double u0 = c.ramp > 0 ? 0.0 : fs.U;
+    FvState ic = FvState::zeros(fm->nC);
+    for (std::size_t q = 0; q < std::size_t(fm->nC); ++q) {
+        ic.var(0)[q] = fs.rho;
+        for (int k = 0; k < 3; ++k) ic.var(1 + k)[q] = fs.rho * u0 * fs.dir[std::size_t(k)];
+        ic.var(4)[q] = fs.p / (fs.gamma - 1.0) + 0.5 * fs.rho * u0 * u0;
+    }
+    const double area = c.fvBc.area > 0 ? c.fvBc.area : c.fvBc.length * fvMeshDepth(*fm);
+    std::vector<double> wd;
+    if (c.rans != RansModel::None) {
+        auto d = fvRansWallDistance(std::move(*pm), *fm, c.fvBc);
+        if (!d) return die(exitInput, c.fvMeshDir + ": " + d.error());
+        wd = std::move(*d);
+    }
+    return runFvCompOn(c, *fm, c.fvBc, fs, ic, c.fvBc.length, area, std::move(wd));
+#else
+    return exitNoGpu;
+#endif
+}
+
+// The time-accurate FV solver (docs/fvincomp.md): a FaceMesh, its --bc table,
+// the initial field; gpu/runner_fvincomp owns the loop.
+#if DNS_WITH_GPU
+gpu::FvIncompRun fvIncompRun(const Case& c, std::string mesh)
+{
+    return gpu::FvIncompRun{.outPrefix = c.outPrefix,
+                            .meshName = std::move(mesh),
+                            .ctl = FvIncompControls{.nu = c.nu,
+                                                    .tol = c.fvTol,
+                                                    .les = c.cs,
+                                                    .maxIter = c.fvMaxPcg,
+                                                    .sgs = c.sgsModel,
+                                                    .precision = c.fvPrecision},
+                            .cfl = c.cfl,
+                            .tEnd = c.tEnd,
+                            .quiet = c.quiet,
+                            .stats = !c.emit.contains(Emit::None)};
+}
+#endif
+
+std::expected<FvIncompBcs, std::string> readFvIncompBcs(const Case& c)
+{
+    std::ifstream in(c.fvBcFile);
+    if (!in) return std::unexpected(c.fvBcFile + ": cannot read");
+    const std::string text{std::istreambuf_iterator<char>(in), {}};
+    auto b = parseFvIncompBcs(text);
+    if (!b) return std::unexpected(c.fvBcFile + ": " + b.error());
+    return b;
+}
+
+// A wall temperature belongs to dns conv.
+std::expected<void, std::string> noWallT(const Case& c, const FvIncompBcs& b)
+{
+    for (const FvIncompPatch& p : b.patches)
+        if (p.hasT) return std::unexpected(std::format("{}: --bc: patch.{}.t belongs to dns conv", c.fvBcFile, p.name));
+    return {};
+}
+
+// Phase 1.5 (--dry-run): the manifest and the --bc table, no bulk mesh data.
+int runFvIncompManifest(const Case& c)
+{
+    auto m = readPolyManifest(fvPolyDir(c.fvMeshDir));
+    if (!m) return die(exitInput, m.error());
+    auto b = readFvIncompBcs(c);
+    if (!b) return die(exitInput, b.error());
+    if (c.sub != Subcommand::Conv)
+        if (auto e = noWallT(c, *b); !e) return die(exitInput, e.error());
+    auto s = describeFvIncompBcs(*b, *m);
+    if (!s) return die(exitInput, c.fvBcFile + ": " + s.error());
+    std::printf("  counts     %lld cells, %lld faces\n%s", (long long)m->nCells, (long long)m->nFaces, s->c_str());
+    return 0;
+}
+
+// flow --polymesh DIR --bc FILE: Acquire = mesh and table (exit 3 before any device).
+int runFvIncompPoly(Case c)
+{
+    auto pm = readPolyMesh(fvPolyDir(c.fvMeshDir));
+    if (!pm) return die(exitInput, pm.error());
+    auto fm = FaceMesh::fromPolyMesh(*pm, CellOrder::Morton);
+    if (!fm) return die(exitInput, c.fvMeshDir + ": " + fm.error());
+    auto b = readFvIncompBcs(c);
+    if (!b) return die(exitInput, b.error());
+    if (auto e = noWallT(c, *b); !e) return die(exitInput, e.error());
+    if (auto e = bindFvIncompBcs(*b, *fm); !e) return die(exitInput, c.fvBcFile + ": " + e.error());
+    if (!haveGpu(c)) return die(exitNoGpu, "no GPU device (dns flow is GPU-only)");
+#if DNS_WITH_GPU
+    c.nu = b->uRef * b->length / c.re;
+    c.tEnd = c.ft * b->length / b->uRef;
+    auto r = fvIncompRun(c, "polyMesh " + c.fvMeshDir);
+    r.pm = &*pm;
+    std::vector<double> U0(3 * std::size_t(fm->nC));
+    for (std::size_t q = 0; q < 3; ++q)
+        std::fill_n(U0.begin() + std::ptrdiff_t(q * std::size_t(fm->nC)), fm->nC, b->u0[q]);
+    auto st = gpu::runFvIncomp(r, *fm, *b, U0);
+    if (!st) return die(st.error().code, st.error().message);
+    std::printf("done: %ld steps, t = %g, %.2f ms/step, cd %.6f cl %.6f cdf %.6f\n", st->steps, st->tStop,
+                st->msPerStep, st->cd, st->cl, st->cdf);
+    return 0;
+#else
+    return exitNoGpu;
+#endif
+}
+
+// flow --solver fv --ogrid: the structured O-grid through fromCurvMesh.
+int runFvIncompOGrid(const Case& c, const Scene* scene)
+{
+    auto geo = buildCaseGeometry(c, scene);
+    if (!geo) return die(exitInput, geo.error());
+    const OGridSpec spec{.cx = c.placement.cx,
+                         .cy = c.placement.cy,
+                         .cz = c.placement.cz,
+                         .rFar = c.ogridRFar,
+                         .beta = c.ogridBeta,
+                         .span = c.ogridSpan};
+    auto og = buildOGrid(c.grid, geo->sdf, spec);
+    if (!og) return die(exitInput, "o-grid: " + og.error());
+    auto fm = fvOgridMesh(*og);
+    if (!fm) return die(exitInput, "o-grid: " + fm.error());
+    if (!haveGpu(c)) return die(exitNoGpu, "no GPU device (dns flow is GPU-only)");
+#if DNS_WITH_GPU
+    FvIncompBcs b{.patches = {{.name = "wall", .kind = FvIncompBc::Wall, .force = true},
+                              {.name = "far", .kind = FvIncompBc::Far, .u = {c.uInf, 0, 0}}},
+                  .uRef = c.uInf,
+                  .length = geo->D,
+                  .area = geo->D * c.ogridSpan,
+                  .u0 = {c.uInf, 0, 0}};
+    if (auto e = bindFvIncompBcs(b, *fm); !e) return die(exitInput, e.error());
+    const std::size_t nC = std::size_t(fm->nC);
+    std::vector<double> U0(3 * nC, 0.0);
+    std::fill_n(U0.begin(), nC, c.uInf);
+    if (c.ogridTrip > 0) { // the solenoidal vortex of runFlowOGrid
+        const double A = c.ogridTrip * c.uInf, w = 0.25 * geo->D;
+        const double x0 = c.placement.cx + geo->D, y0 = c.placement.cy + 0.25 * geo->D, z0 = c.placement.cz;
+        for (std::size_t q = 0; q < nC; ++q) {
+            const double dx = fm->C[0][q] - x0, dy = fm->C[1][q] - y0, dz = fm->C[2][q] - z0;
+            const double e = A * std::exp(-(dx * dx + dy * dy + dz * dz) / (w * w));
+            U0[q] += 2.0 * dy / w * e;
+            U0[nC + q] += -2.0 * dx / w * e;
+        }
+    }
+    auto run = fvIncompRun(c, "O-grid, body-fitted");
+    run.ctl.nu = c.uInf * geo->D / c.re;
+    auto st = gpu::runFvIncomp(run, *fm, b, U0);
+    if (!st) return die(st.error().code, st.error().message);
+    std::printf("done: %ld steps, t = %g, %.2f ms/step, cd %.6f cl %.6f cdf %.6f\n", st->steps, st->tStop,
+                st->msPerStep, st->cd, st->cl, st->cdf);
+    return 0;
+#else
+    return exitNoGpu;
+#endif
+}
+
+// tgv --solver fv: the periodic box as a FaceMesh.
+int runFvIncompTgv(const Case& c)
+{
+    const Grid& g = c.grid;
+    auto fm = fvPeriodicBox(g, FvPerturb(c.fvPerturb), c.fvPerturbAmp);
+    if (!fm) return die(exitInput, "tgv: " + fm.error());
+    if (!haveGpu(c)) return die(exitNoGpu, "no GPU device (dns tgv --solver fv is GPU-only)");
+#if DNS_WITH_GPU
+    const bool twoD = g.nz == 1;
+    const std::size_t nC = std::size_t(fm->nC);
+    std::vector<double> U0(3 * nC, 0.0);
+    for (std::size_t q = 0; q < nC; ++q) {
+        const double x = fm->C[0][q], y = fm->C[1][q], z = fm->C[2][q];
+        const double cz = twoD ? 1.0 : std::cos(z);
+        U0[q] = std::sin(x) * std::cos(y) * cz;
+        U0[nC + q] = -std::cos(x) * std::sin(y) * cz;
+    }
+    auto r = fvIncompRun(c, c.fvPerturb == 0 ? "periodic box" : "perturbed periodic box");
+    r.seriesDt = twoD ? 0.0 : 0.1;
+    r.seriesVolume = twoD ? 1.0 : g.cellVolume() * double(g.size());
+    r.quiet = c.quiet || !twoD; // the 3D stdout is the series
+    gpu::FvIncompState fin;
+    auto st = gpu::runFvIncomp(r, *fm, FvIncompBcs{}, U0, &fin);
+    if (!st) return die(st.error().code, st.error().message);
+    if (twoD && c.emit.contains(Emit::Error)) {
+        const double decay = std::exp(-2.0 * c.nu * st->tStop);
+        double eMax = 0, e2 = 0, vol = 0;
+        for (std::size_t q = 0; q < nC; ++q) {
+            const double x = fm->C[0][q], y = fm->C[1][q];
+            const double du = fin.U[q] - std::sin(x) * std::cos(y) * decay;
+            const double dv = fin.U[nC + q] + std::cos(x) * std::sin(y) * decay;
+            eMax = std::max({eMax, std::abs(du), std::abs(dv)});
+            e2 += fm->V[q] * (du * du + dv * dv);
+            vol += fm->V[q];
+        }
+        std::printf("n=%d nu=%g T=%g steps=%ld\nmax error vs analytic: %.3e\nL2 error vs analytic: %.3e\n", g.nx, c.nu,
+                    st->tStop, st->steps, eMax, std::sqrt(e2 / vol));
+    }
+    std::fprintf(stderr, "done: %ld steps, %.2f ms/step (FV)\n", st->steps, st->msPerStep);
+    return 0;
+#else
+    return exitNoGpu;
+#endif
+}
+
+// dns flow --solver simple (docs/fvstructured.md): Acquire = the mesh and the
+// generated case on disk, then the --polymesh path reads that directory. With
+// --export the directory is the whole output: no device is ever touched.
+int runFvStructured(const Case& c)
+{
+    Sdf sdf;
+    if (c.fvs.mesh == FvStructMesh::OGrid) {
+        auto geo = buildCaseGeometry(c, nullptr);
+        if (!geo) return die(exitInput, geo.error());
+        sdf = std::move(geo->sdf);
+    }
+    auto pm = fvStructuredMesh(c.fvs, sdf);
+    if (!pm) return die(exitInput, pm.error());
+    if (auto w = writeFoamCase(c.fvCase, *pm, fvStructuredTexts(c.fvs)); !w) return die(exitOutput, w.error());
+    if (c.fvExport.empty()) return runFvFlow(c);
+    std::printf("case written to %s: %s, %ld cells, %ld faces\n", c.fvExport.c_str(),
+                fvStructuredLabel(c.fvs).c_str(), long(pm->man.nCells), long(pm->man.nFaces));
+    return 0;
+}
+
 int runFlow(const Case& c, [[maybe_unused]] const RawConfig& raw, const Scene* scene)
 {
     // Input before device: a bad mesh is exit 3 on every machine, GPU or not.
     [[maybe_unused]] const auto t0 = std::chrono::steady_clock::now();
     auto geo = buildCaseGeometry(c, scene);
     if (!geo) return die(exitInput, geo.error());
+#if DNS_WITH_GPU
+    if (c.fvMode == FvCompMode::Structured) return c.ogrid ? runFvOGrid(c, *geo) : runFvBox(c, *geo);
+#endif
     if (!haveGpu(c))
         return die(exitNoGpu, "no GPU device (dns flow is GPU-only)");
 #if DNS_WITH_GPU
@@ -924,8 +1341,175 @@ int runChannel(const Case& c)
         c.meta, c.grid, std::move(fg));
 }
 
+// dns conv --solver fv | --polymesh (docs/fvcomp.md, docs/fvincomp.md). The IC is
+// convIC's and rbIC's analytic fields at the cell centres; the box is a FaceMesh
+// with its floor at y = 0, so both routes are one route.
+#if DNS_WITH_GPU
+std::vector<FvConvWall> fvConvBoxWalls(const FaceMesh& fm, const Case& c)
+{
+    std::vector<FvConvWall> w;
+    for (const MeshPatch& p : fm.patches) {
+        if (p.type == FoamPatchType::Empty) continue;
+        const bool fl = p.name == "floor", li = p.name == "lid";
+        w.push_back({.name = p.name, .fixed = fl || li, .T = fl ? c.tBot : c.tTop});
+    }
+    return w;
+}
+
+gpu::FvConvRun fvConvRun(const Case& c, const FaceMesh& fm, FvConvPlates plates, double kapFace)
+{
+    return {.label = fvConvLabel(c, fm.dim == 2),
+            .H = c.convH,
+            .Tbot = c.tBot,
+            .Ttop = c.tTop,
+            .kapDiff = c.kappaDiff,
+            .kapFace = kapFace,
+            .uFf = c.uFreeFall,
+            .cfl = c.cfl,
+            .tEnd = c.tEnd,
+            .dtRecompute = c.dtRecompute,
+            .profileDt = c.profileDt,
+            .bins = c.fvConvBins,
+            .plates = std::move(plates),
+            .quiet = c.quiet};
+}
+
+int runConvFvOn(const Case& c, const FaceMesh& fm)
+{
+    auto raster = FvRaster::make(fm, {.longSide = c.fvFrameN, .box = c.fvFrameBox});
+    if (!raster) return die(exitInput, raster.error());
+    const bool threeD = fm.dim == 3, poly = !c.fvMeshDir.empty();
+    const std::size_t nC = std::size_t(fm.nC);
+    auto output = [&]() {
+        FrameGeometry fg = FrameGeometry::centred(raster->grid(), c.convH);
+        fg.mask = raster->mask();
+        RunMeta meta = c.meta;
+        meta.setGrid(raster->grid());
+        return RunOutput::make(outputConfig(c, std::format("{{\"app\":\"dns\",\"rayleigh\":{},\"prandtl\":{}",
+                                                           c.rayleigh, c.prandtl)),
+                               meta, raster->grid(), std::move(fg));
+    };
+    if (c.physics == Physics::Incompressible) {
+        FvIncompBcs b;
+        if (poly) {
+            auto rb = readFvIncompBcs(c);
+            if (!rb) return die(exitInput, rb.error());
+            b = std::move(*rb);
+        } else {
+            for (const FvConvWall& w : fvConvBoxWalls(fm, c))
+                b.patches.push_back({.name = w.name, .kind = FvIncompBc::Wall, .hasT = w.fixed, .T = w.T});
+        }
+        auto walls = fvConvWalls(b);
+        if (!walls) return die(exitInput, c.fvBcFile + ": " + walls.error());
+        if (auto e = bindFvIncompBcs(b, fm); !e) return die(exitInput, c.fvBcFile + ": " + e.error());
+        auto plates = fvConvPlates(fm, *walls, c.tBot, c.tTop, c.convH);
+        if (!plates) return die(exitInput, plates.error());
+        auto out = output();
+        if (!out) return die(exitOutput, out.error());
+        std::vector<double> U0(3 * nC), T0(nC);
+        for (std::size_t q = 0; q < nC; ++q) {
+            const RbPoint p = rbPointAt(c, fm.C[0][q], fm.C[1][q], fm.C[2][q], threeD);
+            T0[q] = p.T;
+            for (std::size_t k = 0; k < 3; ++k) U0[k * nC + q] = p.u[k];
+        }
+        const FvIncompControls ctl{.nu = c.nu,
+                                   .tol = c.fvTol,
+                                   .maxIter = c.fvMaxPcg,
+                                   .precision = c.fvPrecision,
+                                   .kappa = c.kappaDiff,
+                                   .Tref = 0.0,
+                                   .betaG = {0.0, c.gravity, 0.0}};
+        gpu::FvConvRun rr = fvConvRun(c, fm, std::move(*plates), c.kappaDiff);
+        rr.statsEvery = 50;
+        auto res = gpu::runFvConvRb(fm, b, ctl, U0, T0, rr, *raster, *out);
+        if (!res) return die(res.error().code, res.error().message);
+        return reportDone(*res, *out);
+    }
+    FvBcSpec spec = c.fvBc;
+    if (!poly) {
+        spec = {};
+        for (const FvConvWall& w : fvConvBoxWalls(fm, c))
+            spec.patches.push_back({.name = w.name, .kind = FvPatchKind::Wall, .isothermal = w.fixed, .tWall = w.T});
+    }
+    auto walls = fvConvWalls(spec);
+    if (!walls) return die(exitInput, c.fvBcFile + ": " + walls.error());
+    auto plates = fvConvPlates(fm, *walls, c.tBot, c.tTop, c.convH);
+    if (!plates) return die(exitInput, plates.error());
+    auto out = output();
+    if (!out) return die(exitOutput, out.error());
+    // The layer's units: Tref = rho_ref = R = 1, p_ref = 1, walls absolute.
+    const FvFreestream fs{.rho = 1.0, .U = 1.0, .p = c.pRef, .T = 1.0, .gamma = kGammaAir};
+    const double gamma = kGammaAir;
+    FvState ic = FvState::zeros(fm.nC);
+    for (std::size_t q = 0; q < nC; ++q) {
+        const double y = std::clamp(fm.C[1][q], 0.0, c.convH);
+        const ConvHydro h = convHydroAt(c, y);
+        const auto u = convTripAt(c, fm.C[0][q], y, fm.C[2][q], threeD);
+        ic.var(0)[q] = h.rho;
+        for (std::size_t k = 0; k < 3; ++k) ic.var(1 + int(k))[q] = h.rho * u[k];
+        ic.var(4)[q] = h.p / (gamma - 1.0) + 0.5 * h.rho * (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+    }
+    const Transport gas = Transport::air(c.nu, 1.0, c.tinfK, c.prandtl, gamma, kRgasBox, c.sutherland);
+    const gpu::FvCompConfig cfg{.tr = gas,
+                                .bc = fvBcsOf(fm, spec, fs, 1.0),
+                                .precision = c.fvPrecision,
+                                .compensated = c.compensated,
+                                .pRef = fs.p,
+                                .gravity = {0.0, -c.gravity, 0.0}};
+    auto res = gpu::runFvConvComp(fm, ic, cfg, fvConvRun(c, fm, std::move(*plates), c.nu * gas.cp() / c.prandtl), *raster,
+                                  *out);
+    if (!res) return die(res.error().code, res.error().message);
+    return reportDone(*res, *out);
+}
+#endif // DNS_WITH_GPU
+
+// Phase 1.5 of dns conv --polymesh: the manifest against the --bc table.
+int runConvFvManifest(const Case& c)
+{
+    std::printf("  label      %s\n", fvConvLabel(c, false).c_str());
+    if (c.physics == Physics::Incompressible) {
+        auto b = readFvIncompBcs(c);
+        if (!b) return die(exitInput, b.error());
+        if (auto w = fvConvWalls(*b); !w) return die(exitInput, c.fvBcFile + ": " + w.error());
+        return runFvIncompManifest(c);
+    }
+    auto two = fvPolyCheck(c);
+    if (!two) return die(two.error().first, two.error().second);
+    if (auto w = fvConvWalls(c.fvBc); !w) return die(exitInput, c.fvBcFile + ": " + w.error());
+    return 0;
+}
+
+int runConvFv(const Case& c)
+{
+    if (c.fvMeshDir.empty()) {
+        auto fm = fvConvBox(c.grid, c.closedSides, FvPerturb(c.fvPerturb), c.fvPerturbAmp);
+        if (!fm) return die(exitInput, "FaceMesh: " + fm.error());
+        if (!haveGpu(c)) return die(exitNoGpu, "no GPU device (dns conv is GPU-only)");
+#if DNS_WITH_GPU
+        return runConvFvOn(c, *fm);
+#else
+        return exitNoGpu;
+#endif
+    }
+    if (c.physics == Physics::Compressible) {
+        auto two = fvPolyCheck(c);
+        if (!two) return die(two.error().first, two.error().second);
+    }
+    auto pm = readPolyMesh(fvPolyDir(c.fvMeshDir));
+    if (!pm) return die(exitInput, pm.error());
+    auto fm = FaceMesh::fromPolyMesh(*pm, CellOrder::Morton);
+    if (!fm) return die(exitInput, c.fvMeshDir + ": " + fm.error());
+    if (!haveGpu(c)) return die(exitNoGpu, "no GPU device (dns conv is GPU-only)");
+#if DNS_WITH_GPU
+    return runConvFvOn(c, *fm);
+#else
+    return exitNoGpu;
+#endif
+}
+
 int runConv(const Case& c)
 {
+    if (c.fvConv) return runConvFv(c);
     if (!haveGpu(c))
         return die(exitNoGpu, "no GPU device (dns conv is GPU-only)");
 #if DNS_WITH_GPU
@@ -1002,6 +1586,246 @@ int runConv(const Case& c)
 
 
 // --- flame -----------------------------------------------------------------
+#if DNS_WITH_GPU
+// dns flame --solver fv (docs/fvcomp.md "Species"): the premixed flame on a
+// FaceMesh. The flags' uniform box (fresh Far, burnt Outflow, y and z as the
+// structured box) or the polyMesh of --bc. Box units as the structured flame.
+// dns flame --mode diffusion on a FaceMesh (docs/fvcomp.md "Diffusion flame"): the
+// jet's per-face rows, the structured box's units, mesh and IC.
+int runFvJet(const Case& c, const FaceMesh& fm, const FvBcSpec& spec, std::array<double, 3> origin)
+{
+    const DiffusionModel& md = c.diff;
+    const double T0 = c.flameTu;
+    const Transport gas = Transport::air(c.prandtl, T0, c.tinfK, c.prandtl, kGammaAir, kRgasBox, c.sutherland);
+    const FvChem chem{.nY = 2,
+                      .fuel = 0,
+                      .lnA = md.lnA(),
+                      .Ta = md.theta() * T0,
+                      .q = gas.cp() * T0 * md.qOverCpT0(),
+                      .invPr = 1.0 / c.prandtl,
+                      .ox = 1,
+                      .stoich = md.s};
+    const FvFreestream fs{.rho = 1.0, .U = 1.0, .p = T0, .T = T0, .gamma = kGammaAir, .dir = spec.dir};
+    const FvJetSpec js{.dir = spec.dir, .lift = spec.lift, .origin = origin, .model = md, .geom = c.bunsen, .T0 = T0,
+                       .gamma = kGammaAir, .Rgas = kRgasBox, .q = chem.q, .skip = std::max(c.nscbcSink, 4)};
+    auto probe = FvJetProbe::make(fm, js);
+    if (!probe) return die(exitInput, probe.error());
+    FvJetRows rows = fvJetRows(fm, spec, fvBcsOf(fm, spec, fs, 1.0), js);
+    auto raster = FvRaster::make(fm, {.longSide = c.fvFrameN, .box = c.fvFrameBox});
+    if (!raster) return die(exitInput, raster.error());
+    FrameGeometry fgeo = FrameGeometry::centred(raster->grid(), 1.0);
+    fgeo.mask = raster->mask();
+    RunMeta meta = c.meta;
+    meta.setGrid(raster->grid());
+    meta.farField = "fv";
+    auto out = RunOutput::make(outputConfig(c, std::format("{{\"app\":\"dns\",\"flame\":\"diffusion\",\"solver\":\"fv\","
+                                                           "\"sigma\":{},\"beta\":{},\"mach\":{}",
+                                                           md.sigma, md.beta, c.mach)),
+                               meta, raster->grid(), std::move(fgeo));
+    if (!out) return die(exitOutput, out.error());
+    gpu::FvCompRun rr{.label = fvFlameLabel(c),
+                      .solver = {.tr = gas,
+                                 .bc = std::move(rows.bc),
+                                 .bcRow = std::move(rows.faceRow),
+                                 .precision = c.fvPrecision,
+                                 .compensated = c.compensated,
+                                 .chem = chem,
+                                 .tallied = std::vector<std::uint8_t>(fm.patches.size(), 0),
+                                 .pRef = fs.p},
+                      .spec = spec,
+                      .fs = fs,
+                      .refArea = 1.0,
+                      .cfl = c.cfl,
+                      .tEnd = c.tEnd,
+                      .dtRecompute = c.dtRecompute,
+                      .quiet = c.quiet,
+                      .jet = &*probe};
+    auto res = gpu::runFvComp(fm, fvJetState(fm, js, c.flameIgnition), rr, *raster, *out);
+    if (!res) return die(res.error().code, res.error().message);
+    if (auto e = out->finish(); !e) return die(exitOutput, e.error());
+    std::printf("done: %ld steps, %.3f ms/step\n", res->steps, res->msPerStep);
+    return 0;
+}
+
+int runFvFlame(const Case& c)
+{
+    const bool poly = c.fvMode == FvCompMode::PolyMesh;
+    const auto& g = c.grid;
+    const double Tu = c.flameTu, sig = c.flameModel.sigma, m = c.flameUIn;
+    const std::array<double, 3> dir = poly ? c.fvBc.dir : std::array<double, 3>{1, 0, 0};
+    FvFreestream fs{.rho = 1.0, .U = m, .p = Tu, .T = Tu, .gamma = kGammaAir, .dir = dir,
+                    .pBurnt = Tu - m * m * (sig - 1), .tBurnt = sig * Tu};
+    std::expected<FaceMesh, std::string> mesh = std::unexpected("");
+    FvBcSpec spec;
+    if (poly) {
+        if (auto two = fvPolyCheck(c); !two) return die(two.error().first, two.error().second);
+        auto pm = readPolyMesh(fvPolyDir(c.fvMeshDir));
+        if (!pm) return die(exitInput, pm.error());
+        mesh = FaceMesh::fromPolyMesh(*pm, CellOrder::Morton);
+        spec = c.fvBc;
+    } else {
+        const FoamPatchType zt = g.nz == 1 ? FoamPatchType::Empty : FoamPatchType::Cyclic;
+        const StructuredSpec ss{.lo = {0, 0, 0},
+                                .hi = {g.nx - 1, g.ny - 1, g.nz - 1},
+                                .name = {"xlo", "xhi", "ylo", "yhi", "back", "front"},
+                                .type = {FoamPatchType::Patch, FoamPatchType::Patch, FoamPatchType::Cyclic,
+                                         FoamPatchType::Cyclic, zt, zt}};
+        mesh = FaceMesh::fromCurvMesh(CurvMesh::uniform(g), ss, CellOrder::Morton);
+        spec.patches = {{.name = "xlo", .kind = FvPatchKind::Far, .hasY = true, .y = {1, 0, 0, 0}},
+                        {.name = "xhi", .kind = FvPatchKind::Outflow, .burnt = true}};
+        if (c.flameDiffusion)
+            spec.patches = {{.name = "xlo", .kind = FvPatchKind::Inflow, .jet = true},
+                            {.name = "xhi", .kind = FvPatchKind::Outflow}};
+    }
+    if (!mesh) return die(exitInput, "FaceMesh: " + mesh.error());
+    const FaceMesh& fm = *mesh;
+    if (!haveGpu(c)) return die(exitNoGpu, "no GPU device (dns flame is GPU-only)");
+    if (c.flameDiffusion) return runFvJet(c, fm, spec, poly ? spec.origin : std::array<double, 3>{0, c.bunsen.yc, 0});
+    // mu = Pr at Tref = Tu: lambda_u = mu cp / Pr = cp (delta_D = 1).
+    const Transport gas = Transport::air(c.prandtl, Tu, c.tinfK, c.prandtl, kGammaAir, kRgasBox, c.sutherland);
+    const FvChem chem{.nY = 1,
+                      .fuel = 0,
+                      .lnA = std::log(c.flameEig.Lambda),
+                      .Ta = c.flameModel.theta() * Tu,
+                      .q = gas.cp() * (sig - 1) * Tu,
+                      .invPr = 1.0 / c.prandtl};
+    const FvFlameSpec fl{.dir = dir, .Tu = Tu, .sigma = sig, .dth = c.flameEig.dthOverDD, .gamma = kGammaAir,
+                         .Rgas = kRgasBox, .q = chem.q, .fuel = 0};
+    auto probe = FvFlameProbe::make(fm, fl);
+    if (!probe) return die(exitInput, probe.error());
+    FvState ic = FvState::zeros(fm.nC, kFvMeanVars + chem.nY);
+    if (poly) {
+        const FlameEigen& tab = c.flameEig.tab;
+        const double xf = c.flameXf0;
+        ic = fvFlameState(fm, fl, spec.origin, m, chem.nY, [&](double s) { return flameProfile(tab, s - xf); });
+    } else {
+        CompState host = CompState::zeros(g);
+        std::vector<double> rhoY;
+        flameIC(c, host, rhoY);
+        const std::vector<double>* v[6] = {&host.rho, &host.mx, &host.my, &host.mz, &host.E, &rhoY};
+        for (int r = 0; r < 6; ++r)
+            for (std::size_t n = 0; n < std::size_t(fm.nC); ++n) ic.var(r)[n] = (*v[r])[std::size_t(fm.srcCell[n])];
+    }
+    auto raster = FvRaster::make(fm, {.longSide = c.fvFrameN, .box = c.fvFrameBox});
+    if (!raster) return die(exitInput, raster.error());
+    FrameGeometry fgeo = FrameGeometry::centred(raster->grid(), 1.0);
+    fgeo.mask = raster->mask();
+    RunMeta meta = c.meta;
+    meta.setGrid(raster->grid());
+    meta.farField = "fv";
+    auto out = RunOutput::make(outputConfig(c, std::format("{{\"app\":\"dns\",\"flame\":\"premixed\",\"solver\":\"fv\","
+                                                           "\"sigma\":{},\"beta\":{},\"lambda\":{},\"mach\":{}",
+                                                           sig, c.flameModel.beta, c.flameEig.Lambda, c.mach)),
+                               meta, raster->grid(), std::move(fgeo));
+    if (!out) return die(exitOutput, out.error());
+    gpu::FvCompRun rr{.label = fvFlameLabel(c),
+                      .solver = {.tr = gas,
+                                 .bc = fvBcsOf(fm, spec, fs, 1.0),
+                                 .precision = c.fvPrecision,
+                                 .compensated = c.compensated,
+                                 .chem = chem,
+                                 .tallied = std::vector<std::uint8_t>(fm.patches.size(), 0),
+                                 .pRef = fs.p},
+                      .spec = spec,
+                      .fs = fs,
+                      .refArea = probe->area(),
+                      .cfl = c.cfl,
+                      .tEnd = c.tEnd,
+                      .dtRecompute = c.dtRecompute,
+                      .quiet = c.quiet,
+                      .flame = &*probe,
+                      .profileDt = c.profileDt};
+    auto res = gpu::runFvComp(fm, ic, rr, *raster, *out);
+    if (!res) return die(res.error().code, res.error().message);
+    if (auto e = out->finish(); !e) return die(exitOutput, e.error());
+    std::printf("done: %ld steps, %.3f ms/step\n", res->steps, res->msPerStep);
+    return 0;
+}
+
+// dns flame --physics lowmach --solver fv | --polymesh (docs/fvincomp.md "Low-Mach"):
+// the planar flame on the FV low-Mach solver. Box units Tu = P0 = R = rho_u = 1. The
+// box lays gpu/lowmach's IC cell for cell; a polyMesh the oracle along reference.direction.
+int runFvLowMachCase(const Case& c)
+{
+    const bool poly = c.fvMode == FvCompMode::PolyMesh;
+    const auto& g = c.grid;
+    const double Tu = c.flameTu, sig = c.flameModel.sigma, m = c.flameUIn;
+    FvBcSpec spec = poly ? c.fvBc : fvLowMachBoxBc();
+    std::expected<FaceMesh, std::string> mesh = std::unexpected("");
+    if (poly) {
+        if (auto two = fvPolyCheck(c); !two) return die(two.error().first, two.error().second);
+        auto pm = readPolyMesh(fvPolyDir(c.fvMeshDir));
+        if (!pm) return die(exitInput, pm.error());
+        mesh = FaceMesh::fromPolyMesh(*pm, CellOrder::Morton);
+    } else {
+        mesh = fvLowMachBox(g);
+    }
+    if (!mesh) return die(exitInput, "FaceMesh: " + mesh.error());
+    const FaceMesh& fm = *mesh;
+    auto bcs = fvLowMachBcs(spec, m, Tu);
+    if (!bcs) return die(exitInput, bcs.error());
+    if (!haveGpu(c)) return die(exitNoGpu, "no GPU device (dns flame is GPU-only)");
+    FvLowMachIC ic;
+    const std::size_t nC = std::size_t(fm.nC);
+    if (poly) {
+        const FlameEigen& tab = c.flameEig.tab;
+        const double xf = c.flameXf0;
+        ic = fvLowMachFlameIC(fm, spec.dir, spec.origin, sig, m, Tu, [&](double s) { return flameProfile(tab, s - xf); });
+    } else {
+        const LowMachState h = lowmachIC(c);
+        ic.rho.resize(nC);
+        ic.ry0.resize(nC);
+        ic.p.resize(nC);
+        ic.ru.assign(3 * nC, 0.0);
+        for (std::size_t q = 0; q < nC; ++q) {
+            const std::size_t src = std::size_t(fm.srcCell[q]);
+            ic.rho[q] = h.rho[src];
+            ic.ry0[q] = h.rhoY[0][src];
+            ic.p[q] = h.p[src];
+            ic.ru[q] = m;
+        }
+    }
+    const Transport gas = Transport::air(c.prandtl, Tu, c.tinfK, c.prandtl, kGammaAir, kRgasBox, c.sutherland);
+    const FvFlameSpec fl{.dir = spec.dir, .Tu = Tu, .sigma = sig, .dth = c.flameEig.dthOverDD, .gamma = kGammaAir,
+                         .Rgas = kRgasBox, .q = gas.cp() * (sig - 1) * Tu, .fuel = 0};
+    auto probe = FvFlameProbe::make(fm, fl);
+    if (!probe) return die(exitInput, probe.error());
+    auto raster = FvRaster::make(fm, {.longSide = c.fvFrameN, .box = c.fvFrameBox});
+    if (!raster) return die(exitInput, raster.error());
+    FrameGeometry fgeo = FrameGeometry::centred(raster->grid(), 1.0);
+    fgeo.mask = raster->mask();
+    RunMeta meta = c.meta;
+    meta.setGrid(raster->grid());
+    meta.farField = "fv";
+    auto out = RunOutput::make(outputConfig(c, std::format("{{\"app\":\"dns\",\"flame\":\"premixed\",\"physics\":"
+                                                           "\"lowmach\",\"solver\":\"fv\",\"sigma\":{},\"beta\":{},"
+                                                           "\"lambda\":{},\"mach\":0",
+                                                           sig, c.flameModel.beta, c.flameEig.Lambda)),
+                               meta, raster->grid(), std::move(fgeo));
+    if (!out) return die(exitOutput, out.error());
+    gpu::FvLowMachRun rr{.model = {.tr = gas,
+                                   .prGas = Tu,
+                                   .lnA = std::log(c.flameEig.Lambda),
+                                   .Ta = c.flameModel.theta() * Tu,
+                                   .qcp = (sig - 1) * Tu},
+                         .ctl = {.tol = c.fvTol, .precision = c.fvPrecision},
+                         .bcs = std::move(*bcs),
+                         .cfl = c.cfl,
+                         .chemK = c.lmChemDt,
+                         .tEnd = c.tEnd,
+                         .dtRecompute = c.dtRecompute,
+                         .profileDt = c.profileDt,
+                         .quiet = c.quiet,
+                         .label = fvFlameLabel(c),
+                         .flame = &*probe};
+    auto res = gpu::runFvLowMach(fm, ic, std::move(rr), *raster, *out);
+    if (!res) return die(res.error().code, res.error().message);
+    if (auto e = out->finish(); !e) return die(exitOutput, e.error());
+    std::printf("done: %ld steps, %.3f ms/step\n", res->steps, res->msPerStep);
+    return 0;
+}
+#endif // DNS_WITH_GPU
+
 
 // --mode chamber (docs/chem.md, "Chamber"): the closed 2D combustion chamber.
 int runChamberCase(const Case& c)
@@ -1380,10 +2204,14 @@ int runFlame(const Case& c, [[maybe_unused]] const CheckpointContext& ckx)
 {
     if (c.chamberMode) return runChamberCase(c);
     if (c.flameWick) return runWickCase(c);
+#if DNS_WITH_GPU
+    if (c.physics == Physics::LowMach && c.fvMode != FvCompMode::Off) return runFvLowMachCase(c);
+#endif
     if (c.physics == Physics::LowMach) return runLowMachCase(c, ckx);
-    if (!haveGpu(c))
+    if (!haveGpu(c) && c.fvMode == FvCompMode::Off)
         return die(exitNoGpu, "no GPU device (dns flame is GPU-only)");
 #if DNS_WITH_GPU
+    if (c.fvMode != FvCompMode::Off) return runFvFlame(c);
     const auto& g = c.grid;
     // --restart: the whole checkpoint is this run's input (exit 3), read
     // before any output is touched; phase 1.5 checked its binary and case.
@@ -1644,6 +2472,7 @@ int runFlame(const Case& c, [[maybe_unused]] const CheckpointContext& ckx)
 
 int runTgv(const Case& c)
 {
+    if (c.fvIncomp) return runFvIncompTgv(c);
     const auto& g = c.grid;
     const double nu = c.nu;
 
@@ -2206,6 +3035,24 @@ int main(int argc, char** argv)
         scene = std::move(*s);
     }
 
+    // Phase 1.5 for the compressible FV path (the --scene precedent): --bc is
+    // an input file, parsed here so a bad one is exit 3 before validate (which
+    // reads its reference length). --physics picks the parser: the incompressible
+    // file is read by that path's Acquire, against the mesh's patches.
+    if ((raw->sub == Subcommand::Flow || raw->sub == Subcommand::Flame || raw->sub == Subcommand::Conv) &&
+        (raw->physics == Physics::Compressible || raw->sub == Subcommand::Flame) && raw->given.contains("--polymesh") &&
+        raw->given.contains("--bc"))
+    {
+        std::ifstream f(raw->bc);
+        if (!f) return die(exitInput, "--bc: cannot read " + raw->bc);
+        const std::string text{std::istreambuf_iterator<char>(f), {}};
+        auto b = parseFvBc(text);
+        if (!b) return die(exitInput, "--bc " + raw->bc + ": " + b.error());
+        if (raw->physics == Physics::LowMach)
+            if (auto l = fvLowMachBcs(*b, 1.0, 1.0); !l) return die(exitInput, raw->bc + ": " + l.error());
+        raw->fvBc = std::move(*b);
+    }
+
     // Phase 1.5 for checkpoints (the --scene precedent): the binary's
     // fingerprint, and --restart's checkpoint HEADER (no fields) against this
     // invocation -- solver, binary, every case-defining flag: a mismatch is
@@ -2257,6 +3104,14 @@ int main(int argc, char** argv)
     // validate() is pure: it collects advisories rather than printing them.
     for (const auto& w : c->warnings)
         std::fprintf(stderr, "dns: warning: %s\n", w.c_str());
+    if (c->dryRun && c->fvs.active)
+    {
+        auto fc = fvStructuredResolved(c->fvs);
+        if (!fc) return die(exitInput, fc.error());
+        fc->dir = c->fvCase;
+        std::printf("--solver simple: %s\n%s", fvStructuredLabel(c->fvs).c_str(), describeFoamCase(*fc).c_str());
+        return 0;
+    }
     if (c->dryRun)
     {
         std::fputs(c->describe().c_str(), stdout);
@@ -2264,6 +3119,15 @@ int main(int argc, char** argv)
         // Phase 1.5 for `dns mesh` (the --scene precedent): the manifest
         // names the input file's facts, read without bulk data.
         if (c->sub == Subcommand::Mesh) return runMeshManifest(*c);
+        if ((c->sub == Subcommand::Flow || c->sub == Subcommand::Flame) && c->fvMode == FvCompMode::PolyMesh) {
+            auto two = fvPolyCheck(*c);
+            if (!two) return die(two.error().first, two.error().second);
+            std::printf("  label      %s\n",
+                        (c->sub == Subcommand::Flame ? fvFlameLabel(*c) : fvCompLabel(*c, *two)).c_str());
+            return 0;
+        }
+        if (c->fvConv && !c->fvMeshDir.empty()) return runConvFvManifest(*c);
+        if (c->fvIncomp && !c->fvMeshDir.empty()) return runFvIncompManifest(*c);
         if (c->sub == Subcommand::Flow && !c->fvCase.empty()) {
             auto fc = loadFoamCaseManifest(c->fvCase);
             if (!fc) return die(exitInput, fc.error());
@@ -2287,6 +3151,10 @@ int main(int argc, char** argv)
     switch (c->sub)
     {
     case Subcommand::Flow:
+        if (c->fvMode == FvCompMode::PolyMesh) return runFvCompPoly(*c);
+        if (c->fvIncomp) return c->fvMeshDir.empty() ? runFvIncompOGrid(*c, scene ? &*scene : nullptr)
+                                                     : runFvIncompPoly(*c);
+        if (c->fvs.active) return runFvStructured(*c);
         if (!c->fvCase.empty()) return runFvFlow(*c);
         return runFlow(*c, *raw, scene ? &*scene : nullptr);
     case Subcommand::Tgv: return runTgv(*c);

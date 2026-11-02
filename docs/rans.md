@@ -38,6 +38,9 @@ URANS, wall models, the incompressible branch, MUSCL scalar convection.
 `--rans` is registered only where it is built (`ransBuilt(Subcommand)`),
 only with the closures that exist.
 
+The same closures run on any FaceMesh through the compressible FV family
+(`--solver fv`, `--polymesh DIR --bc FILE`): `docs/fvcomp.md` "RANS".
+
 Sources: TMR `spalart.html`, `sst.html`; MKM chan180 / chan395 `.means`
 (Re_τ 178.12 / 392.24; ub⁺ by trapezoid over the published profile: 15.679 /
 17.545 — the headers carry no Re_b).

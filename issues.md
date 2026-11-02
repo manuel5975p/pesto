@@ -1379,14 +1379,13 @@ Measured gfx1100 via simjob, 2026-10-28, defaults (4 cells/δ_th) and the
 
 ## FaceMesh / FV path (`docs/mesh.md`, `docs/fv.md`, `plans/masterplan_meshsolver.md`)
 
-56. **Phases 1–2 only: the FaceMesh and a CPU FP64 FV oracle exist, no GPU
-    solver runs on it.** Built and pinned: polyMesh reader/writer,
+56. **The FaceMesh and the CPU FP64 FV oracle (its GPU family: item 78).**
+    Built and pinned: polyMesh reader/writer,
     `fromPolyMesh` / `fromCurvMesh`, orderings, `CellGraph`, `dns mesh`
     (`plans/verify/impl_meshsolver_p1.md`); `fvflux.hpp` / `fvgrad` /
     `FvRef` (`plans/verify/impl_meshsolver_p2.md`, gates in docs/mesh.md).
-    P2 open by plan: no GPU FV kernels (P4), no scalar/species rows, no MRF
-    frame flux, no eddy viscosity, no LTS march; one `FvBc` per patch (no
-    per-face profiles). Scheme limits, stated: `Far` is a 1D characteristic
+    Open by plan: no scalar/species rows, no MRF frame flux, no LTS march; one
+    `FvBc` per patch (no per-face profiles). Scheme limits, stated: `Far` is a 1D characteristic
     state (no transverse terms), `Outflow` fixes p (reflects acoustics),
     `Inflow` is subsonic only, `Slip` keeps the normal viscous stress.
     Unproven: the KG flux with no dissipation on snappy 2:1 meshes beyond
@@ -1637,6 +1636,250 @@ Measured gfx1100 via simjob, 2026-10-28, defaults (4 cells/δ_th) and the
     (d) G-JAC is not exact with freestreamVelocity / freestreamPressure
         patches (duct 1.2e-4 / 3.8e-4: their value fractions follow Ub in
         the FD). G-PAR, G-FOAMRESTART, FP32, RAS, the CUDA backend: not built.
+
+78. **Compressible FV family (`docs/fvcomp.md`, `gpu/fv_comp`): explicit DNS/LES
+    on any FaceMesh, FP32 default, cross-verified against the structured solver.**
+    Device vs FvRef, trajectory vs `Comp` / `DeviceComp`, grid ladders: the table
+    in docs/fvcomp.md. Open:
+    (a) **Plain FP32 wanders on a settled flow.** Re 40 O-grid 128 x 64: FV cd
+        1.5665-1.5764 for ever, period ~250, total mass pulsing 2.7e-4; FP64
+        flat to 6 digits (1.571630); structured plain FP32 1.5650-1.5665. Updates
+        below ulp(q)/2 round away. `--compensated` (off by default, as on the
+        structured path) or FP64 fix it. USER decision: should FV FP32 default
+        to compensated? It costs 1.02x per step (0.186 vs 0.182 ms, 256 x 128).
+    (b) CLOSED: the settled cd plateau FV - structured (+6.0e-3) was a bug in
+        `Far`: the outgoing Riemann invariant read `c_P`, so the warm wake's
+        entropy acted as a pressure source of relative size M. Now the
+        isentropic `c` of p. Gap -1.43e-3, -4.13e-4, -1.6e-4 (96, 192, 384; order
+        1.79, 1.37; 384 at the job cap, t 59), Re 100 mean cd -9.4e-5. The whole
+        structured row on FV gives the same cd to 7e-5. docs/fvcomp.md "Far gap".
+        Left: no R -> infinity limit extrapolated, 384 not flat, the gap at 80 / 160 D
+        M 0.1 is -1.2e-3 / -4.0e-3 at n 192 (order 2.1, 2.4; h1 grows with R).
+    (h) Seen while gating, NOT caused here: `gpu_sst`, `gpu_sa_wedge`, `gpu_precond`
+        fail (structured O-grid `--steady` gates: exit 8 "remaining change inf"
+        or a certify-iteration band). Stats are byte-identical to f892cc6 on the
+        failing cases, and f892cc6 exits 8 too. `amg_setup`: 6M setup 3.02-3.44 s
+        vs its 3 s timing gate, idle host and baseline binary included, not load.
+        `gpu_la_perf`: timing only, `gpu/la` sources equal f892cc6. Lines apply
+        0.794, 0.795, 0.796, 0.812 ms under `--bench` vs its 0.8 gate (doc 0.637);
+        SpMV B5 1.27 vs doc 1.163 ns/cell. It flips at the gate. Cause of the
+        ~10-25% over the doc numbers unmeasured: no f892cc6 `test_gpu_la` run on
+        this machine now. Gate unchanged.
+    (g) Ladders stop at 3 levels by decision (no GPU job over 5 minutes); every
+        quoted order rests on those. Re 100 St difference shrinks at order
+        ~1 on rungs that are not asymptotic (St moves 4% between the last two);
+        cl rms non-monotone; immersed vs FV convergence NOT measured (25.6
+        cells/D still falling at t 51). Dropped rungs: docs/fvcomp.md.
+    (c) Far is 1D characteristic: no transverse term, no sink, no NSCBC. A
+        box on `--solver fv` has none of the structured far-field machinery.
+        Re > 800 unmeasured.
+    (d) Not built, rejected by name: revolved O-grids (P8), immersed bodies on
+        a FaceMesh, MRF, `--temp`, volume / vtk / slices frames, checkpoints,
+        per-face profiles. RANS and `--steady`: item 84. Species: 78b.
+    (e) Unproven: KG with no dissipation on snappy 2:1 meshes past Re 40
+        (`cyl2d_snappy` stable, coarse), 3D snappy, LES on a real wall, the
+        tangential part of the FV wall face gradient (the owner's LSQ value,
+        structured: exactly 0 on the image): second order on cd measured, wall
+        stress profiles not compared; Sutherland + LES; CUDA run (shim covers
+        every call used, no device); Morton vs other cell orders for speed.
+    (f) `reference.area` is a user number on 3D polyMeshes; no check against the
+        wall's projected area.
+
+78b. **Species on the FV family (`dns flame --solver fv`, `--polymesh`, docs/fvcomp.md
+    "Species").** Premixed one-step C0 on any FaceMesh. Interior rounding-equal to the
+    structured kernels (S8), planar rotated 5e-8, non-orthogonal order 2. Open:
+    (a) **FV vs structured S_L end to end is not closed below 1e-3.** Boundaries differ:
+        NSCBC + sink hold rho, `Far` holds entropy, T_u differs (1.3e-3 at M 0.05, 7.5
+        cells), S_L follows at dln S/dln T ~ 1. Read at a matched T_u, -4e-5, -9e-6, +8e-4
+        at u_in 0.98; +3.4e-4, +7.8e-5, -5.3e-4 at u_in 0.9: the finest rung changes sign,
+        moves 3e-4 with `--nscbc-sink`, and sits inside the structured window span
+        (~1e-3). No order claimed. Cause of that span not isolated.
+    (b) **Plain FP32 at M 0.01 scatters S_L ~1e-3, both solvers**, non-monotone in h and
+        dt (FV FP32 1.003167 at dt 9e-5, 1.003884 at 1.8e-4, FP64 1.003472; 30 cells
+        1.001623, FP64 1.000437). Every quoted structured S_L at M 0.01 carries it.
+        `--compensated` matches FP64 to 6 digits on FV; the structured flame has no such
+        mode. USER decision: compensate the structured species path?
+    (c) Not built, rejected by name: bunsen, candle, chamber, wick, `--equivalence`,
+        species LES, TFLES, `--turb`, checkpoints, the jet's `--pulse`. No bluff-body or
+        wall-anchored flame on the FV path has been run: a wall's zero-gradient Y and
+        adiabatic T are unit-tested only (S1, S5). Diffusion C1: item 78c.
+    (d) `Far` + `Outflow` is an acoustic half-pipe: fine for a planar flame. Unproven on a
+        burner: no sink, `Outflow` clamps p.
+
+78c. **Diffusion flame on the FV family (`dns flame --mode diffusion --solver fv`,
+    `--polymesh`, docs/fvcomp.md "Diffusion flame").** Model C1 on any FaceMesh: shared
+    limiter, per-face rows, a fixed inflow face. Numbers: the table there. Open:
+    (a) **Inflow + Outflow rings.** The start's p/p0 +-5% decays with an e-fold ~30
+        l/U, no growth at these Da. No absorber: `Far` rows sag u (fuelIn -11%). A jet
+        reads past t ~100; `gpu_fv_flame_jet` reads [60, 80] and carries the ring.
+    (b) **A 30 deg sheared jet diverges late**: FP64, 3 cells/l at t 308.7, 4.5 at t
+        155.9; 2 cells/l survives t 160, not run past it. A cell-to-cell sawtooth (p 3.7
+        vs 569) on the lean side of the sheet at x ~6, not a boundary; blow-up time ~
+        h^1.7; constant-coefficient symbols of the Laplacian and the stress operator are
+        stable to 45 deg, so it needs the variable state. Cause NOT isolated. Rotated and
+        wavy show nothing. Reproduce: `tools/chem/fv_jet_ladder.py --cells 4.5 --tt 160
+        --meshes shear`. Tip -0.700, -0.342 (order 1.77) stand for 2, 3 cells/l.
+    (c) Inflow rows pin a FACE, structured a CELL: tip offset first order, +0.725, +0.490,
+        +0.352 vs etaIn 1000, limit +0.05 by a line through 3 rungs. No two-reactant S8:
+        interior rounding against `kSpeciesStage2` not built.
+    (d) Not measured (3 levels, 295 s): 6 cells/l: `tools/chem/fv_jet_ladder.py --cells 6
+        --tt 160 --meshes rot`.
+
+79. **Time-accurate incompressible FV (`--solver fv`, `--bc`, docs/fvincomp.md).**
+    Built: `gpu/fv_incomp`, `gpu/runner_fvincomp`, `dns/fvincomp`; DNS, LES;
+    wall, slip, inflow, outflow, convective, far, cyclic, empty; `dns tgv
+    --solver fv`, `dns flow --solver fv --ogrid`, `dns flow --polymesh DIR --bc`.
+    Every ladder rests on 3 levels (user decision); no order is converged. Open:
+    (a) **Re 40 tunnel cd FV vs MAC: cause isolated, one question left.** Same
+        mesh + same BCs vs simpleFoam is the oracle (docs/fvincomp.md "Same mesh").
+        O-grid: U rms order 1.76, 1.30, cd diff −8.9e-3, −3.4e-3, −1.9e-3: the
+        projection and face flux hold. The gap was: the tally (p_P + G.r, +1.2e-2
+        to +2.0e-2, moved with dt: dropped), the wall stress (Laplacian alone +2.9e-2
+        vs simpleFoam at N 128: OpenFOAM's whole wall stress taken, budget closes to
+        4e-4), MAC itself (2.08833, 2.08091, 2.0654 at N 128, 256, 512, last
+        doubling −1.56e-2), the outlet (convective vs p = 0: −1.05e-2, flat).
+        FV now 2.04109, 2.04452, 2.0432 (N 256 not flat, ~2.042), span 3.4e-3; FV −
+        MAC −4.72e-2, −4.10e-2, −3.77e-2, order 0.35, 0.29: it shrinks because MAC
+        moves. OPEN: does MAC reach ~2.04? N 1024 not measured (~40 min), limit
+        estimate ≤ 2.05, so a gap ≤ 0.4% is not excluded; first-order cut wall.
+        Re 100 row predates the wall stress and tally, not re-run.
+        On the tunnel mesh the FIELD difference vs simpleFoam does not shrink (rms
+        1.4e-3, max 1.6e-2 at the ring's corner cells, 43°, volume ratio 1.67 at
+        every N): a mesh property, cd within 1.9e-3 past N 128 with no trend.
+    (b) **CLOSED: T6 cavity 8.6e-2.** Lid-corner singularity, proved by ladder:
+        all-cell max 1.01e-1, 9.41e-2, 9.10e-2 at N 24, 48, 96 (order 0.1), a fixed
+        2 h_24 away 2.03e-2, 6.17e-3, 4.99e-4 (order 1.7, 3.6), rms there order 3.
+        T6 gates outside 2 cells of a lid corner, SAME 5e-2 bound: 2.03e-2 passes.
+        The 8.6e-2 also held a kick from (c). Corner cell moves with c, stated:
+        no bound on it.
+    (c) **CLOSED: cavity 3.2e-2 move.** Not the PCG, not noise: a short step.
+        `march` clamped its last step to the report time; a step of f dt on a
+        steady state moves U by (1 − f) 3.24e-2 (4.07e-2 with the wall stress), any
+        f << 1, because phi holds the last c's Rhie-Chow term and the predictor
+        forgets it; p grows as 1/f; 1e-12 dt diverged the next steps (p 8e10 in
+        the warm start). Reproduced on demand, T7. The two runs had different
+        report times, so different last steps: settings differed, determinism
+        stands. Fix: equal steps to an end time, runner and test; `step` precondition.
+        The runner's written fields had carried the same kick.
+    (d) Random meshes: order 1 (ν 0.05), 0.4–0.65 viscous-dominated, not 2. Convective
+        ½ is forced by skew-symmetry; AlongD on a non-smooth mesh also limits.
+        Re-measured after (a)-(c): unchanged, 1.20, 0.95 at ±0.1 h; K −47.9% in t 29
+        on 32² ±0.25 h. Neither fix touches a periodic interior. No redesign started.
+    (e) The projection is dissipative: K −48% in t 30 on 32² ±0.25 h random, inviscid;
+        2.8% of peak on 192³ TGV. No growth seen, not proved.
+    (f) MAC vs FV TGV −dK/dt difference is non-monotone on the three levels.
+    (g) Not built: implicit viscosity (`dt ~ h²/ν` makes wall clustering expensive),
+        restart, frames, immersed bodies, revolved O-grids, `--ramp`, `--steady`.
+        Unproven: the CUDA backend (no nvcc here, these files never compiled there);
+        `--far`-type outflow beyond a smoke run; `outflow` backflow stability.
+
+80. **simpleFoam on the structured meshes (`dns flow --solver simple`,
+    `docs/fvstructured.md`).** Built: uniform, `--stretch`, `--focal`,
+    channel, O-grid 2D / 3D, wedge, full revolution, laminar, SA, SST, MRF;
+    `--export CASE`. Open:
+    (a) OpenFOAM absent: no generated case has been run by simpleFoam. The
+        `vectorSemiImplicitSource` spelling (`sources`, `injectionRateSuSp`)
+        and its sign are written from memory of v2606; Poiseuille pins the
+        solver's reading, not OpenFOAM's. First check when OpenFOAM is back.
+    (b) OpenFOAM's `wedge` patch is not built: the wedge's sides are `symmetry`,
+        a `cos(dphi/2)` difference in the face value. `Uz` is solved, so a
+        wedge (and any 3D case with a zero component) never certifies a
+        `--steady` stop: its residual is rounding over rounding (0.25).
+    (c) O-grid cd vs structured `--ogrid`: a STATED MODEL GAP. At 20 D it is the
+        far model: U clamped on the far circle takes simple central from -0.0228
+        to +8.1e-4 of structured (n 256; two rungs, no order). Structured 160 D =
+        80 D at n 128 was a grid coincidence: h1 grows with R at fixed ny; steady
+        stop = time march; n 192, 256 fall to 1.5080, 1.5072. OPEN: structured -
+        simple plateaus 0.005 at 80, 160 D (n 256), and at 160 D M 0.1 -> 0.05 moves
+        structured -3.1e-3 at every n (20 D: -1e-4). Cause not isolated. FV with
+        clamped U rings, no steady number. docs/fvstructured.md "Reading the gaps".
+        The cut-cell solver (10% above) is a different domain. Finer rungs: "Not
+        measured".
+    (d) `cd` from wall faces is first order on an O-grid (zeroGradient wall p,
+        one-sided wall stress): the ladder at beta 2 is non-monotone (1.5392,
+        1.5392, 1.5408 at n 256, 512, 1024) and Richardson at order 2 lies.
+    (e) MRF: `--nz > 1` and revolved meshes rejected; the zone is r < D, a
+        sharp OpenFOAM zone, not the structured blend.
+    (f) Immersed bodies on Cartesian meshes have no export (rejected): every
+        `--stretch` / `--focal` case here is body-free. `dns flow --solver
+        simple` on `--body` needs `--ogrid` or an imported polyMesh.
+
+81. **`dns conv` on a FaceMesh (`docs/fvcomp.md` "Gravity", `docs/fvincomp.md`
+    "Temperature", `gpu/runner_fvconv`, `dns/fvconv`).** Both models, `--solver fv`
+    and `--polymesh DIR --bc FILE`, one route (C6: binary polyMesh == box, bytes).
+    Ra 5e4 2D, FV vs structured same model: Boussinesq -0.7%, -0.19%, +0.10%,
+    compressible -0.7%, +0.11%, +0.25% on 48, 96, 192 x H/2 grids; closed -0.15%.
+    Cross 4.7% (15% band, not wider). Open:
+    (a) Compressible FV gravity is WELL BALANCED now (`fvGravityFace`, docs/fvcomp.md
+        "Gravity"): T linear in the height + hydrostatic p is a fixed point on any mesh,
+        FP64 4.4e-14 Uff on random ±0.3 h (was 1.1e-2), nuFlux 1.000000 (was 0.61), no
+        reference state. Left: the FP32 floor, 2.1e-5 to 3.9e-5 Uff (frozen `eps p/h`,
+        two-word state, FP32 fluxes). Not exact: Sutherland, a curved adiabatic wall, any
+        nonlinear T(h): truncation. Random Ra 5e4 192 x 96 reads 3.61 vs 3.75 on 96 x
+        48: a different roll state suspected, not shown; uniform 192 at t 120 not
+        measured (`dns conv --solver fv --nz 1 --n 192 --ny 96 --rayleigh 5e4 --tt 120`).
+    (b) FP32 Boussinesq |div| floors at 1.4e-4 (96), 4.6e-4 (192): `4 eps gross` with
+        `c B_f` in the flux. Nu unaffected to 4 digits. Gate on FP64.
+    (c) `--hot-patch`, open faces under gravity, 3D Nu: not built / not measured.
+        48 x 24 x 24 runs are smokes (`f3d`). Not measured: `dns conv --solver fv
+        --physics incompressible --nz 48 --n 96 --ny 48 --rayleigh 5e4 --tt 40`.
+    (d) Non-orthogonal Ra 5e4 is one mesh (sine 0.05), no ladder. Not measured: `dns
+        conv --solver fv --n 192 --ny 96 --nz 1 --rayleigh 5e4 --tt 40 --mesh-perturb
+        0.05`, both physics.
+    (e) Height bins on a non-planar mesh smear: read `nuBotF`, `nuTopF` there.
+
+84. **RANS on the compressible FV family (`docs/fvcomp.md` "RANS", `dns/fvrans.hpp`,
+    `gpu_fv_rans`): SA-neg, SST-2003m, SST-Vm on any FaceMesh, URANS and `--steady`
+    (local time stepping).** Numbers: the table in docs/fvcomp.md. Open:
+    (a) The channel is driven through `FvCompConfig::bodyForce` only: no CLI flag,
+        no `dns channel --solver fv`. Not built.
+    (b) Far scalars switch sharply on the boundary velocity's sign; the structured
+        far row blends with a tanh band and holds a ghost value. A stated scheme
+        difference, not measured alone.
+    (c) Isothermal `omega_w`, `rho_w`: the FV wall face reads the EOS at T_w, the
+        structured ghost the mean of two cells. Same limit, in the channel's O(h^2).
+    (d) `--steady` on an external FV flow: certified stop NOT measured. Re 1e3
+        cylinder 128x50 SA: FV and structured both exit 8 at 1e6 iterations, cd
+        jitter 3-5%, no steady wake. Only the channel fixed point is measured (from
+        the oracle, LTS, FP64). LTS drifts the mass, no projection built. A cold
+        start and FP32 compensated on the channel: not run.
+    (g) O-grid cdf FV - structured shrinks slowly (+1.5e-5, +1.1e-5, +7.6e-6): no
+        order established on 3 rungs; 4e-4 relative at the finest. SST-2003m cd at
+        128x50 disagrees 10% (+7.85e-2; y+ max 1.7), the finer pairs 1.4e-3, 4.7e-4,
+        and SST cd is non-monotone in h: not asymptotic. Finer: `tools/fv/comp_ladder.py
+        --re 1e4 --ft 0.2 --levels 1024:386 --beta 4 --rans sst-2003m --compensated
+        --limit 1800` NOT measured.
+    (e) SA's negative-branch grad rho coefficient: unverified on any path (docs/rans.md).
+    (f) Not built on FV: implicit steady, `--precond`, RANS + MRF, wall functions,
+        a per-patch inflow turbulence value (one freestream phi for every open
+        patch), Spalding-style y+ columns (stats carry mutMax, floorHits).
+
+85. **Species, RANS, gravity on `gpu/fv_comp` are mutually refused** (`docs/fvcomp.md`
+    "Combinations", `comboGate`). Built apart; no gate composes them. Refused: every
+    pair, species or gravity under `--steady` (`localDt`: `kFvChem`, `kFvGravity` take
+    the bare cr), gravity + LES. Open: each pair is a build with its own test, not a
+    flag. FP32 RANS on the channel fixed point: 84(d).
+
+### Low-Mach FV (`dns flame --physics lowmach --solver fv | --polymesh`, docs/fvincomp.md "Low-Mach")
+
+LF1. **The low-Mach march's energy balance closes at order 1 in dt, on both solvers.** R_T
+    reads the stage's input m, continuity its output m. FV measures it (`eDefect`, L3: 7.7e-5,
+    3.9e-5, 1.9e-5 relative at dt, dt/2, dt/4 on a burning front; the semi-discrete balance is
+    rounding). Structured has no energy tally; L7 says it is the same algebra. Open: whether a
+    transient low-Mach quantity (Darrieus-Landau growth) carries the same order. Not measured.
+
+LF2. **Explicit diffusion on a non-orthogonal mesh.** The rule's sum is `|S|^2/(S.d)`, conservative
+    and unproved: the Σ `corr.S` of the compressible rule diverged at 67 deg, dt 2x above stable; the
+    new rule costs 4.3x in dt there (shear + wavy + rotate, 30 cells: dt 3.2e-5, a 30-cell rung past
+    295 s). No sharper bound measured. The compressible FV flame's dt is acoustic and has not been
+    tried under the same stress at M >= 0.05.
+
+LF3. **The FV step costs 6 to 14x the structured one** (512 x 4: 1.8 ms FP32, 4.3 ms FP64 at tol
+    1e-3, vs 0.31 to 0.44). Launch-bound. Nothing tuned: FP32's 3 iterations a step is the floor stop.
+
+LF4. **Not built, rejected by name**: the burner, open laterals, `--rim`, gravity, two reactants,
+    LES, TFLES, turbulence, `--dt-rule cell`, checkpoints, a closed box. Backflow at an outflow is
+    zero gradient both ways, no gate drives it.
 
 ## Older open items (details in CLAUDE.md)
 

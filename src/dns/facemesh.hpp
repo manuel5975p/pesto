@@ -59,7 +59,9 @@ struct MeshPatch
 // full range required; AxisWrap::Cyclic shares its nodes (internal faces, no
 // patch), AxisWrap::Translate becomes a translational cyclic patch pair
 // named name[2a], name[2a+1]. nz == 1 is 2D: types[4] == types[5] == Empty.
-// Pre (else error): m.axisFaces == {-1,-1}, wrap[2] != MirrorZ (wedge: P8).
+// Revolved mesh (axisFaces set): the range is exactly the real columns, their
+// outer node columns collapse onto the axis (prism cells, no i-/i+ patch, one
+// node per j). MirrorZ: only k = 1, side patches `symmetry`, never `wedge`.
 struct StructuredSpec
 {
     std::array<int, 3> lo{}, hi{};      // inclusive real cells per axis
@@ -101,6 +103,11 @@ struct FaceMesh
     // cyclic patches on Translate, cells numbered i fastest over the range,
     // internal faces upper-triangular. Writable with writePolyMesh (export).
     static std::expected<PolyMesh, std::string> polyOf(const CurvMesh&, const StructuredSpec&);
+    // polyOf's manifest from flags alone (no nodes): phase 1.5 of a structured
+    // FV case. Post: equals polyOf(m, sp)->man for that mesh's g, wrap, axisFaces.
+    static std::expected<PolyManifest, std::string> polyManifest(const Grid&, const std::array<AxisWrap, 3>& wrap,
+                                                                 const std::array<int, 2>& axisFaces,
+                                                                 const StructuredSpec&);
 };
 
 // checkMesh-equivalent numbers (definitions of OpenFOAM v2606

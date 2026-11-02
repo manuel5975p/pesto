@@ -1,0 +1,21 @@
+# --bc file of the compressible FV path for tests/data/mesh/cyl2d_snappy:
+#   dns flow --physics compressible --polymesh tests/data/mesh/cyl2d_snappy \
+#       --bc examples/fvcomp_cyl2d_snappy.toml --re 40 --mach 0.2 --tt 40 --ramp 2
+# See docs/fvcomp.md. `empty` patches need no table; cyclics are internal faces.
+[reference]
+length = 1.0
+
+[patch.cylinder]
+type = "wall"
+
+[patch.inlet]
+type = "far"
+
+[patch.outlet]
+type = "far"
+
+[patch.lower]
+type = "far"
+
+[patch.upper]
+type = "far"

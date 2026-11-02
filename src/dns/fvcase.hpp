@@ -238,6 +238,9 @@ struct FoamCase
     bool relaxPGiven = false;
     std::optional<double> relaxU;           // equations { U }: absent = no relax
     std::vector<FvMrfZone> mrf;
+    // fvOptions: vectorSemiImplicitSource, selectionMode all, specific, Sp 0.
+    // U equation source per unit mass; absent: none (the only fv::option built).
+    std::optional<FvVec3> uSource;
     FvRas ras;                              // model Laminar: the P5b laminar solver
     std::optional<FvForces> forces;
     std::vector<std::string> notes;         // accepted-but-not-reproduced entries (reported)
@@ -248,7 +251,8 @@ struct FoamCase
 // constant/transportProperties; optional: constant/MRFProperties,
 // constant/momentumTransport | constant/turbulenceProperties; with RAS:
 // 0/nut and 0/k + 0/omega (kOmegaSST) or 0/nuTilda (SpalartAllmaras).
-// Present only to be rejected: constant/fvOptions, system/fvOptions.
+// constant/fvOptions | system/fvOptions: one constant specific U source
+// (vectorSemiImplicitSource) or rejected by name.
 using FoamCaseTexts = std::map<std::string, std::string>;
 
 // Pure: resolves the case against the mesh manifest (every non-cyclic patch

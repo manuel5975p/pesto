@@ -1,5 +1,6 @@
 #include "dns/fvref.hpp"
 
+#include "dns/chem.hpp"
 #include "dns/parallel.hpp"
 
 #include <algorithm>
@@ -15,11 +16,6 @@ namespace {
 using V3 = std::array<double, 3>;
 
 V3 at(const std::array<std::vector<double>, 3>& a, std::size_t i) { return {a[0][i], a[1][i], a[2][i]}; }
-
-// Largest diffusivity on mu/rho the FV checkerboard sees: energy gamma/Pr, momentum
-// 4/3 (the normal stress of a longitudinal checkerboard; 1 grew x1.8e6 in 60 steps at
-// Pr 2 on 100:1 cells, E6). FV-only: the structured solvers keep diffusivityFactor.
-double fvDiffusivityFactor(const Transport& tr) { return std::max(4.0 / 3.0, tr.gamma / tr.Pr); }
 
 std::pair<std::size_t, std::size_t> part(std::size_t n, int w, int nw)
 {
@@ -121,12 +117,59 @@ std::expected<FvRef, std::string> FvRef::make(const FaceMesh& fm, FvConfig cfg, 
     const Transport& tr = cfg.tr;
     if (!(tr.gamma > 1.0) || !(tr.muRef >= 0.0) || !(tr.Rgas > 0.0) || !(tr.Pr > 0.0))
         return std::unexpected("FV gas: gamma > 1, mu >= 0, R > 0 and Pr > 0 required");
-    if (cfg.bc.size() != fm.patches.size())
+    const FvChem& ch = cfg.chem;
+    if (ch.nY < 0 || ch.nY > kFvMaxSpecies || (ch.nY > 0 && (ch.fuel < 0 || ch.fuel >= ch.nY)))
+        return std::unexpected(std::format("FV species: nY must be in [0, {}] and fuel one of them", kFvMaxSpecies));
+    if (ch.nY > 0 && (!(ch.invPr > 0.0) || !(ch.q >= 0.0) || !(ch.Ta >= 0.0) || std::isnan(ch.lnA)))
+        return std::unexpected("FV chemistry: needs 1/Pr > 0, q >= 0, Ta >= 0");
+    if (ch.ox >= 0 && (ch.ox >= ch.nY || ch.ox == ch.fuel || !(ch.stoich > 0.0)))
+        return std::unexpected("FV chemistry: the oxidizer is a species other than the fuel, stoich > 0");
+    // Pairs no gate has composed (docs/fvcomp.md "Combinations"), by name.
+    const auto nonzero = [](const std::array<double, 3>& v) {
+        return std::ranges::any_of(v, [](double x) { return x != 0.0; });
+    };
+    const bool closure = cfg.rans.model != RansModel::None, grav = nonzero(cfg.gravity), drive = nonzero(cfg.bodyForce);
+    if (ch.nY > 0 && closure) return std::unexpected("FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)");
+    if (ch.nY > 0 && grav) return std::unexpected("FV species with gravity: not built (no combustion gate under gravity)");
+    if (ch.nY > 0 && drive) return std::unexpected("FV species with bodyForce: not built");
+    if (closure && grav) return std::unexpected("FV RANS with gravity: not built (no buoyancy term in the closures)");
+    if (grav && drive) return std::unexpected("FV gravity with bodyForce: not built");
+    if (cfg.bcRow.empty() ? cfg.bc.size() != fm.patches.size() : cfg.bc.size() < fm.patches.size())
         return std::unexpected(std::format("FV boundary conditions: {} given for {} patches", cfg.bc.size(),
                                            fm.patches.size()));
     for (std::size_t p = 0; p < fm.patches.size(); ++p)
         if (auto ok = checkBc(cfg.bc[p], fm.patches[p], fm.emptyAxis, tr); !ok)
             return std::unexpected(std::move(ok.error()));
+    if (!cfg.bcRow.empty()) {
+        if (cfg.bcRow.size() != std::size_t(fm.nB))
+            return std::unexpected(std::format("FV boundary rows: {} given for {} boundary faces", cfg.bcRow.size(), fm.nB));
+        for (std::size_t p = 0; p < fm.patches.size(); ++p)
+            for (int i = 0; i < fm.patches[p].count; ++i) {
+                const int row = cfg.bcRow[std::size_t(fm.patches[p].first + i)];
+                if (row < 0 || std::size_t(row) >= cfg.bc.size() || cfg.bc[std::size_t(row)].kind != cfg.bc[p].kind)
+                    return std::unexpected(std::format("patch `{}`: a face row must exist and keep the patch's kind",
+                                                       fm.patches[p].name));
+                if (auto ok = checkBc(cfg.bc[std::size_t(row)], fm.patches[p], fm.emptyAxis, tr); !ok)
+                    return std::unexpected(std::move(ok.error()));
+            }
+    }
+
+    if (std::ranges::any_of(cfg.gravity, [](double v) { return v != 0.0; })) {
+        if (fm.emptyAxis >= 0 && cfg.gravity[std::size_t(fm.emptyAxis)] != 0.0)
+            return std::unexpected("FV gravity: along the empty axis of a 2D mesh");
+        for (std::size_t p = 0; p < fm.patches.size(); ++p) {
+            const FvBc& b = cfg.bc[p];
+            const bool closed = b.kind == FvBcKind::Empty || b.kind == FvBcKind::Slip || b.kind == FvBcKind::Wall;
+            if (!closed)
+                return std::unexpected(std::format("patch `{}`: gravity takes wall, slip and empty patches: an open "
+                                                   "face has no hydrostatic ambient",
+                                                   fm.patches[p].name));
+            const bool moving = std::ranges::any_of(b.uWall, [](double v) { return v != 0.0; }) ||
+                                std::ranges::any_of(b.omega, [](double v) { return v != 0.0; });
+            if (moving)
+                return std::unexpected(std::format("patch `{}`: gravity takes resting walls only", fm.patches[p].name));
+        }
+    }
 
     FvRef r;
     r.fm_ = &fm;
@@ -138,9 +181,10 @@ std::expected<FvRef, std::string> FvRef::make(const FaceMesh& fm, FvConfig cfg, 
     r.gw_ = std::move(*gw);
     r.cfg_ = std::move(cfg);
 
-    r.bcOf_.assign(std::size_t(fm.nB), -1);
+    r.patchOf_.assign(std::size_t(fm.nB), -1);
     for (std::size_t p = 0; p < fm.patches.size(); ++p)
-        std::fill_n(r.bcOf_.begin() + fm.patches[p].first, fm.patches[p].count, int(p));
+        std::fill_n(r.patchOf_.begin() + fm.patches[p].first, fm.patches[p].count, int(p));
+    r.bcOf_ = r.cfg_.bcRow.empty() ? r.patchOf_ : r.cfg_.bcRow;
     r.diffCoef_.assign(std::size_t(fm.nC), 0.0);
     for (std::size_t c = 0; c < std::size_t(fm.nC); ++c) {
         double s = 0.0;
@@ -153,6 +197,14 @@ std::expected<FvRef, std::string> FvRef::make(const FaceMesh& fm, FvConfig cfg, 
         r.diffCoef_[c] = s;
     }
     r.workers_ = workerCount(threads, std::max<std::size_t>(1, std::size_t(fm.nC) / 256));
+    const FvRansConfig& rc = r.cfg_.rans;
+    if (rc.model != RansModel::None) {
+        if (!(r.cfg_.tr.muRef > 0.0)) return std::unexpected("FV RANS needs mu > 0");
+        if (rc.wallDist.size() != std::size_t(fm.nC) ||
+            !std::ranges::all_of(rc.wallDist, [](double v) { return v > 0.0 && std::isfinite(v); }))
+            return std::unexpected("FV RANS: the wall distance must be positive on every cell");
+    }
+    r.nV_ = kFvMeanVars + r.cfg_.chem.nY + ransScalars(rc.model);
     return r;
 }
 
@@ -216,7 +268,10 @@ void FvRef::faces(FvEval& ev, std::size_t lo, std::size_t hi) const
     const FaceMesh& m = *fm_;
     const std::size_t nI = std::size_t(m.nI);
     const Transport& tr = cfg_.tr;
-    const bool viscous = tr.muRef > 0.0;
+    const bool viscous = tr.muRef > 0.0, rans = cfg_.rans.model != RansModel::None;
+    const double kapEddy = tr.cp() / kPrandtlTurb;
+    const auto& gv = cfg_.gravity;
+    const bool hasG = gv[0] != 0.0 || gv[1] != 0.0 || gv[2] != 0.0;
     auto cellGrad = [&](std::size_t c, int k, double g[3]) {
         for (int a = 0; a < 3; ++a) g[a] = ev.grad[std::size_t(3 * k + a)][c];
     };
@@ -242,13 +297,18 @@ void FvRef::faces(FvEval& ev, std::size_t lo, std::size_t hi) const
                 fvFaceGrad(ga, gb, A.temp, B.temp, d.data(), corr.data(), gT);
                 fvTransportAt(tr, 0.5 * (A.temp + B.temp), mu, kappa);
             }
+            if (rans) {
+                const double nf = 0.5 * (ev.nut[o] + ev.nut[n]);
+                mu += nf;
+                kappa += nf * kapEddy;
+            }
             F = fvMeanFlux(A, B, S.data(), gu, gT, mu, kappa);
         } else if (geom_.active[f]) {
             const std::size_t b = f - nI;
             const FvBc& bc = cfg_.bc[std::size_t(bcOf_[b])];
             const FvPrim<double>& B = ev.bnd[b];
             double mu = 0.0, kappa = 0.0;
-            if (viscous && (bc.kind == FvBcKind::Wall || bc.kind == FvBcKind::Slip)) {
+            if (viscous && (bc.kind == FvBcKind::Wall || bc.kind == FvBcKind::Slip || bc.diffusive)) {
                 double ga[3];
                 for (int k = 0; k < 3; ++k) {
                     cellGrad(o, k, ga);
@@ -256,10 +316,19 @@ void FvRef::faces(FvEval& ev, std::size_t lo, std::size_t hi) const
                 }
                 cellGrad(o, 3, ga);
                 fvFaceGradBnd(ga, A.temp, B.temp, d.data(), corr.data(), gT);
-                const double Tf = bc.kind == FvBcKind::Wall && bc.isothermal ? 0.5 * (A.temp + B.temp) : A.temp;
+                const double Tf = (bc.kind == FvBcKind::Wall && bc.isothermal) || bc.diffusive ? 0.5 * (A.temp + B.temp) : A.temp;
                 fvTransportAt(tr, Tf, mu, kappa);
+                if (rans && bc.kind == FvBcKind::Slip) { // the even image; a Wall face: mu_t 0
+                    mu += ev.nut[o];
+                    kappa += ev.nut[o] * kapEddy;
+                }
             }
             F = fvBoundaryFlux(bc, A, B, S.data(), gu, gT, mu, kappa);
+        }
+        if (hasG && f < nI) {
+            double o[4];
+            fvGravityFace(fvHydroRho(A, primAt(ev, std::size_t(m.nei[f])), tr.Rgas), F.rho, gv.data(), d.data(), S.data(), o);
+            for (std::size_t k = 0; k < 4; ++k) ev.Fg[k][f] = o[k];
         }
         ev.F[0][f] = F.rho;
         ev.F[1][f] = F.m[0];
@@ -269,52 +338,353 @@ void FvRef::faces(FvEval& ev, std::size_t lo, std::size_t hi) const
     }
 }
 
+// Y_k = rhoY_k / rho and the ONE omega of this stage, read by the species row
+// and the heat release.
+void FvRef::speciesCells(const double* q, FvEval& ev, std::size_t lo, std::size_t hi) const
+{
+    const FvChem& ch = cfg_.chem;
+    const std::size_t nC = std::size_t(fm_->nC);
+    for (std::size_t c = lo; c < hi; ++c) {
+        const double rho = q[c];
+        for (std::size_t s = 0; s < std::size_t(ch.nY); ++s)
+            ev.Y[s][c] = q[(std::size_t(kFvMeanVars) + s) * nC + c] / rho;
+        const double yf = ev.Y[std::size_t(ch.fuel)][c], T = ev.prim[6][c];
+        ev.omega[c] = ch.ox >= 0 ? arrheniusRate2(ch.lnA, ch.Ta, rho, yf, ev.Y[std::size_t(ch.ox)][c], T)
+                                 : arrheniusRate(ch.lnA, ch.Ta, rho, yf, T);
+    }
+}
+
+void FvRef::speciesBnd(FvEval& ev, std::size_t lo, std::size_t hi) const
+{
+    const FaceMesh& m = *fm_;
+    const std::size_t nI = std::size_t(m.nI);
+    for (std::size_t b = lo; b < hi; ++b) {
+        const std::size_t f = nI + b;
+        if (!geom_.active[f]) continue;
+        const std::size_t o = std::size_t(m.own[f]);
+        const FvPrim<double>& B = ev.bnd[b];
+        const double mdot = B.rho * (B.u[0] * m.S[0][f] + B.u[1] * m.S[1][f] + B.u[2] * m.S[2][f]);
+        for (std::size_t s = 0; s < ev.Y.size(); ++s)
+            ev.bY[s][b] = fvBoundaryY(cfg_.bc[std::size_t(bcOf_[b])], int(s), ev.Y[s][o], mdot);
+    }
+}
+
+void FvRef::speciesGrads(FvEval& ev, std::size_t lo, std::size_t hi) const
+{
+    for (std::size_t s = 0; s < ev.Y.size(); ++s)
+        fvCellGradient(*fm_, geom_, gw_, ev.Y[s], ev.bY[s],
+                       {ev.gradY[3 * s].data(), ev.gradY[3 * s + 1].data(), ev.gradY[3 * s + 2].data()}, lo, hi);
+}
+
+// After faces(): F[0] is the mass flux the species ride. rho D at the face's own
+// mu (fvTransportAt on the mean T, the one Sutherland evaluation of the face).
+void FvRef::speciesFaces(FvEval& ev, std::size_t lo, std::size_t hi) const
+{
+    const FaceMesh& m = *fm_;
+    const std::size_t nI = std::size_t(m.nI), nY = ev.Y.size();
+    const Transport& tr = cfg_.tr;
+    const bool viscous = tr.muRef > 0.0, shared = cfg_.chem.ox >= 0;
+    auto cellGrad = [&](std::size_t c, std::size_t s, double g[3]) {
+        for (std::size_t a = 0; a < 3; ++a) g[a] = ev.gradY[3 * s + a][c];
+    };
+    for (std::size_t f = lo; f < hi; ++f) {
+        const double mdot = ev.F[0][f];
+        if (f >= nI) {
+            const std::size_t b = f - nI;
+            const FvBc& bc = cfg_.bc[std::size_t(bcOf_[b])];
+            for (std::size_t s = 0; s < nY; ++s) ev.Fy[s][f] = geom_.active[f] ? mdot * ev.bY[s][b] : 0.0;
+            if (!bc.diffusive || !viscous || !geom_.active[f]) continue;
+            const std::size_t o = std::size_t(m.own[f]);
+            const V3 S = at(m.S, f), d = at(m.d, f), corr = at(geom_.corr, f);
+            double mu, kappa;
+            fvTransportAt(tr, 0.5 * (ev.prim[6][o] + ev.bnd[b].temp), mu, kappa);
+            for (std::size_t s = 0; s < nY; ++s) {
+                double ga[3], g[3];
+                cellGrad(o, s, ga);
+                fvFaceGradBnd(ga, ev.Y[s][o], ev.bY[s][b], d.data(), corr.data(), g);
+                ev.Fy[s][f] = fvSpeciesFlux(mdot, ev.bY[s][b], mu * cfg_.chem.invPr, g, S.data());
+            }
+            continue;
+        }
+        const std::size_t o = std::size_t(m.own[f]), n = std::size_t(m.nei[f]);
+        const V3 S = at(m.S, f), d = at(m.d, f), corr = at(geom_.corr, f);
+        double rhoD = 0.0;
+        if (viscous) {
+            double mu, kappa;
+            fvTransportAt(tr, 0.5 * (ev.prim[6][o] + ev.prim[6][n]), mu, kappa);
+            rhoD = mu * cfg_.chem.invPr;
+        }
+        double th = 2.0;
+        for (std::size_t s = 0; shared && s < nY; ++s) {
+            double ga[3], gb[3];
+            cellGrad(o, s, ga);
+            cellGrad(n, s, gb);
+            th = fvThetaVote(th, mdot, ev.Y[s][o], ev.Y[s][n], ga, gb, d.data());
+        }
+        for (std::size_t s = 0; s < nY; ++s) {
+            double ga[3], gb[3], g[3];
+            cellGrad(o, s, ga);
+            cellGrad(n, s, gb);
+            const double YP = ev.Y[s][o], YN = ev.Y[s][n];
+            fvFaceGrad(ga, gb, YP, YN, d.data(), corr.data(), g);
+            const double Yf = shared ? fvFaceYShared(mdot, YP, YN, th) : fvFaceY(mdot, YP, YN, ga, gb, d.data());
+            ev.Fy[s][f] = fvSpeciesFlux(mdot, Yf, rhoD, g, S.data());
+        }
+    }
+}
+
 void FvRef::gather(const FvEval& ev, const Stage& st, std::size_t lo, std::size_t hi) const
 {
     const FaceMesh& m = *fm_;
     const std::size_t nC = std::size_t(m.nC);
     const int nI = m.nI;
+    const FvChem& ch = cfg_.chem;
+    const int nV = kFvMeanVars + ch.nY;
+    const std::size_t iFuel = std::size_t(kFvMeanVars + ch.fuel);
+    const std::size_t iOx = ch.ox >= 0 ? std::size_t(kFvMeanVars + ch.ox) : std::size_t(nV);
+    auto flux = [&](int v, std::size_t f) {
+        return v < kFvMeanVars ? ev.F[std::size_t(v)][f] : ev.Fy[std::size_t(v - kFvMeanVars)][f];
+    };
+    const std::array<double, 3>& f3 = cfg_.bodyForce;
+    const bool force = f3[0] != 0.0 || f3[1] != 0.0 || f3[2] != 0.0;
+    const auto& g = cfg_.gravity;
+    const bool hasG = g[0] != 0.0 || g[1] != 0.0 || g[2] != 0.0;
     for (std::size_t c = lo; c < hi; ++c) {
-        double acc[kFvMeanVars] = {0, 0, 0, 0, 0};
+        double acc[kFvMeanVars + kFvMaxSpecies] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+        double ag[4] = {0, 0, 0, 0};
         for (int q = m.cellStart[c]; q < m.cellStart[c + 1]; ++q) {
             const std::size_t f = std::size_t(m.cellFace[std::size_t(q)]);
             if (int(f) >= nI && !geom_.active[f]) continue;
+            if (hasG && int(f) < nI)
+                for (std::size_t k = 0; k < 4; ++k) ag[k] += ev.Fg[k][f];
             if (std::size_t(m.own[f]) == c)
-                for (int v = 0; v < kFvMeanVars; ++v) acc[v] += ev.F[std::size_t(v)][f];
+                for (int v = 0; v < nV; ++v) acc[v] += flux(v, f);
             else
-                for (int v = 0; v < kFvMeanVars; ++v) acc[v] -= ev.F[std::size_t(v)][f];
+                for (int v = 0; v < nV; ++v) acc[v] -= flux(v, f);
         }
         const double V = m.V[c];
-        for (int v = 0; v < kFvMeanVars; ++v) {
+        for (int v = 0; v < nV; ++v) {
             const std::size_t i = std::size_t(v) * nC + c;
             double R = -acc[v] / V;
+            if (ch.nY > 0) {
+                if (v == 4) R += ch.q * ev.omega[c];
+                if (std::size_t(v) == iFuel) R -= ev.omega[c];
+                if (std::size_t(v) == iOx) R -= ch.stoich * ev.omega[c];
+            }
             if (st.src) R += st.src[i];
+            if (force && v >= 1 && v <= 3) R += f3[std::size_t(v - 1)];
+            if (force && v == 4) R += f3[0] * ev.prim[1][c] + f3[1] * ev.prim[2][c] + f3[2] * ev.prim[3][c];
+            if (hasG && v >= 1 && v <= 4) R += ag[std::size_t(v - 1)] / V;
             st.out[i] = st.a ? st.ca * st.a[i] + st.cb * st.b[i] + st.cr * R : R;
         }
     }
 }
 
-namespace {
-
-void sizeEval(FvEval& ev, std::size_t nC, std::size_t nB, std::size_t nF)
+void FvRef::ransFields(const double* q, FvEval& ev, std::size_t lo, std::size_t hi) const
 {
+    const std::size_t nC = std::size_t(fm_->nC);
+    const bool sst = ransSst(cfg_.rans.model);
+    for (std::size_t c = lo; c < hi; ++c) {
+        const double rho = ev.prim[0][c];
+        ev.tfld[0][c] = q[5 * nC + c] / rho;
+        ev.tfld[1][c] = sst ? q[6 * nC + c] / rho : rho;
+    }
+}
+
+void FvRef::ransBnd(FvEval& ev, std::size_t lo, std::size_t hi) const
+{
+    const FaceMesh& m = *fm_;
+    const std::size_t nI = std::size_t(m.nI);
+    const FvRansConfig& rc = cfg_.rans;
+    const bool sst = ransSst(rc.model);
+    for (std::size_t b = lo; b < hi; ++b) {
+        const std::size_t f = nI + b, o = std::size_t(m.own[f]);
+        if (!geom_.active[f]) continue;
+        const FvBc& bc = cfg_.bc[std::size_t(bcOf_[b])];
+        const FvPrim<double> A = primAt(ev, o);
+        double mu = 0.0, kappa = 0.0;
+        if (bc.kind == FvBcKind::Wall) fvTransportAt(cfg_.tr, fvWallTemp(bc, A, ev.bnd[b]), mu, kappa);
+        const V3 S = at(m.S, f);
+        const double pA[2] = {ev.tfld[0][o], ev.tfld[1][o]};
+        double v[2];
+        fvRansBndFields(sst, bc, ev.bnd[b], S.data(), pA, rc.phiInf.data(), mu, rc.wallDist[o], cfg_.tr.Rgas, v);
+        ev.tbnd[0][b] = v[0];
+        ev.tbnd[1][b] = v[1];
+    }
+}
+
+void FvRef::ransGrads(FvEval& ev, std::size_t lo, std::size_t hi) const
+{
+    for (std::size_t k = 0; k < std::size_t(kFvRansFields); ++k)
+        fvCellGradient(*fm_, geom_, gw_, ev.tfld[k], ev.tbnd[k],
+                       {ev.tgrad[3 * k].data(), ev.tgrad[3 * k + 1].data(), ev.tgrad[3 * k + 2].data()}, lo, hi);
+}
+
+void FvRef::ransCells(FvEval& ev, std::size_t lo, std::size_t hi) const
+{
+    const FvRansConfig& rc = cfg_.rans;
+    const bool sst = ransSst(rc.model);
+    for (std::size_t c = lo; c < hi; ++c) {
+        double mu, kappa, gd[3][3], g0[3], g1[3];
+        fvTransportAt(cfg_.tr, ev.prim[6][c], mu, kappa);
+        for (std::size_t i = 0; i < 3; ++i) {
+            for (std::size_t j = 0; j < 3; ++j) gd[i][j] = ev.grad[3 * i + j][c];
+            g0[i] = ev.tgrad[i][c];
+            g1[i] = ev.tgrad[3 + i][c];
+        }
+        const double rho = ev.prim[0][c], d = rc.wallDist[c];
+        const FvRansCell<double> o = sst ? fvSstCell(rc.model, rho, ev.tfld[0][c], ev.tfld[1][c], mu, gd, d, g0, g1)
+                                         : fvSaCell(rho, ev.tfld[0][c], mu, gd, d, g0, g1);
+        ev.nut[c] = o.mut;
+        ev.f1[c] = o.f1;
+        ev.tsrc[0][c] = rc.transportOnly ? 0.0 : o.R[0];
+        ev.tsrc[1][c] = rc.transportOnly ? 0.0 : o.R[1];
+        ev.tsrc[2][c] = rc.transportOnly ? 0.0 : o.J[0];
+        ev.tsrc[3][c] = rc.transportOnly ? 0.0 : o.J[1];
+    }
+}
+
+void FvRef::ransFaces(FvEval& ev, std::size_t lo, std::size_t hi) const
+{
+    const FaceMesh& m = *fm_;
+    const std::size_t nI = std::size_t(m.nI);
+    const FvRansConfig& rc = cfg_.rans;
+    const bool sst = ransSst(rc.model), only = rc.transportOnly;
+    const int nT = ransScalars(rc.model);
+    const Transport& tr = cfg_.tr;
+    auto cellGrad = [&](std::size_t c, int k, double g[3]) {
+        for (int a = 0; a < 3; ++a) g[a] = ev.tgrad[std::size_t(3 * k + a)][c];
+    };
+    auto dotS = [](const double g[3], const V3& S) { return g[0] * S[0] + g[1] * S[1] + g[2] * S[2]; };
+    for (std::size_t f = lo; f < hi; ++f) {
+        if (!geom_.active[f]) continue;
+        const std::size_t o = std::size_t(m.own[f]);
+        const V3 S = at(m.S, f), d = at(m.d, f), corr = at(geom_.corr, f);
+        const double mdot = ev.F[0][f];
+        if (f < nI) {
+            const std::size_t n = std::size_t(m.nei[f]);
+            double mu, kappa;
+            fvTransportAt(tr, 0.5 * (ev.prim[6][o] + ev.prim[6][n]), mu, kappa);
+            const double rf = 0.5 * (ev.prim[0][o] + ev.prim[0][n]);
+            const double F1f = 0.5 * (ev.f1[o] + ev.f1[n]), mutf = 0.5 * (ev.nut[o] + ev.nut[n]);
+            for (int e = 0; e < nT; ++e) {
+                const std::size_t q = std::size_t(e);
+                const double pa = ev.tfld[q][o], pb = ev.tfld[q][n];
+                if (only) {
+                    ev.Ft[q][f] = fvUpwind(mdot, pa, pb);
+                    continue;
+                }
+                double ga[3], gb[3], g[3];
+                cellGrad(o, e, ga);
+                cellGrad(n, e, gb);
+                fvFaceGrad(ga, gb, pa, pb, d.data(), corr.data(), g);
+                const double gS = dotS(g, S);
+                if (!sst) {
+                    ev.Ft[q][f] = fvSaFaceFlux(mdot, pa, pb, mu, rf, gS);
+                    continue;
+                }
+                const double sig = e ? sstBlendC(F1f, sst::sigmaW1, sst::sigmaW2)
+                                     : sstBlendC(F1f, sst::sigmaK1, sst::sigmaK2);
+                ev.Ft[q][f] = fvSstFaceFlux(mdot, pa, pb, mu, sig, mutf, gS);
+            }
+            continue;
+        }
+        const std::size_t b = f - nI;
+        const FvBc& bc = cfg_.bc[std::size_t(bcOf_[b])];
+        for (int e = 0; e < nT; ++e) {
+            const std::size_t q = std::size_t(e);
+            if (bc.kind == FvBcKind::Slip) {
+                ev.Ft[q][f] = 0.0;
+            } else if (bc.kind == FvBcKind::Wall) {
+                if (only) {
+                    ev.Ft[q][f] = 0.0;
+                    continue;
+                }
+                double mu, kappa, ga[3], g[3];
+                fvTransportAt(tr, fvWallTemp(bc, primAt(ev, o), ev.bnd[b]), mu, kappa);
+                cellGrad(o, e, ga);
+                fvFaceGradBnd(ga, ev.tfld[q][o], ev.tbnd[q][b], d.data(), corr.data(), g);
+                ev.Ft[q][f] = -(sst ? mu : (1.0 / sa::sigma) * mu) * dotS(g, S);
+            } else {
+                ev.Ft[q][f] = mdot * ev.tbnd[q][b];
+            }
+        }
+    }
+}
+
+void FvRef::ransGather(const FvEval& ev, const Stage& st, std::size_t lo, std::size_t hi) const
+{
+    const FaceMesh& m = *fm_;
+    const std::size_t nC = std::size_t(m.nC);
+    const FvRansConfig& rc = cfg_.rans;
+    const int nT = ransScalars(rc.model);
+    const bool sst = ransSst(rc.model);
+    for (std::size_t c = lo; c < hi; ++c) {
+        double acc[2] = {0, 0};
+        for (int q = m.cellStart[c]; q < m.cellStart[c + 1]; ++q) {
+            const std::size_t f = std::size_t(m.cellFace[std::size_t(q)]);
+            if (!geom_.active[f]) continue;
+            const bool own = std::size_t(m.own[f]) == c;
+            for (int e = 0; e < nT; ++e) {
+                if (own) acc[e] += ev.Ft[std::size_t(e)][f];
+                else acc[e] -= ev.Ft[std::size_t(e)][f];
+            }
+        }
+        const double V = m.V[c];
+        for (int e = 0; e < nT; ++e) {
+            const std::size_t i = std::size_t(5 + e) * nC + c, q = std::size_t(e);
+            const double R = -acc[e] / V + ev.tsrc[q][c];
+            if (!st.a) {
+                st.out[i] = R;
+                continue;
+            }
+            const double comb = st.ca * st.a[i] + st.cb * st.b[i];
+            double o = pointImplicit(comb, st.cr, R, ev.tsrc[2 + q][c], st.b[i]);
+            if (sst) { // the structured guard, against this stage's output density
+                const double floorV = e == 0 ? 0.0 : rc.omegaFloor * st.out[c];
+                if (!(o >= floorV)) o = floorV;
+            }
+            st.out[i] = o;
+        }
+    }
+}
+
+void FvRef::sizeEval(FvEval& ev) const
+{
+    const FaceMesh& m = *fm_;
+    const std::size_t nC = std::size_t(m.nC), nB = std::size_t(m.nB), nF = std::size_t(m.nI) + nB;
+    const std::size_t nY = std::size_t(cfg_.chem.nY);
+    ev.Y.assign(nY, std::vector<double>(nC, 0.0));
+    ev.bY.assign(nY, std::vector<double>(nB, 0.0));
+    ev.gradY.assign(3 * nY, std::vector<double>(nC, 0.0));
+    ev.Fy.assign(nY, std::vector<double>(nF, 0.0));
+    ev.omega.assign(nY > 0 ? nC : 0, 0.0);
     for (auto& p : ev.prim) p.assign(nC, 0.0);
+    const auto& gv = cfg_.gravity;
+    if (gv[0] != 0.0 || gv[1] != 0.0 || gv[2] != 0.0)
+        for (auto& v : ev.Fg) v.assign(std::size_t(m.nI), 0.0);
     ev.bnd.assign(nB, FvPrim<double>{});
     for (auto& p : ev.bphi) p.assign(nB, 0.0);
     for (auto& g : ev.grad) g.assign(nC, 0.0);
     for (auto& F : ev.F) F.assign(nF, 0.0);
+    if (cfg_.rans.model == RansModel::None) return;
+    for (auto& p : ev.tfld) p.assign(nC, 0.0);
+    for (auto& p : ev.tbnd) p.assign(nB, 0.0);
+    for (auto& p : ev.Ft) p.assign(nF, 0.0);
+    for (auto& g : ev.tgrad) g.assign(nC, 0.0);
+    for (auto& g : ev.tsrc) g.assign(nC, 0.0);
+    ev.nut.assign(nC, 0.0);
+    ev.f1.assign(nC, 0.0);
 }
-
-} // namespace
 
 void FvRef::evaluate(const FvState& s, FvEval& ev, FvState& out, const FvState* src) const
 {
     const FaceMesh& m = *fm_;
-    assert(s.nV == kFvMeanVars && s.nC == m.nC && (!src || (src->nV == s.nV && src->nC == s.nC)));
+    assert(s.nV == nV_ && s.nC == m.nC && (!src || (src->nV == s.nV && src->nC == s.nC)));
     const std::size_t nC = std::size_t(m.nC), nB = std::size_t(m.nB), nF = std::size_t(m.nI) + nB;
-    sizeEval(ev, nC, nB, nF);
+    sizeEval(ev);
     if (out.nV != s.nV || out.nC != s.nC) out = FvState::zeros(s.nC, s.nV);
-    const bool viscous = cfg_.tr.muRef > 0.0;
+    const bool viscous = cfg_.tr.muRef > 0.0, species = cfg_.chem.nY > 0, rans = cfg_.rans.model != RansModel::None;
     Stage st;
     st.out = out.q.data();
     st.src = src ? src->q.data() : nullptr;
@@ -326,13 +696,40 @@ void FvRef::evaluate(const FvState& s, FvEval& ev, FvState& out, const FvState* 
         sync();
         bndStates(ev, b0, b1);
         sync();
+        if (species) {
+            speciesCells(s.q.data(), ev, c0, c1);
+            sync();
+            speciesBnd(ev, b0, b1);
+            sync();
+            speciesGrads(ev, c0, c1);
+            sync();
+        }
         if (viscous) {
             grads(ev, c0, c1);
             sync();
         }
+        if (rans) {
+            ransFields(s.q.data(), ev, c0, c1);
+            sync();
+            ransBnd(ev, b0, b1);
+            sync();
+            ransGrads(ev, c0, c1);
+            sync();
+            ransCells(ev, c0, c1);
+            sync();
+        }
         faces(ev, f0, f1);
         sync();
+        if (species) {
+            speciesFaces(ev, f0, f1);
+            sync();
+        }
         gather(ev, st, c0, c1);
+        if (!rans) return;
+        sync();
+        ransFaces(ev, f0, f1);
+        sync();
+        ransGather(ev, st, c0, c1);
     });
 }
 
@@ -345,12 +742,12 @@ void FvRef::rhs(const FvState& s, FvState& out, const FvState* src) const
 void FvRef::march(FvState& s, double dt, int steps, const FvState* src) const
 {
     const FaceMesh& m = *fm_;
-    assert(s.nV == kFvMeanVars && s.nC == m.nC && (!src || (src->nV == s.nV && src->nC == s.nC)));
+    assert(s.nV == nV_ && s.nC == m.nC && (!src || (src->nV == s.nV && src->nC == s.nC)));
     const std::size_t nC = std::size_t(m.nC), nB = std::size_t(m.nB), nF = std::size_t(m.nI) + nB;
     FvEval ev;
-    sizeEval(ev, nC, nB, nF);
+    sizeEval(ev);
     FvState q1 = FvState::zeros(s.nC, s.nV), q2 = FvState::zeros(s.nC, s.nV);
-    const bool viscous = cfg_.tr.muRef > 0.0;
+    const bool viscous = cfg_.tr.muRef > 0.0, species = cfg_.chem.nY > 0, rans = cfg_.rans.model != RansModel::None;
     // SSP-RK3 in the fused form out = ca a + cb b + cr R(b), ca = 1 - cb.
     const double cbs[3] = {0.0, 0.25, 2.0 / 3.0};
     const double* bs[3] = {s.q.data(), q1.q.data(), q2.q.data()};
@@ -365,12 +762,34 @@ void FvRef::march(FvState& s, double dt, int steps, const FvState* src) const
                 sync();
                 bndStates(ev, b0, b1);
                 sync();
+                if (species) {
+                    speciesCells(bs[k], ev, c0, c1);
+                    sync();
+                    speciesBnd(ev, b0, b1);
+                    sync();
+                    speciesGrads(ev, c0, c1);
+                    sync();
+                }
                 if (viscous) {
                     grads(ev, c0, c1);
                     sync();
                 }
+                if (rans) {
+                    ransFields(bs[k], ev, c0, c1);
+                    sync();
+                    ransBnd(ev, b0, b1);
+                    sync();
+                    ransGrads(ev, c0, c1);
+                    sync();
+                    ransCells(ev, c0, c1);
+                    sync();
+                }
                 faces(ev, f0, f1);
                 sync();
+                if (species) {
+                    speciesFaces(ev, f0, f1);
+                    sync();
+                }
                 Stage st;
                 st.a = s.q.data();
                 st.b = bs[k];
@@ -381,18 +800,53 @@ void FvRef::march(FvState& s, double dt, int steps, const FvState* src) const
                 st.src = src ? src->q.data() : nullptr;
                 gather(ev, st, c0, c1);
                 sync();
+                if (!rans) continue;
+                ransFaces(ev, f0, f1);
+                sync();
+                ransGather(ev, st, c0, c1);
+                sync();
             }
     });
+}
+
+double FvRef::chemDt(const FvState& s, double k) const
+{
+    assert(s.nV == nV() && s.nC == fm_->nC);
+    const FvChem& ch = cfg_.chem;
+    if (ch.nY == 0 || !std::isfinite(ch.lnA)) return HUGE_VAL;
+    const Transport& tr = cfg_.tr;
+    const double cv = tr.Rgas / (tr.gamma - 1.0);
+    double J = 0.0;
+    for (std::size_t c = 0; c < std::size_t(s.nC); ++c) {
+        const FvPrim<double> p = fvPrimOf(s.var(0)[c], s.var(1)[c], s.var(2)[c], s.var(3)[c], s.var(4)[c], tr.gamma,
+                                          tr.Rgas);
+        const double Y = s.var(kFvMeanVars + ch.fuel)[c] / p.rho;
+        const double r = std::exp(ch.lnA - ch.Ta / p.temp);
+        if (ch.ox >= 0) {
+            const double yf = std::max(Y, 0.0), yo = std::max(s.var(kFvMeanVars + ch.ox)[c] / p.rho, 0.0);
+            J = std::max(J, r * p.rho * (yo + ch.stoich * yf + ch.q * yf * yo * ch.Ta / (cv * p.temp * p.temp)));
+            continue;
+        }
+        J = std::max(J, r * (1.0 + ch.q * (Y > 0.0 ? Y : 0.0) * ch.Ta / (cv * p.temp * p.temp)));
+    }
+    return J > 0.0 ? k / J : HUGE_VAL;
 }
 
 std::expected<double, std::string> FvRef::stableDt(const FvState& s, FvDtLimits lim,
                                                    std::vector<double>* local) const
 {
     const FaceMesh& m = *fm_;
-    assert(s.nV == kFvMeanVars && s.nC == m.nC);
+    assert(s.nV == nV_ && s.nC == m.nC);
     const std::size_t nC = std::size_t(m.nC);
     const Transport& tr = cfg_.tr;
     if (local) local->assign(nC, 0.0);
+    const bool rans = cfg_.rans.model != RansModel::None;
+    FvEval ev;
+    if (rans) {
+        FvState o;
+        evaluate(s, ev, o);
+    }
+    const double fMol = fvDiffusivityFactor(tr.gamma, tr.Pr), fEddy = fvDiffusivityFactor(tr.gamma, kPrandtlTurb);
     const int nw = workerCount(workers_, nC);
     std::vector<double> mins(std::size_t(nw), INFINITY);
     std::vector<std::optional<std::string>> err(static_cast<std::size_t>(nw));
@@ -417,7 +871,11 @@ std::expected<double, std::string> FvRef::stableDt(const FvState& s, FvDtLimits 
             if (tr.muRef > 0.0) {
                 double mu, kappa;
                 fvTransportAt(tr, p.temp, mu, kappa);
-                dt = std::min(dt, lim.diff * p.rho * m.V[c] / (mu * fvDiffusivityFactor(tr) * diffCoef_[c]));
+                double den = mu * fMol;
+                if (rans) den += ev.nut[c] * fEddy;
+                if (cfg_.rans.model == RansModel::SaNeg)
+                    den = std::max(den, p.rho * saDtDiffusivity(mu / p.rho, ev.tfld[0][c]) / sa::sigma);
+                dt = std::min(dt, lim.diff * p.rho * m.V[c] / (den * diffCoef_[c]));
             }
             if (local) (*local)[c] = dt;
             mins[std::size_t(w)] = std::min(mins[std::size_t(w)], dt);

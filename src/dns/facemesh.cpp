@@ -538,21 +538,37 @@ std::expected<FaceMesh, std::string> FaceMesh::fromPolyMesh(const PolyMesh& pm, 
     return m;
 }
 
-std::expected<PolyMesh, std::string> FaceMesh::polyOf(const CurvMesh& m, const StructuredSpec& sp)
+namespace {
+
+// The checks, shape and manifest of one structured mesh (polyManifest,
+// polyOf): the ONE definition of its patches and counts.
+struct StructuredLayout
 {
-    const Grid& g = m.g;
+    std::array<int, 3> nc{};          // real cells per axis
+    std::array<int, 3> np{};          // node planes per axis, before the axis collapse
+    std::array<bool, 3> shared{};     // Cyclic wrap: nodes shared, internal faces, no patch
+    bool axis = false;                // revolved: i- / i+ columns collapse onto the axis
+    PolyManifest man;
+
+    // No patch on side f (i-, i+, j-, j+, k-, k+).
+    bool noPatch(int f) const { return shared[std::size_t(f / 2)] || (axis && f < 2); }
+};
+
+std::expected<StructuredLayout, std::string> structuredLayout(const Grid& g, const std::array<AxisWrap, 3>& wrap,
+                                                              const std::array<int, 2>& axisFaces,
+                                                              const StructuredSpec& sp)
+{
     const int n[3] = {g.nx, g.ny, g.nz};
-    if (m.axisFaces[0] != -1 || m.axisFaces[1] != -1)
-        return std::unexpected("structured mesh: revolved meshes with axis faces are not supported "
-                               "(masterplan_meshsolver P8)");
-    if (m.wrap[2] == AxisWrap::MirrorZ)
-        return std::unexpected("structured mesh: the axisymmetric wedge (MirrorZ) is not supported "
-                               "(masterplan_meshsolver P8)");
-    if (m.x.size() != g.size() || m.y.size() != g.size() || m.z.size() != g.size())
-        return std::unexpected("structured mesh: node arrays do not match the grid");
+    StructuredLayout L;
+    L.axis = axisFaces[0] != -1 || axisFaces[1] != -1;
+    if (L.axis && (sp.lo[0] != axisFaces[0] + 1 || sp.hi[0] != axisFaces[1]))
+        return std::unexpected("structured mesh: a revolved mesh needs exactly the real columns between its axis faces");
+    if (wrap[2] == AxisWrap::MirrorZ && (sp.lo[2] != 1 || sp.hi[2] != 1))
+        return std::unexpected("structured mesh: the wedge (MirrorZ) has one real cell plane, k = 1");
     for (const auto t : sp.type)
         if (t == FoamPatchType::Wedge)
-            return std::unexpected("structured mesh: wedge patches are not supported (P8)");
+            return std::unexpected("structured mesh: wedge patches are not supported (a wedge mesh takes `symmetry` "
+                                   "side patches, docs/fvstructured.md)");
     const bool twoD = g.nz == 1;
     if (twoD && (sp.type[4] != FoamPatchType::Empty || sp.type[5] != FoamPatchType::Empty))
         return std::unexpected("structured mesh: nz == 1 is 2D: the k-/k+ patches must be empty");
@@ -560,33 +576,37 @@ std::expected<PolyMesh, std::string> FaceMesh::polyOf(const CurvMesh& m, const S
         if (sp.type[std::size_t(f)] == FoamPatchType::Empty && !(twoD && f >= 4))
             return std::unexpected("structured mesh: empty patches only on k-/k+ at nz == 1");
 
-    int nc[3];
-    bool periodic[3], shared[3];
     for (int a = 0; a < 3; ++a) {
         const std::size_t ua = std::size_t(a);
         if (sp.lo[ua] < 0 || sp.hi[ua] >= n[a] || sp.lo[ua] > sp.hi[ua])
             return std::unexpected(std::format("structured mesh: axis {} range [{}, {}] outside [0, {})",
                                                "ijk"[a], sp.lo[ua], sp.hi[ua], n[a]));
-        nc[a] = sp.hi[ua] - sp.lo[ua] + 1;
+        L.nc[ua] = sp.hi[ua] - sp.lo[ua] + 1;
         const bool cl = sp.type[2 * ua] == FoamPatchType::Cyclic,
                    ch = sp.type[2 * ua + 1] == FoamPatchType::Cyclic;
         if (cl != ch)
             return std::unexpected(std::format("structured mesh: axis {}: one side cyclic, the other not",
                                                "ijk"[a]));
-        periodic[a] = cl;
-        if (periodic[a] && (sp.lo[ua] != 0 || sp.hi[ua] != n[a] - 1))
+        if (cl && (sp.lo[ua] != 0 || sp.hi[ua] != n[a] - 1))
             return std::unexpected(std::format("structured mesh: periodic axis {} needs the full range",
                                                "ijk"[a]));
-        if (periodic[a] && m.wrap[ua] != AxisWrap::Cyclic && m.wrap[ua] != AxisWrap::Translate)
+        if (cl && wrap[ua] != AxisWrap::Cyclic && wrap[ua] != AxisWrap::Translate)
             return std::unexpected(std::format("structured mesh: periodic axis {} needs a Cyclic or "
                                                "Translate wrap",
                                                "ijk"[a]));
-        shared[a] = periodic[a] && m.wrap[ua] == AxisWrap::Cyclic;
+        L.shared[ua] = cl && wrap[ua] == AxisWrap::Cyclic;
+        L.np[ua] = L.shared[ua] ? L.nc[ua] : L.nc[ua] + 1;
+        if (cl && L.nc[ua] == 1)
+            return std::unexpected(std::format("structured mesh: periodic axis {} has one cell (a cell coupled to "
+                                               "itself)",
+                                               "ijk"[a]));
     }
+    if (L.axis && L.shared[0])
+        return std::unexpected("structured mesh: a revolved mesh's i axis cannot wrap");
     // Patch names: every emitted patch named, all distinct.
     std::vector<std::string> names;
     for (int f = 0; f < 6; ++f) {
-        if (shared[f / 2]) continue;
+        if (L.noPatch(f)) continue;
         const auto& nm = sp.name[std::size_t(f)];
         if (nm.empty())
             return std::unexpected(std::format("structured mesh: patch {} has no name", f));
@@ -595,17 +615,71 @@ std::expected<PolyMesh, std::string> FaceMesh::polyOf(const CurvMesh& m, const S
         names.push_back(nm);
     }
 
-    const int np[3] = {shared[0] ? nc[0] : nc[0] + 1, shared[1] ? nc[1] : nc[1] + 1,
-                       shared[2] ? nc[2] : nc[2] + 1};
-    const std::int64_t nPts = std::int64_t(np[0]) * np[1] * np[2],
-                       nCells = std::int64_t(nc[0]) * nc[1] * nc[2];
+    const std::int64_t nPts = std::int64_t(L.np[0]) * L.np[1] * L.np[2],
+                       nCells = std::int64_t(L.nc[0]) * L.nc[1] * L.nc[2];
     if (nPts > std::numeric_limits<std::int32_t>::max() / 4 || nCells > std::numeric_limits<std::int32_t>::max() / 8)
         return std::unexpected("structured mesh: too large for int32 polyMesh labels");
 
+    std::int64_t nInternal = 0;
+    for (std::size_t a = 0; a < 3; ++a)
+        nInternal += nCells / L.nc[a] * (L.shared[a] ? L.nc[a] : L.nc[a] - 1);
+    PolyManifest& man = L.man;
+    const double len[3] = {g.nx * g.hx, g.ny * g.hy, g.nz * g.hz};
+    std::int64_t at = nInternal;
+    for (int f = 0; f < 6; ++f) {
+        const std::size_t a = std::size_t(f / 2);
+        if (L.noPatch(f)) continue;
+        FoamPatch p;
+        p.name = sp.name[std::size_t(f)];
+        p.type = sp.type[std::size_t(f)];
+        p.nFaces = nCells / L.nc[a];
+        p.startFace = at;
+        if (p.type == FoamPatchType::Cyclic) {
+            p.neighbourPatch = sp.name[std::size_t(f ^ 1)];
+            std::array<double, 3> sep{0, 0, 0};
+            sep[a] = (f % 2 == 0 ? 1.0 : -1.0) * len[a];
+            p.separation = sep;
+        }
+        at += p.nFaces;
+        man.patches.push_back(std::move(p));
+    }
+    // Each axis column keeps one node per j of its np[2] planes.
+    man.nPoints = L.axis ? nPts - 2 * std::int64_t(L.np[1]) * (L.np[2] - 1) : nPts;
+    man.nCells = nCells;
+    man.nFaces = at;
+    man.nInternalFaces = nInternal;
+    man.binary = false;
+    man.labelBits = 32;
+    return L;
+}
+
+} // namespace
+
+std::expected<PolyManifest, std::string> FaceMesh::polyManifest(const Grid& g, const std::array<AxisWrap, 3>& wrap,
+                                                                const std::array<int, 2>& axisFaces,
+                                                                const StructuredSpec& sp)
+{
+    auto L = structuredLayout(g, wrap, axisFaces, sp);
+    if (!L) return std::unexpected(L.error());
+    return std::move(L->man);
+}
+
+std::expected<PolyMesh, std::string> FaceMesh::polyOf(const CurvMesh& m, const StructuredSpec& sp)
+{
+    if (m.x.size() != m.g.size() || m.y.size() != m.g.size() || m.z.size() != m.g.size())
+        return std::unexpected("structured mesh: node arrays do not match the grid");
+    auto layout = structuredLayout(m.g, m.wrap, m.axisFaces, sp);
+    if (!layout) return std::unexpected(layout.error());
+    const StructuredLayout& L = *layout;
+    const auto& nc = L.nc;
+    const auto& np = L.np;
+    const auto& shared = L.shared;
+
     PolyMesh pm;
-    pm.px.resize(std::size_t(nPts));
-    pm.py.resize(std::size_t(nPts));
-    pm.pz.resize(std::size_t(nPts));
+    const std::size_t nPts = std::size_t(np[0]) * std::size_t(np[1]) * std::size_t(np[2]);
+    pm.px.resize(nPts);
+    pm.py.resize(nPts);
+    pm.pz.resize(nPts);
     for (int k = 0; k < np[2]; ++k)
         for (int j = 0; j < np[1]; ++j)
             for (int i = 0; i < np[0]; ++i) {
@@ -619,6 +693,7 @@ std::expected<PolyMesh, std::string> FaceMesh::polyOf(const CurvMesh& m, const S
         if (shared[0]) i %= nc[0];
         if (shared[1]) j %= nc[1];
         if (shared[2]) k %= nc[2];
+        if (L.axis && (i == 0 || i == nc[0])) k = 0; // one node per j on the axis
         return std::int32_t(i + np[0] * (j + np[1] * k));
     };
     auto cid = [&](int i, int j, int k) { return std::int32_t(i + nc[0] * (j + nc[1] * k)); };
@@ -627,6 +702,7 @@ std::expected<PolyMesh, std::string> FaceMesh::polyOf(const CurvMesh& m, const S
     {
         std::array<std::int32_t, 4> v;
         std::int32_t own, nei;
+        int n = 4;
     };
     std::vector<Face> internal;
     std::array<std::vector<Face>, 6> bnd;
@@ -645,6 +721,25 @@ std::expected<PolyMesh, std::string> FaceMesh::polyOf(const CurvMesh& m, const S
         }
         return v;
     };
+    // A quad with an edge on the axis is a triangle; the side of a cell lying
+    // ON the axis is a line and no face at all (n < 3).
+    auto collapsed = [](Face f) {
+        std::array<std::int32_t, 4> w{};
+        int n = 0;
+        for (int q = 0; q < 4; ++q)
+            if (f.v[std::size_t(q)] != f.v[std::size_t((q + 3) % 4)]) w[std::size_t(n++)] = f.v[std::size_t(q)];
+        f.v = w;
+        f.n = n;
+        return f;
+    };
+    auto keep = [&](std::vector<Face>& to, const Face& f) {
+        if (!L.axis) {
+            to.push_back(f);
+            return;
+        }
+        const Face c = collapsed(f);
+        if (c.n >= 3) to.push_back(c);
+    };
     for (int k = 0; k < nc[2]; ++k)
         for (int j = 0; j < nc[1]; ++j)
             for (int i = 0; i < nc[0]; ++i) {
@@ -653,33 +748,29 @@ std::expected<PolyMesh, std::string> FaceMesh::polyOf(const CurvMesh& m, const S
                     const std::int32_t c = cid(i, j, k);
                     if (ix[a] == 0 && !shared[a]) {  // lo boundary face, outward -a
                         auto v = corners(i, j, k, a, 0);
-                        bnd[std::size_t(2 * a)].push_back({{v[0], v[3], v[2], v[1]}, c, -1});
+                        keep(bnd[std::size_t(2 * a)], {{v[0], v[3], v[2], v[1]}, c, -1});
                     }
                     auto v = corners(i, j, k, a, 1);
                     if (ix[a] < nc[a] - 1 || shared[a]) {
                         int e[3] = {i, j, k};
                         e[a] = (ix[a] + 1) % nc[a];
                         const std::int32_t nb = cid(e[0], e[1], e[2]);
-                        if (nb == c)
-                            return std::unexpected(std::format("structured mesh: periodic axis {} has "
-                                                               "one cell (a cell coupled to itself)",
-                                                               "ijk"[a]));
                         if (c < nb)
-                            internal.push_back({v, c, nb});
+                            keep(internal, {v, c, nb});
                         else
-                            internal.push_back({{v[0], v[3], v[2], v[1]}, nb, c});
+                            keep(internal, {{v[0], v[3], v[2], v[1]}, nb, c});
                     } else
-                        bnd[std::size_t(2 * a + 1)].push_back({v, c, -1});
+                        keep(bnd[std::size_t(2 * a + 1)], {v, c, -1});
                 }
             }
     std::ranges::stable_sort(internal, [](const Face& x, const Face& y) {
         return x.own != y.own ? x.own < y.own : x.nei < y.nei;
     });
 
-    auto& man = pm.man;
+    pm.man = L.man;
     pm.faceStart.push_back(0);
     auto put = [&](const Face& f) {
-        pm.faceNodes.insert(pm.faceNodes.end(), f.v.begin(), f.v.end());
+        pm.faceNodes.insert(pm.faceNodes.end(), f.v.begin(), f.v.begin() + f.n);
         pm.faceStart.push_back(std::int32_t(pm.faceNodes.size()));
         pm.owner.push_back(f.own);
     };
@@ -687,32 +778,30 @@ std::expected<PolyMesh, std::string> FaceMesh::polyOf(const CurvMesh& m, const S
         put(f);
         pm.neighbour.push_back(f.nei);
     }
-    const double L[3] = {g.nx * g.hx, g.ny * g.hy, g.nz * g.hz};
-    std::int64_t at = std::int64_t(internal.size());
     for (int f = 0; f < 6; ++f) {
-        const int a = f / 2;
-        if (shared[a]) continue;
-        FoamPatch p;
-        p.name = sp.name[std::size_t(f)];
-        p.type = sp.type[std::size_t(f)];
-        p.nFaces = std::int64_t(bnd[std::size_t(f)].size());
-        p.startFace = at;
-        if (p.type == FoamPatchType::Cyclic) {
-            p.neighbourPatch = sp.name[std::size_t(f ^ 1)];
-            std::array<double, 3> sep{0, 0, 0};
-            sep[std::size_t(a)] = (f % 2 == 0 ? 1.0 : -1.0) * L[a];
-            p.separation = sep;
-        }
+        if (L.noPatch(f)) continue;
         for (const auto& fc : bnd[std::size_t(f)]) put(fc);
-        at += p.nFaces;
-        man.patches.push_back(std::move(p));
     }
-    man.nPoints = nPts;
-    man.nCells = nCells;
-    man.nFaces = at;
-    man.nInternalFaces = std::int64_t(internal.size());
-    man.binary = false;
-    man.labelBits = 32;
+    if (std::int64_t(internal.size()) != pm.man.nInternalFaces || std::int64_t(pm.owner.size()) != pm.man.nFaces)
+        return std::unexpected("structured mesh: faces do not match the layout's counts");
+    if (L.axis) { // drop the merged nodes, keeping ascending order
+        std::vector<std::int32_t> id(nPts, -1);
+        for (const std::int32_t v : pm.faceNodes) id[std::size_t(v)] = 0;
+        std::int32_t nw = 0;
+        for (std::size_t p = 0; p < nPts; ++p) {
+            if (id[p] < 0) continue;
+            id[p] = nw;
+            pm.px[std::size_t(nw)] = pm.px[p];
+            pm.py[std::size_t(nw)] = pm.py[p];
+            pm.pz[std::size_t(nw)] = pm.pz[p];
+            ++nw;
+        }
+        if (nw != pm.man.nPoints) return std::unexpected("structured mesh: points do not match the layout's count");
+        pm.px.resize(std::size_t(nw));
+        pm.py.resize(std::size_t(nw));
+        pm.pz.resize(std::size_t(nw));
+        for (std::int32_t& v : pm.faceNodes) v = id[std::size_t(v)];
+    }
     return pm;
 }
 

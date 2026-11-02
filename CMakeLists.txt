@@ -49,8 +49,16 @@ add_library(dns_core
     src/dns/framemap.cpp
     src/dns/fvcase.cpp
     src/dns/fvgrad.cpp
+    src/dns/fvincomp.cpp
+    src/dns/fvlowmach.cpp
+    src/dns/fvconv.cpp
     src/dns/fvsimple.cpp
+    src/dns/fvstructured.cpp
     src/dns/fvwalldist.cpp
+    src/dns/fvcomp_case.cpp
+    src/dns/fvcomp_config.cpp
+    src/dns/fvflame.cpp
+    src/dns/fvraster.cpp
     src/dns/fvref.cpp
     src/dns/cutcell.cpp
     src/dns/diagnostics.cpp
@@ -169,6 +177,8 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/derived.hip
     src/dns/gpu/flame_turb.hip
     src/dns/gpu/device_util.hip
+    src/dns/gpu/fv_comp.hip
+    src/dns/gpu/fv_incomp.hip
     src/dns/gpu/fv_simple.hip
     src/dns/gpu/fv_coupled.hip
     src/dns/gpu/fv_ras.hip
@@ -193,6 +203,10 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/runner_conv.hip
     src/dns/gpu/runner_flame.hip
     src/dns/gpu/runner_fv.hip
+    src/dns/gpu/runner_fvcomp.hip
+    src/dns/gpu/runner_fvconv.hip
+    src/dns/gpu/runner_fvincomp.hip
+    src/dns/gpu/runner_fvlowmach.hip
     src/dns/gpu/runner_ogrid.hip
     src/dns/gpu/runner_rb.hip
     src/dns/gpu/runner_incomp.hip
@@ -236,6 +250,9 @@ if(DNS_WITH_HIP)
         message(STATUS "DNS: using requested GPU arch: ${CMAKE_HIP_ARCHITECTURES}")
     endif()
     enable_language(HIP)
+    # Device code is ~93% of a binary and every test embeds its own copy;
+    # uncompressed, build/ is 2.6 GB. Same code objects, only the container.
+    string(APPEND CMAKE_HIP_FLAGS " --offload-compress")
     list(APPEND CMAKE_PREFIX_PATH /opt/rocm)
     find_package(hip REQUIRED)
     find_package(hipfft REQUIRED)
@@ -441,8 +458,8 @@ if(BUILD_TESTING)
         fieldpng webframes channel_config conv_config scene sgs_op framemap ogrid transport
         rotor focal cli_defaults comp_axis_permute rans rans_channel1d
         steady_stop blockband channel_line pseudo_time flow_rans_config precond
-        host_threads flame1d flame_config lowmach_config restart_config bunsen diffusion candle wick chamber_config
-        polymesh facemesh fvref la amg fvcase fvwalldist tfles poisson_sep)
+        host_threads flame1d flame_config lowmach_config fv_lowmach restart_config bunsen diffusion candle wick chamber_config
+        polymesh facemesh fvref fv_comp la amg fvcase fvwalldist fvstructured tfles poisson_sep fvincomp)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini turb_ic)
     endif()
@@ -487,7 +504,7 @@ if(BUILD_TESTING)
     # 831k-cell snappy mesh, LOCAL only (runs/ is git-ignored): rc 77 when
     # absent.
     set(DNS_MESH_DATA ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/mesh)
-    foreach(t polymesh facemesh fvref la amg)
+    foreach(t polymesh facemesh fvref la amg fvincomp)
         target_compile_definitions(test_${t} PRIVATE DNS_MESH_DATA="${DNS_MESH_DATA}")
     endforeach()
     target_compile_definitions(test_facemesh PRIVATE
@@ -705,6 +722,74 @@ if(BUILD_TESTING)
         target_compile_definitions(test_gpu_fv_simple PRIVATE DNS_FV_DATA="${DNS_FV_DATA}")
         add_test(NAME gpu_fv_simple COMMAND test_gpu_fv_simple)
         set_tests_properties(gpu_fv_simple PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+        # Compressible FV family (docs/fvcomp.md): the device vs FvRef, and the
+        # cross-verification against the structured solver.
+        add_executable(test_gpu_fv_comp tests/test_gpu_fv_comp.cpp)
+        target_link_libraries(test_gpu_fv_comp PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_fv_comp PRIVATE DNS_MESH_DATA="${DNS_MESH_DATA}")
+        add_test(NAME gpu_fv_comp COMMAND test_gpu_fv_comp)
+        add_executable(test_gpu_fv_rans tests/test_gpu_fv_rans.cpp)
+        target_link_libraries(test_gpu_fv_rans PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_fv_rans PRIVATE DNS_MESH_DATA="${DNS_MESH_DATA}")
+        add_test(NAME gpu_fv_rans COMMAND test_gpu_fv_rans)
+        add_test(NAME gpu_fv_rans_channel COMMAND test_gpu_fv_rans channel)
+        set_tests_properties(gpu_fv_rans PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+        set_tests_properties(gpu_fv_rans_channel PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 280)
+        add_executable(test_gpu_fv_cross tests/test_gpu_fv_cross.cpp)
+        target_link_libraries(test_gpu_fv_cross PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_fv_cross PRIVATE DNS_BIN="$<TARGET_FILE:dns>"
+            DNS_MESH_DATA="${DNS_MESH_DATA}" DNS_EXAMPLES="${CMAKE_CURRENT_SOURCE_DIR}/examples"
+            X4_ORDER=1.5)
+        add_dependencies(test_gpu_fv_cross dns)
+        add_test(NAME gpu_fv_cross COMMAND test_gpu_fv_cross)
+        add_test(NAME gpu_fv_ladder COMMAND test_gpu_fv_cross ladder)
+        add_test(NAME gpu_fv_far COMMAND test_gpu_fv_cross far)
+        set_tests_properties(gpu_fv_comp gpu_fv_cross gpu_fv_ladder PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+        set_tests_properties(gpu_fv_far PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 280)
+        # The time-accurate incompressible FV solver (docs/fvincomp.md).
+        # Species on the FV family (docs/fvcomp.md "Species").
+        add_executable(test_gpu_fv_flame tests/test_gpu_fv_flame.cpp)
+        target_link_libraries(test_gpu_fv_flame PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_fv_flame PRIVATE DNS_BIN="$<TARGET_FILE:dns>"
+                                   DNS_MESH_DATA="${DNS_MESH_DATA}")
+        add_dependencies(test_gpu_fv_flame dns)
+        add_test(NAME gpu_fv_flame COMMAND test_gpu_fv_flame)
+        add_test(NAME gpu_fv_flame1d COMMAND test_gpu_fv_flame flame1d)
+        set_tests_properties(gpu_fv_flame gpu_fv_flame1d PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+        add_executable(test_gpu_fv_lowmach tests/test_gpu_fv_lowmach.cpp)
+        target_link_libraries(test_gpu_fv_lowmach PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_fv_lowmach PRIVATE DNS_BIN="$<TARGET_FILE:dns>"
+                                   DNS_MESH_DATA="${DNS_MESH_DATA}")
+        add_dependencies(test_gpu_fv_lowmach dns)
+        add_test(NAME gpu_fv_lowmach COMMAND test_gpu_fv_lowmach)
+        add_test(NAME gpu_fv_lowmach1d COMMAND test_gpu_fv_lowmach flame1d)
+        add_test(NAME gpu_fv_lowmach_momentum COMMAND test_gpu_fv_lowmach momentum)
+        set_tests_properties(gpu_fv_lowmach gpu_fv_lowmach1d PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+        set_tests_properties(gpu_fv_lowmach_momentum PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 280)
+        add_test(NAME gpu_fv_flame_mix COMMAND test_gpu_fv_flame mix)
+        add_test(NAME gpu_fv_flame_jet COMMAND test_gpu_fv_flame jet)
+        set_tests_properties(gpu_fv_flame_mix gpu_fv_flame_jet PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 280)
+        add_executable(test_gpu_fv_incomp tests/test_gpu_fv_incomp.cpp)
+        target_link_libraries(test_gpu_fv_incomp PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_fv_incomp PRIVATE DNS_FV_DATA="${DNS_FV_DATA}"
+                                   DNS_MESH_DATA="${DNS_MESH_DATA}")
+        add_test(NAME gpu_fv_incomp COMMAND test_gpu_fv_incomp)
+        set_tests_properties(gpu_fv_incomp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+        # dns conv on a FaceMesh, both models (docs/fvcomp.md, docs/fvincomp.md).
+        add_executable(test_gpu_fv_conv tests/test_gpu_fv_conv.cpp)
+        target_link_libraries(test_gpu_fv_conv PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_fv_conv PRIVATE DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_fv_conv dns)
+        add_test(NAME gpu_fv_conv COMMAND test_gpu_fv_conv)
+        add_test(NAME gpu_fv_conv_long COMMAND test_gpu_fv_conv long)
+        set_tests_properties(gpu_fv_conv PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+        set_tests_properties(gpu_fv_conv_long PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 280)
+        # simpleFoam on the structured meshes vs the existing solvers and exact
+        # solutions (docs/fvstructured.md); ladders: test_gpu_fv_structured MODE.
+        add_executable(test_gpu_fv_structured tests/test_gpu_fv_structured.cpp)
+        target_link_libraries(test_gpu_fv_structured PRIVATE dns_gpu)
+        add_test(NAME gpu_fv_structured COMMAND test_gpu_fv_structured)
+        set_tests_properties(gpu_fv_structured PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
         # gpu/la performance kernels vs the pre-change kernels, kept verbatim in
         # the test as oracles (masterplan_performance): memcmp, float + double.
         # A HIP TU (it defines kernels), routed like the library under CUDA.

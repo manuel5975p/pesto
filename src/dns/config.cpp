@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <format>
@@ -477,6 +478,41 @@ std::expected<Case, ConfigError> validateBench(const RawConfig& r, Case c)
 }
 
 // --- tgv / hit --------------------------------------------------------------
+// dns tgv --solver fv (docs/fvincomp.md). Without it every flag of the FV solver
+// is rejected by name.
+std::optional<ConfigError> resolveFvTgv(const RawConfig& r, Case& c)
+{
+    if (r.sub != Subcommand::Tgv) return std::nullopt;
+    if (r.solver != int(SolverKind::Fv))
+        return rejectGiven(r, {"--mesh-perturb", "--mesh-perturb-kind", "--les", "--sgs", "--tol", "--max-iters"},
+                           "belongs to dns tgv --solver fv");
+    if (r.given.contains("--emit") && (c.emit.contains(Emit::Slices) || c.emit.contains(Emit::Vtk)))
+        return err(2, "--emit", "dns tgv --solver fv writes stats and error only");
+    if (!finitePos(r.tol)) return err(2, "--tol", "must be finite and > 0");
+    if (r.maxIters < 1) return err(2, "--max-iters", "must be >= 1");
+    const bool given = r.given.contains("--mesh-perturb");
+    if (r.given.contains("--mesh-perturb-kind") && !given)
+        return err(2, "--mesh-perturb-kind", "needs --mesh-perturb A");
+    if (given) {
+        const bool sine = r.meshPerturbKind == 0;
+        if (!(std::isfinite(r.meshPerturb) && r.meshPerturb > 0 && r.meshPerturb <= (sine ? 0.06 : 0.45)))
+            return err(2, "--mesh-perturb", sine ? "sine: must be in (0, 0.06]" : "random: must be in (0, 0.45]");
+    }
+    if (r.les < 0 || !std::isfinite(r.les)) return err(2, "--les", "must be finite and >= 0");
+    if (r.given.contains("--sgs") && r.les == 0) return err(2, "--sgs", "selects the SGS model for --les");
+    if (r.les > 0 && r.sgs == SgsModel::Sigma && c.grid.nz == 1)
+        return err(2, "--sgs", "sigma: D_sigma is identically ZERO for any 2D state");
+    c.fvIncomp = true;
+    c.fvPerturb = given ? r.meshPerturbKind + 1 : 0;
+    c.fvPerturbAmp = given ? r.meshPerturb : 0;
+    c.fvPrecision = FvPrecision(r.fvPrecision);
+    c.fvTol = r.given.contains("--tol") ? r.tol : 1e-5;
+    c.fvMaxPcg = r.given.contains("--max-iters") ? r.maxIters : 200;
+    c.cs = r.les;
+    c.sgsModel = r.sgs;
+    return std::nullopt;
+}
+
 std::expected<Case, ConfigError> validatePeriodic(const RawConfig& r, Case c)
 {
     const int nz = r.given.contains("--nz") ? r.nz : r.n;
@@ -513,6 +549,7 @@ std::expected<Case, ConfigError> validatePeriodic(const RawConfig& r, Case c)
         return bad(2, "--emit", "--emit error compares against the 2D analytic "
                                 "Taylor-Green solution and requires --nz 1");
     if (c.emit.empty()) c.emit.insert(Emit::Stats);
+    if (auto e = resolveFvTgv(r, c); e) return std::unexpected(*e);
     c.fdt = r.fdt;
     c.meta = {.re = r.re,
               .frameDt = c.fdt,
@@ -768,6 +805,8 @@ std::expected<Case, ConfigError> validateChannel(const RawConfig& r, Case c)
 // result -- so it is rejected here, by name, with the two knobs that fix
 // it. The adiabatic fraction is M^2 (gamma-1) / eps^2, so it shrinks
 // quadratically as the Mach number drops toward the Boussinesq limit.
+std::optional<ConfigError> resolveFvConv(const RawConfig& r, Case& c);
+
 std::expected<Case, ConfigError> validateConv(const RawConfig& r, Case c)
 {
     if (r.given.contains("--re"))
@@ -969,6 +1008,7 @@ std::expected<Case, ConfigError> validateConv(const RawConfig& r, Case c)
               .rans = "",
               .steady = ""};
     c.meta.setGrid(c.grid);
+    if (auto e = resolveFvConv(r, c); e) return std::unexpected(*e);
     return c;
 }
 
@@ -2003,8 +2043,58 @@ std::expected<Case, ConfigError> validateDiffusion(const RawConfig& r, Case c)
 // The 1D freely propagating premixed flame (docs/chem.md): model C0, the
 // oracle eigenvalue resolved HERE (pure FP64, ~0.1 s) so the grid is counted
 // in the oracle's own thermal thickness and --dry-run prints Lambda.
+// The FV route of dns flame (docs/fvcomp.md "Species"): only what is built on it
+// passes, everything else by name. Off it, its own flags are rejected.
+std::optional<ConfigError> checkFvFlame(const RawConfig& r)
+{
+    const bool poly = r.given.contains("--polymesh");
+    if (!poly && r.solver != int(SolverKind::Fv)) {
+        if (r.physics == Physics::LowMach && r.given.contains("--tol"))
+            return ConfigError{2, "--tol", "belongs to dns flame --physics lowmach --solver fv (the structured solve is direct)"};
+        return rejectGiven(r, {"--bc", "--fv-precision", "--compensated", "--frame-box", "--frame-n"},
+                           "belongs to dns flame --solver fv");
+    }
+    const bool lm = r.physics == Physics::LowMach;
+    static const char* const allowed[] = {
+        "--solver", "--polymesh", "--bc", "--physics", "--mode", "--mach", "--expansion", "--zeldovich", "--prandtl",
+        "--visc", "--tinf", "--cells-per-delta", "--upstream", "--downstream", "--inflow-speed", "--ny", "--nz",
+        "--wrinkle", "--wrinkle-modes", "--tt", "--cfl", "--dt-recompute", "--profile-dt", "--out", "--emit", "--fdt",
+        "--pdt", "--wdt", "--png-down", "--frame-box", "--frame-n", "--frame-start", "--backend", "--quiet", "--dry-run",
+        "--fv-precision", "--compensated"};
+    static const char* const allowedJet[] = {"--stoich", "--fuel-y", "--ox-y", "--damkohler", "--cells-per-unit",
+                                             "--slot-width", "--slot-edge", "--coflow-speed", "--coflow-width",
+                                             "--pilot-width", "--pilot-speed", "--length", "--ignition"};
+    const bool jet = r.flameMode == 2;
+    for (const auto& g : r.given) {
+        if (lm && (g == "--chem-dt" || g == "--tol")) continue;
+        if (std::ranges::none_of(allowed, [&](const char* a) { return g == a; }) &&
+            !(jet && !lm && std::ranges::any_of(allowedJet, [&](const char* a) { return g == a; })))
+            return ConfigError{2, "--solver",
+                               g + " is not built on the FV flame path (docs/fvcomp.md \"Species\", docs/fvincomp.md "
+                                   "\"Low-Mach\")"};
+    }
+    if (r.flameMode != 0 && !jet)
+        return ConfigError{2, "--mode", "--solver fv is built for --mode premixed and diffusion only (bunsen, candle, "
+                                        "chamber: not built, docs/fvcomp.md)"};
+    if (jet && lm)
+        return ConfigError{2, "--mode", "--mode diffusion on --solver fv is the compressible solver's (two reactants "
+                                        "are not built on the low-Mach FV path, docs/fvincomp.md \"Low-Mach\")"};
+    if (lm && r.given.contains("--compensated"))
+        return ConfigError{2, "--compensated", "the low-Mach FV state's rho, rho Y are compensated in FP32 always"};
+    if (poly != r.given.contains("--bc"))
+        return ConfigError{2, "--bc", "--polymesh DIR and --bc FILE.toml go together on dns flame"};
+    if (poly && r.given.contains("--solver") && r.solver != int(SolverKind::Fv))
+        return ConfigError{2, "--solver", "--polymesh is the FV path: only --solver fv goes with it"};
+    if (poly)
+        return rejectGiven(r, {"--cells-per-delta", "--downstream", "--ny", "--nz", "--wrinkle", "--wrinkle-modes",
+                               "--cells-per-unit", "--length"},
+                           "does not apply with --polymesh: the mesh is the case");
+    return std::nullopt;
+}
+
 std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
 {
+    if (auto e = checkFvFlame(r)) return std::unexpected(*e);
     // --equivalence: the rich two-reactant premixed jet (model C2): the
     // premixed 1D/3D flame (both solvers) and the low-Mach bunsen (masterplan
     // real_bunsen S5: the partially premixed burner).
@@ -2669,7 +2759,7 @@ std::optional<ConfigError> flowGrid(const RawConfig& r, Case& c)
         // every immersed-body and box knob is meaningless here and rejected by
         // name rather than silently ignored. --n is the angular cell count,
         // --ny the radial one INCLUDING the two ghost rows.
-        if (!comp)
+        if (!comp && r.solver != int(SolverKind::Fv))
             return err(2, "--ogrid", "the body-fitted O-grid is compressible-"
                                      "only (the curvilinear path is)");
         if (c.bodyKind == BodyKind::None)
@@ -4106,8 +4196,12 @@ std::optional<ConfigError> flowRans(const RawConfig& r, Case& c)
         if (r.seq > 1)
             return err(2, "--rans", "with --seq: grid sequencing is the "
                                     "incompressible steady solve's");
-        if (c.noslipY || c.bodyKind == BodyKind::None ||
-            c.bodyKind == BodyKind::Floor || c.bodyKind == BodyKind::Fence)
+        const bool fvWall = r.solver == int(SolverKind::Fv) && c.noslipY;
+        if (!fvWall && r.solver == int(SolverKind::Fv) && c.bodyKind == BodyKind::None)
+            return err(2, "--rans", "needs a wall: --ogrid, or --noslip on the "
+                                    "FV box");
+        if (!fvWall && (c.noslipY || c.bodyKind == BodyKind::None ||
+            c.bodyKind == BodyKind::Floor || c.bodyKind == BodyKind::Fence))
             return err(2, "--rans", "needs a body (immersed, or wrapped by "
                                     "--ogrid); box walls (--noslip, --body "
                                     "none|floor|fence) need the ghost-row "
@@ -4618,9 +4712,6 @@ std::expected<Case, ConfigError> validateFvFlow(const RawConfig& r, Case c)
                        g + " is not a flag of the FV path: the OpenFOAM case dictionaries (0/, system/, "
                            "constant/) define the mesh, physics and numerics (docs/fv.md)");
     if (r.polymesh.empty()) return bad(2, "--polymesh", "needs an OpenFOAM case directory");
-    if (r.physics != Physics::Incompressible)
-        return bad(2, "--physics", "--polymesh needs --physics incompressible (the compressible FV path, "
-                                   "masterplan P4/P7, is not built)");
     if (c.outPrefix.empty()) return bad(2, "--out", "output prefix must not be empty");
     for (const Emit e : c.emit)
         if (e != Emit::Stats && e != Emit::None)
@@ -4646,6 +4737,518 @@ std::expected<Case, ConfigError> validateFvFlow(const RawConfig& r, Case c)
         c.fvCoupledAlpha = r.fvCoupledAlpha;
         c.fvCoupledCheck = r.fvCoupledCheck;
     }
+    return c;
+}
+
+// "a,b,c,d" of --frame-box.
+std::expected<std::array<double, 4>, ConfigError> frameBoxOf(const RawConfig& r)
+{
+    std::array<double, 4> b{};
+    if (!r.given.contains("--frame-box")) return b;
+    std::size_t at = 0;
+    for (std::size_t i = 0; i < 4; ++i) {
+        const std::size_t e = r.frameBox.find(',', at);
+        if ((e == std::string::npos) != (i == 3)) return bad(2, "--frame-box", "needs lo0,hi0,lo1,hi1");
+        const std::string_view tok = std::string_view(r.frameBox).substr(at, e == std::string::npos ? e : e - at);
+        const auto [ptr, ec] = std::from_chars(tok.data(), tok.data() + tok.size(), b[i]);
+        if (ec != std::errc{} || ptr != tok.data() + tok.size() || !std::isfinite(b[i]))
+            return bad(2, "--frame-box", "needs four finite numbers lo0,hi0,lo1,hi1");
+        at = e + 1;
+    }
+    if (!(b[1] > b[0]) || !(b[3] > b[2])) return bad(2, "--frame-box", "needs lo < hi on both axes");
+    return b;
+}
+
+std::optional<ConfigError> fvCompCommon(const RawConfig& r, Case& c);
+
+// dns conv --solver fv | --polymesh (docs/fvcomp.md, docs/fvincomp.md): the
+// allow-list of the route, the frame plane, the arithmetic. Off: its flags are
+// rejected by name. Pre: the structured conv case is resolved.
+std::optional<ConfigError> resolveFvConv(const RawConfig& r, Case& c)
+{
+    const bool poly = r.given.contains("--polymesh");
+    if (poly && r.given.contains("--solver") && r.solver != int(SolverKind::Fv))
+        return ConfigError{2, "--solver", "--polymesh is the FV path: only --solver fv goes with it"};
+    if (r.solver != int(SolverKind::Fv) && !poly)
+        return rejectGiven(r, {"--bc", "--fv-precision", "--compensated", "--tol", "--max-iters", "--frame-box", "--frame-n",
+                               "--mesh-perturb", "--mesh-perturb-kind"},
+                           "belongs to dns conv --solver fv");
+    const bool comp = c.physics == Physics::Compressible;
+    static const char* const common[] = {"--solver", "--physics", "--rayleigh", "--prandtl", "--ny",
+                                         "--aspect", "--sides",   "--tt",       "--cfl",     "--kick",
+                                         "--out",    "--emit",    "--frame-box", "--frame-n", "--fv-precision",
+                                         "--dt-recompute", "--profile-dt", "--fdt", "--pdt", "--wdt",
+                                         "--png-down", "--backend", "--quiet",  "--dry-run"};
+    static const char* const box[] = {"--n", "--nz", "--mesh-perturb", "--mesh-perturb-kind"};
+    static const char* const mesh[] = {"--polymesh", "--bc"};
+    static const char* const compOnly[] = {"--mach", "--dtemp", "--visc", "--tinf", "--compensated"};
+    static const char* const incompOnly[] = {"--tol", "--max-iters"};
+    auto in = [](std::span<const char* const> l, const std::string& f) {
+        return std::ranges::any_of(l, [&](const char* x) { return f == x; });
+    };
+    for (const std::string& g : r.given) {
+        const bool ok = in(common, g) || (poly ? in(mesh, g) : in(box, g)) || (comp ? in(compOnly, g) : in(incompOnly, g));
+        if (ok) continue;
+        return ConfigError{2, g, g + (in(box, g) ? " belongs to the mesh on --polymesh"
+                                  : in(mesh, g)  ? " needs --polymesh DIR"
+                                                 : " is not built on dns conv --solver fv (docs/fvcomp.md)")};
+    }
+    if (poly) {
+        if (r.polymesh.empty()) return ConfigError{2, "--polymesh", "needs a mesh directory"};
+        if (!r.given.contains("--bc") || r.bc.empty()) return ConfigError{2, "--bc", "--polymesh needs --bc FILE.toml"};
+        if (!r.given.contains("--ny"))
+            return ConfigError{2, "--ny", "required on --polymesh: the height bins of the plane statistics"};
+        if (comp && !r.fvBc) return ConfigError{2, "--bc", "--physics compressible --polymesh needs --bc FILE.toml"};
+        if (comp)
+            if (const std::string k = fvBcFlameKey(*r.fvBc); !k.empty())
+                return ConfigError{2, "--bc", k + " belongs to a dns flame file: dns conv carries no species"};
+    }
+    if (auto e = fvCompCommon(r, c)) return e;
+    if (!comp && r.given.contains("--compensated"))
+        return ConfigError{2, "--compensated", "is the compressible state's low word"};
+    // FV plain FP32 drops the updates of its 2x smaller dt: Nu -2% at 192 x 96, Ra 5e4
+    // (compensated == FP64 to 3e-4; docs/fvcomp.md "Gravity"). Same cost.
+    if (comp && c.fvPrecision == FvPrecision::Fp32) c.compensated = true;
+    if (!finitePos(r.tol)) return ConfigError{2, "--tol", "must be finite and > 0"};
+    if (r.maxIters < 1) return ConfigError{2, "--max-iters", "must be >= 1"};
+    if (r.given.contains("--mesh-perturb-kind") && !r.given.contains("--mesh-perturb"))
+        return ConfigError{2, "--mesh-perturb-kind", "needs --mesh-perturb A"};
+    if (r.given.contains("--mesh-perturb")) {
+        const bool sine = r.meshPerturbKind == 0;
+        if (!(std::isfinite(r.meshPerturb) && r.meshPerturb > 0 && r.meshPerturb <= (sine ? 0.12 : 0.45)))
+            return ConfigError{2, "--mesh-perturb", sine ? "sine: must be in (0, 0.12]" : "random: must be in (0, 0.45]"};
+        c.fvPerturb = r.meshPerturbKind + 1;
+        c.fvPerturbAmp = r.meshPerturb;
+    }
+    c.fvConv = true;
+    c.fvConvBins = r.ny;
+    c.fvTol = r.given.contains("--tol") ? r.tol : 1e-6;
+    c.fvMaxPcg = r.given.contains("--max-iters") ? r.maxIters : 200;
+    if (poly) {
+        c.fvMeshDir = r.polymesh;
+        c.fvBcFile = r.bc;
+        if (comp) c.fvBc = *r.fvBc;
+    }
+    return std::nullopt;
+}
+
+// The FV family's frame window and arithmetic, and the --emit kinds it writes.
+std::optional<ConfigError> fvCompCommon(const RawConfig& r, Case& c)
+{
+    for (const Emit e : c.emit)
+        if (e != Emit::Stats && e != Emit::None && e != Emit::Bin && e != Emit::Png && e != Emit::Web && e != Emit::Shm)
+            return ConfigError{2, "--emit",
+                               "the compressible FV path writes stats, bin, png, web and shm (a uniform plane "
+                               "through the mesh); volume, slices, vtk, surface, mesh, spectrum, snapshot and "
+                               "error are not built"};
+    auto box = frameBoxOf(r);
+    if (!box) return box.error();
+    if (r.frameN < 16) return ConfigError{2, "--frame-n", "must be >= 16"};
+    c.fvFrameBox = *box;
+    c.fvFrameN = r.frameN;
+    c.fvPrecision = FvPrecision(r.fvPrecision);
+    if (r.compensated && c.fvPrecision == FvPrecision::Fp64)
+        return ConfigError{2, "--compensated", "is the FP32 state's low word: --fv-precision fp64 has no update floor"};
+    c.compensated = r.compensated;
+    return std::nullopt;
+}
+
+// --rans on the polyMesh route (flowRans owns the structured-mesh routes): the
+// closure's own flags, rejected by name.
+std::optional<ConfigError> fvRansCheck(const RawConfig& r)
+{
+    const RansModel m = RansModel(r.rans);
+    const bool sa = m == RansModel::SaNeg, sst = ransSst(m);
+    if (m != RansModel::None && (r.les > 0.0 || r.given.contains("--sgs")))
+        return ConfigError{2, "--rans", "and --les/--sgs would put two eddy viscosities in one slot; drop --les/--sgs"};
+    if (r.given.contains("--rans-nutinf") && !sa)
+        return ConfigError{2, "--rans-nutinf", "is the SA freestream nu~/nu; it needs --rans sa-neg"};
+    for (const char* f : {"--rans-kinf", "--rans-mutinf"})
+        if (r.given.contains(f) && !sst)
+            return ConfigError{2, f, "is an SST freestream value; it needs --rans sst-2003m|sst-vm"};
+    if (sa && !finitePos(r.ransNutInf)) return ConfigError{2, "--rans-nutinf", "must be finite and > 0"};
+    if (sst && !finitePos(r.ransKInf)) return ConfigError{2, "--rans-kinf", "must be finite and > 0"};
+    if (sst && !finitePos(r.ransMutInf)) return ConfigError{2, "--rans-mutinf", "must be finite and > 0"};
+    return std::nullopt;
+}
+
+// Pre: fvRansCheck passed; c.nu, c.uInf set.
+void fvRansResolve(const RawConfig& r, Case& c)
+{
+    c.rans = RansModel(r.rans);
+    c.ransNutInf = r.ransNutInf;
+    c.ransKInf = r.ransKInf;
+    c.ransMutInf = r.ransMutInf;
+    if (c.rans == RansModel::SaNeg) c.ransPhiInf[0] = nuTildaInf(c.ransNutInf, c.nu);
+    if (ransSst(c.rans)) {
+        c.ransPhiInf[0] = kInf(c.ransKInf, c.uInf);
+        c.ransPhiInf[1] = omegaInf(c.ransPhiInf[0], c.ransMutInf, c.nu);
+    }
+}
+
+// dns flow --physics compressible --polymesh DIR --bc FILE (docs/fvcomp.md): the
+// mesh and its patches are the case; every flag not listed is rejected by name.
+std::expected<Case, ConfigError> validateFvCompMesh(const RawConfig& r, Case c)
+{
+    static const char* const allowed[] = {"--polymesh", "--bc",      "--physics",    "--re",        "--mach",
+                                          "--tt",       "--ramp",    "--cfl",        "--les",       "--sgs",
+                                          "--visc",     "--tinf",    "--prandtl",    "--fv-precision", "--out",
+                                          "--emit",     "--fdt",     "--pdt",        "--wdt",       "--png-down",
+                                          "--vort-max", "--vort-map", "--speed-map", "--dt-recompute", "--frame-box",
+                                          "--frame-n",  "--backend", "--quiet",      "--dry-run",   "--compensated",
+                                          "--solver",   "--rans",    "--rans-nutinf", "--rans-kinf", "--rans-mutinf",
+                                          "--steady",   "--steady-steps"};
+    for (const auto& g : r.given)
+        if (std::ranges::none_of(allowed, [&](const char* a) { return g == a; }))
+            return bad(2, "--polymesh", g + " is not a flag of the compressible FV path on a polyMesh (docs/fvcomp.md)");
+    if (!r.fvBc) return bad(2, "--bc", "--physics compressible --polymesh needs --bc FILE.toml");
+    if (const std::string k = fvBcFlameKey(*r.fvBc); !k.empty())
+        return bad(2, "--bc", k + " belongs to a dns flame file: dns flow carries no species");
+    if (c.outPrefix.empty()) return bad(2, "--out", "output prefix must not be empty");
+    if (c.outPrefix.find_first_of("\"\\\n\r\t") != std::string::npos)
+        return bad(2, "--out", "output prefix must not contain quotes, backslashes or control characters");
+    if (!r.given.contains("--re") || !finitePos(r.re)) return bad(2, "--re", "required, finite and > 0");
+    if (!r.given.contains("--mach") || !finitePos(r.mach) || r.mach >= 1.0)
+        return bad(2, "--mach", "required, in (0, 1): the KG flux has no shock capturing");
+    const bool steady = r.given.contains("--steady");
+    if (steady) {
+        for (const char* f : {"--tt", "--ramp", "--fdt", "--pdt", "--wdt"})
+            if (r.given.contains(f)) return bad(2, f, "with --steady: pseudo-time is not time; --steady-steps is the cap");
+        if (r.given.contains("--emit") && !c.emit.contains(Emit::Stats) && !c.emit.contains(Emit::None))
+            return bad(2, "--emit", "frames with --steady: pseudo-time is not time; frames are time-keyed");
+        if (!(r.steady >= kSteadyTolMin && r.steady < 1))
+            return bad(2, "--steady", std::format("is a relative change of the integrals: must be in [{:g}, 1)",
+                                                  kSteadyTolMin));
+        if (r.given.contains("--steady-steps") && r.steadySteps < 1) return bad(2, "--steady-steps", "must be >= 1");
+    } else if (r.given.contains("--steady-steps")) {
+        return bad(2, "--steady-steps", "requires --steady TOL");
+    }
+    if (!steady && (!r.given.contains("--tt") || !finitePos(r.ttFv)))
+        return bad(2, "--tt", "required, finite and > 0 (L/U)");
+    if (r.given.contains("--ramp") && !(r.ramp >= 0.0)) return bad(2, "--ramp", "must be >= 0");
+    if (!(r.prandtl > 0.0)) return bad(2, "--prandtl", "must be > 0");
+    if (r.given.contains("--sgs") && !(r.les > 0.0)) return bad(2, "--sgs", "selects the --les model: needs --les");
+    if (!(r.les >= 0.0)) return bad(2, "--les", "must be >= 0");
+    if (auto e = fvRansCheck(r)) return std::unexpected(*e);
+    c.fvMode = FvCompMode::PolyMesh;
+    c.fvMeshDir = r.polymesh;
+    c.fvBc = *r.fvBc;
+    c.re = r.re;
+    c.mach = r.mach;
+    c.uInf = 1.0;
+    c.tEnd = r.ttFv * r.fvBc->length / c.uInf;
+    c.ramp = r.given.contains("--ramp") ? r.ramp : 0.0;
+    if (steady) {
+        c.steadyTol = r.steady;
+        c.compSteady = true;
+        c.steadySteps = r.steadySteps;
+    }
+    c.cfl = r.given.contains("--cfl") ? r.cfl : 0.4;
+    c.dtRecompute = r.given.contains("--dt-recompute") ? r.dtRecompute : 16;
+    c.cs = r.les;
+    c.sgsModel = r.sgs;
+    c.lesLabel = c.cs > 0;
+    c.sutherland = r.visc == 1;
+    c.tinfK = r.tinf;
+    c.prandtl = r.prandtl;
+    c.fdt = r.fdt;
+    c.pdt = r.pdt > 0 ? r.pdt : c.fdt;
+    c.wdt = r.wdt > 0 ? r.wdt : c.fdt;
+    c.pngDown = r.pngDown;
+    c.vortMax = r.vortMax;
+    c.vortAsinh = r.vortMap == 1;
+    c.speedDelta = r.speedMap == 1;
+    c.nu = c.uInf * r.fvBc->length / c.re;
+    fvRansResolve(r, c);
+    c.meta = {.D = r.fvBc->length, .re = c.re, .mach = c.mach, .frameDt = c.fdt, .cs = c.cs, .les = c.lesLabel,
+              .body = "polymesh", .farField = "fv", .physics = "compressible", .kick = 0,
+              .sgs = c.lesLabel ? std::string(name(c.sgsModel)) : std::string(),
+              .rans = c.rans == RansModel::None ? std::string() : std::string(ransName(c.rans)), .steady = {}};
+    if (auto e = fvCompCommon(r, c)) return std::unexpected(*e);
+    return c;
+}
+
+// --solver fv --physics compressible on a structured case, BEFORE validateFlow:
+// the mesh routes through FaceMesh, so only what FV is built for passes; rejected by name, never ignored.
+std::optional<ConfigError> checkFvStructured(const RawConfig& r)
+{
+    static const char* const allowed[] = {
+        "--solver",  "--body",      "--n",        "--ny",          "--nz",         "--dr",       "--re",
+        "--mach",    "--physics",   "--ogrid",    "--ogrid-far",   "--ogrid-beta", "--ogrid-trip", "--aspect",
+        "--stretch", "--focal",     "--focal-ratio", "--focal-blend", "--focal-wake", "--focal-pad", "--far",
+        "--noslip",  "--wall",      "--twall",    "--visc",        "--tinf",       "--prandtl",  "--les",
+        "--sgs",     "--cfl",       "--ft",       "--ramp",        "--kick",       "--dt-recompute", "--out",
+        "--emit",    "--fdt",       "--pdt",      "--wdt",         "--png-down",   "--vort-max", "--vort-map",
+        "--speed-map", "--quiet",   "--dry-run",  "--backend",     "--fv-precision", "--frame-box", "--frame-n",
+        "--compensated", "--rans",  "--rans-nutinf", "--rans-kinf", "--rans-mutinf", "--steady", "--steady-steps"};
+    for (const auto& g : r.given)
+        if (std::ranges::none_of(allowed, [&](const char* a) { return g == a; }))
+            return ConfigError{2, "--solver", g + " is not built on the FV path (--solver fv, docs/fvcomp.md)"};
+    if (!r.scene.empty()) return ConfigError{2, "--scene", "a scene is immersed: FV has no immersed wall"};
+    const bool none = r.body == "none";
+    if (!r.ogrid && !none)
+        return ConfigError{2, "--solver", "fv has no immersed wall: a body needs --ogrid (body-fitted) or a polyMesh "
+                                          "(--polymesh DIR --bc FILE); --body none runs the empty box"};
+    if (r.ogrid && r.body == "sphere")
+        return ConfigError{2, "--ogrid", "the revolved O-grid (wedge, axis faces, full revolution) is not on FaceMesh "
+                                         "(masterplan P8); --solver fv takes z-extruded O-grids"};
+    return std::nullopt;
+}
+
+// The time-accurate incompressible FV solver (docs/fvincomp.md). An allowlist:
+// every other flag is rejected by name.
+std::expected<Case, ConfigError> validateFvIncompFlow(const RawConfig& r, Case c)
+{
+    const bool poly = r.given.contains("--polymesh");
+    static const char* const common[] = {"--solver", "--physics", "--re",           "--ft",     "--cfl",
+                                         "--les",    "--sgs",     "--tol",          "--out",    "--emit",
+                                         "--backend", "--quiet",  "--dry-run",      "--max-iters",
+                                         "--fv-precision", "--seed"};
+    static const char* const polyOnly[] = {"--polymesh", "--bc"};
+    static const char* const ogridOnly[] = {"--ogrid", "--ogrid-far", "--ogrid-beta", "--ogrid-trip", "--body",
+                                            "--n",     "--ny",        "--nz"};
+    const auto listed = [](std::span<const char* const> l, const std::string& g) {
+        return std::ranges::any_of(l, [&](const char* a) { return g == a; });
+    };
+    for (const auto& g : r.given)
+        if (!listed(common, g) && !(poly ? listed(polyOnly, g) : listed(ogridOnly, g)))
+            return bad(2, "--solver", g + " is not a flag of the time-accurate FV solver (docs/fvincomp.md)");
+    if (poly && !r.given.contains("--bc"))
+        return bad(2, "--bc", "--polymesh DIR with --solver fv needs --bc FILE.toml (--polymesh CASE alone is "
+                              "simpleFoam)");
+    if (!poly && r.given.contains("--bc")) return bad(2, "--bc", "binds the patches of --polymesh DIR");
+    if (!poly && !r.ogrid)
+        return bad(2, "--solver", "--solver fv has no immersed wall: use --ogrid (a body-fitted O-grid) or "
+                                  "--polymesh DIR --bc FILE.toml");
+    if (!finitePos(r.tol)) return bad(2, "--tol", "must be finite and > 0");
+    if (r.given.contains("--max-iters") && r.maxIters < 1) return bad(2, "--max-iters", "must be >= 1");
+    if (r.les < 0 || !std::isfinite(r.les)) return bad(2, "--les", "must be finite and >= 0");
+    if (r.given.contains("--sgs") && r.les == 0) return bad(2, "--sgs", "selects the SGS model for --les");
+    if (poly) {
+        if (r.polymesh.empty()) return bad(2, "--polymesh", "needs a mesh directory");
+        if (r.bc.empty()) return bad(2, "--bc", "needs a file");
+        if (c.outPrefix.empty()) return bad(2, "--out", "output prefix must not be empty");
+        if (!finitePos(r.re)) return bad(2, "--re", "must be finite and > 0");
+        if (!finitePos(r.ft)) return bad(2, "--ft", "must be finite and > 0");
+        c.re = r.re;
+        c.ft = r.ft;
+        c.fvMeshDir = r.polymesh;
+        c.fvBcFile = r.bc;
+        c.cfl = r.given.contains("--cfl") ? r.cfl : 0.8;
+        if (!finitePos(c.cfl)) return bad(2, "--cfl", "must be finite and > 0");
+    } else {
+        if (r.n < 1) return bad(2, "--n", "must be >= 1");
+        if (!finitePos(r.re)) return bad(2, "--re", "must be finite and > 0");
+        c.re = r.re;
+        c.n = r.n;
+        auto f = validateFlow(r, std::move(c));
+        if (!f) return f;
+        c = std::move(*f);
+        if (c.ogridRevolved)
+            return bad(2, "--ogrid", "--solver fv: a revolved O-grid is an axis mesh (no FaceMesh yet)");
+        c.cfl = r.given.contains("--cfl") ? r.cfl : 0.8;
+    }
+    if (r.given.contains("--emit")) {
+        for (const Emit e : r.emit)
+            if (e != Emit::Stats && e != Emit::None)
+                return bad(2, "--emit", "the FV solver writes stats (--emit stats | none)");
+        c.emit = r.emit;
+    } else
+        c.emit = {Emit::Stats};
+    if (r.les > 0 && r.sgs == SgsModel::Sigma && !poly && c.grid.nz == 1)
+        return bad(2, "--sgs", "sigma: D_sigma is identically ZERO for any 2D state");
+    c.fvIncomp = true;
+    c.fvPrecision = FvPrecision(r.fvPrecision);
+    c.fvTol = r.given.contains("--tol") ? r.tol : 1e-5;
+    c.fvMaxPcg = r.given.contains("--max-iters") ? r.maxIters : 200;
+    c.cs = r.les;
+    c.sgsModel = r.sgs;
+    return c;
+}
+
+// dns flow --solver simple (docs/fvstructured.md): the structured mesh stages
+// on their compressible box conventions (the curvilinear meshes live there),
+// then the generated case. Only flags with a simpleFoam meaning pass.
+std::expected<Case, ConfigError> validateFvStructured(const RawConfig& r0, Case c)
+{
+    static const char* const allowed[] = {
+        "--solver",       "--export",       "--out",          "--emit",        "--backend",     "--quiet",
+        "--dry-run",      "--fv-precision", "--physics",      "--max-iters",   "--steady",      "--re",
+        "--re-tau",       "--n",            "--ny",           "--nz",          "--dr",          "--body",
+        "--aspect",       "--far",          "--open",         "--noslip",      "--stretch",     "--focal",
+        "--focal-ratio",  "--focal-blend",  "--focal-wake",   "--focal-pad",   "--ogrid",       "--ogrid-far",
+        "--ogrid-beta",   "--ogrid-wedge",  "--rans",         "--rans-nutinf", "--rans-kinf",   "--rans-mutinf",
+        "--rotor-mach",   "--rotor-frame",  "--rotor-axis",   "--mach"};
+    for (const auto& g : r0.given)
+        if (std::ranges::none_of(allowed, [&](const char* a) { return g == a; }))
+            return bad(2, g.c_str(), "has no simpleFoam meaning: --solver simple solves the steady incompressible case "
+                             "the mesh flags name (docs/fvstructured.md)");
+    if (r0.physics != Physics::Incompressible)
+        return bad(2, "--physics", "--solver simple is incompressible (simpleFoam)");
+    const bool exporting = r0.given.contains("--export");
+    if (exporting) {
+        if (r0.exportCase.empty()) return bad(2, "--export", "needs a directory");
+        for (const char* f : {"--out", "--emit", "--fv-precision", "--backend"})
+            if (r0.given.contains(f))
+                return bad(2, f, "belongs to a run; --export only writes the case (dns flow --polymesh CASE runs it)");
+    }
+    const RansModel model = RansModel(r0.rans);
+    if (model == RansModel::SstVm)
+        return bad(2, "--rans", "sst-vm: OpenFOAM's kOmegaSST has no vorticity-production variant (sa-neg | "
+                                "sst-2003m, docs/fvstructured.md)");
+    if (model == RansModel::None)
+        for (const char* f : {"--rans-nutinf", "--rans-kinf", "--rans-mutinf"})
+            if (r0.given.contains(f)) return bad(2, f, "sets the RANS freestream: give --rans");
+    if (r0.rotorMach == 0 && r0.given.contains("--mach"))
+        return bad(2, "--mach", "has no simpleFoam meaning alone; with --rotor-mach the ratio is tip speed / U");
+    if (r0.given.contains("--rotor-mach") && !r0.ogrid)
+        return bad(2, "--rotor-mach", "--solver simple spins a body-fitted wall: needs --ogrid");
+    if (r0.given.contains("--far") && r0.far != FarField::Tunnel && r0.far != FarField::Nscbc &&
+        r0.far != FarField::Periodic)
+        return bad(2, "--far", std::string(name(r0.far)) + " has no simpleFoam meaning (tunnel | nscbc: inlet and "
+                                                           "outlet; periodic: the --re-tau channel)");
+    const bool periodic = r0.given.contains("--far") && r0.far == FarField::Periodic;
+    const bool channel = r0.given.contains("--re-tau");
+    if (channel != periodic)
+        return bad(2, channel ? "--re-tau" : "--far",
+                   "the plane channel is --re-tau R --far periodic --noslip --body none: a periodic box has no "
+                   "driver without the channel's body force");
+    if (channel && !r0.noslip) return bad(2, "--noslip", "the plane channel has no-slip walls: give --noslip");
+    if (channel)
+        for (const char* f : {"--re", "--dr", "--open"})
+            if (r0.given.contains(f)) return bad(2, f, "is not a channel flag: --re-tau sets nu, delta = 1");
+
+    // The stages read the compressible box conventions; --far is settled above.
+    RawConfig r = r0;
+    r.physics = Physics::Compressible;
+    c.physics = Physics::Compressible;
+    if (!r.ogrid) r.given.erase("--far");
+    r.far = FarField::Nscbc;
+    c.far = FarField::Nscbc;
+    if (auto e = flowBody(r, c); e) return std::unexpected(*e);
+    if (c.bodyKind != BodyKind::None && !r.ogrid)
+        return bad(2, "--body", "an immersed body has no body-fitted faces on a Cartesian mesh: use --ogrid, or "
+                                "--body none (a staircase is not exported)");
+
+    FvStructured s;
+    s.active = true;
+    s.uInf = 1;
+    if (channel) {
+        if (!finitePos(r.reTau)) return bad(2, "--re-tau", "must be finite and > 0");
+        if (r.n < 2) return bad(2, "--n", "the channel's cyclic x needs >= 2 cells");
+        const int ny = r.given.contains("--ny") ? r.ny : r.n;
+        if (ny < 8) return bad(2, "--ny", "the channel's fluid rows: >= 8");
+        if (r.nz < 1 || r.nz == 2) return bad(2, "--nz", "1 (2D) or >= 3");
+        if (!(std::isfinite(r.stretch) && r.stretch >= 0 && r.stretch <= 4))
+            return bad(2, "--stretch", "must be in [0,4] (tanh clustering strength)");
+        c.stretchBeta = r.stretch;
+        const double lx = 2 * pi, lz = r.nz == 1 ? 1.0 : pi;
+        // channelY's grid (ghost rows included), or the bare box under --focal.
+        const bool focal = r.given.contains("--focal");
+        if (focal && r.stretch > 0)
+            return bad(2, "--focal", "--stretch and --focal are different curvilinear meshes; pick one");
+        const int nyT = focal ? ny : ny + 2;
+        const double h1 = ChannelStretchY::firstCell(ny + 2, c.stretchBeta, 1.0);
+        auto box = makeBox(r.n, nyT, r.nz, lx, focal ? 2.0 : 2.0 + 2 * h1, lz);
+        if (!box) return std::unexpected(box.error());
+        c.grid = *box;
+        c.nzInterior = r.nz;
+        c.h = c.grid.hy;
+        c.L = lx;
+        c.placement = {0.0, 0.0, 0.0, 1.0};
+        c.re = r.reTau;
+        c.reTau = r.reTau;
+        c.nu = 1.0 / r.reTau;
+        if (focal) {
+            if (auto e = flowFocal(r, c); e) return std::unexpected(*e);
+        } else if (auto e = rejectGiven(r, {"--focal-ratio", "--focal-blend", "--focal-wake", "--focal-pad"},
+                                        "requires --focal");
+                   e)
+            return std::unexpected(*e);
+        s.mesh = FvStructMesh::Channel;
+        s.reTau = r.reTau;
+    } else {
+        if (auto e = flowGrid(r, c); e) return std::unexpected(*e);
+        if (auto e = flowPhysics(r, c); e) return std::unexpected(*e);
+        if (auto e = flowStretch(r, c); e) return std::unexpected(*e);
+        if (auto e = flowFocal(r, c); e) return std::unexpected(*e);
+        if (auto e = flowRotor(r, c); e) return std::unexpected(*e);
+        s.mesh = r.ogrid ? FvStructMesh::OGrid : FvStructMesh::Box;
+        s.lateral = r.noslip ? FvStructLateral::Wall : r.open ? FvStructLateral::Open : FvStructLateral::Symmetry;
+        if (r.noslip && r.open) return bad(2, "--open", "--noslip walls are not open faces");
+    }
+    if (r.ogrid && r.noslip) return bad(2, "--noslip", "is the box's y walls; the O-grid has none");
+    s.grid = c.grid;
+    s.nu = c.nu;
+    s.stretchBeta = c.stretchBeta;
+    s.focal = c.focalActive;
+    s.focalRatio = c.focalRatio;
+    for (std::size_t a = 0; a < 3; ++a) {
+        s.focalLo[a] = c.focalLo[a];
+        s.focalHi[a] = c.focalHi[a];
+        s.focalW[a] = c.focalW[a];
+    }
+    if (c.ogrid) {
+        const double D = c.placement.D;
+        s.ogrid = {.cx = c.placement.cx, .cy = c.placement.cy, .cz = c.placement.cz, .rFar = c.ogridRFar,
+                   .beta = c.ogridBeta, .span = c.ogridSpan};
+        s.revolved = c.ogridRevolved;
+        if (s.revolved) {
+            s.rev = c.ogridNphi > 0 ? RevolvedSpec{.wedge = false, .dphi = 2.0 * pi / c.ogridNphi, .nphi = c.ogridNphi}
+                                    : RevolvedSpec{.wedge = true, .dphi = c.ogridWedgeDeg * pi / 180.0};
+            s.refArea = 0.25 * pi * D * D * (s.rev.wedge ? s.rev.dphi / (2.0 * pi) : 1.0);
+        } else {
+            s.refArea = D * c.ogridSpan;
+        }
+        if (c.rotor.active()) {
+            if (s.revolved)
+                return bad(2, "--rotor-mach", "the revolved O-grid's axis is x, the MRF zone's shaft z: the frame "
+                                              "is not built there");
+            if (c.grid.nz > 1)
+                return bad(2, "--rotor-mach", "--nz > 1: every zone cell touches the cyclic z faces, which OpenFOAM's "
+                                              "MRF treats per side (rejected by the FV path); run --nz 1");
+            s.omega = c.rotor.omega;
+            s.mrfRadius = 2.0 * 0.5 * D; // inside the far circle: rFar > D
+            if (s.mrfRadius >= 0.5 * c.ogridRFar)
+                return bad(2, "--ogrid-far", "the MRF zone (r < D) must stay inside half the far radius");
+        }
+    }
+    s.model = model == RansModel::SaNeg ? FvTurbModel::SpalartAllmaras
+              : model == RansModel::Sst2003m ? FvTurbModel::KOmegaSST
+                                             : FvTurbModel::Laminar;
+    if (!finitePos(r.ransNutInf) || !finitePos(r.ransKInf) || !finitePos(r.ransMutInf))
+        return bad(2, "--rans-nutinf", "the RANS freestream values must be finite and > 0");
+    s.nutRatio = r.ransNutInf;
+    s.kInf = r.ransKInf;
+    s.mutRatio = r.ransMutInf;
+    if (r.given.contains("--max-iters") && r.maxIters < 1) return bad(2, "--max-iters", "must be >= 1");
+    s.iters = r.given.contains("--max-iters") ? r.maxIters : 2000;
+    if (r.given.contains("--steady")) {
+        if (!finitePos(r.steady)) return bad(2, "--steady", "the residualControl of every field: must be > 0");
+        if (channel)
+            return bad(2, "--steady", "the channel's Uy is rounding normalised by rounding (residual ~0.2 forever): "
+                                      "residualControl never fires; give --max-iters");
+        s.residual = r.steady;
+        if (r.steady < 2e-6 && FvPrecision(r.fvPrecision) == FvPrecision::Fp32)
+            c.warnings.push_back(std::format("--steady {:g} sits on the FP32 residual noise (U 7.9e-7, p 6.8e-7): it "
+                                             "may never certify; give --fv-precision fp64",
+                                             r.steady));
+    }
+
+    if (exporting) {
+        c.fvExport = r.exportCase;
+        c.fvCase = r.exportCase;
+    } else {
+        if (c.outPrefix.empty()) return bad(2, "--out", "output prefix must not be empty");
+        for (const Emit e : c.emit)
+            if (e != Emit::Stats && e != Emit::None)
+                return bad(2, "--emit", "the FV path writes OpenFOAM time directories and stats only "
+                                        "(--emit stats | none)");
+        c.fvCase = c.outPrefix;
+    }
+    c.fvPrecision = FvPrecision(r.fvPrecision);
+    c.fvs = s;
+    c.physics = Physics::Incompressible;
     return c;
 }
 
@@ -4691,12 +5294,48 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         c.meshOrder = r.meshOrder;
         return c;
     }
-    // flow --polymesh: the incompressible FV path takes its whole case from
-    // the OpenFOAM dictionaries; every structured-solver flag is rejected.
-    if (r.sub == Subcommand::Flow && r.given.contains("--polymesh"))
-        return validateFvFlow(r, std::move(c));
-    if (r.given.contains("--fv-precision"))
-        return bad(2, "--fv-precision", "selects the arithmetic of the FV path: only with --polymesh");
+    // flow's routes. --polymesh CASE alone is simpleFoam, its whole case the
+    // OpenFOAM dictionaries; --polymesh DIR --bc FILE and --solver fv are the FV
+    // solver of --physics; --solver simple takes the structured mesh flags.
+    if (r.sub == Subcommand::Flow) {
+        const bool poly = r.given.contains("--polymesh");
+        const bool comp = r.physics == Physics::Compressible;
+        const bool fv = r.solver == int(SolverKind::Fv);
+        if (poly && r.given.contains("--solver") && !fv)
+            return bad(2, "--solver", "--polymesh names its own path: only --solver fv goes with it");
+        if (r.solver == int(SolverKind::Simple)) {
+            if (!finitePos(r.re)) return bad(2, "--re", "must be finite and > 0");
+            c.re = r.re;
+            c.n = r.n;
+            return validateFvStructured(r, std::move(c));
+        }
+        if (poly && comp) return validateFvCompMesh(r, std::move(c));
+        if (poly && (fv || r.given.contains("--bc"))) return validateFvIncompFlow(r, std::move(c));
+        if (poly) {
+            for (const char* f : {"--tt", "--frame-box", "--frame-n"})
+                if (r.given.contains(f))
+                    return bad(2, f, "belongs to the compressible FV path: add --physics compressible and --bc");
+            return validateFvFlow(r, std::move(c));
+        }
+        if (fv && !comp) return validateFvIncompFlow(r, std::move(c));
+        if (r.given.contains("--bc")) return bad(2, "--bc", "binds the patches of --polymesh DIR");
+        for (const char* f : {"--export", "--re-tau"})
+            if (r.given.contains(f)) return bad(2, f, "only with --solver simple");
+        if (r.given.contains("--tt"))
+            return bad(2, "--tt", "belongs to the compressible FV path on a polyMesh (--polymesh DIR)");
+    }
+    // Past here the only FV routes left: flow --solver fv compressible, tgv --solver fv.
+    const bool fvStructured = r.sub == Subcommand::Flow && r.solver == int(SolverKind::Fv);
+    const bool fvTgv = r.sub == Subcommand::Tgv && r.solver == int(SolverKind::Fv);
+    const bool fvConv = r.sub == Subcommand::Conv && (r.solver == int(SolverKind::Fv) || r.given.contains("--polymesh"));
+    if (r.given.contains("--fv-precision") && !fvStructured && !fvTgv && !fvConv && r.sub != Subcommand::Flame)
+        return bad(2, "--fv-precision", "selects the arithmetic of the FV path: only with --polymesh, --solver "
+                                        "simple or --solver fv");
+    if (r.sub == Subcommand::Flow && !fvStructured)
+        for (const char* f : {"--frame-box", "--frame-n"})
+            if (r.given.contains(f)) return bad(2, f, "the FV path's frame plane: only with --polymesh or --solver fv");
+    if (fvStructured)
+        if (auto e = checkFvStructured(r)) return std::unexpected(*e);
     for (const char* f : {"--fv-coupled", "--fv-coupled-eta", "--fv-coupled-alpha", "--fv-coupled-check"})
         if (r.given.contains(f)) return bad(2, f, "the coupled prototype of the FV path: only with --polymesh");
 
@@ -4729,9 +5368,33 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
             if (auto e = resolveFrameStart(r, *f); e) return std::unexpected(*e);
         if (f)
             if (auto e = resolveCheckpoint(r, *f); e) return std::unexpected(*e);
+        if (f && (r.solver == int(SolverKind::Fv) || r.given.contains("--polymesh"))) {
+            f->fvMode = r.given.contains("--polymesh") ? FvCompMode::PolyMesh : FvCompMode::Structured;
+            if (r.given.contains("--polymesh")) {
+                if (!r.fvBc) return bad(2, "--bc", "--polymesh needs --bc FILE.toml");
+                f->fvMeshDir = r.polymesh;
+                f->fvBc = *r.fvBc;
+                const bool jetBc = std::ranges::any_of(f->fvBc.patches, &FvPatchSpec::jet);
+                if (f->flameDiffusion != jetBc)
+                    return bad(2, "--bc", f->flameDiffusion ? "--mode diffusion needs a patch with jet = true"
+                                                            : "jet = true belongs to --mode diffusion");
+                // No sink band on a mesh: --upstream is the plain distance from the origin.
+                if (!f->flameDiffusion) f->flameXf0 = r.upstream * f->flameEig.dthOverDD;
+            }
+            if (auto e = fvCompCommon(r, *f)) return std::unexpected(*e);
+            if (f->physics == Physics::LowMach) {
+                if (!finitePos(r.tol)) return bad(2, "--tol", "must be finite and > 0");
+                f->fvTol = r.given.contains("--tol") ? r.tol : 1e-5;
+            }
+        }
         return f;
     }
-    return validateFlow(r, std::move(c));
+    auto f = validateFlow(r, std::move(c));
+    if (f && fvStructured) {
+        f->fvMode = FvCompMode::Structured;
+        if (auto e = fvCompCommon(r, *f)) return std::unexpected(*e);
+    }
+    return f;
 }
 
 double channelUbEstimate(double reTau)
@@ -4743,6 +5406,48 @@ double channelPRef(double reTau, double mach)
 {
     const double ub = channelUbEstimate(reTau);
     return (ub / mach) * (ub / mach) / kGammaAir;
+}
+
+std::string fvCompLabel(const Case& c, bool twoD)
+{
+    const std::string mesh =
+        c.fvMode == FvCompMode::PolyMesh ? std::format("polyMesh {}", c.fvMeshDir)
+        : c.ogrid                        ? std::string("body-fitted O-grid via FaceMesh::fromCurvMesh")
+        : c.focalActive                  ? std::string("focal box via FaceMesh::fromCurvMesh")
+        : c.stretchBeta > 0              ? std::string("stretched box via FaceMesh::fromCurvMesh")
+                                         : std::string("uniform box via FaceMesh::fromCurvMesh");
+    if (c.rans != RansModel::None) // a mean-model label: no DNS/LES text, no 2D caveat
+        return std::format("[FV path, {}, {}{}] compressible {} [exact wall distance, scalars first-order upwind]: "
+                           "Kennedy-Gruber face flux, least-squares gradients, SSP-RK3",
+                           mesh, fvPrecisionName(c.fvPrecision), c.compensated || c.compSteady ? " compensated" : "",
+                           ransRunLabel(c.rans, c.compSteady ? RansMode::SteadyExplicit : RansMode::Urans));
+    const std::string model =
+        c.compSteady ? ransRunLabel(RansModel::None, RansMode::SteadyExplicit)
+        : c.lesLabel ? lesRunLabel(c.sgsModel, c.cs, twoD)
+                   : std::string("DNS") + (twoD ? " (2D: qualitative only, no vortex stretching)" : "");
+    return std::format("[FV path, {}, {}{}] compressible {}: Kennedy-Gruber face flux, least-squares gradients, "
+                       "SSP-RK3",
+                       mesh, fvPrecisionName(c.fvPrecision), c.compensated ? " compensated" : "", model);
+}
+
+std::string fvFlameLabel(const Case& c)
+{
+    const std::string mesh = c.fvMode == FvCompMode::PolyMesh ? std::format("polyMesh {}", c.fvMeshDir)
+                                                              : std::string("uniform box via FaceMesh::fromCurvMesh");
+    if (c.physics == Physics::LowMach) {
+        // The model part of the structured label; the scheme is this path's own.
+        const std::string base = flameRunLabel(c);
+        return base.substr(0, base.find(" MAC staggered")) +
+               std::format(" FV path, {}, {}: collocated SSP-RK3, mass-flux projection per stage on the geometric "
+                           "pressure matrix (AMG-PCG), T and species: MC-limited, ONE limiter shared by the species "
+                           "and T, species and rho on the PROJECTED face mass flux (mean flow central)",
+                           mesh, c.fvPrecision == FvPrecision::Fp32 ? "fp32, rho and rho Y compensated" : "fp64");
+    }
+    return flameRunLabel(c) +
+           std::format(" | FV path, {}, {}{}: Kennedy-Gruber face flux, least-squares gradients, SSP-RK3; species "
+                       "virtual-upwind MC {}on the face mass flux; open faces are FV boundary fluxes, no NSCBC, no sink",
+                       mesh, fvPrecisionName(c.fvPrecision), c.compensated ? " compensated" : "",
+                       c.flameDiffusion ? "shared by the species " : "");
 }
 
 std::string flowRunLabel(const Case& c)
@@ -4777,7 +5482,7 @@ std::string flowRunLabel(const Case& c)
         // The frozen rotor's steady march (immersed, laminar): the MRF note
         // ahead of the wall's.
         const std::string where =
-            rans && !c.ogrid ? std::string(kImmersedSuffix)
+            rans && !c.ogrid && c.fvMode == FvCompMode::Off ? std::string(kImmersedSuffix)
             : c.rotorMrf && !c.ogrid
                 ? std::string(kMrfSteadySuffix) + std::string(kImmersedSuffix)
                 : geo;
@@ -5385,6 +6090,29 @@ double hFine(const Case& c)
 std::string Case::describe() const
 {
     std::string s = describeCase();
+    if (fvMode == FvCompMode::Structured && sub == Subcommand::Flame)
+        s += std::format("  solver     {}\n  patches    {}\n  frames     uniform plane, containing cell per pixel, long "
+                         "side {}\n",
+                         fvFlameLabel(*this),
+                         physics == Physics::LowMach
+                             ? "x-lo inflow face, x-hi outflow p = 0 (the structured faces above; same mesh)"
+                         : flameDiffusion
+                             ? "x-lo Inflow, one fixed-face row per face (the Burke-Schumann sheet), x-hi Outflow at "
+                               "p0 carrying its own Y, no NSCBC and no sink (any NSCBC line above is the structured "
+                               "solver's; same mesh)"
+                             : "x-lo Far at the fresh state, x-hi Outflow at the burnt p, no NSCBC and no sink (any "
+                               "NSCBC line above is the structured solver's; same mesh)",
+                         fvFrameN);
+    else if (fvMode == FvCompMode::Structured)
+    {
+        s += std::format("  solver     {}\n  patches    {}\n  frames     uniform plane, containing cell per pixel, "
+                         "long side {}\n",
+                         fvCompLabel(*this, grid.nz == 1),
+                         ogrid ? "wall row: Wall; outer circle: Far (1D characteristic, not the structured far row)"
+                               : "box faces: Far (1D characteristic: no NSCBC, no sink), --noslip y: Wall, --far "
+                                 "periodic: cyclic",
+                         fvFrameN);
+    }
     if (checkpointDt > 0 || !restartPrefix.empty()) {
         s += checkpointDt > 0
                  ? std::format("  checkpoint every {:g} (model time) -> {}_ckpt.bin{}\n",
@@ -5401,15 +6129,81 @@ std::string Case::describe() const
     return s;
 }
 
+std::string fvConvLabel(const Case& c, bool twoD)
+{
+    const std::string mesh =
+        !c.fvMeshDir.empty() ? std::format("polyMesh {}", c.fvMeshDir)
+        : c.fvPerturb == 0   ? std::string("uniform box via FaceMesh::fromCurvMesh")
+                             : std::format("{} {:g} box via FaceMesh::fromCurvMesh", c.fvPerturb == 1 ? "sine" : "random",
+                                           c.fvPerturbAmp);
+    const std::string model = c.physics == Physics::Incompressible ? "Boussinesq, face buoyancy, skew-symmetric T"
+                                                                   : "compressible, buoyancy = rho(T) g through the EOS";
+    return std::format("DNS{} [FV path, {}, {}{}] Rayleigh-Benard {}", twoD ? " (2D: qualitative only)" : "", mesh,
+                       fvPrecisionName(c.fvPrecision), c.compensated ? " compensated" : "", model);
+}
+
 std::string Case::describeCase() const
 {
     if (sub == Subcommand::Prop) return describeProp(prop);
+    if (sub == Subcommand::Conv && fvConv)
+        return std::format("case:\n"
+                           "  mode       Rayleigh-Benard on a FaceMesh\n"
+                           "  label      {}\n"
+                           "  mesh       {}\n"
+                           "  sides      {}\n"
+                           "  driving    Ra={:.6g}  Pr={:.4g}  floor T={:.6g}, lid T={:.6g}, gravity {:.6g} in -y\n"
+                           "  derived    nu={:.6g}  kappa={:.6g}  Uff={:.6g}  cfl={:.3g}\n"
+                           "  run        tt={:.6g} free-fall times (tEnd={:.6g})  kick={:.3g}  height bins {}\n"
+                           "  out        {}\n",
+                           fvConvLabel(*this, fvMeshDir.empty() && grid.nz == 1),
+                           fvMeshDir.empty() ? std::format("{} x {} x {} fluid cells", nxInterior, grid.ny - 2, nzInterior)
+                                             : std::format("polyMesh {}, --bc {}", fvMeshDir, fvBcFile),
+                           closedSides ? "closed: no-slip adiabatic FaceMesh walls" : "periodic: cyclic faces", rayleigh,
+                           prandtl, tBot, tTop, gravity, nu, kappaDiff, uFreeFall, cfl, ft, tEnd, kick, fvConvBins,
+                           outPrefix);
     if (sub == Subcommand::Mesh)
         return std::format("case:\n"
                            "  mode       FaceMesh report of an OpenFOAM polyMesh (host-only, no GPU)\n"
                            "  polymesh   {}\n"
                            "  order      {}\n",
                            polyMeshDir, cellOrderNames()[std::size_t(meshOrder)]);
+    if (sub == Subcommand::Flow && fvMode == FvCompMode::PolyMesh)
+        return std::format("case:\n"
+                           "  mode       compressible FV path on an OpenFOAM polyMesh, GPU [FV path, body-fitted]\n"
+                           "  polymesh   {}\n"
+                           "  physics    Re {:g} on L {:g}, Mach {:g}, Pr {:g}, viscosity {}\n"
+                           "  sgs        {}\n"
+                           "  precision  {}\n"
+                           "  time       tt {:g} after ramp {:g} (L/U), cfl {:g}\n"
+                           "  frames     uniform plane, containing cell per pixel, long side {}\n"
+                           "  out        {}\n{}",
+                           fvMeshDir, re, fvBc.length, mach, prandtl, sutherland ? "sutherland" : "constant",
+                           lesLabel ? lesRunLabel(sgsModel, cs, false) : std::string("DNS"),
+                           fvPrecisionName(fvPrecision), tEnd, ramp, cfl, fvFrameN, outPrefix, fvBc.describe());
+    if (fvIncomp)
+    {
+        const std::string mesh =
+            sub == Subcommand::Tgv
+                ? std::format("periodic box {} x {} x {}{}", grid.nx, grid.ny, grid.nz,
+                              fvPerturb == 0 ? std::string()
+                                             : std::format(", {} perturbation {:g}", fvPerturb == 1 ? "sine" : "random",
+                                                           fvPerturbAmp))
+            : !fvMeshDir.empty() ? std::format("polyMesh {}, --bc {}", fvMeshDir, fvBcFile)
+                                 : std::format("O-grid {} x {} x {} (fromCurvMesh)", grid.nx, grid.ny - 2, grid.nz);
+        return std::format("case:\n"
+                           "  mode       incompressible time-accurate FV solver on a FaceMesh: collocated SSP-RK3 + "
+                           "per-stage projection, skew-symmetric central convection, AMG-PCG [{}]\n"
+                           "  mesh       {}\n"
+                           "  label      {}\n"
+                           "  run        {} = {:g}  cfl {:g}  pressure tol {:g}, maxIter {}\n"
+                           "  precision  {}\n"
+                           "  out        {}\n",
+                           sub == Subcommand::Tgv ? "dns tgv" : "dns flow", mesh,
+                           cs > 0 ? std::format("LES {} C {:g}", sgsModel == SgsModel::Sigma ? "sigma" : "Smagorinsky", cs)
+                                  : std::string("DNS"),
+                           fvMeshDir.empty() ? "tEnd" : "--ft", fvMeshDir.empty() ? tEnd : ft, cfl, fvTol, fvMaxPcg,
+                           fvPrecisionName(fvPrecision), outPrefix);
+    }
     if (sub == Subcommand::Flow && !fvCase.empty())
     {
         const FvNumerics num = fvNumerics(fvPrecision);
@@ -5725,6 +6519,13 @@ std::string Case::describeCase() const
             std::min(dtAc, dtTh), dtAc, dtTh, flameRunLabel(*this), outPrefix);
     }
     if (sub == Subcommand::Flame && chamberMode) return describeChamber(*this);
+    if (sub == Subcommand::Flame && fvMode == FvCompMode::PolyMesh)
+        return std::format("dns flame: premixed, FV path, polyMesh {}\n  flame      sigma {:g} beta {:g} Pr {:g} M {:g}, "
+                           "Lambda {:.10g}, delta_th/delta_D {:.6g}\n  run        tt {:g}, cfl {:g}, {}{}, x_f at s = {:g} "
+                           "from the origin, u_in {:g}\n  output     {}\n{}",
+                           fvMeshDir, flameModel.sigma, flameModel.beta, prandtl, mach, flameEig.Lambda,
+                           flameEig.dthOverDD, tEnd, cfl, fvPrecisionName(fvPrecision),
+                           compensated ? " compensated" : "", flameXf0, flameUIn, outPrefix, fvBc.describe());
     if (sub == Subcommand::Flame)
     {
         const double sig = flameModel.sigma, dth = flameEig.dthOverDD;

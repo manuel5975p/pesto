@@ -258,6 +258,18 @@ __global__ void __launch_bounds__(256) kURow(Mesh<R> m, Ctl<R> c, const R* U, co
     for (int j = 0; j < 3; ++j) sU[std::size_t(j) * nC + std::size_t(cc)] = s[j];
 }
 
+// fvOptions(U): the matrix source gains V f. A pass of its own: without a
+// source kURow's output is untouched bit for bit.
+template <class R>
+__global__ void kUForce(Mesh<R> m, Ctl<R> c, R* sU)
+{
+    const int cc = int(blockIdx.x) * kT + int(threadIdx.x);
+    if (cc >= m.nC) return;
+    const std::size_t nC = std::size_t(m.nC);
+#pragma unroll
+    for (int j = 0; j < 3; ++j) sU[std::size_t(j) * nC + std::size_t(cc)] += m.V[cc] * c.f[j];
+}
+
 // Component j's system for every j in mask: diag + boundary internalCoeffs,
 // source - V grad p + boundaryCoeffs (component j: Ad + j nC, rhs + j nC).
 template <class R>
@@ -1045,6 +1057,10 @@ std::expected<void, std::string> makeImpl(SimpleImpl<R>& I, const FvSimpleSetup&
     c.snLim = R(fc.schemes.snGradLimit);
     c.consistent = fc.simple.consistent;
     c.relaxU = R(fc.relaxU ? *fc.relaxU : 0.0);
+    if (fc.uSource) {
+        c.force = true;
+        for (std::size_t j = 0; j < 3; ++j) c.f[j] = R((*fc.uSource)[j]);
+    }
     c.emptyAxis = s.emptyAxis;
     I.needRef = s.needRef;
     I.refCell = s.refCell;
@@ -1176,6 +1192,7 @@ void SimpleImpl<R>::rowsU()
     (multiZone ? kURow<R, true> : kURow<R, false>)<<<grid(std::size_t(m.nC)), kT>>>(
         m, c, U.data(), up.data(), lo.data(), fx.data(), phi.data(), phiB.data(), ic.data(), bfx.data(), AU->off(),
         dU.data(), sU.data());
+    if (c.force) kUForce<R><<<grid(std::size_t(m.nC)), kT>>>(m, c, sU.data());
 }
 
 template <class R>
