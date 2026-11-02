@@ -221,7 +221,7 @@ ghost is an image. That difference converges at 2, so it is truncation, not a ga
 FP64 only: an FP32 channel is not on this table.
 
 
-Compared with care: `gpu_sst`, `gpu_sa_wedge`, `gpu_precond` fail at baseline
+Compared with care: `gpu_sst`, `gpu_sa_wedge`, `gpu_precond` failed at baseline
 (issues 78(h)) and were not read as oracles.
 
 ## Combinations

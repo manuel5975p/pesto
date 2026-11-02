@@ -640,21 +640,24 @@ void testRotor2Steady()
 // --precond 3 must certify the SAME cd as the plain march (1.55804, cd jitter
 // J 6.6e-5: within 2J), and M 0.05 with --precond 1 must not diverge (the
 // viscous-floor case). Measured 2026-10-28: K 3 certifies 1.55804 at 42400
-// iterations (plain 38000), M 0.05 K 1 at 68800 (plain 80000). The prop is
-// the customer (impl_M2.md); this pins the fixed point and the stability.
+// iterations (plain 38000). The prop is the customer (impl_M2.md); this pins
+// the fixed point and the stability.
+// M 0.05 runs at TOL 3e-4: cd jitter scales 1/M^2, so 1e-4 sits on the floor and
+// the stop is noise (2026-11-02, M or Re nudged by 1e-6, cd within 2e-5: 80200,
+// 86400, 111600, 118000, 129600, 174600, and one not within 4e5, which
+// settled like the rest). 3e-4 certifies all 7 at 43000-68200.
 void testPrecondCyl()
 {
     const std::string base =
         "\"" DNS_BIN "\" flow --physics compressible --body cylinder --ogrid "
-        "--n 256 --ny 96 --re 40 --steady 1e-4 --steady-steps 100000 "
-        "--emit stats --quiet";
+        "--n 256 --ny 96 --re 40 --steady-steps 100000 --emit stats --quiet";
     struct Case
     {
         const char* name;
         const char* extra;
     };
-    for (const Case k : {Case{"gpu_precond_m01_k3", " --mach 0.1 --precond 3"},
-                         Case{"gpu_precond_m005_k1", " --mach 0.05 --precond 1"}}) {
+    for (const Case k : {Case{"gpu_precond_m01_k3", " --steady 1e-4 --mach 0.1 --precond 3"},
+                         Case{"gpu_precond_m005_k1", " --steady 3e-4 --mach 0.05 --precond 1"}}) {
         const std::string prefix = k.name;
         const std::string out = prefix + "_stdout.txt";
         const int rc = valtest::runBinaryTo(base + k.extra + " --out " + prefix, out);

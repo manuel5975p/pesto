@@ -1,5 +1,7 @@
 #include "dns/la/amg.hpp"
 
+#include "dns/parallel.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -92,10 +94,26 @@ struct Coarse
     AmgTransfer t;
 };
 
+// Coarse rows per coarsen() worker, at least: a level below this runs inline.
+constexpr std::size_t kCoarsenGrain = 1 << 14;
+
+// The coarse rows of one coarsen() block in row order; the ends count from the
+// block's first entry.
+struct CoarseBlock
+{
+    std::size_t first = 0;                // the block's first coarse row
+    std::vector<int> col, rowEnd;         // coarse slots, per coarse row
+    std::vector<double> w;                // per coarse slot
+    std::vector<int> intraSlot, intraEnd; // per coarse row
+    std::vector<int> offSlot, offEnd;     // per coarse slot
+};
+
 // The coarse graph of agg (nc rows) with summed weights; the full transfer
-// when `transfer` (else only g, w). Deterministic: members ascending, each
-// coarse row's external slots sorted by (coarse column, fine slot).
-Coarse coarsen(const CellGraph& g, std::span<const double> w, std::vector<int> agg, int nc, bool transfer)
+// when `transfer` (else only g, w). Deterministic at any worker count: members
+// ascending, each coarse row's external slots sorted by (coarse column, fine
+// slot), its sums its own; blocks merge in block order.
+Coarse coarsen(const CellGraph& g, std::span<const double> w, std::vector<int> agg, int nc, bool transfer,
+               int threads)
 {
     Coarse c;
     c.g.n = nc;
@@ -108,41 +126,81 @@ Coarse coarsen(const CellGraph& g, std::span<const double> w, std::vector<int> a
         std::vector<int> fill(t.memberPtr.begin(), t.memberPtr.end() - 1);
         for (int i = 0; i < g.n; ++i) t.member[std::size_t(fill[std::size_t(agg[std::size_t(i)])]++)] = i;
     }
+    const int nw = workerCount(threads, std::size_t(nc) / kCoarsenGrain);
+    std::vector<CoarseBlock> blocks{std::size_t(nw)};
+    forBlocks(nw, std::size_t(nc), [&](int b, std::size_t lo, std::size_t hi) {
+        CoarseBlock& o = blocks[std::size_t(b)];
+        o.first = lo;
+        const std::size_t slots = g.col.size() / std::size_t(nw);
+        o.rowEnd.reserve(hi - lo);
+        o.col.reserve(slots / 2);
+        o.w.reserve(slots / 2);
+        if (transfer) {
+            o.intraEnd.reserve(hi - lo);
+            o.offEnd.reserve(slots / 2);
+            o.offSlot.reserve(slots);
+        }
+        std::vector<std::pair<int, int>> ext; // (coarse column, fine slot)
+        for (std::size_t I = lo; I < hi; ++I) {
+            ext.clear();
+            for (int m = t.memberPtr[I]; m < t.memberPtr[I + 1]; ++m) {
+                const int i = t.member[std::size_t(m)];
+                for (int k = g.rowPtr[std::size_t(i)]; k < g.rowPtr[std::size_t(i) + 1]; ++k) {
+                    const int J = agg[std::size_t(g.col[std::size_t(k)])];
+                    if (std::size_t(J) != I) ext.emplace_back(J, k);
+                    else if (transfer) o.intraSlot.push_back(k);
+                }
+            }
+            std::ranges::sort(ext);
+            for (std::size_t e = 0; e < ext.size();) {
+                const int J = ext[e].first;
+                double s = 0;
+                for (; e < ext.size() && ext[e].first == J; ++e) {
+                    s += w[std::size_t(ext[e].second)];
+                    if (transfer) o.offSlot.push_back(ext[e].second);
+                }
+                o.col.push_back(J);
+                o.w.push_back(s);
+                if (transfer) o.offEnd.push_back(int(o.offSlot.size()));
+            }
+            o.rowEnd.push_back(int(o.col.size()));
+            if (transfer) o.intraEnd.push_back(int(o.intraSlot.size()));
+        }
+    });
+    struct Base
+    {
+        std::size_t col = 0, intra = 0, off = 0;
+    };
+    std::vector<Base> base(std::size_t(nw) + 1);
+    for (std::size_t b = 0; b < std::size_t(nw); ++b)
+        base[b + 1] = {.col = base[b].col + blocks[b].col.size(),
+                       .intra = base[b].intra + blocks[b].intraSlot.size(),
+                       .off = base[b].off + blocks[b].offSlot.size()};
+    const Base total = base.back();
     c.g.rowPtr.assign(std::size_t(nc) + 1, 0);
-    c.g.col.reserve(g.col.size() / 2);
-    c.w.reserve(g.col.size() / 2);
+    c.g.col.resize(total.col);
+    c.w.resize(total.col);
     if (transfer) {
         t.intraPtr.assign(std::size_t(nc) + 1, 0);
-        t.offPtr.assign(1, 0);
-        t.offPtr.reserve(g.col.size() / 2 + 1);
-        t.offSlot.reserve(g.col.size());
+        t.intraSlot.resize(total.intra);
+        t.offPtr.assign(total.col + 1, 0);
+        t.offSlot.resize(total.off);
     }
-    std::vector<std::pair<int, int>> ext; // (coarse column, fine slot)
-    for (int I = 0; I < nc; ++I) {
-        ext.clear();
-        for (int m = t.memberPtr[std::size_t(I)]; m < t.memberPtr[std::size_t(I) + 1]; ++m) {
-            const int i = t.member[std::size_t(m)];
-            for (int k = g.rowPtr[std::size_t(i)]; k < g.rowPtr[std::size_t(i) + 1]; ++k) {
-                const int J = agg[std::size_t(g.col[std::size_t(k)])];
-                if (J != I) ext.emplace_back(J, k);
-                else if (transfer) t.intraSlot.push_back(k);
-            }
-        }
-        std::ranges::sort(ext);
-        for (std::size_t e = 0; e < ext.size();) {
-            const int J = ext[e].first;
-            double s = 0;
-            for (; e < ext.size() && ext[e].first == J; ++e) {
-                s += w[std::size_t(ext[e].second)];
-                if (transfer) t.offSlot.push_back(ext[e].second);
-            }
-            c.g.col.push_back(J);
-            c.w.push_back(s);
-            if (transfer) t.offPtr.push_back(int(t.offSlot.size()));
-        }
-        c.g.rowPtr[std::size_t(I) + 1] = int(c.g.col.size());
-        if (transfer) t.intraPtr[std::size_t(I) + 1] = int(t.intraSlot.size());
-    }
+    const auto shifted = [](std::span<const int> ends, std::size_t by, int* out) {
+        std::ranges::transform(ends, out, [by](int e) { return int(std::size_t(e) + by); });
+    };
+    forBlocks(nw, std::size_t(nw), [&](int b, std::size_t, std::size_t) {
+        const CoarseBlock& o = blocks[std::size_t(b)];
+        const Base& at = base[std::size_t(b)];
+        std::ranges::copy(o.col, c.g.col.begin() + std::ptrdiff_t(at.col));
+        std::ranges::copy(o.w, c.w.begin() + std::ptrdiff_t(at.col));
+        shifted(o.rowEnd, at.col, c.g.rowPtr.data() + o.first + 1);
+        if (!transfer) return;
+        std::ranges::copy(o.intraSlot, t.intraSlot.begin() + std::ptrdiff_t(at.intra));
+        std::ranges::copy(o.offSlot, t.offSlot.begin() + std::ptrdiff_t(at.off));
+        shifted(o.intraEnd, at.intra, t.intraPtr.data() + o.first + 1);
+        shifted(o.offEnd, at.off, t.offPtr.data() + at.col + 1);
+    });
     if (transfer) t.agg = std::move(agg);
     return c;
 }
@@ -208,13 +266,13 @@ std::expected<AmgHierarchy, std::string> amgHierarchy(const CellGraph& g, std::s
     while (h.levels() < s.maxLevels && std::int64_t(cur->n) * B > s.coarseUnknowns) {
         auto [agg, nc] = pairwise(*cur, curW, s.strongBeta);
         for (int p = 1; p < s.passes; ++p) {
-            const Coarse mid = coarsen(*cur, curW, agg, nc, false);
+            const Coarse mid = coarsen(*cur, curW, agg, nc, false, s.threads);
             auto [a2, n2] = pairwise(mid.g, mid.w, s.strongBeta);
             for (int& a : agg) a = a2[std::size_t(a)];
             nc = n2;
         }
         if (double(cur->n) < s.minRatio * double(nc)) break; // stalled: cur is the coarsest
-        Coarse c = coarsen(*cur, curW, std::move(agg), nc, true);
+        Coarse c = coarsen(*cur, curW, std::move(agg), nc, true, s.threads);
         h.transfers.push_back(std::move(c.t));
         h.graphs.push_back(std::move(c.g));
         curW = std::move(c.w);

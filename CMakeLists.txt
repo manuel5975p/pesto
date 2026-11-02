@@ -519,7 +519,8 @@ if(BUILD_TESTING)
     # AMG setup gate (docs/la.md, masterplan_meshsolver P5 "Setup"): the host
     # hierarchy of a 6M-cell 7-point graph <= 3 s, two setups identical.
     add_test(NAME amg_setup COMMAND test_amg setup)
-    set_tests_properties(amg_setup PROPERTIES TIMEOUT 120)
+    # A wall-time gate on all host threads: under ctest -j it measures the other tests.
+    set_tests_properties(amg_setup PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
     # Incompressible FV path (docs/fv.md): the OpenFOAM case layer and the
     # simpleFoam parity references (tools/fv/make_test_data.sh).
     set(DNS_FV_DATA ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/fv)

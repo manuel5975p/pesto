@@ -10,6 +10,13 @@ bool deviceAvailable()
     return hipGetDeviceCount(&n) == hipSuccess && n > 0;
 }
 
+std::string deviceName()
+{
+    hipDeviceProp_t prop{};
+    if (hipGetDeviceProperties(&prop, 0) != hipSuccess) return {};
+    return prop.name;
+}
+
 hipError_t uploadNarrow(const std::vector<double>& src, DeviceScalar& dst)
 {
     if (src.size() != dst.size()) return hipErrorInvalidValue;

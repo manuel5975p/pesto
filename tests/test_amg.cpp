@@ -14,8 +14,10 @@
 #include "dns/la/structured.hpp"
 #include "dns/polymesh.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <map>
@@ -323,6 +325,29 @@ void rejections()
     check(f && f->levels() == 1, "100 rows <= 256: one level");
 }
 
+// coarsen() threads its levels: the hierarchy is byte-identical at any worker
+// count. 64^3 so that the fine levels really split (kCoarsenGrain rows per
+// worker); uneven symmetric weights so that every sum and tie matters.
+void threadInvariance()
+{
+    const CellGraph g = structuredGraph({64, 64, 64}, {false, false, false});
+    std::vector<double> w(g.col.size());
+    for (int i = 0; i < g.n; ++i)
+        for (int k = g.rowPtr[std::size_t(i)]; k < g.rowPtr[std::size_t(i) + 1]; ++k) {
+            const std::uint64_t a = std::uint64_t(std::min(i, g.col[std::size_t(k)]));
+            const std::uint64_t b = std::uint64_t(std::max(i, g.col[std::size_t(k)]));
+            const std::uint64_t h = (a * 0x9E3779B97F4A7C15ull) ^ (b * 0xC2B2AE3D27D4EB4Full);
+            w[std::size_t(k)] = 1.0 / 3.0 + double(h >> 40) * 0x1p-24;
+        }
+    const auto setupAt = [&](int threads) {
+        return orDie(amgHierarchy(g, w, 1, AmgSetup{.lineRatio = 4, .threads = threads}), "threads");
+    };
+    const AmgHierarchy ref = setupAt(1);
+    check(ref.levels() > 3, "thread invariance: a real hierarchy");
+    for (const int t : {2, 3, 7, 64, 0})
+        check(setupAt(t) == ref, "hierarchy at " + std::to_string(t) + " threads == serial, every vector");
+}
+
 int setupGate()
 {
     std::printf("Setup gate: host hierarchy of a 6M-cell 7-point graph\n");
@@ -362,5 +387,6 @@ int main(int argc, char** argv)
     hierarchies();
     structure();
     rejections();
+    threadInvariance();
     return dnstest::finish();
 }

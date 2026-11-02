@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <format>
+#include <iterator>
 #include <memory>
 #include <vector>
 
@@ -156,7 +157,7 @@ void wedgeGate()
     const int rc = valtest::runBinary(
         "\"" DNS_BIN "\" flow --physics compressible --body sphere --ogrid --nz 1 "
         "--n 64 --ny 48 --re 1e3 --mach 0.2 --ogrid-far 20 --ogrid-beta 4.5 "
-        "--rans sst-2003m --steady 1e-4 --steady-steps 200000 --emit stats "
+        "--rans sst-2003m --steady 1e-4 --steady-steps 400000 --emit stats "
         "--emit surface --out " + prefix);
     check(rc == 0, "wedge L1 Re 1e3 SST-2003m: the steady march certifies (exit 0)");
     const auto st = valtest::loadCsv(prefix + "_stats.csv");
@@ -173,7 +174,23 @@ void wedgeGate()
     std::printf("wedge L1 Re 1e3 SST-2003m: %.0f iterations, cd %.5f, theta_s "
                 "%.2f, L_r %.4f, mutMax %.2f, hits %.0f\n",
                 it, cd, ts, lr, mut, hits);
-    check(it <= 1.5e5, "wedge gate: certified within 1.5e5 iterations (114600)");
+    // The stop iteration is noise, as gpu_sa_wedge measured: same case 231600
+    // twice; M or Re moved by 5e-7..1e-6, cd within 1e-4: 122400, 152200,
+    // 152400, 165400, 169000, 188200 (gfx1201, 2026-11-02); 114600 on gfx1100.
+    // The first row with remaining < 3e-4 holds at 104400-124200.
+    const auto& iters = st->col("iter");
+    const auto& rem = st->col("remaining");
+    const auto& lrs = st->col("lr");
+    const auto first = std::ranges::find_if(rem, [](double x) { return x < 3e-4; });
+    const auto row = std::distance(rem.begin(), first);
+    const double settled =
+        first == rem.end() ? HUGE_VAL : iters[static_cast<std::size_t>(row)];
+    std::printf("  remaining < 3e-4 first at iteration %.0f\n", settled);
+    check(settled <= 1.4e5,
+          "wedge gate: remaining < 3e-4 within 1.4e5 iterations (104400-124200)");
+    check(std::ranges::all_of(lrs.begin() + row, lrs.end(),
+                              [](double x) { return std::abs(x / 1.1656 - 1) < 5e-3; }),
+          "wedge gate: L_r holds its value on every row once settled");
     check(std::abs(cd / 0.49851 - 1) < 5e-4 && std::abs(lr / 1.1656 - 1) < 5e-3 &&
               std::abs(ts - 100.30) < 0.1,
           "wedge gate: cd, L_r, theta_s at their measured values");

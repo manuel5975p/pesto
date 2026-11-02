@@ -32,4 +32,6 @@ inline constexpr cudaMemcpyKind hipMemcpyDeviceToDevice = cudaMemcpyDeviceToDevi
 #define hipGetLastError cudaGetLastError
 #define hipGetErrorString cudaGetErrorString
 #define hipGetDeviceCount cudaGetDeviceCount
+#define hipGetDeviceProperties cudaGetDeviceProperties
+#define hipDeviceProp_t cudaDeviceProp
 #define hipMemGetInfo cudaMemGetInfo

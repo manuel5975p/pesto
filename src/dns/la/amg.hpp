@@ -30,6 +30,7 @@ struct AmgSetup
     int maxLevels = 30;
     double minRatio = 1.2;     // coarsening stalls below rows_l / rows_{l+1}
     double lineRatio = 0;      // > 1: strongLines on every level at this ratio
+    int threads = 0;           // host workers, <= 0: hardware; never moves a result
 };
 
 // Level l -> l + 1. Coarse row I sums its members' rows; the coarse diagonal

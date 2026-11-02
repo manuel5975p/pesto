@@ -348,7 +348,9 @@ All double gaps ≤ 3e-15. A random NON-skew block coupling on a weakly dominant
 operator is indefinite (the first attempt: FGMRES stalled at 0.2, BiCGStab
 broke down) — test operators must be well posed.
 
-**LA-perf** (`gpu_la_perf`, `simjob --bench`):
+**LA-perf** (`gpu_la_perf`, `simjob --bench`; bounds per device, `laPerfGate`.
+Table: gfx1100. RX 9070 XT, gfx1201: SpMV B5 1.269 ns/cell, lines 0.79-0.81 ms,
+gates 1.4 / 0.9):
 
 | kernel | measured | gate |
 |---|---|---|
@@ -412,9 +414,11 @@ r = 0.1 cylinder, sanitized; constant null space). FFT-PCG (FP32, tol 1e-6 of
 FP32 floor of an h⁻² operator), yet its p agrees to 1e-7.
 
 **Setup** (`amg_setup`, host): 182³ = 6.03M-row 7-point graph, unit weights:
-**1.83 s** (lines on: 2.01 s), 9 levels 6 028 568 → 1 507 145 → 376 841 →
+**1.92 s** (lines on: 2.31 s; Ryzen 3900X, RUN_SERIAL, 3 s gate), 9 levels 6 028 568 → 1 507 145 → 376 841 →
 94 314 → 23 592 → 5 901 → 1 476 → 370 → 93, grid complexity 1.333, operator
-1.559; two setups identical (`AmgHierarchy ==`, every vector).
+1.559; two setups identical (`AmgHierarchy ==`, every vector). `coarsen` runs in
+`forBlocks` (per-block buffers merged in block order, a row's sums its own):
+byte-identical at any worker count (`test_amg` thread invariance).
 
 **Polyhedral meshes** (`gpu_amg_meshes` + local paths; OpenFOAM's
 `Gauss linear corrected` Laplacian, γ = 1: internal `|S|/max(n·d, 0.05|d|)`,

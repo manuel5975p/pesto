@@ -531,19 +531,17 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
             return s / nk;
         };
         const double xRear = og.mesh.node(og.nTheta + 1, 1, kLo)[0];
-        // The wedge demands reversed flow in the first cell (verbatim). The
-        // full revolution starts at the first reversed cell instead: the
-        // k-mean of the first cell sits within jitter of 0 at the rear
-        // stagnation point and flipped L_r between its value and 0
-        // (measured, SA-neg Re 1e3 64 x 48 x 64).
+        // Start at the first reversed cell: the first cell sits within jitter
+        // of 0 at the rear stagnation point and flipped L_r between its value
+        // and 0 (measured, SA-neg Re 1e3: 64 x 48 x 64, and 1/3 of the 64 x 48
+        // wedge's stats rows, the last one included).
         int jStart = 1;
-        if (!wedge)
-            while (jStart < g.ny - 2)
-            {
-                double xs = 0;
-                if (at(jStart, xs) < 0) break;
-                ++jStart;
-            }
+        while (jStart < g.ny - 2)
+        {
+            double xs = 0;
+            if (at(jStart, xs) < 0) break;
+            ++jStart;
+        }
         double x0 = 0, u0 = at(jStart, x0);
         if (!(u0 < 0)) return 0.0;
         for (int j = jStart + 1; j <= g.ny - 2; ++j)

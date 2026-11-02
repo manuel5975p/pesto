@@ -759,11 +759,14 @@ Measured gfx1100 via simjob, 2026-10-28.
     uninitialised `hipMalloc` phi (`runner_incomp` zeroes it, line 138); a
     fresh process got different garbage. The test now zeroes phi: w is 0.0
     exactly, 16 iterations every run. No solver change.
-77. **`amg_setup` fails its wall-time gate under `ctest -j 8`** (found in
-    S6, not caused: no la code touched): "[FAIL] 6M setup (lineRatio 4) <=
-    3 s (3.094201 s)" twice in the host suite at -j 8 (simjob --cpu); alone
-    it passes (9 s total). A timing gate in a parallel suite is
-    load-dependent; OPEN: run it serially (RUN_SERIAL) or gate on a ratio.
+77. **FIXED (2026-11-02): `amg_setup` failed its wall-time gate** (found in
+    S6): "[FAIL] 6M setup (lineRatio 4) <= 3 s (3.094201 s)" twice at -j 8,
+    blamed on load. It also failed idle, this code and f892cc6: 3.0 / 3.35 s on
+    the Ryzen 3900X (docs/la.md's old 1.83 s was another host). `coarsen` was
+    60% of it; now threaded, byte-identical at any worker count (`test_amg`;
+    hierarchy hash == f892cc6 on 8 cases). Gate unchanged: 1.92 / 2.31 s alone.
+    Threaded, it still lost at -j 8 (2.87 / 4.10 s, other tests on its cores),
+    so the test is RUN_SERIAL: a wall-time gate needs the host to itself.
 
 ### Low-Mach (`--physics lowmach`, docs/chem.md "Low-Mach" / "Low-Mach Bunsen" / "Low-Mach open laterals" / "Low-Mach gravity" / "Low-Mach rim" / "Low-Mach dt rule, real-burner scouts, renderer"; masterplan real_bunsen S4–S9)
 
@@ -1655,16 +1658,17 @@ Measured gfx1100 via simjob, 2026-10-28, defaults (4 cells/δ_th) and the
         structured row on FV gives the same cd to 7e-5. docs/fvcomp.md "Far gap".
         Left: no R -> infinity limit extrapolated, 384 not flat, the gap at 80 / 160 D
         M 0.1 is -1.2e-3 / -4.0e-3 at n 192 (order 2.1, 2.4; h1 grows with R).
-    (h) Seen while gating, NOT caused here: `gpu_sst`, `gpu_sa_wedge`, `gpu_precond`
-        fail (structured O-grid `--steady` gates: exit 8 "remaining change inf"
-        or a certify-iteration band). Stats are byte-identical to f892cc6 on the
-        failing cases, and f892cc6 exits 8 too. `amg_setup`: 6M setup 3.02-3.44 s
-        vs its 3 s timing gate, idle host and baseline binary included, not load.
-        `gpu_la_perf`: timing only, `gpu/la` sources equal f892cc6. Lines apply
-        0.794, 0.795, 0.796, 0.812 ms under `--bench` vs its 0.8 gate (doc 0.637);
-        SpMV B5 1.27 vs doc 1.163 ns/cell. It flips at the gate. Cause of the
-        ~10-25% over the doc numbers unmeasured: no f892cc6 `test_gpu_la` run on
-        this machine now. Gate unchanged.
+    (h) FIXED (2026-11-02), seen while gating, none caused here. `gpu_sa_wedge`,
+        `gpu_sst`, `gpu_precond` gated `dns flow --steady`'s stop iteration, a first
+        passage of noise through TOL: SA 111000-185400, SST 122400-231600 under a
+        1e-6 nudge of M or Re, cd within 1e-4. Wedges now gate the first `remaining`
+        < 3e-4 (98600-113000 <= 1.3e5, 104400-124200 <= 1.4e5), cap 2e5 -> 4e5.
+        M 0.05 K 1 sat on the jitter floor at TOL 1e-4 (one nudge not within 4e5):
+        TOL 3e-4 there, 43000-68200 under the same 1e5 cap. The wedge's L_r read 0
+        on 1/3 of its stats rows (first axis cell at jitter around 0): fixed in
+        `recircLength`, pinned on every settled row. `gpu_la_perf`: f892cc6 = now on
+        gfx1201 (1.269 ns/cell, 0.79-0.81 ms), the 0.8 ms gate was gfx1100's: bounds
+        per device (`laPerfGate`). `amg_setup`: see 77.
     (g) Ladders stop at 3 levels by decision (no GPU job over 5 minutes); every
         quoted order rests on those. Re 100 St difference shrinks at order
         ~1 on rungs that are not asymptotic (St moves 4% between the last two);

@@ -10,12 +10,17 @@
 #include <cassert>
 #include <cstdio>
 #include <expected>
+#include <string>
 #include <vector>
 
 namespace dns::gpu {
 
 // True iff at least one GPU device is usable (tests skip otherwise).
 bool deviceAvailable();
+
+// Device 0's marketing name: a wall-time gate is a fact about one device, so it
+// picks its bound by this. Empty when the runtime refuses.
+std::string deviceName();
 
 // Which toolchain compiled this backend. The sources are identical either way
 // (src/compat/cuda/README.md); the label exists so a stored provenance line --
