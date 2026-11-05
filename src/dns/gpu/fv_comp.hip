@@ -5,6 +5,7 @@
 #include "dns/fvrans.hpp"
 #include "dns/gpu/device_buffer.hpp"
 #include "dns/gpu/hip_runtime.hpp"
+#include "dns/gpu/internal/ckpt_words.hpp"
 #include "dns/gpu/internal/reduce.hpp"
 #include "dns/gpu/internal/stage_write.hpp"
 #include "dns/gpu/reductions.hpp"
@@ -362,10 +363,10 @@ __global__ void __launch_bounds__(kT) kFvGravity(View<R> m, R cr, const R* Gf, R
 // Per-cell dt (FvRef::stableDt's bound); a non-positive or non-finite rho, p
 // writes -1. Les: mu_t adds at its own factor. Rans: 1 SA (its scalar's bound on
 // the first field), 2 SST; a non-finite mu_t writes -1.
-template <class R, bool Les, int Rans>
+template <class R, bool Les, int Rans, bool Thick = false>
 __global__ void __launch_bounds__(kT) kFvDt(View<R> m, Gas<R> gas, double cfl, double diff, R fMol, R fEddy,
                                             const R* P, const R* nut, const R* Ph, const R* entS, const R* diffC,
-                                            R* dtc)
+                                            R* dtc, const R* fe = nullptr, R gPr = R(0.0))
 {
     const int c = int(blockIdx.x) * kT + int(threadIdx.x);
     if (c >= m.nC) return;
@@ -390,6 +391,10 @@ __global__ void __launch_bounds__(kT) kFvDt(View<R> m, Gas<R> gas, double cfl, d
         R mu, kappa;
         transportAt(gas, p.temp, mu, kappa);
         R den = mu * fMol;
+        if constexpr (Thick) { // the thickened energy and species: FE gamma/Pr on mu
+            const R a = fe[c] * gPr, b = R(4.0 / 3.0);
+            den = mu * (a > b ? a : b);
+        }
         if constexpr (Les) den += nut[c] * fEddy;
         if constexpr (Rans == 1) {
             const R ds = p.rho * saDtDiffusivity(mu / p.rho, Ph[std::size_t(kFvRansFields) * std::size_t(c)]) /
@@ -726,11 +731,25 @@ struct SpView
 {
     int nY, iY, fuel, ox;
     R lnA, Ta, q, invPr, stoich;
+    // LES, TFLES (Diff != 0 instantiations): 1/Sc_t, the eddy conductivity scale
+    // cp/Pr_t, LES on (the Thick kernel's SGS term).
+    R invSct, kapLes;
+    int les;
+};
+
+// The species face diffusivity of kFvSpFace, one instantiation each: Molecular (the
+// shipped kernel), Eddy (LES), Thick (TFLES, with or without LES).
+enum class FvSpDiff : int
+{
+    Molecular = 0,
+    Eddy = 1,
+    Thick = 2
 };
 
 // Y_k = rhoY_k / rho [nY per cell] and the ONE omega of this stage. Two: model C1.
-template <class R, bool Two>
-__global__ void kFvSpCell(View<R> m, SpView<R> sp, const R* q, const R* P, R* Y, R* om)
+// Thick: (E/F) omega, eof the step's per-cell E/F (kChemCellPass<true>).
+template <class R, bool Two, bool Thick = false>
+__global__ void kFvSpCell(View<R> m, SpView<R> sp, const R* q, const R* P, R* Y, R* om, const R* eof)
 {
     const int c = int(blockIdx.x) * kT + int(threadIdx.x);
     if (c >= m.nC) return;
@@ -739,7 +758,24 @@ __global__ void kFvSpCell(View<R> m, SpView<R> sp, const R* q, const R* P, R* Y,
     R* y = Y + std::size_t(sp.nY) * cc;
     for (int s = 0; s < sp.nY; ++s) y[s] = q[std::size_t(sp.iY + s) * nC + cc] / rho;
     if constexpr (Two) om[c] = arrheniusRate2(sp.lnA, sp.Ta, rho, y[sp.fuel], y[sp.ox], P[std::size_t(kPrim) * cc + 6]);
+    else if constexpr (Thick) om[c] = arrheniusRate(sp.lnA, sp.Ta, rho, y[sp.fuel], P[std::size_t(kPrim) * cc + 6]) * eof[c];
     else om[c] = arrheniusRate(sp.lnA, sp.Ta, rho, y[sp.fuel], P[std::size_t(kPrim) * cc + 6]);
+}
+
+// kFvSpCell<R, true> with model C2b (FvChem::law): arrheniusRate2(lnA + ln C(xi), ...),
+// xi of the cell's unfloored Y_F, Y_O (the structured kChemCellPass2Phi). Its own kernel:
+// the C1 instantiation stays the shipped one.
+template <class R>
+__global__ void kFvSpCellPhi(View<R> m, SpView<R> sp, PhiRateLaw<R> law, const R* q, const R* P, R* Y, R* om)
+{
+    const int c = int(blockIdx.x) * kT + int(threadIdx.x);
+    if (c >= m.nC) return;
+    const std::size_t nC = std::size_t(m.nC), cc = std::size_t(c);
+    const R rho = q[cc];
+    R* y = Y + std::size_t(sp.nY) * cc;
+    for (int s = 0; s < sp.nY; ++s) y[s] = q[std::size_t(sp.iY + s) * nC + cc] / rho;
+    const R yf = y[sp.fuel], yo = y[sp.ox];
+    om[c] = arrheniusRate2(sp.lnA + phiRateLn(law, yf, yo), sp.Ta, rho, yf, yo, P[std::size_t(kPrim) * cc + 6]);
 }
 
 // Boundary Y [nY per compact face]: fvBoundaryY on the boundary state's mass flux.
@@ -782,9 +818,13 @@ __global__ void __launch_bounds__(kT) kFvGradY(View<R> m, int nY, const R* Y, co
 
 // Internal species fluxes: the F[0] of this face times the limited face value,
 // minus Fick. Runs after kFvFace. Visc: mu > 0. Two: one limiter shared by all
-// species (the premixed kernel is the other instantiation, bit for bit).
-template <class R, bool Visc, bool Two>
-__global__ void __launch_bounds__(kT) kFvSpFace(View<R> m, SpView<R> sp, Gas<R> gas, const R* P, const R* Y, const R* GY, R* F)
+// species (the premixed kernel is the other instantiation, bit for bit). Diff
+// (FvSpDiff, premixed, Visc): Eddy rho D + nut_f/Sc_t; Thick fvThickRhoD and the
+// thickened energy flux added to this face's F_E (G the cell gradients, fe, omc the
+// step's F E and Omega). Molecular: the kernel as it was.
+template <class R, bool Visc, bool Two, int Diff = 0>
+__global__ void __launch_bounds__(kT) kFvSpFace(View<R> m, SpView<R> sp, Gas<R> gas, const R* P, const R* Y, const R* GY,
+                                                const R* G, const R* nut, const R* fe, const R* omc, R* F)
 {
     const int f = int(blockIdx.x) * kT + int(threadIdx.x);
     if (f >= m.nI) return;
@@ -797,6 +837,20 @@ __global__ void __launch_bounds__(kT) kFvSpFace(View<R> m, SpView<R> sp, Gas<R> 
         transportAt(gas, R(0.5) * (P[std::size_t(kPrim) * std::size_t(r.own) + 6] + P[std::size_t(kPrim) * std::size_t(r.nei) + 6]),
                     mu, kappa);
         rhoD = mu * sp.invPr;
+        if constexpr (Diff == int(FvSpDiff::Eddy)) {
+            rhoD = fvEddyRhoD(rhoD, R(0.5) * (nut[r.own] + nut[r.nei]), sp.invSct);
+        } else if constexpr (Diff == int(FvSpDiff::Thick)) {
+            const R nutf = sp.les ? R(0.5) * (nut[r.own] + nut[r.nei]) : R(0.0);
+            const R FEf = R(0.5) * (fe[r.own] + fe[r.nei]), Omf = R(0.5) * (omc[r.own] + omc[r.nei]);
+            rhoD = fvThickRhoD(rhoD, FEf, Omf, nutf, sp.invSct, sp.les != 0);
+            R ga[3], gb[3], gT[3];
+            cellGrad(G, r.own, 3, ga);
+            cellGrad(G, r.nei, 3, gb);
+            fvFaceGrad(ga, gb, P[std::size_t(kPrim) * std::size_t(r.own) + 6], P[std::size_t(kPrim) * std::size_t(r.nei) + 6], r.d,
+                       r.corr, gT);
+            const R gTS = gT[0] * r.S[0] + gT[1] * r.S[1] + gT[2] * r.S[2];
+            w[4] = w[4] + fvThickEnergyFlux(FEf, Omf, nutf, kappa, sp.kapLes, gTS, sp.les != 0);
+        }
     }
     const R* yP = Y + std::size_t(sp.nY) * std::size_t(r.own);
     const R* yN = Y + std::size_t(sp.nY) * std::size_t(r.nei);
@@ -880,6 +934,103 @@ __global__ void kFvChem(View<R> m, SpView<R> sp, const R* om, R* out, R* ol, R c
     }
 }
 
+// --- TFLES (FvCompConfig::tfles; FvRef's tfles* passes, gpu/tfles.hip on faces). ---
+
+// The fixed arguments of the TFLES kernels.
+template <class R>
+struct TfView
+{
+    int iF, rad, uniform, charlette;
+    R lnAs, TaS, beta, Fmax, deltaL, nuU, effBeta;
+};
+
+// Raw sensor tanh(beta w_s) (w_s the rate at TaS, kTflesSensorRaw) and, for the
+// efficiency, curl u off the cell gradients [3][nC].
+template <class R>
+__global__ void kFvTflesRaw(View<R> m, TfView<R> t, const R* q, const R* P, const R* G, R* raw, R* curl)
+{
+    const int c = int(blockIdx.x) * kT + int(threadIdx.x);
+    if (c >= m.nC) return;
+    const std::size_t nC = std::size_t(m.nC), cc = std::size_t(c);
+    if (!t.uniform) {
+        const R r = q[cc];
+        raw[c] = tanh(t.beta * arrheniusRate(t.lnAs, t.TaS, r, q[std::size_t(t.iF) * nC + cc] / r, P[std::size_t(kPrim) * cc + 6]));
+    }
+    if (t.charlette) {
+        const R* g = G + std::size_t(kGrad) * cc;
+        curl[cc] = g[7] - g[5];
+        curl[nC + cc] = g[2] - g[6];
+        curl[2 * nC + cc] = g[3] - g[1];
+    }
+}
+
+// One pass of the T-gated max filter along walked axis slot `pass`: out = max of in
+// over the cells the face walk reaches in rad steps each way with T >= T_c (c itself
+// included). next: fvTflesWalk's table, -1 stops.
+template <class R>
+__global__ void kFvTflesDilate(View<R> m, int rad, const int* next, const R* P, const R* in, R* out)
+{
+    const int c = int(blockIdx.x) * kT + int(threadIdx.x);
+    if (c >= m.nC) return;
+    const std::size_t nC = std::size_t(m.nC);
+    const R Tc = P[std::size_t(kPrim) * std::size_t(c) + 6];
+    R mx = in[c];
+    for (int dir = 0; dir < 2; ++dir) {
+        const int* nx = next + std::size_t(dir) * nC;
+        int n = c;
+        for (int k = 0; k < rad; ++k) {
+            n = nx[n];
+            if (n < 0) break;
+            if (P[std::size_t(kPrim) * std::size_t(n) + 6] >= Tc) mx = fmax(mx, in[n]);
+        }
+    }
+    out[c] = mx;
+}
+
+// Colin's grid u' = c2 h^3 |lap(curl u)| (coef = c2 h^3 per cell), the compact
+// Laplacian (1/V) sum (phi_N - phi_P) corr.S over the cell's internal CSR entries.
+template <class R>
+__global__ void __launch_bounds__(kT) kFvTflesColin(View<R> m, const R* lapW, const R* coef, const R* curl, R* uh)
+{
+    const int c = int(blockIdx.x) * kT + int(threadIdx.x);
+    if (c >= m.nC) return;
+    const std::size_t nC = std::size_t(m.nC);
+    R s2 = R(0.0);
+    for (int k = 0; k < 3; ++k) {
+        const R* f = curl + std::size_t(k) * nC;
+        R l = R(0.0);
+        for (int e = m.cStart[c]; e < m.cStart[c + 1]; ++e) {
+            const int o = m.gEnt[e].other;
+            if (o < 0) continue;
+            l += lapW[e] * (f[o] - f[c]);
+        }
+        l /= m.V[c];
+        s2 += l * l;
+    }
+    uh[c] = coef[c] * sqrt(s2);
+}
+
+// F = 1 + (F_max - 1) Omega, E Charlette off the edge layers (kTflesCombine): fe =
+// F E, eof = E / F, om = Omega. W null: the uniform sensor (Omega 1).
+template <class R>
+__global__ void kFvTflesCombine(int nC, TfView<R> t, const R* W, const R* uh, const R* hc, const std::uint8_t* edge, R* fe,
+                                R* eof, R* om)
+{
+    const int c = int(blockIdx.x) * kT + int(threadIdx.x);
+    if (c >= nC) return;
+    const R w = W ? W[c] : R(1.0);
+    const R F = R(1.0) + (t.Fmax - R(1.0)) * w;
+    R E = R(1.0);
+    if (t.charlette && !edge[c]) {
+        const R D = F * t.deltaL;
+        const R up = colinUprime(uh[c], D, hc[c]);
+        E = charletteEfficiency(F, up, up * D / t.nuU, t.effBeta);
+    }
+    fe[c] = F * E;
+    eof[c] = E / F;
+    om[c] = w;
+}
+
 // J_c of FvRef::chemDt, FP64 from the state words.
 template <class R>
 struct ChemJ
@@ -915,6 +1066,29 @@ struct ChemJ2
         const double yf = fmax(double(s[std::size_t(iFuel) * n + cc]) / p.rho, 0.0);
         const double yo = fmax(double(s[std::size_t(iOx) * n + cc]) / p.rho, 0.0);
         const double J = exp(lnA - Ta / p.temp) * p.rho * (yo + stoich * yf + q * yf * yo * Ta / (cv * p.temp * p.temp));
+        return isfinite(J) ? J : HUGE_VAL;
+    }
+};
+
+// ChemJ2 with the C2b law: ChemRate2Phi's expression (ln C in FP64 of the unfloored
+// Y_F, Y_O), FP64 from the state words. Its own functor: ChemJ2 stays the shipped one.
+template <class R>
+struct ChemJ2Phi
+{
+    const R* s;
+    std::size_t n;
+    int iFuel, iOx;
+    double gamma, Rgas, lnA, Ta, q, cv, stoich;
+    PhiRateLaw<double> law;
+    __device__ double operator()(int c) const
+    {
+        const std::size_t cc = std::size_t(c);
+        const FvPrim<double> p = fvPrimOf(double(s[cc]), double(s[n + cc]), double(s[2 * n + cc]), double(s[3 * n + cc]),
+                                          double(s[4 * n + cc]), gamma, Rgas);
+        const double YF = double(s[std::size_t(iFuel) * n + cc]) / p.rho, YO = double(s[std::size_t(iOx) * n + cc]) / p.rho;
+        const double yf = fmax(YF, 0.0), yo = fmax(YO, 0.0);
+        const double J =
+            exp(lnA + phiRateLn(law, YF, YO) - Ta / p.temp) * p.rho * (yo + stoich * yf + q * yf * yo * Ta / (cv * p.temp * p.temp));
         return isfinite(J) ? J : HUGE_VAL;
     }
 };
@@ -985,11 +1159,15 @@ struct DeviceFvComp::Impl
     virtual std::expected<std::vector<double>, std::string> patchFlux(int) = 0;
     virtual std::expected<FvSurface, std::string> surface() = 0;
     virtual std::expected<std::vector<double>, std::string> eddyViscosity() = 0;
+    virtual std::expected<DeviceFvComp::TflesStats, std::string> tflesStats() = 0;
     virtual std::expected<unsigned long long, std::string> floorHits() const = 0;
     virtual std::expected<void, std::string> cellFields(std::array<std::vector<double>, 7>&,
                                                         std::array<std::vector<double>, 12>&) = 0;
     virtual void boost(const std::array<double, 3>&) = 0;
     virtual std::expected<void, std::string> setBc(int, const FvBc&) = 0;
+    virtual std::expected<void, RunError> save(Checkpoint&) const = 0;
+    virtual std::expected<void, RunError> load(const Checkpoint&) = 0;
+    virtual std::expected<void, std::string> setBcRows(int, std::span<const FvBc>) = 0;
     virtual std::size_t bytes() const = 0;
     int nC = 0;
     FvPrecision precision{};
@@ -1016,6 +1194,7 @@ struct FvCompImpl final : DeviceFvComp::Impl
     // RANS: nState = 5 + nT rows; force: the channel's drive (dns/fvrans.hpp).
     int nState = kFvMeanVars, nT = 0;
     bool rans = false, sst = false, ransOnly = false, force = false, useLts = false;
+    FvModuleSet mods{}; // the inventory's modules of this solver (localDt adds Steady)
     RansModel ransModel = RansModel::None;
     R phiInf[2] = {R(0.0), R(0.0)}, omegaFloor = R(0.0), fb[3] = {R(0.0), R(0.0), R(0.0)};
     std::array<double, 3> grav{};
@@ -1039,6 +1218,15 @@ struct FvCompImpl final : DeviceFvComp::Impl
     FvChem chem{};
     DeviceBuffer<R> dw, Ph, Bh, Gh, f1, Sr, Ft, lts; // RANS; local time stepping
     DeviceBuffer<unsigned long long> hits;
+    // TFLES: the step's F E, E/F, Omega; the sensor's ping-pong, curl, Colin's u';
+    // the walk, edge layers, Laplacian weights per CSR entry, h and c2 h^3 per cell.
+    bool thick = false;
+    TfView<R> tf{};
+    int nAx = 0;
+    R gPr = R(0.0);
+    DeviceBuffer<R> fe, eof, omT, tfA, tfB, curl, uh, lapW, hc, coef;
+    DeviceBuffer<int> walk;
+    DeviceBuffer<std::uint8_t> edge;
     mutable ReduceScratch red;
     Gas<R> gas{};
 
@@ -1111,9 +1299,36 @@ struct FvCompImpl final : DeviceFvComp::Impl
     // The species passes before the mean-flow gradients: Y, omega, boundary Y.
     void speciesCells(const R* s)
     {
-        if (chem.ox >= 0) kFvSpCell<R, true><<<blocksOf(std::size_t(nC)), kT>>>(view(), sp, s, P.data(), Y.data(), om.data());
-        else kFvSpCell<R, false><<<blocksOf(std::size_t(nC)), kT>>>(view(), sp, s, P.data(), Y.data(), om.data());
+        const unsigned nc = blocksOf(std::size_t(nC));
+        if (chem.ox >= 0 && chem.law.n > 0)
+            kFvSpCellPhi<R><<<nc, kT>>>(view(), sp, chem.law.as<R>(), s, P.data(), Y.data(), om.data());
+        else if (chem.ox >= 0) kFvSpCell<R, true><<<nc, kT>>>(view(), sp, s, P.data(), Y.data(), om.data(), nullptr);
+        else if (thick) kFvSpCell<R, false, true><<<nc, kT>>>(view(), sp, s, P.data(), Y.data(), om.data(), eof.data());
+        else kFvSpCell<R, false><<<nc, kT>>>(view(), sp, s, P.data(), Y.data(), om.data(), nullptr);
         if (nB) kFvSpBnd<R><<<blocksOf(std::size_t(nB)), kT>>>(view(), sp, Y.data(), B.data(), Yb.data());
+    }
+
+    // TFLES: F E, E/F, Omega of state s (FvRef::tflesFields): primitives and the
+    // velocity gradients of s, the raw sensor, a dilation pass per walked axis (raw ->
+    // tfB -> tfA -> tfB), Colin's u', the combine. A uniform sensor without the
+    // efficiency is constant: formed at make, nothing runs.
+    void tflesUpdate(const R* s)
+    {
+        if (tf.uniform && !tf.charlette) return;
+        const unsigned nc = blocksOf(std::size_t(nC));
+        primsOf(s);
+        if (tf.charlette) kFvGrad<R><<<nc, kT>>>(view(), P.data(), B.data(), G.data());
+        kFvTflesRaw<R><<<nc, kT>>>(view(), tf, s, P.data(), G.data(), tfA.data(), curl.data());
+        const R* W = nullptr;
+        if (!tf.uniform) {
+            R* buf[2] = {tfA.data(), tfB.data()};
+            for (int p = 0; p < nAx; ++p)
+                kFvTflesDilate<R><<<nc, kT>>>(view(), tf.rad, walk.data() + std::size_t(2 * p) * std::size_t(nC), P.data(),
+                                              buf[p & 1], buf[(p + 1) & 1]);
+            W = buf[nAx & 1];
+        }
+        if (tf.charlette) kFvTflesColin<R><<<nc, kT>>>(view(), lapW.data(), coef.data(), curl.data(), uh.data());
+        kFvTflesCombine<R><<<nc, kT>>>(nC, tf, W, uh.data(), hc.data(), edge.data(), fe.data(), eof.data(), omT.data());
     }
 
     // After faces(): gradients of Y, then the species fluxes on F[0].
@@ -1121,10 +1336,23 @@ struct FvCompImpl final : DeviceFvComp::Impl
     {
         kFvGradY<R><<<blocksOf(std::size_t(nC)), kT>>>(view(), sp.nY, Y.data(), Yb.data(), GY.data());
         const unsigned nf = blocksOf(std::size_t(nI));
-        if (chem.ox >= 0 && visc) kFvSpFace<R, true, true><<<nf, kT>>>(view(), sp, gas, P.data(), Y.data(), GY.data(), F.data());
-        else if (chem.ox >= 0) kFvSpFace<R, false, true><<<nf, kT>>>(view(), sp, gas, P.data(), Y.data(), GY.data(), F.data());
-        else if (visc) kFvSpFace<R, true, false><<<nf, kT>>>(view(), sp, gas, P.data(), Y.data(), GY.data(), F.data());
-        else kFvSpFace<R, false, false><<<nf, kT>>>(view(), sp, gas, P.data(), Y.data(), GY.data(), F.data());
+        const R *g = G.data(), *nt = nut.data(), *f = fe.data(), *o = omT.data();
+        if (chem.ox >= 0 && les)
+            kFvSpFace<R, true, true, int(FvSpDiff::Eddy)><<<nf, kT>>>(view(), sp, gas, P.data(), Y.data(), GY.data(), g, nt, f, o,
+                                                                       F.data());
+        else if (chem.ox >= 0 && visc)
+            kFvSpFace<R, true, true><<<nf, kT>>>(view(), sp, gas, P.data(), Y.data(), GY.data(), g, nt, f, o, F.data());
+        else if (chem.ox >= 0)
+            kFvSpFace<R, false, true><<<nf, kT>>>(view(), sp, gas, P.data(), Y.data(), GY.data(), g, nt, f, o, F.data());
+        else if (thick)
+            kFvSpFace<R, true, false, int(FvSpDiff::Thick)><<<nf, kT>>>(view(), sp, gas, P.data(), Y.data(), GY.data(), g, nt, f, o,
+                                                                         F.data());
+        else if (les)
+            kFvSpFace<R, true, false, int(FvSpDiff::Eddy)><<<nf, kT>>>(view(), sp, gas, P.data(), Y.data(), GY.data(), g, nt, f, o,
+                                                                        F.data());
+        else if (visc)
+            kFvSpFace<R, true, false><<<nf, kT>>>(view(), sp, gas, P.data(), Y.data(), GY.data(), g, nt, f, o, F.data());
+        else kFvSpFace<R, false, false><<<nf, kT>>>(view(), sp, gas, P.data(), Y.data(), GY.data(), g, nt, f, o, F.data());
         if (nB && chem.ox >= 0)
             kFvSpBndFace<R, true><<<blocksOf(std::size_t(nB)), kT>>>(view(), sp, gas, P.data(), B.data(), Y.data(), GY.data(), Yb.data(), F.data());
         else if (nB)
@@ -1214,6 +1442,7 @@ struct FvCompImpl final : DeviceFvComp::Impl
     {
         const R cb1 = R(0.25), cb2 = R(2.0 / 3.0);
         const R dtR = R(dt);
+        if (thick) tflesUpdate(q.data()); // F, E, Omega of the step's input state
         if (compensated) {
             stagePair(q.data(), l.data(), q.data(), l.data(), q1.data(), l1.data(), R(0.0), dtR);
             stagePair(q.data(), l.data(), q1.data(), l1.data(), q2.data(), l2.data(), cb1, cb1 * dtR);
@@ -1279,6 +1508,7 @@ struct FvCompImpl final : DeviceFvComp::Impl
 
     std::expected<void, std::string> rhs(dns::FvState& out) override
     {
+        if (thick) tflesUpdate(q.data());
         stage(q.data(), q.data(), q1.data(), R(0.0), R(0.0), R(1.0), true);
         if (auto c = check("rhs"); !c) return c;
         out.nV = nState;
@@ -1341,6 +1571,13 @@ struct FvCompImpl final : DeviceFvComp::Impl
             for (std::size_t s = 0; s < nY; ++s)
                 for (std::size_t b = 0; b < std::size_t(nB); ++b) ev.bY[s][std::size_t(bndFace[b])] = t[nY * b + s];
         }
+        if (les)
+            if (auto r = fetch(nut, ev.nut, "eddy viscosity"); !r) return r;
+        if (thick) {
+            if (auto r = fetch(fe, ev.fe, "TFLES F E"); !r) return r;
+            if (auto r = fetch(eof, ev.eof, "TFLES E/F"); !r) return r;
+            if (auto r = fetch(omT, ev.om, "TFLES sensor"); !r) return r;
+        }
         if (!rans) return {};
         for (auto& v : ev.tfld) v.assign(n, 0.0);
         for (auto& v : ev.tbnd) v.assign(bndFull, 0.0);
@@ -1379,6 +1616,15 @@ struct FvCompImpl final : DeviceFvComp::Impl
     std::expected<double, std::string> chemDt(double k) override
     {
         if (!sp.nY || !std::isfinite(chem.lnA)) return HUGE_VAL;
+        if (chem.ox >= 0 && chem.law.n > 0) {
+            const double J2 = internal::reduce(red, std::size_t(nC),
+                                               ChemJ2Phi<R>{q.data(), std::size_t(nC), sp.iY + sp.fuel, sp.iY + sp.ox, gamma,
+                                                            Rgas, chem.lnA, chem.Ta, chem.q, Rgas / (gamma - 1.0), chem.stoich,
+                                                            chem.law},
+                                               rocprim::maximum<double>(), 0.0);
+            if (auto c = check("chemDt"); !c) return std::unexpected(c.error());
+            return J2 > 0.0 ? k / J2 : HUGE_VAL;
+        }
         if (chem.ox >= 0) {
             const double J2 = internal::reduce(red, std::size_t(nC),
                                                ChemJ2<R>{q.data(), std::size_t(nC), sp.iY + sp.fuel, sp.iY + sp.ox, gamma, Rgas,
@@ -1400,6 +1646,7 @@ struct FvCompImpl final : DeviceFvComp::Impl
         omega.clear();
         if (auto r = download(s); !r) return r;
         if (!sp.nY) return {};
+        if (thick) tflesUpdate(q.data()); // omega is (E/F) omega of the current state's E, F
         primsOf(q.data());
         speciesCells(q.data());
         if (auto c = check("species fields"); !c) return c;
@@ -1419,10 +1666,17 @@ struct FvCompImpl final : DeviceFvComp::Impl
 
     std::expected<double, std::string> stableDt(FvDtLimits lim) override
     {
+        if (thick) tflesUpdate(q.data());
         primsOf(q.data());
         gradsAndNut(q.data());
         const unsigned bc = blocksOf(std::size_t(nC));
-        if (sst)
+        if (thick && les)
+            kFvDt<R, true, 0, true><<<bc, kT>>>(view(), gas, lim.cfl, lim.diff, fMol, fEddy, P.data(), nut.data(), Ph.data(),
+                                                entS.data(), diffC.data(), dtc.data(), fe.data(), gPr);
+        else if (thick)
+            kFvDt<R, false, 0, true><<<bc, kT>>>(view(), gas, lim.cfl, lim.diff, fMol, fEddy, P.data(), nut.data(), Ph.data(),
+                                                 entS.data(), diffC.data(), dtc.data(), fe.data(), gPr);
+        else if (sst)
             kFvDt<R, true, 2><<<bc, kT>>>(view(), gas, lim.cfl, lim.diff, fMol, fEddy, P.data(), nut.data(), Ph.data(),
                                           entS.data(), diffC.data(), dtc.data());
         else if (rans)
@@ -1451,9 +1705,10 @@ struct FvCompImpl final : DeviceFvComp::Impl
 
     std::expected<double, std::string> localDt(FvDtLimits lim) override
     {
-        // kFvChem, kFvGravity take the bare cr: under LTS the fixed point would move.
-        if (sp.nY) return std::unexpected("FV local time stepping with species: not built");
-        if (hasG) return std::unexpected("FV local time stepping with gravity: not built");
+        // The time axis of the inventory: kFvChem, kFvGravity take the bare cr, LES is time-accurate.
+        FvModuleSet withLts = mods;
+        withLts.set(std::size_t(FvModule::Steady));
+        if (auto ok = fvModulesCheck(withLts); !ok) return std::unexpected(std::move(ok.error()));
         auto d = stableDt(lim);
         if (!d) return d;
         if (lts.size() == 0) {
@@ -1506,6 +1761,24 @@ struct FvCompImpl final : DeviceFvComp::Impl
         return o;
     }
 
+    std::expected<DeviceFvComp::TflesStats, std::string> tflesStats() override
+    {
+        if (!thick) return std::unexpected("FV TFLES stats: no --tfles");
+        tflesUpdate(q.data());
+        if (auto c = check("TFLES stats"); !c) return std::unexpected(c.error());
+        std::vector<double> f, e, w;
+        if (auto r = fetch(fe, f, "TFLES F E"); !r) return std::unexpected(r.error());
+        if (auto r = fetch(eof, e, "TFLES E/F"); !r) return std::unexpected(r.error());
+        if (auto r = fetch(omT, w, "TFLES sensor"); !r) return std::unexpected(r.error());
+        double so = 0.0, soe = 0.0, mx = 0.0;
+        for (std::size_t c = 0; c < f.size(); ++c) {
+            so += V[c] * w[c];
+            soe += V[c] * w[c] * std::sqrt(f[c] * e[c]); // E = sqrt(FE E/F)
+            mx = std::max(mx, f[c]);
+        }
+        return DeviceFvComp::TflesStats{.Ebar = so > 0.0 ? soe / so : NAN, .FEmax = mx};
+    }
+
     std::expected<unsigned long long, std::string> floorHits() const override
     {
         if (hits.size() == 0) return 0ull;
@@ -1513,6 +1786,32 @@ struct FvCompImpl final : DeviceFvComp::Impl
         unsigned long long h = 0;
         if (const hipError_t e = hits.download(&h); e != hipSuccess) return std::unexpected(hipErr("floor hits", e));
         return h;
+    }
+
+    // The carried words: q, the compensated l, the SST guard's count.
+    std::expected<void, RunError> save(Checkpoint& ck) const override
+    {
+        if (auto e = internal::putWords(ck, "state.fv.q", q); !e) return e;
+        if (compensated)
+            if (auto e = internal::putWords(ck, "state.fv.lo", l); !e) return e;
+        if (hits.size() == 0) return {};
+        unsigned long long h = 0;
+        if (hits.download(&h) != hipSuccess) return std::unexpected(RunError{6, "checkpoint: floor hits download failed"});
+        ck.putI64("state.fv.hits", std::int64_t(h));
+        return {};
+    }
+
+    std::expected<void, RunError> load(const Checkpoint& ck) override
+    {
+        if (auto e = internal::getWords(ck, "state.fv.q", q); !e) return e;
+        if (compensated)
+            if (auto e = internal::getWords(ck, "state.fv.lo", l); !e) return e;
+        if (hits.size() == 0) return {};
+        auto h = ck.i64Scalar("state.fv.hits");
+        if (!h) return std::unexpected(RunError{3, "--restart: " + h.error()});
+        const auto v = static_cast<unsigned long long>(*h);
+        if (hits.upload(&v) != hipSuccess) return std::unexpected(RunError{6, "--restart: floor hits upload failed"});
+        return {};
     }
 
     std::expected<void, std::string> cellFields(std::array<std::vector<double>, 7>& prim,
@@ -1557,15 +1856,32 @@ struct FvCompImpl final : DeviceFvComp::Impl
         return {};
     }
 
+    std::expected<void, std::string> setBcRows(int first, std::span<const FvBc> rows) override
+    {
+        if (first < 0 || std::size_t(first) + rows.size() > bcHost.size())
+            return std::unexpected("FV setBcRows: rows past the table");
+        for (std::size_t i = 0; i < rows.size(); ++i)
+            if (bcHost[std::size_t(first) + i].kind != rows[i].kind)
+                return std::unexpected("FV setBcRows: a row changes its kind");
+        if (rows.empty()) return {};
+        std::ranges::copy(rows, bcHost.begin() + first);
+        (void)hipDeviceSynchronize();
+        if (const hipError_t e = hipMemcpy(bcs.data() + first, rows.data(), rows.size() * sizeof(FvBc), hipMemcpyHostToDevice);
+            e != hipSuccess)
+            return std::unexpected(hipErr("boundary rows upload", e));
+        return {};
+    }
+
     std::size_t bytes() const override
     {
         std::size_t s = face.size() * sizeof(FaceRow<R>) + bnd.size() * sizeof(BndRow<R>) +
                         bcs.size() * sizeof(FvBc) + gEnt.size() * sizeof(GradEnt<R>) +
                         (cStart.size() + gFace.size() + tallyList.size()) * sizeof(int);
         for (const auto* b : {&Vd, &diffC, &cd, &entS, &q, &q1, &q2, &l, &l1, &l2, &P, &B, &G, &F, &Gf, &nut, &dtc, &tally, &Y,
-                              &Yb, &GY, &om, &dw, &Ph, &Bh, &Gh, &f1, &Sr, &Ft, &lts})
+                              &Yb, &GY, &om, &dw, &Ph, &Bh, &Gh, &f1, &Sr, &Ft, &lts, &fe, &eof, &omT, &tfA, &tfB, &curl, &uh,
+                              &lapW, &hc, &coef})
             s += b->size() * sizeof(R);
-        return s;
+        return s + walk.size() * sizeof(int) + edge.size();
     }
 
     std::size_t bndFull = 0;
@@ -1586,25 +1902,26 @@ template <class R>
 std::expected<std::unique_ptr<DeviceFvComp::Impl>, std::string> makeImpl(const FaceMesh& fm, const FvCompConfig& cfg,
                                                                          int threads)
 {
-    auto ref = FvRef::make(fm,
-                           {.tr = cfg.tr,
-                            .bc = cfg.bc,
-                            .bcRow = cfg.bcRow,
-                            .gravity = cfg.gravity,
-                            .chem = cfg.chem,
-                            .rans = cfg.rans,
-                            .bodyForce = cfg.bodyForce},
-                           threads);
+    const FvConfig rc{.tr = cfg.tr,
+                      .bc = cfg.bc,
+                      .bcRow = cfg.bcRow,
+                      .gravity = cfg.gravity,
+                      .ambient = cfg.ambient,
+                      .chem = cfg.chem,
+                      .rans = cfg.rans,
+                      .bodyForce = cfg.bodyForce,
+                      .les = {.cs = cfg.csLes, .sgs = cfg.sgs, .prt = cfg.prt},
+                      .tfles = cfg.tfles,
+                      .turb = cfg.turb};
+    // The model pairs (dns/fvmodules): FvRef::make refuses each by name.
+    auto ref = FvRef::make(fm, rc, threads);
     if (!ref) return std::unexpected(std::move(ref.error()));
-    if (cfg.chem.nY > 0 && cfg.csLes > 0.0)
-        return std::unexpected("FV species with LES: the species SGS flux is not built on the FV path");
-    if (cfg.csLes > 0.0 && std::ranges::any_of(cfg.gravity, [](double v) { return v != 0.0; }))
-        return std::unexpected("FV gravity with LES: not built (no buoyancy term in the SGS model)");
-    if (!(cfg.csLes >= 0.0) || !(cfg.prt > 0.0)) return std::unexpected("FV LES: needs Cs >= 0 and Pr_t > 0");
+    // The precision axis of the inventory.
+    FvModuleSet mods = fvModulesOf(rc);
+    mods.set(std::size_t(FvModule::Compensated), cfg.compensated);
+    mods.set(std::size_t(FvModule::Fp64), !std::is_same_v<R, Real>);
+    if (auto ok = fvModulesCheck(mods); !ok) return std::unexpected(std::move(ok.error()));
     const bool withRans = cfg.rans.model != RansModel::None;
-    if (withRans && cfg.csLes > 0.0) return std::unexpected("FV: LES and RANS put two eddy viscosities in one slot");
-    if (cfg.compensated && !std::is_same_v<R, Real>)
-        return std::unexpected("--compensated is the FP32 state's low word: FP64 has no update floor to lift");
     if (!cfg.tallied.empty() && cfg.tallied.size() != fm.patches.size())
         return std::unexpected("FV tally: one flag per patch required");
     const FvFaceGeom& fg = ref->faceGeom();
@@ -1614,6 +1931,7 @@ std::expected<std::unique_ptr<DeviceFvComp::Impl>, std::string> makeImpl(const F
     auto im = std::make_unique<FvCompImpl<R>>();
     FvCompImpl<R>& I = *im;
     I.nC = fm.nC;
+    I.mods = mods;
     I.nI = fm.nI;
     I.nV = kFvMeanVars + cfg.chem.nY;
     I.chem = cfg.chem;
@@ -1625,7 +1943,27 @@ std::expected<std::unique_ptr<DeviceFvComp::Impl>, std::string> makeImpl(const F
             .Ta = R(cfg.chem.Ta),
             .q = R(cfg.chem.q),
             .invPr = R(cfg.chem.invPr),
-            .stoich = R(cfg.chem.stoich)};
+            .stoich = R(cfg.chem.stoich),
+            .invSct = R(1.0 / cfg.prt),
+            .kapLes = R(cfg.tr.cp() / cfg.prt),
+            .les = cfg.csLes > 0.0 ? 1 : 0};
+    I.thick = cfg.tfles.has_value();
+    if (I.thick) {
+        const TflesSetup& t = *cfg.tfles;
+        I.tf = {.iF = kFvMeanVars + cfg.chem.fuel,
+                .rad = t.dilate,
+                .uniform = t.uniform ? 1 : 0,
+                .charlette = t.charlette ? 1 : 0,
+                .lnAs = R(t.lnAs),
+                .TaS = R(t.TaS),
+                .beta = R(t.sensorBeta),
+                .Fmax = R(t.F),
+                .deltaL = R(t.deltaL),
+                .nuU = R(t.nuU),
+                .effBeta = R(t.effBeta)};
+        I.nAx = ref->tflesWalk().nAxes;
+        I.gPr = R(cfg.tr.gamma / cfg.tr.Pr);
+    }
     I.gamma = cfg.tr.gamma;
     I.Rgas = cfg.tr.Rgas;
     I.precision = cfg.precision;
@@ -1744,24 +2082,24 @@ std::expected<std::unique_ptr<DeviceFvComp::Impl>, std::string> makeImpl(const F
     I.nTally = int(tlist.size());
 
     std::vector<R> vr(nCs), dc(nCs), cdv(I.les ? nCs : 0);
-    const double thick = fm.emptyAxis >= 0 ? [&] {
-        // A 2D mesh's depth: V / (cell area) from the empty face of cell 0.
-        for (const MeshPatch& p : fm.patches)
-            if (p.type == FoamPatchType::Empty && p.count > 0) {
-                const std::size_t f = nIs + std::size_t(p.first);
-                const std::size_t c = std::size_t(fm.own[f]);
-                return fm.V[c] / std::abs(fm.S[std::size_t(fm.emptyAxis)][f]);
-            }
-        return 1.0;
-    }() : 1.0;
     for (std::size_t c = 0; c < nCs; ++c) {
         vr[c] = R(fm.V[c]);
         dc[c] = R(ref->diffCoef()[c]);
-        if (I.les) {
-            // kCompSmagNutCurv's C^2 curvDelta2(vol).
-            const double r3 = std::cbrt(fm.V[c]);
-            const double d2 = fm.emptyAxis >= 0 ? fm.V[c] / thick : r3 * r3;
-            cdv[c] = R(cfg.csLes * cfg.csLes * d2);
+        // kCompSmagNutCurv's C^2 curvDelta2(vol): fvLesDelta2, FvRef's.
+        if (I.les) cdv[c] = R(cfg.csLes * cfg.csLes * ref->lesDelta2()[c]);
+    }
+    // TFLES: the walk, edge layers, Laplacian weights per compact CSR entry (FvRef's
+    // per FaceMesh entry, the inactive faces dropped), h = sqrt Delta^2, c2 h^3.
+    std::vector<R> lw, hcv, cov;
+    if (I.thick) {
+        const FvTflesWalk& wk = ref->tflesWalk();
+        for (std::size_t c = 0; c < nCs; ++c)
+            for (int q = fm.cellStart[c]; q < fm.cellStart[c + 1]; ++q)
+                if (fg.active[std::size_t(fm.cellFace[std::size_t(q)])]) lw.push_back(R(wk.lapW[std::size_t(q)]));
+        for (std::size_t c = 0; c < nCs; ++c) {
+            const double h = std::sqrt(ref->lesDelta2()[c]);
+            hcv.push_back(R(h));
+            cov.push_back(R(kColinC2 * h * h * h));
         }
     }
 
@@ -1819,7 +2157,22 @@ std::expected<std::unique_ptr<DeviceFvComp::Impl>, std::string> makeImpl(const F
     take(I.Yb, sized<R>(nYs * std::size_t(I.nB), "species"));
     take(I.GY, sized<R>(3 * nYs * nCs, "species"));
     take(I.om, sized<R>(nYs ? nCs : 1, "species"));
+    if (I.thick) {
+        const FvTflesWalk& wk = ref->tflesWalk();
+        const bool tc = cfg.tfles->charlette;
+        for (DeviceBuffer<R>* b : {&I.fe, &I.eof, &I.omT, &I.tfA, &I.tfB, &I.uh}) take(*b, sized<R>(nCs, "TFLES fields"));
+        take(I.curl, sized<R>(tc ? 3 * nCs : 1, "TFLES curl"));
+        take(I.walk, uploaded(wk.next, "TFLES walk"));
+        take(I.edge, uploaded(wk.edge, "TFLES edge layers"));
+        take(I.lapW, uploaded(tc ? lw : std::vector<R>{}, "TFLES Laplacian"));
+        take(I.hc, uploaded(hcv, "TFLES h"));
+        take(I.coef, uploaded(cov, "TFLES Colin"));
+    }
     if (err) return std::unexpected(std::move(*err));
+    // A uniform sensor without the efficiency is constant: formed here, once.
+    if (I.thick && cfg.tfles->uniform && !cfg.tfles->charlette)
+        kFvTflesCombine<R><<<blocksOf(nCs), kT>>>(I.nC, I.tf, nullptr, I.uh.data(), I.hc.data(), I.edge.data(), I.fe.data(),
+                                                  I.eof.data(), I.omT.data());
     auto rs = ReduceScratch::make();
     if (!rs) return std::unexpected(hipErr("reduction scratch", rs.error()));
     I.red = std::move(*rs);
@@ -1857,6 +2210,7 @@ std::expected<void, std::string> DeviceFvComp::speciesFields(dns::FvState& s, st
 std::expected<std::vector<double>, std::string> DeviceFvComp::patchFlux(int row) { return p_->patchFlux(row); }
 std::expected<FvSurface, std::string> DeviceFvComp::surface() { return p_->surface(); }
 std::expected<std::vector<double>, std::string> DeviceFvComp::eddyViscosity() { return p_->eddyViscosity(); }
+std::expected<DeviceFvComp::TflesStats, std::string> DeviceFvComp::tflesStats() { return p_->tflesStats(); }
 std::expected<unsigned long long, std::string> DeviceFvComp::floorHits() const { return p_->floorHits(); }
 std::expected<void, std::string> DeviceFvComp::cellFields(std::array<std::vector<double>, 7>& prim,
                                                           std::array<std::vector<double>, 12>& grad)
@@ -1865,6 +2219,12 @@ std::expected<void, std::string> DeviceFvComp::cellFields(std::array<std::vector
 }
 void DeviceFvComp::boost(const std::array<double, 3>& du) { p_->boost(du); }
 std::expected<void, std::string> DeviceFvComp::setBc(int patch, const FvBc& bc) { return p_->setBc(patch, bc); }
+std::expected<void, RunError> DeviceFvComp::save(Checkpoint& ck) const { return p_->save(ck); }
+std::expected<void, RunError> DeviceFvComp::load(const Checkpoint& ck) { return p_->load(ck); }
+std::expected<void, std::string> DeviceFvComp::setBcRows(int first, std::span<const FvBc> rows)
+{
+    return p_->setBcRows(first, rows);
+}
 int DeviceFvComp::cells() const { return p_->nC; }
 FvPrecision DeviceFvComp::precision() const { return p_->precision; }
 std::size_t DeviceFvComp::deviceBytes() const { return p_->bytes(); }

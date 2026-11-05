@@ -58,8 +58,7 @@ Fields run(const Case& c, const Opts& o)
 {
     const Grid& g = c.grid;
     const double Tu = c.flameTu, sig = c.flameModel.sigma;
-    const auto tr = Transport::air(c.prandtl, Tu, c.tinfK, c.prandtl, kGammaAir,
-                                   kRgasBox, c.sutherland);
+    const auto tr = flameGas(c, Tu);
     auto dev = gpu::DeviceComp::make(g, tr);
     auto red = gpu::ReduceScratch::make();
     if (!dev || !red) std::exit(EXIT_FAILURE);

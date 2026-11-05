@@ -441,6 +441,15 @@ std::expected<FaceMesh, std::string> fvOgridMesh(const OGrid& og, int threads)
     return FaceMesh::fromCurvMesh(og.mesh, sp, CellOrder::Morton, threads);
 }
 
+FviModuleSet fviModulesOf(const FvIncompControls& c, bool thermal)
+{
+    FviModuleSet s;
+    if (c.les > 0) s.set(std::size_t(c.sgs == SgsModel::Sigma ? FviModule::LesSigma : FviModule::LesSmag));
+    if (thermal) s.set(std::size_t(FviModule::Temperature));
+    if (std::ranges::any_of(c.betaG, [](double g) { return g != 0.0; })) s.set(std::size_t(FviModule::Gravity));
+    return s;
+}
+
 std::string fvIncompLabel(const FvIncompControls& c, std::string_view mesh)
 {
     const std::string what =

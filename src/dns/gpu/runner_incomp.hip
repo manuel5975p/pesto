@@ -114,7 +114,7 @@ runIncompressible(const Grid& g, const CutGeometry& cut, const Sdf& sdf,
     // Both come RESOLVED from validate(); the runner does not second-guess
     // them. (The fallbacks that used to live here disagreed with the
     // validator's rule for a thin 3D box -- nz > 1 but too thin to hold a z
-    // band -- and were only dead because dns_main always passes the resolved
+    // band -- and were only dead because the driver (dns/drive/flow.cpp) always passes the resolved
     // values through.)
     if (r.fringeCells <= 0 || (r.fringeAxes != 2 && r.fringeAxes != 3))
         return fail(6, "far-field band width/axes were not resolved");

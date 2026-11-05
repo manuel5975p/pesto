@@ -43,7 +43,7 @@ struct FlameRun
     // NSCBC outflow pressure anchor (Config::sigma). 0.25 = the shared
     // default (1D and bunsen keep it). The diffusion jet's dilatation held
     // the box at p/p0 1.67 under 0.25 (relaxation L/(sigma c) ~ 20 l/U);
-    // dns_main sets kDiffOutflowSigma there.
+    // dns/drive/flame.cpp sets kDiffOutflowSigma there.
     double outSigma = 0.25;
     bool thermalInflow = false; // entropy inflow holds T = Tu, not rho = 1
     int sinkNb = 16;         // 0 = no sink
@@ -96,7 +96,7 @@ struct FlameRun
     // xFresh, xLead, the frames add vort, speed, and exit 8 fires when the
     // brush's leading edge reaches the inflow band (flash-back).
     // Bunsen at nz > 1 (docs/chem.md, "3D turbulent slot Bunsen"): rows at
-    // j + ny k; turbBox is the box times the row's jet weight J (dns_main);
+    // j + ny k; turbBox is the box times the row's jet weight J (dns/drive/flame.cpp);
     // the sweep runs at U_jet (+ pulse); the cone is measured on span-mean
     // fields; stats append ST, area, I0; frames add vort, speed.
     std::array<std::vector<double>, 3> turbBox;

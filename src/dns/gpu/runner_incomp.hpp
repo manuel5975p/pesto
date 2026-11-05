@@ -81,13 +81,9 @@ struct IncompRun
     // Per-object force integration (scenes): one extra tally per object,
     // written as the "forces" CSV series (t, then cd_/cl_/cdf_ per label) at
     // the same cadence as "stats". Boxes must be pairwise disjoint -- an
-    // overlapping pair would each count the shared surface -- and the caller
-    // (dns_main) enforces that, downgrading to the total-only tally instead.
-    struct Tally
-    {
-        std::string name;
-        BodyBox box;
-    };
+    // overlapping pair would each count the shared surface -- objectTallyBoxes
+    // (gpu/bodyforce) refuses one, and the caller keeps the total-only tally instead.
+    using Tally = NamedBodyBox;
     std::vector<Tally> tallies;
 
     int statsEvery = 20;      // steps between force/diagnostic rows

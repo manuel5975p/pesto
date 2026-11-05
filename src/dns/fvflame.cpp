@@ -185,7 +185,8 @@ void FvFlameProbe::finish(FvFlameMeasure& o, std::vector<FvFlameSlab> b) const
     o.dth = peak > 0.0 ? dT / peak : 0.0;
     o.omegaEdge = wmax > 0.0 ? std::max(at(0).omega, at(n - 1).omega) / wmax : 0.0;
     const FvFlameSlab& ref = at(std::min(n - 1, int(std::lround(2.0 * sp.dth / h_))));
-    o.SL = ref.ry > 0.0 ? o.burn / (area_ * ref.ry) : NAN;
+    const double ryRef = ref.ry - sp.yBurnt * ref.rho;
+    o.SL = ryRef > 0.0 ? o.burn / (area_ * ryRef) : NAN;
     o.uRef = ref.u;
     o.pRef = ref.p;
     o.TRef = ref.T;
@@ -247,6 +248,13 @@ std::expected<FvJetProbe, std::string> FvJetProbe::make(const FaceMesh& fm, cons
     }
     for (std::vector<int>& k : p.slabs_)
         std::ranges::stable_sort(k, {}, [&](int c) { return p.y_[std::size_t(c)]; });
+    if (std::ranges::any_of(spec.g, [](double v) { return v != 0.0; })) {
+        const FvAmbient a = fvJetAmbient(spec);
+        for (std::size_t c = 0; c < nC; ++c) {
+            const double x[3] = {fm.C[0][c], fm.C[1][c], fm.C[2][c]};
+            p.pAmbient_ += fm.V[c] * fvAmbientP(a, spec.g, x, spec.Rgas);
+        }
+    }
     return p;
 }
 
@@ -275,6 +283,7 @@ FvJetMeasure FvJetProbe::measure(const FvState& st, const std::vector<double>& o
         o.energy += V * (st.var(4)[c] + sp.q * st.var(kFvMeanVars)[c]);
         o.pMean += V * p.p;
         vol += V;
+        o.uMax = std::max(o.uMax, std::sqrt(p.u[0] * p.u[0] + p.u[1] * p.u[1] + p.u[2] * p.u[2]));
         o.zMin = std::min(o.zMin, z);
         o.zMax = std::max(o.zMax, z);
         o.yfMin = std::min(o.yfMin, YF);
@@ -290,7 +299,8 @@ FvJetMeasure FvJetProbe::measure(const FvState& st, const std::vector<double>& o
             axV[b] += V;
         }
     }
-    o.pMean /= vol * sp.T0;
+    if (pAmbient_ > 0.0) o.pMean /= pAmbient_;
+    else o.pMean /= vol * sp.T0;
     const double zs = md.zst();
     int prev = -1;
     for (int i = 0; i < nBin_ && !std::isfinite(o.xTip); ++i) {
@@ -326,19 +336,39 @@ FvJetMeasure FvJetProbe::measure(const FvState& st, const std::vector<double>& o
     return o;
 }
 
+FvAmbient fvJetAmbient(const FvJetSpec& js) { return {.p0 = js.Rgas * js.T0, .T0 = js.T0, .x0 = js.origin}; }
+
+namespace {
+
+DiffusionInflowRow jetInflowAt(const FvJetSpec& js, double y)
+{
+    return js.quiescent ? quiescentInflow(js.model) : diffusionInflow(js.model, js.geom, y);
+}
+
+} // namespace
+
 FvJetRows fvJetRows(const FaceMesh& fm, const FvBcSpec& spec, std::vector<FvBc> bc, const FvJetSpec& js)
 {
     FvJetRows o{.bc = std::move(bc), .faceRow = std::vector<int>(std::size_t(fm.nB), 0)};
     const std::size_t nI = std::size_t(fm.nI);
+    const bool candle = std::ranges::any_of(js.g, [](double v) { return v != 0.0; });
     for (std::size_t p = 0; p < fm.patches.size(); ++p) {
         const MeshPatch& m = fm.patches[p];
         std::fill_n(o.faceRow.begin() + m.first, m.count, int(p));
-        if (o.bc[p].kind == FvBcKind::Outflow) o.bc[p].ownY = o.bc[p].characteristic = true;
+        if (o.bc[p].kind == FvBcKind::Outflow) {
+            o.bc[p].ownY = !candle;
+            o.bc[p].characteristic = true;
+            if (candle) {
+                o.bc[p].tBack = js.T0;
+                o.bc[p].y[0] = 0.0;
+                o.bc[p].y[1] = js.model.yO2;
+            }
+        }
         const auto it = std::ranges::find(spec.patches, m.name, &FvPatchSpec::name);
         if (it == spec.patches.end() || !it->jet) continue;
         for (int i = 0; i < m.count; ++i) {
             const std::size_t f = nI + std::size_t(m.first + i);
-            const DiffusionInflowRow r = diffusionInflow(js.model, js.geom, offset(fm.Cf, f, js.origin, js.lift) + js.geom.yc);
+            const DiffusionInflowRow r = jetInflowAt(js, offset(fm.Cf, f, js.origin, js.lift) + js.geom.yc);
             FvBc b = o.bc[p];
             b.tIn = js.T0 * r.t;
             b.diffusive = true;
@@ -349,7 +379,8 @@ FvJetRows fvJetRows(const FaceMesh& fm, const FvBcSpec& spec, std::vector<FvBc> 
             o.bc.push_back(b);
         }
     }
-    return o;
+    if (!candle) return o;
+    return fvAmbientRows(fm, std::move(o), fvJetAmbient(js), js.g, js.gamma, js.Rgas);
 }
 
 FvState fvJetState(const FaceMesh& fm, const FvJetSpec& js, double ignition)
@@ -357,18 +388,22 @@ FvState fvJetState(const FaceMesh& fm, const FvJetSpec& js, double ignition)
     const double p0 = js.T0;
     FvState q = FvState::zeros(fm.nC, kFvMeanVars + 2);
     const std::vector<double> lat = fvJetLateral(fm, js);
+    const bool candle = std::ranges::any_of(js.g, [](double v) { return v != 0.0; });
+    const FvAmbient amb = fvJetAmbient(js);
     for (std::size_t c = 0; c < std::size_t(fm.nC); ++c) {
         const double x = offset(fm.C, c, js.origin, js.dir), y = lat[c] + js.geom.yc;
-        DiffusionInflowRow in = diffusionInflow(js.model, js.geom, y);
+        DiffusionInflowRow in = jetInflowAt(js, y);
         if (ignition > 0) {
             const double w = 0.5 * (1.0 - std::tanh((x - ignition) / js.geom.edge));
             const SheetState st = burkeSchumann(js.model, in.Z * w);
             in = {js.geom.uCo + (in.u - js.geom.uCo) * w, in.Z * w, st.YF, st.YO, st.t, in.jet * w};
         }
-        const double rho = 1.0 / in.t; // p0 / (R T0 t), R = 1, p0 = T0
+        const double C[3] = {fm.C[0][c], fm.C[1][c], fm.C[2][c]};
+        const double p = candle ? fvAmbientP(amb, js.g, C, js.Rgas) : p0;
+        const double rho = candle ? p / (js.Rgas * js.T0 * in.t) : 1.0 / in.t; // p0 / (R T0 t), R = 1, p0 = T0
         q.var(0)[c] = rho;
         for (int k = 0; k < 3; ++k) q.var(1 + k)[c] = rho * in.u * js.dir[std::size_t(k)];
-        q.var(4)[c] = p0 / (js.gamma - 1.0) + 0.5 * rho * in.u * in.u;
+        q.var(4)[c] = p / (js.gamma - 1.0) + 0.5 * rho * in.u * in.u;
         q.var(kFvMeanVars)[c] = rho * in.YF;
         q.var(kFvMeanVars + 1)[c] = rho * in.YO;
     }

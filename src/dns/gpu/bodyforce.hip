@@ -190,6 +190,24 @@ BodyBox bodyBox(const GpuGrid& g, const std::array<double, 6>& w, int margin)
     return {i0, i1, j0, j1, k0, k1};
 }
 
+std::expected<std::vector<NamedBodyBox>, std::pair<std::string, std::string>>
+objectTallyBoxes(const GpuGrid& g, double lz, const std::vector<std::pair<std::string, std::array<double, 6>>>& objects)
+{
+    std::vector<NamedBodyBox> t;
+    for (const auto& [nm, bb] : objects) {
+        auto b = bodyBox(g, bb);
+        if (g.nz > 1 && bb[2] == 0.0 && bb[5] >= lz) {
+            b.k0 = g.kInLo();
+            b.k1 = g.kInHi();
+        }
+        t.push_back({nm, b});
+    }
+    for (std::size_t a = 0; a < t.size(); ++a)
+        for (std::size_t b = a + 1; b < t.size(); ++b)
+            if (overlaps(t[a].box, t[b].box)) return std::unexpected(std::pair{t[a].name, t[b].name});
+    return t;
+}
+
 bool overlaps(const BodyBox& a, const BodyBox& b)
 {
     return a.i0 <= b.i1 && b.i0 <= a.i1 && a.j0 <= b.j1 && b.j0 <= a.j1

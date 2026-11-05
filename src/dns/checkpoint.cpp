@@ -400,6 +400,11 @@ std::expected<CheckpointFacts, std::string> checkpointFacts(const Checkpoint& ck
         return std::unexpected("checkpoint 'grid' must hold nx, ny, nz, nY");
     f.binary = *bin;
     f.solver = *sol;
+    if (ck.has("mesh")) {
+        auto m = ck.text("mesh");
+        if (!m) return std::unexpected(m.error());
+        f.mesh = *m;
+    }
     f.caseFlags = parseCaseFlagsText(*cs);
     f.nx = int((*grid)[0]);
     f.ny = int((*grid)[1]);

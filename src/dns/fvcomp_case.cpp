@@ -1,8 +1,10 @@
 #include "dns/fvcomp_case.hpp"
 
+#include "dns/comp.hpp"
 #include "dns/fvwalldist.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 
 namespace dns {
@@ -53,6 +55,11 @@ FvBc fvBcOf(const FvPatchSpec& p, const FvFreestream& f, double frac)
         return b;
     }
     case FvPatchKind::Empty: b.kind = FvBcKind::Empty; return b;
+    case FvPatchKind::Open:
+        // The low-Mach route's kind: validate() rejects it on this route by name.
+        assert(false && "type = open reached the compressible table");
+        b.kind = FvBcKind::Empty;
+        return b;
     }
     return b;
 }
@@ -123,6 +130,62 @@ double fvMeshDepth(const FaceMesh& fm)
             return fm.V[std::size_t(fm.own[f])] / std::abs(fm.S[a][f]);
         }
     return 1.0;
+}
+
+FvState fvStateOf(const FaceMesh& fm, const CompState& q, std::span<const std::vector<double>> rhoY)
+{
+    FvState s = FvState::zeros(fm.nC, kFvMeanVars + int(rhoY.size()));
+    const std::vector<double>* mean[kFvMeanVars] = {&q.rho, &q.mx, &q.my, &q.mz, &q.E};
+    for (int r = 0; r < kFvMeanVars + int(rhoY.size()); ++r) {
+        const std::vector<double>& v = r < kFvMeanVars ? *mean[r] : rhoY[std::size_t(r - kFvMeanVars)];
+        for (std::size_t n = 0; n < std::size_t(fm.nC); ++n) s.var(r)[n] = v[std::size_t(fm.srcCell[n])];
+    }
+    return s;
+}
+
+StructuredSpec fvCompOgridSpec(const Grid& g)
+{
+    const FoamPatchType zt = g.nz == 1 ? FoamPatchType::Empty : FoamPatchType::Cyclic;
+    return StructuredSpec{.lo = {0, 1, 0},
+                          .hi = {g.nx - 1, g.ny - 2, g.nz - 1},
+                          .name = {"ilo", "ihi", "wall", "far", "back", "front"},
+                          .type = {FoamPatchType::Cyclic, FoamPatchType::Cyclic, FoamPatchType::Wall,
+                                   FoamPatchType::Patch, zt, zt}};
+}
+
+StructuredSpec fvCompBoxSpec(const Grid& g, bool periodic, bool wallY)
+{
+    const FoamPatchType xt = periodic ? FoamPatchType::Cyclic : FoamPatchType::Patch;
+    const FoamPatchType yt = wallY ? FoamPatchType::Wall : xt;
+    const FoamPatchType zt = g.nz == 1 ? FoamPatchType::Empty : FoamPatchType::Cyclic;
+    return StructuredSpec{.lo = {0, 0, 0},
+                          .hi = {g.nx - 1, g.ny - 1, g.nz - 1},
+                          .name = {"xlo", "xhi", "ylo", "yhi", "back", "front"},
+                          .type = {xt, xt, yt, yt, zt, zt}};
+}
+
+FvBcSpec fvCompBoxBc(const FaceMesh& fm)
+{
+    FvBcSpec bc;
+    for (const MeshPatch& p : fm.patches) {
+        if (p.type == FoamPatchType::Empty) continue;
+        if (p.type == FoamPatchType::Wall)
+            bc.patches.push_back({.name = p.name, .kind = FvPatchKind::Wall, .isothermal = false, .tallied = true});
+        else
+            bc.patches.push_back({.name = p.name, .kind = FvPatchKind::Far});
+    }
+    return bc;
+}
+
+FvState fvUniformState(const FaceMesh& fm, const FvFreestream& fs, double u0)
+{
+    FvState ic = FvState::zeros(fm.nC);
+    for (std::size_t q = 0; q < std::size_t(fm.nC); ++q) {
+        ic.var(0)[q] = fs.rho;
+        for (int k = 0; k < 3; ++k) ic.var(1 + k)[q] = fs.rho * u0 * fs.dir[std::size_t(k)];
+        ic.var(4)[q] = fs.p / (fs.gamma - 1.0) + 0.5 * fs.rho * u0 * u0;
+    }
+    return ic;
 }
 
 } // namespace dns

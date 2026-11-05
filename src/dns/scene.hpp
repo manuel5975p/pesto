@@ -127,7 +127,7 @@ std::expected<Scene, std::string> parseScene(std::string_view toml);
 // before validate; a failure is an INPUT error (exit 3).
 std::expected<Scene, std::string> loadScene(const std::string& path);
 
-// (applySceneModel lives in config.cpp: merging a scene's model selection into
+// (applySceneModel lives in dns/config/common.cpp: merging a scene's model selection into
 // the RawConfig is a CONFIG-layer act. Having the geometry layer mutate the
 // parse layer inverted the documented order.)
 

@@ -411,7 +411,7 @@ void Doc::build(const DocState& s, uint64_t rev, Build& out)
         out.geo.cut = std::move(*mapped);
     }
 
-    // The runners sanitize before solving (apps/dns_main.cpp), so the cut the
+    // The runners sanitize before solving (dns/drive/flow.cpp), so the cut the
     // viewer draws is the sanitized one -- otherwise it would show slivers the
     // solver never sees.
     out.sanitize = dns::sanitizeCut(g, out.geo.cut);
@@ -714,7 +714,7 @@ Doc::Placement3 Doc::proposePlacement(dns::SceneObjectKind kind, double d,
     };
     // Clearance is not a physics rule -- overlapping objects are legal
     // (docs/scene.md) -- it exists so per-object force columns survive:
-    // apps/dns_main.cpp tests CELL-SNAPPED index boxes, so two world boxes
+    // dns/drive/flow.cpp tests CELL-SNAPPED index boxes, so two world boxes
     // that merely touch can still snap to overlapping index boxes.
     const double gap = std::max(0.25 * d * p.D, 2.0 * std::max(g.hx, g.hy));
     auto clears = [&](const dns::SceneObject& cand) {

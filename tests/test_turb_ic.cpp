@@ -180,6 +180,73 @@ int main()
                                         "its centres to 1e-12 u'");
     }
 
+    // M5: the point evaluations every FV route reads.
+    {
+        const TurbSpec sm = spec(16);
+        const auto mm = turbModes(sm);
+        const auto bm = turbBox(sm);
+        const double h = 24.0 / 16;
+        // turbBoxAt at the centres (its own phase expression) and at a MAC face shift.
+        const auto ba = turbBoxAt(sm, {0.5, 0.5, 0.5});
+        double eA = 0;
+        for (int c = 0; c < 3; ++c)
+            for (std::size_t q = 0; q < bm[0].size(); ++q) eA = std::max(eA, std::abs(ba[c][q] - bm[c][q]));
+        const auto bf = turbBoxAt(sm, {0.0, 0.5, 0.5});
+        double eF = 0;
+        for (int k = 0; k < 16; k += 3)
+            for (int j = 0; j < 16; j += 5)
+                for (int i = 0; i < 16; i += 2) {
+                    const auto u = turbPoint(mm, sm, i * h, (j + 0.5) * h, (k + 0.5) * h);
+                    const std::size_t q = std::size_t(i) + 16 * (j + std::size_t(16) * k);
+                    for (int c = 0; c < 3; ++c) eF = std::max(eF, std::abs(u[c] - bf[c][q]));
+                }
+        // turbAt at the centres vs the FFT box; thread-count invariance.
+        std::vector<std::array<double, 3>> pts;
+        for (int k = 0; k < 16; ++k)
+            for (int j = 0; j < 16; ++j)
+                for (int i = 0; i < 16; ++i) pts.push_back({(i + 0.5) * h, (j + 0.5) * h, (k + 0.5) * h});
+        const auto p1 = turbAt(mm, sm, pts, {}, 1), p3 = turbAt(mm, sm, pts, {}, 3), p0 = turbAt(mm, sm, pts);
+        double eP = 0;
+        for (int c = 0; c < 3; ++c)
+            for (std::size_t q = 0; q < pts.size(); ++q) eP = std::max(eP, std::abs(p1[c][q] - bm[c][q]));
+        std::printf("  M5: turbBoxAt(1/2) vs turbBox %.2e, turbBoxAt(0, 1/2, 1/2) vs turbPoint %.2e, turbAt vs "
+                    "turbBox %.2e (u' %g)\n",
+                    eA, eF, eP, sm.urms);
+        check(eA <= 1e-13 * sm.urms, "turbBoxAt at the centres == turbBox to 1e-13 u' (rounding)");
+        check(eF <= 1e-12 * sm.urms, "turbBoxAt at the x faces == the direct sum there to 1e-12 u'");
+        check(eP <= 1e-12 * sm.urms, "turbAt (the FV IC's point sum) == turbBox to 1e-12 u' (rounding)");
+        check(p1 == p3 && p1 == p0, "turbAt: bit-identical at 1, 3 and hw threads");
+        // TurbSweep: the face points (x = 0) swept to X vs turbPoint at (-X, y, z).
+        std::vector<std::array<double, 3>> face;
+        for (int k = 0; k < 16; ++k)
+            for (int j = 0; j < 16; ++j) face.push_back({0.0, (j + 0.5) * h, (k + 0.5) * h});
+        const TurbSweep sw1 = TurbSweep::make(mm, sm, face, 1), sw4 = TurbSweep::make(mm, sm, face, 4);
+        double eS = 0;
+        bool same = true;
+        for (const double X : {0.0, 0.37, 5.1, 31.7}) {
+            std::array<std::vector<double>, 3> a, b;
+            sw1.sample(X, a);
+            sw4.sample(X, b);
+            same = same && a == b;
+            for (std::size_t q = 0; q < face.size(); ++q) {
+                const auto u = turbPoint(mm, sm, -X, face[q][1], face[q][2]);
+                for (int c = 0; c < 3; ++c) eS = std::max(eS, std::abs(u[c] - a[c][q]));
+            }
+        }
+        std::printf("  M5: TurbSweep vs turbPoint at (-X, y, z) %.2e\n", eS);
+        check(eS <= 1e-12 * sm.urms, "TurbSweep == turbPoint at the swept point to 1e-12 u' (grouped sum)");
+        check(same, "TurbSweep: bit-identical at 1 and 4 threads");
+        // Zero modes: exactly 0.
+        std::vector<TurbMode> z = mm;
+        for (auto& t : z) t.uh[0] = t.uh[1] = t.uh[2] = 0.0;
+        std::array<std::vector<double>, 3> u0;
+        TurbSweep::make(z, sm, face).sample(3.3, u0);
+        bool zero = true;
+        for (int c = 0; c < 3; ++c)
+            for (double v : u0[c]) zero = zero && v == 0.0;
+        check(zero, "TurbSweep of zero modes: exactly 0");
+    }
+
     // Seed determinism.
     const auto box2 = turbBox(s);
     check(box2 == box, "same seed: the same bytes");

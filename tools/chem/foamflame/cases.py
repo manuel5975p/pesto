@@ -151,7 +151,7 @@ CASES = {
         "title": "2D slot-jet diffusion flame, dns defaults (docs/chem.md "
                  "2D slot-jet diffusion flame)",
         "geometry": "diffusion2d",
-        # model C1 at the --mode diffusion defaults (dns/config.cpp)
+        # model C1 at the --mode diffusion defaults (dns/config/flame_modes.cpp)
         "model": {"s": 1.0, "yF1": 1.0, "yO2": 1.0, "sigma": 5.0, "beta": 5.0,
                   "Da": 1000.0, "Pr": 0.72, "mach": 0.05},
         # foam species: the two reactants, a PASSIVE mixture-fraction tracer
@@ -212,7 +212,7 @@ CASES = {
     "G3b": {
         "title": "2D candle (dns flame --mode candle defaults, 4 cells/l)",
         "geometry": "candle2d",
-        # the candle defaults (dns/config.cpp): paraffin/air s 3.4, Y_O2
+        # the candle defaults (dns/config/flame_modes.cpp): paraffin/air s 3.4, Y_O2
         # 0.233, sigma 5, beta 5, Da 5000, M 0.005
         "model": {"s": 3.4, "yF1": 1.0, "yO2": 0.233, "sigma": 5.0, "beta": 5.0,
                   "Da": 5000.0, "Pr": 0.72, "mach": 0.005},
@@ -446,7 +446,7 @@ ZT_EPS = 1e-3
 # --- geometry: 1d -------------------------------------------------------------
 
 def mesh_1d(spec, N, dth):
-    """dns' 1D flame grid (dns/config.cpp): h = delta_th/N, nx = ceil((up +
+    """dns' 1D flame grid (dns/config/flame.cpp): h = delta_th/N, nx = ceil((up +
     down) N) + 2 sink, x_f0 = sink h + up delta_th, the stats' fresh
     reference column iRef = sink + round(2 delta_th/h)."""
     b = spec["box"]
@@ -507,7 +507,7 @@ def probes_1d(m, si):
 # --- geometry: bunsen2d (dns flame --mode bunsen, nz 1) -------------------------
 
 def bunsen_geom(spec, dth):
-    """dns/config.cpp bunsenGeometry() with the case's burner flags (lengths
+    """dns/config/flame_modes.cpp bunsenGeometry() with the case's burner flags (lengths
     delta_th in the spec, box units out): W, uJet, uCo, wCo, tCo, pilot 0,
     edge, yc = half h, coneH; the box nx x ny."""
     b = spec["burner"]
@@ -709,7 +709,7 @@ def mixture_fraction(md, YF, YO):
 
 
 def diff_geom(spec):
-    """dns/config.cpp's diffusion/candle grid and BunsenGeom (box units, l):
+    """dns/config/flame_modes.cpp's diffusion/candle grid and BunsenGeom (box units, l):
     h = 1/N, ny = 2 ceil((W/2 + wco) N), nx = ceil(L N) + 2 sink, yc = half
     h; length default ceil(min(1.25 x the constant-density sheet tip + 8,
     20 W)) (the jet; the candle's is 32)."""

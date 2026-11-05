@@ -263,7 +263,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         // Zone: f = 1 must cover the blade plus the ghost wall's mirror band,
         // f = 0 must be reached well before any domain face so the NSCBC rows
         // and the sink never see the frame. Margins in fine cells and in D.
-        assert(r.hFine > 0);   // dns_main fills it from hFine(Case)
+        assert(r.hFine > 0);   // dns/drive/flow.cpp fills it from hFine(Case)
         const double hF = r.hFine;
         const double aHalf = aHalfMeas;
         MrfZone z;

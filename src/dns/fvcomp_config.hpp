@@ -15,7 +15,10 @@
 
 namespace dns {
 
-enum class FvPatchKind : std::uint8_t { Wall, Slip, Inflow, Outflow, Far, Empty };
+// Open: the low-Mach route's sign-of-flux face (dns flame --physics lowmach only;
+// every other route rejects it by name): outflow zero gradient, inflow the ambient
+// tIn, y at rest with face p = -rho_a u_n^2/2.
+enum class FvPatchKind : std::uint8_t { Wall, Slip, Inflow, Outflow, Far, Empty, Open };
 
 // One patch's condition in freestream units: velocities / U, temperature and
 // pressure ratios to T_inf and p_inf. Only the members of `kind` are read.
@@ -29,7 +32,7 @@ struct FvPatchSpec
     bool tallied = false;    // Wall, Slip: enters the force tally (Wall default on)
     bool hasU = false;       // Inflow: u given, else the freestream
     std::array<double, 3> uIn{};
-    double tIn = 1;          // Inflow
+    double tIn = 1;          // Inflow; Open: the ambient T / T_inf
     double pOut = 1, tBack = 1; // Outflow
     // dns flame only (a `dns flow` file rejects them by name). Inflow, Outflow,
     // Far: y, the mass fractions an incoming face carries; burnt, an Outflow at

@@ -8,6 +8,12 @@ differences and orders.
 
     tools/chem/fv_flame_ladder.py --cells 7.5,15,30 --tt 14 --meshes rot,shear,wavy,all
 
+--extra "FLAGS": physics flags on every run and the box's dry run, e.g. the air-methane jet
+(docs/fvcomp.md "Air-methane"; meshes then get the y-free file of --premix):
+
+    tools/chem/fv_flame_ladder.py --cells 7.5,15,30 --tt 20 --dth 4.70964 --meshes rot,shear \
+        --extra "--equivalence 1.3 --expansion 6.88 --visc sutherland --tinf 298"
+
 --physics lowmach: the same rungs on the low-Mach solvers (docs/fvincomp.md "Low-Mach"),
 structured low-Mach FP32 for the structured column, plus the compressible FV flame at
 --mach (FP64, tag cm64); --ny-mesh N overrides the polyMesh rung's ny.
@@ -17,6 +23,7 @@ import csv
 import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -47,10 +54,10 @@ def window(prefix, tt):
             "hits": max(float(r["yHits"]) for r in rows), "steps": len(rows)}
 
 
-def box(c, phys, ny=4):
+def box(c, phys, ny=4, extra=()):
     """nx, ny-free box facts from the dry run of the structured flame."""
-    out = subprocess.run([DNS, "flame", *phys, "--cells-per-delta", str(c), "--ny", str(ny), "--dry-run", "--out", "/tmp/dns/sp/x"],
-                         capture_output=True, text=True).stdout
+    out = subprocess.run([DNS, "flame", *phys, *extra, "--cells-per-delta", str(c), "--ny", str(ny), "--dry-run", "--out",
+                          "/tmp/dns/sp/x"], capture_output=True, text=True).stdout
     m = re.search(r"grid\s+(\d+) x (\d+) x 1\s+h = ([0-9.e+-]+).*box ([0-9.e+-]+) x ([0-9.e+-]+)", out)
     x = re.search(r"x_f0 = ([0-9.e+-]+)", out)
     return int(m[1]), int(m[2]), float(m[3]), float(m[4]), float(m[5]), float(x[1])
@@ -73,7 +80,14 @@ def main():
     a.add_argument("--tol", default="")
     a.add_argument("--wrinkle", default="", help="a 2D wrinkled flame, ny 32 c / 15: the momentum path (no meshes)")
     a.add_argument("--tags", default="", help="only these box runs, e.g. fv64")
+    a.add_argument("--tfles", default="", help="the thickened flame --tfles F on every run (docs/fvcomp.md \"Species LES "
+                                               "and TFLES\"); --cells stay per un-thickened delta_th")
+    a.add_argument("--box-up", default="", help="--upstream of the box (and the mesh's flame position)")
+    a.add_argument("--box-down", default="", help="--downstream of the box")
+    a.add_argument("--extra", default="", help="physics flags on every run (and the box's dry run)")
     o = a.parse_args()
+    extraPhys = shlex.split(o.extra)
+    premix = "--equivalence" in extraPhys
     os.makedirs(o.out, exist_ok=True)
     cells = [float(c) for c in o.cells.split(",")]
     lm = o.physics == "lowmach"
@@ -81,13 +95,16 @@ def main():
     ma = ["--mach", o.mach]
     phys = ["--physics", "lowmach"] if lm else []
     tol = ["--tol", o.tol] if o.tol and lm else []
+    thick = ["--tfles", o.tfles] if o.tfles else []
+    boxes = (["--upstream", o.box_up] if o.box_up else []) + (["--downstream", o.box_down] if o.box_down else [])
+    ma = ma + thick + extraPhys
     runs = [("st32", phys + ([] if lm else ma)), ("fv32", phys + ([] if lm else ma) + ["--solver", "fv"] + tol),
             ("fv64", phys + ([] if lm else ma) + ["--solver", "fv", "--fv-precision", "fp64"] + tol)]
     if lm:
         runs.append(("cm64", ma + ["--solver", "fv", "--fv-precision", "fp64"]))
     res = {}
     for c in cells:
-        g = ["--cells-per-delta", str(c)]
+        g = ["--cells-per-delta", str(c), *boxes]
         if o.wrinkle:
             g += ["--ny", str(int(round(32 * c / 15))), "--wrinkle", o.wrinkle, "--wrinkle-modes", "1"]
         for tag, extra in runs:
@@ -96,12 +113,13 @@ def main():
             p = f"{o.out}/{tag}_{c}"
             if job(f"sp-{tag}-{c}", ["flame", *g, *tt, *COMMON, *extra, "--out", p]):
                 res[tag, c] = window(p, o.tt)
-        nx, _, h, lx, _, xf = box(c, phys)
+        nx, _, h, lx, _, xf = box(c, phys, extra=boxes + thick + extraPhys)
         ny = o.ny_mesh or int(round(32 * c / 15))
         for m in filter(None, o.meshes.split(",")):
             d = f"{o.out}/mesh_{m}_{c}"
             subprocess.run([sys.executable, os.path.join(ROOT, "tools/chem/fv_flame_mesh.py"), "--nx", str(nx), "--ny", str(ny),
-                            "--lx", str(lx), "--ly", str(ny * h), *MESHES[m], *(["--lowmach"] if lm else []), "--out", d],
+                            "--lx", str(lx), "--ly", str(ny * h), *MESHES[m], *(["--lowmach"] if lm else []),
+                            *(["--premix"] if premix and not lm else []), "--out", d],
                            check=True, capture_output=True)
             p = f"{o.out}/{m}_{c}"
             if job(f"sp-{m}-{c}", ["flame", "--polymesh", d, "--bc", d + "/bc.toml", "--upstream", str(xf / o.dth), *tt, *COMMON,

@@ -117,7 +117,7 @@ build/dns flame --inflow-speed 0.98 --tt 20 --emit stats
 # the same flame on the LOW-MACH solver (the M -> 0 limit: P0 constant, MAC
 # mass-flux projection, face inflow / p = 0 outflow; ~10 s, S_L 0.998274;
 # --equivalence 1.3 for the rich C2b jet; --chem-dt K the chemistry dt factor
-# [1]; --mach/--nscbc-*/--les/--tfles/--turb and modes other than premixed
+# [1]; --mach/--nscbc-* and modes other than premixed and bunsen
 # rejected; docs/chem.md "Low-Mach")
 build/dns flame --physics lowmach --inflow-speed 0.98 --tt 20 --emit stats
 # the same flame on a FaceMesh (or --polymesh DIR --bc FILE; docs/fvincomp.md "Low-Mach")
@@ -131,6 +131,13 @@ build/dns flame --mode bunsen --physics lowmach --equivalence 1.3 \
   --expansion 6.88 --visc sutherland --tinf 298 --prandtl 0.41 \
   --slot-width 14 --jet-speed 6 --rim 1.4 --laterals open --coflow-width 6 \
   --cells-per-delta 4 --chem-dt 0.5 --tt 40 --emit stats
+# the same burner on a FaceMesh (--solver fv: the tube's cells removed, its faces an
+# isothermal Wall patch; the laterals the `open` face kind; ~60 s; docs/fvincomp.md
+# "Open faces, gravity, rim")
+build/dns flame --mode bunsen --physics lowmach --solver fv --equivalence 1.3 \
+  --expansion 6.88 --visc sutherland --tinf 298 --prandtl 0.41 \
+  --slot-width 14 --jet-speed 6 --rim 1.4 --laterals open --coflow-width 6 \
+  --cells-per-delta 4 --tt 40 --emit stats
 
 # 3D premixed flame in synthetic inflow turbulence (u'/S_L 4, l_t 2.5 delta_th,
 # frozen hash-seeded box swept in at u_in), the fresh mass held by the inflow
@@ -149,6 +156,32 @@ build/dns flame --nz 90 --ny 90 --cells-per-delta 6 --upstream 16 \
 build/dns flame --nz 30 --ny 30 --cells-per-delta 2 --tfles 3 --les 1.35 \
   --sgs sigma --nscbc-sink 5 --upstream 16 --downstream 16 --turb 4 \
   --hold-flame --inflow-speed 1.2 --mach 0.02 --tt 20
+# LES + TFLES on a FaceMesh (--solver fv, or --polymesh DIR --bc FILE on any 3D
+# mesh; premixed; --turb on the box below; docs/fvcomp.md "Species LES and TFLES"; ~35 s,
+# laminar: S_L 1.0173 FP32, 1.01679 with --fv-precision fp64)
+build/dns flame --solver fv --nz 8 --ny 8 --cells-per-delta 3.75 --tfles 2 \
+  --les 1.35 --sgs sigma --upstream 16 --downstream 12 --inflow-speed 0.98 --tt 28
+# --turb on the FV box and on the low-Mach solvers (both; the planar flame): the same
+# hash-seeded box at the cell centroids (IC) and swept past the inflow faces as per-face
+# rows; u'/S_L 4, l_t 2 delta_th, 72 x 48 x 48, 4 cells/delta_th (docs/fvcomp.md
+# "Turbulence", docs/chem.md "Low-Mach turbulence"; tools/chem/turb_fv.sh: S_c and the
+# flame-surface ratio vs the structured solver on the same mesh)
+build/dns flame --solver fv --turb 4 --turb-length 2 --cells-per-delta 4 --ny 48 \
+  --nz 48 --upstream 6 --downstream 4 --mach 0.02 --tt 2 --emit stats
+build/dns flame --physics lowmach --solver fv --turb 4 --turb-length 2 \
+  --cells-per-delta 4 --ny 48 --nz 48 --upstream 6 --downstream 4 --tt 2 --emit stats
+
+# LES with air-methane chemistry on a polyMesh with a bc file (docs/fvcomp.md
+# "Air-methane"): model C2b (rich CH4/air phi 1.3, S_L(phi) calibrated to GRI-3.0),
+# sigma-model LES, a 3D box rotated 20 deg (165 x 8 x 8, z cyclic), fresh far in,
+# burnt outflow out (--equivalence sets both patches' Y; the bc file gives none).
+# Measured: S_L 1.015320 over t 10-20 (= the planar FP64 box), delta_th 4.594,
+# Z 1, 0 bound hits; 66545 steps, 17 s.
+python3 tools/chem/fv_flame_mesh.py --nx 165 --ny 8 --nz 8 --lx 103.612 --ly 5.02361 \
+  --depth 5.02361 --rotate 20 --premix --out /tmp/dns/ch4mesh
+build/dns flame --polymesh /tmp/dns/ch4mesh --bc /tmp/dns/ch4mesh/bc.toml \
+  --equivalence 1.3 --expansion 6.88 --visc sutherland --tinf 298 \
+  --les 1.35 --sgs sigma --upstream 12 --inflow-speed 0.98 --tt 20 --compensated
 
 # 2D slot Bunsen cone on a burnt coflow, U_jet 5 S_L, M 0.02 (~20 s); video:
 # tools/chem/fire_video.py PREFIX --out cone.mp4 (needs --emit bin)
@@ -174,6 +207,9 @@ build/dns flame --mode diffusion --solver fv --fv-precision fp64 --tt 160 --emit
 # 2D candle: the diffusion flame under gravity from a low-Peclet wick, steady
 # by tt ~20 (~100 s for tt 30); fire_video.py --gamma 3 --smooth 4
 build/dns flame --mode candle --tt 30 --emit stats
+# the same candle on a FaceMesh (docs/fvcomp.md "Hydrostatic ambient"): open faces on
+# the hydrostatic ambient's per-face rows, a characteristic Far top
+build/dns flame --mode candle --solver fv --mach 0.01 --cells-per-unit 6 --tt 30 --emit stats
 
 # 2D WICK candle: an immersed isothermal wick + candle body (ghost wall), fuel
 # vapour from the wick surface, soot (one-equation, appearance-tuned) formed
@@ -190,9 +226,13 @@ python3 tools/chem/chamber_video.py c --out chamber.mp4 --png chamber.png
 # a flame run longer than one 1800 s simjob: checkpoints every 5 flame times,
 # each job stops at a checkpoint before 1700 s and the next resumes it; the
 # chained outputs equal one uninterrupted run byte for byte (docs/chem.md
-# "Checkpoint and restart"; premixed / bunsen / diffusion / candle)
+# "Checkpoint and restart"; premixed / bunsen / diffusion / candle, and every
+# FV flame route: --solver fv, --polymesh DIR --bc FILE, both physics; a
+# changed mesh or --bc file is exit 3 on --restart)
 tools/chem/chain.sh runs/flames/long/r 4 -- flame --mode bunsen --tt 200 \
   --checkpoint-dt 5 --emit stats --emit bin --fdt 0.5
+tools/chem/chain.sh runs/flames/lmfv/r 4 -- flame --physics lowmach --solver fv \
+  --mode bunsen --laterals open --tt 100 --checkpoint-dt 5 --emit stats
 
 # a multi-object scene
 build/dns flow --scene examples/tandem_cylinders.toml
@@ -204,12 +244,15 @@ numbers: `docs/scenarios.md`. TOML run configs: `examples/configs/`.
 ## Code layout
 
 ```
-cli/config (parse + validate, pure)  [+ dns/scene, dns/remap, dns/sgs, dns/rans]
+cli/config (parse + validate, pure: src/dns/config/, one file per subcommand)
+                                     [+ dns/scene, dns/remap, dns/sgs, dns/rans]
   → bodies/geometry (sdf + cut sampling)  [+ dns/curvmesh, dns/framemap, dns/walldist,
                                            dns/polymesh, dns/facemesh, dns/la/graph,
                                            dns/fvflux.hpp, dns/fvgrad, dns/fvref (FP64 FV oracle),
                                            dns/la/{ell,lines,structured,amg},
-                                           dns/foamdict, dns/fvcase, dns/fvsimple (OpenFOAM case layer)]
+                                           dns/foamdict, dns/fvcase, dns/fvsimple (OpenFOAM case layer),
+                                           Case -> ICs / rows / FV specs: dns/flow_ic, dns/flame1d,
+                                           dns/lowmach, dns/fvflame_case, dns/fvcomp_case, dns/fvconv]
     → gpu/{tunnel,bodyforce,les,rans,cutpoisson,cutflux,derived,comp_channel,comp_conv,boussinesq}
       [+ gpu/la/{blockell,smooth,krylov,amg}: the sparse solver library (P3, P5)]
       [+ gpu/fv_simple: incompressible FV SIMPLE on gpu/la (P5b)]
@@ -219,9 +262,15 @@ cli/config (parse + validate, pure)  [+ dns/scene, dns/remap, dns/sgs, dns/rans]
       → gpu/runner_{incomp,comp,channel,conv,rb,ogrid,fv,fvcomp,fvincomp,fvlowmach,lowmach}   (the time / iteration loops)
         → output (RunOutput, the one artefact sink; the FV path writes
           OpenFOAM time directories through dns/foamio)
+          → dns/drive (dns_drive: a validated Case onto the meshes, ICs, runners and sink,
+            one driver per subcommand; drive.hpp is its whole interface)
 ```
 
-`apps/dns_main.cpp` is **Parse → Validate → Acquire → Run**: phases 1–2 touch
+The drivers hold no per-cell physics: every IC, inflow row table, mesh patch
+spec and solver constant set is a library function, and the tests call those
+functions instead of copying a driver.
+
+`apps/dns_main.cpp` owns argv and the phase order only, **Parse → Validate → Acquire → Run**: phases 1–2 touch
 neither filesystem nor GPU; phase 3 creates every output before the first GPU
 allocation. `std::expected` for anything a user can cause, `assert` only for
 what the validator makes unreachable.
@@ -652,6 +701,13 @@ R = ρ_ref = 1.
 `--solver fv` runs both models on a FaceMesh, `--polymesh DIR --bc FILE --ny BINS`
 on any mesh with flat plates (`docs/fvcomp.md` "Gravity", `docs/fvincomp.md`
 "Temperature"); Ra 5e4 Nu within 0.3% of the structured solvers at 96 x 48 and 192 x 96.
+`--physics incompressible --solver fv --les C [--sgs smag|sigma]` is its LES (eddy heat flux
+nu_t/Pr_t; `docs/fvincomp.md` "Incompressible combinations"):
+
+```
+build/dns conv --solver fv --physics incompressible --rayleigh 1e5 --aspect 2 \
+               --n 32 --ny 16 --nz 32 --les 1.35 --sgs sigma --tt 60
+```
 
 **`--physics compressible`** (default, `gpu/comp_conv` + `runner_conv`).
 Buoyancy is ρ(T)·g through the EOS — one source term (`addGravity`) on the

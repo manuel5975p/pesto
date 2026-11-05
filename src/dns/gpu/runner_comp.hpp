@@ -25,7 +25,7 @@ struct CompRun
 {
     // The gas. Carries the viscosity law, Pr, R and gamma; `tr.gamma` is the
     // value the boundary configs quote. Default-constructed (constant
-    // viscosity) reproduces the pre-thermal solver bit-for-bit -- dns_main
+    // viscosity) reproduces the pre-thermal solver bit-for-bit -- dns/drive/flow.cpp
     // fills it from the validated Case.
     Transport tr;
     // Body surface thermal condition. Adiabatic is the historical wall.
@@ -34,7 +34,7 @@ struct CompRun
     // NSCBC entropy inflow holds T instead of rho (see comp_nscbc.hpp).
     bool nscbcThermalInflow = false;
     // NOTE: no `mach` here. Mach reaches the solver through pInf (set from it
-    // in dns_main); a second copy was plumbed to the GPU and never read.
+    // in dns/drive/flow.cpp); a second copy was plumbed to the GPU and never read.
     double uInf = 1.0, rhoInf = 1.0, pInf = 1.0;
     double D = 1.0;
     double qRef = 1.0;

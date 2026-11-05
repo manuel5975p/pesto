@@ -337,7 +337,7 @@ int main()
         // fluid: the two plate rows always, and the lateral columns once those
         // faces are walls. (The compressible twin gets this from convIC and has
         // it pinned in conv_config; this is the Boussinesq branch's, built in
-        // dns_main, and nothing checked it before -- not even for the rows.)
+        // the driver (dns/drive/conv.cpp), and nothing checked it before -- not even for the rows.)
         {
             const int n = 48, nyF = 24;
             (void)runCase("sidesmask", "incompressible", 5e4, n, nyF, 2.0,

@@ -60,6 +60,10 @@ struct LowMachRun
     // boundary at or past k every, never at tEnd; wall-limit and SIGINT stop
     // there.
     CheckpointPolicy ckpt;
+    // --turb (M5, sp.turb): the inflow rows' swept box (dns/lowmach lowmachTurbRows),
+    // set before every step at X = sum uIn dt of its start, held over its stages. Null:
+    // off (the rows of make(), the solver bit for bit).
+    const LowMachTurbSweeps* turb = nullptr;
 };
 
 // Stats columns: t, dt, dtChem, dtDiff, SL, SLdisp, xf, dth, Tmax, mass,
@@ -107,7 +111,9 @@ struct LowMachRun
 // that does not converge is exit 8.
 //
 // --dt-rule cell (S9): every stats series appends dtPos (the positivity
-// bound of the last dt recompute, before the margin).
+// bound of the last dt recompute, before the margin). LES (M4, sp.cs > 0)
+// then appends mutMax (max mu_t), TFLES (sp.tfles) FEmax, Ebar (the
+// Omega-weighted mean efficiency) -- DeviceLowMach::eddyStats.
 std::expected<RunStats, RunError> runLowMach(const Grid&, const LowMachState& ic,
                                              const LowMachRun&, RunOutput&);
 

@@ -17,6 +17,9 @@
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/run_result.hpp"
 
+#include <array>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <expected>
 #include <format>
@@ -25,6 +28,67 @@
 #include <vector>
 
 namespace dns::gpu::internal {
+
+// The header records every checkpoint carries: "binary", "solver", "case",
+// "grid" (4 counts: nx ny nz nY on a structured grid; nC nI nB nY on a
+// FaceMesh), "t", "steps", "restarts", and "mesh" (the FaceMesh's identity,
+// CheckpointPolicy::mesh) when the policy names one.
+inline void putHeader(Checkpoint& ck, const CheckpointPolicy& cp, const char* solver,
+                      const std::array<std::int64_t, 4>& grid, double t, long steps)
+{
+    ck.putText("binary", cp.binary);
+    ck.putText("solver", solver);
+    ck.putText("case", cp.caseText);
+    if (!cp.mesh.empty()) ck.putText("mesh", cp.mesh);
+    ck.putI64("grid", grid);
+    ck.putF64("t", t);
+    ck.putI64("steps", steps);
+    ck.putI64("restarts", cp.restarts);
+}
+
+// runFlame's checkpoint cadence for a time loop: the next checkpoint at the
+// first step boundary at or past k * every (never at tEnd); --wall-limit stops
+// at a checkpoint once the job's wall clock (from main's start) has passed the
+// limit or would pass it before the next one (the last interval ahead).
+class CheckpointSchedule
+{
+public:
+    using Clock = std::chrono::steady_clock;
+    // t: the loop's start (the checkpoint's t on a restart); wall0 the runner's
+    // clock, the job's start when the policy has none.
+    CheckpointSchedule(const CheckpointPolicy& cp, double t, Clock::time_point wall0)
+        : cp_(cp), tCk_(cp.restart ? t : -1.0),
+          jobStart_(cp.wallStart == Clock::time_point{} ? wall0 : cp.wallStart), lastCk_(jobStart_)
+    {
+        if (cp_.every > 0) advance(t);
+    }
+    // At the end of a step (its rows and frame written).
+    bool due(double t, double tEnd) const { return cp_.every > 0 && t < tEnd && t >= double(k_) * cp_.every; }
+    // A stop signal at this boundary: a checkpoint newer than the last is worth writing.
+    bool stopWorth(double t) const { return cp_.every > 0 && t > tCk_; }
+    // After a checkpoint at t: the next slot; true = --wall-limit stops the job here.
+    bool written(double t)
+    {
+        tCk_ = t;
+        advance(t);
+        const Clock::time_point now = Clock::now();
+        const double elapsed = seconds(now - jobStart_), interval = seconds(now - lastCk_);
+        lastCk_ = now;
+        return cp_.wallLimit >= 0 && (elapsed >= cp_.wallLimit || elapsed + interval > cp_.wallLimit);
+    }
+
+private:
+    static double seconds(Clock::duration d) { return std::chrono::duration<double>(d).count(); }
+    void advance(double t)
+    {
+        k_ = long(std::floor(t / cp_.every)) + 1;
+        while (double(k_) * cp_.every <= t) ++k_;
+    }
+    const CheckpointPolicy& cp_;
+    long k_ = 0;
+    double tCk_;
+    Clock::time_point jobStart_, lastCk_;
+};
 
 template <class Loop>
 void saveLoop(Checkpoint& ck, Loop& L)

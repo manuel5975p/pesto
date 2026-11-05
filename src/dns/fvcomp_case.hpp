@@ -12,10 +12,13 @@
 #include "dns/rans.hpp"
 
 #include <expected>
+#include <span>
 #include <string>
 #include <vector>
 
 namespace dns {
+
+struct CompState;
 
 // rho, U, p, T of the freestream, along dir. pBurnt, tBurnt: what a `burnt`
 // Outflow reads (dns flame; unread otherwise).
@@ -47,6 +50,25 @@ std::expected<std::vector<double>, std::string> fvRansWallDistance(PolyMesh pm, 
 
 // s (5 rows) with the scalar rows of closure m appended: rho phiInf[e] per cell.
 FvState fvWithScalars(const FvState& s, RansModel m, const std::array<double, 2>& phiInf);
+
+// The compressible FV O-grid's patches for fromCurvMesh: node rows 1 and ny - 1 the
+// `wall` and `far` lines, i cyclic (`ilo`, `ihi`), z cyclic (`empty` at nz 1).
+StructuredSpec fvCompOgridSpec(const Grid& g);
+
+// The compressible FV body-free box's patches: x and y `Far` patches (cyclic when periodic;
+// y walls when wallY), z cyclic (`empty` at nz 1).
+StructuredSpec fvCompBoxSpec(const Grid& g, bool periodic, bool wallY);
+
+// The box's --bc: every non-empty patch of fm a Far, or an adiabatic tallied Wall on a
+// `wall` patch.
+FvBcSpec fvCompBoxBc(const FaceMesh& fm);
+
+// The uniform start: rho, rho u0 dir, E = p/(gamma - 1) + rho u0^2/2 per cell (fs's gas).
+FvState fvUniformState(const FaceMesh& fm, const FvFreestream& fs, double u0);
+
+// A structured state (rows rho, m, E, then rhoY's) onto fm's numbering, cell n from
+// srcCell[n] (fromCurvMesh: Grid::idx). Pre: q and each rhoY span srcCell's range.
+FvState fvStateOf(const FaceMesh& fm, const CompState& q, std::span<const std::vector<double>> rhoY = {});
 
 // The mesh's depth along emptyAxis (2D), else 1.
 double fvMeshDepth(const FaceMesh& fm);

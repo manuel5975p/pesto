@@ -114,9 +114,25 @@ int main()
         rejects({"flame", "--chem-dt", "1"}, "--chem-dt",
                 "--chem-dt without --physics lowmach rejected");
     }
+    // M4: LES and TFLES are built (dns/lmmodules decides the pairs).
+    {
+        auto l = runCli({"flame", "--physics", "lowmach", "--nz", "8", "--les", "1.35", "--sgs", "sigma"});
+        check(l && l->lesLabel && l->sgsModel == SgsModel::Sigma, "M4: --les --sgs sigma accepted (3D)");
+        auto t = runCli({"flame", "--physics", "lowmach", "--tfles", "2"});
+        check(t && t->flameTfles == 2, "M4: --tfles accepted");
+        rejects({"flame", "--physics", "lowmach", "--les", "0.2", "--sgs", "smag"}, "--les",
+                "M4: 2D --les rejected (needs --nz >= 8)");
+        rejects({"flame", "--physics", "lowmach", "--equivalence", "1.3", "--tfles", "2"}, "--tfles",
+                "M4: TFLES of two reactants refused", "premixed C0 only");
+        rejects({"flame", "--physics", "lowmach", "--mode", "bunsen", "--laterals", "open", "--tfles", "2"},
+                "--tfles", "M4: TFLES with open laterals refused", "wraps");
+        rejects({"flame", "--physics", "lowmach", "--mode", "bunsen", "--nz", "8", "--rim", "1", "--les", "1.35",
+                 "--sgs", "sigma"},
+                "--les", "M4: LES with the rim refused", "wall model");
+    }
     // Everything the low-Mach solver does not have, by name.
     for (const char* f : {"--mach", "--nscbc-etain", "--nscbc-sink",
-                          "--nscbc-sink-amp", "--les", "--tfles", "--turb"}) {
+                          "--nscbc-sink-amp", "--turb"}) {
         std::vector<std::string> a = {"flame", "--physics", "lowmach", f,
                                       std::string(f) == "--mach" ? "0.01"
                                       : std::string(f) == "--nscbc-sink-amp"

@@ -38,12 +38,13 @@ std::expected<FvPatchKind, std::string> kindOf(std::string_view s)
     if (s == "outflow") return FvPatchKind::Outflow;
     if (s == "far") return FvPatchKind::Far;
     if (s == "empty") return FvPatchKind::Empty;
-    return Err(std::format("unknown patch type '{}'; one of: wall, slip, inflow, outflow, far, empty", s));
+    if (s == "open") return FvPatchKind::Open;
+    return Err(std::format("unknown patch type '{}'; one of: wall, slip, inflow, outflow, far, empty, open", s));
 }
 
 const char* kindName(FvPatchKind k)
 {
-    static constexpr const char* n[] = {"wall", "slip", "inflow", "outflow", "far", "empty"};
+    static constexpr const char* n[] = {"wall", "slip", "inflow", "outflow", "far", "empty", "open"};
     return n[std::size_t(k)];
 }
 
@@ -63,6 +64,7 @@ std::vector<std::string_view> keysOf(FvPatchKind k)
     case FvPatchKind::Outflow: return {"type", "p", "tback", "y", "burnt"};
     case FvPatchKind::Far: return {"type", "y"};
     case FvPatchKind::Empty: return {"type"};
+    case FvPatchKind::Open: return {"type", "t", "y"};
     }
     return {"type"};
 }
@@ -73,7 +75,7 @@ std::expected<FvPatchSpec, std::string> parsePatch(const std::string& name, cons
     if (t.get("kind"))
         return Err(w + ": key 'kind' is the incompressible --bc schema; --physics compressible spells it type");
     const toml::node* ty = t.get("type");
-    if (!ty || !ty->is_string()) return Err(w + ": needs type = \"wall|slip|inflow|outflow|far|empty\"");
+    if (!ty || !ty->is_string()) return Err(w + ": needs type = \"wall|slip|inflow|outflow|far|empty|open\"");
     auto kind = kindOf(ty->value_or(std::string()));
     if (!kind) return Err(w + ": " + kind.error());
     FvPatchSpec p{.name = name, .kind = *kind};
@@ -115,6 +117,8 @@ std::expected<FvPatchSpec, std::string> parsePatch(const std::string& name, cons
         if (auto r = vec("u", p.uIn); !r) return Err(r.error());
         if (auto r = num("t", p.tIn); !r) return Err(r.error());
     }
+    if (p.kind == FvPatchKind::Open)
+        if (auto r = num("t", p.tIn); !r) return Err(r.error());
     if (p.kind == FvPatchKind::Outflow) {
         if (auto r = num("p", p.pOut); !r) return Err(r.error());
         if (auto r = num("tback", p.tBack); !r) return Err(r.error());
@@ -262,6 +266,7 @@ std::string fvBcFlameKey(const FvBcSpec& spec)
         if (p.hasY) return "patch." + p.name + ".y";
         if (p.burnt) return "patch." + p.name + ".burnt";
         if (p.jet) return "patch." + p.name + ".jet";
+        if (p.kind == FvPatchKind::Open) return "patch." + p.name + ".type = \"open\"";
     }
     return {};
 }

@@ -40,7 +40,7 @@ Semantic notes, i.e. the places where 1:1 needed a check rather than a typedef:
   the pragma. Where a kernel must keep two roundings (gpu/la
   `kProlongAddScaled`), the product is spelled `__dmul_rn`, which both
   runtimes provide.
-- The headers must stay compilable by the plain HOST compiler: `dns_main.cpp`
+- The headers must stay compilable by the plain HOST compiler: `src/dns/drive/*.cpp`
   and the `test_gpu_*.cpp` tests are CXX TUs that include `gpu/device_util.hpp`
   and hence `hip/hip_runtime.h`. `cuda_runtime.h` is host-safe; `cub.cuh` is
   not, which is why the rocPRIM shim is only reachable from `gpu/internal/`.

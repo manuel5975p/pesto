@@ -6,10 +6,13 @@
 #include "dns/comp.hpp"
 #include "dns/config.hpp"
 #include "dns/grid.hpp"
+#include "dns/tfles.hpp"
+#include "dns/transport.hpp"
 #include "dns/turb_ic.hpp"
 
 #include <array>
 #include <functional>
+#include <span>
 #include <vector>
 
 namespace dns {
@@ -120,5 +123,48 @@ void addBunsenTurbulence(const Case& c,
 inline constexpr double kWickIcDecay = 0.5;
 inline constexpr double kWickIcAbove = 4;
 void wickIC(const Case& c, CompState& q, std::vector<double> (&rhoY)[3]);
+
+// The premix whose products leave: --equivalence's burnt one at --mix-phi (C2, C2b),
+// else the case's; sigma its expansion ratio (C0: the flame model's).
+struct FlameBurnt
+{
+    PartialPremixModel burn;
+    double sigma = 1;
+};
+FlameBurnt flameBurnt(const Case& c);
+
+// --tfles F (structured and FV, both physics): the thickened flame's setup in box
+// units (mu = Pr, rho_u = 1, Tu = c.flameTu), the sensor's radius `dilate` cells.
+// Pre: c.flameTfles > 0.
+TflesSetup flameTflesSetup(const Case& c, double sigma, int dilate);
+
+// The flame's gas in box units at T (Tu, T0): mu = Pr at Tref = T, so lambda = mu cp /
+// Pr = cp (delta_D = 1); the case's viscosity law.
+Transport flameGas(const Case& c, double T);
+
+// The compressible flame's x-lo inflow rows, row j + ny k (NSCBC Prof rows): velocity,
+// jet weight, the density target (rho; 1/(R T) under --nscbc-tinflow), rho, fuel and
+// oxidizer mass fractions (yO empty: one reactant).
+struct FlameInflowRows
+{
+    std::vector<double> u, jet, target, rho, yF, yO;
+};
+
+// --mode bunsen: bunsenInflowAt per row (slot or round nozzle), p0 = Tu. Pre: c.flameBunsen.
+FlameInflowRows bunsenInflowRows(const Case& c);
+
+// --mode diffusion | candle: the Burke-Schumann sheet of Z(y) (quiescentInflow with
+// --quiescent); under gravity gx > 0 rho = pIn / T (the ambient column at h/2), else
+// p0 = T0. Pre: c.flameDiffusion.
+FlameInflowRows diffusionInflowRows(const Case& c, double gx, double pIn);
+
+// --wick: the coflow air at rest on the ambient column, rho = pIn / T0 (rho empty).
+// Pre: c.flameWick.
+FlameInflowRows wickInflowRows(const Case& c, double pIn);
+
+// --mode bunsen --turb: the inflow sees the box times the jet weight of its row (cell i
+// of row r reads box column i mod nbx: q / nbx is the row), the coflow stays laminar.
+// Pre: box from turbBox(flameTurbSpec(c)), rows nbx wide, jet one weight per row.
+void bunsenTurbJetWeight(std::array<std::vector<double>, 3>& box, std::span<const double> jet, int nbx);
 
 } // namespace dns

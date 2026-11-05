@@ -358,6 +358,19 @@ int main()
               "--compensated is compressible");
         check(rejected({"conv", "--solver", "fv", "--tol", "1e-6"}, 2, "--tol"), "--tol is incompressible on FV");
         check(rejected({"conv", "--tol", "1e-6"}, 2, "--tol"), "--tol needs --solver fv");
+        // mci: LES of the Boussinesq layer (dns/fvimodules), incompressible FV only.
+        auto l = runCli({"conv", "--solver", "fv", "--physics", "incompressible", "--n", "16", "--ny", "8", "--nz", "16",
+                         "--les", "1.35", "--sgs", "sigma"});
+        check(l.has_value() && l->cs == 1.35 && l->sgsModel == dns::SgsModel::Sigma && l->meta.sgs == "sigma",
+              "conv --solver fv incompressible takes --les --sgs sigma");
+        check(rejected({"conv", "--les", "0.17"}, 2, "--les"), "--les is not on the structured conv");
+        check(rejected({"conv", "--solver", "fv", "--les", "0.17"}, 2, "--les"), "--les is not on the compressible FV conv");
+        check(rejected({"conv", "--solver", "fv", "--physics", "incompressible", "--nz", "1", "--les", "1", "--sgs",
+                        "sigma"},
+                       2, "--sgs"),
+              "sigma is refused on a 2D conv box");
+        check(rejected({"conv", "--solver", "fv", "--physics", "incompressible", "--sgs", "sigma"}, 2, "--sgs"),
+              "--sgs needs --les");
         check(rejected({"conv", "--compensated"}, 2, "--compensated"), "--compensated needs --solver fv");
         check(rejected({"conv", "--fv-precision", "fp64"}, 2, "--fv-precision"), "--fv-precision needs --solver fv");
         check(rejected({"conv", "--mesh-perturb", "0.05"}, 2, "--mesh-perturb"), "--mesh-perturb needs --solver fv");

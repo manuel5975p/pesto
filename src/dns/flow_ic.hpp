@@ -14,13 +14,19 @@
 #include "dns/casegeom.hpp"
 #include "dns/comp.hpp"
 #include "dns/config.hpp"
+#include "dns/facemesh.hpp"
 #include "dns/field.hpp"
+#include "dns/fvref.hpp"
 #include "dns/remap.hpp"
 
 #include <array>
+#include <span>
 #include <vector>
 
 namespace dns {
+
+struct CurvMesh;
+struct WedgeStart;
 
 // Incompressible body flow: uniform stream (or rest under --ramp) plus a
 // deterministic z-uniform v-kick in the near wake.
@@ -146,5 +152,48 @@ struct RbPoint
     std::array<double, 3> u{};
 };
 RbPoint rbPointAt(const Case& c, double x, double y, double z, bool threeD);
+
+// --ogrid-trip (every O-grid but the wedge, which config rejects): a solenoidal Gaussian
+// vortex, axis along z, at (cx + D, cy + D/4, cz), width w = D/4, strength A U -- u += 2
+// (y - y0)/w e, v -= 2 (x - x0)/w e, e = A U exp(-|x - x0|^2/w^2): divergence-free (w ==
+// 0, and e's z factor multiplies both), so acoustically silent. On the full revolution it
+// breaks the exact pi-rotation symmetry about the axis that otherwise locks out the odd
+// azimuthal modes; on the cylinder the up-down symmetry that delays shedding. cz is the
+// span's centre, and the 2D cell centre sits on it. On the uniform start it is bit for bit
+// the aeb53b9 trip (adding v = w = 0 is exact). Here: the vortex added to the primitives
+// pr, pu, pv, pw, pp at mesh's cell centres (the mean of the 8 nodes), into the conserved
+// ic. Pre: c.ogridTrip > 0, mesh c.grid's O-grid, every primitive g.size().
+void addOgridTrip(const Case& c, const CaseGeometry& geo, const CurvMesh& mesh, const std::vector<double>& pr,
+                  const std::vector<double>& pu, const std::vector<double>& pv, const std::vector<double>& pw,
+                  const std::vector<double>& pp, CompState& ic);
+
+// The same vortex on an FV O-grid's incompressible start: u, v (U0 rows 0, 1 of 3 nC) at
+// the centroids C. Pre: c.ogridTrip > 0, U0.size() == 3 C[0].size().
+void addOgridTripFv(const Case& c, double D, const std::array<std::vector<double>, 3>& C, std::vector<double>& U0);
+
+// The compressible O-grid's start (runFlowOGrid; --solver fv on the O-grid): the quiet start
+// AT REST, exactly consistent with the no-slip wall (--ramp 0 starts it in the freestream;
+// a steady march always does, impulsively -- pseudo-time has no ramp), or --init-from's
+// revolved wedge (full revolution); then the trip. turb: one row per RANS scalar, rho phi at
+// the freestream (the wedge's when revolved); the wall row images them. wedge consumed.
+// Pre: mesh c.grid's O-grid; wedge from revolveWedgeState on it, or null.
+CompState ogridCompressibleIC(const Case& c, const CaseGeometry& geo, const CurvMesh& mesh, double rhoInf,
+                              double pInf, WedgeStart* wedge, std::span<std::vector<double>> turb);
+
+// dns conv --solver fv | --polymesh, compressible: convIC's analytic field at fm's
+// centroids (y clamped into [0, H]: convHydroAt's column, convTripAt's trip).
+FvState convFvState(const Case& c, const FaceMesh& fm);
+
+// dns conv --solver fv | --polymesh, incompressible: rbIC's field at fm's centroids
+// (rbPointAt): U0 rows u, v, w of 3 nC, T0 per cell.
+void rbFvFields(const Case& c, const FaceMesh& fm, std::vector<double>& U0, std::vector<double>& T0);
+
+// Uniform-density Taylor-Green as a COMPRESSIBLE state: rho = 1, the same
+// velocity field the incompressible benchmark uses, and a uniform pressure set
+// by the Mach number (p = 1/(gamma M^2) with uInf = rho = 1). Not an exact
+// solution of anything -- a benchmark needs a representative field, not a
+// converged one -- but it is smooth, fills every cell and exercises the full
+// convective + viscous flux.
+CompState benchCompState(const Grid& g, const VectorField& U, double gamma, double mach);
 
 } // namespace dns

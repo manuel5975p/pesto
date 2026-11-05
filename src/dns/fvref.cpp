@@ -1,6 +1,7 @@
 #include "dns/fvref.hpp"
 
 #include "dns/chem.hpp"
+#include "dns/diffusion.hpp"
 #include "dns/parallel.hpp"
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <cmath>
 #include <format>
 #include <optional>
+#include <span>
 
 namespace dns {
 namespace {
@@ -103,6 +105,87 @@ struct FvRef::Stage
     const double* src = nullptr;
 };
 
+FvModuleSet fvModulesOf(const FvConfig& cfg)
+{
+    const auto nonzero = [](const std::array<double, 3>& v) {
+        return std::ranges::any_of(v, [](double x) { return x != 0.0; });
+    };
+    FvModuleSet s;
+    const auto on = [&](FvModule m, bool b) { s.set(std::size_t(m), b); };
+    const bool lesOn = cfg.les.cs > 0.0;
+    on(FvModule::LesSmag, lesOn && cfg.les.sgs != SgsModel::Sigma);
+    on(FvModule::LesSigma, lesOn && cfg.les.sgs == SgsModel::Sigma);
+    on(FvModule::TflesUniform, cfg.tfles && cfg.tfles->uniform);
+    on(FvModule::TflesDynamic, cfg.tfles && !cfg.tfles->uniform);
+    on(FvModule::TflesEfficiency, cfg.tfles && cfg.tfles->charlette);
+    on(FvModule::RansSa, cfg.rans.model != RansModel::None && !ransSst(cfg.rans.model));
+    on(FvModule::RansSst, ransSst(cfg.rans.model));
+    on(FvModule::ChemC0, cfg.chem.nY > 0 && cfg.chem.ox < 0);
+    on(FvModule::ChemC1, cfg.chem.nY > 0 && cfg.chem.ox >= 0 && cfg.chem.law.n == 0);
+    on(FvModule::ChemC2b, cfg.chem.nY > 0 && cfg.chem.ox >= 0 && cfg.chem.law.n > 0);
+    on(FvModule::Gravity, nonzero(cfg.gravity));
+    on(FvModule::BodyForce, nonzero(cfg.bodyForce));
+    on(FvModule::Turb, cfg.turb);
+    return s;
+}
+
+double fvAmbientP(const FvAmbient& a, const std::array<double, 3>& g, const double x[3], double Rgas)
+{
+    assert(a.p0 > 0.0 && a.T0 > 0.0 && Rgas > 0.0);
+    const double gm = std::sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
+    if (!(gm > 0.0)) return a.p0;
+    const V3 up = {-g[0] / gm, -g[1] / gm, -g[2] / gm};
+    const double h = (x[0] - a.x0[0]) * up[0] + (x[1] - a.x0[1]) * up[1] + (x[2] - a.x0[2]) * up[2];
+    return candleAmbientP(a.p0, gm, Rgas * a.T0, h);
+}
+
+std::array<double, 5> fvAmbientConserved(const FvAmbient& a, const std::array<double, 3>& g, const double x[3],
+                                         const double u[3], double gamma, double Rgas)
+{
+    const double p = fvAmbientP(a, g, x, Rgas), rho = p / (Rgas * a.T0);
+    return {rho, rho * u[0], rho * u[1], rho * u[2], p / (gamma - 1.0) + 0.5 * rho * (u[0] * u[0] + u[1] * u[1] + u[2] * u[2])};
+}
+
+FvBcTable fvAmbientRows(const FaceMesh& fm, FvBcTable t, const FvAmbient& a, const std::array<double, 3>& g,
+                        double gamma, double Rgas)
+{
+    if (t.faceRow.empty()) {
+        t.faceRow.assign(std::size_t(fm.nB), 0);
+        for (std::size_t p = 0; p < fm.patches.size(); ++p)
+            std::fill_n(t.faceRow.begin() + fm.patches[p].first, fm.patches[p].count, int(p));
+    }
+    for (std::size_t b = 0; b < std::size_t(fm.nB); ++b) {
+        const FvBc& r = t.bc[std::size_t(t.faceRow[b])];
+        if (r.kind != FvBcKind::Far && r.kind != FvBcKind::Outflow) continue;
+        const std::size_t c = std::size_t(fm.own[std::size_t(fm.nI) + b]);
+        const double x[3] = {fm.C[0][c], fm.C[1][c], fm.C[2][c]};
+        FvBc n = r;
+        if (r.kind == FvBcKind::Far) {
+            const double u[3] = {r.qFar[1] / r.qFar[0], r.qFar[2] / r.qFar[0], r.qFar[3] / r.qFar[0]};
+            const std::array<double, 5> q = fvAmbientConserved(a, g, x, u, gamma, Rgas);
+            std::ranges::copy(q, n.qFar);
+        } else {
+            n.pOut = fvAmbientP(a, g, x, Rgas);
+        }
+        t.faceRow[b] = int(t.bc.size());
+        t.bc.push_back(n);
+    }
+    return t;
+}
+
+FvState fvAmbientState(const FaceMesh& fm, const FvAmbient& a, const std::array<double, 3>& g, double gamma,
+                       double Rgas, int nV)
+{
+    FvState s = FvState::zeros(fm.nC, nV);
+    const double u[3] = {0.0, 0.0, 0.0};
+    for (std::size_t c = 0; c < std::size_t(fm.nC); ++c) {
+        const double x[3] = {fm.C[0][c], fm.C[1][c], fm.C[2][c]};
+        const std::array<double, 5> q = fvAmbientConserved(a, g, x, u, gamma, Rgas);
+        for (int v = 0; v < kFvMeanVars; ++v) s.var(v)[c] = q[std::size_t(v)];
+    }
+    return s;
+}
+
 FvState FvState::zeros(int nC, int nV)
 {
     FvState s;
@@ -124,16 +207,26 @@ std::expected<FvRef, std::string> FvRef::make(const FaceMesh& fm, FvConfig cfg, 
         return std::unexpected("FV chemistry: needs 1/Pr > 0, q >= 0, Ta >= 0");
     if (ch.ox >= 0 && (ch.ox >= ch.nY || ch.ox == ch.fuel || !(ch.stoich > 0.0)))
         return std::unexpected("FV chemistry: the oxidizer is a species other than the fuel, stoich > 0");
-    // Pairs no gate has composed (docs/fvcomp.md "Combinations"), by name.
-    const auto nonzero = [](const std::array<double, 3>& v) {
-        return std::ranges::any_of(v, [](double x) { return x != 0.0; });
-    };
-    const bool closure = cfg.rans.model != RansModel::None, grav = nonzero(cfg.gravity), drive = nonzero(cfg.bodyForce);
-    if (ch.nY > 0 && closure) return std::unexpected("FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)");
-    if (ch.nY > 0 && grav) return std::unexpected("FV species with gravity: not built (no combustion gate under gravity)");
-    if (ch.nY > 0 && drive) return std::unexpected("FV species with bodyForce: not built");
-    if (closure && grav) return std::unexpected("FV RANS with gravity: not built (no buoyancy term in the closures)");
-    if (grav && drive) return std::unexpected("FV gravity with bodyForce: not built");
+    if (const PhiRateLaw<double>& L = ch.law; L.n != 0) {
+        const auto xi = std::span(L.xi, std::size_t(std::clamp(L.n, 0, PhiRateLaw<double>::kMaxNodes)));
+        const bool nodes = L.n >= 2 && L.n <= PhiRateLaw<double>::kMaxNodes &&
+                           std::ranges::adjacent_find(xi, std::greater_equal<>{}) == xi.end();
+        if (ch.ox < 0 || !nodes || !(L.invDen > 0.0) || !std::isfinite(L.invDen))
+            return std::unexpected("FV chemistry: the C2b law needs two reactants and 2 to 32 strictly ascending nodes");
+    }
+    const FvLes& les = cfg.les;
+    if (!(les.cs >= 0.0) || !std::isfinite(les.cs) || !(les.prt > 0.0))
+        return std::unexpected("FV LES: needs Cs >= 0 and Pr_t > 0");
+    const bool lesOn = les.cs > 0.0;
+    // Every pair and requirement of the configured modules: the inventory (dns/fvmodules,
+    // docs/fvcomp.md "Combinations"), by name.
+    if (auto ok = fvModulesCheck(fvModulesOf(cfg)); !ok) return std::unexpected(std::move(ok.error()));
+    if (cfg.tfles) {
+        const TflesSetup& t = *cfg.tfles;
+        if (!(t.F >= 1.0) || !(t.deltaL > 0.0) || !(t.nuU > 0.0) || t.dilate < 0)
+            return std::unexpected("FV TFLES: needs F >= 1, delta_L > 0, nu_u > 0, a dilation radius >= 0");
+        if (!(tr.muRef > 0.0)) return std::unexpected("FV TFLES needs mu > 0 (it thickens the molecular fluxes)");
+    }
     if (cfg.bcRow.empty() ? cfg.bc.size() != fm.patches.size() : cfg.bc.size() < fm.patches.size())
         return std::unexpected(std::format("FV boundary conditions: {} given for {} patches", cfg.bc.size(),
                                            fm.patches.size()));
@@ -154,20 +247,47 @@ std::expected<FvRef, std::string> FvRef::make(const FaceMesh& fm, FvConfig cfg, 
             }
     }
 
-    if (std::ranges::any_of(cfg.gravity, [](double v) { return v != 0.0; })) {
+    const bool gravOn = std::ranges::any_of(cfg.gravity, [](double v) { return v != 0.0; });
+    if (cfg.ambient && !gravOn) return std::unexpected("FV hydrostatic ambient without gravity: nothing to balance");
+    if (cfg.ambient && !(cfg.ambient->p0 > 0.0 && cfg.ambient->T0 > 0.0 && std::isfinite(cfg.ambient->p0) &&
+                         std::isfinite(cfg.ambient->T0)))
+        return std::unexpected("FV hydrostatic ambient: needs p0 > 0 and T0 > 0");
+    if (gravOn) {
         if (fm.emptyAxis >= 0 && cfg.gravity[std::size_t(fm.emptyAxis)] != 0.0)
             return std::unexpected("FV gravity: along the empty axis of a 2D mesh");
         for (std::size_t p = 0; p < fm.patches.size(); ++p) {
             const FvBc& b = cfg.bc[p];
-            const bool closed = b.kind == FvBcKind::Empty || b.kind == FvBcKind::Slip || b.kind == FvBcKind::Wall;
-            if (!closed)
-                return std::unexpected(std::format("patch `{}`: gravity takes wall, slip and empty patches: an open "
-                                                   "face has no hydrostatic ambient",
-                                                   fm.patches[p].name));
             const bool moving = std::ranges::any_of(b.uWall, [](double v) { return v != 0.0; }) ||
                                 std::ranges::any_of(b.omega, [](double v) { return v != 0.0; });
-            if (moving)
+            if (b.kind == FvBcKind::Wall && moving)
                 return std::unexpected(std::format("patch `{}`: gravity takes resting walls only", fm.patches[p].name));
+            if (b.kind != FvBcKind::Far && b.kind != FvBcKind::Outflow) continue;
+            // An open face's reference pressure is the ambient column's at its owner's
+            // height: without it the face is a pressure mismatch of rho g h (docs/fvcomp.md
+            // "Hydrostatic ambient").
+            const MeshPatch& mp = fm.patches[p];
+            if (!cfg.ambient)
+                return std::unexpected(std::format("patch `{}`: an open patch under gravity needs the hydrostatic "
+                                                   "ambient (FvConfig::ambient, rows of fvAmbientRows)",
+                                                   mp.name));
+            for (int i = 0; i < mp.count; ++i) {
+                const std::size_t f = std::size_t(mp.first + i);
+                const FvBc& row = cfg.bc[std::size_t(cfg.bcRow.empty() ? int(p) : cfg.bcRow[f])];
+                const std::size_t c = std::size_t(fm.own[std::size_t(fm.nI) + f]);
+                const double x[3] = {fm.C[0][c], fm.C[1][c], fm.C[2][c]};
+                const double pa = fvAmbientP(*cfg.ambient, cfg.gravity, x, tr.Rgas);
+                double pr = row.pOut, Tr = cfg.ambient->T0;
+                if (row.kind == FvBcKind::Far) {
+                    const FvPrim<double> F = fvPrimOf(row.qFar[0], row.qFar[1], row.qFar[2], row.qFar[3], row.qFar[4],
+                                                      tr.gamma, tr.Rgas);
+                    pr = F.p;
+                    Tr = F.temp;
+                }
+                if (!(std::abs(pr / pa - 1.0) <= 1e-12) || !(std::abs(Tr / cfg.ambient->T0 - 1.0) <= 1e-12))
+                    return std::unexpected(std::format("patch `{}`: face {} is not the hydrostatic ambient's row at its "
+                                                       "owner's centroid (p {:.17g} vs p_a {:.17g}; fvAmbientRows)",
+                                                       mp.name, i, pr, pa));
+            }
         }
     }
 
@@ -205,6 +325,12 @@ std::expected<FvRef, std::string> FvRef::make(const FaceMesh& fm, FvConfig cfg, 
             return std::unexpected("FV RANS: the wall distance must be positive on every cell");
     }
     r.nV_ = kFvMeanVars + r.cfg_.chem.nY + ransScalars(rc.model);
+    if (lesOn || r.cfg_.tfles) r.delta2_ = fvLesDelta2(fm);
+    if (r.cfg_.tfles) {
+        auto w = fvTflesWalk(fm, r.geom_);
+        if (!w) return std::unexpected(std::move(w.error()));
+        r.walk_ = std::move(*w);
+    }
     return r;
 }
 
@@ -268,8 +394,9 @@ void FvRef::faces(FvEval& ev, std::size_t lo, std::size_t hi) const
     const FaceMesh& m = *fm_;
     const std::size_t nI = std::size_t(m.nI);
     const Transport& tr = cfg_.tr;
-    const bool viscous = tr.muRef > 0.0, rans = cfg_.rans.model != RansModel::None;
-    const double kapEddy = tr.cp() / kPrandtlTurb;
+    const bool les = cfg_.les.cs > 0.0;
+    const bool viscous = tr.muRef > 0.0 || les, rans = cfg_.rans.model != RansModel::None || les;
+    const double kapEddy = tr.cp() / (les ? cfg_.les.prt : kPrandtlTurb);
     const auto& gv = cfg_.gravity;
     const bool hasG = gv[0] != 0.0 || gv[1] != 0.0 || gv[2] != 0.0;
     auto cellGrad = [&](std::size_t c, int k, double g[3]) {
@@ -349,9 +476,130 @@ void FvRef::speciesCells(const double* q, FvEval& ev, std::size_t lo, std::size_
         for (std::size_t s = 0; s < std::size_t(ch.nY); ++s)
             ev.Y[s][c] = q[(std::size_t(kFvMeanVars) + s) * nC + c] / rho;
         const double yf = ev.Y[std::size_t(ch.fuel)][c], T = ev.prim[6][c];
-        ev.omega[c] = ch.ox >= 0 ? arrheniusRate2(ch.lnA, ch.Ta, rho, yf, ev.Y[std::size_t(ch.ox)][c], T)
-                                 : arrheniusRate(ch.lnA, ch.Ta, rho, yf, T);
+        // C2b: ln C of the cell's unfloored Y_F, Y_O (kChemCellPass2Phi's arguments).
+        const double yo = ch.ox >= 0 ? ev.Y[std::size_t(ch.ox)][c] : 0.0;
+        const double lnA = ch.law.n > 0 ? ch.lnA + phiRateLn(ch.law, yf, yo) : ch.lnA;
+        const double w = ch.ox >= 0 ? arrheniusRate2(lnA, ch.Ta, rho, yf, yo, T) : arrheniusRate(ch.lnA, ch.Ta, rho, yf, T);
+        ev.omega[c] = cfg_.tfles ? w * ev.eof[c] : w; // TFLES: (E/F) omega, kChemCellPass<true>
     }
+}
+
+// mu_t = rho (C Delta)^2 op(grad u): DeviceFvComp's kFvNut, Delta^2 = fvLesDelta2.
+void FvRef::lesCells(FvEval& ev, std::size_t lo, std::size_t hi) const
+{
+    const double cs = cfg_.les.cs;
+    const int sigma = cfg_.les.sgs == SgsModel::Sigma ? 1 : 0;
+    for (std::size_t c = lo; c < hi; ++c) {
+        double gd[3][3];
+        for (std::size_t i = 0; i < 3; ++i)
+            for (std::size_t j = 0; j < 3; ++j) gd[i][j] = ev.grad[3 * i + j][c];
+        ev.nut[c] = ev.prim[0][c] * (cs * cs * delta2_[c]) * sgsRate(sigma, gd);
+    }
+}
+
+// The raw sensor tanh(beta w_s) into tfWork[0] (w_s the rate at TaS, gpu/tfles's
+// kTflesSensorRaw) and, for the efficiency, curl u off the cell gradients.
+void FvRef::tflesRaw(const double* q, FvEval& ev, std::size_t lo, std::size_t hi) const
+{
+    const TflesSetup& t = *cfg_.tfles;
+    const std::size_t nC = std::size_t(fm_->nC), iF = std::size_t(kFvMeanVars + cfg_.chem.fuel);
+    for (std::size_t c = lo; c < hi; ++c) {
+        if (!t.uniform) {
+            const double r = q[c];
+            ev.tfWork[0][c] = std::tanh(t.sensorBeta * arrheniusRate(t.lnAs, t.TaS, r, q[iF * nC + c] / r, ev.prim[6][c]));
+        }
+        if (t.charlette) { // grad rows [3 field + axis]; fields u, v, w
+            ev.curl[0][c] = ev.grad[7][c] - ev.grad[5][c];
+            ev.curl[1][c] = ev.grad[2][c] - ev.grad[6][c];
+            ev.curl[2][c] = ev.grad[3][c] - ev.grad[1][c];
+        }
+    }
+}
+
+// Pass p of the T-gated max filter: tfWork[p & 1] -> tfWork[(p + 1) & 1] along walked
+// axis p, dilate steps each way; a cell takes the cells it reaches with T >= its own.
+void FvRef::tflesDilate(FvEval& ev, int pass, std::size_t lo, std::size_t hi) const
+{
+    const std::size_t nC = std::size_t(fm_->nC);
+    const std::vector<double>& in = ev.tfWork[std::size_t(pass & 1)];
+    std::vector<double>& out = ev.tfWork[std::size_t((pass + 1) & 1)];
+    const std::vector<double>& T = ev.prim[6];
+    const int rad = cfg_.tfles->dilate;
+    for (std::size_t c = lo; c < hi; ++c) {
+        double m = in[c];
+        for (std::size_t dir = 0; dir < 2; ++dir) {
+            const int* nx = walk_.next.data() + (std::size_t(pass) * 2 + dir) * nC;
+            int n = int(c);
+            for (int k = 0; k < rad; ++k) {
+                n = nx[std::size_t(n)];
+                if (n < 0) break;
+                if (T[std::size_t(n)] >= T[c]) m = std::max(m, in[std::size_t(n)]);
+            }
+        }
+        out[c] = m;
+    }
+}
+
+// Colin's grid-scale u' = c2 h^3 |lap(curl u)|, h = sqrt(Delta^2), the compact
+// Laplacian (1/V) sum_f (phi_N - phi_P) corr.S over internal faces.
+void FvRef::tflesColin(FvEval& ev, std::size_t lo, std::size_t hi) const
+{
+    const FaceMesh& m = *fm_;
+    for (std::size_t c = lo; c < hi; ++c) {
+        double s2 = 0.0;
+        for (std::size_t k = 0; k < 3; ++k) {
+            double l = 0.0;
+            for (int q = m.cellStart[c]; q < m.cellStart[c + 1]; ++q) {
+                const std::size_t f = std::size_t(m.cellFace[std::size_t(q)]);
+                if (f >= std::size_t(m.nI)) continue;
+                const std::size_t o = std::size_t(m.own[f]) == c ? std::size_t(m.nei[f]) : std::size_t(m.own[f]);
+                l += walk_.lapW[std::size_t(q)] * (ev.curl[k][o] - ev.curl[k][c]);
+            }
+            l /= m.V[c];
+            s2 += l * l;
+        }
+        const double h = std::sqrt(delta2_[c]);
+        ev.uh[c] = kColinC2 * h * h * h * std::sqrt(s2);
+    }
+}
+
+// F = 1 + (F_max - 1) Omega, E = Charlette off the edge layers: kTflesCombine.
+void FvRef::tflesCombine(FvEval& ev, std::size_t lo, std::size_t hi) const
+{
+    const TflesSetup& t = *cfg_.tfles;
+    const std::vector<double>& W = ev.tfWork[std::size_t(walk_.nAxes & 1)];
+    for (std::size_t c = lo; c < hi; ++c) {
+        const double w = t.uniform ? 1.0 : W[c];
+        const double F = 1.0 + (t.F - 1.0) * w;
+        double E = 1.0;
+        if (t.charlette && !walk_.edge[c]) {
+            const double D = F * t.deltaL;
+            const double up = colinUprime(ev.uh[c], D, std::sqrt(delta2_[c]));
+            E = charletteEfficiency(F, up, up * D / t.nuU, t.effBeta);
+        }
+        ev.fe[c] = F * E;
+        ev.eof[c] = E / F;
+        ev.om[c] = w;
+    }
+}
+
+template <class Sync>
+void FvRef::tflesFields(const double* q, FvEval& ev, std::size_t c0, std::size_t c1, Sync&& sync) const
+{
+    const TflesSetup& t = *cfg_.tfles;
+    tflesRaw(q, ev, c0, c1);
+    sync();
+    if (!t.uniform)
+        for (int p = 0; p < walk_.nAxes; ++p) {
+            tflesDilate(ev, p, c0, c1);
+            sync();
+        }
+    if (t.charlette) {
+        tflesColin(ev, c0, c1);
+        sync();
+    }
+    tflesCombine(ev, c0, c1);
+    sync();
 }
 
 void FvRef::speciesBnd(FvEval& ev, std::size_t lo, std::size_t hi) const
@@ -383,7 +631,9 @@ void FvRef::speciesFaces(FvEval& ev, std::size_t lo, std::size_t hi) const
     const FaceMesh& m = *fm_;
     const std::size_t nI = std::size_t(m.nI), nY = ev.Y.size();
     const Transport& tr = cfg_.tr;
-    const bool viscous = tr.muRef > 0.0, shared = cfg_.chem.ox >= 0;
+    const bool les = cfg_.les.cs > 0.0, thick = cfg_.tfles.has_value();
+    const bool viscous = tr.muRef > 0.0 || les, shared = cfg_.chem.ox >= 0;
+    const double kapLes = tr.cp() / cfg_.les.prt;
     auto cellGrad = [&](std::size_t c, std::size_t s, double g[3]) {
         for (std::size_t a = 0; a < 3; ++a) g[a] = ev.gradY[3 * s + a][c];
     };
@@ -408,11 +658,30 @@ void FvRef::speciesFaces(FvEval& ev, std::size_t lo, std::size_t hi) const
         }
         const std::size_t o = std::size_t(m.own[f]), n = std::size_t(m.nei[f]);
         const V3 S = at(m.S, f), d = at(m.d, f), corr = at(geom_.corr, f);
-        double rhoD = 0.0;
+        double rhoD = 0.0, kapf = 0.0;
         if (viscous) {
-            double mu, kappa;
-            fvTransportAt(tr, 0.5 * (ev.prim[6][o] + ev.prim[6][n]), mu, kappa);
+            double mu;
+            fvTransportAt(tr, 0.5 * (ev.prim[6][o] + ev.prim[6][n]), mu, kapf);
             rhoD = mu * cfg_.chem.invPr;
+        }
+        // LES, TFLES (docs/fvcomp.md "Species LES and TFLES"): the eddy and thickened rho D,
+        // the thickened energy flux added to F_E.
+        if (les || thick) {
+            const double nutf = les ? 0.5 * (ev.nut[o] + ev.nut[n]) : 0.0, invSct = 1.0 / cfg_.les.prt;
+            if (!thick) {
+                rhoD = fvEddyRhoD(rhoD, nutf, invSct);
+            } else {
+                const double FEf = 0.5 * (ev.fe[o] + ev.fe[n]), Omf = 0.5 * (ev.om[o] + ev.om[n]);
+                rhoD = fvThickRhoD(rhoD, FEf, Omf, nutf, invSct, les);
+                double ga[3], gb[3], gT[3];
+                for (std::size_t a = 0; a < 3; ++a) {
+                    ga[a] = ev.grad[9 + a][o];
+                    gb[a] = ev.grad[9 + a][n];
+                }
+                fvFaceGrad(ga, gb, ev.prim[6][o], ev.prim[6][n], d.data(), corr.data(), gT);
+                const double gTS = gT[0] * S[0] + gT[1] * S[1] + gT[2] * S[2];
+                ev.F[4][f] = ev.F[4][f] + fvThickEnergyFlux(FEf, Omf, nutf, kapf, kapLes, gTS, les);
+            }
         }
         double th = 2.0;
         for (std::size_t s = 0; shared && s < nY; ++s) {
@@ -667,6 +936,11 @@ void FvRef::sizeEval(FvEval& ev) const
     for (auto& p : ev.bphi) p.assign(nB, 0.0);
     for (auto& g : ev.grad) g.assign(nC, 0.0);
     for (auto& F : ev.F) F.assign(nF, 0.0);
+    if (cfg_.les.cs > 0.0) ev.nut.assign(nC, 0.0);
+    if (cfg_.tfles) {
+        for (auto* v : {&ev.fe, &ev.eof, &ev.om, &ev.uh, &ev.tfWork[0], &ev.tfWork[1], &ev.curl[0], &ev.curl[1], &ev.curl[2]})
+            v->assign(nC, 0.0);
+    }
     if (cfg_.rans.model == RansModel::None) return;
     for (auto& p : ev.tfld) p.assign(nC, 0.0);
     for (auto& p : ev.tbnd) p.assign(nB, 0.0);
@@ -684,7 +958,8 @@ void FvRef::evaluate(const FvState& s, FvEval& ev, FvState& out, const FvState* 
     const std::size_t nC = std::size_t(m.nC), nB = std::size_t(m.nB), nF = std::size_t(m.nI) + nB;
     sizeEval(ev);
     if (out.nV != s.nV || out.nC != s.nC) out = FvState::zeros(s.nC, s.nV);
-    const bool viscous = cfg_.tr.muRef > 0.0, species = cfg_.chem.nY > 0, rans = cfg_.rans.model != RansModel::None;
+    const bool les = cfg_.les.cs > 0.0, thick = cfg_.tfles.has_value();
+    const bool viscous = cfg_.tr.muRef > 0.0 || les, species = cfg_.chem.nY > 0, rans = cfg_.rans.model != RansModel::None;
     Stage st;
     st.out = out.q.data();
     st.src = src ? src->q.data() : nullptr;
@@ -696,16 +971,23 @@ void FvRef::evaluate(const FvState& s, FvEval& ev, FvState& out, const FvState* 
         sync();
         bndStates(ev, b0, b1);
         sync();
+        // The cell gradients first: mu_t and TFLES's coefficients read them, the species
+        // pass reads E/F (independent passes, so the order moves no number).
+        if (viscous) {
+            grads(ev, c0, c1);
+            sync();
+        }
+        if (les) {
+            lesCells(ev, c0, c1);
+            sync();
+        }
+        if (thick) tflesFields(s.q.data(), ev, c0, c1, sync);
         if (species) {
             speciesCells(s.q.data(), ev, c0, c1);
             sync();
             speciesBnd(ev, b0, b1);
             sync();
             speciesGrads(ev, c0, c1);
-            sync();
-        }
-        if (viscous) {
-            grads(ev, c0, c1);
             sync();
         }
         if (rans) {
@@ -747,7 +1029,8 @@ void FvRef::march(FvState& s, double dt, int steps, const FvState* src) const
     FvEval ev;
     sizeEval(ev);
     FvState q1 = FvState::zeros(s.nC, s.nV), q2 = FvState::zeros(s.nC, s.nV);
-    const bool viscous = cfg_.tr.muRef > 0.0, species = cfg_.chem.nY > 0, rans = cfg_.rans.model != RansModel::None;
+    const bool les = cfg_.les.cs > 0.0, thick = cfg_.tfles.has_value();
+    const bool viscous = cfg_.tr.muRef > 0.0 || les, species = cfg_.chem.nY > 0, rans = cfg_.rans.model != RansModel::None;
     // SSP-RK3 in the fused form out = ca a + cb b + cr R(b), ca = 1 - cb.
     const double cbs[3] = {0.0, 0.25, 2.0 / 3.0};
     const double* bs[3] = {s.q.data(), q1.q.data(), q2.q.data()};
@@ -762,16 +1045,22 @@ void FvRef::march(FvState& s, double dt, int steps, const FvState* src) const
                 sync();
                 bndStates(ev, b0, b1);
                 sync();
+                if (viscous) {
+                    grads(ev, c0, c1);
+                    sync();
+                }
+                if (les) {
+                    lesCells(ev, c0, c1);
+                    sync();
+                }
+                // TFLES: F, E, Omega of the step's INPUT state, held over its stages.
+                if (thick && k == 0) tflesFields(bs[k], ev, c0, c1, sync);
                 if (species) {
                     speciesCells(bs[k], ev, c0, c1);
                     sync();
                     speciesBnd(ev, b0, b1);
                     sync();
                     speciesGrads(ev, c0, c1);
-                    sync();
-                }
-                if (viscous) {
-                    grads(ev, c0, c1);
                     sync();
                 }
                 if (rans) {
@@ -821,12 +1110,15 @@ double FvRef::chemDt(const FvState& s, double k) const
         const FvPrim<double> p = fvPrimOf(s.var(0)[c], s.var(1)[c], s.var(2)[c], s.var(3)[c], s.var(4)[c], tr.gamma,
                                           tr.Rgas);
         const double Y = s.var(kFvMeanVars + ch.fuel)[c] / p.rho;
-        const double r = std::exp(ch.lnA - ch.Ta / p.temp);
         if (ch.ox >= 0) {
-            const double yf = std::max(Y, 0.0), yo = std::max(s.var(kFvMeanVars + ch.ox)[c] / p.rho, 0.0);
+            // ChemRate2Phi with the law: ln C in FP64 of the unfloored Y_F, Y_O.
+            const double YO = s.var(kFvMeanVars + ch.ox)[c] / p.rho;
+            const double r = std::exp(ch.lnA + (ch.law.n > 0 ? phiRateLn(ch.law, Y, YO) : 0.0) - ch.Ta / p.temp);
+            const double yf = std::max(Y, 0.0), yo = std::max(YO, 0.0);
             J = std::max(J, r * p.rho * (yo + ch.stoich * yf + ch.q * yf * yo * ch.Ta / (cv * p.temp * p.temp)));
             continue;
         }
+        const double r = std::exp(ch.lnA - ch.Ta / p.temp);
         J = std::max(J, r * (1.0 + ch.q * (Y > 0.0 ? Y : 0.0) * ch.Ta / (cv * p.temp * p.temp)));
     }
     return J > 0.0 ? k / J : HUGE_VAL;
@@ -840,13 +1132,15 @@ std::expected<double, std::string> FvRef::stableDt(const FvState& s, FvDtLimits 
     const std::size_t nC = std::size_t(m.nC);
     const Transport& tr = cfg_.tr;
     if (local) local->assign(nC, 0.0);
+    const bool les = cfg_.les.cs > 0.0, thick = cfg_.tfles.has_value();
     const bool rans = cfg_.rans.model != RansModel::None;
     FvEval ev;
-    if (rans) {
+    if (rans || les || thick) {
         FvState o;
         evaluate(s, ev, o);
     }
-    const double fMol = fvDiffusivityFactor(tr.gamma, tr.Pr), fEddy = fvDiffusivityFactor(tr.gamma, kPrandtlTurb);
+    const double fMol = fvDiffusivityFactor(tr.gamma, tr.Pr),
+                 fEddy = fvDiffusivityFactor(tr.gamma, les ? cfg_.les.prt : kPrandtlTurb);
     const int nw = workerCount(workers_, nC);
     std::vector<double> mins(std::size_t(nw), INFINITY);
     std::vector<std::optional<std::string>> err(static_cast<std::size_t>(nw));
@@ -868,11 +1162,12 @@ std::expected<double, std::string> FvRef::stableDt(const FvState& s, FvDtLimits 
                 sum += std::abs(p.u[0] * Sx + p.u[1] * Sy + p.u[2] * Sz) + cs * std::sqrt(Sx * Sx + Sy * Sy + Sz * Sz);
             }
             double dt = 2.0 * lim.cfl * m.V[c] / sum;
-            if (tr.muRef > 0.0) {
+            if (tr.muRef > 0.0 || les) {
                 double mu, kappa;
                 fvTransportAt(tr, p.temp, mu, kappa);
-                double den = mu * fMol;
-                if (rans) den += ev.nut[c] * fEddy;
+                // TFLES: the thickened energy and species carry FE gamma/Pr on mu.
+                double den = mu * (thick ? std::max(4.0 / 3.0, ev.fe[c] * (tr.gamma / tr.Pr)) : fMol);
+                if (rans || les) den += ev.nut[c] * fEddy;
                 if (cfg_.rans.model == RansModel::SaNeg)
                     den = std::max(den, p.rho * saDtDiffusivity(mu / p.rho, ev.tfld[0][c]) / sa::sigma);
                 dt = std::min(dt, lim.diff * p.rho * m.V[c] / (den * diffCoef_[c]));

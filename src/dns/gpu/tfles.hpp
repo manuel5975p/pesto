@@ -43,6 +43,10 @@ public:
     void update(const DeviceCompState& s, const DeviceScalar& u,
                 const DeviceScalar& v, const DeviceScalar& w,
                 const DeviceScalar& T);
+    // The same from raw fields: rho, rho Y_fuel (the low-Mach solver's words).
+    void update(const Real* rho, const Real* ryFuel, const DeviceScalar& u,
+                const DeviceScalar& v, const DeviceScalar& w,
+                const DeviceScalar& T);
 
     const Real* fe() const { return fe_.data(); }
     const Real* eof() const { return eof_.data(); }

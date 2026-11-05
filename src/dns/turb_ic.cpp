@@ -1,6 +1,7 @@
 #include "dns/turb_ic.hpp"
 
 #include "dns/hit_ic.hpp"
+#include "dns/parallel.hpp"
 
 #if DNS_WITH_FFTW
 #include <fftw3.h>
@@ -257,7 +258,102 @@ std::array<std::vector<double>, 3> turbBox(const TurbSpec& s)
     fftw_free(cp);
     return out;
 }
+
+std::array<std::vector<double>, 3> turbBoxAt(const TurbSpec& s, const std::array<double, 3>& sh)
+{
+    const std::vector<TurbMode> modes = turbModes(s);
+    const std::size_t n = std::size_t(s.nx) * s.ny * s.nz;
+    const int nxh = s.nx / 2 + 1;
+    const std::size_t nc = std::size_t(nxh) * s.ny * s.nz;
+    double* real = fftw_alloc_real(n);
+    fftw_complex* cp = fftw_alloc_complex(nc);
+    const fftw_plan bwd = fftw_plan_dft_c2r_3d(s.nz, s.ny, s.nx, cp, real, FFTW_ESTIMATE);
+    std::array<std::vector<double>, 3> out;
+    for (int c = 0; c < 3; ++c) {
+        for (std::size_t q = 0; q < nc; ++q) cp[q][0] = cp[q][1] = 0.0;
+        for (const TurbMode& m : modes) {
+            if (m.m[0] < 0) continue;
+            const int jy = (m.m[1] % s.ny + s.ny) % s.ny;
+            const int kz = (m.m[2] % s.nz + s.nz) % s.nz;
+            // u((i + sh) h) = sum uh e^{i k.sh h} e^{i 2 pi m i/n}.
+            const double ph =
+                kTwoPi * (sh[0] * double(m.m[0]) / s.nx + sh[1] * double(m.m[1]) / s.ny + sh[2] * double(m.m[2]) / s.nz);
+            const cplx z = m.uh[c] * cplx(std::cos(ph), std::sin(ph));
+            const std::size_t q = std::size_t(m.m[0]) + std::size_t(nxh) * (std::size_t(jy) + std::size_t(s.ny) * kz);
+            cp[q][0] = z.real();
+            cp[q][1] = z.imag();
+        }
+        fftw_execute(bwd);
+        out[std::size_t(c)].assign(real, real + n);
+    }
+    fftw_destroy_plan(bwd);
+    fftw_free(real);
+    fftw_free(cp);
+    return out;
+}
 #endif
+
+std::array<std::vector<double>, 3> turbAt(const std::vector<TurbMode>& modes, const TurbSpec& s,
+                                          const std::vector<std::array<double, 3>>& pts,
+                                          const std::vector<std::uint8_t>& skip, int threads)
+{
+    assert(skip.empty() || skip.size() == pts.size());
+    std::array<std::vector<double>, 3> u;
+    for (auto& v : u) v.assign(pts.size(), 0.0);
+    forBlocks(workerCount(threads, pts.size()), pts.size(), [&](int, std::size_t lo, std::size_t hi) {
+        for (std::size_t p = lo; p < hi; ++p) {
+            if (!skip.empty() && skip[p]) continue;
+            const std::array<double, 3> v = turbPoint(modes, s, pts[p][0], pts[p][1], pts[p][2]);
+            for (std::size_t c = 0; c < 3; ++c) u[c][p] = v[c];
+        }
+    });
+    return u;
+}
+
+TurbSweep TurbSweep::make(const std::vector<TurbMode>& modes, const TurbSpec& s,
+                          const std::vector<std::array<double, 3>>& pts, int threads)
+{
+    TurbSweep t;
+    t.threads_ = threads;
+    t.dkx_ = kTwoPi / s.Lx;
+    for (const TurbMode& m : modes) t.mx_.push_back(m.m[0]);
+    std::ranges::sort(t.mx_);
+    t.mx_.erase(std::ranges::unique(t.mx_).begin(), t.mx_.end());
+    const std::size_t nP = pts.size(), nM = t.mx_.size();
+    t.x_.resize(nP);
+    t.b_.assign(nP * nM * 3, cplx(0.0, 0.0));
+    const double dk[3] = {kTwoPi / s.Lx, kTwoPi / s.Ly, kTwoPi / s.Lz};
+    forBlocks(workerCount(threads, nP), nP, [&](int, std::size_t lo, std::size_t hi) {
+        for (std::size_t p = lo; p < hi; ++p) {
+            t.x_[p] = pts[p][0];
+            for (const TurbMode& m : modes) {
+                const std::size_t q = std::size_t(std::ranges::lower_bound(t.mx_, m.m[0]) - t.mx_.begin());
+                const double ph = m.m[1] * dk[1] * pts[p][1] + m.m[2] * dk[2] * pts[p][2];
+                const cplx e(std::cos(ph), std::sin(ph));
+                for (std::size_t c = 0; c < 3; ++c) t.b_[(p * nM + q) * 3 + c] += m.uh[c] * e;
+            }
+        }
+    });
+    return t;
+}
+
+void TurbSweep::sample(double X, std::array<std::vector<double>, 3>& u) const
+{
+    const std::size_t nP = x_.size(), nM = mx_.size();
+    for (auto& v : u) v.assign(nP, 0.0);
+    forBlocks(workerCount(threads_, nP), nP, [&](int, std::size_t lo, std::size_t hi) {
+        for (std::size_t p = lo; p < hi; ++p) {
+            const double xb = x_[p] - X;
+            double a[3] = {0.0, 0.0, 0.0};
+            for (std::size_t q = 0; q < nM; ++q) {
+                const double ph = mx_[q] * dkx_ * xb;
+                const cplx e(std::cos(ph), std::sin(ph));
+                for (std::size_t c = 0; c < 3; ++c) a[c] += (b_[(p * nM + q) * 3 + c] * e).real();
+            }
+            for (std::size_t c = 0; c < 3; ++c) u[c][p] = a[c];
+        }
+    });
+}
 
 TurbNumbers turbNumbers(double urms, double lt, double nu, double dth)
 {

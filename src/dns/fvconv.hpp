@@ -54,4 +54,13 @@ std::expected<FvConvPlates, std::string> fvConvPlates(const FaceMesh& fm, std::s
 std::expected<std::vector<FvConvWall>, std::string> fvConvWalls(const FvBcSpec& s);
 std::expected<std::vector<FvConvWall>, std::string> fvConvWalls(const FvIncompBcs& b);
 
+// The flags' box walls (fvConvBox): `floor` at tBot and `lid` at tTop fixed, every other
+// non-empty patch (the closed sides) adiabatic, in patch order.
+std::vector<FvConvWall> fvConvBoxWalls(const FaceMesh& fm, double tBot, double tTop);
+
+// The walls as the incompressible route's --bc table (Wall, T where fixed) and as the
+// compressible one's (Wall, isothermal where fixed).
+FvIncompBcs fvConvIncompBcsOf(std::span<const FvConvWall> walls);
+FvBcSpec fvConvCompBcOf(std::span<const FvConvWall> walls);
+
 } // namespace dns

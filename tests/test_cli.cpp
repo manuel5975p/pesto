@@ -370,7 +370,7 @@ int main()
         // rejection above fires first.)
     }
 
-    // --penalize scope: the three constraints at config.cpp's penalize block.
+    // --penalize scope: the three constraints at dns/config/flow.cpp's penalize block.
     {
         auto ok = runCli(split("flow --body cylinder --penalize 0.01 --n 64 --nz 1"));
         check(ok.has_value(), "--penalize is accepted with a body");

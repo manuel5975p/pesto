@@ -105,7 +105,7 @@ Box units: rho 1, U 1, `p = 1/(gamma M^2)`, `T = p`, `mu = L/Re`.
 
 ## CLI: what is rejected
 
-`--solver fv`: allow-list in `config.cpp`, every other flag exit 2 by name: all
+`--solver fv`: allow-list in `src/dns/config/fv.cpp`, every other flag exit 2 by name: all
 `--nscbc-*`, `--pot`, `--rotor-*`, `--thin-seal`,
 `--penalize`, `--cut-flux`, `--temp`, `--scene`. An immersed body exit 2 (FV has no
 immersed wall). The revolved O-grid exit 2 (P8). `--solver fv` dispatches on
@@ -226,28 +226,265 @@ Compared with care: `gpu_sst`, `gpu_sa_wedge`, `gpu_precond` failed at baseline
 
 ## Combinations
 
-Species (`dns flame`), RANS (`dns flow`) and gravity (`dns conv`) share `gpu/fv_comp`,
-`FvRef` and one stage (`gatherStage`: mean rows, gravity, drive, species, scalars). They
-were built apart and no gate composes them, so a pair is refused, never run. Rule: a pair
-goes live with its test in the same commit.
+Every module of the stage (turbulence, thickening, chemistry, gravity, the drive, local time
+stepping, precision) is a set of ADDITIVE face / cell terms or a stage-writer switch on the one
+`gatherStage` (mean rows, gravity, drive, species, scalars). `dns/fvmodules` is the inventory:
+each module as data, ONE decision per pair (live | refused + error text + reason), the
+requirements (TFLES needs C0, Charlette needs LES and TFLES). `FvRef::make` (`fvModulesOf`),
+`DeviceFvComp::make` (the precision axis), `DeviceFvComp::localDt` (the time axis) and the CLI's
+flag pairs (`fvCompCommon`: `--compensated` + `fp64`, `--les` + `--steady`; `fvRansCheck`:
+`--rans` + `--les`) read it; nothing restates a pair. A pair goes live when the generic gate
+matrix passes its cell, in the same commit as its physics number.
 
-| Pair | Decision | Refused at | Why |
+- **Generic gates** (`gpu_fv_matrix`, `tests/test_gpu_fv_matrix.cpp`; host part `test_fv_comp`
+  `inventoryGate`: every model pair FvRef::make can be configured with is decided exactly as the
+  inventory, with its text; every live FvRef cell byte-identical at 1 and 4 threads). A cell is a
+  module, or a pair, closed under the requirements (`tests/fv_matrix_util.hpp`: one FvConfig per
+  cell, fixed strengths); precision runs inside every cell. Meshes: uniform periodic box 8x6x5,
+  box_cyclic (y walls), box_refined (split faces, Sutherland), cyl2d_snappy (wall, inflow,
+  outflow, slip, far; gravity runs it with the hydrostatic ambient's rows, and its rest gate on the
+  same set at rest: "Hydrostatic ambient").
+  (a) inert = without, bitwise: passive species, TFLES F 1 (no LES: with it Omega still switches
+  the SGS scalar flux off), RANS scalars 0; (b) rest (hydrostatic) rhs = the drive to rounding,
+  uniform power-of-two Y exact (FP32, compensated, FP64), mass and E + q rho Y_F + rho Phi
+  telescope, Z == tracer, C2b with C(xi) == 1 = C1 byte for byte; (c) FP64 vs FvRef 1e-13 every pass and 3 steps, FP32 vs FP64; (d)
+  Source / Morton / ColourMajor, 3 FP64 steps, to summation order (test_fvref E4: the CSR order
+  moves with the numbering); (e) rerun byte-identical, plain and compensated. 48 cells, 4
+  meshes, ~15 s.
+- **Matrix states are UNTIED** (1e-3 hashed noise on E). The TFLES dynamic sensor's T-gate is a
+  switch, and mirror-symmetric fields on a uniform patch tie neighbouring T exactly. Measured on
+  the TIED state (`tiedSensor`, TFLES dynamic + C0, 3 steps): numberings at rounding on every
+  mesh (<= 4.6e-16); FP32 vs FP64 2-5e-7 on three meshes, 1.8e-4 on box_refined (a tie flipped
+  by FP32 rounding). Untied, every cell's FP32 vs FP64 is <= 5.3e-6.
+- **Found and fixed by (d): the TFLES walk depended on the cell numbering on split faces.**
+  `fvTflesWalk` took the first of exactly tied sub-faces in CSR order: box_refined ColourMajor vs
+  Source, TFLES dynamic, 2.3e-3 of the state in 3 steps. Ties now go to the lowest `srcFace`:
+  every numbering <= 8.6e-16 over all 43 cells (uniform meshes have no tie: no number moved
+  there; X1, L5 of `gpu_fv_flame_les` reproduce their table rows).
+
+Turned on in MC (each with its physics number, `gpu_fv_matrix_phys`, FP64 unless stated):
+
+| Pair | Physics | Measured |
+|---|---|---|
+| species + gravity (C0, C1, TFLES) | buoyancy is rho(T) g through the EOS: no Boussinesq term; closed patches only | hot product pocket (T 1.5 T0, passive marker) in a hydrostatic 64x64 walled box, g 0.4: marker centroid rise 8.94e-3 at t 1 (925 steps); g 0: 1.6e-15; early acceleration 0.0689 = 0.861 x the 2D added-mass estimate g (rho_a - rho_p)/(rho_a + rho_p) |
+| gravity + LES (smag, sigma) | resolved buoyancy is resolved; the SGS model carries no buoyancy correction (Lilly / Richardson): a stated model gap, the usual LES-of-convection closure | mu_t at the hydrostatic rest exactly 0; same pocket, Smagorinsky 0.17 (sigma: the matrix only): max mu_t / mu 0.002, rise 0.9994 x DNS |
+| gravity + bodyForce | two additive momentum sources | plane Poiseuille across g (x cyclic, y walls, g -0.4, f 0.004, mu 0.05, M 0.008) from the hydrostatic rest to t 2 H^2/mu: max abs(u - f y (H - y)/(2 mu)) / u_c 3.9e-3 / 9.8e-4 at ny 16 / 32 (order 2.00) |
+| species + bodyForce | the drive is per volume, species ride the mass flux | the same channel with a passive species: u bitwise the species-free run, uniform Y 0.25, 0.5 exact (FP64) |
+| C1 + LES (smag, sigma) | `kFvSpFace<R, true, true, Eddy>`: one rho D + nut_f/Sc_t and one limiter for every species, so Z(Y) is linear in Y | two periodic sheared Z sheets on a wavy 96x96 periodic mesh, burning, FP32, t 2 (1316 steps): max abs(Z(Y) - tracer) DNS 9.5e-6, Smagorinsky 0.17 9.1e-6, both inside the FP32 walk 3.0e-5; Z variance LES / DNS 0.9982 (the eddy flux mixes) |
+
+Turned on in M2 ("Air-methane"): C2b (`FvChem::law`) with LES smag / sigma (3D laminar LES vs
+DNS: sigma 0, Smagorinsky 0.17 +5.3e-4 in S_L), gravity and bodyForce (harness only: the law is a
+rate factor on C1's transport); C2b + TFLES refused (premixed thickening only).
+
+Kept refused, by physics: species + RANS (a mean reaction rate needs a closure: Arrhenius of the
+mean state is not the mean rate), RANS + gravity (no buoyancy production in the closures: an
+unstable stratification makes no k or nu~, a RANS convection cell would decay toward laminar),
+LES + `--steady` (LES is time-accurate; the structured validator refuses the same pair;
+before MC the polyMesh route ACCEPTED `--les` with `--steady` and ran it: now exit 2; the structured-mesh FV route already refused it in `validateFlow`), TFLES with RANS or C1.
+By code: species or gravity under LTS (`kFvChem`, `kFvGravity` take the bare cr). By route
+(no CLI spelling yet; the case surface is M6): gravity + LES and gravity + bodyForce on `dns
+conv`, two-reactant LES on the 2D jet (`--nz 1`, LES needs `--nz >= 8`). `dns flame --gravity`
+is the candle's (M5a, "Hydrostatic ambient"): gravity x open patches and gravity x C1 live.
+
+<!-- generated: dns::fvCombinationsMarkdown (src/dns/fvmodules.cpp); test_gpu_fv_matrix markdown -->
+| Module | Axis | Spelling |
+|---|---|---|
+| LES smag | turbulence | `--les Cs [--sgs smag]` |
+| LES sigma | turbulence | `--les C --sgs sigma` |
+| TFLES uniform | flame | `--tfles F --tfles-sensor uniform` |
+| TFLES dynamic | flame | `--tfles F [--tfles-sensor dynamic]` |
+| Charlette | efficiency | `--efficiency charlette` |
+| RANS SA | turbulence | `--rans sa-neg` |
+| RANS SST | turbulence | `--rans sst-2003m, --rans sst-vm` |
+| C0 | chemistry | `dns flame --mode premixed` |
+| C1 | chemistry | `dns flame --mode diffusion; --equivalence PHI --sl-law onestep (C2)` |
+| C2b | chemistry | `dns flame --equivalence PHI [--sl-law gri30] [--mix-phi PHI]` |
+| gravity | gravity | `dns conv; dns flame --mode candle (FvConfig::gravity; open patches: FvConfig::ambient rows)` |
+| bodyForce | drive | `the channel's drive (FvConfig::bodyForce)` |
+| turb | inflow | `dns flame --turb U --solver fv (FvConfig::turb)` |
+| steady LTS | time | `--steady TOL (DeviceFvComp::localDt)` |
+| compensated | precision | `--compensated` |
+| FP64 | precision | `--fv-precision fp64` |
+
+Pair matrix: L live, R refused, x one axis (exclusive).
+
+|   | LES smag | LES sigma | TFLES uniform | TFLES dynamic | Charlette | RANS SA | RANS SST | C0 | C1 | C2b | gravity | bodyForce | turb | steady LTS | compensated | FP64 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| LES smag | . | x | L | L | L | x | x | L | L | L | L | L | L | R | L | L |
+| LES sigma | x | . | L | L | L | x | x | L | L | L | L | L | L | R | L | L |
+| TFLES uniform | L | L | . | x | L | R | R | L | R | R | L | L | L | R | L | L |
+| TFLES dynamic | L | L | x | . | L | R | R | L | R | R | L | L | L | R | L | L |
+| Charlette | L | L | L | L | . | R | R | L | R | R | L | L | L | R | L | L |
+| RANS SA | x | x | R | R | R | . | x | R | R | R | R | L | R | L | L | L |
+| RANS SST | x | x | R | R | R | x | . | R | R | R | R | L | R | L | L | L |
+| C0 | L | L | L | L | L | R | R | . | x | x | L | L | L | R | L | L |
+| C1 | L | L | R | R | R | R | R | x | . | x | L | L | R | R | L | L |
+| C2b | L | L | R | R | R | R | R | x | x | . | L | L | L | R | L | L |
+| gravity | L | L | L | L | L | R | R | L | L | L | . | L | R | R | L | L |
+| bodyForce | L | L | L | L | L | L | L | L | L | L | L | . | R | L | L | L |
+| turb | L | L | L | L | L | R | R | L | R | L | R | R | . | R | L | L |
+| steady LTS | R | R | R | R | R | L | L | R | R | R | R | L | R | . | L | L |
+| compensated | L | L | L | L | L | L | L | L | L | L | L | L | L | L | . | x |
+| FP64 | L | L | L | L | L | L | L | L | L | L | L | L | L | L | x | . |
+
+| Pair | Decision | Error text | Why |
 |---|---|---|---|
-| species + RANS | rejected | `--rans` is no `dns flame` flag (exit 1); `--bc` `y`, `burnt`, `reference.origin` on `dns flow`, `dns conv` (exit 2); `FvRef::make` (exit 3) | rows 5.. have two users; no turbulent scalar flux or TFLES analogue |
-| species + gravity | rejected | `--gravity` off the `dns flame --solver fv` allow-list (exit 2); `FvRef::make` | no combustion gate under gravity; an open face has no hydrostatic ambient |
-| species + LES | rejected | allow-list; `DeviceFvComp::make` | no species SGS flux |
-| species + `bodyForce` | rejected | no CLI spelling; `FvRef::make` | untested |
-| RANS + gravity | rejected | `--rans` is no `dns conv` flag, `dns flow` has no `--gravity`; `FvRef::make` | no buoyancy term in the closures |
-| gravity + LES | rejected | no `--les` on `dns conv`; `DeviceFvComp::make` | no buoyancy term in the SGS model |
-| gravity + `bodyForce` | rejected | no CLI spelling; `FvRef::make` | untested |
-| species + `--steady` | rejected | no `--steady` on `dns flame`; `localDt` | `kFvChem` takes the bare cr: the fixed point would move with lts |
-| gravity + `--steady` | rejected | no `--steady` on `dns conv`; `localDt` | `kFvGravity` takes the bare cr |
-| species + `--compensated`, FP64 | allowed | | S3, S4 in plain FP32, compensated, FP64 (`gpu_fv_flame`) |
-| gravity + `--compensated`, FP64 | allowed | | `gpu_fv_conv`; compensated is the FP32 default on that route |
-| RANS + `--compensated`, FP64, `--steady` | allowed | | `gpu_fv_rans`; FP32 `--steady` forces the two-word state; FP32 on the channel fixed point: not run (issues.md 84d) |
+| LES smag + RANS SA | exclusive | `FV: LES and RANS put two eddy viscosities in one slot` | mu_t has one slot (nut); one model owns it |
+| LES smag + RANS SST | exclusive | `FV: LES and RANS put two eddy viscosities in one slot` | mu_t has one slot (nut); one model owns it |
+| LES smag + steady LTS | refused | `FV LES with local time stepping: LES is time-accurate (pseudo-time has no filtered field)` | an LES statistic is a time average of a filtered unsteady field; the structured validator refuses the same pair |
+| LES sigma + RANS SA | exclusive | `FV: LES and RANS put two eddy viscosities in one slot` | mu_t has one slot (nut); one model owns it |
+| LES sigma + RANS SST | exclusive | `FV: LES and RANS put two eddy viscosities in one slot` | mu_t has one slot (nut); one model owns it |
+| LES sigma + steady LTS | refused | `FV LES with local time stepping: LES is time-accurate (pseudo-time has no filtered field)` | an LES statistic is a time average of a filtered unsteady field; the structured validator refuses the same pair |
+| TFLES uniform + RANS SA | refused | `FV TFLES with RANS: the thickened flame is a resolved (DNS / LES) flame` | TFLES thickens a flame the grid carries; a RANS mean flame has none |
+| TFLES uniform + RANS SST | refused | `FV TFLES with RANS: the thickened flame is a resolved (DNS / LES) flame` | TFLES thickens a flame the grid carries; a RANS mean flame has none |
+| TFLES uniform + C1 | refused | `FV TFLES: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening and its sensor are the premixed step's (kChemCellPass<true>) |
+| TFLES uniform + C2b | refused | `FV TFLES with --equivalence: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening, its sensor (the one-step rate at Ta/2) and Charlette's E are the premixed step's; a two-reactant TFLES would thicken the partially premixed jet's outer diffusion sheet too, which no model here defines (the structured --equivalence refuses --tfles alike) |
+| TFLES uniform + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
+| TFLES dynamic + RANS SA | refused | `FV TFLES with RANS: the thickened flame is a resolved (DNS / LES) flame` | TFLES thickens a flame the grid carries; a RANS mean flame has none |
+| TFLES dynamic + RANS SST | refused | `FV TFLES with RANS: the thickened flame is a resolved (DNS / LES) flame` | TFLES thickens a flame the grid carries; a RANS mean flame has none |
+| TFLES dynamic + C1 | refused | `FV TFLES: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening and its sensor are the premixed step's (kChemCellPass<true>) |
+| TFLES dynamic + C2b | refused | `FV TFLES with --equivalence: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening, its sensor (the one-step rate at Ta/2) and Charlette's E are the premixed step's; a two-reactant TFLES would thicken the partially premixed jet's outer diffusion sheet too, which no model here defines (the structured --equivalence refuses --tfles alike) |
+| TFLES dynamic + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
+| Charlette + RANS SA | refused | `FV TFLES efficiency (Charlette) with RANS: it reads an LES sub-grid velocity` | Charlette's u' is the filtered field's (Colin's operator), RANS has none |
+| Charlette + RANS SST | refused | `FV TFLES efficiency (Charlette) with RANS: it reads an LES sub-grid velocity` | Charlette's u' is the filtered field's (Colin's operator), RANS has none |
+| Charlette + C1 | refused | `FV TFLES: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening and its sensor are the premixed step's (kChemCellPass<true>) |
+| Charlette + C2b | refused | `FV TFLES with --equivalence: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening, its sensor (the one-step rate at Ta/2) and Charlette's E are the premixed step's; a two-reactant TFLES would thicken the partially premixed jet's outer diffusion sheet too, which no model here defines (the structured --equivalence refuses --tfles alike) |
+| Charlette + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
+| RANS SA + C0 | refused | `FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)` | a RANS flame needs a mean reaction-rate closure (Arrhenius of the mean state is not the mean rate) and a turbulent scalar flux; neither is built |
+| RANS SA + C1 | refused | `FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)` | a RANS flame needs a mean reaction-rate closure (Arrhenius of the mean state is not the mean rate) and a turbulent scalar flux; neither is built |
+| RANS SA + C2b | refused | `FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)` | a RANS flame needs a mean reaction-rate closure (Arrhenius of the mean state is not the mean rate) and a turbulent scalar flux; neither is built |
+| RANS SA + gravity | refused | `FV RANS with gravity: not built (no buoyancy term in the closures)` | the closures carry no buoyancy production: an unstable stratification produces no k or nu~, so a RANS convection cell (gravity's customer, dns conv) would decay toward laminar. Wrong physics, not a small gap |
+| RANS SA + turb | refused | `FV --turb with RANS: synthetic fluctuations on an ensemble mean` | a RANS field is the ensemble mean: resolved fluctuations at its inflow are no RANS input (that is k and omega / nu~ at the patch), and the RANS flame is refused anyway |
+| RANS SST + C0 | refused | `FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)` | a RANS flame needs a mean reaction-rate closure (Arrhenius of the mean state is not the mean rate) and a turbulent scalar flux; neither is built |
+| RANS SST + C1 | refused | `FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)` | a RANS flame needs a mean reaction-rate closure (Arrhenius of the mean state is not the mean rate) and a turbulent scalar flux; neither is built |
+| RANS SST + C2b | refused | `FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)` | a RANS flame needs a mean reaction-rate closure (Arrhenius of the mean state is not the mean rate) and a turbulent scalar flux; neither is built |
+| RANS SST + gravity | refused | `FV RANS with gravity: not built (no buoyancy term in the closures)` | the closures carry no buoyancy production: an unstable stratification produces no k or nu~, so a RANS convection cell (gravity's customer, dns conv) would decay toward laminar. Wrong physics, not a small gap |
+| RANS SST + turb | refused | `FV --turb with RANS: synthetic fluctuations on an ensemble mean` | a RANS field is the ensemble mean: resolved fluctuations at its inflow are no RANS input (that is k and omega / nu~ at the patch), and the RANS flame is refused anyway |
+| C0 + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
+| C1 + turb | refused | `FV --turb with model C1 / C2 (--mode diffusion, --sl-law onestep): not built (the turbulent box is measured on C0 and C2b)` | the slot jet takes no --turb on any solver; the one-step C2 premix is C1's stage and has no turbulent number |
+| C1 + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
+| C2b + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
+| gravity + turb | refused | `FV --turb with gravity: not built (the box's inflow is an open patch)` | gravity needs a closed domain (no hydrostatic ambient on open patches); --turb needs an open inflow |
+| gravity + steady LTS | refused | `FV local time stepping with gravity: not built` | kFvGravity takes the bare cr: under LTS the fixed point would move with lts |
+| bodyForce + turb | refused | `FV --turb with a body force: not built (the drive's channel has no inflow)` | the box is swept through an inflow patch; the driven channel is closed |
+| turb + steady LTS | refused | `FV --turb with local time stepping: the swept inflow is time-accurate` | the rows follow X = sum U dt; pseudo-time has no physical sweep |
+| compensated + FP64 | exclusive | `--compensated is the FP32 state's low word: FP64 has no update floor to lift` | the two-word state lifts FP32's update floor; FP64 has none |
+| turb without C0 or C2b | requirement | `FV --turb: the premixed flame box (C0, C2b; dns flame --mode premixed --solver fv)` | |
+| TFLES uniform without C0 | requirement | `FV TFLES: the thickened flame is premixed species only (FvChem ox < 0)` | |
+| TFLES dynamic without C0 | requirement | `FV TFLES: the thickened flame is premixed species only (FvChem ox < 0)` | |
+| Charlette without TFLES uniform or TFLES dynamic | requirement | `FV TFLES efficiency (Charlette) is an option of the thickened flame: needs TFLES` | |
+| Charlette without LES smag or LES sigma | requirement | `FV TFLES efficiency (Charlette) needs LES: the sub-grid velocity of a filtered field` | |
 
-`--compensated --fv-precision fp64` is rejected on every route (`fvCompCommon`).
-`tests/test_fv_comp.cpp` `comboGate` pins each spelling and each `FvRef::make` refusal.
+| Live pair | Hand gates besides gpu_fv_matrix |
+|---|---|
+| LES smag + TFLES uniform | gpu_fv_flame_les L1-L5, X1 |
+| LES smag + TFLES dynamic | gpu_fv_flame_les L1-L5, X1 |
+| LES smag + Charlette | gpu_fv_flame_les L1-L5, X1 |
+| LES smag + C0 | gpu_fv_flame_les L1-L5, X1 |
+| LES smag + C2b | gpu_fv_flame_rich_les (3D laminar LES vs DNS) |
+| LES smag + turb | gpu_fv_turb (IC, rows, trajectory X), tools/chem/turb_fv.sh comp, pairs (S_c, area vs structured) |
+| LES smag + FP64 | gpu_fv_cross X2 |
+| LES sigma + TFLES uniform | gpu_fv_flame_les L1-L5, X1 |
+| LES sigma + TFLES dynamic | gpu_fv_flame_les L1-L5, X1 |
+| LES sigma + Charlette | gpu_fv_flame_les L1-L5, X1 |
+| LES sigma + C0 | gpu_fv_flame_les L1-L5, X1 |
+| LES sigma + C2b | gpu_fv_flame_rich_les (3D laminar LES vs DNS) |
+| LES sigma + turb | gpu_fv_turb (IC, rows, trajectory X), tools/chem/turb_fv.sh comp, pairs (S_c, area vs structured) |
+| LES sigma + FP64 | gpu_fv_cross X2 |
+| TFLES uniform + Charlette | gpu_fv_flame_les L1-L5, X1 |
+| TFLES uniform + C0 | gpu_fv_flame_les L1-L5, X1 |
+| TFLES uniform + turb | gpu_fv_turb (IC, rows, trajectory X), tools/chem/turb_fv.sh comp, pairs (S_c, area vs structured) |
+| TFLES dynamic + Charlette | gpu_fv_flame_les L1-L5, X1 |
+| TFLES dynamic + C0 | gpu_fv_flame_les L1-L5, X1 |
+| TFLES dynamic + turb | gpu_fv_turb (IC, rows, trajectory X), tools/chem/turb_fv.sh comp, pairs (S_c, area vs structured) |
+| Charlette + C0 | gpu_fv_flame_les L1-L5, X1 |
+| Charlette + turb | gpu_fv_turb (IC, rows, trajectory X), tools/chem/turb_fv.sh comp, pairs (S_c, area vs structured) |
+| RANS SA + bodyForce | gpu_fv_rans R8 (the channel) |
+| RANS SA + steady LTS | gpu_fv_rans |
+| RANS SA + compensated | gpu_fv_rans |
+| RANS SA + FP64 | gpu_fv_rans |
+| RANS SST + bodyForce | gpu_fv_rans R8 (the channel) |
+| RANS SST + steady LTS | gpu_fv_rans |
+| RANS SST + compensated | gpu_fv_rans |
+| RANS SST + FP64 | gpu_fv_rans |
+| C0 + turb | gpu_fv_turb (IC, rows, trajectory X), tools/chem/turb_fv.sh comp, pairs (S_c, area vs structured) |
+| C0 + compensated | gpu_fv_flame S3, S4 |
+| C0 + FP64 | gpu_fv_flame S3, S4 |
+| C1 + gravity | gpu_fv_candle_rest, _g0, _height (the candle vs structured) |
+| C1 + compensated | gpu_fv_flame_jet |
+| C1 + FP64 | gpu_fv_flame_jet |
+| C2b + turb | gpu_fv_turb (IC, rows, trajectory X), tools/chem/turb_fv.sh comp, pairs (S_c, area vs structured) |
+| C2b + compensated | gpu_fv_flame_rich R1, R2, gpu_fv_flame_rich1d |
+| C2b + FP64 | gpu_fv_flame_rich R1, R2, gpu_fv_flame_rich1d |
+| gravity + compensated | gpu_fv_conv |
+| gravity + FP64 | gpu_fv_conv |
+| bodyForce + steady LTS | gpu_fv_rans |
+| turb + compensated | gpu_fv_turb (IC, rows, trajectory X), tools/chem/turb_fv.sh comp, pairs (S_c, area vs structured) |
+| turb + FP64 | gpu_fv_turb (IC, rows, trajectory X), tools/chem/turb_fv.sh comp, pairs (S_c, area vs structured) |
+
+<!-- generated: test_gpu_fv_matrix markdown (tests/test_gpu_fv_matrix.cpp) -->
+Harness rows (`gpu_fv_matrix`, 55 live cells on the meshes box 8x6x5 periodic, box_cyclic, box_refined, cyl2d_snappy; gravity on the open set through the hydrostatic ambient's rows). oracle: double vs FvRef, max relative over every pass, 3 steps; orders: Source / Morton / ColourMajor, 3 FP64 steps; rest: |rhs - source| / (p sum|S| / V), FP64 / FP32 on the closed set, open rest on the open set at rest (gravity, cyl2d_snappy: Far, Outflow, Inflow faces); mass, energy: 10 FP64 steps; Z: max|Z(Y) - tracer|, FP64 / FP32, 20 steps. Steady LTS cells: the oracle is the rhs and stableDt (FvRef has no LTS), mass n/a (LTS drifts it). Energy n/a with the drive (its work).
+
+| Cell | oracle | f32 vs f64 | orders | rest FP64 / FP32 | open rest | mass | energy | pow2 Y | Z == tracer | inert | rerun |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| laminar | 4.7e-15 | 4.3e-06 | 4.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.6e-15 | 1.3e-15 | n/a | n/a | n/a | byte-identical |
+| LES smag | 4.4e-15 | 4.3e-06 | 4.7e-16 | 6.7e-17 / 3.3e-08 | n/a | 7.8e-16 | 6.7e-16 | n/a | n/a | n/a | byte-identical |
+| LES sigma | 1.3e-14 | 5.3e-06 | 6.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 8.9e-16 | 1.1e-15 | n/a | n/a | n/a | byte-identical |
+| RANS SA | 3.8e-15 | 3.6e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.4e-15 | 4.4e-16 | n/a | n/a | RANS scalars 0: bitwise | byte-identical |
+| RANS SST | 3.3e-15 | 4.7e-06 | 4.7e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.6e-15 | 6.7e-16 | n/a | n/a | RANS scalars 0: bitwise | byte-identical |
+| C0 | 4.8e-15 | 2.7e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | 7.8e-16 | exact | n/a | passive species: bitwise | byte-identical |
+| LES smag + C0 | 4.7e-15 | 3.2e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 7.8e-16 | exact | n/a | passive species: bitwise | byte-identical |
+| LES sigma + C0 | 1.3e-14 | 2.7e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | 8.9e-16 | exact | n/a | passive species: bitwise | byte-identical |
+| TFLES uniform + C0 | 4.8e-15 | 2.7e-06 | 3.0e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.0e-15 | 8.9e-16 | exact | n/a | TFLES F 1: bitwise | byte-identical |
+| LES smag + TFLES uniform + C0 | 4.7e-15 | 3.2e-06 | 3.4e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 4.4e-16 | exact | n/a | n/a | byte-identical |
+| LES sigma + TFLES uniform + C0 | 1.3e-14 | 2.7e-06 | 4.6e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.0e-15 | 8.9e-16 | exact | n/a | n/a | byte-identical |
+| TFLES dynamic + C0 | 4.8e-15 | 2.7e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | 8.9e-16 | exact | n/a | TFLES F 1: bitwise | byte-identical |
+| LES smag + TFLES dynamic + C0 | 4.7e-15 | 3.2e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | 1.7e-15 | exact | n/a | n/a | byte-identical |
+| LES sigma + TFLES dynamic + C0 | 1.3e-14 | 2.7e-06 | 4.6e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | 1.0e-15 | exact | n/a | n/a | byte-identical |
+| LES smag + TFLES uniform + Charlette + C0 | 4.7e-15 | 3.2e-06 | 3.4e-16 | 6.7e-17 / 3.3e-08 | n/a | 8.9e-16 | 1.3e-15 | exact | n/a | n/a | byte-identical |
+| LES sigma + TFLES uniform + Charlette + C0 | 1.3e-14 | 2.7e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.0e-15 | 1.6e-15 | exact | n/a | n/a | byte-identical |
+| LES smag + TFLES dynamic + Charlette + C0 | 4.7e-15 | 3.2e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 1.7e-15 | exact | n/a | n/a | byte-identical |
+| C1 | 4.8e-15 | 2.7e-06 | 4.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 1.8e-15 | exact | 1.4e-15 / 6.9e-07 | passive species: bitwise | byte-identical |
+| LES smag + C1 | 4.7e-15 | 3.2e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 3.1e-15 | 2.2e-15 | exact | 1.3e-15 / 7.0e-07 | passive species: bitwise | byte-identical |
+| LES sigma + C1 | 1.3e-14 | 2.7e-06 | 4.5e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | 1.8e-15 | exact | 1.4e-15 / 6.9e-07 | passive species: bitwise | byte-identical |
+| C2b | 4.8e-15 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.2e-16 | 8.9e-16 | exact | 1.3e-15 / 7.4e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
+| LES smag + C2b | 4.7e-15 | 3.2e-06 | 4.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.0e-15 | 1.3e-15 | exact | 1.2e-15 / 8.4e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
+| LES sigma + C2b | 1.3e-14 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 8.9e-16 | exact | 1.3e-15 / 7.4e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
+| gravity | 4.7e-15 | 4.3e-06 | 3.2e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 1.4e-15 | 4.4e-16 | n/a | n/a | n/a | byte-identical |
+| LES smag + gravity | 4.4e-15 | 4.3e-06 | 3.2e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 8.9e-16 | 1.1e-15 | n/a | n/a | n/a | byte-identical |
+| LES sigma + gravity | 1.3e-14 | 5.3e-06 | 3.7e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 1.4e-15 | 4.4e-16 | n/a | n/a | n/a | byte-identical |
+| C0 + gravity | 4.8e-15 | 2.4e-06 | 4.0e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 1.1e-15 | 4.4e-16 | exact | n/a | passive species: bitwise | byte-identical |
+| TFLES uniform + C0 + gravity | 4.8e-15 | 2.4e-06 | 3.3e-16 | 1.0e-15 / 4.5e-07 | 1.0e-15 / 4.5e-07 | 4.4e-16 | 8.9e-16 | exact | n/a | TFLES F 1: bitwise | byte-identical |
+| TFLES dynamic + C0 + gravity | 4.8e-15 | 2.4e-06 | 3.2e-16 | 5.4e-16 / 2.4e-07 | 5.4e-16 / 2.4e-07 | 1.7e-15 | 2.0e-15 | exact | n/a | TFLES F 1: bitwise | byte-identical |
+| LES smag + TFLES uniform + Charlette + C0 + gravity | 4.4e-15 | 2.8e-06 | 3.7e-16 | 1.0e-15 / 4.5e-07 | 1.0e-15 / 4.5e-07 | 8.9e-16 | 4.4e-16 | exact | n/a | n/a | byte-identical |
+| C1 + gravity | 4.8e-15 | 2.4e-06 | 4.5e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 4.4e-16 | 8.9e-16 | exact | 1.7e-15 / 6.9e-07 | passive species: bitwise | byte-identical |
+| C2b + gravity | 4.8e-15 | 2.4e-06 | 4.5e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 8.9e-16 | 2.4e-15 | exact | 1.2e-15 / 8.0e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
+| bodyForce | 4.7e-15 | 4.3e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.3e-15 | n/a | n/a | n/a | n/a | byte-identical |
+| LES smag + bodyForce | 4.4e-15 | 4.3e-06 | 4.7e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | n/a | n/a | n/a | byte-identical |
+| LES sigma + bodyForce | 1.3e-14 | 5.3e-06 | 4.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.3e-15 | n/a | n/a | n/a | n/a | byte-identical |
+| RANS SA + bodyForce | 3.8e-15 | 3.6e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | n/a | n/a | n/a | RANS scalars 0: bitwise | byte-identical |
+| RANS SST + bodyForce | 3.5e-15 | 4.7e-06 | 4.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | n/a | n/a | RANS scalars 0: bitwise | byte-identical |
+| C0 + bodyForce | 4.8e-15 | 2.7e-06 | 3.4e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | n/a | exact | n/a | passive species: bitwise | byte-identical |
+| TFLES uniform + C0 + bodyForce | 4.8e-15 | 2.7e-06 | 3.0e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | exact | n/a | TFLES F 1: bitwise | byte-identical |
+| TFLES dynamic + C0 + bodyForce | 4.8e-15 | 2.7e-06 | 4.6e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | n/a | exact | n/a | TFLES F 1: bitwise | byte-identical |
+| LES smag + TFLES uniform + Charlette + C0 + bodyForce | 4.7e-15 | 3.2e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | exact | n/a | n/a | byte-identical |
+| C1 + bodyForce | 4.8e-15 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | exact | 1.1e-15 / 5.8e-07 | passive species: bitwise | byte-identical |
+| C2b + bodyForce | 4.8e-15 | 2.7e-06 | 3.8e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.3e-15 | n/a | exact | 1.6e-15 / 7.5e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
+| gravity + bodyForce | 4.7e-15 | 4.3e-06 | 3.4e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 4.4e-16 | n/a | n/a | n/a | n/a | byte-identical |
+| C0 + turb | 4.8e-15 | 2.7e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | 7.8e-16 | exact | n/a | passive species, turb u' 0: bitwise | byte-identical |
+| LES smag + C0 + turb | 4.7e-15 | 3.2e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 7.8e-16 | exact | n/a | passive species, turb u' 0: bitwise | byte-identical |
+| LES sigma + C0 + turb | 1.3e-14 | 2.7e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | 8.9e-16 | exact | n/a | passive species, turb u' 0: bitwise | byte-identical |
+| TFLES uniform + C0 + turb | 4.8e-15 | 2.7e-06 | 3.0e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.0e-15 | 8.9e-16 | exact | n/a | TFLES F 1, turb u' 0: bitwise | byte-identical |
+| TFLES dynamic + C0 + turb | 4.8e-15 | 2.7e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | 8.9e-16 | exact | n/a | TFLES F 1, turb u' 0: bitwise | byte-identical |
+| LES smag + TFLES uniform + Charlette + C0 + turb | 4.7e-15 | 3.2e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 8.9e-16 | 1.3e-15 | exact | n/a | turb u' 0: bitwise | byte-identical |
+| C2b + turb | 4.8e-15 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.2e-16 | 8.9e-16 | exact | 1.3e-15 / 7.4e-07 | passive species, C(xi) 1 = C1, turb u' 0: bitwise | byte-identical |
+| steady LTS | 4.7e-15 | 4.3e-06 | 5.2e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical |
+| RANS SA + steady LTS | 3.8e-15 | 3.6e-06 | 5.4e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical |
+| RANS SST + steady LTS | 3.3e-15 | 4.7e-06 | 5.0e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical |
+| bodyForce + steady LTS | 4.7e-15 | 4.3e-06 | 8.6e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical |
+
+Regenerate: `test_gpu_fv_matrix markdown` (via simjob) prints everything from the first
+`<!-- generated` marker to here.
 
 ## Cross-verification
 
@@ -425,9 +662,10 @@ the x_f, delta_th (parabolic peak), S_L formulas are `runner_flame`'s. `energy` 
 `Sum V (E + q rho Y)`. `--profile-dt` writes slab means. Frames: `temp`, `fuel`,
 `omega`. Exit 8 when x_f comes within 2 delta_th of an end.
 
-Rejected by name on this route: every `--nscbc-*`, `--les`, `--tfles`, `--turb`,
-`--hold-flame`, `--equivalence`, `--mode` other than premixed, checkpoints; the mesh
-flags with `--polymesh`. `--physics lowmach` on this route is `docs/fvincomp.md`
+Rejected by name on this route: every `--nscbc-*`, `--turb`,
+`--hold-flame`, `--mode` other than premixed and diffusion (`--equivalence`: "Air-methane"); the mesh
+flags with `--polymesh`. `--les`, `--sgs`, `--tfles`, `--tfles-sensor`, `--efficiency`:
+"Species LES and TFLES" below (premixed only). `--physics lowmach` on this route is `docs/fvincomp.md`
 "Low-Mach". Off it: `--bc`, `--fv-precision`,
 `--compensated`, `--frame-*`.
 
@@ -500,12 +738,93 @@ Not measured (dropped by the 3-level rule): a 60-cell rung of any row:
 
     tools/chem/fv_flame_ladder.py --cells 60 --tt 14 --meshes rot,shear,wavy,all
 
+## Species LES and TFLES
+
+`dns flame --solver fv` and `--polymesh DIR --bc FILE` take the structured flame's
+`--les CS --sgs smag|sigma`, `--tfles F`, `--tfles-sensor`, `--efficiency` (docs/chem.md
+"LES species and the thickened flame"), premixed C0 only; same validator rules (`--sgs`
+explicit; `--les` needs `--nz >= 8` on the box, a 3D mesh on `--polymesh`: exit 3 at the
+run; Charlette needs `--les`; F x cells per delta_th >= 4, measured off the probe's slab
+on a mesh). Equations, constants, label and IC are the structured ones; the FV terms
+restate the `Eddy` / `Thick` instantiations of `kSpeciesStage` and `gpu/tfles` on faces:
+
+- **Eddy** (`fvEddyRhoD`): every internal face rho D + nut_f / Sc_t, nut_f the mean flux's
+  own face mean of mu_t (the FV LES slot, `kFvNut`), Sc_t = Pr_t = `prt` (ONE constant,
+  0.9). Boundary faces: no SGS flux (the structured open rows: none either). The
+  structured flame copies mu_t onto its open x rows (its SGS gradient wraps there); the
+  FV gradient reads the boundary face, so no copy.
+- **Thick** (`fvThickRhoD`, `fvThickEnergyFlux`): rho D = FE_f mu_f/Pr + (1 - Om_f)
+  nut_f/Sc_t; F_E += -(FE_f - 1) kappa_f g_T.S + Om_f nut_f (cp/Pr_t) g_T.S, an ADDITIVE
+  face flux in the species face kernel (`kFvSpFace<.., Thick>`), g_T the corrected face
+  gradient: the structured compact dT/dn on a uniform mesh. omega -> (E/F) omega in the
+  cell pass, read by the fuel row and q omega (one buffer). Boundary faces unthickened.
+- **Frozen per step**: `step()` forms F E, E/F, Omega from its INPUT state; `rhs`,
+  `evaluate`, `stableDt`, `speciesFields`, `tflesStats` from the current one.
+- **Sensor**: `tanh(beta w_s)` (rate at Ta/2), then the T-gated max filter, one pass per
+  walked global axis (x, y, z; the empty axis skipped). The filter walks FACES
+  (`fvTflesWalk`, `dns/fvles`): from a cell, `dilate` steps along +-e_a, each to the
+  neighbour across the face whose outward normal is most aligned (ties: first in CSR
+  order); a boundary face stops the walk, a cyclic face is internal. On a uniform box
+  that is the structured line: x clamped at Far/Outflow, y and z wrapped (L5 below). On
+  a mesh rotated or sheared by less than 45 deg it walks the mesh lines.
+- **Efficiency**: Colin's u' off the LSQ curl and the compact Laplacian (1/V) sum (phi_N
+  - phi_P) corr.S, h = sqrt Delta^2 (`fvLesDelta2`: V^(1/3); 2D the cell's side), E = 1
+  on the cells within `kTflesEdgeRows` face layers of an active boundary face (the
+  structured edge rows on the flame box; walls too).
+- **dt**: the Sigma form with mu max(4/3, FE gamma/Pr) + mu_t max(4/3, gamma/Pr_t), FE the
+  cell's. The structured `tflesStableDt` is a separate 0.25 h^2 bound.
+- **Stats**: `Ebar` (sum V Omega E / sum V Omega; structured: unweighted), `FEmax`; S_L
+  is then the consumption speed of (E/F) omega.
+
+Off: no `--les`, no `--tfles` launches no new kernel (the Molecular instantiations,
+byte for byte); `--tfles 1` (uniform or dynamic, no LES) is the DNS byte for byte (L2).
+Two reactants + LES (MC, "Combinations"): the `Eddy` instantiation of the `Two` face
+kernel (`kFvSpFace<R, true, true, Eddy>`), one diffusivity `rho D + nut_f/Sc_t` and one
+limiter for every species, so Z(Y) == a carried tracer holds (`gpu_fv_matrix`,
+`gpu_fv_matrix_phys` P5). No CLI spelling for the jet (2D, `--nz 1`; LES takes `--nz >= 8`); the CLI spelling is
+`--equivalence` ("Air-methane").
+Not built: TFLES of two reactants (the inventory refuses it), `--turb`, a thickened
+boundary face, the structured open-row mu_t copy (not needed), LES on a 2D mesh.
+
+### Species LES and TFLES verification
+
+`gpu_fv_flame_les` (`tests/test_gpu_fv_flame_les.cpp`) and `gpu_fv_tfles1d`. FvRef carries
+the same terms (`FvConfig::les`, `FvConfig::tfles`, `lesCells`, `tfles*`).
+
+| pair | mesh | quantity | expected | measured |
+|---|---|---|---|---|
+| FV(FP64) vs FvRef (L1): LES; TFLES uniform; dynamic; LES + dynamic + Charlette | box_cyclic, box_refined (Sutherland), cyl2d_snappy (every kind), 3D periodic 12x10x8 (sigma) | rhs; mean fluxes (thickened E included); species fluxes; omega; mu_t; F E, E/F, Omega; stableDt; 3 steps | rounding, 1e-13 | <= 5.3e-15; <= 1.1e-15; <= 7.6e-16; <= 4.0e-16; <= 6.0e-14 (sigma's conditioning, gpu_fv_comp O9); <= 3.4e-16; 0; <= 9.4e-16 |
+| FV(FP32) vs FV(FP64) (L1) | same | rhs; 3 steps | O2's 2e-5, 2e-6 | <= 4.5e-6; <= 4.2e-7 |
+| `--tfles 1` vs DNS (L2) | same 4 meshes, 40 steps, FP32, compensated, FP64 | state | bitwise | bitwise, uniform and dynamic |
+| passive species + LES vs LES nY 0 (L2) | same | mean rows | bitwise | bitwise, all three |
+| uniform Y 0.25, 0.5 (L2) | same, LES and LES + TFLES | rho Y vs Y rho | bitwise | bitwise, all three |
+| burning box, LES + TFLES + Charlette (L3) | box_cyclic, box_refined, 3D periodic; 9-39% burnt | mass; E + q rho Y; passive | rounding, 1e-13 | 2.4e-15 / 2.9e-15 / 2.0e-15; 8.9e-16 / 1.3e-15 / 8.9e-16; 2.7e-15 / 2.2e-15 / 2.0e-15 |
+| rerun (L4) | 4 meshes, 40 steps | state | bitwise | bitwise, both precisions |
+| FV face walk vs `DeviceTfles` (L5) | uniform 64x16x16, open x (Far, Outflow), y z cyclic, one burning state, FP32, F 2, radius 12 | Omega; F E (dynamic; + Charlette, E up to 1.222) | rounding (the raw sensor, LSQ vs central curl) | 8.3e-7; 5.3e-7, 9.4e-7 of F E |
+| FV(FP32) vs structured `kSpeciesStage<Eddy/Thick>` (X1) | uniform periodic 96x16x16, burning slab + vortical patch u' 2 S_L, M 0.05, same dt, 300 steps | full state | rounding: <= 3 x FV FP32 vs FP64 | Smagorinsky 0.17: 2.2e-5 (own 3.4e-5), mu_t/mu 0.013; sigma 1.35: 2.2e-5 (3.1e-5); Smagorinsky 1.5 (test-only, mu_t/mu 0.78): 2.3e-5 (3.5e-5); TFLES F 2 uniform: 2.9e-5 (4.5e-5); dynamic: 6.1e-5 (2.9e-5); sigma + dynamic + Charlette: 4.0e-5 (2.6e-5); Smagorinsky 1.5 + dynamic + Charlette: 3.6e-5 (2.7e-5) |
+| structured vs FV(FP64) (X1) | same | full state | same bound | 3.3e-5, 3.2e-5, 3.0e-5, 5.6e-5, 5.4e-5, 3.7e-5, 3.4e-5 |
+| TFLES F 2 dynamic, FV(FP64) vs oracle | box, 3.75 / 7.5 / 15 cells per delta_th (7.5 / 15 / 30 thickened), M 0.01, --upstream 16 --downstream 12, tt 28, window [14, 28] | S_L - 1 | order 2 | 1.016790, 1.003352, 1.000304: +1.68e-2, +3.35e-3, +3.04e-4 (2.33, 3.46). FV DNS at twice the cells ("Species" table, another box and window [7, 14]): 1.016873, 1.003472, 1.000437 |
+| same | same | delta_th / 2 | -> oracle | 1.55285, 1.59129, 1.59999 |
+| FV(FP32) vs structured (FP32), same flags | same | S_L | not rounding: the M 0.01 FP32 floor and the boundaries ("Species" items 1-3) | -1.44e-4, +7.9e-6, +2.07e-3 (FV FP32 at 15: 1.001771 vs FP64 1.000304, item 1's scatter) |
+| rotated 30 deg vs planar | same, ny 8 / 16 / 32, FP64 | S_L; delta_th | rounding of the geometry | -1.08e-5, < 1e-9, < 1e-9; +4.2e-6, +3.4e-6, -6.3e-7. The 3.75 rung with the UNIFORM sensor: -9.2e-6, so not the walk; h = delta_th/3.75 is coarser than any DNS rung (DNS rotated at 7.5 cells: -5.1e-8). Cause not isolated |
+| sheared 30 deg (every face non-orthogonal) vs planar | same | S_L; delta_th | order 2 | -3.51e-3, -9.40e-4, -2.36e-4 (1.90, 1.99); -4.19e-2, -1.06e-2, -2.50e-3 (1.98, 2.08): the DNS row's numbers at twice the cells (-3.50e-3, -9.40e-4, -2.38e-4) |
+| 3D laminar LES + TFLES F 2 + Charlette vs 2D TFLES F 2 | box 3.75 cells, nz 8 ny 8 vs ny 8, FP64, window [14, 28] | S_L; Ebar | D_sigma 0 and curl 0 on a planar flame (E = 1): equal up to the different step sequence | sigma 1.35: +5.1e-7; Smagorinsky 0.17: +7.8e-7 (its stress stays; Omega 1 switches its scalar flux off); Ebar 1.000000, FEmax 2 both |
+| binary route (`gpu_fv_tfles1d`) | box, F 2 dynamic at 3.75 cells/delta_th (7.5 thickened), FP64, t 20, window [10, 20] | S_L; delta_th; FEmax; hits | S_L 2%; 2 delta_th 5%; F; 0 | 1.016984; 3.10744 (2 x 1.55372); 2.000000; 0 |
+
+The dynamic-sensor rows of X1 sit 1.3-2.1 x their own FP32 distance (uniform sensor and LES
+alone: 0.6-1.2 x). Within the bound; the excess is not isolated (a candidate, not measured:
+the gate `T_n >= T_c` is a switch a near tie can flip between two FP32 evaluations).
+
+Ladder rows (3 levels; a 30-cell rung, 60 thickened, not measured):
+
+    tools/chem/fv_flame_ladder.py --cells 3.75,7.5,15 --tt 28 --tfles 2 --box-up 16 --box-down 12 --meshes rot,shear
+
 ## Diffusion flame
 
 `dns flame --mode diffusion --solver fv` (the structured box as a FaceMesh) and `dns flame
 --mode diffusion --polymesh DIR --bc FILE` (any polyMesh): model C1 of `docs/chem.md`, F +
 s O -> (1 + s) P, on the species passes above. One solver, one loop: `runFvComp` with
-`FvCompRun::jet`. Candle, chamber, bunsen, wick, `--pulse`: exit 2 by name.
+`FvCompRun::jet`. Chamber, bunsen, wick, `--pulse`: exit 2 by name; the candle: "Hydrostatic ambient".
 
 - **`FvChem::ox >= 0`**: omega = A rho^2 Y_F Y_O e^(-Ta/T) (`arrheniusRate2`, floors both Y),
   oxidizer `-s omega`, E `+q omega`, ONE omega. `kFvSpCell`, `kFvSpFace`, `kFvSpBndFace`,
@@ -576,7 +895,8 @@ s O -> (1 + s) P, on the species passes above. One solver, one loop: `runFvComp`
 
 Stated gaps. The structured row pins a CELL, this one a FACE: burn base 0 vs 0.25, a first-order
 tip offset. No sink: the ring above. The interior is not compared to rounding: no
-two-reactant S8 was built (the premixed S8 covers the passes they share).
+two-reactant S8 against the jet (the premixed S8 covers the passes they share; the
+interior of the two-reactant stage is rounding-equal to `kSpeciesStage2`: "Air-methane" R1).
 
 **Sheared jets are NOT stable to the end.** 30 deg, FP64: 3 cells/l diverges at t 308.7, 4.5
 cells/l at t 155.9 (dt falls 3x per 200 steps), 2 cells/l survives t 160, not run past it.
@@ -594,6 +914,160 @@ Not measured (dropped by the 3-level rule and the 295 s cap): a finer rung:
 
     dns flame --mode diffusion --polymesh SHEAR_4.5 --bc SHEAR_4.5/bc.toml --tt 160 --fv-precision fp64   # diverges at t 155.9
 
+## Air-methane
+
+`dns flame --equivalence PHI [--sl-law gri30|onestep] [--stoich S --ox-y Y] [--mix-phi PHI]
+--solver fv` (the flags' box) and `--polymesh DIR --bc FILE` (any polyMesh): models C2 and C2b
+of `docs/chem.md` ("Model C2", "Model C2b"), the rich CH4/air premix on the two-reactant stage
+of "Diffusion flame" (masterplan_multiphysics M2). One solver, one loop: `runFvComp` with
+`FvCompRun::flame`, the C0 flame's probe, stats, frames.
+
+- **C2 is C1's stage** (`FvChem::ox >= 0`, `law.n == 0`): F + s O, ONE omega, one shared
+  limiter; only the case differs (premix in, oracle `premixedEigen2`, q = cp Tu (sigma - 1)
+  s / Y_O1, `flameIC2`). **C2b = `FvChem::law`** (`PhiRateLaw`, module `C2b`):
+  `kFvSpCellPhi` puts `arrheniusRate2(lnA + phiRateLn(law, Y_F, Y_O), ...)` in the cell pass
+  (the structured `kChemCellPass2Phi`), `ChemJ2Phi` the same ln C in FP64 into the chemistry
+  dt (`ChemRate2Phi`). Their own kernel and functor: `law.n == 0` launches the C1 ones bit for
+  bit, and a law with C(xi) == 1 equals C1 byte for byte (`gpu_fv_matrix` inert column).
+  FvRef: the same expression per cell, `chemDt` likewise.
+- **Patches.** The box: x-lo `Far` at the fresh premix (Y_F1, Y_O1 of `--mix-phi`'s phi when
+  given), x-hi burnt `Outflow` (rich: Y_F,rem, 0; lean: 0, Y_O,rem). A polyMesh: the same
+  rule on every `far` / `inflow` and every `outflow` patch; a `y` in the file is exit 2 by
+  name (the flags are the one source). `tools/chem/fv_flame_mesh.py --premix` writes the
+  y-free file, `--nz N` a 3D box (z cyclic).
+- **Stats**: the C0 flame's columns with S_L on rho (Y_F - Y_F,rem) (`FvFlameSpec::yBurnt`,
+  the structured `FlameRun::yFBurnt`), then `zMin`, `zMax` = `mixtureFraction(Y_F, Y_O)` over
+  the cells (runner_flame's). `.json` appends `model` (C2 | C2b), `phi`, `zst`.
+- **LES** (`--les CS --sgs smag|sigma`, `--nz >= 8` on the box, a 3D mesh on `--polymesh`):
+  the `Eddy` instantiation of the two-reactant face kernel, one rho D + nut_f/Sc_t for every
+  species (MC's C1 + LES), the law in the cell pass. **TFLES refused** by the inventory's text
+  (`--tfles`, `--tfles-sensor`, `--efficiency`, exit 2): the thickening, its sensor and
+  Charlette's E are the premixed step's; a two-reactant TFLES would thicken the partially
+  premixed jet's outer sheet too, which no model here defines. The structured `--equivalence`
+  keeps refusing `--les`.
+
+Pairs (inventory, "Combinations"): C2b + LES smag / sigma live (harness + `gpu_fv_flame_rich_les`);
+C2b + gravity, + bodyForce live on the harness (the law is a rate factor: transport, buoyancy
+and the drive are C1's; the CLI keeps `--gravity` off the flame: open patches); C2b + TFLES
+(uniform, dynamic, Charlette) refused; C2b + RANS refused (species + RANS); C2b + steady LTS
+refused (`kFvChem` bare cr); compensated and FP64 live.
+
+### Air-methane verification
+
+`gpu_fv_flame_rich` (R1, R2), `gpu_fv_flame_rich1d`, `gpu_fv_flame_rich_les`
+(`tests/test_gpu_fv_flame_rich.cpp`), the generic cells C2b, LES smag / sigma + C2b,
+C2b + gravity, C2b + bodyForce of `gpu_fv_matrix`. Ladder: sigma 6.88, beta 8, Sutherland 298 K,
+M 0.01, phi 1.3, C2b, u_in 0.98, tt 20, window [10, 20] (gpu_flame_rich1d's protocol).
+
+| pair | mesh | quantity | expected | measured |
+|---|---|---|---|---|
+| FV(FP64) vs FvRef, generic gates (`gpu_fv_matrix`) | 4 meshes | every pass, 3 steps; numberings; rest; pow2 Y; Z == tracer; C(xi) 1 vs C1 | 1e-13; bitwise | oracle 4.8e-15 (LES sigma 1.3e-14); orders 3.2e-16; Z 1.3e-15 FP64, 7.4e-7 FP32; pow2 exact; C(xi) 1 = C1 bytes, chem dt equal |
+| device omega vs `phiRateLn` + `arrheniusRate2` restated (R2) | uniform 128 x 32, stratified premix | omega, FP64 | 1e-13 | 7.4e-15; C(xi) 1.004..2.98, C(jet) - 1 = 6.7e-16 |
+| FV(FP32) vs structured `kSpeciesStage2` + `kChemCellPass2(Phi)` (R1) | uniform periodic 128 x 32, burning slab, premix phi 1.17..1.3, A / 10, M 0.05, same dt, 400 steps | full state | rounding: <= 3 x FV FP32 vs FP64 | C2: 3.6e-5 (own 9.3e-5), structured vs FV FP64 9.8e-5; C2b: 4.8e-5 (own 5.5e-5), 7.2e-5. At the flame's A the non-equilibrium slab explodes (T 2 Tb, ox < 0) in all three: chaotic, not a gate |
+| FV(FP64) vs oracle | 1D box, 7.5 / 15 / 30 cells per delta_th | S_L - 1 | order 2 about the O(M^2) offset (-8.2e-4) | +1.53e-2, +2.98e-3, +1.23e-4; about the offset 1.61e-2, 3.80e-3, 9.5e-4 (2.08, 2.00). Window spans 7.2e-4, 2.2e-4, 6.0e-5 |
+| same | same | delta_th | -> 4.70964 | 4.59387, 4.68800, 4.70774 |
+| structured (FP32) | same box | S_L | not rounding: NSCBC vs `Far`, and the FP32 Z walk through C (d ln S/dZ -7.3, docs/chem.md "Model C2b") | 1.015555, 1.002132, 0.996512: the 30-cell rung reads below 1, the walk's sign |
+| FV(FP32) vs structured (FP32) | same | S_L | same, both walk | -4.9e-4, +1.6e-4, +2.7e-5 (FV FP32 0.996539 at 30: the same walk) |
+| FV(FP64) | same | Z = mixtureFraction over the box and run | exact | 1 to the csv digits at every rung (structured FP32: +-1.7e-4) |
+| FV(FP64) `--mix-phi 1.2` vs oracle ratio r 1.417470 (rich1d) | 15 cells | S/r - 1; (S_mix/S_jet)/r - 1 | 5e-3; 3e-3 (gpu_flame_rich1d_law's) | +2.37e-3; -6.1e-4 (structured FP32: +1.3e-3, -8.1e-4) |
+| rotated 30 deg vs planar | 7.5 / 15 / 30, ny 16 / 32 / 64, FP64 | S_L; delta_th | rounding of the geometry | -2.7e-7, 0, 0; +2.1e-5, +3.4e-6, -1.6e-6 |
+| sheared 30 deg vs planar | same | S_L; delta_th | order 2 | -1.56e-3, -4.42e-4, -1.13e-4 (1.82, 1.96); -4.74e-2, -1.20e-2, -2.86e-3 |
+| 3D laminar LES vs DNS (`gpu_fv_flame_rich_les`) | box 7.5 cells, ny 8 nz 8, FP64 | S_L | sigma: D_sigma 0 on a planar flame; Smagorinsky: mu_t of the dilatation | sigma 1.015320 = DNS 1.015320 (0 to the csv digits); Smagorinsky 0.17 +5.3e-4 |
+| README example: LES sigma + C2b on a rotated (20 deg) 3D polyMesh | 165 x 8 x 8, 7.5 cells, `--compensated` | S_L, delta_th, Z, hits | = the planar FP64 box | 1.015320, 4.59413, Z 1, 0 hits; 66545 steps, 17 s |
+
+All rows: 0 cells outside `[-1e-6, 1 + 1e-6]`.
+
+Not measured (3 levels, 295 s): a 60-cell rung, a wavy mesh, `--mix-phi` below 1 on FV, a
+turbulent LES flame (no synthetic inflow on the route: `--turb` exit 2):
+
+    tools/chem/fv_flame_ladder.py --cells 60 --tt 20 --dth 4.70964 --meshes rot,shear,wavy \
+        --extra "--equivalence 1.3 --expansion 6.88 --visc sutherland --tinf 298"
+
+## Turbulence (`--turb`, masterplan_multiphysics M5)
+
+`dns flame --solver fv --turb U [--turb-length L --seed S]` on the flags' box, premixed C0
+and C2b (`--equivalence`). The generator is `dns/turb_ic`'s (hash-seeded per wavevector,
+the reference set, `flameTurbSpec`: the structured box, nbx = nz columns); the FV route
+reads it as its Fourier sum at points (`dns/fvturb`):
+
+```
+IC     every centroid: m += rho w u'(C), E += the kinetic-energy change (p kept),
+       w = turbWindow(C_x, x_f0 - 1.5 l_t, l_t/4): flame1d addTurbulence's arithmetic per cell
+       (turbAt: turbPoint per point, threaded, bit-identical at any thread count; w == 0 skips the sum)
+inflow the xlo Far patch gets one FvBc row per face (FvCompConfig::bcRow, rows after the patch rows);
+       before every step the box swept to X = sum U dt (FP64 host) is sampled at the face centres
+       (TurbSweep: the sum grouped by mx, B_p(mx) built once) and each row rewritten as fvBcOf's Far
+       row with velocity U dir + du (fvFarTurbRow), one upload (DeviceFvComp::setBcRows); held over
+       the step's three stages
+```
+
+No device generator, no stage term: the module `Turb` (dns/fvmodules, axis `inflow`) is
+live with C0, C2b, LES (smag, sigma), TFLES (uniform, dynamic, Charlette) and both
+precision modules; refused by name with RANS (fluctuations on an ensemble mean), C1/C2 (the
+jet and the one-step C2 premix: no turbulent number), gravity (no open patch under it),
+the body force (a closed channel), local time stepping (the sweep is time-accurate); it
+requires C0 or C2b. Refused on the route: `--polymesh` (the box's periods and lattice are
+the flags'; issues.md M5c1), `--hold-flame`, `--mode diffusion`, `--sl-law onestep`. The
+3D stats gain `area` (sum V |grad Y_F| / A, the structured column's co-area integral; the
+least-squares gradient is central on the box) and `I0` = SL/area.
+
+Verification (gfx1201, 2026-11-03; `tests/test_gpu_fv_turb.cpp`, ctest `gpu_fv_turb` 3 s):
+
+| gate | case | measured | relation |
+|---|---|---|---|
+| off | `tools/fv/comp_bit_identity.sh` (36 cases, + `flameturb`, `lm3d`, `fvlm3d`) vs the pre-M5 binary | every artefact | byte-identical (0 failures) |
+| T1 IC | the CLI's box, 4 cells/delta_th, 24^2 cross-section (41472 cells, 12144 modes) | FV point sum vs the structured `addTurbulence(turbBox)`: m 3.7e-14 (u' 1), E 2.0e-16 of max E | rounding (direct FP64 sum vs FFTW c2r) |
+| T2 zero amplitude | the same box, xlo rows rewritten every step with u' 0, 60 steps | FP32, compensated, FP64 | byte-identical to the laminar table |
+| T3 rows reach the flow | u' 1 rows, FP64, 60 steps | first cell layer max \|v\|, \|w\| 0.54 u'; mass vs laminar 7.1e-7 | plane-mean u' 0 |
+| X3 FV vs structured | burning slab + turbBox velocity, 48 x 16 x 16 periodic, M 0.05, 200 steps, same dt | FV32 vs structured 1.77e-5, structured vs FV64 1.93e-5, FV32 vs FV64 1.66e-5 (transverse KE decays to 1.3%: Re_t ~ 1) | rounding, <= 3 x own |
+| matrix | `gpu_fv_matrix`: 7 Turb cells x 4 meshes (C0, C2b, + LES smag / sigma, TFLES uniform / dynamic, Charlette) | oracle <= 1.3e-14, orders <= 4e-16, mass, energy, pow2 Y, Z, rerun; inert: rows of u' 0 = the cell without Turb bitwise (FP32 plain and compensated) | every generic gate |
+
+The inflow itself is a STATED GAP, not rounding: the structured flame relaxes its NSCBC
+inflow CELL (x = h/2) to the box's lerped column, the FV route sets the Far FACE (x = 0) to
+the exact sum. The IC's box sits on the flame at t = 0 and the inflow's needs ~13 flame
+times to arrive (6 delta_th + the 16 sink cells at u_in 1), so the physics window below is
+the IC's.
+
+Physics number (`tools/chem/turb_fv.sh`, M 0.02, u'/S_L 4, l_t 2 delta_th (Re_t 17.8), L_y =
+L_z = 6 l_t, 6 fresh + 4 burnt delta_th, means over t in [0.5, 2]; structured = the
+NSCBC + sink solver, FV = this route on the same mesh, FP32):
+
+| cells/delta_th (mesh) | S_c structured | S_c FV | FV - st | area structured | area FV | laminar S_c st / FV (same window, 8^2) |
+|---|---|---|---|---|---|---|
+| 4 (72 x 48 x 48) | 1.09880 | 1.09638 | -0.22% | 1.03683 | 1.03632 | 1.03957 / 1.03289 (-0.64%) |
+| 6 (92 x 72 x 72) | 1.06125 | 1.05230 | -0.84% | 1.02815 | 1.02633 | 1.03358 / 1.02873 (-0.47%) |
+| 8 (112 x 96 x 96) | 1.05237 | 1.04039 | -1.14% | 1.03422 | 1.03135 | 1.02003 / 1.01566 (-0.43%) |
+
+FV `--compensated` moves S_c by < 1.1e-4 (1.09644, 1.05239, 1.04050): not the FP32 update
+floor. The gap is NOT rounding and does not shrink over the three levels (area -0.05%,
+-0.18%, -0.28%): the window is the start transient of an M 0.02 box, and the laminar flame
+already differs by 0.4-0.6% there between the NSCBC + sink structured boundaries and the FV
+Far / Outflow faces; the low-Mach pair, whose boundaries are the same face conditions on both
+solvers, agrees to 3e-4 on the same turbulent case (docs/chem.md "Low-Mach turbulence"). Read
+as a stated boundary gap (issues.md M5c2), 3 levels by decision, no limit claimed. FV cost: 1.2
+ms/step at 41k cells (the rows' sample + upload included).
+
+The pairs, 4 cells/delta_th (72 x 48 x 48), the same case and window:
+
+| cell | S_c structured | S_c FV | area structured | area FV | S_c / laminar S_c, st / FV |
+|---|---|---|---|---|---|
+| C0 + turb (DNS) | 1.09880 | 1.09638 | 1.03683 | 1.03632 | 1.0570 / 1.0615 |
+| + LES smag 0.17 | 1.10044 | 1.09778 | 1.03636 | 1.03585 | |
+| + LES sigma 1.35 | 1.09881 | 1.09627 | 1.03632 | 1.03582 | |
+| + TFLES F 2 (dynamic) | 1.15741 | 1.04206 | 1.03387 | 1.03401 | 1.0222 / 1.0238 (laminar TFLES 1.13224 / 1.01787) |
+| + TFLES F 2 + sigma + Charlette | 1.15999 | 1.04187 | 1.03218 | 1.03231 | 1.0245 / 1.0236 |
+| C2b phi 1.3 + turb | (not built) | 1.10562 | | 1.03449 | low-Mach partner: MAC 1.04023, FV 1.04078 |
+
+LES and the turbulent pairs keep the C0 gap (-0.24%, -0.23% S_c, -0.05% area); TFLES and
+Charlette agree on the flame surface to 1.4e-4 and on S_T/S_L to 0.16%, but the LAMINAR
+thickened flame already differs by 10% in this window between the two compressible solvers
+(1.132 vs 1.018; low-Mach 1.106): a pre-existing TFLES gap of the 3D M 0.02 start, no `--turb`
+in it (issues.md M5c6). C2b has no structured compressible --turb; its compressible FV S_c
+(1.106) carries the M 0.02 start transient the low-Mach pair (1.040, agreeing to 5e-4) has
+not.
+
+`issues.md` M5c.
+
 ## Gates
 
 `fv_comp` (host, `tests/test_fv_comp.cpp`): the `--bc` parser, the binding, the
@@ -602,7 +1076,7 @@ the structured stencil (1e-15), `FvFlameProbe`, FvRef species at 1 vs 4 threads,
 `FvJetProbe` vs `measureJet` (1e-5, FP32 fields), the shared limiter's linearity and vote, the
 characteristic Outflow's entropy and invariant.
 
-`fvref` adds W1, W2 ("Gravity").
+`fvref` adds W1, W2 ("Gravity"), W3 ("Hydrostatic ambient"); `gpu_fv_candle_rest` (56 s), `_g0` (2 s), `_height` (102 s) the candle.
 
 `gpu_fv_comp` (device vs FP64 oracle, `tests/test_gpu_fv_comp.cpp`):
 
@@ -629,6 +1103,12 @@ bounds 2%, 3%; `gpu_fv_flame_mix`; `gpu_fv_flame_jet`: the binary at defaults, F
 window [60, 80]: tip 47.23, TmaxIn/T_ad 0.98475, burn/in 0.9975, out/in 3.5e-11, p/p0 1.0017,
 bands gpu_diffusion_jet's, no tip pin: the ring is still in that window):
 `tests/test_gpu_fv_flame.cpp`.
+
+`gpu_fv_flame_rich` (R1, R2), `gpu_fv_flame_rich1d`, `gpu_fv_flame_rich_les`: "Air-methane
+verification".
+
+`gpu_fv_flame_les` (L1-L5, X1) and `gpu_fv_tfles1d` (the binary, F 2): table in "Species
+LES and TFLES verification", `tests/test_gpu_fv_flame_les.cpp`.
 
 `gpu_fv_cross` (X1-X3), `gpu_fv_ladder` (X4, every route's smoke run), `gpu_fv_far`
 (X5, settled gap, 95 s: 192x96 -4.1e-4 <= 6e-4, order 1.80 >= 1.5):
@@ -730,6 +1210,72 @@ rounding leave `eps p/h`, a frozen forcing, 1.2e-6 to 2.2e-6 urms; FP64 rounding
 Max non-orthogonality at 64 x 32: sine 0.05 26.2 deg, sine 0.08 40.6 deg, random 0.3 60.0 deg. 3D ran as smokes only:
 48 x 24 x 24 closed t 4 finite, onset not reached. No 3D Nu is quoted.
 
+## Hydrostatic ambient: open patches under gravity, the candle
+
+`FvConfig::ambient` (`FvAmbient`: p0, T0, x0) is the isothermal column `p_a(x) =
+candleAmbientP(p0, |g|, R T0, h)`, `h = (x - x0).up`, `up = -g/|g|`: the structured candle's ONE
+definition (`dns/diffusion`), the same numbers when g is along -x and x0 on the inflow plane.
+`fvAmbientRows` gives every face of a `Far` / `Outflow` row a row of its own (`FvConfig::bcRow`,
+no device path, no kernel edit): Far's `qFar` the ambient's conserved state at the OWNER'S
+CENTROID moving with the row's velocity (`fvAmbientConserved`), Outflow's `pOut` p_a there.
+`Inflow` needs no row: its p is the owner's (`p_P + rho c (u_n,P - u_n,in)`).
+
+- **Why the owner's centroid, not the face centre.** A boundary face carries no gravity share
+  (`fvGravityFace` is internal), so its pressure must be the owner height's, exactly as a Wall
+  face's is p_P ("A Wall or Slip face adds nothing" above): the missing `rho g.r` between
+  centroid and face is that half cell's absent share. With the row at the centroid the rest
+  state crosses an open face as `P == F` (Far returns F exactly, the characteristic Outflow
+  `pOut == p_P`): the column is a fixed point through Inflow, Outflow and Far faces to the same
+  rounding as the closed box, on any mesh, and the incoming characteristic of a moving state
+  compares the owner with the ambient AT ITS HEIGHT (the structured candle's hydrostatic NSCBC
+  waves, `Config::hydroLo/Hi`, in face-flux form). A face-centre row would need a boundary
+  gravity term and a hydrostatic shift inside `fvBoundaryState`: more device code, rest no
+  longer exact.
+- **Checked, not trusted** (`FvRef::make`, so `DeviceFvComp::make` too): gravity with a Far or
+  Outflow patch and no `ambient`: exit by name (`needs the hydrostatic ambient`); every such
+  face's row p (Far: and T) within 1e-12 of the column at its owner: else by name (`not the
+  hydrostatic ambient's row`); `ambient` without gravity: refused. Moving walls stay refused.
+  `dns conv` keeps its closed layer (an open patch there is refused by name: conv's experiment).
+- **IC** `fvAmbientState` (rest) and `fvJetState` under gravity (`p = p_a(C)`, `rho =
+  p_a/(R T)`: the structured candle IC) read `fvAmbientP`: the rows' bits.
+
+`dns flame --mode candle --solver fv` (and `--polymesh DIR --bc FILE`, g along `-direction`,
+x0 = `origin`): the FV jet ("Diffusion flame") + `FvCompConfig::gravity = -g dir` + the ambient
+rows on its Outflow (Far) patches (`fvJetRows`, `fvJetAmbient`). Under gravity an Outflow
+backflow is the ambient's air at T0 (`y = {0, Y_O2}`, not `ownY`): air drawn down through the
+top, the structured `ambientHi`. `--quiescent`: every inflow face and the IC at rest, no
+extinction guard. Stats: the jet's 21 columns + `uMax`, `uOutMin` (the structured candle's);
+`pMean` against `Sum V p_a`. g 0 is the FV jet byte for byte (`gpu_fv_candle_g0`). `--wick`,
+`--les`, the structured-only knobs: exit 2 by name.
+
+**The candle's top is a `Far` row, the jet's `Outflow` only at g 0.** Measured first with the
+jet's fixed-p characteristic Outflow at the top (8 cells/l, M 0.01, defaults): an organ pipe the
+flame pumps. p/p0 swung +-0.7% sustained to t 30 (the g 0 jet's ring decays to +-0.2%), air
+drawn down at uOutMin -11 to -23 U (structured -7 to -11), 3600-4000 cells with Z below -1e-6
+(Y_O 3e-5 above Y_O2), tip 6.48 l; at 6 cells/l tip 6.3 -> 4.6 inside the window, at 4 cells/l
+extinction (exit 8, t 25). A `Far` top (characteristic, the ambient's air at T0 moving with the
+coflow, `--quiescent` at rest) radiates the mode: steady, no hits, tip h-independent. The
+polyMesh route takes either (`type = "outflow"` keeps the rows of `fvAmbientRows` too);
+`tools/chem/fv_flame_mesh.py --jet` + `[patch.xhi] type = "far"` reproduces the box to the
+printed digits (tip 7.1333 both).
+
+### Hydrostatic ambient verification
+
+| pair | mesh | quantity | expected | measured |
+|---|---|---|---|---|
+| column at rest, FvRef (W3) | 24 x 14 closed + open box (Wall floor, Inflow at rest, characteristic Outflow lid, Far side): uniform, oblique g 30 deg (the rotated mesh's frame), random +-0.3 h | max\|rhs\|; max\|u\| after 200 FP64 steps | rounding of p/h | 9.3e-15, 1.6e-14, 2.0e-14 (bound 9.5e-14 - 1.2e-13); 8.6e-16, 7.5e-16, 4.7e-16 |
+| refusals (W3) | same | open patch without ambient; ambient without g; a Far row 1e-6 off | exit by name | all three |
+| FV(FP64) vs FvRef, ambient rows (`gpu_fv_candle_rest`) | 48 x 28, the three meshes, a moving state | rhs, 3 steps | 1e-13 | 6.4e-15, 6.4e-15, 4.6e-15 |
+| FP32 rest, 4000 steps | same | max\|u\|/c, first / second half | flat, FP32 floor | 20000 steps (18-25 acoustic crossings): 1.11e-6 / 1.12e-6, 1.01e-6 / 1.22e-6, 4.7e-7 / 5.1e-7 |
+| matrix (`gpu_fv_matrix`) | cyl2d_snappy open set (inflow, outflow, far, slip, wall) at rest, every gravity cell | open rest FP64 / FP32 | rounding | 3.4e-16 / 1.5e-7 (C0, C1, C2b, LES, TFLES, bodyForce cells: <= 1.0e-15 / 4.5e-7) = the closed set's |
+| quiescent candle, binary (`gpu_fv_candle_rest`) | 288 x 200 (8 cells/l), M 0.005, tt 10, the structured `gpu_candle_rest` case | max\|u\| / U; max\|p/p_a - 1\|; hits | structured 1.21e-3 (NSCBC hydrostatic waves; 0.67 without) | Far top: 6.3e-4 (halves 6.3e-4 / 6.3e-4), 0, 0; FP64 tt 2 8.0e-13 (Outflow top before: 1.16e-3 FP32) |
+| same, `--compensated`; FP64 (Outflow top, before the Far top) | same | max\|u\| / U, halves | rounding | 6.6e-5 / 6.4e-5; 1.6e-12 / 1.7e-12: the FP32 number is p's rounding (p = T0 = 28571), the scheme's rest is exact |
+| g 0 = FV jet (`gpu_fv_candle_g0`) | W 4, 4 cells/l, tt 1 | 21 stats columns | bytes | 17 rows, 0 differ (tt 3) |
+| FV candle alone | 4, 6, 8 cells/l, M 0.01, defaults, window t 20-30 | tip; TmaxIn/T_ad; fuelIn; half | converging | 7.154, 7.133, 7.133; 0.9756, 0.9749, 0.9748; 0.8862, 0.8833, 0.8792; 1.340, 1.342, 1.345; halves within 0.6%, hits 0 |
+| FV vs structured etaIn 1000, same mesh | 4, 6, 8 cells/l | tip; TmaxIn/T_ad; fuelIn | the inflow model's gap (FV fixed face vs a pinned cell, "Diffusion flame") | structured 7.07 (flapping, halves 7.96 / 6.18), 7.88 (8.20 / 7.55), 7.94: FV +1.2%, -9.5%, -10.2%; TmaxIn 0.9702, 0.9729, 0.9716: +0.6%, +0.2%, +0.3%; fuelIn 0.958, 0.939, 0.929: FV -7.5%, -5.9%, -5.4%. Roper's buoyant H ~ Q^(4/3) explains -7.4% of the -10.2%: residual ~3%, no h trend in it established (structured is unsteady below 8) |
+| FV vs structured default (etaIn 100) | 4, 8 cells/l | tip; fuelIn | NOT the same inflow (the etaIn 100 row overshoots, 39% more fuel at W 1) | 8.69 (unsteady), 10.19; 1.22 at 8 cells/l |
+| g 0, FV vs structured default | 8 cells/l | tip; fuelIn | the momentum jet, same inflow gap | 10.42 vs 21.44; 0.717 vs 1.025 |
+
 ## Performance
 
 O-grid 256x128 (32 640 fluid cells), Re 40, gfx1201, ms/step: FV plain 0.182, FV
@@ -776,10 +1322,10 @@ Not built here, shaped for:
 
 ## Not built
 
-`wedge` / axisymmetric meshes (P8), MRF, `--hot-patch` (per-face wall T), open patches
-under gravity, every flame mode but premixed C0 and diffusion C1 (bunsen, candle, chamber,
-wick, `--equivalence`), the jet's `--pulse`, species LES, TFLES,
-turbulent inflow, flame checkpoints, moving meshes, immersed bodies on a FaceMesh, a
-checkpoint, `--temp`,
+`wedge` / axisymmetric meshes (P8), MRF, `--hot-patch` (per-face wall T), a non-isothermal
+ambient column (stratified T), every flame mode but premixed C0, diffusion C1 and the candle
+(bunsen, chamber, wick), the jet's `--pulse`, LES / TFLES of the two-reactant jet,
+turbulent inflow on a polyMesh (`--turb` is the box's), moving meshes, immersed bodies on a FaceMesh, a
+checkpoint of `dns flow` (the flame's are built, M5: docs/chem.md "Checkpoint and restart"), `--temp`,
 frames other than one plane, the CUDA run (compiled through the shim only on a
 machine with nvcc). `issues.md` item 78.

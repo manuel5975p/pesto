@@ -80,6 +80,15 @@
 // live beside the lo-face arrays: my's hi face (j = ny) in myHi (nx nz), mz's
 // in mzHi (nx ny).
 //
+// LES and TFLES (M4, docs/chem.md "Low-Mach LES"; LowMachSetup::cs, ::tfles;
+// their own kernel instantiations, off = the kernels above bit for bit):
+// mu_t = rho_c (cs Delta)^2 rate(g) per cell and stage (dns/sgs.hpp), g the
+// central differences of the cell-centred velocity; mu + mu_t in the momentum
+// stress; species and T rho D + mu_t,f / Sc_t on INTERIOR faces (Sc_t = Pr_t:
+// Le_t = 1 keeps the Shvab-Zeldovich coupling), boundary faces molecular.
+// TFLES (C0): F E rho D + (1 - Omega) mu_t / Sc_t there, omega E/F (fuel and
+// heat release), F, E, Omega from gpu/tfles on each step's input state.
+//
 // Deterministic: own-index writes, no FP atomics, FP64 reductions min/max
 // only (rocPRIM) and the mass tally a fixed-order single-block tree.
 // GPU-only header.
@@ -92,8 +101,11 @@
 #include "dns/gpu/lm_poisson.hpp"
 #include "dns/gpu/reductions.hpp"
 #include "dns/gpu/run_result.hpp"
+#include "dns/gpu/tfles.hpp"
 #include "dns/grid.hpp"
 #include "dns/lowmach.hpp"
+#include "dns/sgs.hpp"
+#include "dns/tfles.hpp"
 #include "dns/transport.hpp"
 
 #include <array>
@@ -155,6 +167,29 @@ struct LowMachSetup
     std::vector<std::uint8_t> solid;
     double wallT = 1;
     double pcgTol = 1e-6;
+    // LES (M4; header comment): cs > 0 = Cs (Smagorinsky) or C_sigma (sgs),
+    // Delta^2 = (hx hy hz)^(2/3), hx hy at nz == 1; prt = Sc_t = Pr_t. 0: the
+    // kernels bit for bit. Pre (make): no solid; sigma needs nz > 1.
+    double cs = 0;
+    SgsModel sgs = SgsModel::Smagorinsky;
+    double prt = kLesPrt;
+    // TFLES (M4): set = thickened (gpu/tfles' setup, box units). Pre (make):
+    // nY == 1 (C0), no solid, periodic laterals; charlette needs cs > 0, nz > 1.
+    std::optional<TflesSetup> tfles;
+    // --turb (M5, docs/chem.md "Low-Mach turbulence"): the inflow face's per-row m and
+    // its tangential velocity rows (v on the y-edge rows at y = j hy, w on the z-edge
+    // rows at z = k hz) are the swept box's, rewritten between steps by setInflowTurb
+    // (the Turb instantiation of the tangential momentum; until the first call v = w =
+    // 0). false: the antimirror (u_t = 0 on the face), the kernels bit for bit.
+    // Pre (make): no solid, periodic laterals.
+    bool turb = false;
+};
+
+// The eddy fields' extrema of the current state (DeviceLowMach::eddyStats):
+// max mu_t, max F E, the Omega-weighted mean E (NaN without TFLES or flame).
+struct LmEddyStats
+{
+    double mutMax = 0, feMax = 1, eBar = NAN;
 };
 
 // FP64 boundary sums of the CURRENT state (DeviceLowMach::boundarySums;
@@ -191,6 +226,13 @@ public:
     // first stage's predictor zeroes them in its output either way).
     std::expected<void, std::string> upload(const LowMachState& s);
 
+    // --turb (M5): the inflow rows for the next steps, ny nz each (row j + ny k), FP64
+    // rounded to FP32 once: m the face mass flux (replaces the profile's), v at (0, j hy,
+    // (k + 1/2) hz), w at (0, (j + 1/2) hy, k hz). Error: not made with setup.turb, a
+    // size, an upload.
+    std::expected<void, std::string> setInflowTurb(const std::vector<double>& m, const std::vector<double>& v,
+                                                   const std::vector<double>& w);
+
     // One SSP-RK3 step of dt. A pressure-solve failure is an error by name
     // (pcgFailed(): the apertured PCG ran out of iterations -- exit 8).
     std::expected<void, std::string> step(double dt);
@@ -205,14 +247,26 @@ public:
     // cfl / max_c sum_a |u_a|/h_a (face maxima per cell); diffusive 0.25 h^2
     // rho_min / (mu(T_max) max(4/3, 1/Pr)), T_max = P0/(R rho_min) (Sutherland
     // monotone); chemistry K / max J (the cp-form Jacobian of chemStableDt).
+    // LES / TFLES (M4): diffusiveDt is coef h^2 rho_min / (mu(T_max) max(4/3,
+    // FE_max/Pr) + mu_t,max max(4/3, 1/Sc_t)), positivityDt's D_c the cell's own
+    // mu, mu_t, F E alike; both first lay the eddy fields of the CURRENT state
+    // (refreshEddy), so a restart reads the dt of the uninterrupted run.
     double convectiveDt(ReduceScratch& r, double cfl) const;
-    double diffusiveDt(ReduceScratch& r) const;
+    double diffusiveDt(ReduceScratch& r);
     double chemDt(ReduceScratch& r, double K) const;
     // `--dt-rule cell` (S9, issues LM10): K / max_c (2 C_c + D_c), the
     // per-cell sum of the convective (x2: MC) and diffusive rates (LmPosRate in
     // lowmach.hip): the explicit transport step's positivity bound for T and
     // Y_k at the cell where both are large (the hot, fast products).
-    double positivityDt(ReduceScratch& r, double K) const;
+    double positivityDt(ReduceScratch& r, double K);
+    // M4: mu_t and gpu/tfles' F E, E/F, Omega of the current state (no-op
+    // without LES and TFLES); eddyStats reads them (refreshEddy first).
+    void refreshEddy();
+    LmEddyStats eddyStats(ReduceScratch& r);
+    bool les() const { return sp_.cs > 0; }
+    bool thick() const { return tf_.has_value(); }
+    // The eddy viscosity of the last refresh or stage (zeros without LES).
+    const DeviceScalar& mut() const { return mut_; }
 
     // The cell pass on the current state (T, Y, omega fresh for the stats and
     // frames below).
@@ -295,6 +349,10 @@ private:
                double cb, double cr, int si, std::string& err);
     // The inflow row buffers (m, rho, T, Y_0, Y_1 or null).
     std::array<const Real*, 5> inflowRows() const;
+    // M4: mu_t of state b into mut_ and mu_ += mu_t (Pre: the cell pass on b
+    // ran); the cell pass of s_ and gpu/tfles' update from it.
+    void eddyOf(const State& b);
+    void tflesOf(const State& b);
 
     GpuGrid g_;
     LowMachSetup sp_;
@@ -304,6 +362,8 @@ private:
     DeviceScalar Y_[kLmMaxY];
     // The inflow face per row (ny nz): m, rho = P0/(R T), T, Y_k.
     DeviceScalar inM_, inRho_, inT_, inY_[kLmMaxY];
+    // M5 --turb: the inflow's tangential rows (allocated with setup.turb only).
+    DeviceScalar inV_, inW_;
     // The stage's boundary face fluxes per species (kLmScalars writes, the
     // species tally sums): x-lo, x-hi (ny nz each), y-lo, y-hi (nx nz), z-lo,
     // z-hi (nx ny); periodic axes' segments unused.
@@ -315,6 +375,12 @@ private:
     DeviceScalar phiW_[3];
     int pcgIt_[3] = {0, 0, 0};
     bool pcgFailed_ = false;
+    // M4: mu_t and the cell-centred velocity it differences (allocated with
+    // LES or the efficiency; mut_ a zero cell otherwise), (cs Delta)^2, the
+    // thickened flame.
+    DeviceScalar mut_, uc_, vc_, wc_;
+    Real cd2_ = 0;
+    std::optional<DeviceTfles> tf_;
 };
 
 } // namespace dns::gpu

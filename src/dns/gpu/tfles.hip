@@ -232,12 +232,19 @@ void DeviceTfles::update(const DeviceCompState& s, const DeviceScalar& u,
                          const DeviceScalar& v, const DeviceScalar& w,
                          const DeviceScalar& T)
 {
+    update(s.rho.data(), s.y[0].data(), u, v, w, T);
+}
+
+void DeviceTfles::update(const Real* rho, const Real* ryFuel,
+                         const DeviceScalar& u, const DeviceScalar& v,
+                         const DeviceScalar& w, const DeviceScalar& T)
+{
     if (s_.uniform && !s_.charlette) return; // constant, formed at make()
     const std::size_t n = g_.size();
     const Real* omega = nullptr;
     if (!s_.uniform) {
         kTflesSensorRaw<<<launchBlocks(n), blockSize>>>(
-            g_, s.rho.data(), s.y[0].data(), T.data(), Real(s_.lnAs),
+            g_, rho, ryFuel, T.data(), Real(s_.lnAs),
             Real(s_.TaS), Real(s_.sensorBeta), ra_.data());
         checkLastKernel("kTflesSensorRaw");
         // raw (ra) -> x (rb) -> y (ra) -> z (rb) | nz == 1: ends in ra.

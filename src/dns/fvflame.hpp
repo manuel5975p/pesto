@@ -42,6 +42,9 @@ struct FvFlameSpec
     std::array<double, 3> dir{1, 0, 0};
     double Tu = 1, sigma = 5, dth = 1, gamma = 1.4, Rgas = 1, q = 0;
     int fuel = 0;
+    // The burnt side's Y of the fuel row (model C2: Y_F,rem): SL's reference is
+    // rho (Y - yBurnt), the structured FlameRun::yFBurnt; 0 = the C0 expression.
+    double yBurnt = 0;
 };
 
 // The low-Mach state's cell fields (gpu/fv_incomp DeviceFvLowMach::cells), [nC] but
@@ -87,6 +90,9 @@ private:
 // (C - origin).lift + geom.yc in the structured box's coordinates, y - yc wrapped to
 // the mesh's lateral period (a sheared cyclic mesh leaves the slot's y). p0 = T0 (R 1).
 // skip: cells at each end TmaxIn ignores, in slabs.
+// --mode candle (candle): the stats append uMax, uOutMin; g = -gravity dir (zero: the
+// jet bit for bit), the hydrostatic ambient fvJetAmbient; quiescent: every inflow face
+// and the IC at rest (quiescentInflow), no extinction guard.
 struct FvJetSpec
 {
     std::array<double, 3> dir{1, 0, 0}, lift{0, 1, 0}, origin{};
@@ -94,14 +100,21 @@ struct FvJetSpec
     BunsenGeom geom{};
     double T0 = 1, gamma = 1.4, Rgas = 1, q = 0;
     int skip = 4;
+    bool candle = false, quiescent = false;
+    std::array<double, 3> g{};
 };
 
+// The candle's ambient column: isothermal T0, p0 = R T0 (rho0 1) at the slot's centre on
+// the inflow plane, so h = (x - origin).dir: the structured candle's candleAmbientP numbers.
+FvAmbient fvJetAmbient(const FvJetSpec& js);
+
 // measureJet's numbers and the runner's. energy = Sum V (E + q rho Y_F), pMean the
-// volume mean p/p0; hits: cells with Z, Y_F or Y_O outside [-1e-6, 1 + 1e-6].
+// volume mean p/p0 (under gravity Sum V p / Sum V p_a: the structured candle's ambient
+// reference); hits: cells with Z, Y_F or Y_O outside [-1e-6, 1 + 1e-6]; uMax max |u|.
 struct FvJetMeasure
 {
     double xTip = NAN, xBase = NAN, half = NAN, Tmax = 0, TmaxIn = 0, burn = 0, mass = 0, energy = 0, pMean = 0;
-    double zMin = 0, zMax = 0, yfMin = 0, yoMin = 0, hits = 0;
+    double zMin = 0, zMax = 0, yfMin = 0, yoMin = 0, hits = 0, uMax = 0;
 };
 
 class FvJetProbe
@@ -124,19 +137,18 @@ private:
     std::vector<int> bin_;                 // per cell
     std::vector<double> x_, y_;            // per cell, from the slot's inflow centre, y wrapped
     std::vector<std::vector<int>> slabs_;  // cells per slab, ascending y
-    double h_ = 0, hLat_ = 0, lo_ = 0;
+    double h_ = 0, hLat_ = 0, lo_ = 0, pAmbient_ = 0; // pAmbient_: Sum V p_a (gravity only)
     int nBin_ = 0;
 };
 
 // The table of a jet run: a copy of bc (a row per patch) plus one row per face of
-// every `jet` patch, diffusionInflow(y) at the face centre: its u, T, y[0], y[1] =
-// Y_F, Y_O, `diffusive`. Every Outflow row carries its owner's Y both ways and is
-// `characteristic`. faceRow: per boundary face, its row.
-struct FvJetRows
-{
-    std::vector<FvBc> bc;
-    std::vector<int> faceRow;
-};
+// every `jet` patch, diffusionInflow(y) at the face centre (quiescentInflow if
+// js.quiescent): its u, T, y[0], y[1] = Y_F, Y_O, `diffusive`. Every Outflow row is
+// `characteristic` and carries its owner's Y both ways; under gravity (the candle) a
+// backflow is the ambient's air instead (y = {0, Y_O2}, T0: air drawn down through the
+// top, the structured candle's ambientHi), and every Far / Outflow face gets the ambient
+// row of fvAmbientRows. faceRow: per boundary face, its row.
+using FvJetRows = FvBcTable;
 FvJetRows fvJetRows(const FaceMesh& fm, const FvBcSpec& spec, std::vector<FvBc> bc, const FvJetSpec& js);
 
 // y of every cell off the slot's axis, wrapped: a 2D mesh with cyclic faces has the
@@ -145,7 +157,8 @@ std::vector<double> fvJetLateral(const FaceMesh& fm, const FvJetSpec& js);
 
 // diffusionIC on any mesh: the inflow row at the cell's y, extruded along dir;
 // ignition > 0: the short burning column of --ignition. Rows rho, m, E, rho Y_F,
-// rho Y_O.
+// rho Y_O. Under gravity p = p_a(C) (fvJetAmbient), rho = p_a/(R T): the structured
+// candle's IC (horizontally uniform p).
 FvState fvJetState(const FaceMesh& fm, const FvJetSpec& js, double ignition);
 
 // The FV state of t(s, C) = T/Tu at every cell centroid C, s = (C - origin) . dir,

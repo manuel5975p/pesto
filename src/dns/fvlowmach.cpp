@@ -1,6 +1,7 @@
 #include "dns/fvlowmach.hpp"
 
 #include "dns/curvmesh.hpp"
+#include "dns/polymesh.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -38,7 +39,9 @@ std::expected<FvLowMachBcs, std::string> fvLowMachBcs(const FvBcSpec& spec, doub
             break;
         case FvPatchKind::Slip: o.kind = FvIncompBc::Slip; break;
         case FvPatchKind::Inflow:
-            if (!p.hasY) return bad(std::format("patch.{}: an inflow carries y = [...] on the low-Mach route", p.name));
+            // jet = true: the burner's rows set u, t and y per face (fvLowMachRows).
+            if (!p.hasY && !p.jet)
+                return bad(std::format("patch.{}: an inflow carries y = [...] on the low-Mach route", p.name));
             o.kind = FvIncompBc::Inflow;
             o.hasT = true;
             o.T = p.tIn * Tu;
@@ -56,11 +59,27 @@ std::expected<FvLowMachBcs, std::string> fvLowMachBcs(const FvBcSpec& spec, doub
             o.kind = FvIncompBc::Outflow;
             open = true;
             break;
+        case FvPatchKind::Open: {
+            // p = 0 on the face as an outflow's; the sign-of-flux rule rides the
+            // tables (bOpen). One ambient per run: gpu/lowmach's.
+            const double t = p.tIn * Tu;
+            const std::array<double, kFvLmMaxY> y{p.y[0], p.y[1]};
+            if (b.open && (t != b.ambT || y != b.ambY))
+                return bad(std::format("patch.{}: every open patch draws the one ambient: t, y must equal patch.{}'s",
+                                       p.name, b.openPatches.front()));
+            b.open = true;
+            b.openPatches.push_back(p.name);
+            b.ambT = t;
+            b.ambY = y;
+            o.kind = FvIncompBc::Outflow;
+            open = true;
+            break;
+        }
         case FvPatchKind::Empty: break;
         }
         b.flow.patches.push_back(std::move(o));
     }
-    if (!open) return bad("no outflow patch: a closed box needs a time-dependent P0, not built");
+    if (!open) return bad("no outflow or open patch: a closed box needs a time-dependent P0, not built");
     return b;
 }
 
@@ -83,6 +102,19 @@ FvLowMachTables buildFvLowMachTables(const FaceMesh& fm, const FvLowMachBcs& b, 
         t.bYfix[q] = 1;
         const double rhoB = prGas / s.bT[q];
         for (std::size_t k = 0; k < 3; ++k) t.rUb[k * nB + q] = rhoB * s.bU[k * nB + q];
+    }
+    if (b.open) {
+        t.ambT = b.ambT;
+        t.ambY = b.ambY;
+        t.bOpen.assign(nB, 0);
+        for (std::size_t q = 0; q < nB; ++q) {
+            if (s.bCode[q] != std::uint8_t(FvIncompFaceBc::Outflow)) continue;
+            const std::size_t fb = std::size_t(s.bFace[q]);
+            const auto pit = std::ranges::find_if(fm.patches, [&](const MeshPatch& m) {
+                return std::size_t(m.first) <= fb && fb < std::size_t(m.first + m.count);
+            });
+            t.bOpen[q] = std::ranges::find(b.openPatches, pit->name) != b.openPatches.end() ? 2 : 1;
+        }
     }
     t.first.assign(nI, 0);
     for (std::size_t c = 0; c < nC; ++c)
@@ -109,22 +141,140 @@ FvLowMachTables buildFvLowMachTables(const FaceMesh& fm, const FvLowMachBcs& b, 
     return t;
 }
 
-std::expected<FaceMesh, std::string> fvLowMachBox(const Grid& g)
+std::expected<int, std::string> fvLowMachRows(const FaceMesh& fm, const std::string& patch, FvIncompSetup& s,
+                                              FvLowMachTables& t, double prGas,
+                                              const std::function<FvLmRow(std::size_t q)>& row)
+{
+    const auto pit = std::ranges::find_if(fm.patches, [&](const MeshPatch& m) { return m.name == patch; });
+    if (pit == fm.patches.end()) return bad(std::format("the burner's inflow patch `{}` is not in the mesh", patch));
+    const std::size_t nB = std::size_t(s.nB);
+    int n = 0;
+    for (std::size_t q = 0; q < nB; ++q) {
+        const std::size_t fb = std::size_t(s.bFace[q]);
+        if (fb < std::size_t(pit->first) || fb >= std::size_t(pit->first + pit->count)) continue;
+        if (s.bCode[q] != std::uint8_t(FvIncompFaceBc::Inflow))
+            return bad(std::format("patch.{}: the burner's rows need type = \"inflow\"", patch));
+        double e[3], mag = 0;
+        for (std::size_t k = 0; k < 3; ++k) {
+            e[k] = s.bU[k * nB + q];
+            mag += e[k] * e[k];
+        }
+        mag = std::sqrt(mag);
+        if (!(mag > 0)) return bad(std::format("patch.{}: a zero inflow velocity has no direction for the rows", patch));
+        const FvLmRow r = row(q);
+        for (std::size_t k = 0; k < 3; ++k) {
+            e[k] /= mag;
+            s.bU[k * nB + q] = r.m * r.t / prGas * e[k];
+            t.rUb[k * nB + q] = r.m * e[k];
+        }
+        s.bT[q] = r.t;
+        for (std::size_t k = 0; k < std::size_t(kFvLmMaxY); ++k) t.bY[k][q] = r.y[k];
+        ++n;
+    }
+    if (n == 0) return bad(std::format("patch.{}: no faces", patch));
+    return n;
+}
+
+std::expected<FaceMesh, std::string> fvLowMachBox(const Grid& g, bool openY, std::span<const std::uint8_t> solid)
 {
     const FoamPatchType zt = g.nz == 1 ? FoamPatchType::Empty : FoamPatchType::Cyclic;
+    const FoamPatchType yt = openY ? FoamPatchType::Patch : FoamPatchType::Cyclic;
     const StructuredSpec ss{.lo = {0, 0, 0},
                             .hi = {g.nx - 1, g.ny - 1, g.nz - 1},
                             .name = {"xlo", "xhi", "ylo", "yhi", "back", "front"},
-                            .type = {FoamPatchType::Patch, FoamPatchType::Patch, FoamPatchType::Cyclic,
-                                     FoamPatchType::Cyclic, zt, zt}};
-    return FaceMesh::fromCurvMesh(CurvMesh::uniform(g), ss, CellOrder::Morton);
+                            .type = {FoamPatchType::Patch, FoamPatchType::Patch, yt, yt, zt, zt}};
+    if (solid.empty()) return FaceMesh::fromCurvMesh(CurvMesh::uniform(g), ss, CellOrder::Morton);
+    if (solid.size() != g.size()) return std::unexpected("fv low-Mach box: the solid map does not match the grid");
+    auto pm = FaceMesh::polyOf(CurvMesh::uniform(g), ss);
+    if (!pm) return std::unexpected(pm.error());
+    // polyOf's cells are Grid::idx. Keep the fluid cells (ascending: owner < neighbour
+    // survives); a fluid/solid face becomes a `rim` face owned by its fluid cell (node
+    // order reversed when the fluid cell was the neighbour: S points out of the fluid);
+    // faces of solid cells only go. Patches keep their order, `rim` last.
+    const std::size_t nCell = g.size();
+    std::vector<std::int32_t> fluid(nCell, -1), cellOf;
+    for (std::size_t c = 0; c < nCell; ++c)
+        if (!solid[c]) {
+            fluid[c] = std::int32_t(cellOf.size());
+            cellOf.push_back(std::int32_t(c));
+        }
+    if (cellOf.empty()) return std::unexpected("fv low-Mach box: every cell is solid");
+    const PolyMesh& src = *pm;
+    PolyMesh out;
+    out.px = src.px;
+    out.py = src.py;
+    out.pz = src.pz;
+    out.faceStart.push_back(0);
+    std::vector<std::int32_t> rimNodes, rimStart{0}, rimOwner;
+    auto nodesOf = [&](std::int64_t f) {
+        const std::size_t a = std::size_t(src.faceStart[std::size_t(f)]), e = std::size_t(src.faceStart[std::size_t(f) + 1]);
+        return std::span<const std::int32_t>(src.faceNodes.data() + a, e - a);
+    };
+    auto put = [&](std::span<const std::int32_t> nd, std::int32_t own) {
+        out.faceNodes.insert(out.faceNodes.end(), nd.begin(), nd.end());
+        out.faceStart.push_back(std::int32_t(out.faceNodes.size()));
+        out.owner.push_back(own);
+    };
+    const std::int64_t nInt = src.man.nInternalFaces;
+    for (std::int64_t f = 0; f < nInt; ++f) {
+        const std::int32_t o = fluid[std::size_t(src.owner[std::size_t(f)])],
+                           n = fluid[std::size_t(src.neighbour[std::size_t(f)])];
+        if (o >= 0 && n >= 0) {
+            put(nodesOf(f), o);
+            out.neighbour.push_back(n);
+        } else if (o >= 0 || n >= 0) {
+            const auto nd = nodesOf(f);
+            if (o >= 0) {
+                rimNodes.insert(rimNodes.end(), nd.begin(), nd.end());
+            } else {
+                rimNodes.push_back(nd[0]);
+                rimNodes.insert(rimNodes.end(), nd.rbegin(), nd.rend() - 1);
+            }
+            rimStart.push_back(std::int32_t(rimNodes.size()));
+            rimOwner.push_back(o >= 0 ? o : n);
+        }
+    }
+    out.man = src.man;
+    out.man.nInternalFaces = std::int64_t(out.neighbour.size());
+    out.man.patches.clear();
+    for (const FoamPatch& fp : src.man.patches) {
+        if (fp.type == FoamPatchType::Cyclic)
+            for (std::int64_t f = fp.startFace; f < fp.startFace + fp.nFaces; ++f)
+                if (solid[std::size_t(src.owner[std::size_t(f)])])
+                    return std::unexpected("fv low-Mach box: a solid cell on a cyclic face (the tube needs open "
+                                           "laterals)");
+        FoamPatch np = fp;
+        np.startFace = std::int64_t(out.owner.size());
+        for (std::int64_t f = fp.startFace; f < fp.startFace + fp.nFaces; ++f) {
+            const std::int32_t o = fluid[std::size_t(src.owner[std::size_t(f)])];
+            if (o >= 0) put(nodesOf(f), o);
+        }
+        np.nFaces = std::int64_t(out.owner.size()) - np.startFace;
+        out.man.patches.push_back(std::move(np));
+    }
+    FoamPatch rim{.name = "rim", .type = FoamPatchType::Wall, .startFace = std::int64_t(out.owner.size())};
+    for (std::size_t q = 0; q + 1 < rimStart.size(); ++q)
+        put(std::span<const std::int32_t>(rimNodes.data() + rimStart[q], std::size_t(rimStart[q + 1] - rimStart[q])),
+            rimOwner[q]);
+    rim.nFaces = std::int64_t(out.owner.size()) - rim.startFace;
+    out.man.patches.push_back(std::move(rim));
+    out.man.nCells = std::int64_t(cellOf.size());
+    out.man.nFaces = std::int64_t(out.owner.size());
+    auto fm = FaceMesh::fromPolyMesh(out, CellOrder::Morton);
+    if (!fm) return std::unexpected(fm.error());
+    for (auto& c : fm->srcCell) c = cellOf[std::size_t(c)];
+    return fm;
 }
 
-FvBcSpec fvLowMachBoxBc()
+FvBcSpec fvLowMachBoxBc(bool openY, double ambT, std::array<double, kFvLmMaxY> ambY)
 {
     FvBcSpec spec;
     spec.patches = {{.name = "xlo", .kind = FvPatchKind::Inflow, .hasY = true, .y = {1, 0, 0, 0}},
                     {.name = "xhi", .kind = FvPatchKind::Outflow}};
+    if (openY)
+        for (const char* n : {"ylo", "yhi"})
+            spec.patches.push_back(
+                {.name = n, .kind = FvPatchKind::Open, .tIn = ambT, .hasY = true, .y = {ambY[0], ambY[1], 0, 0}});
     return spec;
 }
 
@@ -147,6 +297,17 @@ FvLowMachIC fvLowMachFlameIC(const FaceMesh& fm, const std::array<double, 3>& di
         for (std::size_t k = 0; k < 3; ++k) ic.ru[k * nC + c] = m * dir[k];
     }
     return ic;
+}
+
+std::expected<void, std::string> fvLowMachTfles(const FaceMesh& fm, FvLowMachTables& t)
+{
+    // The walk needs the active flags only: AlongD, alpha 1 (the FV path's pinned scheme).
+    auto geom = fvFaceGeom(fm, FvFaceGradRule::AlongD, 1.0);
+    if (!geom) return std::unexpected(geom.error());
+    auto w = fvTflesWalk(fm, *geom);
+    if (!w) return std::unexpected(w.error());
+    t.walk = std::move(*w);
+    return {};
 }
 
 } // namespace dns

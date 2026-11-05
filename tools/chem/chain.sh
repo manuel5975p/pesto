@@ -7,7 +7,10 @@
 # Job 1 runs `build/dns flame ARGS --out PREFIX --wall-limit W`; jobs 2..N add
 # `--restart PREFIX` (with --resume, job 1 does too: continue a chain that
 # stopped). ARGS must carry --checkpoint-dt (the wall limit stops only at a
-# checkpoint) and the run's --tt. Each job goes through
+# checkpoint) and the run's --tt. Every flame route checkpoints: the structured
+# solvers and the FV ones (--solver fv, --polymesh DIR --bc FILE: keep the mesh
+# and the --bc file unchanged over the chain, a restart compares their
+# content). Each job goes through
 # `build/simjob submit --gpu -t T -m M --wait`. Stops on the first rc != 0 or
 # when PREFIX.json says "complete": true. Run it through run_in_background.
 #

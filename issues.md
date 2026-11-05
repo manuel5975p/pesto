@@ -713,8 +713,8 @@ Measured gfx1100 via simjob, 2026-10-28.
     FP32 coupling-function walk reaches the rate (d ln S/dZ = −7.3 at φ
     1.3: 1D jet −2.3e-3 vs the uncorrected step at 30 cells, Z up to
     1 + 4.6e-4).
-74. **Checkpoint / restart built on `runFlame` only; its byte rule rests on
-    one struct** (masterplan real_bunsen S2, 2026-10-31, docs/chem.md
+74. **Checkpoint / restart built on `runFlame`, `runLowMach` and the FV flame
+    runners (M5); its byte rule rests on one struct per runner** (masterplan real_bunsen S2, 2026-10-31, docs/chem.md
     "Checkpoint and restart"). `--checkpoint-dt` / `--wall-limit` /
     `--restart` + `tools/chem/chain.sh`; `gpu_restart_flame` proves the
     byte rule on premixed 1D (+ junk past a checkpoint), `--equivalence`,
@@ -734,6 +734,23 @@ Measured gfx1100 via simjob, 2026-10-28.
     predicts the next interval from the LAST interval's wall time only
     (an interval that slows down, e.g. frames starting at `--frame-start`,
     can still overrun the simjob cap: keep the interval well under T − W).
+    **M5 (2026-11-03): built on the FV flame routes too** (`runFvComp`,
+    `runFvLowMach`; docs/chem.md "Checkpoint and restart"). Before M5 the FV
+    allow-list refused the three flags by name (`--solver: --checkpoint-dt is
+    not built on the FV flame path`); the lift covers every FV flame route,
+    each proven by `gpu_restart_fv` / `gpu_restart_fvlm` (chained = straight
+    byte for byte, last checkpoints equal, teeth). The mesh is in the
+    identity (`mesh` record: polyMesh files + `--bc` content). OPEN: (g) the
+    FV loop structs (`FvCompLoop`, `FvLowMachLoop`) carry K12's risk the same
+    way: a new FV stats column or mode needs a case in `gpu_restart_fv`. (h)
+    The low-Mach FV loop's equal steps to `--tt` make its trajectory depend on
+    `--tt`: a restart that GROWS `--tt` continues correctly but is not the
+    straight run to the larger `--tt` (no "grow" gate there; the compressible
+    FV loop clips only its last step, as runFlame). (i) The mesh identity
+    hashes every regular file of the polyMesh directory (not subdirectories,
+    not `cellZones` semantics): a harmless edit (a comment) is exit 3 too, by
+    design. (j) `dns flow` on the FV path (and every non-flame runner) has no
+    checkpoint.
 75. **Low-Mach pressure solve (masterplan real_bunsen S3, docs/la.md
     "Separable Poisson"): the FP32 PCG's TRUE residual floors at 1.3e-5 –
     5e-5 of |b|, and the tube's projection costs ~2x the plan's budget.**
@@ -1405,6 +1422,11 @@ Measured gfx1100 via simjob, 2026-10-28, defaults (4 cells/δ_th) and the
     (`runs/` is git-ignored); its checkMesh log was an 8-rank run whose face
     count (2 622 899) includes processor faces — the reconstructed mesh has
     2 600 459, which the gate pins.
+    OPEN (found M5b, 2026-11-03, not investigated): `FaceMesh::polyOf` of a
+    SHEARED CurvMesh with a y-cyclic wrap writes broken top-row cells
+    (skewness 103, non-orthogonality 89 deg). `gpu_restart_fv`'s poly case
+    writes its sheared mesh in C++ (port of `tools/chem/fv_flame_mesh.py`)
+    instead. Suspect: the wrap's node identification under shear.
     FIXED (verifier P2): the `FvRef` diffusive dt took `max(1, γ/Pr)`, which
     misses momentum's 4/3 normal stress: a longitudinal u checkerboard on
     100:1 cells grew ×1.78e6 in 60 steps at Pr 2 and 7 (λΔt −2.67). Now
@@ -1703,8 +1725,8 @@ Measured gfx1100 via simjob, 2026-10-28, defaults (4 cells/δ_th) and the
         1.001623, FP64 1.000437). Every quoted structured S_L at M 0.01 carries it.
         `--compensated` matches FP64 to 6 digits on FV; the structured flame has no such
         mode. USER decision: compensate the structured species path?
-    (c) Not built, rejected by name: bunsen, candle, chamber, wick, `--equivalence`,
-        species LES, TFLES, `--turb`, checkpoints, the jet's `--pulse`. No bluff-body or
+    (c) Not built, rejected by name: bunsen, candle, chamber, wick,
+        `--turb` (`--equivalence`: 78e), the jet's `--pulse` (checkpoints: built, M5, item 74). Species LES and TFLES: 78d. No bluff-body or
         wall-anchored flame on the FV path has been run: a wall's zero-gradient Y and
         adiabatic T are unit-tested only (S1, S5). Diffusion C1: item 78c.
     (d) `Far` + `Outflow` is an acoustic half-pipe: fine for a planar flame. Unproven on a
@@ -1724,10 +1746,52 @@ Measured gfx1100 via simjob, 2026-10-28, defaults (4 cells/δ_th) and the
         wavy show nothing. Reproduce: `tools/chem/fv_jet_ladder.py --cells 4.5 --tt 160
         --meshes shear`. Tip -0.700, -0.342 (order 1.77) stand for 2, 3 cells/l.
     (c) Inflow rows pin a FACE, structured a CELL: tip offset first order, +0.725, +0.490,
-        +0.352 vs etaIn 1000, limit +0.05 by a line through 3 rungs. No two-reactant S8:
-        interior rounding against `kSpeciesStage2` not built.
+        +0.352 vs etaIn 1000, limit +0.05 by a line through 3 rungs. The two-reactant
+        interior is rounding-equal to `kSpeciesStage2` on a periodic box (78e R1); not on the jet.
     (d) Not measured (3 levels, 295 s): 6 cells/l: `tools/chem/fv_jet_ladder.py --cells 6
         --tt 160 --meshes rot`.
+
+78d. **Species LES and TFLES on the FV family (`dns flame --solver fv | --polymesh --bc`
+    with `--les --sgs`, `--tfles`, docs/fvcomp.md "Species LES and TFLES").** Premixed C0:
+    eddy species flux, thickened flame (uniform / dynamic sensor, Charlette), the sensor's
+    filter walking faces. FvRef 1e-13 every pass; FV vs structured on one periodic 3D box
+    rounding over 300 steps; rotated = planar, sheared order 2. Open:
+    (a) **Rotated 30 deg at 3.75 cells/delta_th: S_L -1.08e-5** (7.5, 15: < 1e-9). The
+        uniform sensor gives -9.2e-6: not the walk. Cause not isolated (the coarsest h of
+        any FV flame row).
+    (b) X1's dynamic-sensor rows sit 1.3-2.1 x their own FP32 distance (uniform, LES:
+        0.6-1.2 x); inside the 3 x bound, excess not isolated.
+    (c) Not built, rejected by name: TFLES of two reactants (`FvRef::make`, the
+        inventory); two-reactant LES is solver-live since MC (`gpu_fv_matrix`, Z == tracer),
+        spelled on the CLI by `--equivalence` (78e); the jet stays 2D only;
+        `--turb` on the FV route, LES on a 2D mesh (box:
+        `--nz >= 8`; polyMesh: exit 3 at the run), a thickened boundary face. Unproven:
+        a turbulent FV LES flame (no synthetic inflow on the route), TFLES on a wall-
+        bounded mesh (edge layers and the walk's stop are unit-gated only, L1 cyl2d).
+    (d) Not measured: a 30-cell rung of the TFLES ladder (`tools/chem/fv_flame_ladder.py
+        --cells 30 --tt 28 --tfles 2 --box-up 16 --box-down 12 --meshes rot,shear`).
+    (e) FIXED (MC, `gpu_fv_matrix` (d)): the sensor walk took the first of exactly tied
+        sub-faces in CSR order, so on split faces it depended on the cell numbering
+        (box_refined ColourMajor vs Source, TFLES dynamic: 2.3e-3 of the state in 3 steps).
+        Ties go to the lowest srcFace. Uniform meshes have no tie: unchanged there.
+
+78e. **Air-methane on the FV family (`dns flame --equivalence --solver fv | --polymesh --bc`,
+    docs/fvcomp.md "Air-methane", masterplan_multiphysics M2).** C2 = C1's stage, C2b =
+    `FvChem::law` (`kFvSpCellPhi`, `ChemJ2Phi`), module `C2b` of `dns/fvmodules`; LES live,
+    TFLES refused. FP64 S_L order 2 about the M^2 offset, Z exact; rotated = planar, sheared
+    order 1.8-2; interior rounding vs `kSpeciesStage2` (R1). Open:
+    (a) **R1 at the flame's A diverges in all three solvers** (the tanh slab is not a flame:
+        its preheat zone explodes at constant volume, T 2 Tb, Y_O < 0, chaotic); the gate runs
+        A / 10. A gate on an equilibrium IC (the oracle profile) at the real A not built.
+    (b) **Structured vs FV at 30 cells: 0.996512 vs FV FP64 1.000123.** The structured FP32
+        Z walk through C (docs/chem.md "Model C2b"); FV FP32 reads the same 0.996539, FP64 and
+        `--compensated` do not walk. Plain FP32 C2b at >= 30 cells is walk-limited on both.
+    (c) Not built: `--turb` on the route (exit 2), a turbulent LES flame, TFLES of two
+        reactants, `--gravity` on the flame (open patches), a lean `--mix-phi` on FV and a
+        wavy mesh (not measured), the Bunsen burner (compressible: structured only too).
+    (d) Not measured (3 levels): a 60-cell rung (`tools/chem/fv_flame_ladder.py --cells 60
+        --tt 20 --dth 4.70964 --meshes rot,shear,wavy --extra "--equivalence 1.3 --expansion
+        6.88 --visc sutherland --tinf 298"`).
 
 79. **Time-accurate incompressible FV (`--solver fv`, `--bc`, docs/fvincomp.md).**
     Built: `gpu/fv_incomp`, `gpu/runner_fvincomp`, `dns/fvincomp`; DNS, LES;
@@ -1858,11 +1922,50 @@ Measured gfx1100 via simjob, 2026-10-28, defaults (4 cells/δ_th) and the
         a per-patch inflow turbulence value (one freestream phi for every open
         patch), Spalding-style y+ columns (stats carry mutMax, floorHits).
 
-85. **Species, RANS, gravity on `gpu/fv_comp` are mutually refused** (`docs/fvcomp.md`
-    "Combinations", `comboGate`). Built apart; no gate composes them. Refused: every
-    pair, species or gravity under `--steady` (`localDt`: `kFvChem`, `kFvGravity` take
-    the bare cr), gravity + LES. Open: each pair is a build with its own test, not a
-    flag. FP32 RANS on the channel fixed point: 84(d).
+85. **The compressible FV modules compose through one inventory** (`dns/fvmodules`,
+    `docs/fvcomp.md` "Combinations", `gpu_fv_matrix`, `gpu_fv_matrix_phys`). Live since MC:
+    species + gravity, gravity + LES, gravity + bodyForce, species + bodyForce, two
+    reactants + LES (solver level; physics numbers in the docs table). Open:
+    (a) Refused by physics, each needs a model, not a gate: species + RANS (mean
+        reaction-rate closure), RANS + gravity (buoyancy production), LES + `--steady`.
+        By code: species or gravity under LTS (`kFvChem`, `kFvGravity` take the bare cr;
+        a `Lts` instantiation each + a fixed-point-vs-lts gate would turn them on).
+    (b) No CLI spelling for most live pairs: `dns conv` has no `--les`, nothing spells
+        `bodyForce` with gravity, the FV jet is 2D (`--nz 1`) so its LES is unreachable.
+        The case surface (masterplan M6) is the route; until then the solver-live pairs
+        are gated at the solver only.
+    (c) `--les` + `--steady` on the compressible polyMesh route was ACCEPTED before MC (an
+        LTS LES run, labelled DNS); now exit 2 by the inventory's text. The structured-mesh
+        FV route already refused it. No pinned case used it.
+    (d) The matrix is pairs (closed under requirements), not triples: e.g. LES + gravity
+        + bodyForce is live by composition and ungated as a triple. Precision runs inside
+        every cell; steady LTS cells skip the FvRef march (FvRef has no LTS) and mass.
+    (e) The TFLES dynamic sensor's T-gate is a switch: an exactly tied state flips under
+        rounding (tiedSensor measures it per mesh); the matrix runs untied states.
+    FP32 RANS on the channel fixed point: 84(d).
+
+86. **The candle on compressible FV** (`docs/fvcomp.md` "Hydrostatic ambient",
+    `gpu_fv_candle`). Gravity x open patches and gravity x C1 live through the ambient's
+    per-face rows. Open:
+    (a) FV vs structured tip -9.5% / -10.2% at 6 / 8 cells/l against etaIn 1000 (FV h-flat
+        7.133). The FV fixed inflow face carries 5.4-5.9% less fuel than the pinned structured
+        cell (W 1: 8 cells across the slot, tanh edges 4 cells); Roper's Q^(4/3) explains
+        -7.4%. The ~3% residual is not attributed (top: Far row vs NSCBC + sink + lateral relax
+        blend; structured flaps below 8 cells/l, so no h trend). Against the structured
+        DEFAULT (etaIn 100) the gap is the known inflow overshoot: 39% more fuel at W 1
+        (10.19 vs 7.13).
+    (b) The jet's fixed-p Outflow as a candle top: an organ pipe the flame sustains (p/p0
+        +-0.7%, backflow -20 U, Y_O 3e-5 over Y_O2 in ~4000 cells counted as hits, extinction
+        at 4 cells/l). The box candle uses a Far top; a polyMesh `type = "outflow"` top is
+        still accepted under gravity (its rows are the ambient's) and rings: not refused, not
+        recommended. The Y_O overshoot itself (virtual-upwind MC is not strictly bounded in
+        multi-D) is counted, not fixed.
+    (c) Not built: the wick (`--wick`: an immersed ghost wall, no FaceMesh twin), a
+        stratified (non-isothermal) ambient column, the low-Mach candle, `--les` on the candle,
+        the structured candle's `--pulse`. `dns conv` keeps its closed layer by decision.
+    (d) Plain FP32 quiescent candle max|u| 6.3e-4 U (Far top; 1.2e-3 with the Outflow top) =
+        p's FP32 rounding (p = T0 = 28571 at M 0.005); compensated 6.5e-5, FP64 8e-13. Not a
+        boundary error.
 
 ### Low-Mach FV (`dns flame --physics lowmach --solver fv | --polymesh`, docs/fvincomp.md "Low-Mach")
 
@@ -1881,9 +1984,157 @@ LF2. **Explicit diffusion on a non-orthogonal mesh.** The rule's sum is `|S|^2/(
 LF3. **The FV step costs 6 to 14x the structured one** (512 x 4: 1.8 ms FP32, 4.3 ms FP64 at tol
     1e-3, vs 0.31 to 0.44). Launch-bound. Nothing tuned: FP32's 3 iterations a step is the floor stop.
 
-LF4. **Not built, rejected by name**: the burner, open laterals, `--rim`, gravity, two reactants,
-    LES, TFLES, turbulence, `--dt-rule cell`, checkpoints, a closed box. Backflow at an outflow is
-    zero gradient both ways, no gate drives it.
+LF4. **Not built, rejected by name**: the 3D slot and the round nozzle, the burner's
+    `--profile-dt`, turbulence on a polyMesh or the burner (M5c: the planar box is built), a closed box, gravity on the planar flame (checkpoints: built, M5, item 74),
+    `--rim` on a polyMesh. A plain outflow (no open patch in the run) keeps its backflow zero
+    gradient both ways, no gate drives it. Built (M3, 2026-11-03): two reactants C2 / C2b
+    (rounding vs structured, docs/fvincomp.md table), the 2D slot burner (per-face rows,
+    `--dt-rule cell`), LF5; open faces, gravity, the rim (steps 3-5): LF6-LF8. LES and TFLES (M4, both
+    low-Mach solvers): LF9-LF11.
+
+LF5. **FV vs structured burner is a scheme gap, not rounding** (G2a and rich2d at 4, 6, 8 cells,
+    docs/fvincomp.md table): collocated vs MAC momentum (L8) and the cell velocity's definition
+    (FV (rho u)/rho, structured the mean of the face m/rho_f) differ. Every cone number's gap
+    shrinks from 6 to 8 cells (order 0.8 to 2.5; G2a xTip +3.2e-3, +1.5e-3, +1.1e-3), FV(FP64) at 6
+    cells moves it < 1e-4. Not asymptotic: G2a mFlank -1.93e-3, -2.12e-3, -1.34e-3 (grows 4 to 6),
+    rich2d preFrac non-monotone; 3 levels by decision, no limit claimed. The FV conv dt rate is the
+    face MEAN per axis, LmConvRate the larger face: binary dt sequences differ (stated). The FV
+    burner step is 3.4 to 9.7x the structured one (the .json ms/step, startup included: G2a 4 / 6
+    / 8 cells FV32 6.2 / 8.1 / 7.7 vs 1.3 / 2.4 / 0.8 ms; rich2d 8 cells 13.7 vs 3.4; FV PCG ~40
+    iterations a step at FP32 tol 1e-5). Not tuned.
+    The polyMesh burner ran (`--wavy 2`, G2a 6 cells: xTip +1.2e-3 vs the box); one rung only.
+
+LF6. **FV open faces vs structured: the OUTFLOW PARTITION plateaus without gravity** (G2a
+    `--laterals open`, 4/6/8 cells, docs/fvincomp.md table): the cone gap shrinks (xTip +3.9e-3,
+    +2.5e-3, +2.2e-3), the split of the outflow between x-hi and the laterals does not (mdotLat
+    -9.2e-2, -1.03e-1, -1.15e-1 of 37, 0.25-0.31%, grows); with `--gravity 0.0964` it shrinks at
+    order 1.2-1.5 (+0.57, +0.35, +0.23). uLatMax (+1.9e-2, 1%) is flat in both: a pointwise
+    extreme. The API ladder (O4, a transient to t 0.25) shows the same quantity: lateral outflow
+    FV - MAC -1.4e-2, -2.0e-2, -1.1e-2 of 0.13-0.21, no smaller without the corner columns
+    (+2.2e-2, -2.7e-2, -1.6e-2): the corners alone are not it. Cause NOT isolated. Structural
+    differences left: an open face's predicted flux is
+    its CELL's (phi* = S . (rho u)*_P, zeroth order) where the MAC face integrates its own
+    momentum; the corner cells where an open face meets x-hi (two p = 0 faces); the normal
+    momentum flux phi_b (u_P . n) vs m_b^2/rho_f. Fixed on the way (measured): species upwinded
+    by the stage input's flux sign (Y_O -2.6e-5), traction-free tau_nn = 0 instead of the
+    structured zero normal-stress gradient (API l1 distance grew with h). Not measured: the
+    clearance-6 rich2d open slot (S6's [150, 200] window is past 295 s), Bickley on FV.
+
+LF7. **FV gravity: hydrostatic rest exact on the box, a residual on non-orthogonal meshes**
+    (G2: |rho u(g) - rho u(0)| of the free-fall scale 4.3e-16 box, 5.2e-5 sheared 21 deg, 3.1e-6
+    random 0.3 h; gated at gpu/lowmach's 1e-4): the deferred `kg` and the walls' image `dpB`
+    balance the face force only to the correction's order. The plume similarity gate
+    (gpu_lowmach_plume, 192 x 128 to t 450) and a gravity run on a polyMesh read from disk: not
+    measured (API meshes in memory only).
+
+LF8. **FV rim = the structured staircase on the same cells; its corners are scheme numbers**
+    (R1: the max FV - MAC rho u sits at the tube's inflow corner and stays 9.8e-2 of 2.9 at 3
+    levels, the lid-corner case; 0.5 off the corners and l1 shrink at order ~1.1). The 2D slot's
+    lips are grid-aligned, so the staircase IS the body-fitted wall; a curved tube (the round
+    nozzle, a polyMesh tube generator) is not built. Anchor case (rich slot U 6, open 6, T_w 1):
+    anchored at 4, 6, 8 cells, the base on the structured row or one row off (6 cells until t
+    39.5), qRim -0.57%, -0.36%, -0.22%. FV cost there: 8 cells 268 s vs 92 s structured (the
+    whole run, 2.9x; FV PCG ~85 iterations a step).
+
+LF9. **Low-Mach Smagorinsky: FV vs structured is a scheme gap of mu_t, not rounding** (M4 X2,
+    docs/chem.md "Low-Mach LES"): mu_t differences the cell velocity, (rho u)/rho on FV, the mean
+    of the face m/rho_f on MAC. Order 2 (1.2e-2, 3.1e-3, 7.7e-4 of max mu_t at h, h/2, h/4); the
+    1D march's rho gap 1.0e-6, 7.2e-8, 2.4e-8 reaches the L7 rounding at h/4. TFLES is rounding
+    (X1, the T and Y algebra never reads u); sigma on a planar flame is 0 in both. The structured
+    gradient's end cells take themselves as the missing neighbour, FV's least-squares reads the
+    boundary value: stated, not unified.
+
+LF10. **The laminar flame's LES shift of S_L is small and not monotone in h** (Smagorinsky 0.17,
+    3D planar, 4/6/8 cells: +1.8e-4, +8.1e-4, +4.2e-4 structured; FV +1.9e-4, +8.4e-4 at 4/6, the
+    solvers agree to 3e-5): the DNS S_L itself moves non-monotonically there (1.00065, 0.99252,
+    0.99484). No order claimed; 3 levels. FV sigma on the planar flame is the DNS to 7 digits but
+    not bitwise in FP32 on the Morton mesh (mutMax 9.4e-9: D_sigma of row-to-row rounding); the
+    device-level gate (L1, 64 x 4 x 4) is bitwise.
+
+LF11. **Low-Mach LES not measured / not built**: a turbulent low-Mach LES-vs-DNS statistic beyond M5c5's single grid,
+    the round-nozzle 3D Bunsen under LES (144 x
+    144 cross-section past 295 s); FV TFLES dynamic at 8 cells and FV 3D LES at 8 cells (past
+    295 s). Refused by decision (dns/lmmodules): TFLES with C2/C2b, with open laterals, LES and
+    TFLES with the rim. The 3D slot Bunsen is z-invariant, so sigma is exactly 0 there
+    (bitwise the DNS): only Smagorinsky moves it (xTip -0.13% at 4 cells).
+
+### Turbulence on the FV and low-Mach routes (`--turb`, M5c; docs/fvcomp.md "Turbulence", docs/chem.md "Low-Mach turbulence")
+
+M5c1. **`--turb` on a polyMesh is not built** (exit 2 by name): the point evaluation
+    (`dns/fvturb`) is mesh-generic, but the box's periods (L_y, L_z), its lattice
+    truncation (n_d) and the frame (x along the flow from the inflow plane) are the flags'
+    box. A polyMesh needs them from the mesh (its cyclic periods, a slab width as h, a
+    lateral basis): undecided, no case asks for it yet.
+
+M5c2. **The turbulent inflow is a stated gap between the compressible solvers, never
+    measured on its own**: structured = the NSCBC inflow CELL relaxed to the box's FP32 lerp
+    at x = h/2 (etaIn 100) behind a 16-cell sink band; FV = the Far FACE set to the exact sum
+    at x = 0, no sink. The physics window (t in [0.5, 2]) is the IC's turbulence (the inflow's
+    reaches the flame after ~13 flame times, past a 295 s job at 6 and 8 cells). A
+    swept-inflow statistic (u' at a fixed distance downstream of the inflow, FV vs structured)
+    is not measured. Measured in that window (u'/S_L 4, l_t 2 delta_th, M 0.02): FV - structured
+    S_c -0.22%, -0.84%, -1.14% and area -0.05%, -0.18%, -0.28% at 4, 6, 8 cells/delta_th: NOT
+    shrinking; the laminar flame differs -0.64%, -0.47%, -0.43% in the same window (the M 0.02
+    start transient through NSCBC + sink vs Far faces); `--compensated` moves FV by < 1.1e-4.
+    The low-Mach pair (same face conditions on both solvers) agrees to 6.7e-4, 3.4e-4, 2.6e-4 on
+    the same case, so the turbulence path itself is consistent; the compressible cause is not
+    isolated further (candidates: the 16-cell sink bands, the NSCBC inflow cell, the acoustic
+    start).
+
+M5c3. **Low-Mach `--turb` with checkpoints is refused** (exit 2): the loop carries the sweep
+    X in its checkpoint fields (`LowMachLoop::sweep` when turb), the FV low-Mach runner has
+    no checkpoint at all; no restart byte gate was run for the structured one. The
+    compressible structured --turb restart (gpu_restart_flame) is untouched.
+
+M5c4. **Low-Mach FV vs MAC under turbulence is a scheme gap, order 2** (L2: 7.7e-4, 2.0e-4
+    of rho at 4, 8 cells/delta_th, t 0.4): collocated vs MAC velocity, and the tangential
+    inflow rows sit on the structured y / z edges but on the FV face centres. Two levels
+    (the third, 12 cells, 72^2 x ~180, not run in the gate). On S_c (docs/chem.md table, u'/S_L
+    4) the gap is 6.7e-4, 3.4e-4, 2.6e-4 at 4, 6, 8 cells: below the grid change of S_c.
+
+M5c5. **Physics numbers for the M5 pairs beyond C0 DNS are single-grid** (4 cells,
+    docs/fvcomp.md / docs/chem.md tables): LES smag / sigma, TFLES, Charlette, C2b. C2b has
+    no structured compressible partner (two-reactant --turb is not built there): its
+    cross-solver partner is the low-Mach route (compressible FV M 0.02 vs low-Mach FV and MAC).
+
+M5c6. **Found, not chased: the compressible laminar TFLES flame differs 10% between the
+    structured and the FV solver in the 3D M 0.02 start window** (`--tfles 2`, 4 cells/delta_th,
+    8^2, t in [0.5, 2]: S_c 1.13224 structured vs 1.01787 FV; the low-Mach structured 1.10592).
+    No `--turb` in it. The FV vs structured TFLES gates (X1, gpu_fv_flame_les) are a periodic
+    box and a 1D flame: none covers this open 3D start. The turbulent pairs are read as S_c /
+    laminar S_c (1.0222 vs 1.0238) and the flame surface (1.4e-4).
+
+M5c7. **Low-Mach LES under turbulence: FV - MAC S_c -9.0e-3 (Smagorinsky), -5.5e-3 (sigma) at 4
+    cells**, the LF9 cell-velocity gap of mu_t, larger with resolved turbulence than on the
+    planar flame (where sigma is 0). One grid; not laddered.
+
+### Incompressible FV combinations (`dns/fvimodules`, docs/fvincomp.md "Incompressible combinations")
+
+FI1. **Species on the incompressible FV stage: refused by decision, on evidence** (C0, C1, C2b
+    refused alone, exit 2 where a flag can name them). No oracle: neither structured
+    incompressible solver (gpu/incomp MAC, gpu/boussinesq) carries a scalar beyond T, so the
+    generic gate 5 has no counterpart. No consumer: every flame model is calibrated by its
+    heat release (S_L, T_ad), which constant density removes; the variable-density flame on
+    the same mesh view is DeviceFvLowMach. A passive tracer already exists: the T row at
+    betaG 0 (gpu_fvi_matrix (a): momentum bitwise the run without it; conv T energy 0 to
+    rounding). Reopen if a constant-density mixing case (a Z field, a scalar plume) gets a
+    reference: then a second T row (kFaceT/kBndT/kGatherT, a per-patch value table) with Z ==
+    tracer, no new kernel shape.
+
+FI2. **RANS on the incompressible FV stage: refused** (SA, SST refused alone, `--rans` exit 2 by
+    the inventory's text). The family's RAS is simpleFoam (gpu/fv_simple + gpu/fv_ras, OpenFOAM
+    v2606 verbatim, IF-T gate 1e-9); URANS on the projection stage would restate the closures
+    with a second wall treatment. Not built, no consumer.
+
+FI3. **LES of the Boussinesq layer has no structured counterpart** (`dns conv --solver fv
+    --physics incompressible --les`): the structured conv solvers carry no SGS model, so gate
+    5 is open for LES x T and LES x gravity; their physics numbers are LES vs DNS on the same
+    FV solver (gpu_fvi_matrix_phys). FV LES vs the MAC LES (gpu/les, `dns flow` only) is two
+    MODELS, not a scheme gap: gpu/les is the gradient form div(nut grad u) with a lambda
+    fluid-fraction damping, FV the symmetric stress nut (g + g^T).S; no shared periodic route
+    exists (MAC LES runs only around a body in runner_incomp). Not measured.
+    The interior nuFlux column is resolved + molecular (no SGS heat flux); the wall columns
+    are exact (walls carry no nut_f).
 
 ## Older open items (details in CLAUDE.md)
 

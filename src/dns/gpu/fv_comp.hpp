@@ -12,7 +12,9 @@
 // summed in ascending face order in FP64, so reruns are byte-identical.
 //
 // Species (FvChem, docs/fvcomp.md "Species"): rows 5.. of the state, their own
-// kernels after the mean-flow ones, nY == 0 launches none of them.
+// kernels after the mean-flow ones, nY == 0 launches none of them. Species LES and
+// TFLES ("Species LES and TFLES"): the eddy / thickened instantiations of the species
+// face kernel, the TFLES coefficient passes at each step's start; off = none of them.
 //
 // RANS (FvCompConfig::rans, dns/fvrans.hpp, docs/fvcomp.md "RANS"): the state
 // gains rows 5.. (rho nu~ | rho k, rho omega); mu_t rides the LES slot, so the
@@ -30,14 +32,21 @@
 #include "dns/facemesh.hpp"
 #include "dns/fvprecision.hpp"
 #include "dns/fvref.hpp"
+#include "dns/gpu/run_result.hpp"
 #include "dns/sgs.hpp"
 
 #include <array>
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <vector>
+
+namespace dns {
+class Checkpoint; // dns/checkpoint.hpp
+}
 
 namespace dns::gpu {
 
@@ -60,8 +69,14 @@ struct FvCompConfig
     // wanders 0.5% (docs/fvcomp.md). Costs the two extra low-word stage writes.
     bool compensated = false;
     // Species rows and the one-step chemistry (FvRef::make's rules), nY == 0 off.
-    // Rejected with LES: no species SGS flux is built here.
+    // With LES (premixed and two reactants): + nut_f / Sc_t on every internal face, Sc_t =
+    // Pr_t = prt (docs/fvcomp.md "Species LES and TFLES").
     FvChem chem{};
+    // The thickened flame (FvConfig::tfles's rules and terms): F E, E/F, Omega from
+    // each step's input state (step(); rhs, evaluate, stableDt and speciesFields form
+    // them from the current state), held over the three stages. Empty: off, no
+    // TFLES kernel, the species kernels bit for bit.
+    std::optional<TflesSetup> tfles{};
     // RANS closure (exclusive with csLes): FvRef's rules. Pr_t = kPrandtlTurb.
     FvRansConfig rans{};
     // Constant force per volume, rhs of m + f, of E + f.u; 0 = no pass.
@@ -74,6 +89,11 @@ struct FvCompConfig
     // Acceleration vector (FvConfig::gravity, the same rules). Zero: no gravity
     // pass runs. dns conv's buoyancy: rho(T) through the EOS, no Boussinesq term.
     std::array<double, 3> gravity{};
+    // The hydrostatic ambient its open patches' rows are (FvConfig::ambient: checked, not
+    // read by a kernel; the rows are the table's).
+    std::optional<FvAmbient> ambient{};
+    // --turb (M5): FvConfig::turb (the inventory's module; the rows are setBcRows').
+    bool turb = false;
 };
 
 // Force and heat on the tallied faces, FP64 sums in ascending face order.
@@ -96,7 +116,8 @@ class DeviceFvComp
 {
 public:
     // Pre: fm outlives nothing (every table is copied). Errors (user input, exit
-    // 3 at the caller): whatever FvRef::make rejects. Errors (device): allocation.
+    // 3 at the caller): whatever FvRef::make rejects, the inventory's precision pairs
+    // (dns/fvmodules). Errors (device): allocation.
     static std::expected<DeviceFvComp, std::string> make(const FaceMesh& fm, const FvCompConfig& cfg,
                                                          int threads = 0);
 
@@ -120,8 +141,8 @@ public:
     // Local time stepping (pseudo-time, not time-accurate): every later step(dtRef)
     // advances cell c by dtRef lts[c], lts[c] = dt_c/dtRef >= 1 from stableDt's
     // per-cell bound of the current state; every stage writer takes it. Returns
-    // dtRef. Errors: stableDt's; species or gravity (their passes take the bare cr,
-    // docs/fvcomp.md "Combinations"). Never calling it keeps step() bit for bit.
+    // dtRef. Errors: stableDt's; the inventory's time-axis refusals (dns/fvmodules:
+    // species, gravity, LES). Never calling it keeps step() bit for bit.
     std::expected<double, std::string> localDt(FvDtLimits lim = {});
     // chemDt of FvRef on the current state (FP64 from the state words): k / max J,
     // +inf without a reaction. Errors: a launch failure.
@@ -139,6 +160,14 @@ public:
     std::expected<unsigned long long, std::string> floorHits() const;
     // Per-cell mu_t of the current state (0 without LES or RANS).
     std::expected<std::vector<double>, std::string> eddyViscosity();
+    // TFLES: Ebar = sum V Omega E / sum V Omega (NaN if Omega == 0), FEmax = max F E
+    // of the current state's coefficients, FP64 in ascending cell order. Errors:
+    // no TFLES, a launch failure.
+    struct TflesStats
+    {
+        double Ebar = 0, FEmax = 0;
+    };
+    std::expected<TflesStats, std::string> tflesStats();
     // u, v, w, |grad-free| primitives and the velocity gradient of the current
     // state for frames: rows rho u v w e p T, gradient [12][nC] as FvEval.
     std::expected<void, std::string> cellFields(std::array<std::vector<double>, 7>& prim,
@@ -147,6 +176,19 @@ public:
     void boost(const std::array<double, 3>& du);
     // Replace one row of the FvBc table. Pre: patch valid, kind unchanged.
     std::expected<void, std::string> setBc(int patch, const FvBc& bc);
+    // --checkpoint-dt: every word a step carries to the next, raw (F32 or F64 by
+    // precision): "state.fv.q", the compensated low words "state.fv.lo", the SST
+    // guard's count "state.fv.hits". Nothing else survives a step (eddy, TFLES and
+    // gradient fields are of the step's input state). Errors: exit 6 (download).
+    std::expected<void, RunError> save(Checkpoint& ck) const;
+    // --restart: save's records into this solver (same mesh, closure, precision);
+    // after it the next step is the checkpointed run's bit for bit. Errors: a record
+    // missing or mis-sized exit 3, an upload exit 6.
+    std::expected<void, RunError> load(const Checkpoint& ck);
+    // Replace rows first .. first + rows.size() of the FvBc table in one upload (M5: the
+    // turbulent inflow's per-face rows, rewritten between steps). Pre: the range is in
+    // the table, every kind unchanged (else an error by name, nothing written).
+    std::expected<void, std::string> setBcRows(int first, std::span<const FvBc> rows);
 
     int cells() const;
     FvPrecision precision() const;

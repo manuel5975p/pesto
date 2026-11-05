@@ -134,7 +134,7 @@ runOGrid(const Grid& g, const OGrid& og, const CompState& ic, const OGridRun& r,
         // --rotor-frame mrf on the body-fitted mesh. The real tip radius is
         // EXACT here -- the wall is a node row -- so the tip-Mach guard uses
         // it directly; omega stays quoted on the nominal D/2 like the
-        // Cartesian path (one definition, config.cpp).
+        // Cartesian path (one definition, dns/config/flow_mesh.cpp).
         const double* cs = r.rotor.shaft.data();
         const double tipR = og.rWallMax;
         const double cInf = std::sqrt(r.tr.gamma * r.pInf / r.rhoInf);

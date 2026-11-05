@@ -15,8 +15,9 @@
 // (the low-Mach runner's "state.p") without a version bump; a missing name is
 // an error by name. Standard records: "binary" (sha256 of the dns binary),
 // "solver", "case" (caseFlagsText), "grid" (nx, ny, nz, nY), "t", "steps",
-// "restarts"; "loop.*" (the runner's loop-state struct), "out.*" (the
-// RunOutput resume point), "state.*" (raw device fields).
+// "restarts"; "mesh" (the FV solvers' mesh identity, CheckpointPolicy::mesh;
+// their "grid" holds nC, nI, nB, nY); "loop.*" (the runner's loop-state
+// struct), "out.*" (the RunOutput resume point), "state.*" (raw device fields).
 #pragma once
 
 #include "dns/output.hpp"
@@ -108,6 +109,7 @@ private:
 struct CheckpointFacts
 {
     std::string binary, solver;
+    std::string mesh; // the "mesh" record; empty when absent (a structured solver)
     CaseFlags caseFlags;
     int nx = 0, ny = 0, nz = 0, nY = 0;
     double t = 0;
@@ -119,7 +121,7 @@ std::expected<CheckpointFacts, std::string> checkpointFacts(const Checkpoint&);
 void putOutputResume(Checkpoint&, const OutputResume&);
 std::expected<OutputResume, std::string> outputResume(const Checkpoint&);
 
-// What a runner needs to checkpoint and to resume (dns_main fills it).
+// What a runner needs to checkpoint and to resume (the drivers fill it, dns/drive).
 struct CheckpointPolicy
 {
     double every = 0;          // --checkpoint-dt (model time); 0 = off
@@ -129,6 +131,11 @@ struct CheckpointPolicy
     std::string prefix;        // the run's --out
     std::string binary;        // sha256 of the dns binary
     std::string caseText;      // caseFlagsText of the run
+    // The FV solvers' mesh identity (the "mesh" record, compared by text in
+    // phase 1.5): "polyMesh sha256:<hex> bc sha256:<hex>" over the polyMesh
+    // files and the --bc file, "flags" for a box the case flags define. Empty:
+    // a structured grid (no record).
+    std::string mesh;
     const Checkpoint* restart = nullptr; // --restart: the loaded checkpoint
     long restarts = 0;         // this job's restart count (ckpt's + 1)
     bool active() const { return every > 0 || restart != nullptr; }

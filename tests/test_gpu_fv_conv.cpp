@@ -104,7 +104,7 @@ void gravityOracle()
     std::printf("  C1 3 steps: device vs FvRef %.3e of %.3e\n", e, sc);
     check(e <= 1e-13 * sc, "C1 gravity march: device == FvRef to 1e-13");
 
-    // Open patches and moving walls have no hydrostatic ambient.
+    // Moving walls are refused; an open patch needs FvConfig::ambient and its rows.
     std::vector<FvBc> moved = bc;
     moved[0].uWall[0] = 0.1;
     check(!FvRef::make(fm, {.tr = tr, .bc = moved, .gravity = gv}), "C1 gravity rejects a moving wall");
@@ -112,7 +112,7 @@ void gravityOracle()
     open[0].kind = FvBcKind::Far;
     open[0].isothermal = false;
     open[0].qFar[4] = 2.5;
-    check(!FvRef::make(fm, {.tr = tr, .bc = open, .gravity = gv}), "C1 gravity rejects an open patch");
+    check(!FvRef::make(fm, {.tr = tr, .bc = open, .gravity = gv}), "C1 gravity rejects an open patch without the ambient");
 }
 
 void compensated()
@@ -140,8 +140,9 @@ void compensated()
     auto refused = orDie(DeviceFvComp::make(fm, {.tr = tr, .bc = bc, .gravity = gv}), "device");
     const auto lts = refused.localDt({.cfl = 0.4});
     check(!lts && lts.error().find("with gravity") != std::string::npos, "local time stepping refused with gravity");
+    // Gravity + LES is live since MC (gpu_fv_matrix, docs/fvcomp.md "Combinations").
     const auto les = DeviceFvComp::make(fm, {.tr = tr, .bc = bc, .csLes = 0.17, .gravity = gv});
-    check(!les && les.error().find("gravity with LES") != std::string::npos, "gravity + LES refused");
+    check(les.has_value(), "gravity + LES composes");
     const FvState d64 = run(FvPrecision::Fp64, false), cmp = run(FvPrecision::Fp32, true), pln = run(FvPrecision::Fp32, false);
     const double e64 = d64.var(2)[3] - 1.0, eC = cmp.var(2)[3] - 1.0, eP = pln.var(2)[3] - 1.0;
     std::printf("  C2 dm after 40 steps: FP64 %.4e, compensated %.4e, plain %.4e\n", e64, eC, eP);

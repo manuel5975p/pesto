@@ -269,7 +269,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--max-iters", &c.maxIters}, {"--frame-box", &c.frameBox},
              {"--frame-n", &c.frameN}, {"--mesh-perturb", &c.meshPerturb},
              {"--fdt", &c.fdt}, {"--pdt", &c.pdt}, {"--wdt", &c.wdt},
-             {"--planes", &c.planes}, {"--png-down", &c.pngDown}});
+             {"--planes", &c.planes}, {"--png-down", &c.pngDown},
+             {"--les", &c.les}});
     if (c.sub == Subcommand::Flame)
         add({{"--ny", &c.ny}, {"--mach", &c.mach},
              {"--expansion", &c.expansion}, {"--zeldovich", &c.zeldovich},
@@ -376,7 +377,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         enums.push_back({"--dt-rule", {{"bounds", 0}, {"cell", 1}}, &c.dtRule});
     }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Bench || c.sub == Subcommand::Tgv
-        || c.sub == Subcommand::Channel || c.sub == Subcommand::Flame)
+        || c.sub == Subcommand::Channel || c.sub == Subcommand::Flame || c.sub == Subcommand::Conv)
         enums.push_back({"--sgs", enumValues(sgsModelNames()), &sgsSel});
     if (c.sub == Subcommand::Flow)
     {
@@ -1709,6 +1710,12 @@ FV PATH (docs/fvcomp.md, docs/fvincomp.md)
   --compensated      two-word FP32 state, --physics compressible: ON by
                      default here (plain FP32 reads Nu 2% low at 192 x 96)
   --tol T, --max-iters N   pressure solve, --physics incompressible
+  --les C [--sgs smag|sigma]   --physics incompressible only: LES of the
+                     Boussinesq layer (momentum nu_t on faces, eddy heat
+                     flux nu_t/Pr_t, Pr_t 0.9); sigma needs nz > 1. The
+                     wall Nu columns are exact (walls carry no nu_t);
+                     nuFlux is resolved + molecular, no SGS part.
+                     docs/fvincomp.md "Incompressible combinations"  [0]
   --frame-n N, --frame-box lo0,hi0,lo1,hi1   the uniform frame plane
 
 PHYSICS

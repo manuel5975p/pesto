@@ -23,6 +23,7 @@
 #pragma once
 
 #include <array>
+#include <cmath>
 #include <complex>
 #include <cstdint>
 #include <vector>
@@ -84,7 +85,50 @@ TurbShells turbShells(const std::vector<TurbMode>& modes, const TurbSpec& s);
 // The field at the cell centres ((i + 1/2) Lx/nx, ...), i fastest
 // (i + nx (j + ny k)): {u, v, w}. One FFTW c2r per component, serial.
 std::array<std::vector<double>, 3> turbBox(const TurbSpec& s);
+// The field at the shifted lattice ((i + sh[0]) Lx/nx, (j + sh[1]) Ly/ny, (k +
+// sh[2]) Lz/nz), turbBox's layout: the MAC faces of the low-Mach solver (sh 0 on
+// the face's axis, 1/2 on the others). Same modes as turbBox, its own phase
+// expression: sh = 1/2 equals turbBox to rounding, not bitwise.
+std::array<std::vector<double>, 3> turbBoxAt(const TurbSpec& s, const std::array<double, 3>& sh);
 #endif
+
+// The field at arbitrary points (M5: FaceMesh centroids and face centres): turbPoint
+// per point, threaded in contiguous blocks (dns/parallel.hpp), each point its serial
+// expression, so the result is bit-identical at any thread count. skip[p] != 0: that
+// point is not evaluated (exactly 0). Component-major: u[c][p]. Pre: skip empty or
+// pts.size().
+std::array<std::vector<double>, 3> turbAt(const std::vector<TurbMode>& modes, const TurbSpec& s,
+                                          const std::vector<std::array<double, 3>>& pts,
+                                          const std::vector<std::uint8_t>& skip = {}, int threads = 0);
+
+// The box swept past fixed points (Taylor's hypothesis, M5: the FV and low-Mach
+// turbulent inflow rows): u(x_p - X, y_p, z_p) for a sweep X. The Fourier sum
+// grouped by mx, u = Re sum_mx e^{i kx (x_p - X)} B_p(mx), B_p(mx) = sum over the
+// modes of that mx of uh e^{i (ky y_p + kz z_p)} (modes order), built once; one
+// sample costs points x distinct mx. The same sum as turbPoint at (x_p - X, y_p,
+// z_p), grouped: rounding, not bitwise (test_turb_ic). Zero modes: exactly 0.
+class TurbSweep
+{
+public:
+    // Pre: s and modes of turbModes(s). threads <= 0: hardware concurrency.
+    static TurbSweep make(const std::vector<TurbMode>& modes, const TurbSpec& s,
+                          const std::vector<std::array<double, 3>>& pts, int threads = 0);
+    // u[c][p] at sweep X (resized). Bit-identical at any thread count.
+    void sample(double X, std::array<std::vector<double>, 3>& u) const;
+    std::size_t points() const { return x_.size(); }
+
+private:
+    std::vector<double> x_;  // per point: x_p
+    std::vector<int> mx_;    // the distinct mx, ascending
+    double dkx_ = 0;
+    // B[(p nMx + q) 3 + c]
+    std::vector<std::complex<double>> b_;
+    int threads_ = 0;
+};
+
+// The --turb IC's window ahead of the flame: (1 - tanh((x - xw)/ew))/2 (flame1d's
+// addTurbulence: xw = x_f0 - 1.5 l_t, ew = l_t/4). Every solver's IC reads it.
+inline double turbWindow(double x, double xw, double ew) { return 0.5 * (1.0 - std::tanh((x - xw) / ew)); }
 
 // Turbulence groups of a premixed flame, box units (S_L = 1): Re_t = u' lt /
 // nu, Kolmogorov eta = lt Re_t^(-3/4), Ka = u'^1.5 (lt/dth)^(-0.5), Da =

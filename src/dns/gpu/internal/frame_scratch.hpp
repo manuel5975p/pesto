@@ -109,7 +109,7 @@ public:
     // The subtraction is done in DOUBLE and rounded once, which is what every
     // caller had except the two delta-speed maps -- those rounded `off` to
     // float first. Identical today because the freestream is pinned to
-    // uInf = 1 (config.cpp), exactly representable; if that ever stops being
+    // uInf = 1 (validate()), exactly representable; if that ever stops being
     // true this rounds better, not the same.
     //
     // A failed download leaves the channel as it was and returns false; the

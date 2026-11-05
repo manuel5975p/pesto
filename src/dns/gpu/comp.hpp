@@ -399,7 +399,7 @@ public:
     // NOTE: there is deliberately no compressible --cut-flux. Aperture-
     // weighted face fluxes DIVERGE near the body here: the KG split flux
     // loses its kinetic-energy property under per-face area weighting
-    // (measured twice, 2026-07-23). config.cpp rejects the combination, and
+    // (measured twice, 2026-07-23). validate() rejects the combination, and
     // the implementation was deleted rather than left as a dead branch in the
     // hot RHS dispatch. `--cut-flux` remains incompressible-only
     // (gpu/cutflux.*) until the compressible variant is redesigned.

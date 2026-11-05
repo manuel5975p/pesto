@@ -157,6 +157,21 @@ double lmWallHeat(const Grid& g, std::span<const std::uint8_t> solid,
     return q;
 }
 
+LmInflowRows lmInflowRows(const Case& c)
+{
+    const Grid& g = c.grid;
+    LmInflowRows r;
+    for (int k = 0; k < g.nz; ++k)
+        for (int j = 0; j < g.ny; ++j) {
+            const LmInflowRow in = lmInflowRow(c, (j + 0.5) * g.hy, (k + 0.5) * g.hz);
+            r.m.push_back(in.m);
+            r.T.push_back(c.flameTu * in.t);
+            r.yF.push_back(in.yF);
+            if (c.flamePremix2) r.yO.push_back(in.yO);
+        }
+    return r;
+}
+
 LmInflowRow lmInflowRow(const Case& c, double y, double z)
 {
     assert(c.flameBunsen && c.physics == Physics::LowMach);
@@ -270,8 +285,9 @@ LowMachState rimIC(const Case& c)
                 }
                 const double P = 0.25 * (1.0 - std::tanh((r - ri) / b.edge)) *
                                  (1.0 - std::tanh((x - xTop) / b.edge));
-                const double tf =
-                    flameProfile(c.flameEig.tab, bunsenConeDistanceAt(b, x - b.xRim, y, z));
+                const double dRim = bunsenConeDistanceAt(b, x - b.xRim, y, z);
+                const double tf = flameProfile(c.flameEig.tab,
+                                               c.flameTfles > 1 ? dRim / c.flameTfles : dRim);
                 const double sp = (sig - tf) / (sig - 1.0);
                 if (two) {
                     const LmMix mx = lmPartialPremixMix(pm, P * sp, P * (1 - sp),
@@ -287,7 +303,43 @@ LowMachState rimIC(const Case& c)
     return s;
 }
 
+// One cell of lowmachBunsenIC (no rim) at (x, y, z) of the row in = lmInflowRow(c, y, z).
+LmBunsenCell bunsenCell(const Case& c, const LmInflowRow& in, double x, double y, double z, double sig)
+{
+    const BunsenGeom& b = c.bunsen;
+    const PartialPremixModel& pm = c.premix;
+    const bool two = c.flamePremix2;
+    if (c.lmInert) {
+        // --reaction off (S6): the inflow row extruded, no cone.
+        const double rho = 1.0 / in.t;
+        return {.rho = rho, .ryF = rho * in.yF, .ryO = two ? rho * in.yO : 0.0, .m = in.m};
+    }
+    // --tfles F (M4): the oracle thickened by F (flame1d.cpp's rule).
+    const double dc = bunsenConeDistanceAt(b, x, y, z);
+    const double tf = flameProfile(c.flameEig.tab, c.flameTfles > 1 ? dc / c.flameTfles : dc);
+    const double sp = (sig - tf) / (sig - 1.0); // the jet's progress
+    if (two) {
+        // Fresh jet a = J s_p; products b = J (1 - s_p) + P at
+        // sigma / tPilot; air C: its overlap with the products
+        // laid burnt (the outer sheet's Burke-Schumann state).
+        const LmMix mx = lmPartialPremixMix(pm, in.jet * sp, in.jet * (1 - sp) + in.pilot,
+                                            sig * in.jet * (1 - sp) + b.tPilot * in.pilot, in.co, b.tCo * in.co);
+        const double rho = 1.0 / mx.t;
+        return {.rho = rho, .ryF = rho * mx.yF, .ryO = rho * mx.yO, .m = in.m};
+    }
+    const double t = tf * in.jet + b.tPilot * in.pilot + b.tCo * in.co;
+    const double rho = 1.0 / t;
+    return {.rho = rho, .ryF = rho * sp * in.jet, .ryO = 0.0, .m = in.m};
+}
+
 } // namespace
+
+LmBunsenCell lmBunsenPoint(const Case& c, double x, double y, double z)
+{
+    assert(c.flameBunsen && !c.lmRim);
+    const double sig = c.flamePremix2 ? c.premix.sigmaAt(c.premix.phi) : c.flameModel.sigma;
+    return bunsenCell(c, lmInflowRow(c, y, z), x, y, z, sig);
+}
 
 LowMachState lowmachBunsenIC(const Case& c)
 {
@@ -295,7 +347,6 @@ LowMachState lowmachBunsenIC(const Case& c)
            c.flameBunsen && !c.flameEig.tab.T.empty() && c.flameTu == 1.0);
     if (c.lmRim) return rimIC(c);
     const Grid& g = c.grid;
-    const BunsenGeom& b = c.bunsen;
     const double sig = c.flamePremix2 ? c.premix.sigmaAt(c.premix.phi)
                                       : c.flameModel.sigma;
     LowMachState s;
@@ -307,7 +358,6 @@ LowMachState lowmachBunsenIC(const Case& c)
     s.mx.assign(std::size_t(g.nx + 1) * g.ny * g.nz, 0.0);
     s.rhoY[0].assign(g.size(), 0.0);
     if (s.nY == 2) s.rhoY[1].assign(g.size(), 0.0);
-    const PartialPremixModel& pm = c.premix;
     for (int k = 0; k < g.nz; ++k) {
         const double z = (k + 0.5) * g.hz;
         for (int j = 0; j < g.ny; ++j) {
@@ -318,36 +368,10 @@ LowMachState lowmachBunsenIC(const Case& c)
                 s.mx[std::size_t(i) + std::size_t(g.nx + 1) * row] = in.m;
             for (int i = 0; i < g.nx; ++i) {
                 const std::size_t cc = g.idx(i, j, k);
-                if (c.lmInert) {
-                    // --reaction off (S6): the inflow row extruded, no cone.
-                    const double rho = 1.0 / in.t;
-                    s.rho[cc] = rho;
-                    s.rhoY[0][cc] = rho * in.yF;
-                    if (s.nY == 2) s.rhoY[1][cc] = rho * in.yO;
-                    continue;
-                }
-                const double x = (i + 0.5) * g.hx;
-                const double tf =
-                    flameProfile(c.flameEig.tab, bunsenConeDistanceAt(b, x, y, z));
-                const double sp = (sig - tf) / (sig - 1.0); // the jet's progress
-                if (s.nY == 2) {
-                    // Fresh jet a = J s_p; products b = J (1 - s_p) + P at
-                    // sigma / tPilot; air C: its overlap with the products
-                    // laid burnt (the outer sheet's Burke-Schumann state).
-                    const LmMix mx = lmPartialPremixMix(
-                        pm, in.jet * sp, in.jet * (1 - sp) + in.pilot,
-                        sig * in.jet * (1 - sp) + b.tPilot * in.pilot, in.co,
-                        b.tCo * in.co);
-                    const double rho = 1.0 / mx.t;
-                    s.rho[cc] = rho;
-                    s.rhoY[0][cc] = rho * mx.yF;
-                    s.rhoY[1][cc] = rho * mx.yO;
-                } else {
-                    const double t = tf * in.jet + b.tPilot * in.pilot + b.tCo * in.co;
-                    const double rho = 1.0 / t;
-                    s.rho[cc] = rho;
-                    s.rhoY[0][cc] = rho * sp * in.jet;
-                }
+                const LmBunsenCell q = bunsenCell(c, in, (i + 0.5) * g.hx, y, z, sig);
+                s.rho[cc] = q.rho;
+                s.rhoY[0][cc] = q.ryF;
+                if (s.nY == 2) s.rhoY[1][cc] = q.ryO;
             }
         }
     }
@@ -380,8 +404,11 @@ LowMachState lowmachIC(const Case& c)
         const double y = (j + 0.5) * g.hy;
         const double xf =
             c.flameXf0 + flameWrinkle(A, c.flameWrinkleModes, y, Ly);
+        // --tfles F (M4): the oracle thickened by F (flame1d.cpp's rule).
         for (int i = 0; i < g.nx; ++i)
-            T[std::size_t(i)] = flameProfile(tab, (i + 0.5) * g.hx - xf);
+            T[std::size_t(i)] = flameProfile(tab, c.flameTfles > 1 ? ((i + 0.5) * g.hx - xf) / c.flameTfles
+                                                                   : (i + 0.5) * g.hx - xf);
+
         const double tLast = T[std::size_t(g.nx - 1)];
         for (int i = 0; i < g.nx; ++i) {
             const double t = T[std::size_t(i)];
@@ -402,6 +429,73 @@ LowMachState lowmachIC(const Case& c)
         s.rhoY[0] = std::move(rhoY[1]);
     }
     return s;
+}
+
+#if DNS_WITH_FFTW
+void lowmachAddTurbulence(const Case& c, LowMachState& s)
+{
+    assert(c.flameTurb > 0 && !c.flameBunsen && c.physics == Physics::LowMach);
+    const Grid& g = c.grid;
+    const TurbSpec ts = flameTurbSpec(c);
+    const int nbx = c.flameTurbNbx;
+    const double xw = c.flameXf0 - 1.5 * c.flameTurbL, ew = 0.25 * c.flameTurbL;
+    const double rhoIn = 1.0; // P0/(R Tu), box units
+    auto col = [&](int i, int j, int k) {
+        return std::size_t(i % nbx) + std::size_t(nbx) * (std::size_t(j) + std::size_t(g.ny) * std::size_t(k));
+    };
+    // x faces: (i h, (j + 1/2) h, (k + 1/2) h), i in [0, nx].
+    const auto bx = turbBoxAt(ts, {0.0, 0.5, 0.5});
+    for (int k = 0; k < g.nz; ++k)
+        for (int j = 0; j < g.ny; ++j)
+            for (int i = 0; i <= g.nx; ++i) {
+                const double rf = i == 0       ? rhoIn
+                                  : i == g.nx ? s.rho[g.idx(g.nx - 1, j, k)]
+                                              : 0.5 * (s.rho[g.idx(i - 1, j, k)] + s.rho[g.idx(i, j, k)]);
+                const std::size_t f = std::size_t(i) + std::size_t(g.nx + 1) * (std::size_t(j) + std::size_t(g.ny) * k);
+                s.mx[f] += rf * (turbWindow(i * g.hx, xw, ew) * bx[0][col(i, j, k)]);
+            }
+    // y and z faces: the cell's lo face, periodic.
+    const auto by = turbBoxAt(ts, {0.5, 0.0, 0.5}), bz = turbBoxAt(ts, {0.5, 0.5, 0.0});
+    for (int k = 0; k < g.nz; ++k)
+        for (int j = 0; j < g.ny; ++j)
+            for (int i = 0; i < g.nx; ++i) {
+                const std::size_t cc = g.idx(i, j, k);
+                const double w = turbWindow((i + 0.5) * g.hx, xw, ew);
+                const double ry = 0.5 * (s.rho[g.idx(i, (j + g.ny - 1) % g.ny, k)] + s.rho[cc]);
+                const double rz = 0.5 * (s.rho[g.idx(i, j, (k + g.nz - 1) % g.nz)] + s.rho[cc]);
+                s.my[cc] += ry * (w * by[1][col(i, j, k)]);
+                s.mz[cc] += rz * (w * bz[2][col(i, j, k)]);
+            }
+}
+#endif
+
+LowMachTurbSweeps lowmachTurbSweeps(const Case& c)
+{
+    assert(c.flameTurb > 0);
+    const Grid& g = c.grid;
+    const TurbSpec ts = flameTurbSpec(c);
+    const std::vector<TurbMode> modes = turbModes(ts);
+    std::vector<std::array<double, 3>> pm, pv, pw;
+    for (int k = 0; k < g.nz; ++k)
+        for (int j = 0; j < g.ny; ++j) {
+            pm.push_back({0.0, (j + 0.5) * g.hy, (k + 0.5) * g.hz});
+            pv.push_back({0.0, j * g.hy, (k + 0.5) * g.hz});
+            pw.push_back({0.0, (j + 0.5) * g.hy, k * g.hz});
+        }
+    return {TurbSweep::make(modes, ts, pm), TurbSweep::make(modes, ts, pv), TurbSweep::make(modes, ts, pw)};
+}
+
+void lowmachTurbRows(const LowMachTurbSweeps& s, double X, double mIn, std::vector<double>& m, std::vector<double>& v,
+                     std::vector<double>& w)
+{
+    std::array<std::vector<double>, 3> u;
+    s.m.sample(X, u);
+    m.resize(u[0].size());
+    for (std::size_t q = 0; q < m.size(); ++q) m[q] = mIn + 1.0 * u[0][q]; // rho_in = 1
+    s.v.sample(X, u);
+    v = u[1];
+    s.w.sample(X, u);
+    w = u[2];
 }
 
 } // namespace dns

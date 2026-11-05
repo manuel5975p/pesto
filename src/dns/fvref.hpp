@@ -7,9 +7,11 @@
 // are pinned against; on a uniform Cartesian FaceMesh it equals dns::Comp.
 //
 // Pass order (the GPU stage choreography): primitives -> boundary states ->
-// [Y, omega, boundary Y] -> cell gradients of u, v, w, T [and Y] -> face fluxes
-// F[5][nI+nB] (materialized) [and species fluxes] -> per-cell gather of its CSR
-// faces in ascending face order, divided by V, plus additive cell sources.
+// cell gradients of u, v, w, T -> [LES mu_t] -> [TFLES F E, E/F, Omega: the step's
+// first stage only] -> [Y, omega, boundary Y, grad Y] -> face fluxes F[5][nI+nB]
+// (materialized) [and species fluxes, the thickened energy flux added to F_E] ->
+// per-cell gather of its CSR faces in ascending face order, divided by V, plus
+// additive cell sources. (Independent passes: their order moves no number.)
 // Every pass writes only its own index, so the result is byte-identical for any
 // thread count.
 //
@@ -24,11 +26,16 @@
 #include "dns/facemesh.hpp"
 #include "dns/fvflux.hpp"
 #include "dns/fvgrad.hpp"
+#include "dns/fvles.hpp"
+#include "dns/fvmodules.hpp"
 #include "dns/fvrans.hpp"
+#include "dns/sgs.hpp"
+#include "dns/tfles.hpp"
 #include "dns/transport.hpp"
 
 #include <array>
 #include <expected>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -59,6 +66,38 @@ struct FvRansConfig
     bool transportOnly = false;
 };
 
+// LES of an FV run (cs > 0): mu_t = rho (C Delta)^2 op(grad u) per cell (dns/sgs.hpp,
+// Delta^2 = fvLesDelta2), its face mean into mu, cp/prt scaled into kappa; a Slip face
+// takes the owner's mu_t, a Wall face none. Species (docs/fvcomp.md "Species LES and
+// TFLES"): + nut_f / Sc_t on every internal face, Sc_t = Pr_t = prt (ONE constant).
+struct FvLes
+{
+    double cs = 0;
+    SgsModel sgs = SgsModel::Smagorinsky;
+    double prt = 0.9;
+};
+
+// The hydrostatic ambient column of an FV run under gravity g (docs/fvcomp.md
+// "Hydrostatic ambient"): isothermal at T0, p_a(x) = candleAmbientP(p0, |g|, R T0, h),
+// h = (x - x0).up the height above x0, up = -g/|g| (the structured candle's ONE
+// definition: g along -x, x0 on the inflow plane, the same numbers). An open face reads
+// it at its OWNER'S CENTROID, the face's height in the gravity scheme: a boundary face
+// carries no gravity share (fvGravityFace is internal), so its pressure is the owner
+// height's, as a Wall's is p_P. At rest the row is the cell's state bit for bit
+// (Far: P == F returns F exactly), so the rest is exact on any mesh.
+struct FvAmbient
+{
+    double p0 = 1, T0 = 1;
+    std::array<double, 3> x0{};
+};
+
+// A boundary table: rows (a row per patch first), and per boundary face its row.
+struct FvBcTable
+{
+    std::vector<FvBc> bc;
+    std::vector<int> faceRow;
+};
+
 struct FvConfig
 {
     Transport tr;
@@ -71,14 +110,49 @@ struct FvConfig
     // Empty: a face reads its patch's row. Else, per boundary face, its row of bc.
     std::vector<int> bcRow{};
     // Acceleration vector. Nonzero: the well-balanced face form of rho g, g.m on the
-    // internal faces (fvGravityFace, fvHydroRho). Open patches and moving walls are
-    // rejected: they have no hydrostatic ambient.
+    // internal faces (fvGravityFace, fvHydroRho). Moving walls are rejected; Far and
+    // Outflow patches need `ambient` and rows that are its column (fvAmbientRows).
+    // Composes with species, LES, bodyForce (docs/fvcomp.md "Combinations"), not with RANS.
     std::array<double, 3> gravity{};
+    // The hydrostatic ambient of the open patches under gravity (FvAmbient). Empty: no
+    // open Far / Outflow patch may meet gravity. Set without gravity: an error.
+    std::optional<FvAmbient> ambient{};
     FvChem chem{};        // species rows and the step; nY == 0 off
     FvRansConfig rans{};
     // Constant force per volume: rhs of m + f, of E + f.u (the channel's drive).
     std::array<double, 3> bodyForce{};
+    FvLes les{};
+    // The thickened flame (premixed species only; docs/fvcomp.md "Species LES and
+    // TFLES"): F, E, Omega per cell from each step's INPUT state (the walk of
+    // fvTflesWalk, dilate steps per direction), held over its three stages.
+    // Internal faces: rho D = FE_f mu_f/Pr + (1 - Om_f) nut_f/Sc_t, and the energy
+    // flux gains -(FE_f - 1) kappa_f g_T.S + Om_f nut_f (cp/Pr_t) g_T.S (additive);
+    // omega -> (E/F) omega. Boundary faces: unthickened. Empty: off.
+    std::optional<TflesSetup> tfles{};
+    // --turb (M5, dns/fvmodules Turb): the open patches' bcRow rows carry the swept
+    // synthetic box, rewritten by the caller between steps. No stage term: the
+    // inventory's pairs only.
+    bool turb = false;
 };
+
+// The modules cfg switches on (dns/fvmodules; the precision and time axes are the
+// device's): what FvRef::make checks against the inventory.
+FvModuleSet fvModulesOf(const FvConfig& cfg);
+
+// p_a at x (FvAmbient). g zero: p0. Pre: p0, T0, Rgas > 0.
+double fvAmbientP(const FvAmbient& a, const std::array<double, 3>& g, const double x[3], double Rgas);
+// The ambient's conserved state at x moving with u: rho_a = p_a/(R T0), rho_a u, p_a/(gamma - 1)
+// + rho_a |u|^2/2. The rows and the rest IC both read it: the same bits.
+std::array<double, 5> fvAmbientConserved(const FvAmbient& a, const std::array<double, 3>& g, const double x[3],
+                                         const double u[3], double gamma, double Rgas);
+// t with a row of its own for every face of a Far or Outflow row: Far's qFar the ambient
+// at the owner's centroid moving with the row's velocity, Outflow's pOut p_a there; every
+// other member and face unchanged. faceRow empty: each face's patch row first.
+FvBcTable fvAmbientRows(const FaceMesh& fm, FvBcTable t, const FvAmbient& a, const std::array<double, 3>& g,
+                        double gamma, double Rgas);
+// The ambient at rest on every cell: rows rho, 0, 0, 0, E (nV rows, the rest 0).
+FvState fvAmbientState(const FaceMesh& fm, const FvAmbient& a, const std::array<double, 3>& g, double gamma,
+                       double Rgas, int nV);
 
 // Explicit dt limits, both per cell (LTS-ready), both Sigma forms:
 //   convective  2 cfl V / sum_f (|u.S| + c |S|)    (cfl 1 = 1D CFL 1)
@@ -110,7 +184,13 @@ struct FvEval
     std::array<std::vector<double>, 2> tfld, tbnd, Ft;
     std::array<std::vector<double>, 6> tgrad;
     std::array<std::vector<double>, 4> tsrc;
-    std::vector<double> nut, f1;
+    std::vector<double> nut, f1; // nut: RANS or LES mu_t per cell
+    // TFLES (FvConfig::tfles): F E, E/F, Omega per cell (the step's coefficients),
+    // and their scratch: the dilation's ping-pong, curl u [3][nC], Colin's grid u'.
+    std::vector<double> fe, eof, om;
+    std::array<std::vector<double>, 2> tfWork;
+    std::array<std::vector<double>, 3> curl;
+    std::vector<double> uh;
 };
 
 class FvRef
@@ -120,7 +200,8 @@ public:
     // BC values): bc count != patches, Empty <-> `empty` mismatch, invalid BC
     // values, a 2D mesh given out-of-plane BC velocities, bad geometry
     // (fvFaceGeom / fvGradWeights), a RANS closure without mu > 0 or with a
-    // wallDist not positive on every cell. threads <= 0: hardware concurrency.
+    // wallDist not positive on every cell, a module pair or requirement the inventory
+    // refuses (dns/fvmodules, fvModulesOf). threads <= 0: hardware concurrency.
     static std::expected<FvRef, std::string> make(const FaceMesh& fm, FvConfig cfg, int threads = 0);
 
     const FaceMesh& mesh() const { return *fm_; }
@@ -129,6 +210,10 @@ public:
     const FvGradWeights& gradWeights() const { return gw_; }
     // State rows: 5 + the closure's scalars.
     int nV() const { return nV_; }
+    // TFLES only: the sensor walk and edge layers (empty otherwise).
+    const FvTflesWalk& tflesWalk() const { return walk_; }
+    // LES or TFLES: Delta^2 per cell (empty otherwise).
+    const std::vector<double>& lesDelta2() const { return delta2_; }
     // Per cell sum_f corr . S over active faces: the diffusive dt's denominator.
     const std::vector<double>& diffCoef() const { return diffCoef_; }
     // Row of the FvBc table per boundary face; the patch of that face.
@@ -142,8 +227,9 @@ public:
     void evaluate(const FvState& s, FvEval& ev, FvState& out, const FvState* src = nullptr) const;
 
     // min over cells of the FvDtLimits bound; per-cell values into local when
-    // non-null. RANS: mu_t adds at max(4/3, gamma/Pr_t), SA's bound takes rho
-    // max(nu, K)/sigma. Errors: rho or p not positive-finite (a diverged state).
+    // non-null. RANS, LES: mu_t adds at max(4/3, gamma/Pr_t), SA's bound takes rho
+    // max(nu, K)/sigma; TFLES: mu at max(4/3, FE gamma/Pr), FE the cell's of s.
+    // Errors: rho or p not positive-finite (a diverged state).
     std::expected<double, std::string> stableDt(const FvState& s, FvDtLimits lim = {},
                                                 std::vector<double>* local = nullptr) const;
 
@@ -174,6 +260,15 @@ private:
     void ransCells(FvEval& ev, std::size_t lo, std::size_t hi) const;
     void ransFaces(FvEval& ev, std::size_t lo, std::size_t hi) const;
     void ransGather(const FvEval& ev, const Stage& st, std::size_t lo, std::size_t hi) const;
+    void lesCells(FvEval& ev, std::size_t lo, std::size_t hi) const;
+    // TFLES coefficients of state q: raw sensor and curl, a dilation pass per walked
+    // axis, Colin's u', the combine. Every pass writes its own cells; sync between.
+    void tflesRaw(const double* q, FvEval& ev, std::size_t lo, std::size_t hi) const;
+    void tflesDilate(FvEval& ev, int pass, std::size_t lo, std::size_t hi) const;
+    void tflesColin(FvEval& ev, std::size_t lo, std::size_t hi) const;
+    void tflesCombine(FvEval& ev, std::size_t lo, std::size_t hi) const;
+    template <class Sync>
+    void tflesFields(const double* q, FvEval& ev, std::size_t c0, std::size_t c1, Sync&& sync) const;
     void sizeEval(FvEval& ev) const;
 
     const FaceMesh* fm_ = nullptr;
@@ -183,6 +278,8 @@ private:
     std::vector<int> bcOf_;        // FvBc row per boundary face
     std::vector<int> patchOf_;     // patch per boundary face
     std::vector<double> diffCoef_; // per cell sum_f corr . S
+    FvTflesWalk walk_;             // TFLES
+    std::vector<double> delta2_;   // LES, TFLES (Colin's h = sqrt Delta^2)
     int workers_ = 1, nV_ = kFvMeanVars;
 };
 

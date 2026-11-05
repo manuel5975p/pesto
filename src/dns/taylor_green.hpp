@@ -5,7 +5,10 @@
 #include "dns/field.hpp"
 #include "dns/grid.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <vector>
 
 namespace dns {
 
@@ -57,6 +60,45 @@ inline double taylorGreenError(const Grid& g, double nu, double t, const VectorF
         e = std::max(e, std::abs(U.w[c] - ref.w[c]));
     }
     return e;
+}
+
+// The TGV velocity at points C (an FV mesh's centroids): u = sin x cos y cz, v = -cos x
+// sin y cz, w = 0, cz = cos z (twoD: 1). Rows u, v, w of 3 n.
+inline std::vector<double> taylorGreenAt(const std::array<std::vector<double>, 3>& C, bool twoD)
+{
+    const std::size_t nC = C[0].size();
+    std::vector<double> U0(3 * nC, 0.0);
+    for (std::size_t q = 0; q < nC; ++q) {
+        const double x = C[0][q], y = C[1][q], z = C[2][q];
+        const double cz = twoD ? 1.0 : std::cos(z);
+        U0[q] = std::sin(x) * std::cos(y) * cz;
+        U0[nC + q] = -std::cos(x) * std::sin(y) * cz;
+    }
+    return U0;
+}
+
+// The 2D TGV error of an FV velocity at time t: max |u - u_exact| over both components and
+// the volume-weighted L2 norm. U rows u, v of 3 n; C, V the mesh's centroids and volumes.
+struct TaylorGreenFvError
+{
+    double max = 0, l2 = 0;
+};
+inline TaylorGreenFvError taylorGreenErrorAt(const std::array<std::vector<double>, 3>& C,
+                                             const std::vector<double>& V, const std::vector<double>& U, double nu,
+                                             double t)
+{
+    const std::size_t nC = C[0].size();
+    const double decay = std::exp(-2.0 * nu * t);
+    double eMax = 0, e2 = 0, vol = 0;
+    for (std::size_t q = 0; q < nC; ++q) {
+        const double x = C[0][q], y = C[1][q];
+        const double du = U[q] - std::sin(x) * std::cos(y) * decay;
+        const double dv = U[nC + q] + std::cos(x) * std::sin(y) * decay;
+        eMax = std::max({eMax, std::abs(du), std::abs(dv)});
+        e2 += V[q] * (du * du + dv * dv);
+        vol += V[q];
+    }
+    return {.max = eMax, .l2 = std::sqrt(e2 / vol)};
 }
 
 } // namespace dns

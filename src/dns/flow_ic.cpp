@@ -1,5 +1,7 @@
 #include "dns/flow_ic.hpp"
 
+#include "dns/curvmesh.hpp"
+#include "dns/meshio.hpp"
 #include "dns/parallel.hpp"
 
 #include <algorithm>
@@ -479,6 +481,140 @@ void rbIC(const Case& c, VectorField& U, Scalar& T, std::vector<float>& mask)
                            * (std::sin(bz * zf + 0.2) * ez(zf)); // -d psi_x / dy
                 }
             }
+}
+
+void addOgridTrip(const Case& c, const CaseGeometry& geo, const CurvMesh& mesh, const std::vector<double>& pr,
+                  const std::vector<double>& pu, const std::vector<double>& pv, const std::vector<double>& pw,
+                  const std::vector<double>& pp, CompState& ic)
+{
+    const auto& g = c.grid;
+    const double gamma = kGammaAir;
+    const double A = c.ogridTrip * c.uInf, w = 0.25 * geo.D;
+    const double x0 = c.placement.cx + geo.D, y0 = c.placement.cy + 0.25 * geo.D, z0 = c.placement.cz;
+    for (int k = 0; k < g.nz; ++k)
+        for (int j = 0; j < g.ny; ++j)
+            for (int i = 0; i < g.nx; ++i)
+            {
+                double x[3] = {0, 0, 0};
+                for (int dk = 0; dk < 2; ++dk)
+                    for (int dj = 0; dj < 2; ++dj)
+                        for (int di = 0; di < 2; ++di)
+                        {
+                            const auto p = mesh.node(i + di, j + dj, k + dk);
+                            for (int a = 0; a < 3; ++a) x[a] += 0.125 * p[a];
+                        }
+                const double dx = x[0] - x0, dy = x[1] - y0, dz = x[2] - z0;
+                const double e = A * std::exp(-(dx * dx + dy * dy + dz * dz) / (w * w));
+                const std::size_t q = g.idx(i, j, k);
+                const double uu = pu[q] + 2.0 * dy / w * e, vv = pv[q] + -2.0 * dx / w * e, ww = pw[q];
+                ic.mx[q] = pr[q] * uu;
+                ic.my[q] = pr[q] * vv;
+                ic.mz[q] = pr[q] * ww;
+                ic.E[q] = pp[q] / (gamma - 1.0) + 0.5 * pr[q] * (uu * uu + vv * vv + ww * ww);
+            }
+}
+
+void addOgridTripFv(const Case& c, double D, const std::array<std::vector<double>, 3>& C, std::vector<double>& U0)
+{
+    const std::size_t nC = C[0].size();
+    const double A = c.ogridTrip * c.uInf, w = 0.25 * D;
+    const double x0 = c.placement.cx + D, y0 = c.placement.cy + 0.25 * D, z0 = c.placement.cz;
+    for (std::size_t q = 0; q < nC; ++q) {
+        const double dx = C[0][q] - x0, dy = C[1][q] - y0, dz = C[2][q] - z0;
+        const double e = A * std::exp(-(dx * dx + dy * dy + dz * dz) / (w * w));
+        U0[q] += 2.0 * dy / w * e;
+        U0[nC + q] += -2.0 * dx / w * e;
+    }
+}
+
+CompState ogridCompressibleIC(const Case& c, const CaseGeometry& geo, const CurvMesh& mesh, double rhoInf,
+                              double pInf, WedgeStart* wedge, std::span<std::vector<double>> turb)
+{
+    const Grid& g = c.grid;
+    const double gamma = kGammaAir;
+    auto ic = CompState::zeros(g);
+    const double u0 = c.ramp > 0 ? 0.0 : c.uInf;
+    for (std::size_t q = 0; q < g.size(); ++q) {
+        ic.rho[q] = rhoInf;
+        ic.mx[q] = rhoInf * u0;
+        ic.E[q] = pInf / (gamma - 1.0) + 0.5 * rhoInf * u0 * u0;
+    }
+    for (std::size_t i = 0; i < turb.size(); ++i) turb[i].assign(g.size(), rhoInf * c.ransPhiInf[i]);
+    // The primitives the trip adds to: the full revolution's wedge start, or the uniform
+    // state above.
+    std::vector<double> pr, pu, pv, pw, pp;
+    if (c.ogridNphi > 0 || c.ogridTrip > 0) {
+        if (wedge) {
+            pr = std::move(wedge->rho);
+            pu = std::move(wedge->u);
+            pv = std::move(wedge->v);
+            pw = std::move(wedge->w);
+            pp = std::move(wedge->p);
+            for (std::size_t q = 0; q < g.size(); ++q) {
+                ic.rho[q] = pr[q];
+                ic.mx[q] = pr[q] * pu[q];
+                ic.my[q] = pr[q] * pv[q];
+                ic.mz[q] = pr[q] * pw[q];
+                ic.E[q] = pp[q] / (gamma - 1.0) + 0.5 * pr[q] * (pu[q] * pu[q] + pv[q] * pv[q] + pw[q] * pw[q]);
+            }
+            for (std::size_t i = 0; i < turb.size(); ++i)
+                for (std::size_t q = 0; q < g.size(); ++q) turb[i][q] = pr[q] * wedge->phi[i][q];
+        } else {
+            pr.assign(g.size(), rhoInf);
+            pu.assign(g.size(), u0);
+            pv.assign(g.size(), 0.0);
+            pw.assign(g.size(), 0.0);
+            pp.assign(g.size(), pInf);
+        }
+    }
+    if (c.ogridTrip > 0) addOgridTrip(c, geo, mesh, pr, pu, pv, pw, pp, ic);
+    return ic;
+}
+
+FvState convFvState(const Case& c, const FaceMesh& fm)
+{
+    const bool threeD = fm.dim == 3;
+    const std::size_t nC = std::size_t(fm.nC);
+    const double gamma = kGammaAir;
+    FvState ic = FvState::zeros(fm.nC);
+    for (std::size_t q = 0; q < nC; ++q) {
+        const double y = std::clamp(fm.C[1][q], 0.0, c.convH);
+        const ConvHydro h = convHydroAt(c, y);
+        const auto u = convTripAt(c, fm.C[0][q], y, fm.C[2][q], threeD);
+        ic.var(0)[q] = h.rho;
+        for (std::size_t k = 0; k < 3; ++k) ic.var(1 + int(k))[q] = h.rho * u[k];
+        ic.var(4)[q] = h.p / (gamma - 1.0) + 0.5 * h.rho * (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+    }
+    return ic;
+}
+
+void rbFvFields(const Case& c, const FaceMesh& fm, std::vector<double>& U0, std::vector<double>& T0)
+{
+    const bool threeD = fm.dim == 3;
+    const std::size_t nC = std::size_t(fm.nC);
+    U0.assign(3 * nC, 0.0);
+    T0.assign(nC, 0.0);
+    for (std::size_t q = 0; q < nC; ++q) {
+        const RbPoint p = rbPointAt(c, fm.C[0][q], fm.C[1][q], fm.C[2][q], threeD);
+        T0[q] = p.T;
+        for (std::size_t k = 0; k < 3; ++k) U0[k * nC + q] = p.u[k];
+    }
+}
+
+CompState benchCompState(const Grid& g, const VectorField& U, double gamma,
+                         double mach)
+{
+    auto s = CompState::zeros(g);
+    const double p = 1.0 / (gamma * mach * mach);
+    for (std::size_t i = 0; i < g.size(); ++i) {
+        const double u = U.u[i], v = U.v[i], w = U.w[i];
+        s.rho[i] = 1.0;
+        s.mx[i] = u;
+        s.my[i] = v;
+        s.mz[i] = w;
+        s.E[i] = p / (gamma - 1.0) + 0.5 * (u * u + v * v + w * w);
+    }
+    return s;
 }
 
 } // namespace dns

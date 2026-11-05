@@ -18,6 +18,7 @@
 // RANS scalars later.
 #pragma once
 
+#include "dns/chem.hpp"
 #include "dns/dual.hpp"
 #include "dns/hd.hpp"
 #include "dns/transport.hpp"
@@ -254,6 +255,38 @@ DNS_HD inline T fvSpeciesFlux(T mdot, T Yf, T rhoD, const T g[3], const G S[3])
     return mdot * Yf - rhoD * (g[0] * T(S[0]) + g[1] * T(S[1]) + g[2] * T(S[2]));
 }
 
+// Species rho D of an internal face under LES (docs/fvcomp.md "Species LES and
+// TFLES"): gpu/species.hip effRhoD<Eddy> restated, rho D + nut_f / Sc_t, nut_f the
+// face mean of mu_t (the mean flux's own), invSct = 1/Pr_t (Sc_t = Pr_t).
+template <class T>
+DNS_HD inline T fvEddyRhoD(T rhoD, T nutf, T invSct)
+{
+    return rhoD + nutf * invSct;
+}
+
+// The thickened flame's (effRhoD<Thick>): FE_f rho D, plus (1 - Om_f) nut_f / Sc_t
+// with LES (no SGS flux where the sensor thickens). FE_f, Om_f arithmetic face means.
+template <class T>
+DNS_HD inline T fvThickRhoD(T rhoD, T FEf, T Omf, T nutf, T invSct, bool les)
+{
+    T r = FEf * rhoD;
+    if (les) r = r + (T(1.0) - Omf) * nutf * invSct;
+    return r;
+}
+
+// The energy flux the mean face flux lacks under TFLES (thickEnergyFlux restated):
+// the conductivity becomes FE kappa + (1 - Om) mu_t cp/Pr_t, so add
+//   -(FE_f - 1) kappa_f g_T.S + Om_f nut_f (cp/Pr_t) g_T.S   [LES term with les]
+// to F_E: additive, conservative, the mean flux untouched. kappa_f: the face's own
+// molecular value (its Sutherland ratio), gTS the corrected face gradient of T . S.
+template <class T>
+DNS_HD inline T fvThickEnergyFlux(T FEf, T Omf, T nutf, T kapf, T kapLes, T gTS, bool les)
+{
+    T fl = (T(0.0) - (FEf - T(1.0))) * kapf * gTS;
+    if (les) fl = fl + Omf * nutf * kapLes * gTS;
+    return fl;
+}
+
 // Boundary kinds of the FV path (masterplan §2.3). Cyclic is an internal
 // face; Empty carries no flux (the 2D restriction).
 enum class FvBcKind : std::uint8_t { Wall, Slip, Inflow, Outflow, Far, Empty };
@@ -301,12 +334,15 @@ struct FvBc
 // lnA == -inf: no reaction (omega exactly 0).
 // ox >= 0: model C1, F + s O -> (1+s) P: omega = arrheniusRate2, oxidizer -stoich
 // omega on the same omega, one shared limiter per face (fvThetaVote). ox < 0: off.
+// law.n > 0 (ox >= 0 only): model C2b, ln A + phiRateLn(law, Y_F, Y_O) per cell (the
+// structured kChemCellPass2Phi / ChemRate2Phi); n == 0: the C1 rate bit for bit.
 struct FvChem
 {
     int nY = 0, fuel = 0;
     double lnA = 0, Ta = 0, q = 0, invPr = 1;
     int ox = -1;
     double stoich = 1;
+    PhiRateLaw<double> law{};
 };
 
 // Wall velocity at a point. omega x (x - origin).

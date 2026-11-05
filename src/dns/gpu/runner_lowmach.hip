@@ -42,8 +42,11 @@ struct LowMachLoop
     bool bindChem = false;
     double xfPrev = NAN, tPrev = 0;
     double lastHits = 0, lastMin = 0, lastMax = 1;
+    // --turb (M5): the swept distance X = sum uIn dt (FP64 host).
+    bool turb = false;
+    double sweep = 0;
 
-    explicit LowMachLoop(const LowMachRun& r) : cad{r.statsEvery}, prof(r.profileDt) {}
+    explicit LowMachLoop(const LowMachRun& r) : cad{r.statsEvery}, prof(r.profileDt), turb(r.turb != nullptr) {}
 
     template <class F>
     void fields(F&& f)
@@ -64,6 +67,7 @@ struct LowMachLoop
         f("lastHits", lastHits);
         f("lastMin", lastMin);
         f("lastMax", lastMax);
+        if (turb) f("sweep", sweep);
     }
 };
 
@@ -121,6 +125,16 @@ std::expected<RunStats, RunError> runLowMach(const Grid& g, const LowMachState& 
         if (r.rim) cols.insert(cols.end(), {"xRimBase", "rBase", "qRim"});
     }
     if (r.dtCell) cols.push_back("dtPos");
+    // M4: the eddy fields (DeviceLowMach::eddyStats).
+    const bool lesOn = r.sp.cs > 0, thickOn = r.sp.tfles.has_value();
+    if (lesOn) cols.push_back("mutMax");
+    if (thickOn) cols.insert(cols.end(), {"FEmax", "Ebar"});
+    auto eddyCols = [&](std::vector<double>& row) {
+        if (!lesOn && !thickOn) return;
+        const LmEddyStats e = dev.eddyStats(*red);
+        if (lesOn) row.push_back(e.mutMax);
+        if (thickOn) row.insert(row.end(), {e.feMax, e.eBar});
+    };
     // S8: the tube's conduction coefficient lambda_w = cp mu(T_w)/Pr (cp =
     // gamma R/(gamma - 1), R = 1 in box units).
     const double lambdaW =
@@ -590,6 +604,7 @@ std::expected<RunStats, RunError> runLowMach(const Grid& g, const LowMachState& 
 
     RunStats st;
     LowMachLoop L(r);
+    std::vector<double> turbM, turbV, turbW;
     long steps0 = 0;
     if (cp.restart) {
         if (auto e = internal::loadLoop(*cp.restart, L); !e)
@@ -670,7 +685,14 @@ std::expected<RunStats, RunError> runLowMach(const Grid& g, const LowMachState& 
         const double dt = rem <= L.dtStab         ? rem
                           : rem < 2 * L.dtStab    ? 0.5 * rem
                                                   : L.dtStab;
+        // --turb: the box column the inflow face sees at the step's start, held over
+        // its stages; the box then sweeps past at u_in.
+        if (r.turb) {
+            lowmachTurbRows(*r.turb, L.sweep, r.sp.mIn, turbM, turbV, turbW);
+            if (auto e = dev.setInflowTurb(turbM, turbV, turbW); !e) return fail(6, e.error());
+        }
         if (auto e = dev.step(dt); !e) return fail(dev.pcgFailed() ? 8 : 6, e.error());
+        L.sweep += r.uIn * dt;
         L.t += dt;
         ++L.steps;
         const double t = L.t;
@@ -727,6 +749,7 @@ std::expected<RunStats, RunError> runLowMach(const Grid& g, const LowMachState& 
             const double xRimBase = c.xBase - r.geom.xRim;
             if (r.rim) row.insert(row.end(), {xRimBase, m->rBase, m->qRim});
             if (r.dtCell) row.push_back(L.dtPos);
+            eddyCols(row);
             out.row("stats", row);
             if (L.cad.printDue(L.steps, t, r.tEnd)) {
                 std::printf("t=%.3f/%.3f tip=%.3f base=%.3f alpha=%.3f deg "
@@ -808,7 +831,9 @@ std::expected<RunStats, RunError> runLowMach(const Grid& g, const LowMachState& 
                 if (r.premix2)
                     row.insert(row.end(), {m->zMin - zIn, m->zMax - zIn});
                 if (r.dtCell) row.push_back(L.dtPos);
+                eddyCols(row);
                 out.row("stats", row);
+
                 L.xfPrev = m->xf;
                 L.tPrev = t;
                 if (L.cad.printDue(L.steps, t, r.tEnd)) {

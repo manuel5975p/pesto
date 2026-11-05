@@ -232,6 +232,29 @@ void cliFlags()
           "a structured flag rejected");
     check(codeOf({"flow", "--polymesh", "x"}) == 0, "--polymesh CASE alone stays the simpleFoam path");
     check(codeOf({"flow", "--polymesh", "x", "--re", "10"}) == 2, "... with its own rejection of every other flag");
+    check(codeOf({"flow", "--solver", "fv", "--ogrid", "--body", "cylinder", "--n", "64", "--ny", "32", "--re", "40",
+                  "--rans", "sa-neg"}) == 2,
+          "--rans: the inventory refuses RANS on this route");
+}
+
+// mci: dns/fvimodules (docs/fvincomp.md "Incompressible combinations").
+void inventory()
+{
+    std::printf("inventory\n");
+    using M = FviModule;
+    for (const FviModuleInfo& i : fviModules())
+        check(i.refused.empty() == fviModulesCheck(fviModulesClosure(fviModuleSet({i.id}))).has_value(),
+              std::string(i.name) + ": built iff its closed single set passes");
+    check(!fviModulesCheck(fviModuleSet({M::Gravity})), "gravity without T is refused");
+    check(fviModulesClosure(fviModuleSet({M::Gravity})) == fviModuleSet({M::Gravity, M::Temperature}),
+          "the closure adds T to gravity");
+    check(fviModulesCheck(fviModuleSet({M::LesSigma, M::Temperature, M::Gravity})).has_value(), "LES + T + gravity live");
+    check(fviPair(M::LesSmag, M::LesSigma).decision == FvPairDecision::Exclusive, "one turbulence model");
+    check(fviPair(M::RansSa, M::Temperature).decision == FvPairDecision::Refused, "a refused module refuses its pairs");
+    const FvIncompControls c{.les = 0.17, .betaG = {0, 1, 0}};
+    check(fviModulesOf(c, true) == fviModuleSet({M::LesSmag, M::Temperature, M::Gravity}), "fviModulesOf the controls");
+    check(fviModulesOf(c, false) == fviModuleSet({M::LesSmag, M::Gravity}) && !fviModulesCheck(fviModulesOf(c, false)),
+          "gravity controls without T0: refused");
 }
 
 } // namespace
@@ -242,6 +265,7 @@ int main()
     binding();
     periodicBox();
     cliFlags();
+    inventory();
     {
         auto t = parseFvIncompBcs("[patch.a]\nkind = \"wall\"\nt = 0.5\n[patch.b]\nkind = \"slip\"\n");
         check(t.has_value() && t->patches[0].hasT && t->patches[0].T == 0.5 && !t->patches[1].hasT, "wall t parses");

@@ -110,8 +110,8 @@ std::expected<std::vector<FvConvWall>, std::string> fvConvWalls(const FvBcSpec& 
     for (const FvPatchSpec& p : s.patches) {
         if (p.kind == FvPatchKind::Empty) continue;
         if (p.kind != FvPatchKind::Wall && p.kind != FvPatchKind::Slip)
-            return bcErr(std::format("patch.{}: dns conv takes wall, slip and empty patches: an open face has no "
-                                     "hydrostatic ambient",
+            return bcErr(std::format("patch.{}: dns conv takes wall, slip and empty patches: the layer is closed (an "
+                                     "open face on a hydrostatic ambient is dns flame --mode candle's)",
                                      p.name));
         if (nonzero(p.uWall) || nonzero(p.omega)) return bcErr(std::format("patch.{}: dns conv walls rest", p.name));
         w.push_back({.name = p.name, .fixed = p.isothermal, .T = p.tWall});
@@ -130,6 +130,33 @@ std::expected<std::vector<FvConvWall>, std::string> fvConvWalls(const FvIncompBc
         w.push_back({.name = p.name, .fixed = p.hasT, .T = p.T});
     }
     return w;
+}
+
+std::vector<FvConvWall> fvConvBoxWalls(const FaceMesh& fm, double tBot, double tTop)
+{
+    std::vector<FvConvWall> w;
+    for (const MeshPatch& p : fm.patches) {
+        if (p.type == FoamPatchType::Empty) continue;
+        const bool fl = p.name == "floor", li = p.name == "lid";
+        w.push_back({.name = p.name, .fixed = fl || li, .T = fl ? tBot : tTop});
+    }
+    return w;
+}
+
+FvIncompBcs fvConvIncompBcsOf(std::span<const FvConvWall> walls)
+{
+    FvIncompBcs b;
+    for (const FvConvWall& w : walls)
+        b.patches.push_back({.name = w.name, .kind = FvIncompBc::Wall, .hasT = w.fixed, .T = w.T});
+    return b;
+}
+
+FvBcSpec fvConvCompBcOf(std::span<const FvConvWall> walls)
+{
+    FvBcSpec spec;
+    for (const FvConvWall& w : walls)
+        spec.patches.push_back({.name = w.name, .kind = FvPatchKind::Wall, .isothermal = w.fixed, .tWall = w.T});
+    return spec;
 }
 
 } // namespace dns

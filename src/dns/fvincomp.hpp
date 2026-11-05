@@ -8,6 +8,7 @@
 #pragma once
 
 #include "dns/facemesh.hpp"
+#include "dns/fvimodules.hpp"
 #include "dns/fvprecision.hpp"
 #include "dns/ogrid.hpp"
 #include "dns/sgs.hpp"
@@ -88,6 +89,10 @@ struct FvIncompControls
     // flux is laid by the caller, never projected (div m is not 0).
     bool lowMach = false;
 };
+
+// The inventory's modules of a DeviceFvIncomp run (dns/fvimodules): LES of c, T when
+// thermal (make given T0), gravity when betaG != 0. Read by DeviceFvIncomp::make's guard.
+FviModuleSet fviModulesOf(const FvIncompControls& c, bool thermal);
 
 // Tables of DeviceFvIncomp. nB counts NON-empty boundary faces; b in [0, nB)
 // is FaceMesh face nI + bFace[b]. Vectors [3 n] are component-major.

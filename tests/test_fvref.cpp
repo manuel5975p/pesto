@@ -1017,6 +1017,88 @@ void wellBalanced()
     check(std::abs(m1 / m0 - 1) <= 1e-13, "W2 mass holds to rounding");
 }
 
+// W3 (docs/fvcomp.md "Hydrostatic ambient"): a closed + open box at rest under gravity, its
+// Far / Outflow faces on fvAmbientRows (p_a at the owner centroid), an Inflow at rest: the
+// isothermal column is a fixed point through every face kind on the uniform, oblique-g (the
+// rotated mesh's frame) and random meshes; 200 FP64 steps stay at rounding. The open patch
+// without the ambient, the ambient without gravity, a row off the column: refused by name.
+void hydrostaticAmbient()
+{
+    const double gam = 1.4;
+    const Grid g = Grid::make(24, 14, 1, 2.0, 1.0 + 2.0 / 12.0, 1.0);
+    const Transport tr = Transport::constant(gam, 0.02);
+    const double T0 = 1.0 / tr.Rgas;
+    const FvAmbient amb{.p0 = 1.0, .T0 = T0};
+    const double gs = 0.3, th = 30.0 * std::numbers::pi / 180.0;
+    struct Case
+    {
+        const char* name;
+        FvPerturb kind;
+        std::array<double, 3> gv;
+    };
+    const Case cases[] = {{"uniform", FvPerturb::None, {0.0, -gs, 0.0}},
+                          {"oblique g 30 deg", FvPerturb::None, {gs * std::sin(th), -gs * std::cos(th), 0.0}},
+                          {"random 0.3h", FvPerturb::Random, {0.0, -gs, 0.0}}};
+    for (const Case& k : cases) {
+        auto fm = fvConvBox(g, true, k.kind, k.kind == FvPerturb::None ? 0.0 : 0.3);
+        check(fm.has_value(), "W3 mesh");
+        if (!fm) return;
+        std::vector<FvBc> bc;
+        for (const MeshPatch& p : fm->patches) {
+            FvBc b;
+            b.kind = p.type == FoamPatchType::Empty ? FvBcKind::Empty : FvBcKind::Wall;
+            if (p.name == "xlo") {
+                b.kind = FvBcKind::Inflow;
+                b.tIn = T0;
+            } else if (p.name == "lid") {
+                b.kind = FvBcKind::Outflow;
+                b.characteristic = true;
+                b.pOut = 1.0;
+                b.tBack = T0;
+            } else if (p.name == "xhi") {
+                b.kind = FvBcKind::Far;
+                b.qFar[4] = 1.0 / (gam - 1.0);
+            }
+            bc.push_back(b);
+        }
+        const FvBcTable t = fvAmbientRows(*fm, {.bc = bc, .faceRow = {}}, amb, k.gv, gam, tr.Rgas);
+        const FvConfig cfg{.tr = tr, .bc = t.bc, .bcRow = t.faceRow, .gravity = k.gv, .ambient = amb};
+        auto ref = FvRef::make(*fm, cfg);
+        check(ref.has_value(), std::format("W3 {}: FvRef with the ambient rows", k.name));
+        if (!ref) {
+            std::printf("    %s\n", ref.error().c_str());
+            return;
+        }
+        FvState s = fvAmbientState(*fm, amb, k.gv, gam, tr.Rgas, kFvMeanVars), r;
+        ref->rhs(s, r);
+        double e = 0.0, p1 = 0.0;
+        for (int v = 0; v < 5; ++v) e = std::max(e, maxAbsOf(r.var(v), std::size_t(fm->nC)));
+        for (std::size_t c = 0; c < std::size_t(fm->nC); ++c) p1 = std::max(p1, (gam - 1.0) * s.var(4)[c]);
+        const double bound = 8e-15 * p1 / (2.0 / 24.0);
+        ref->march(s, 0.4 * *ref->stableDt(s), 200);
+        double um = 0.0;
+        for (std::size_t c = 0; c < std::size_t(fm->nC); ++c)
+            um = std::max(um, std::hypot(s.var(1)[c], s.var(2)[c], s.var(3)[c]) / s.var(0)[c]);
+        std::printf("  W3 %s: max|rhs| %.3e (rounding of p/h %.3e), 200 steps max|u| %.3e (c %.3f)\n", k.name, e, bound, um,
+                    std::sqrt(gam * tr.Rgas * T0));
+        check(e <= bound, std::format("W3 {}: the column is a fixed point through Inflow, Outflow, Far faces", k.name));
+        check(um <= 1e-11, std::format("W3 {}: 200 steps stay at rest to rounding", k.name));
+        if (k.kind != FvPerturb::None || k.gv[0] != 0.0) continue;
+        // Refusals by name.
+        auto noAmb = FvRef::make(*fm, {.tr = tr, .bc = t.bc, .bcRow = t.faceRow, .gravity = k.gv});
+        check(!noAmb && noAmb.error().find("needs the hydrostatic ambient") != std::string::npos,
+              "W3 an open patch under gravity without the ambient: refused by name");
+        auto noG = FvRef::make(*fm, {.tr = tr, .bc = bc, .ambient = amb});
+        check(!noG && noG.error().find("without gravity") != std::string::npos, "W3 the ambient without gravity: refused");
+        FvBcTable off = t;
+        for (FvBc& b : off.bc)
+            if (b.kind == FvBcKind::Far) b.qFar[4] *= 1.0 + 1e-6;
+        auto bad = FvRef::make(*fm, {.tr = tr, .bc = off.bc, .bcRow = off.faceRow, .gravity = k.gv, .ambient = amb});
+        check(!bad && bad.error().find("not the hydrostatic ambient's row") != std::string::npos,
+              "W3 a Far row off the column: refused by name");
+    }
+}
+
 int main(int argc, char** argv)
 {
     if (argc > 1 && std::string(argv[1]) == "mms") return mms();
@@ -1033,6 +1115,7 @@ int main(int argc, char** argv)
     e5();
     e6();
     wellBalanced();
+    hydrostaticAmbient();
     return dnstest::finish();
 }
 

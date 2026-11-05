@@ -1,7 +1,7 @@
 // hip/hip_runtime.h -- CUDA build only. See src/compat/cuda/README.md.
 //
 // Host-safe: this header is reached from plain CXX translation units
-// (apps/dns_main.cpp, tests/test_gpu_*.cpp) via gpu/device_util.hpp, so it must
+// (src/dns/drive/*.cpp, tests/test_gpu_*.cpp) via gpu/device_util.hpp, so it must
 // compile under g++ with no nvcc extensions. <cuda_runtime.h> is written for
 // exactly that; the __global__/__device__/blockIdx spellings the .hip sources
 // use come from nvcc itself and never reach the host compiler.

@@ -17,6 +17,7 @@
 
 #include "dns/chem.hpp"
 #include "dns/config.hpp"
+#include "dns/turb_ic.hpp"
 
 #include <algorithm>
 #include <array>
@@ -45,10 +46,13 @@ inline constexpr double kLmChemDtDefault = 1.0;
 // 1.9e4 hits); docs/chem.md "Low-Mach dt rule".
 inline constexpr double kLmPosKDefault = 1.0;
 
-// The checkpoint "solver" record of runLowMach (dns_main's phase 1.5 checks a
+// The checkpoint "solver" record of runLowMach (phase 1.5, dns/drive/run.cpp, checks a
 // --restart against it; runFlame writes "flame-compressible").
 inline constexpr const char* kLowMachSolverName = "flame-lowmach";
 inline constexpr const char* kFlameCompSolverName = "flame-compressible";
+// The FV flame routes' (runFvComp, runFvLowMach; --solver fv | --polymesh).
+inline constexpr const char* kFvFlameCompSolverName = "flame-fv-compressible";
+inline constexpr const char* kFvLowMachSolverName = "flame-fv-lowmach";
 
 // The premixed weight of a cell's flame index xi (Takeno; D14): w_p =
 // smoothstep(-0.2, 0.2, xi) = t^2 (3 - 2t), t = clamp((xi + 0.2)/0.4, 0, 1).
@@ -121,6 +125,27 @@ struct LowMachState
 // c.sub == Flame, premixed or bunsen mode.
 LowMachState lowmachIC(const Case& c);
 
+// --turb on the low-Mach planar flame (M5, docs/chem.md "Low-Mach turbulence"): every
+// MAC face's m += rho_f w(x_f) u'_a(x_f), the box (flameTurbSpec) at the face centre
+// (turbBoxAt: the face's axis unshifted, the others at the cell centre; face i reads box
+// column i mod nbx), w = turbWindow(x_f, x_f0 - 1.5 l_t, l_t/4) -- flame1d
+// addTurbulence's field and window on the staggered faces. rho_f the mean of the
+// face's two cells (the inflow x face: the inflow density P0/(R Tu), the outflow face:
+// the last cell's). Pre: c.flameTurb > 0, premixed (not bunsen), s = lowmachIC(c).
+void lowmachAddTurbulence(const Case& c, LowMachState& s);
+
+// The --turb inflow rows of the structured low-Mach face at sweep X (M5): row j + ny k
+// of m = mIn + rho_in u'(-X, (j + 1/2) hy, (k + 1/2) hz), v = v'(-X, j hy, (k + 1/2)
+// hz), w = w'(-X, (j + 1/2) hy, k hz) (the tangential MAC edges' positions), from three
+// TurbSweep point sets (lowmachTurbSweeps). rho_in = P0/(R Tu) = 1.
+struct LowMachTurbSweeps
+{
+    TurbSweep m, v, w;
+};
+LowMachTurbSweeps lowmachTurbSweeps(const Case& c);
+void lowmachTurbRows(const LowMachTurbSweeps& s, double X, double mIn, std::vector<double>& m, std::vector<double>& v,
+                     std::vector<double>& w);
+
 // A partially premixed cell of the --equivalence burner (masterplan
 // real_bunsen S5) from its mass fractions of three gases: fresh rich premix
 // a (Y_F1, Y_O1, T = Tu), the jet's burnt products b (Y_F,rem, Y_O 0) whose
@@ -153,6 +178,24 @@ struct LmInflowRow
     double m, t, yF, yO, jet, pilot, co;
 };
 LmInflowRow lmInflowRow(const Case& c, double y, double z);
+
+// The burner's x-lo rows of the structured grid, row j + ny k (gpu/lowmach's rowM,
+// rowT, rowY): lmInflowRow at the row centre, T = Tu t; yO empty without
+// --equivalence. Pre: as lmInflowRow.
+struct LmInflowRows
+{
+    std::vector<double> m, T, yF, yO;
+};
+LmInflowRows lmInflowRows(const Case& c);
+
+// One cell of lowmachBunsenIC at the point (x, y, z), its row's m: the ONE IC rule,
+// shared with the FV burner (a FaceMesh centroid in the box's coordinates).
+// Pre: c.flameBunsen, !c.lmRim (the rim IC is the developed tube's, per grid).
+struct LmBunsenCell
+{
+    double rho, ryF, ryO, m;
+};
+LmBunsenCell lmBunsenPoint(const Case& c, double x, double y, double z);
 
 // The developed tube flow of --rim (D12), u(r) per unit bulk speed at the
 // cell centres of grid g: the discrete steady solution of the solver's

@@ -86,7 +86,7 @@ Tip measure(const std::vector<std::string>& args)
         check(false, "rotor table: " + tbl.error());
         return out;
     }
-    // Box units of the compressible flow (dns_main): rho = 1, p = uInf^2 /
+    // Box units of the compressible flow (dns/drive/flow.cpp): rho = 1, p = uInf^2 /
     // (gamma M^2).
     const double gamma = dns::kGammaAir;
     const double pInf = c->uInf * c->uInf / (gamma * c->mach * c->mach);

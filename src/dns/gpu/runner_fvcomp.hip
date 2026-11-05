@@ -1,13 +1,18 @@
 #include "dns/gpu/runner_fvcomp.hpp"
 
+#include "dns/fvturb.hpp"
+
 #include "dns/gpu/chem.hpp"
 #include "dns/gpu/hip_runtime.hpp"
+#include "dns/gpu/internal/checkpoint.hpp"
 #include "dns/gpu/internal/frame_scratch.hpp"
 #include "dns/gpu/internal/run_loop.hpp"
 #include "dns/interrupt.hpp"
+#include "dns/lowmach.hpp"
 #include "dns/steady_stop.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -47,15 +52,60 @@ double dot3(const std::array<double, 3>& a, const std::array<double, 3>& b)
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
 
+// runFvComp's loop state: EVERY host variable the time loop carries from one
+// step to the next, so the checkpoint's "loop.*" records (fields();
+// gpu/internal/checkpoint.hpp). A loop variable outside it breaks the restart
+// byte rule silently (gpu_restart_fv is the proof).
+struct FvCompLoop
+{
+    double t = 0.0, dtStab = 0.0, uCur = 0.0, dtFirst = 0.0;
+    int sinceDt = 1 << 30;
+    long step = 0;
+    internal::StatsCadence cad;
+    internal::ProfileSchedule prof;
+    double dtChem = HUGE_VAL, xfPrev = NAN, tPrev = 0, lastHits = 0, lastMin = 0, lastMax = 1;
+    bool bindChem = false;
+    double sweep = 0.0; // --turb: X = sum U dt, the box's travel past the inflow (FP64)
+
+    explicit FvCompLoop(const FvCompRun& r) : uCur(r.ramp > 0 ? 0.0 : r.fs.U), cad{r.statsEvery}, prof(r.profileDt) {}
+
+    template <class F>
+    void fields(F&& f)
+    {
+        f("t", t);
+        f("dtStab", dtStab);
+        f("uCur", uCur);
+        f("dtFirst", dtFirst);
+        f("sinceDt", sinceDt);
+        f("steps", step);
+        f("cad.lastLog", cad.lastLog);
+        f("cad.lastPrint", cad.lastPrint);
+        f("prof.next", prof.next);
+        f("dtChem", dtChem);
+        f("xfPrev", xfPrev);
+        f("tPrev", tPrev);
+        f("lastHits", lastHits);
+        f("lastMin", lastMin);
+        f("lastMax", lastMax);
+        f("bindChem", bindChem);
+        f("sweep", sweep);
+    }
+};
+
 } // namespace
 
 std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvState& ic, const FvCompRun& r,
                                             const FvRaster& raster, RunOutput& out)
 {
+    const CheckpointPolicy& cp = r.ckpt;
+    assert(!cp.active() || (r.ramp <= 0 && r.steadyTol <= 0));
     auto made = DeviceFvComp::make(fm, r.solver);
     if (!made) return fail(made.error().starts_with("FV device") ? 6 : 3, made.error());
     DeviceFvComp& dev = *made;
     if (auto u = dev.upload(ic); !u) return fail(6, u.error());
+    // --restart: the checkpoint's words replace the IC, bit for bit.
+    if (cp.restart)
+        if (auto e = dev.load(*cp.restart); !e) return std::unexpected(e.error());
     // The solver validated the converged table; a ramp starts from frac 0.
     auto retarget = [&](double frac) -> std::expected<void, RunError> {
         for (std::size_t p = 0; p < fm.patches.size(); ++p) {
@@ -84,10 +134,30 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
                                            "TFresh", "yMin", "yMax",  "burn",  "fuel"}
                 : std::vector<std::string>{"t",   "dt",  "cd",   "cl",     "cs",     "heat",
                                            "machMax", "cdf", "clf", "mass", "energy", "kinetic"};
+    // The candle: the structured candle's two columns (max |u|, the outflow cells' min u.dir).
+    const bool candle = r.jet && r.jet->spec().candle;
+    if (candle) cols.insert(cols.end(), {"uMax", "uOutMin"});
     if (rans) {
         cols.emplace_back("mutMax");
         if (ransSst(r.solver.rans.model)) cols.emplace_back("floorHits");
     }
+    // TFLES: the structured runner's Omega-weighted mean E and max F E (V-weighted here).
+    const bool thick = r.flame && r.solver.tfles.has_value();
+    if (thick) cols.insert(cols.end(), {"Ebar", "FEmax"});
+    const bool zCols = r.flame && r.premix.has_value();
+    if (zCols) cols.insert(cols.end(), {"zMin", "zMax"});
+    // --restart: every output back to its checkpointed length (the series then
+    // append, without a header).
+    if (cp.restart) {
+        auto at = outputResume(*cp.restart);
+        if (!at) return fail(3, "--restart: " + at.error());
+        if (auto e = out.resumeAt(*at); !e) return fail(3, e.error());
+    }
+    // --turb: the structured 3D flame's surface ratio area = sum V |grad Y_F| / (A dY_F)
+    // (dY_F: the inflow Y_F minus the burnt one; the least-squares gradient, central on the
+    // uniform box) and I0 = SL/area.
+    const bool areaCols = r.flame && r.turbSweep;
+    if (areaCols) cols.insert(cols.end(), {"area", "I0"});
     if (auto e = out.declareSeries("stats", cols, r.label); !e) return fail(4, e.error());
     if (r.flame) {
         const std::string pcols[] = {"t", "x", "T", "rho", "u", "p", "Y", "omega"};
@@ -174,16 +244,35 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
     };
 
     RunStats st;
-    double t = 0.0, dtStab = 0.0, uCur = r.ramp > 0 ? 0.0 : r.fs.U;
-    int sinceDt = 1 << 30;
-    long step = 0;
-    double dtFirst = 0.0;
-    internal::StatsCadence cad{r.statsEvery};
-    internal::ProfileSchedule prof(r.profileDt);
+    FvCompLoop L(r);
+    double &t = L.t, &dtStab = L.dtStab, &uCur = L.uCur, &dtFirst = L.dtFirst;
+    int& sinceDt = L.sinceDt;
+    long& step = L.step;
+    internal::StatsCadence& cad = L.cad;
+    internal::ProfileSchedule& prof = L.prof;
+    double &dtChem = L.dtChem, &xfPrev = L.xfPrev, &tPrev = L.tPrev, &lastHits = L.lastHits, &lastMin = L.lastMin,
+           &lastMax = L.lastMax;
+    bool& bindChem = L.bindChem;
+    // --restart: the loop where the checkpoint left it.
+    long steps0 = 0;
+    if (cp.restart) {
+        if (auto e = internal::loadLoop(*cp.restart, L); !e) return fail(3, "--restart: " + e.error());
+        steps0 = step;
+    }
     const auto wall0 = std::chrono::steady_clock::now();
-
-    double dtChem = HUGE_VAL, xfPrev = NAN, tPrev = 0, lastHits = 0, lastMin = 0, lastMax = 1;
-    bool bindChem = false;
+    internal::CheckpointSchedule ckpt(cp, t, wall0);
+    auto writeCheckpoint = [&]() -> std::expected<void, RunError> {
+        Checkpoint ck;
+        internal::putHeader(ck, cp, kFvFlameCompSolverName, {fm.nC, fm.nI, fm.nB, r.solver.chem.nY}, t, step);
+        internal::saveLoop(ck, L);
+        auto at = out.resumePoint();
+        if (!at) return fail(4, "checkpoint: " + at.error());
+        putOutputResume(ck, *at);
+        if (auto e = dev.save(ck); !e) return std::unexpected(e.error());
+        if (auto e = ck.write(checkpointPath(cp.prefix)); !e) return fail(4, "checkpoint: " + e.error());
+        return {};
+    };
+    bool stopped = false; // a checkpoint stop: the run is incomplete
     // One flame measure: the stats row and/or the profile, the drift guard.
     auto flameRow = [&](double dt, bool row, bool profile) -> std::expected<void, RunError> {
         if (auto c = dev.speciesFields(flameState, flameOmega); !c) return fail(6, c.error());
@@ -195,8 +284,38 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
         lastMax = m.yMax;
         if (row) {
             const double dxf = std::isfinite(xfPrev) && t > tPrev ? (m.xf - xfPrev) / (t - tPrev) : 0.0;
-            const double v[] = {t,      dt,          dtChem, m.SL,   m.uRef - dxf, m.xf,   m.dth,    m.Tmax, m.mass, m.energy,
-                                m.omegaEdge, m.hits, m.uRef, m.pRef, m.TRef,       m.yMin, m.yMax, m.burn, m.fuel};
+            std::vector<double> v = {t,      dt,          dtChem, m.SL,   m.uRef - dxf, m.xf,   m.dth,    m.Tmax, m.mass, m.energy,
+                                     m.omegaEdge, m.hits, m.uRef, m.pRef, m.TRef,       m.yMin, m.yMax, m.burn, m.fuel};
+            if (thick) {
+                auto ts = dev.tflesStats();
+                if (!ts) return fail(6, ts.error());
+                v.push_back(ts->Ebar);
+                v.push_back(ts->FEmax);
+            }
+            if (zCols) {
+                double zMin = HUGE_VAL, zMax = -HUGE_VAL;
+                const double *ry = flameState.var(kFvMeanVars), *ro = flameState.var(kFvMeanVars + 1), *rho = flameState.var(0);
+                for (std::size_t c = 0; c < std::size_t(flameState.nC); ++c) {
+                    const double z = r.premix->mixtureFraction(ry[c] / rho[c], ro[c] / rho[c]);
+                    zMin = std::min(zMin, z);
+                    zMax = std::max(zMax, z);
+                }
+                v.insert(v.end(), {zMin, zMax});
+            }
+            if (areaCols) {
+                FvEval ev;
+                dns::FvState rr;
+                if (auto e = dev.evaluate(ev, rr); !e) return fail(6, e.error());
+                const std::size_t nC = std::size_t(fm.nC), k0 = std::size_t(3 * r.flame->spec().fuel);
+                double a = 0.0;
+                for (std::size_t c = 0; c < nC; ++c)
+                    a += fm.V[c] * std::sqrt(ev.gradY[k0][c] * ev.gradY[k0][c] + ev.gradY[k0 + 1][c] * ev.gradY[k0 + 1][c] +
+                                             ev.gradY[k0 + 2][c] * ev.gradY[k0 + 2][c]);
+                // Normalised by the fuel's jump (C2b: Y_F,rem is burnt; C0: 1).
+                const double dY = r.turbPatch->y[std::size_t(r.flame->spec().fuel)] - r.flame->spec().yBurnt;
+                const double area = a / (r.flame->area() * dY);
+                v.insert(v.end(), {area, m.SL / area});
+            }
             out.row("stats", v);
             xfPrev = m.xf;
             tPrev = t;
@@ -235,27 +354,48 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
         double fuelIn = 0, fuelOut = 0;
         for (std::size_t p = 0; p < fm.patches.size(); ++p) {
             const FvBcKind k = r.solver.bc[p].kind;
-            if (k == FvBcKind::Far || k == FvBcKind::Inflow) fuelIn -= (*pf)[p];
-            if (k == FvBcKind::Outflow) fuelOut += (*pf)[p];
+            // The candle's Far top is its outflow.
+            const bool out = k == FvBcKind::Outflow || (candle && k == FvBcKind::Far);
+            if (!out && (k == FvBcKind::Far || k == FvBcKind::Inflow)) fuelIn -= (*pf)[p];
+            if (out) fuelOut += (*pf)[p];
         }
         lastHits = m.hits;
         lastMin = std::min(m.yfMin, m.yoMin);
         lastMax = m.zMax;
-        const double v[] = {t,     dt,      dtChem, m.xTip,  m.xBase, m.half,  m.Tmax,   m.TmaxIn, m.burn,
-                            fuelIn, fuelOut, fuelIn > 0 ? m.burn / fuelIn : 0.0, m.mass, m.energy, m.pMean,
-                            m.zMin, m.zMax,  m.yfMin, m.yoMin, m.hits,  1.0};
+        const FvJetSpec& js = r.jet->spec();
+        std::vector<double> v = {t,     dt,      dtChem, m.xTip,  m.xBase, m.half,  m.Tmax,   m.TmaxIn, m.burn,
+                                 fuelIn, fuelOut, fuelIn > 0 ? m.burn / fuelIn : 0.0, m.mass, m.energy, m.pMean,
+                                 m.zMin, m.zMax,  m.yfMin, m.yoMin, m.hits,  1.0};
+        double uOutMin = HUGE_VAL;
+        if (candle) {
+            // Owners of Outflow / Far faces, ascending face order: u.dir (< 0 = air drawn down).
+            for (std::size_t b = 0; b < std::size_t(fm.nB); ++b) {
+                const int row = r.solver.bcRow.empty() ? -1 : r.solver.bcRow[b];
+                if (row < 0) continue;
+                const FvBcKind k = r.solver.bc[std::size_t(row)].kind;
+                if (k != FvBcKind::Outflow && k != FvBcKind::Far) continue;
+                const std::size_t c = std::size_t(fm.own[std::size_t(fm.nI) + b]);
+                const double rho = flameState.var(0)[c];
+                double un = 0.0;
+                for (int k = 0; k < 3; ++k) un += flameState.var(1 + k)[c] / rho * js.dir[std::size_t(k)];
+                uOutMin = std::min(uOutMin, un);
+            }
+            v.insert(v.end(), {m.uMax, uOutMin});
+        }
         out.row("stats", v);
         cad.logged(step);
-        const FvJetSpec& js = r.jet->spec();
         if (!r.quiet && cad.printDue(step, t, r.tEnd)) {
-            std::printf("t=%.3f/%.3f xTip=%.3f half=%.3f TmaxIn/Tad=%.4f burn/in=%.4f p/p0=%.4f hits=%g dt=%.2e%s\n", t, r.tEnd,
+            std::printf("t=%.3f/%.3f xTip=%.3f half=%.3f TmaxIn/Tad=%.4f burn/in=%.4f p/p0=%.4f hits=%g dt=%.2e%s", t, r.tEnd,
                         m.xTip, m.half, m.TmaxIn / (js.model.sigma * js.T0), fuelIn > 0 ? m.burn / fuelIn : 0.0, m.pMean,
                         m.hits, dt, bindChem ? " (chem dt)" : "");
+            if (candle) std::printf(" |u|max=%.4g uOutMin=%.4g", m.uMax, uOutMin);
+            std::printf("\n");
             std::fflush(stdout);
             cad.printed(step);
         }
         const double Tmid = 0.5 * (1.0 + js.model.sigma) * js.T0;
         std::string why;
+        if (js.quiescent) return {}; // no fuel: nothing to extinguish
         if (m.TmaxIn < Tmid)
             why = std::format("Tmax past the ends = {:.4g} T0 fell below the mid temperature {:.4g} T0 (extinction)",
                               m.TmaxIn / js.T0, Tmid / js.T0);
@@ -343,8 +483,21 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
         return st;
     }
 
+    double& sweep = L.sweep;
+    std::array<std::vector<double>, 3> turbU;
+    std::vector<FvBc> turbRows(r.turbSweep ? r.turbSweep->points() : 0);
     while (t < r.tEnd) {
-        if (stopRequested()) break;
+        if (stopRequested()) {
+            // SIGINT / SIGTERM with checkpoints on: keep this step boundary.
+            if (ckpt.stopWorth(t)) {
+                if (auto e = writeCheckpoint(); !e) return std::unexpected(e.error());
+                (void)ckpt.written(t);
+                std::printf("checkpoint: t=%.9g steps=%ld (%s; resume with --restart %s)\n", t, step, stopReason(),
+                            cp.prefix.c_str());
+                stopped = true;
+            }
+            break;
+        }
         // Collapse is relative: a real mesh's dt has no absolute scale.
         std::string diverged;
         if (auto e = internal::recomputeDt(sinceDt, dtStab, r.dtRecompute, r.dtMargin, 1e-4 * dtFirst, [&] {
@@ -365,7 +518,16 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
             return fail(7, diverged.empty() ? e.error() : diverged);
         if (dtFirst == 0.0) dtFirst = dtStab;
         const double dt = std::min(r.tEnd - t, dtStab);
+        // --turb: the box column the inflow faces see at the step's start, held over its
+        // stages; the box then sweeps past at U.
+        if (r.turbSweep) {
+            r.turbSweep->sample(sweep, turbU);
+            for (std::size_t i = 0; i < turbRows.size(); ++i)
+                turbRows[i] = fvFarTurbRow(*r.turbPatch, r.fs, {turbU[0][i], turbU[1][i], turbU[2][i]});
+            if (auto e = dev.setBcRows(r.turbFirst, turbRows); !e) return fail(6, e.error());
+        }
         dev.step(dt);
+        sweep += r.fs.U * dt;
         if (t < r.ramp) {
             // Quiet start, as the structured O-grid: an exact Galilean boost,
             // then the open patches retarget.
@@ -395,7 +557,20 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
             std::fflush(stdout);
             cad.printed(step);
         }
+        // --checkpoint-dt: at the end of the step (its rows and frame written).
+        if (ckpt.due(t, r.tEnd)) {
+            if (auto e = writeCheckpoint(); !e) return std::unexpected(e.error());
+            if (ckpt.written(t)) {
+                std::printf("checkpoint: t=%.9g steps=%ld (incomplete; resume with --restart %s)\n", t, step,
+                            cp.prefix.c_str());
+                stopped = true;
+                break;
+            }
+            std::printf("checkpoint: t=%.9g steps=%ld -> %s\n", t, step, checkpointPath(cp.prefix).c_str());
+        }
     }
+    // A checkpointed run's .json says whether it reached --tt.
+    if (cp.active()) out.setCompletion(!stopped && t >= r.tEnd, cp.restarts);
     if (r.flame && lastHits > 0)
         std::fprintf(stderr,
                      "dns: warning: %g cells with Y outside [-1e-6, 1+1e-6] at the last stats row (counted, never "
@@ -409,7 +584,8 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
     if (burning) std::printf("label: %s\n", r.label.c_str());
     st.steps = step;
     st.tStop = t;
-    finishTiming(st, wall0, out);
+    // ms/step over THIS job's steps (a restart's steps0 came before it).
+    finishTiming(st, wall0, out, steps0);
     return st;
 }
 

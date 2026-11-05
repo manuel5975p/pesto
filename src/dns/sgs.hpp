@@ -24,6 +24,11 @@ namespace dns {
 
 enum class SgsModel { Smagorinsky, Sigma };
 
+// Sc_t = Pr_t of the flame LES's eddy Fick and Fourier fluxes: ONE constant (Le_t
+// = 1 keeps the Shvab-Zeldovich coupling), the compressible solvers' 0.9
+// (gpu/comp.hpp prt_, FvCompConfig::prt). The low-Mach solvers read this.
+inline constexpr double kLesPrt = 0.9;
+
 namespace detail {
 
 // Per-precision tuning of the sigma operator, MEASURED (2026-07-26, 5e5 random

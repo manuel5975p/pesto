@@ -305,7 +305,7 @@ void addTurbulence(const Case& c, const std::array<std::vector<double>, 3>& box,
         for (int j = 0; j < g.ny; ++j)
             for (int i = 0; i < g.nx; ++i) {
                 const double x = (i + 0.5) * g.hx;
-                const double w = 0.5 * (1.0 - std::tanh((x - xw) / ew));
+                const double w = turbWindow(x, xw, ew);
                 const std::size_t b =
                     std::size_t(i % nbx) + std::size_t(nbx) * (j + std::size_t(g.ny) * k);
                 const std::size_t cc = g.idx(i, j, k);
@@ -361,6 +361,90 @@ void wickIC(const Case& c, CompState& q, std::vector<double> (&rhoY)[3])
             rhoY[0][cc] = r * st.YF;
             rhoY[1][cc] = r * st.YO;
         }
+}
+
+FlameBurnt flameBurnt(const Case& c)
+{
+    FlameBurnt b{.burn = c.premix};
+    if (c.flamePremix2) b.burn.phi = c.premixBurnPhi();
+    b.sigma = c.flamePremix2 ? c.premix.sigmaAt(b.burn.phi) : c.flameModel.sigma;
+    return b;
+}
+
+TflesSetup flameTflesSetup(const Case& c, double sigma, int dilate)
+{
+    const double thetaS = kTflesTaFraction * c.flameModel.theta();
+    return TflesSetup{.F = c.flameTfles,
+                      .uniform = c.flameTflesUniform,
+                      .charlette = c.flameCharlette,
+                      .deltaL = c.flameEig.dthOverDD,
+                      .nuU = c.prandtl, // mu = Pr, rho_u = 1
+                      .lnAs = -tflesSensorLogMax(sigma, thetaS),
+                      .TaS = thetaS * c.flameTu,
+                      .dilate = dilate};
+}
+
+Transport flameGas(const Case& c, double T)
+{
+    return Transport::air(c.prandtl, T, c.tinfK, c.prandtl, kGammaAir, kRgasBox, c.sutherland);
+}
+
+FlameInflowRows bunsenInflowRows(const Case& c)
+{
+    const Grid& g = c.grid;
+    const double Tu = c.flameTu;
+    FlameInflowRows r;
+    for (int k = 0; k < g.nz; ++k)
+        for (int j = 0; j < g.ny; ++j) {
+            const BunsenInflowRow in = bunsenInflowAt(c.bunsen, (j + 0.5) * g.hy, (k + 0.5) * g.hz);
+            const double T = Tu * in.t, rho = Tu / T; // p0 = Tu, R = 1
+            r.u.push_back(in.u);
+            r.jet.push_back(in.jet);
+            r.target.push_back(c.nscbcThermalInflow ? 1.0 / (kRgasBox * T) : rho);
+            r.rho.push_back(rho);
+            r.yF.push_back(in.Y);
+        }
+    return r;
+}
+
+FlameInflowRows diffusionInflowRows(const Case& c, double gx, double pIn)
+{
+    const Grid& g = c.grid;
+    const DiffusionModel& m = c.diff;
+    const double T0 = c.flameTu;
+    FlameInflowRows r;
+    for (int j = 0; j < g.ny; ++j) {
+        const DiffusionInflowRow in = c.flameQuiescent ? quiescentInflow(m) : diffusionInflow(m, c.bunsen, (j + 0.5) * g.hy);
+        const double T = T0 * in.t;
+        const double rho = gx > 0 ? pIn / T : T0 / T; // p0 = T0, R = 1
+        r.u.push_back(in.u);
+        r.jet.push_back(in.jet);
+        r.target.push_back(c.nscbcThermalInflow ? 1.0 / (kRgasBox * T) : rho);
+        r.rho.push_back(rho);
+        r.yF.push_back(in.YF);
+        r.yO.push_back(in.YO);
+    }
+    return r;
+}
+
+FlameInflowRows wickInflowRows(const Case& c, double pIn)
+{
+    const double T0 = c.flameTu;
+    FlameInflowRows r;
+    for (int j = 0; j < c.grid.ny; ++j) {
+        r.u.push_back(c.bunsen.uCo);
+        r.jet.push_back(0.0);
+        r.target.push_back(c.nscbcThermalInflow ? 1.0 / (kRgasBox * T0) : pIn / T0);
+        r.yF.push_back(0.0);
+        r.yO.push_back(c.diff.yO2);
+    }
+    return r;
+}
+
+void bunsenTurbJetWeight(std::array<std::vector<double>, 3>& box, std::span<const double> jet, int nbx)
+{
+    for (auto& comp : box)
+        for (std::size_t q = 0; q < comp.size(); ++q) comp[q] *= jet[q / std::size_t(nbx)];
 }
 
 } // namespace dns

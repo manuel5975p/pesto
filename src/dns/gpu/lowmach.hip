@@ -44,6 +44,8 @@ struct LmK
     // tube's wall T (read by the Wall instantiations only).
     const std::uint8_t* code;
     Real wallT;
+    // M5 --turb: the inflow's tangential rows (read by the Turb instantiation only).
+    const Real *inV, *inW;
 };
 
 // The MAC mass fluxes of one state: x (nx + 1 per row), the y and z LO faces
@@ -321,13 +323,52 @@ __device__ inline Real wallCond(const LmK& K, Real h)
     return rhoDAt(K, K.wallT) / (Real(0.5) * h);
 }
 
+// --- LES and TFLES (M4; header comment, docs/chem.md "Low-Mach LES") ----------
+// The interior faces' diffusivity of T and the species, one instantiation each:
+// Molecular rho D (the S8 kernels), Eddy rho D + mu_t,f / Sc_t, Thick F E_f rho D
+// + (1 - Omega_f) mu_t,f / Sc_t (no SGS flux where the sensor thickens; mut null
+// = no LES); face values arithmetic means (species.hip effRhoD's operands).
+enum : int
+{
+    kLmMolecular = 0,
+    kLmEddy = 1,
+    kLmThick = 2
+};
+
+struct LmEddy
+{
+    const Real* mut; // mu_t per cell (null: no LES)
+    Real invSct;
+    const Real *FE, *Om; // TFLES (null: not thickened)
+};
+
+template <int Diff>
+__device__ inline Real lmEffD(const LmEddy& E, std::size_t L, std::size_t R, Real rd)
+{
+    if constexpr (Diff == kLmMolecular) {
+        return rd;
+    } else if constexpr (Diff == kLmEddy) {
+        return rd + Real(0.5) * (E.mut[L] + E.mut[R]) * E.invSct;
+    } else {
+        Real r = Real(0.5) * (E.FE[L] + E.FE[R]) * rd;
+        if (E.mut) {
+            const Real om = Real(0.5) * (E.Om[L] + E.Om[R]);
+            r += (Real(1) - om) * (Real(0.5) * (E.mut[L] + E.mut[R])) * E.invSct;
+        }
+        return r;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 1. Cell pass: T, Y_k, omega, mu(T), div u.
 
-template <bool TwoR, bool Phi, bool OY, bool OZ>
+// Eof (M4 TFLES, C0 only): omega *= E/F of the cell (gpu/tfles' eof); false
+// = the S8 kernel bit for bit.
+template <bool TwoR, bool Phi, bool OY, bool OZ, bool Eof = false>
 __global__ void kLmCellPass(LmK K, PhiRateLaw<Real> law, const Real* rho,
                             const Real* ry0, const Real* ry1, LmM M, Real* T,
-                            Real* Y0, Real* Y1, Real* om, Real* mu, Real* divu)
+                            Real* Y0, Real* Y1, Real* om, Real* mu, Real* divu,
+                            const Real* eof)
 {
     using L = Lat<OY, OZ>;
     const GpuGrid& g = K.g;
@@ -350,7 +391,10 @@ __global__ void kLmCellPass(LmK K, PhiRateLaw<Real> law, const Real* rho,
         else
             om[c] = arrheniusRate2(K.lnA, K.Ta, r, y0, y1, t);
     } else {
-        om[c] = arrheniusRate(K.lnA, K.Ta, r, y0, t);
+        if constexpr (Eof)
+            om[c] = arrheniusRate(K.lnA, K.Ta, r, y0, t) * eof[c];
+        else
+            om[c] = arrheniusRate(K.lnA, K.Ta, r, y0, t);
     }
     mu[c] = K.vv.mu * ratioAt(K.vv, t);
     const Real mxl = M.x[L::fx(g, i, j, k)], mxh = M.x[L::fx(g, i + 1, j, k)];
@@ -391,16 +435,45 @@ __global__ void kLmCellVelocity(LmK K, const Real* rho, LmM M, Real* u, Real* v,
     w[c] = Real(0.5) * (wl + wh);
 }
 
+// M4 LES: mu_t = rho (cs Delta)^2 rate(g) of cell (i, j, k) (dns/sgs.hpp; cd2 =
+// (cs Delta)^2), g[q][a] = d u_q / d x_a the central difference of the
+// cell-centred velocity (kLmCellVelocity) over 2 h_a; a missing neighbour is
+// the cell itself (x ends, open lateral ends: Lat clamps; nz == 1: the z row
+// is 0). mu += mu_t: the momentum stress reads mu + mu_t through mu.
+template <bool OY, bool OZ>
+__global__ void kLmNut(LmK K, Real cd2, int sigma, const Real* rho, const Real* u,
+                       const Real* v, const Real* w, Real* mut, Real* mu)
+{
+    using L = Lat<OY, OZ>;
+    const GpuGrid& g = K.g;
+    const std::size_t c = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= g.size()) return;
+    int i, j, k;
+    decompose(g, c, i, j, k);
+    const Real* U[3] = {u, v, w};
+    const Real ih[3] = {Real(0.5) / g.hx, Real(0.5) / g.hy, Real(0.5) / g.hz};
+    const std::size_t nb[3][2] = {
+        {L::cell(g, clampN(i - 1, g.nx), j, k), L::cell(g, clampN(i + 1, g.nx), j, k)},
+        {L::cell(g, i, j - 1, k), L::cell(g, i, j + 1, k)},
+        {L::cell(g, i, j, k - 1), L::cell(g, i, j, k + 1)}};
+    Real gd[3][3];
+    for (int q = 0; q < 3; ++q)
+        for (int a = 0; a < 3; ++a) gd[q][a] = (U[q][nb[a][1]] - U[q][nb[a][0]]) * ih[a];
+    const Real mt = rho[c] * (cd2 * sgsRate<Real>(sigma, gd));
+    mut[c] = mt;
+    mu[c] = mu[c] + mt;
+}
+
 // ---------------------------------------------------------------------------
 // 2. Temperature predictor and the divergence target.
 
 // The lateral axis A's part of R_T for cell (i, j, k): conv += -(ch - cl)/h,
 // dif += (dh - dl)/h. An open boundary face: upwind (ambient on inflow, the
 // cell's own on outflow: 0), no diffusion.
-template <bool OY, bool OZ, int A, bool Wall>
+template <bool OY, bool OZ, int A, bool Wall, int Diff = kLmMolecular>
 __device__ inline void latT(const LmK& K, const Real* const* Vp, int nv,
                             const Real* T, const LmM& M, int i, int j, int k,
-                            Real tc, Real& conv, Real& dif)
+                            Real tc, Real& conv, Real& dif, const LmEddy& E = {})
 {
     using L = Lat<OY, OZ>;
     const GpuGrid& g = K.g;
@@ -432,7 +505,8 @@ __device__ inline void latT(const LmK& K, const Real* const* Vp, int nv,
         if constexpr (Wall) wallFace(K, fl);
         const Real tl = sharedThetaOf(Vp, nv, -1, fl, ml);
         cl = ml * (faceValue2(T, fl, ml, tl) - tc);
-        dl = rhoDAt(K, Real(0.5) * (T[fl.L] + T[fl.R])) * (tc - T[fl.L]) / h;
+        dl = lmEffD<Diff>(E, fl.L, fl.R, rhoDAt(K, Real(0.5) * (T[fl.L] + T[fl.R]))) *
+             (tc - T[fl.L]) / h;
     }
     if (hiOpen) {
         ch = mh < Real(0) ? mh * (K.ambT - tc) : Real(0);
@@ -446,17 +520,20 @@ __device__ inline void latT(const LmK& K, const Real* const* Vp, int nv,
         if constexpr (Wall) wallFace(K, fh);
         const Real tH = sharedThetaOf(Vp, nv, -1, fh, mh);
         ch = mh * (faceValue2(T, fh, mh, tH) - tc);
-        dh = rhoDAt(K, Real(0.5) * (T[fh.L] + T[fh.R])) * (T[fh.R] - tc) / h;
+        dh = lmEffD<Diff>(E, fh.L, fh.R, rhoDAt(K, Real(0.5) * (T[fh.L] + T[fh.R]))) *
+             (T[fh.R] - tc) / h;
     }
     conv -= (ch - cl) / h;
     dif += (dh - dl) / h;
 }
 
-template <bool TwoR, bool OY, bool OZ, bool Wall>
+// Diff (M4): the interior faces' conduction (lmEffD); kLmMolecular = the S8
+// kernel bit for bit.
+template <bool TwoR, bool OY, bool OZ, bool Wall, int Diff = kLmMolecular>
 __global__ void kLmTemperature(LmK K, Real ca, Real cb, Real cr,
                                const Real* rhoA, const Real* rhoB, const Real* T,
                                const Real* Y0, const Real* Y1, const Real* om,
-                               LmM M, Real* Tstar, Real* D)
+                               LmM M, Real* Tstar, Real* D, LmEddy E)
 {
     using L = Lat<OY, OZ>;
     const GpuGrid& g = K.g;
@@ -497,7 +574,8 @@ __global__ void kLmTemperature(LmK K, Real ca, Real cb, Real cr,
             const Real m = M.x[L::fx(g, i, j, k)];
             const Real th = sharedThetaOf(Vp, nY + 1, -1, f, m);
             cl = m * (faceValue2(T, f, m, th) - tc);
-            dl = rhoDAt(K, Real(0.5) * (T[f.L] + T[f.R])) * (tc - T[f.L]) / h;
+            dl = lmEffD<Diff>(E, f.L, f.R, rhoDAt(K, Real(0.5) * (T[f.L] + T[f.R]))) *
+                 (tc - T[f.L]) / h;
         }
         Real ch, dh;
         if (i == g.nx - 1) {
@@ -518,12 +596,13 @@ __global__ void kLmTemperature(LmK K, Real ca, Real cb, Real cr,
             const Real m = M.x[L::fx(g, i + 1, j, k)];
             const Real th = sharedThetaOf(Vp, nY + 1, -1, f, m);
             ch = m * (faceValue2(T, f, m, th) - tc);
-            dh = rhoDAt(K, Real(0.5) * (T[f.L] + T[f.R])) * (T[f.R] - tc) / h;
+            dh = lmEffD<Diff>(E, f.L, f.R, rhoDAt(K, Real(0.5) * (T[f.L] + T[f.R]))) *
+                 (T[f.R] - tc) / h;
         }
         conv -= (ch - cl) / h;
         dif += (dh - dl) / h;
-        latT<OY, OZ, 1, Wall>(K, Vp, nY + 1, T, M, i, j, k, tc, conv, dif);
-        latT<OY, OZ, 2, Wall>(K, Vp, nY + 1, T, M, i, j, k, tc, conv, dif);
+        latT<OY, OZ, 1, Wall, Diff>(K, Vp, nY + 1, T, M, i, j, k, tc, conv, dif, E);
+        latT<OY, OZ, 2, Wall, Diff>(K, Vp, nY + 1, T, M, i, j, k, tc, conv, dif, E);
     }
     const Real ra = rhoA[c], rb = rhoB[c];
     const Real RT = solid ? Real(0) : (conv + dif + K.qcp * om[c]) / rb;
@@ -670,7 +749,9 @@ __global__ void kLmMomX(LmK K, Real ca, Real cb, Real cr, const Real* mxA,
 // lateral open, a backflow edge antimirrors: the ambient at rest). An open
 // A face: zero normal-stress gradient (traction-free), face pressure
 // openFaceP; open B edges: outflow zero gradient, inflow u_t = 0.
-template <int A, bool OY, bool OZ, bool Wall>
+// Turb (M5): the inflow face's tangential velocity is the row's (K.inV / K.inW at
+// row (j, k): the x edge of this A face), vl = 2 v_in - v_r; false: the antimirror.
+template <int A, bool OY, bool OZ, bool Wall, bool Turb = false>
 __global__ void kLmMomT(LmK K, Real ca, Real cb, Real cr, const Real* mAa,
                         const Real* mAaHi, const Real* rho, LmM M, const Real* p,
                         const Real* mu, const Real* divu, Real* out, Real* outHi)
@@ -748,6 +829,9 @@ __global__ void kLmMomT(LmK K, Real ca, Real cb, Real cr, const Real* mAa,
         const Real mx0 = M.x[L::fx(g, ii, jj(-1, 0), kk(-1, 0))];
         const Real mx1 = M.x[L::fx(g, ii, j, k)];
         Real vl = in ? -vr0 : vl0;
+        if constexpr (Turb) {
+            if (in) vl = Real(2) * (A == 1 ? K.inV : K.inW)[rowAt(g, j, k)] - vr0;
+        }
         Real vr = outE ? vl0 : vr0;
         if constexpr (Op) {
             if (outE && mx0 + mx1 < Real(0)) vr = -vl0;
@@ -963,11 +1047,11 @@ struct LmBF
 // The lateral axis A's species fluxes of cell (i, j, k): div[s] -= (Fh -
 // Fl)/h; an open boundary face convective upwind (ambient | own), no
 // diffusion, recorded in bf.
-template <bool OY, bool OZ, int A, int NY, bool Wall>
+template <bool OY, bool OZ, int A, int NY, bool Wall, int Diff = kLmMolecular>
 __device__ inline void latY(const LmK& K, const Real* const* Yp,
                             const Real* const* Vp, const Real* T, const LmM& M,
                             const LmBF& bf, int i, int j, int k, std::size_t c,
-                            Real* div)
+                            Real* div, const LmEddy& E = {})
 {
     using L = Lat<OY, OZ>;
     const GpuGrid& g = K.g;
@@ -1001,7 +1085,7 @@ __device__ inline void latY(const LmK& K, const Real* const* Yp,
         Face fl = faceLat<OY, OZ, A>(g, i, j, k);
         if constexpr (Wall) wallFace(K, fl);
         const Real tl = sharedThetaOf(Vp, NY + 1, -1, fl, ml);
-        const Real kl = rhoDAt(K, Real(0.5) * (T[fl.L] + T[fl.R]));
+        const Real kl = lmEffD<Diff>(E, fl.L, fl.R, rhoDAt(K, Real(0.5) * (T[fl.L] + T[fl.R])));
         for (int s = 0; s < NY; ++s) Fl[s] = faceY2(Yp[s], fl, ml, tl, kl, h);
     }
     if (hiOpen) {
@@ -1018,16 +1102,18 @@ __device__ inline void latY(const LmK& K, const Real* const* Yp,
                          : faceLat<OY, OZ, A>(g, i, j, k + 1);
         if constexpr (Wall) wallFace(K, fh);
         const Real tH = sharedThetaOf(Vp, NY + 1, -1, fh, mh);
-        const Real kh = rhoDAt(K, Real(0.5) * (T[fh.L] + T[fh.R]));
+        const Real kh = lmEffD<Diff>(E, fh.L, fh.R, rhoDAt(K, Real(0.5) * (T[fh.L] + T[fh.R])));
         for (int s = 0; s < NY; ++s) Fh[s] = faceY2(Yp[s], fh, mh, tH, kh, h);
     }
     for (int s = 0; s < NY; ++s) div[s] -= (Fh[s] - Fl[s]) / h;
 }
 
-template <bool TwoR, bool OY, bool OZ, bool Wall>
+// Diff (M4): the interior faces' Fick coefficient (lmEffD); kLmMolecular =
+// the S8 kernel bit for bit.
+template <bool TwoR, bool OY, bool OZ, bool Wall, int Diff = kLmMolecular>
 __global__ void kLmScalars(LmK K, Real cb, Real cr, LmWords W, const Real* T,
                            const Real* Y0, const Real* Y1, const Real* om, LmM M,
-                           LmBF bf)
+                           LmBF bf, LmEddy E)
 {
     using L = Lat<OY, OZ>;
     const GpuGrid& g = K.g;
@@ -1082,7 +1168,7 @@ __global__ void kLmScalars(LmK K, Real cb, Real cr, LmWords W, const Real* T,
             if constexpr (Wall) wallFace(K, f);
             const Real m = M.x[L::fx(g, i, j, k)];
             const Real th = sharedThetaOf(Vp, nY + 1, -1, f, m);
-            const Real kd = rhoDAt(K, Real(0.5) * (T[f.L] + T[f.R]));
+            const Real kd = lmEffD<Diff>(E, f.L, f.R, rhoDAt(K, Real(0.5) * (T[f.L] + T[f.R])));
             for (int s = 0; s < nY; ++s) Fl[s] = faceY2(Yp[s], f, m, th, kd, h);
         }
         if (i == g.nx - 1) {
@@ -1101,13 +1187,13 @@ __global__ void kLmScalars(LmK K, Real cb, Real cr, LmWords W, const Real* T,
             if constexpr (Wall) wallFace(K, f);
             const Real m = M.x[L::fx(g, i + 1, j, k)];
             const Real th = sharedThetaOf(Vp, nY + 1, -1, f, m);
-            const Real kd = rhoDAt(K, Real(0.5) * (T[f.L] + T[f.R]));
+            const Real kd = lmEffD<Diff>(E, f.L, f.R, rhoDAt(K, Real(0.5) * (T[f.L] + T[f.R])));
             for (int s = 0; s < nY; ++s) Fh[s] = faceY2(Yp[s], f, m, th, kd, h);
         }
         for (int s = 0; s < nY; ++s) div[s] -= (Fh[s] - Fl[s]) / h;
     }
-    latY<OY, OZ, 1, nY, Wall>(K, Yp, Vp, T, M, bf, i, j, k, c, div);
-    latY<OY, OZ, 2, nY, Wall>(K, Yp, Vp, T, M, bf, i, j, k, c, div);
+    latY<OY, OZ, 1, nY, Wall, Diff>(K, Yp, Vp, T, M, bf, i, j, k, c, div, E);
+    latY<OY, OZ, 2, nY, Wall, Diff>(K, Yp, Vp, T, M, bf, i, j, k, c, div, E);
     const Real dm = negDivM<OY, OZ>(g, M, i, j, k);
     lmPutWord(W, 0, c, cb, cr * dm);
     const Real w = om[c];
@@ -1405,6 +1491,28 @@ struct LmPosRate
     }
 };
 
+// M4: LmPosRate with the eddy fields: D_c = dcoef2 (mu(T_c) max(4/3, FE_c/Pr)
+// + mu_t,c max(4/3, 1/Sc_t)) / rho_c, dcoef2 = 2 sum_a 1/h_a^2 (null FE: 1,
+// null mut: 0). Off: LmPosRate.
+template <bool OY, bool OZ>
+struct LmPosRateEddy
+{
+    LmConvRate<OY, OZ> conv;
+    Transport tr;
+    double prGas;
+    double dcoef2, invPr, fT; // fT = max(4/3, 1/Sc_t)
+    const Real *mut, *FE;
+    __host__ __device__ double operator()(int c) const
+    {
+        const double r = conv.rho[c];
+        const double fe = FE ? double(FE[c]) : 1.0;
+        const double mt = mut ? double(mut[c]) : 0.0;
+        const double d = tr.mu(prGas / r) * fmax(4.0 / 3.0, fe * invPr) + mt * fT;
+        const double s = 2.0 * conv(c) + dcoef2 * d / r;
+        return isfinite(s) ? s : HUGE_VAL;
+    }
+};
+
 template <bool OY, bool OZ>
 struct LmDivErr
 {
@@ -1597,6 +1705,9 @@ std::expected<DeviceLowMach, std::string> DeviceLowMach::make(const Grid& g,
           s.ambT > 0))
         return std::unexpected("low-Mach: gravity must be finite and >= 0 (along "
                                "-x) with an ambient T > 0 (rho_a = P0/(R T_amb))");
+    if (s.turb && (!s.solid.empty() || s.openY || s.openZ))
+        return std::unexpected("low-Mach: --turb is the planar box's (no tube, periodic laterals: the synthetic "
+                               "box is periodic in y and z)");
     SepBox box;
     box.nx = g.nx;
     box.ny = g.ny;
@@ -1616,6 +1727,23 @@ std::expected<DeviceLowMach, std::string> DeviceLowMach::make(const Grid& g,
                                            s.solid.size(), g.size()));
     if (!s.solid.empty() && !(std::isfinite(s.wallT) && s.wallT > 0))
         return std::unexpected("low-Mach: the tube's wall T must be > 0");
+    // M4: LES and TFLES (dns/lmmodules' pairs; the CLI refuses them by name
+    // first, these are the API's guards).
+    if (!(std::isfinite(s.cs) && s.cs >= 0 && std::isfinite(s.prt) && s.prt > 0))
+        return std::unexpected("low-Mach LES: Cs >= 0 and Sc_t = Pr_t > 0");
+    if (s.cs > 0 && s.sgs == SgsModel::Sigma && g.nz == 1)
+        return std::unexpected("low-Mach LES: sigma: D_sigma is identically 0 for any 2D state");
+    if ((s.cs > 0 || s.tfles) && !s.solid.empty())
+        return std::unexpected("low-Mach LES / TFLES with the immersed tube: not built (no wall "
+                               "model for mu_t at the staircase; the sensor reads the solid)");
+    if (s.tfles && s.nY != 1)
+        return std::unexpected("low-Mach TFLES: premixed C0 only (two reactants refused, "
+                               "dns/lmmodules)");
+    if (s.tfles && (s.openY || s.openZ))
+        return std::unexpected("low-Mach TFLES with open laterals: the sensor's max filter "
+                               "wraps y and z periodic");
+    if (s.tfles && s.tfles->charlette && !(s.cs > 0 && g.nz > 1))
+        return std::unexpected("low-Mach TFLES: the efficiency needs LES in 3D");
     LmPressureOptions po;
     po.tol = s.pcgTol;
     auto pr = LmPressure::make(box, s.solid, po);
@@ -1656,6 +1784,22 @@ std::expected<DeviceLowMach, std::string> DeviceLowMach::make(const Grid& g,
             if (e == hipSuccess) e = hipMemset(b.data(), 0, n * sizeof(Real));
         }
     for (int k = 0; k < kLmMaxY && e == hipSuccess; ++k) e = alloc(d.Y_[k], n);
+    // M4: mu_t, the cell velocity it (and the efficiency) differences, TFLES.
+    {
+        const bool vel = s.cs > 0 || (s.tfles && s.tfles->charlette);
+        if (e == hipSuccess) e = alloc(d.mut_, s.cs > 0 ? n : 1);
+        for (DeviceScalar* b : {&d.uc_, &d.vc_, &d.wc_})
+            if (e == hipSuccess) e = alloc(*b, vel ? n : 1);
+        if (e == hipSuccess) e = hipMemset(d.mut_.data(), 0, d.mut_.size() * sizeof(Real));
+        const double c3 = std::cbrt(double(g.hx) * g.hy * g.hz);
+        const double d2 = g.nz > 1 ? c3 * c3 : double(g.hx) * g.hy;
+        d.cd2_ = Real(s.cs * s.cs * d2);
+        if (s.tfles && e == hipSuccess) {
+            auto t = DeviceTfles::make(g, *s.tfles);
+            if (!t) e = t.error();
+            else d.tf_ = std::move(*t);
+        }
+    }
     if (e == hipSuccess)
         e = alloc(d.bflux_, std::size_t(s.nY) * bfLayout(d.g_, nullptr).nb);
     if (e == hipSuccess) {
@@ -1676,6 +1820,11 @@ std::expected<DeviceLowMach, std::string> DeviceLowMach::make(const Grid& g,
                                "every Y_k");
     for (DeviceScalar* b : {&d.inM_, &d.inRho_, &d.inT_, &d.inY_[0], &d.inY_[1]})
         if (e == hipSuccess) e = alloc(*b, nr);
+    if (s.turb)
+        for (DeviceScalar* b : {&d.inV_, &d.inW_}) {
+            if (e == hipSuccess) e = alloc(*b, nr);
+            if (e == hipSuccess) e = hipMemset(b->data(), 0, nr * sizeof(Real));
+        }
     if (e == hipSuccess) {
         const bool rows = !s.rowM.empty();
         std::vector<Real> f(nr);
@@ -1760,6 +1909,24 @@ std::expected<void, std::string> DeviceLowMach::upload(const LowMachState& h)
     return {};
 }
 
+std::expected<void, std::string> DeviceLowMach::setInflowTurb(const std::vector<double>& m,
+                                                              const std::vector<double>& v,
+                                                              const std::vector<double>& w)
+{
+    const std::size_t nr = std::size_t(g_.ny) * g_.nz;
+    if (!sp_.turb) return std::unexpected("low-Mach: setInflowTurb needs setup.turb");
+    if (m.size() != nr || v.size() != nr || w.size() != nr)
+        return std::unexpected(std::format("low-Mach: --turb rows have {}, {}, {} entries, the face {}", m.size(),
+                                           v.size(), w.size(), nr));
+    std::vector<Real> f(nr);
+    (void)hipDeviceSynchronize();
+    for (auto [b, h] : {std::pair{&inM_, &m}, std::pair{&inV_, &v}, std::pair{&inW_, &w}}) {
+        for (std::size_t q = 0; q < nr; ++q) f[q] = Real((*h)[q]);
+        if (b->upload(f.data()) != hipSuccess) return std::unexpected("low-Mach: --turb row upload failed");
+    }
+    return {};
+}
+
 std::array<const Real*, 5> DeviceLowMach::inflowRows() const
 {
     return {inM_.data(), inRho_.data(), inT_.data(), inY_[0].data(),
@@ -1782,23 +1949,38 @@ void DeviceLowMach::cellVelocity(DeviceScalar& u, DeviceScalar& v,
 namespace {
 
 // The cell pass on state (rho, ry0, ry1, M) into the derived fields.
+// eof (M4 TFLES, C0): omega *= E/F (the Eof instantiation); null = the S8 pass.
 template <bool OY, bool OZ>
 void cellPass(const LmK& K, const LowMachSetup& sp, const Real* rho,
               const Real* ry0, const Real* ry1, const LmM& M, Real* T, Real* Y0,
-              Real* Y1, Real* om, Real* mu, Real* divu)
+              Real* Y1, Real* om, Real* mu, Real* divu, const Real* eof = nullptr)
 {
     const std::size_t n = K.g.size();
     const bool two = sp.nY == 2;
     const PhiRateLaw<Real> law = sp.law.as<Real>();
+    assert(!eof || !two);
     if (two && sp.law.n > 0)
         kLmCellPass<true, true, OY, OZ><<<launchBlocks(n), blockSize>>>(
-            K, law, rho, ry0, ry1, M, T, Y0, Y1, om, mu, divu);
+            K, law, rho, ry0, ry1, M, T, Y0, Y1, om, mu, divu, nullptr);
     else if (two)
         kLmCellPass<true, false, OY, OZ><<<launchBlocks(n), blockSize>>>(
-            K, law, rho, ry0, ry1, M, T, Y0, Y1, om, mu, divu);
+            K, law, rho, ry0, ry1, M, T, Y0, Y1, om, mu, divu, nullptr);
+    else if (eof)
+        kLmCellPass<false, false, OY, OZ, true><<<launchBlocks(n), blockSize>>>(
+            K, law, rho, ry0, ry1, M, T, Y0, Y1, om, mu, divu, eof);
     else
         kLmCellPass<false, false, OY, OZ><<<launchBlocks(n), blockSize>>>(
-            K, law, rho, ry0, ry1, M, T, Y0, Y1, om, mu, divu);
+            K, law, rho, ry0, ry1, M, T, Y0, Y1, om, mu, divu, nullptr);
+}
+
+// The diffusivity instantiation of a call (M4): f(std::integral_constant<int,
+// kLmMolecular | kLmEddy | kLmThick>).
+template <class F>
+void withDiff(int d, F&& f)
+{
+    if (d == kLmThick) f(std::integral_constant<int, kLmThick>{});
+    else if (d == kLmEddy) f(std::integral_constant<int, kLmEddy>{});
+    else f(std::integral_constant<int, kLmMolecular>{});
 }
 
 } // namespace
@@ -1808,7 +1990,11 @@ void DeviceLowMach::stage(const State& a, const State& b, State& o, double ca,
 {
     if (!err.empty()) return;
     const GpuGrid& g = g_;
-    const LmK K = kernelConsts(g, sp_, inflowRows(), pr_.faceCodes());
+    LmK K = kernelConsts(g, sp_, inflowRows(), pr_.faceCodes());
+    if (sp_.turb) {
+        K.inV = inV_.data();
+        K.inW = inW_.data();
+    }
     const std::size_t n = g.size();
     const std::size_t nfx = std::size_t(g.nx + 1) * g.ny * g.nz;
     const Real rca = Real(ca), rcb = Real(cb), rcr = Real(cr);
@@ -1822,23 +2008,42 @@ void DeviceLowMach::stage(const State& a, const State& b, State& o, double ca,
     // PCG's warm start is the same stage's phi of the previous step
     // (checkpointed); without, the scratch the direct solve overwrites.
     Real* phi = imm ? phiW_[si].data() : phi_.data();
+    // M4: the interior faces' diffusivity and its fields.
+    const int diff = tf_ ? kLmThick : les() ? kLmEddy : kLmMolecular;
+    const LmEddy E{.mut = les() ? mut_.data() : nullptr,
+                   .invSct = Real(1.0 / sp_.prt),
+                   .FE = tf_ ? tf_->fe() : nullptr,
+                   .Om = tf_ ? tf_->om() : nullptr};
     withLat(sp_, [&](auto oyT, auto ozT) {
       withWall(imm, [&](auto wT) {
         constexpr bool OY = decltype(oyT)::value, OZ = decltype(ozT)::value;
         constexpr bool WL = decltype(wT)::value;
-        // 1. Cell pass on b.
+        // 1. Cell pass on b (TFLES: omega E/F); LES: mu_t, mu += mu_t.
         cellPass<OY, OZ>(K, sp_, b.rho.data(), b.y[0].data(), y1b, Mb, T_.data(),
-                         Y_[0].data(), Y1, om_.data(), mu_.data(), divu_.data());
+                         Y_[0].data(), Y1, om_.data(), mu_.data(), divu_.data(),
+                         tf_ ? tf_->eof() : nullptr);
         checkLastKernel("kLmCellPass");
+        if (les()) eddyOf(b);
         // 2. Temperature predictor -> T*, D.
-        if (two)
-            kLmTemperature<true, OY, OZ, WL><<<launchBlocks(n), blockSize>>>(
-                K, rca, rcb, rcr, a.rho.data(), b.rho.data(), T_.data(), Y_[0].data(),
-                Y1, om_.data(), Mb, Tstar_.data(), D_.data());
-        else
-            kLmTemperature<false, OY, OZ, WL><<<launchBlocks(n), blockSize>>>(
-                K, rca, rcb, rcr, a.rho.data(), b.rho.data(), T_.data(), Y_[0].data(),
-                Y1, om_.data(), Mb, Tstar_.data(), D_.data());
+        withDiff(diff, [&](auto dT) {
+            constexpr int DF = decltype(dT)::value;
+            if constexpr (WL && DF != kLmMolecular) {
+                assert(false); // make() refuses LES / TFLES with the tube
+            } else {
+                if (two) {
+                    if constexpr (DF != kLmThick)
+                        kLmTemperature<true, OY, OZ, WL, DF><<<launchBlocks(n), blockSize>>>(
+                            K, rca, rcb, rcr, a.rho.data(), b.rho.data(), T_.data(),
+                            Y_[0].data(), Y1, om_.data(), Mb, Tstar_.data(), D_.data(), E);
+                    else
+                        assert(false); // make() refuses TFLES with two reactants
+                } else {
+                    kLmTemperature<false, OY, OZ, WL, DF><<<launchBlocks(n), blockSize>>>(
+                        K, rca, rcb, rcr, a.rho.data(), b.rho.data(), T_.data(), Y_[0].data(),
+                        Y1, om_.data(), Mb, Tstar_.data(), D_.data(), E);
+                }
+            }
+        });
         checkLastKernel("kLmTemperature");
         // 3. Momentum predictor -> o.m* (gravity: the Grav instantiation;
         // g == 0 the S6 kernel).
@@ -1852,14 +2057,24 @@ void DeviceLowMach::stage(const State& a, const State& b, State& o, double ca,
                 mu_.data(), divu_.data(), o.mx.data());
         const std::size_t nyh = OY ? std::size_t(g.nx) * g.nz : 0;
         const std::size_t nzh = OZ ? std::size_t(g.nx) * g.ny : 0;
-        kLmMomT<1, OY, OZ, WL><<<launchBlocks(n + nyh), blockSize>>>(
-            K, rca, rcb, rcr, a.my.data(), OY ? a.myHi.data() : nullptr, b.rho.data(),
-            Mb, b.p.data(), mu_.data(), divu_.data(), o.my.data(),
-            OY ? o.myHi.data() : nullptr);
-        kLmMomT<2, OY, OZ, WL><<<launchBlocks(n + nzh), blockSize>>>(
-            K, rca, rcb, rcr, a.mz.data(), OZ ? a.mzHi.data() : nullptr, b.rho.data(),
-            Mb, b.p.data(), mu_.data(), divu_.data(), o.mz.data(),
-            OZ ? o.mzHi.data() : nullptr);
+        // M5 --turb: the Turb instantiation (make refuses it with a solid or open laterals).
+        auto momT = [&](auto tb) {
+            constexpr bool TB = decltype(tb)::value;
+            kLmMomT<1, OY, OZ, WL, TB><<<launchBlocks(n + nyh), blockSize>>>(
+                K, rca, rcb, rcr, a.my.data(), OY ? a.myHi.data() : nullptr, b.rho.data(),
+                Mb, b.p.data(), mu_.data(), divu_.data(), o.my.data(),
+                OY ? o.myHi.data() : nullptr);
+            kLmMomT<2, OY, OZ, WL, TB><<<launchBlocks(n + nzh), blockSize>>>(
+                K, rca, rcb, rcr, a.mz.data(), OZ ? a.mzHi.data() : nullptr, b.rho.data(),
+                Mb, b.p.data(), mu_.data(), divu_.data(), o.mz.data(),
+                OZ ? o.mzHi.data() : nullptr);
+        };
+        if constexpr (!WL && !OY && !OZ) {
+            if (sp_.turb) momT(std::true_type{});
+            else momT(std::false_type{});
+        } else {
+            momT(std::false_type{});
+        }
         checkLastKernel("kLmMom");
         // 4. Projection on the mass flux.
         const LmM Mo = massFluxes(o);
@@ -1904,12 +2119,23 @@ void DeviceLowMach::stage(const State& a, const State& b, State& o, double ca,
                 W.ol[v] = v == 0 ? o.rlo.data() : o.ylo[v - 1].data();
             }
         }
-        if (two)
-            kLmScalars<true, OY, OZ, WL><<<launchBlocks(n), blockSize>>>(
-                K, rcb, rcr, W, T_.data(), Y_[0].data(), Y1, om_.data(), Mo, bf);
-        else
-            kLmScalars<false, OY, OZ, WL><<<launchBlocks(n), blockSize>>>(
-                K, rcb, rcr, W, T_.data(), Y_[0].data(), Y1, om_.data(), Mo, bf);
+        withDiff(diff, [&](auto dT) {
+            constexpr int DF = decltype(dT)::value;
+            if constexpr (WL && DF != kLmMolecular) {
+                assert(false);
+            } else {
+                if (two) {
+                    if constexpr (DF != kLmThick)
+                        kLmScalars<true, OY, OZ, WL, DF><<<launchBlocks(n), blockSize>>>(
+                            K, rcb, rcr, W, T_.data(), Y_[0].data(), Y1, om_.data(), Mo, bf, E);
+                    else
+                        assert(false);
+                } else {
+                    kLmScalars<false, OY, OZ, WL, DF><<<launchBlocks(n), blockSize>>>(
+                        K, rcb, rcr, W, T_.data(), Y_[0].data(), Y1, om_.data(), Mo, bf, E);
+                }
+            }
+        });
         checkLastKernel("kLmScalars");
         kLmTally<OY, OZ><<<1, kTallyThreads>>>(g, double(rca), double(rcb),
                                                double(rcr), a.tally.data(),
@@ -1923,12 +2149,90 @@ void DeviceLowMach::stage(const State& a, const State& b, State& o, double ca,
     });
 }
 
+void DeviceLowMach::eddyOf(const State& b)
+{
+    const LmK K = kernelConsts(g_, sp_, inflowRows(), pr_.faceCodes());
+    const LmM M = massFluxes(b);
+    const int sig = sp_.sgs == SgsModel::Sigma ? 1 : 0;
+    withLat(sp_, [&](auto oy, auto oz) {
+        constexpr bool OY = decltype(oy)::value, OZ = decltype(oz)::value;
+        kLmCellVelocity<OY, OZ><<<launchBlocks(g_.size()), blockSize>>>(
+            K, b.rho.data(), M, uc_.data(), vc_.data(), wc_.data());
+        kLmNut<OY, OZ><<<launchBlocks(g_.size()), blockSize>>>(
+            K, cd2_, sig, b.rho.data(), uc_.data(), vc_.data(), wc_.data(), mut_.data(),
+            mu_.data());
+    });
+    checkLastKernel("kLmNut");
+}
+
+void DeviceLowMach::tflesOf(const State& b)
+{
+    // T (and the cell velocity for the efficiency) of b, then F E, E/F, Omega.
+    const LmK K = kernelConsts(g_, sp_, inflowRows(), pr_.faceCodes());
+    const LmM M = massFluxes(b);
+    const Real* y1 = sp_.nY == 2 ? b.y[1].data() : nullptr;
+    withLat(sp_, [&](auto oy, auto oz) {
+        constexpr bool OY = decltype(oy)::value, OZ = decltype(oz)::value;
+        cellPass<OY, OZ>(K, sp_, b.rho.data(), b.y[0].data(), y1, M, T_.data(),
+                         Y_[0].data(), Y_[1].data(), om_.data(), mu_.data(),
+                         divu_.data());
+        if (sp_.tfles->charlette)
+            kLmCellVelocity<OY, OZ><<<launchBlocks(g_.size()), blockSize>>>(
+                K, b.rho.data(), M, uc_.data(), vc_.data(), wc_.data());
+    });
+    checkLastKernel("kLmCellPass");
+    tf_->update(b.rho.data(), b.y[0].data(), uc_, vc_, wc_, T_);
+}
+
+void DeviceLowMach::refreshEddy()
+{
+    if (tf_) tflesOf(s_);
+    if (!les()) return;
+    // The cell pass of s_ (mu(T) before mu += mu_t), then mu_t.
+    const LmK K = kernelConsts(g_, sp_, inflowRows(), pr_.faceCodes());
+    const LmM M = massFluxes(s_);
+    const Real* y1 = sp_.nY == 2 ? s_.y[1].data() : nullptr;
+    withLat(sp_, [&](auto oy, auto oz) {
+        cellPass<decltype(oy)::value, decltype(oz)::value>(
+            K, sp_, s_.rho.data(), s_.y[0].data(), y1, M, T_.data(), Y_[0].data(),
+            Y_[1].data(), om_.data(), mu_.data(), divu_.data(),
+            tf_ ? tf_->eof() : nullptr);
+    });
+    checkLastKernel("kLmCellPass");
+    eddyOf(s_);
+}
+
+LmEddyStats DeviceLowMach::eddyStats(ReduceScratch& r)
+{
+    refreshEddy();
+    LmEddyStats e;
+    if (les())
+        e.mutMax = internal::reduce(r, g_.size(), LmAbsField{mut_.data()},
+                                    rocprim::maximum<double>(), 0.0);
+    if (tf_) {
+        e.feMax = tf_->maxFE(r);
+        DeviceBuffer<double> scratch;
+        std::vector<double> h;
+        if (tf_->columnStats(scratch, h) == hipSuccess) {
+            double so = 0, soe = 0;
+            for (int i = 0; i < g_.nx; ++i) {
+                so += h[std::size_t(i) * DeviceTfles::kTflesSums];
+                soe += h[std::size_t(i) * DeviceTfles::kTflesSums + 1];
+            }
+            e.eBar = so > 0 ? soe / so : NAN;
+        }
+    }
+    return e;
+}
+
 std::expected<void, std::string> DeviceLowMach::step(double dt)
 {
     // SSP-RK3 with StageCombine's weights (gpu/comp.hip DeviceComp::step):
     // ca = 1 - cb exactly (Sterbenz), cr = cb dt.
     const Real d = Real(dt);
     std::string err;
+    // M4 TFLES: F, E, Omega frozen over the step, from its input state.
+    if (tf_) tflesOf(s_);
     stage(s_, s_, q1_, 1.0, 0.0, double(d), 0, err);
     stage(s_, q1_, q2_, 0.75, 0.25, double(Real(0.25) * d), 1, err);
     const Real cb3 = Real(2.0 / 3.0), ca3 = Real(1) - cb3;
@@ -1956,7 +2260,7 @@ double DeviceLowMach::convectiveDt(ReduceScratch& r, double cfl) const
     return w > 0 ? cfl / w : HUGE_VAL;
 }
 
-double DeviceLowMach::diffusiveDt(ReduceScratch& r) const
+double DeviceLowMach::diffusiveDt(ReduceScratch& r)
 {
     const double rhoMin = internal::reduce(r, g_.size(), LmMinField{s_.rho.data()},
                                            rocprim::minimum<double>(), 1e300);
@@ -1970,7 +2274,18 @@ double DeviceLowMach::diffusiveDt(ReduceScratch& r) const
     // 8-cell round partially premixed burner undershot Y_O and overshot T to
     // 8.6 (sigma_st 6.98) at the inner tip (measured).
     const double coef = g_.nz > 1 ? 1.0 / 6.0 : 0.25;
-    return coef * h * h * rhoMin / (mu * std::max(4.0 / 3.0, 1.0 / sp_.tr.Pr));
+    if (!les() && !tf_)
+        return coef * h * h * rhoMin / (mu * std::max(4.0 / 3.0, 1.0 / sp_.tr.Pr));
+    // M4: the eddy fields of the current state, maxima over the box (the
+    // compressible tflesStableDt's form).
+    refreshEddy();
+    const double fe = tf_ ? tf_->maxFE(r) : 1.0;
+    const double mt = les() ? internal::reduce(r, g_.size(), LmAbsField{mut_.data()},
+                                               rocprim::maximum<double>(), 0.0)
+                            : 0.0;
+    const double dd = mu * std::max(4.0 / 3.0, fe / sp_.tr.Pr) +
+                      mt * std::max(4.0 / 3.0, 1.0 / sp_.prt);
+    return coef * h * h * rhoMin / dd;
 }
 
 double DeviceLowMach::chemDt(ReduceScratch& r, double K) const
@@ -1999,33 +2314,49 @@ double DeviceLowMach::chemDt(ReduceScratch& r, double K) const
     return J > 0 ? K / J : HUGE_VAL;
 }
 
-double DeviceLowMach::positivityDt(ReduceScratch& r, double K) const
+double DeviceLowMach::positivityDt(ReduceScratch& r, double K)
 {
     const LmM M = massFluxes(s_);
     const double amb = sp_.prGas / sp_.ambT;
     double inv2 = 1.0 / (double(g_.hx) * g_.hx) + 1.0 / (double(g_.hy) * g_.hy);
     if (g_.nz > 1) inv2 += 1.0 / (double(g_.hz) * g_.hz);
     const double dcoef = 2.0 * inv2 * std::max(4.0 / 3.0, 1.0 / sp_.tr.Pr);
+    const bool eddy = les() || tf_.has_value();
+    if (eddy) refreshEddy();
     double w = 0;
     withLat(sp_, [&](auto oy, auto oz) {
         constexpr bool OY = decltype(oy)::value, OZ = decltype(oz)::value;
-        const LmPosRate<OY, OZ> f{
-            LmConvRate<OY, OZ>{g_, M, s_.rho.data(), inRho_.data(), amb}, sp_.tr,
-            sp_.prGas, dcoef};
-        w = internal::reduce(r, g_.size(), f, rocprim::maximum<double>(), 0.0);
+        const LmConvRate<OY, OZ> cr{g_, M, s_.rho.data(), inRho_.data(), amb};
+        if (eddy) {
+            const LmPosRateEddy<OY, OZ> f{cr,
+                                          sp_.tr,
+                                          sp_.prGas,
+                                          2.0 * inv2,
+                                          1.0 / sp_.tr.Pr,
+                                          std::max(4.0 / 3.0, 1.0 / sp_.prt),
+                                          les() ? mut_.data() : nullptr,
+                                          tf_ ? tf_->fe() : nullptr};
+            w = internal::reduce(r, g_.size(), f, rocprim::maximum<double>(), 0.0);
+        } else {
+            const LmPosRate<OY, OZ> f{cr, sp_.tr, sp_.prGas, dcoef};
+            w = internal::reduce(r, g_.size(), f, rocprim::maximum<double>(), 0.0);
+        }
     });
     return w > 0 ? K / w : HUGE_VAL;
 }
 
 void DeviceLowMach::updateCells()
 {
+    // M4 TFLES: omega is (E/F) omega of the current state's F, E.
+    if (tf_) tflesOf(s_);
     const LmK K = kernelConsts(g_, sp_, inflowRows(), pr_.faceCodes());
     const LmM M = massFluxes(s_);
     const Real* y1 = sp_.nY == 2 ? s_.y[1].data() : nullptr;
     withLat(sp_, [&](auto oy, auto oz) {
         cellPass<decltype(oy)::value, decltype(oz)::value>(
             K, sp_, s_.rho.data(), s_.y[0].data(), y1, M, T_.data(), Y_[0].data(),
-            Y_[1].data(), om_.data(), mu_.data(), divu_.data());
+            Y_[1].data(), om_.data(), mu_.data(), divu_.data(),
+            tf_ ? tf_->eof() : nullptr);
     });
     checkLastKernel("kLmCellPass");
 }

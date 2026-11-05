@@ -187,6 +187,8 @@ g alpha = 1, nu = sqrt(Pr/Ra), kappa = 1/sqrt(Ra Pr)). `dns conv --polymesh DIR 
 FILE --ny BINS`: `[patch.X] kind = "wall"`, `t = 0.5` the fixed T (floor +0.5, lid
 -0.5, exit 3 otherwise), no `t` = adiabatic, `slip`. `t` under `dns flow`: exit 3 by
 name. `--tol` defaults to 1e-6 here. See `docs/fvcomp.md` "Gravity" for the route.
+`--les C [--sgs smag|sigma]`: LES of the layer, the eddy heat flux `nu_t,f / Pr_t` on the
+internal T faces ("Incompressible combinations" below).
 
 - **T** rides the stage on the same phi: `kFaceT`, `kBndT`, `kGatherT`, the scalar of
   `kFace`, `kBnd`, `kGather`, skew-symmetric central + compact diffusion with AlongD.
@@ -222,6 +224,166 @@ Stats: `runner_rb`'s columns on height bins, `nuBotF, nuTopF`, `maxDiv, pcgIters
 | non-orthogonal Ra 5e4 | sine 0.05, max non-orth. 26.2 deg, 96 x 48 | nuBot, nuTop, nuFlux; face | uniform's | 4.021, 4.048, 3.978; 3.978, 3.969: +0.7% on the face Nu |
 | critical Ra | 64 x 32, kick 0.02, t 80 | urms trend | ~1708 bracket | Ra 1600 decays (3.6e-3, 2.3e-3, 1.6e-3); Ra 1900 grows (3.4e-2, 5.3e-2, 6.6e-2) |
 | projection | 96 x 48, Ra 5e4 | max \|div\| | 1e-4 | FP64 3.8e-7; **FP32 1.4e-4, 192 x 96 4.6e-4**: the floor `4 eps gross`, the flux carries c B_f. FP32 Nu equals FP64 to 4 digits. The gate runs FP64 |
+
+## Incompressible combinations
+
+`dns/fvimodules` (mci; the shape of the compressible `dns/fvmodules` and the low-Mach
+`dns/lmmodules`): the modules of `DeviceFvIncomp`'s stage and ONE decision per pair, read by
+`validate()` (`fvIncompModules`: `dns flow` / `dns conv` on this route; the refusal names its
+flag, exit 2), `DeviceFvIncomp::make` (`fviModulesOf` of the controls: a refused set is an
+error by its text) and `gpu_fvi_matrix`. A module that is not built on this family is refused
+ALONE (the module's own row), not per pair.
+
+- **LES** (Smagorinsky, sigma): momentum `nu_t,f (g_f + g_fᵀ)·S` (Scheme above), built before
+  mci. **LES + T** (mci): the eddy heat flux `(kappa + nu_t,f / Pr_t)` on the internal T faces,
+  `nu_t,f` the cells' mean (the momentum's), `Pr_t = kLesPrt` (0.9, the one constant of the
+  compressible and low-Mach LES), boundary faces molecular (the wall's `nu_t,f` is 0):
+  `kFaceT<…, Les>`. `nu_t = 0` gives `kappa + 0 = kappa`: the molecular T bit for bit. dt: the
+  rule's `2 nu_t,f` already bounds `nu_t,f / Pr_t`.
+- **T** (the scalar row) and **gravity** (the Boussinesq face force, requires T). T without
+  gravity (`betaG = 0`) is a PASSIVE TRACER: the force passes (`kBuoyF`, `kBuoyB`, the
+  `fp - B_f` reconstruction, `kGradP`'s wall image) do not run, so momentum is the run without T
+  bit for bit (gate (a)). No CLI spelling: `dns conv` always carries gravity.
+- **Refused alone**: RANS (SA, SST; simpleFoam owns RAS on a FaceMesh, issues.md FI2) and species
+  (C0, C1, C2b; decided on evidence, issues.md FI1: no oracle, no consumer, the passive tracer
+  exists as T).
+
+`dns conv --solver fv --physics incompressible --les C [--sgs smag|sigma]` is the LES route of
+the Boussinesq layer (sigma needs nz > 1; `--les` on the structured conv and on the compressible
+FV conv: exit 2 by name). Label `LES Smagorinsky Cs C, eddy heat flux Pr_t 0.9 [FV path, …]`.
+The wall Nu columns (`nuBot`, `nuTop`, `nuBotF`, `nuTopF`) are exact under LES (walls carry no
+`nu_t`); `nuFlux` is resolved + molecular, without the SGS heat flux (issues.md FI3).
+
+**`gpu_fvi_matrix`** (`test_gpu_fvi_matrix`, 15 s): every live set (each module alone and each
+pair, closed under the requirements: 9 sets) on four 3D meshes, each in Source / Morton /
+ColourMajor numbering: a uniform 8 x 6 x 4 walled box (conv's: periodic x, z, plates at y 0
+and 1 with T 0.5 / -0.5), the same box rotated rigidly by 0.7 rad about (1, 2, 3) (polyOf, points
+and cyclic separations rotated, gravity rotated with it), a random ±0.25 h box, a cylinder O-grid
+16 x 8 x 4 (open: hot wall T 0.5 + far u (1, 0, 0); closed: adiabatic wall + slip circle).
+(a) inert: passive T leaves momentum bitwise (FP32 and FP64, every mesh); sigma on a 2D mesh
+(D_sigma = 0) is the molecular run bitwise, momentum and T, on the non-orthogonal 2D meshes
+(random ±0.25 h, sine 0.08; the 2D O-grid is orthogonal there: its molecular run skips the
+gradient, another instantiation, n/a). (b) on the closed set rest stays rest: exactly 0 without
+gravity; with gravity the hydrostatic state (boxes: the conduction profile; O-grid: uniform T
+0.25 != Tref, a linear p) to 1e-12 on uniform, rotated, O-grid (measured 7e-17, 1.4e-16, 1.7e-14),
+random 0.25 h a STATED residual 1.6e-3 of the free-fall velocity after 10 steps (gate 5e-3; the
+non-orthogonal balance of "Temperature" above); the divergence floor of a vortical state after
+10 steps, max|div φ|/u_max ≤ 1.0e-10 FP64 (gate 1e-9), ≤ 1.2e-5 FP32 (gate 1e-4); `Σ V u·C(u)`
+and `Σ V T C(T)` ≤ 2e-16 of their gross (gate 1e-13). (c) FP32 vs FP64 |ΔU|/U ≤ 3.4e-6 over 10
+steps (gate 1e-4). (d) numbering: FP64 tol 1e-12, 3 steps, by srcCell: ≤ 1.4e-13 (gate 1e-10),
+summation order (CSR and dot order move with the numbering), not bitwise. (e) rerun byte-
+identical, FP32 and FP64. Make refuses gravity without T by the inventory's text.
+
+**`gpu_fvi_matrix_phys`** (the live pairs' physics; same grid, LES vs DNS: gate 5 has no
+structured counterpart, the structured conv solvers carry no SGS model, issues.md FI3):
+
+| case | grid | DNS nuBot | sigma 1.35 | Smagorinsky 0.17 |
+|---|---|---|---|---|
+| Ra 1e5 3D, aspect 2, t 60 (window t 24-60) | 32 x 16 x 32 | 5.3968 | 5.5803 (+3.4%) | 5.8679 (+8.7%) |
+| | 48 x 24 x 48 | 4.9395 | 5.0942 (+3.1%) | 5.2141 (+5.6%) |
+| | 64 x 32 x 64 | 4.8450 | not measured | not measured |
+| Ra 5e4 2D (qualitative), t 40 | 48 x 24 | 4.2328 | (2D: 0) | 4.2997 (+1.6%) |
+
+Both LES RAISE Nu: no wall damping, so the first interior faces carry `nu_t,f / Pr_t` inside the
+thermal layer, where the DNS conducts. Sigma moves it less (D_sigma vanishes in pure shear, the
+near-wall state; Smagorinsky's |S| does not), and the shift shrinks with h (Delta ~ h: the
+filtered solution tends to the DNS). Walls balance to < 3% in every LES run. The DNS itself is not
+converged at these grids (5.40, 4.94, 4.85): LES is not a substitute for resolution here, it is
+the filtered model of the same grid. Gates: walls 5%, DNS < sigma < Smagorinsky at both grids,
+LES within 12% of the DNS, the shift shrinking 32 → 48; 2D Smagorinsky within 5%.
+
+Generated (`test_gpu_fvi_matrix markdown`):
+
+<!-- generated: dns::fviCombinationsMarkdown (src/dns/fvimodules.cpp); test_gpu_fvi_matrix markdown -->
+| Module | Axis | Spelling | Built |
+|---|---|---|---|
+| LES smag | turbulence | `--les Cs [--sgs smag]` | yes |
+| LES sigma | turbulence | `--les C --sgs sigma (3D)` | yes |
+| RANS SA | turbulence | `--rans sa-neg` | refused |
+| RANS SST | turbulence | `--rans sst-2003m, sst-vm` | refused |
+| T | scalar | `dns conv --physics incompressible --solver fv; DeviceFvIncomp::make(T0)` | yes |
+| gravity | force | `dns conv (betaG = g alpha, free-fall scaling)` | yes |
+| C0 | chemistry | `(premixed one-step)` | refused |
+| C1 | chemistry | `(two reactants)` | refused |
+| C2b | chemistry | `(--equivalence, GRI-3.0 A(phi))` | refused |
+
+Pair matrix: L live, R refused, x one axis (exclusive).
+
+|   | LES smag | LES sigma | RANS SA | RANS SST | T | gravity | C0 | C1 | C2b |
+|---|---|---|---|---|---|---|---|---|---|
+| LES smag | . | x | R | R | L | L | R | R | R |
+| LES sigma | x | . | R | R | L | L | R | R | R |
+| RANS SA | R | R | . | R | R | R | R | R | R |
+| RANS SST | R | R | R | . | R | R | R | R | R |
+| T | L | L | R | R | . | L | R | R | R |
+| gravity | L | L | R | R | L | . | R | R | R |
+| C0 | R | R | R | R | R | R | . | R | R |
+| C1 | R | R | R | R | R | R | R | . | R |
+| C2b | R | R | R | R | R | R | R | R | . |
+
+| Refused | Error text | Why |
+|---|---|---|
+| RANS SA | `--rans on the time-accurate incompressible FV solver: not built (steady RANS on a FaceMesh is simpleFoam: dns flow --polymesh CASE or --solver simple)` | the family's RAS is gpu/fv_simple + gpu/fv_ras, OpenFOAM v2606 kOmegaSST / SpalartAllmaras verbatim and gated to 1e-9 (gpu_fv_simple IF-T); URANS on the projection stage would be a second implementation of the closures with its own wall treatment and no consumer |
+| RANS SST | `--rans on the time-accurate incompressible FV solver: not built (steady RANS on a FaceMesh is simpleFoam: dns flow --polymesh CASE or --solver simple)` | the family's RAS is gpu/fv_simple + gpu/fv_ras, OpenFOAM v2606 kOmegaSST / SpalartAllmaras verbatim and gated to 1e-9 (gpu_fv_simple IF-T); URANS on the projection stage would be a second implementation of the closures with its own wall treatment and no consumer |
+| C0 | `species on the incompressible FV solver: not built (constant-density reacting scalars; the flame on a FaceMesh is dns flame --physics lowmach --solver fv)` | decided on evidence (issues.md FI1): no oracle (neither structured incompressible solver, gpu/incomp nor gpu/boussinesq, carries a scalar beyond T, so gate 5 has no counterpart); no consumer (every flame model, C0, C1, C2b, is calibrated by its heat release: S_L, T_ad; constant density removes it, DeviceFvLowMach is the variable-density flame on this mesh view); a passive tracer is the T row without gravity (gpu_fvi_matrix: momentum bitwise, conv T energy 0), so a scalar row would add no kernel |
+| C1 | `species on the incompressible FV solver: not built (constant-density reacting scalars; the flame on a FaceMesh is dns flame --physics lowmach --solver fv)` | decided on evidence (issues.md FI1): no oracle (neither structured incompressible solver, gpu/incomp nor gpu/boussinesq, carries a scalar beyond T, so gate 5 has no counterpart); no consumer (every flame model, C0, C1, C2b, is calibrated by its heat release: S_L, T_ad; constant density removes it, DeviceFvLowMach is the variable-density flame on this mesh view); a passive tracer is the T row without gravity (gpu_fvi_matrix: momentum bitwise, conv T energy 0), so a scalar row would add no kernel |
+| C2b | `species on the incompressible FV solver: not built (constant-density reacting scalars; the flame on a FaceMesh is dns flame --physics lowmach --solver fv)` | decided on evidence (issues.md FI1): no oracle (neither structured incompressible solver, gpu/incomp nor gpu/boussinesq, carries a scalar beyond T, so gate 5 has no counterpart); no consumer (every flame model, C0, C1, C2b, is calibrated by its heat release: S_L, T_ad; constant density removes it, DeviceFvLowMach is the variable-density flame on this mesh view); a passive tracer is the T row without gravity (gpu_fvi_matrix: momentum bitwise, conv T energy 0), so a scalar row would add no kernel |
+| gravity without T (requirement) | `the Boussinesq force needs the temperature row (dns conv)` | |
+
+| Live pair | Hand gates |
+|---|---|
+| LES smag + T | gpu_fvi_matrix_phys P2 (Ra 1e5 3D: Nu +8.7%, +5.6% of the same-grid DNS at 32, 48 cells, shrinking with h) |
+| LES smag + gravity | gpu_fvi_matrix_phys P1 (2D Ra 5e4: Nu +1.6%), P2 |
+| LES sigma + T | gpu_fvi_matrix (a: sigma on a 2D mesh = molecular bitwise, momentum and T); gpu_fvi_matrix_phys P2 (Nu +3.4%, +3.1%) |
+| LES sigma + gravity | gpu_fvi_matrix_phys P2 (DNS < sigma < Smagorinsky Nu at both grids) |
+| T + gravity | gpu_fv_conv C3-C8, long (FV vs MAC Ra 5e4) |
+
+Matrix rows (`test_gpu_fvi_matrix`, the run of this commit; (b) columns: rest max |u|, div = max|div φ|/u_max
+FP64 (FP32), KE and T = the convective rates over their gross; (c) max |U32 − U64|/max|U|; (d) max
+difference over the numberings / max|U|):
+
+| Set | Mesh | (a) inert | (b) rest, div, KE | (c) fp32 | (d) numbering | (e) rerun |
+|---|---|---|---|---|---|---|
+| laminar | uniform box 8x6x4 | n/a (off = absence) | rest max u 0.0e+00, div/u 2.0e-11 (fp32 6.2e-06), KE 9.9e-17 | 6.7e-07 | 4.3e-16 | = |
+| laminar | rotated box (0.7 rad about (1,2,3)) | n/a (off = absence) | rest max u 0.0e+00, div/u 2.2e-11 (fp32 3.0e-06), KE 5.6e-17 | 2.6e-07 | 3.6e-14 | = |
+| laminar | random 0.25 h box | n/a (off = absence) | rest max u 0.0e+00, div/u 2.5e-11 (fp32 5.3e-06), KE 2.0e-17 | 7.6e-07 | 1.3e-13 | = |
+| laminar | O-grid 16x8x4 | n/a (off = absence) | rest max u 0.0e+00, div/u 3.9e-11 (fp32 1.2e-05), KE 5.7e-17 | 1.4e-06 | 2.2e-14 | = |
+| LES smag | uniform box 8x6x4 | n/a (off = absence) | rest max u 0.0e+00, div/u 2.2e-11 (fp32 6.0e-06), KE 3.2e-17 | 6.1e-07 | 4.5e-16 | = |
+| LES smag | rotated box (0.7 rad about (1,2,3)) | n/a (off = absence) | rest max u 0.0e+00, div/u 1.2e-12 (fp32 3.4e-06), KE 1.6e-17 | 4.2e-07 | 3.8e-14 | = |
+| LES smag | random 0.25 h box | n/a (off = absence) | rest max u 0.0e+00, div/u 1.8e-11 (fp32 4.7e-06), KE 1.8e-17 | 6.3e-07 | 1.4e-13 | = |
+| LES smag | O-grid 16x8x4 | n/a (off = absence) | rest max u 0.0e+00, div/u 4.0e-11 (fp32 1.1e-05), KE 1.0e-17 | 1.1e-06 | 2.1e-14 | = |
+| LES sigma | uniform box 8x6x4 | ; sigma 2D random 0.25 h box 2D: bitwise; sigma 2D sine 0.08 box 2D: bitwise; O-grid 2D: n/a (orthogonal) | rest max u 0.0e+00, div/u 2.2e-11 (fp32 6.5e-06), KE 6.8e-18 | 6.8e-07 | 4.3e-16 | = |
+| LES sigma | rotated box (0.7 rad about (1,2,3)) | n/a (off = absence) | rest max u 0.0e+00, div/u 2.0e-11 (fp32 2.7e-06), KE 2.4e-17 | 3.7e-07 | 3.0e-14 | = |
+| LES sigma | random 0.25 h box | n/a (off = absence) | rest max u 0.0e+00, div/u 2.6e-11 (fp32 5.0e-06), KE 1.8e-17 | 7.0e-07 | 1.3e-13 | = |
+| LES sigma | O-grid 16x8x4 | n/a (off = absence) | rest max u 0.0e+00, div/u 3.9e-11 (fp32 1.2e-05), KE 0.0e+00 | 2.2e-06 | 2.2e-14 | = |
+| T | uniform box 8x6x4 | T passive: momentum bitwise | rest max u 0.0e+00, div/u 2.0e-11 (fp32 6.2e-06), KE 9.9e-17, T 9.9e-18 | 6.7e-07 | 2.5e-16 | = |
+| T | rotated box (0.7 rad about (1,2,3)) | T passive: momentum bitwise | rest max u 0.0e+00, div/u 2.2e-11 (fp32 3.0e-06), KE 5.6e-17, T 7.4e-18 | 2.6e-07 | 1.4e-14 | = |
+| T | random 0.25 h box | T passive: momentum bitwise | rest max u 0.0e+00, div/u 2.5e-11 (fp32 5.3e-06), KE 2.0e-17, T 4.4e-18 | 7.6e-07 | 6.7e-14 | = |
+| T | O-grid 16x8x4 | T passive: momentum bitwise | rest max u 0.0e+00, div/u 3.9e-11 (fp32 1.2e-05), KE 5.7e-17, T 5.9e-17 | 1.4e-06 | 2.2e-14 | = |
+| LES smag + T | uniform box 8x6x4 | T passive: momentum bitwise | rest max u 0.0e+00, div/u 2.2e-11 (fp32 6.0e-06), KE 3.2e-17, T 1.1e-17 | 6.1e-07 | 1.9e-16 | = |
+| LES smag + T | rotated box (0.7 rad about (1,2,3)) | T passive: momentum bitwise | rest max u 0.0e+00, div/u 1.2e-12 (fp32 3.4e-06), KE 1.6e-17, T 2.8e-18 | 4.2e-07 | 1.4e-14 | = |
+| LES smag + T | random 0.25 h box | T passive: momentum bitwise | rest max u 0.0e+00, div/u 1.8e-11 (fp32 4.7e-06), KE 1.8e-17, T 3.9e-17 | 6.3e-07 | 7.0e-14 | = |
+| LES smag + T | O-grid 16x8x4 | T passive: momentum bitwise | rest max u 0.0e+00, div/u 4.0e-11 (fp32 1.1e-05), KE 1.0e-17, T 6.3e-17 | 1.1e-06 | 2.1e-14 | = |
+| LES sigma + T | uniform box 8x6x4 | T passive: momentum bitwise; sigma 2D random 0.25 h box 2D: bitwise; sigma 2D sine 0.08 box 2D: bitwise; O-grid 2D: n/a (orthogonal) | rest max u 0.0e+00, div/u 2.2e-11 (fp32 6.5e-06), KE 6.8e-18, T 2.0e-17 | 6.8e-07 | 2.5e-16 | = |
+| LES sigma + T | rotated box (0.7 rad about (1,2,3)) | T passive: momentum bitwise | rest max u 0.0e+00, div/u 2.0e-11 (fp32 2.7e-06), KE 2.4e-17, T 2.5e-17 | 3.7e-07 | 1.1e-14 | = |
+| LES sigma + T | random 0.25 h box | T passive: momentum bitwise | rest max u 0.0e+00, div/u 2.6e-11 (fp32 5.0e-06), KE 1.8e-17, T 4.5e-18 | 7.0e-07 | 6.6e-14 | = |
+| LES sigma + T | O-grid 16x8x4 | T passive: momentum bitwise | rest max u 0.0e+00, div/u 3.9e-11 (fp32 1.2e-05), KE 0.0e+00, T 1.5e-17 | 2.2e-06 | 2.2e-14 | = |
+| T + gravity | uniform box 8x6x4 | T passive: momentum bitwise | rest max u 7.1e-17, div/u 1.4e-11 (fp32 1.2e-06), KE 1.1e-17, T 2.4e-17 | 2.5e-07 | 2.5e-16 | = |
+| T + gravity | rotated box (0.7 rad about (1,2,3)) | T passive: momentum bitwise | rest max u 1.4e-16, div/u 9.9e-11 (fp32 1.1e-05), KE 5.5e-18, T 4.8e-17 | 8.9e-07 | 3.0e-14 | = |
+| T + gravity | random 0.25 h box | T passive: momentum bitwise | rest max u 1.6e-03 (stated), div/u 7.6e-11 (fp32 9.7e-06), KE 4.3e-17, T 4.3e-17 | 1.2e-06 | 5.4e-14 | = |
+| T + gravity | O-grid 16x8x4 | T passive: momentum bitwise | rest max u 1.7e-14, div/u 4.1e-11 (fp32 1.2e-05), KE 1.9e-17, T 1.1e-16 | 1.3e-06 | 2.1e-14 | = |
+| LES smag + T + gravity | uniform box 8x6x4 | T passive: momentum bitwise | rest max u 7.1e-17, div/u 1.2e-11 (fp32 1.4e-06), KE 4.0e-17, T 5.3e-18 | 3.7e-07 | 2.5e-16 | = |
+| LES smag + T + gravity | rotated box (0.7 rad about (1,2,3)) | T passive: momentum bitwise | rest max u 1.4e-16, div/u 6.1e-12 (fp32 1.1e-05), KE 2.7e-17, T 1.6e-17 | 1.1e-06 | 2.8e-14 | = |
+| LES smag + T + gravity | random 0.25 h box | T passive: momentum bitwise | rest max u 1.6e-03 (stated), div/u 9.6e-11 (fp32 6.9e-06), KE 2.8e-17, T 3.8e-17 | 1.0e-06 | 5.6e-14 | = |
+| LES smag + T + gravity | O-grid 16x8x4 | T passive: momentum bitwise | rest max u 1.7e-14, div/u 3.4e-11 (fp32 1.0e-05), KE 2.1e-17, T 2.0e-16 | 1.1e-06 | 2.2e-14 | = |
+| LES sigma + T + gravity | uniform box 8x6x4 | T passive: momentum bitwise; sigma 2D random 0.25 h box 2D: bitwise; sigma 2D sine 0.08 box 2D: bitwise; O-grid 2D: n/a (orthogonal) | rest max u 7.1e-17, div/u 1.3e-11 (fp32 1.6e-06), KE 4.8e-17, T 0.0e+00 | 3.0e-07 | 2.5e-16 | = |
+| LES sigma + T + gravity | rotated box (0.7 rad about (1,2,3)) | T passive: momentum bitwise | rest max u 1.4e-16, div/u 1.0e-10 (fp32 1.2e-05), KE 5.7e-18, T 7.7e-17 | 9.5e-07 | 2.8e-14 | = |
+| LES sigma + T + gravity | random 0.25 h box | T passive: momentum bitwise | rest max u 1.6e-03 (stated), div/u 7.7e-11 (fp32 8.4e-06), KE 8.9e-18, T 3.5e-17 | 1.2e-06 | 5.4e-14 | = |
+| LES sigma + T + gravity | O-grid 16x8x4 | T passive: momentum bitwise | rest max u 1.7e-14, div/u 4.1e-11 (fp32 1.1e-05), KE 3.9e-17, T 1.6e-16 | 3.4e-06 | 2.0e-14 | = |
+
+FV LES vs the structured MAC LES (gpu/les) is two models (gradient form `div(nu_t grad u)` with
+the fluid-fraction damping vs the symmetric stress) with no shared route: not measured
+(issues.md FI3).
 
 ## Verification
 
@@ -419,14 +581,26 @@ dns flame --physics lowmach --polymesh DIR --bc FILE.toml --upstream U [same phy
 
 `--bc` is `docs/fvcomp.md`'s file (`type`, `reference.direction`, `reference.origin`,
 ratios), with a low-Mach table: `inflow` fixes m = rho_b u_b, T, `y` (required); `outflow`
-is p = 0, scalars zero gradient both ways; `wall` adiabatic or isothermal, species-tight,
-no-slip; `slip`. `far` (no characteristic state), outflow `p`, `tback`, `burnt`, `y`, no
+is p = 0, scalars zero gradient both ways; `open` (`t`, `y`: the ambient, default Tu and 0;
+one ambient per run, two different ones exit 3 by name) the sign-of-flux face below;
+`wall` adiabatic or isothermal, species-tight, no-slip; `slip`. `far` (no characteristic state), outflow `p`, `tback`, `burnt`, `y`, no
 outflow at all (a closed box needs P0(t)): exit 3 by name, `--dry-run` included.
 `tools/chem/fv_flame_mesh.py --lowmach` writes that file.
 
-Rejected by name: `--mach`, `--compensated` (always on in FP32), `--equivalence`, `--mode`
-other than premixed, `--gravity`, `--rim`, `--laterals`, every LES, TFLES and turbulence
-flag, `--dt-rule`, checkpoints. Off the route `--tol`, `--bc`, `--fv-precision`.
+Also built (M3): `--equivalence PHI [--sl-law gri30|onestep] [--stoich] [--ox-y] [--mix-phi]`
+(model C2 / C2b, "Two reactants" below) and `--mode bunsen` (the 2D slot burner, "Burner"
+below, with `--dt-rule cell|bounds` and the burner flags `--slot-width`, `--jet-speed`,
+`--coflow-*`, `--pilot-*`, `--slot-edge`, `--length`, `--reaction`), and on the burner
+`--laterals open`, `--gravity G`, `--rim LIP [--rim-temp R] [--tube-length L]` ("Open faces,
+gravity, rim" below; on a polyMesh: an `open` patch, `--gravity` along -`reference.direction`,
+an isothermal wall patch).
+
+Rejected by name: `--mach`, `--compensated` (always on in FP32), `--mode` diffusion, candle,
+chamber, `--nozzle`, `--nz > 1` with `--mode bunsen`, the burner's `--profile-dt`, `--turb`
+(LES and TFLES are built, M4: "Low-Mach LES" below; their pairs "Low-Mach combinations"), `--gravity` off the burner, `--laterals`, `--rim`,
+`--rim-temp`, `--tube-length` with `--polymesh` (the mesh and `--bc` are the case).
+`--dt-rule` only with `--mode bunsen`. Off the route `--tol`, `--bc`, `--fv-precision`;
+`type = "open"` off it (dns flow, conv: a flame key; the compressible flame: by name).
 
 **State.** rho, rho Y_k (cells; FP32: hi + Kahan lo, `combineWord2`, gpu/lowmach's words;
 FP64 plain), rho u (cells), m (faces), p. T = P0/(R rho), Y = rho Y / rho derived.
@@ -500,6 +674,222 @@ step, the noise floor stops it), FV FP64 4.3 ms (`--tol 1e-3`, 16 to 30 iteratio
 step is launch-bound. A 30-cell rung in FP64 takes
 tt 8 inside 295 s only at `--tol 1e-3`; `--tol` moves S_L 1e-6 at 15 cells (1e-3 vs 1e-5).
 
+### Two reactants (model C2, C2b; `--equivalence`)
+
+`FvLowMachModel::ox = 1` (nY 2): gpu/lowmach's two-reactant algebra on faces, its own
+instantiations, `ox < 0` the one-reactant kernels bit for bit. `kLmfCell<R, TwoR, Phi>`:
+omega = `arrheniusRate2(lnA (+ phiRateLn(law, Y_F, Y_O)), ...)`, kLmCellPass<true, Phi>'s
+call; `kLmfGatherS<R, Comp, TwoR>`: the oxidizer row's sink `- s omega` (kLmScalars' `div -
+s w`); `kLmfRate<R, TwoR, Phi>`: LmChemJ's `k rho (Y_O + s Y_F + q/cp Y_F Y_O Ta/T^2)`. The
+limiter was already one theta over Y_F, Y_O and T. Box IC = `lowmachIC` (flameIC2's rule)
+cell for cell; a polyMesh lays the oracle s_p along `reference.direction` and
+`premix2Reactants` turns it into Y_F, Y_O. Inflow `y = [Y_F1, Y_O1]` in the `--bc` file
+(`tools/chem/fv_flame_mesh.py --lowmach --inflow-y A,B`); the route does not check the
+values against the premix (a stratified inflow is legal). Stats append `dzMin`, `dzMax`
+(Z - Z_in, gpu/runner_lowmach's); SL reads `rho (Y_F - Y_F,rem)` at the reference slab
+(`FvFlameSpec::yBurnt`, 0 = C0's expression).
+
+### Burner (`--mode bunsen`, 2D slot)
+
+The structured burner's inflow rows are a TABLE on faces: `fvLowMachRows` writes each
+face's `bU = (m T/P0) e`, `rUb = m e`, `bT`, `bY` (e the patch's unit velocity) before the
+upload; the kernels read per-face tables already, so no device path is new. Box: the rows
+of the owner's row j (lmInflowRow at (j + 1/2) hy, the structured `sp.rowM/rowT/rowY`
+exactly), IC `lowmachBunsenIC` cell for cell with rho u = the row's m. polyMesh: the one
+`jet = true` inflow patch takes lmInflowRow at the face centre, every cell
+`lmBunsenPoint` (the structured IC's ONE rule, factored out of lowmachBunsenIC) at its
+centroid, x = (C - origin).dir, y = (C - origin).lift + yc; dir = x, lift = y, 2D only
+(exit 3 by name). `--cells-per-delta`, `--length` keep the slot box's meaning there (yc,
+the measurement pixel).
+
+`--dt-rule cell` (the burner default, structured S9): dt also <= posK / max_c (2 conv_c +
+diff_c), `kLmfPos` on `kLmfRate`'s two rates. The FV conv rate is `sum_f |m| / (2 V min
+rho)`, the MEAN of a cell's faces per axis where LmConvRate takes the larger face: a
+stated rule difference, so a binary run's dt is not the structured run's.
+
+Stats: gpu/runner_lowmach's burner columns, same names, closed laterals. The cone
+(`measureCone`, `flankMassFlux`) on a uniform plane through the mesh (`FvRaster`, pixel h
+= the flags' cell, lower corner the inflow plane at y = yc - origin): on the box pixel =
+cell, bitwise the cell values. Integrals exact on cells per unit depth; fuelIn, fuelOut the
+current state's boundary face fluxes (`DeviceFvLowMach::faces()`); the flame index on the
+least-squares gradients (`flameIndex()`, gpu/derived's expression; interior equal to the
+central difference on the box, one-sided ends differ). The structured exit-8 anchoring
+guards (no rim).
+
+### Open faces, gravity, rim (M3 steps 3-5)
+
+**Open faces** (`type = "open"`, the box's `--laterals open`: `ylo`, `yhi`; `FvLowMachTables::bOpen`,
+2 on an open patch, 1 on every outflow while one exists: the structured x-hi backflow rule).
+p = 0 as an outflow's (the AMG matrix unchanged), and ONE rule per face by the sign of the
+face's own flux, gpu/lowmach's: OUT zero gradient (u, T, Y the cell's), IN the quiescent
+ambient (T_a, Y_a, rho_a = P0/(R T_a), the face velocity phi_b/(|S| rho_a) along n, tangential
+0) with the face pressure `bP = -beta rho_a u_n^2/2` (`kLmfOpenP`, openFaceP's operands; beta =
+`FvLowMachModel::backflow`, 1). No diffusion either way. Which flux decides: the temperature
+predictor, momentum and the face p read the stage INPUT's (structured: latT, kLmMomT read M of
+b), the species flux the PROJECTED one it carries (`kLmfBndY`, kLmScalars'): upwinding species
+by the input's sign carried the ambient's Y_O out of a face whose projected flux had turned
+outward, Y_O -2.6e-5 (O3, measured; structured 3.7e-25). Viscous: the normal stress is the
+CELL's (gpu/lowmach's zero normal-stress gradient), the tangential the one-sided full stress
+toward u_b (the structured edge stresses: zero gradient out, still air in). Traction-free
+(tau_nn = 0) is another boundary condition: it left the boundary rows O(1) off MAC and the l1
+distance growing with h (O4 before the fix: 2.7e-2, 3.1e-2, 3.3e-2). Absent (`bOpen` empty):
+none of it launches, the solver bit for bit.
+
+**Gravity** (`FvLowMachModel::gravity`, the vector: the box's `--gravity G` is (-G, 0, 0), a
+polyMesh's -G `reference.direction`). `addBuoyancyLm` on faces: every internal face's m* gains
+`cr (rho_f - rho_a) g . S` (`kLmfBuoyF`, rho_f the linear face density, the two-cell mean on a
+uniform mesh), and the reconstruction reads `fp - B` (`IncompImpl::buoyant`): a hydrostatic
+state cancels face by face, `DeviceFvIncomp`'s Boussinesq face force with the low-Mach density.
+A p-fixed face (outflow, open) carries the force of its upwind density (the cell's; on an open
+face's inflow the ambient's: 0), the structured x-hi face; Neumann faces none, their hydrostatic
+image `dpB = (rho_b - rho_a) g . r` feeds the deferred `kGradP`. Hydrostatics live in p: the
+quiescent ambient is p = 0 exactly. Absent (g = 0): none of it launches.
+
+**Rim** (`--rim` on the box): the tube's staircase (`lmTubeSolid`, the ONE tube definition)
+cells REMOVED from the box (`fvLowMachBox(g, openY, solid)`: polyOf, fluid cells kept in
+ascending order, a fluid/solid face a `rim` face owned by its fluid cell, S out of the fluid;
+srcCell stays Grid::idx), the `rim` patch an isothermal Wall at `--rim-temp`. Nothing new in a
+kernel: a Wall face is impermeable (phi_b == 0), species-tight (flux EXACTLY 0), no-slip, and
+conducts `rho D(T_w) (T_w - T_P) |S|/(h/2)` (the structured wall face's form); the limiter's
+first-side rule is the structured "second neighbour solid: central". The structured staircase
+is the oracle on these cells; a body-fitted tube (a polyMesh with its own wall patch) has no
+structured twin. IC, rows (Poiseuille, the room draft), stats (`xRimBase`, `rBase`, `qRim` =
+cp x the rim faces' conduction, per unit span) and the anchoring guards (flash-back below the
+rim, blow-off above half the cone over it) are gpu/runner_lowmach's. A polyMesh burner takes
+no `--rim`: its wall patch is the tube.
+
+Gates (`test_gpu_fv_lowmach burner`, ctest `gpu_fv_lowmach_burner`):
+
+| gate | case | measured | bound |
+|---|---|---|---|
+| O1/G1 rest | quiescent open box (rho = rho_a, Y the ambient's, m_in 0), 32 x 16, 1000 steps of dt 0.05, g 0 and 1, both precisions | rho u, m, p exactly 0 | exact |
+| O2 backflow | a vortex (mu 0.01) 3 cells inside the open y-hi face, 64 x 48, 2000 steps of dt 0.01, KE every 100 from the first step's (projected) field | beta 1: KE max/KE0 1.000000 (end 0.457); beta 0: 4.47 (structured 4.42) | <= 1 + 1e-6; > 1.5 |
+| O3 tallies | the hot blob through open y (64 x 32, 100 steps), uniform Y 0.5 / 0.25 at that ambient; a pure-fuel box under an air ambient | 0 cells off; mass, species - tally of the throughput: FP64 <= 8.4e-14, FP32 <= 2.6e-9; air: Y_O in [3.6e-25, 0.0496] (structured 3.7e-25), lateral inflow 0.72 | bitwise; FP64 1e-13, FP32 1e-7; [-1e-6, Y_O2] |
+| O4 vs structured | the blob, open y, swirl vanishing on the open faces, FV64 vs structured(FP32), dt 0.03 h^2, t 0.25, 32 x 16 to 128 x 64 | l1 rho 7.62e-5, 7.04e-5, 3.76e-5 (0.11, 0.90); l1 rho u 1.37e-2, 8.52e-3, 4.58e-3 (0.68, 0.90) of 1.25; max rho u 0.141, 0.296, 0.171 (the boundary row); lateral outflow -1.38e-2, -2.00e-2, -1.07e-2 of 0.13-0.21 | l1 shrinks |
+| G3 vs structured | the same, g 0.5 | l1 rho 7.51e-5, 7.02e-5, 3.74e-5 (0.10, 0.91); l1 rho u 1.36e-2, 8.46e-3, 4.53e-3 (0.69, 0.90) | l1 shrinks |
+| G2 hydrostatic | stratified column (T 1 -> 1.5 up, x-lo m 0, p = 0 on top), g 1 vs g 0, same dt 0.01, 1000 steps, FP64 | |rho u(g) - rho u(0)| / sqrt(g L): box 4.3e-16, sheared 21 deg 5.2e-5, random 0.3 h 3.1e-6 | 1e-4 (gpu/lowmach's; applied to sheared, random after their first measurement) |
+| R2 rim conduction | x-lo T 2 m 0, a slab across y T_w 1 at x 12, open y, 500 steps | max |T - T_lin| FP32 4.0e-7, FP64 2.2e-16; wall heat = lambda dT/L L_y = the inflow face's (0.333333, over cp) | FP32 2e-6, FP64 1e-12; 1e-5 |
+| R1 vs structured staircase | a slot tube (lips 2 f cells, x < 3, T_w 1.5), jet m 1, draft 0.2, passive Y 0.5, open y, t 0.125, 48 x 32 to 192 x 128 | uniform Y bitwise; rim faces phi_b == 0, species flux == 0 exactly; mass, species tallies <= 5.2e-15; l1 rho 4.00e-5, 2.20e-5, 8.74e-6 (0.87, 1.33); l1 rho u 7.33e-3, 2.87e-3, 1.11e-3 (1.35, 1.37) of 4.1; 0.5 off the tube's corners 5.40e-2, 2.41e-2, 1.03e-2 (1.17, 1.23); the max (inflow corner) 0.141, 0.098, 0.098 (flat: a corner cell, LF8) | bitwise; exact; 1e-13; l1 and off the corners shrink |
+
+The ctest takes 174 s on a shared GPU.
+
+### Low-Mach LES (M4: `--les`, `--sgs`, `--tfles`)
+
+gpu/lowmach's LES and TFLES (docs/chem.md "Low-Mach LES") on faces, operand for operand
+(`lmfEffD` is `lmEffD`, species.hip's effRhoD operands): `kLmfNut` mu_t = rho (Cs Delta)^2
+rate of the least-squares gradient (I.G, the cell velocity (rho u)/rho), Delta^2 =
+`FvIncompSetup::delta2`, per stage after the gradients, riding `I.nut`; `kLmfFaceM<R, true>`
+mu + mu_t,f; `kLmfFaceT`, `kLmfFaceY<R, Corr, Diff>` rho D + mu_t,f/Sc_t (Eddy) or F E_f rho D +
+(1 - Omega_f) mu_t,f/Sc_t (Thick) on internal faces, boundary faces molecular; `kLmfCell<.., Eof>`
+omega E/F; `kLmfRate<.., Eddy>` the cell's mu max(4/3, FE/Pr) + mu_t max(4/3, 1/Sc_t). TFLES:
+gpu/tfles' sensor on dns/fvles' face walk (`fvLowMachTfles`: FvLowMachTables::walk, the edge
+layers), Colin's u' on the compact cS Laplacian, the Charlette combine; a uniform sensor
+without the efficiency is formed once at make. Off: none of it launches (the M3 kernels).
+
+Same mesh + same dt vs structured (docs/chem.md table): TFLES is rounding (X1: the T, Y
+algebra never reads the velocity); Smagorinsky is a scheme gap of mu_t (X2: the cell
+velocity is (rho u)/rho here, the mean of the face m/rho_f there; order 2, the march's rho gap
+reaches the L7 rounding at h/4); sigma on a planar flame is 0 in both (L1, bitwise).
+`--les` on a 2D polyMesh: exit 3 (the compressible FV flame's rule).
+
+### Low-Mach turbulence (M5: `--turb`)
+
+The planar box only (docs/chem.md "Low-Mach turbulence"): the IC adds rho w u' to every
+centroid's rho u (`fvLowMachAddTurbulence`), the xlo faces' `bU`, `rUb` are rewritten before
+every step from the box swept past their centres (`TurbSweep`, `fvLowMachTurbRows`,
+`DeviceFvLowMach::setInflow`: a host table upload, no device path); only inflow faces read
+them, so the kernels are untouched. u' 0 = the tables bit for bit (L1). Same mesh + same dt
+vs structured is a scheme gap of order 2 (L2: collocated vs MAC, and the structured tangential
+rows sit on the y / z edges, the FV ones on the face centres). `--turb` on a polyMesh: exit 2.
+
+### Low-Mach combinations
+
+`dns/lmmodules` (the compressible family's `dns/fvmodules` shape): the low-Mach stage's
+modules, one decision per pair, read by `validate()` (`lowMachModules`: the refusal names its
+flag), both solvers' `make()` guards and `gpu_lm_matrix` (`test_gpu_lowmach_les matrix`:
+every live set holding an M4 module, singles and pairs closed under the requirements, on a 3D
+box, a sine-perturbed 3D box and the open 3D box: (a) TFLES F 1 = the cell without TFLES
+byte for byte (without LES; with it Omega switches the SGS scalar flux off, so F 1 is not
+LES alone), (b) passive uniform Y 0.25 bitwise / Z == 1 kept (C2, C2b: measured FP64 <= 7.8e-16,
+FP32 <= 3.2e-8), mass and fuel tallies (bounds FP64 1e-13, FP32 1e-7; measured <= 4.5e-15,
+<= 7.8e-11), (c) rerun bitwise both precisions, (d) Source / Morton / ColourMajor FP64 to
+summation order (<= 3.0e-12); 22 sets, 42 rows, 386 checks, 51 s on a shared GPU; M5: 29 sets, 56 rows with the Turb sets, 81 s; a Turb cell adds (a) rows of u' 0 = the cell without Turb bitwise and runs (b)-(d) with swept xlo rows). The M3 pairs (C0/C2/C2b with gravity, open, rim) keep their own gates
+(`gpu_fv_lowmach*`). Generated below (`test_gpu_lowmach_les markdown`):
+
+<!-- generated: dns::lmCombinationsMarkdown (src/dns/lmmodules.cpp); test_gpu_lm_matrix markdown -->
+| Module | Axis | Spelling |
+|---|---|---|
+| LES smag | turbulence | `--les Cs --sgs smag` |
+| LES sigma | turbulence | `--les C --sgs sigma` |
+| TFLES uniform | flame | `--tfles F --tfles-sensor uniform` |
+| TFLES dynamic | flame | `--tfles F [--tfles-sensor dynamic]` |
+| Charlette | efficiency | `--efficiency charlette` |
+| C0 | chemistry | `dns flame --physics lowmach (premixed, bunsen)` |
+| C2 | chemistry | `--equivalence PHI --sl-law onestep` |
+| C2b | chemistry | `--equivalence PHI [--sl-law gri30]` |
+| gravity | gravity | `--gravity G (--mode bunsen)` |
+| open | open | `--laterals open; type = open in --bc` |
+| rim | rim | `--rim LIP, an isothermal wall patch` |
+| turb | inflow | `--turb U (the planar flame, --nz >= 8)` |
+
+Pair matrix: L live, R refused, x one axis (exclusive).
+
+|   | LES smag | LES sigma | TFLES uniform | TFLES dynamic | Charlette | C0 | C2 | C2b | gravity | open | rim | turb |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| LES smag | . | x | L | L | L | L | L | L | L | L | R | L |
+| LES sigma | x | . | L | L | L | L | L | L | L | L | R | L |
+| TFLES uniform | L | L | . | x | L | L | R | R | L | R | R | L |
+| TFLES dynamic | L | L | x | . | L | L | R | R | L | R | R | L |
+| Charlette | L | L | L | L | . | L | R | R | L | R | R | L |
+| C0 | L | L | L | L | L | . | x | x | L | L | L | L |
+| C2 | L | L | R | R | R | x | . | x | L | L | L | R |
+| C2b | L | L | R | R | R | x | x | . | L | L | L | L |
+| gravity | L | L | L | L | L | L | L | L | . | L | L | R |
+| open | L | L | R | R | R | L | L | L | L | . | L | R |
+| rim | R | R | R | R | R | L | L | L | L | L | . | R |
+| turb | L | L | L | L | L | L | R | L | R | R | R | . |
+
+| Pair | Decision | Error text | Why |
+|---|---|---|---|
+| LES smag + rim | refused | `--les with --rim: not built (no wall model for mu_t at the immersed staircase)` | the cell-centred velocity differences read the solid cells' zero velocity: mu_t peaks at the lip with no damping (the incompressible cut-cell LES caveat) |
+| LES sigma + rim | refused | `--les with --rim: not built (no wall model for mu_t at the immersed staircase)` | the cell-centred velocity differences read the solid cells' zero velocity: mu_t peaks at the lip with no damping (the incompressible cut-cell LES caveat) |
+| TFLES uniform + C2 | refused | `--tfles with --equivalence: the thickened flame is premixed C0 only (low-Mach TFLES of two reactants is refused)` | F keeps one S_L and E wrinkles one (S_L, delta_L) pair: the C2 burner carries an outer Burke-Schumann diffusion sheet whose structure thickening does not preserve, and the sensor's normalisation is the one-step C0 manifold's (tflesSensorLogMax) |
+| TFLES uniform + C2b | refused | `--tfles with --equivalence: the thickened flame is premixed C0 only (low-Mach TFLES of two reactants is refused)` | F keeps one S_L and E wrinkles one (S_L, delta_L) pair: the C2 burner carries an outer Burke-Schumann diffusion sheet whose structure thickening does not preserve, and the sensor's normalisation is the one-step C0 manifold's (tflesSensorLogMax) |
+| TFLES uniform + open | refused | `--tfles with --laterals open: the sensor's T-gated max filter wraps y and z periodic (gpu/tfles)` | an open lateral is no wrap: the dilation would read across the box |
+| TFLES uniform + rim | refused | `--tfles with --rim: not built (the sensor dilates through the tube's solid cells)` | the max filter has no solid gate |
+| TFLES dynamic + C2 | refused | `--tfles with --equivalence: the thickened flame is premixed C0 only (low-Mach TFLES of two reactants is refused)` | F keeps one S_L and E wrinkles one (S_L, delta_L) pair: the C2 burner carries an outer Burke-Schumann diffusion sheet whose structure thickening does not preserve, and the sensor's normalisation is the one-step C0 manifold's (tflesSensorLogMax) |
+| TFLES dynamic + C2b | refused | `--tfles with --equivalence: the thickened flame is premixed C0 only (low-Mach TFLES of two reactants is refused)` | F keeps one S_L and E wrinkles one (S_L, delta_L) pair: the C2 burner carries an outer Burke-Schumann diffusion sheet whose structure thickening does not preserve, and the sensor's normalisation is the one-step C0 manifold's (tflesSensorLogMax) |
+| TFLES dynamic + open | refused | `--tfles with --laterals open: the sensor's T-gated max filter wraps y and z periodic (gpu/tfles)` | an open lateral is no wrap: the dilation would read across the box |
+| TFLES dynamic + rim | refused | `--tfles with --rim: not built (the sensor dilates through the tube's solid cells)` | the max filter has no solid gate |
+| Charlette + C2 | refused | `--tfles with --equivalence: the thickened flame is premixed C0 only (low-Mach TFLES of two reactants is refused)` | F keeps one S_L and E wrinkles one (S_L, delta_L) pair: the C2 burner carries an outer Burke-Schumann diffusion sheet whose structure thickening does not preserve, and the sensor's normalisation is the one-step C0 manifold's (tflesSensorLogMax) |
+| Charlette + C2b | refused | `--tfles with --equivalence: the thickened flame is premixed C0 only (low-Mach TFLES of two reactants is refused)` | F keeps one S_L and E wrinkles one (S_L, delta_L) pair: the C2 burner carries an outer Burke-Schumann diffusion sheet whose structure thickening does not preserve, and the sensor's normalisation is the one-step C0 manifold's (tflesSensorLogMax) |
+| Charlette + open | refused | `--tfles with --laterals open: the sensor's T-gated max filter wraps y and z periodic (gpu/tfles)` | an open lateral is no wrap: the dilation would read across the box |
+| Charlette + rim | refused | `--tfles with --rim: not built (the sensor dilates through the tube's solid cells)` | the max filter has no solid gate |
+| C2 + turb | refused | `--turb with --sl-law onestep (model C2): not built (no turbulent number)` | the turbulent box is measured on C0 and C2b; the uncorrected one-step C2 is the S1 diagnostic step |
+| gravity + turb | refused | `--turb on the low-Mach burner (--rim, --gravity): not built (the low-Mach --turb is the planar flame box's)` | the burner's inflow is the jet's per-row profile (lmInflowRow); a turbulent jet weight J(y) is the compressible slot's and has no low-Mach counterpart |
+| open + turb | refused | `--turb with --laterals open: not built (the synthetic box is periodic in y and z)` | an open lateral is no period of the box; its rows would wrap across it |
+| rim + turb | refused | `--turb on the low-Mach burner (--rim, --gravity): not built (the low-Mach --turb is the planar flame box's)` | the burner's inflow is the jet's per-row profile (lmInflowRow); a turbulent jet weight J(y) is the compressible slot's and has no low-Mach counterpart |
+| Charlette without LES smag or LES sigma | requirement | `--efficiency charlette needs --les (the sub-grid velocity of a filtered field)` | |
+| Charlette without TFLES uniform or TFLES dynamic | requirement | `--efficiency needs --tfles F (>= 1)` | |
+| TFLES uniform without C0 | requirement | `--tfles: the premixed C0 flame` | |
+| TFLES dynamic without C0 | requirement | `--tfles: the premixed C0 flame` | |
+
+| Live pair | Hand gates |
+|---|---|
+| LES smag + C0 | gpu_lowmach_les X2 (FV vs structured: the scheme gap shrinks) |
+| LES smag + C2b | gpu_lm_matrix (b): Z == 1 kept under the one-Sc_t eddy flux |
+| LES smag + turb | gpu_lm_turb (IC, rows, structured vs FV), tools/chem/turb_fv.sh lm, lmpairs (S_c vs structured) |
+| LES sigma + C0 | gpu_lowmach_les L1 (sigma on a planar flame = DNS bitwise, both solvers) |
+| LES sigma + C2b | gpu_lm_matrix (b): Z == 1 kept under the one-Sc_t eddy flux |
+| LES sigma + turb | gpu_lm_turb (IC, rows, structured vs FV), tools/chem/turb_fv.sh lm, lmpairs (S_c vs structured) |
+| TFLES uniform + C0 | gpu_lowmach_les X1 (FV vs structured: rounding), S_L of F |
+| TFLES uniform + turb | gpu_lm_turb (IC, rows, structured vs FV), tools/chem/turb_fv.sh lm, lmpairs (S_c vs structured) |
+| TFLES dynamic + C0 | gpu_lowmach_les X1 (FV vs structured: rounding) |
+| TFLES dynamic + turb | gpu_lm_turb (IC, rows, structured vs FV), tools/chem/turb_fv.sh lm, lmpairs (S_c vs structured) |
+| Charlette + turb | gpu_lm_turb (IC, rows, structured vs FV), tools/chem/turb_fv.sh lm, lmpairs (S_c vs structured) |
+| C0 + turb | gpu_lm_turb (IC, rows, structured vs FV), tools/chem/turb_fv.sh lm, lmpairs (S_c vs structured) |
+| C2b + turb | gpu_lm_turb (IC, rows, structured vs FV), tools/chem/turb_fv.sh lm, lmpairs (S_c vs structured) |
+
 ### Low-Mach verification
 
 Same table rules as `docs/fvcomp.md` "Cross-verification". Agreement proves the port, not
@@ -532,12 +922,57 @@ the physics. Flame rows: sigma 5, beta 8, Pr 0.72, u_in 0.98, S_L and delta_th m
 | same | same | delta_th | order 2 | +1.05e-2, +6.33e-3, +1.63e-3 (0.73, 1.96): slab read across curved i lines |
 | shear + wavy + rotate 20 deg vs planar | 7.5, 15, ny 16, FP64, 67 deg max | S_L | order 2 | -2.51e-3, -6.47e-4 (1.96). 30: not measured |
 | same | same | delta_th | order 2 | -7.91e-3, +1.13e-3: sign change, no order |
+| two reactants, Z (R1) | box, sine, snappy; C2 and C2b; 40 steps | max |Z - 1| | rounding | FP64 6.7e-16 / 1.4e-15 / 8.9e-16 (C2b 6.7e-16 / 1.7e-15 / 8.9e-16); FP32 2.9e-8 / 3.5e-8 / 2.7e-8 (C2b 3.1e-8 / 3.0e-8 / 3.5e-8) |
+| two reactants, tallies (R2, R3) | same | fuel + burn, oxidizer + s burn, mass vs FP64 tallies; energy rate | rounding | FP64 <= 1.9e-15 every row, energy <= 2.7e-16; FP32 <= 8.9e-11, energy <= 1.1e-7 |
+| FV vs `DeviceLowMach` two-reactant C2b, same dt, 400 steps (R7) | 128 x 4 box, burning, phi 1.3 | rho, rho Y_F, rho Y_O | rounding, <= 3 x FV32 vs FV64 | FV32 3.16e-7, own 3.24e-7; FV64 vs structured(FP32) 5.2e-8 |
+| FV(FP64) vs structured(FP32), C2b, Sutherland 298 K, sigma 6.88 | 7.5, 15 cells, 1D box, [10, 20] | S_L | rounding: <= FV32 vs FV64 | 0.9945958 vs 0.9945961, 0.9984696 vs 0.9984699: -3.0e-7, -3.0e-7 (FV32 - FV64 -8.0e-6, +4.4e-6). 30 cells: not measured (FV64 ~800 s) |
+| same | same | delta_th; Z - Z_in | rounding | 4.700089 vs 4.700087, 4.711926 vs 4.711924; FV64 Z within 1.3e-14 / 5.6e-14 of Z_in, FV32 1.1e-7 / 1.2e-7, structured 1.7e-7 / 1.8e-7 |
+| C2b sheared 30 deg (polyMesh) vs planar, FP64 | 7.5, 15 cells, ny 8, 16 | S_L | order 2 | 0.9926079, 0.9980001: -1.99e-3, -4.70e-4 (2.08); Z within 8.4e-15 / 4.8e-14 |
+| per-face rows (B1, B2) | 48 x 32 box, a hot slot in a fresh coflow, burning, 40 steps | inflow phi_b vs - m_row |S|; mass, fuel, passive vs tallies | rounding | FP64 0, 5.3e-15, 1.2e-16, 5.3e-15; FP32 5.7e-8, 2.5e-11, 7.3e-11, 2.5e-11 |
+| FV(FP32) - structured(FP32), G2a slot burner (C0, sigma 5, W 12, U 5, burnt coflow, `--length 49`), each its own dt | 4, 6, 8 cells, window [20, 25] | xTip | scheme gap (collocated vs MAC momentum, cell u (rho u)/rho vs face-mean m/rho_f): shrinks | 44.3072 vs 44.3040, 44.0420 vs 44.0405, 43.9278 vs 43.9267: +3.18e-3, +1.45e-3, +1.07e-3 (1.94, 1.04) |
+| same | same | tanA; sinRatio | same | -8.07e-5, -4.50e-5, -2.79e-5 (1.44, 1.66); -3.80e-4, -2.10e-4, -1.30e-4 (1.46, 1.66) |
+| same | same | SLflank; mFlank | same | +2.86e-5, +2.05e-5, +1.40e-5 (0.82, 1.33); -1.93e-3, -2.12e-3, -1.34e-3 (no order 4 to 6, 1.60 6 to 8) |
+| same | same | burnRatio; massErr | rounding; the tally | both 0.99999 to 1.2e-6; FV 3e-11 to 4.4e-10, structured -4.7e-8, +2.6e-8 (its IC adjustment, chem.md) |
+| FV(FP32) - structured(FP32), rich2d partially premixed slot (C2b phi 1.3, sigma 6.88, Sutherland 298 K, Pr 0.52, W 4, U 3, pilots 1.5 at 3, air coflow 6, `--length 50`) | 4, 6, 8 cells, window [30, 40] | inner xTip; outer xTipOut | scheme gap: shrinks | 17.7787 vs 17.7868, 17.7450 vs 17.7497, 17.7106 vs 17.7143: -8.03e-3, -4.65e-3, -3.74e-3 (1.35, 0.76); 79.8441 vs 79.8243, 80.0348 vs 80.0269, 80.0899 vs 80.0848: +1.99e-2, +7.83e-3, +5.05e-3 (2.30, 1.52) |
+| same | same | tanA; sinRatio | same | -9.82e-4, -4.42e-4, -2.14e-4 (1.97, 2.52); -2.42e-3, -1.09e-3, -5.25e-4 (1.98, 2.53) |
+| same | same | SLflank; mFlank | same | +3.01e-4, +9.04e-5, +6.79e-5 (2.97, 0.99); +2.03e-2, +7.32e-3, +3.79e-3 (2.52, 2.29) |
+| same | same | preFrac; burnRatio; Z, yHits | same; rounding | -8.9e-6, -2.7e-4, -6.5e-5 (no order); both 0.99987 to 4e-6; FV Z in [2.3e-8, 1 + 1e-7] at 8 cells, 0 hits both |
+| polyMesh `--wavy 2` (h) of the G2a box vs the box, FV32 | 6 cells, one rung | xTip, tanA, sinRatio, SLflank, mFlank | the mesh's truncation | +1.2e-3, -7.6e-5, -3.6e-4, +1.7e-4, -1.4e-4 (44.0432, 0.208502, 1.02056, 0.989016, 0.990589); burnRatio 0.99999, massErr -4.8e-10, 0 hits. 4, 8 cells: not measured |
+| FV(FP64, `--tol 1e-3`) - FV(FP32), G2a | 6 cells | xTip, tanA, mFlank | the precision's (and tol) | +1.1e-4, -8.5e-7, -2.3e-6: below the gap above |
+| FV(FP32) - structured(FP32), G2a `--laterals open` (the open face kind on ylo, yhi), each its own dt | 4, 6, 8 cells, window [20, 25] | xTip | scheme gap: shrinks | 44.2862 vs 44.2823, 44.0217 vs 44.0192, 43.9049 vs 43.9026: +3.92e-3, +2.47e-3, +2.25e-3 (1.14, 0.32) |
+| same | same | tanA; sinRatio | same | -1.51e-4, -1.02e-4, -8.62e-5 (0.97, 0.57); -7.10e-4, -4.79e-4, -4.06e-4 (0.97, 0.58) |
+| same | same | SLflank; mFlank | same | +6.7e-6, +2.22e-5, +1.52e-5 (no order 4 to 6, 1.31); -2.02e-3, -2.19e-3, -1.41e-3 (none, 1.54) |
+| same | same | mdotOut; mdotLat (net in); mdotIn | the outflow's partition: PLATEAU (issues LF6) | 63.718 vs 63.808, 63.823 vs 63.923, 63.832 vs 63.946: -9.0e-2, -1.01e-1, -1.13e-1; mdotLat -9.2e-2, -1.03e-1, -1.15e-1 (0.25-0.31% of it, grows); mdotIn 100.692 both (the rows) |
+| same | same | uLatMin; uLatMax | pointwise extremes | -4.4e-3, -2.5e-3, -1.4e-3 (1.35, 2.01); +1.96e-2, +1.89e-2, +1.87e-2 (1%, flat) |
+| same | same | burnRatio; massErr; yHits | rounding; the tally | 1.00025 vs 1.00022 to 1.00022 vs 1.00020 (both); FV max massErr 1.1e-9, 0 hits |
+| polyMesh `--wavy 2 --open-y` (`tools/chem/fv_flame_mesh.py`: ylo, yhi `type = "open"` patches) vs the box `--laterals open`, FV32 | 6 cells, one rung | xTip, tanA, sinRatio, SLflank, mFlank; mdotLat | the mesh's truncation | +1.2e-3, -9.0e-5, -4.2e-4, +1.7e-4, -9.4e-5 (44.0229, 0.201216, 0.986311, 0.990362, 0.99345); mdotLat -1.5e-2 of 36.9; burnRatio equal to 2e-6, massErr 4.5e-10, 0 hits. 4, 8 cells: not measured |
+| FV(FP32) - structured(FP32), the same + `--gravity 0.0964` (4x real g) | 4, 6, 8 cells, [20, 25] | xTip | scheme gap: shrinks | 44.2873 vs 44.2841, 44.0207 vs 44.0193, 43.9044 vs 43.9034: +3.17e-3, +1.35e-3, +9.68e-4 (2.10, 1.16) |
+| same | same | tanA; sinRatio | same | -1.52e-4, -1.09e-4, -8.56e-5 (0.83, 0.83); -7.14e-4, -5.12e-4, -4.03e-4 (0.82, 0.83) |
+| same | same | SLflank; mFlank | same | +9.1e-6, +1.88e-5, +1.13e-5 (none, 1.78); -2.06e-3, -2.23e-3, -1.43e-3 (none, 1.54) |
+| same | same | mdotOut; mdotLat (net in) | same | +5.42e-1, +3.31e-1, +2.41e-1 (1.21, 1.11); +5.70e-1, +3.51e-1, +2.28e-1 (1.20, 1.49) of 8.6-9.3 |
+| same | same | uLatMin; uLatMax | pointwise extremes | +6.6e-3, +8.7e-3, +2.48e-2 (grows); +2.56e-2, +2.80e-2, +2.87e-2 (3.5% of 0.80, flat) |
+| same | same | burnRatio; massErr; yHits | rounding; the tally | 0.99995 to 0.99997 both, within 4e-6; FV max massErr 1.6e-9, 0 hits |
+| FV(FP32) - structured(FP32), the rim anchor (gpu_lowmach_rim_anchor's case: rich phi 1.3 C2b, sigma 6.88, Sutherland 298 K, Pr 0.41, W 14, U 6, lip 1.4, open laterals at 6, T_w 1, tt 40); the tube's staircase = the FV mesh's `rim` patch (grid-aligned lips: the staircase IS the body-fitted wall) | 4, 6, 8 cells, window [30, 40] | anchored (exit 0) | both | both exit 0 at every rung (no flash-back, no blow-off) |
+| same | same | xRimBase; rBase | the base ROW (a cell centre): equal or one row apart | 4: 4.12093 both, rBase 37.0997 vs 37.1050; 6: FV one row lower until t 39.5 (2.747 vs 3.532 = 3.5 h vs 4.5 h, rBase 39.35 vs 37.76 follows the row), then the same row (37.80 vs 37.82); 8: 3.23788 both (0.69 delta_th), rBase 38.598 vs 38.612 |
+| same | same | qRim; preFrac; burnRatio | scheme gap: shrinks | 85.314 vs 85.801, 83.187 vs 83.487, 84.340 vs 84.528: -0.57%, -0.36%, -0.22% (1.19, 1.64); +6.9e-4, +4.3e-4, -8.2e-5 (1.16, sign change); +1.24e-3, +7.2e-4, +2.9e-4 (1.34, 3.14) |
+| same | same | inner xTip; mdotLat (net in); Tmax | | -2.9e-2, -8.7e-3, -2.6e-2 of 244-248 (1e-4, no order); +2.01, +1.21, -0.45 of 340-404 (sign change); -5.1e-4, +1.7e-4, +9.0e-4. 0 hits both, FV max massErr 5.2e-8 |
 | low-Mach FV(FP64) - compressible FV(FP64), M 0.01 | 7.5, 15, 30, same box | S_L | h part order 2, limit `+gamma M^2 (sigma - 1)` = +5.6e-4, the O(M^2) offset | 1.017309, 1.003584, 1.000469 vs low-Mach: -2.30e-2, -5.31e-3, -9.32e-4 (2.12, 2.51). Richardson on the last two at order 2: +5.3e-4 |
 | same | same | delta_th | shrinks | 1.55562, 1.59063, 1.59976 vs low-Mach: +6.1e-2, +1.12e-2, +1.87e-3 |
 
 The h part of that last row is a stated model and scheme gap: the compressible flame carries
 central energy flux, the low-Mach one the limited T_f. It shrinks; its limit is the known O(M^2)
 offset.
+
+M3 off = bit for bit: `tools/fv/comp_bit_identity.sh` (pre-M3 binary vs this tree, 29 cases
+with the low-Mach FV planar box FP32 / FP64, a sheared polyMesh, the structured low-Mach C0 and
+C2 burner through `lmBunsenPoint`'s cell rule): 29 byte-identical, 0 failures (2026-11-03).
+Steps 3-5 off = bit for bit: the same script, faad136 vs this tree, 32 byte-identical, 0
+failures; and the steps 1-2 binary vs this tree on the low-Mach FV routes (C2, C2b gri30 FP64,
+the G2a burner FP32 / FP64, the rich burner, the planar box, the sheared polyMesh): 7
+byte-identical, 0 failures (2026-11-03). No open patch, g = 0, no rim: no new launch.
+
+Not measured (M3, each past 295 s or past the 3-level budget): the C2b 1D 30-cell rung in FP64
+(~800 s), the G2a burner at 8 cells in FP64, the wavy polyMesh burner at 4 and 8 cells.
 
 Not measured (each past 295 s on the final dt rule):
 
@@ -546,8 +981,12 @@ Not measured (each past 295 s on the final dt rule):
 
 **Gates.** `fv_lowmach` (host, `tests/test_fv_lowmach.cpp`): route, rejections, `--bc`, the first
 table, `fvThetaVote` vs the structured stencil, `measureLowMach`. `gpu_fv_lowmach` (L1-L7,
-`tests/test_gpu_fv_lowmach.cpp`, 43 s), `gpu_fv_lowmach_momentum` (L8, 147 s), `gpu_fv_lowmach1d`
-(the binary at 7.5 cells: S_L 0.994256, delta_th 1.61176, 0 hits at tt 12).
+`tests/test_gpu_fv_lowmach.cpp`, with R1-R3, R7, B1-B2 55 s), `gpu_fv_lowmach_momentum` (L8, 147 s),
+`gpu_fv_lowmach1d` (the binary at 7.5 cells: S_L 0.994256, delta_th 1.61176, 0 hits at tt 12),
+`gpu_fv_lowmach_bunsen` (the binary's G2a burner at 4 cells, 32 s: xTip 44.3072, burnRatio
+0.999990, max |massErr| 1.2e-9, 0 hits), `gpu_fv_lowmach_burner` (O1-O4, G1-G3, R1-R2: "Open
+faces, gravity, rim", 174 s). The host gate adds the `open` kind's parse and errors, the route's
+new flags, and the box minus a solid strip (`rim` faces, S out of the fluid, `bOpen` 1 / 2).
 
 | gate | bound |
 |---|---|
@@ -558,6 +997,11 @@ table, `fvThetaVote` vs the structured stencil, `measureLowMach`. `gpu_fv_lowmac
 | L7 | FV32 vs structured <= 3 x FV32 vs FV64 |
 | L8 | order >= 1.5 per rung |
 | flame1d | S_L within 2e-3 of the structured 7.5-cell value, 0 hits |
+| R1 Z kept | FP64 1e-12, FP32 1e-6 (set before the result) |
+| R2 mass, fuel, oxidizer; R3 energy rate | L2's, L3's |
+| R7 | L7's |
+| B1 inflow m vs row; B2 tallies | FP64 1e-14, FP32 1e-6; L2's |
+| bunsen | xTip within 1e-2 of the structured 4-cell 44.304 (set after the result: +3.2e-3, a scheme gap, issues LF5), burnRatio within 1e-4 of 1, |massErr| <= 1e-7, 0 hits, exit 0 (anchored) |
 
 ## Rejected / not built
 
@@ -570,10 +1014,11 @@ table, `fvThetaVote` vs the structured stencil, `measureLowMach`. `gpu_fv_lowmac
 - Restart: not built.
 - `dns conv --solver fv`: `--hot-patch` (per-face wall T), inflow / outflow under
   buoyancy: not built.
-- Low-Mach FV: not built, rejected by name: the Bunsen burner (per-face inflow rows,
-  cone stats), open laterals, `--rim`, `--gravity`, `--equivalence` and two reactants,
-  `--les`, `--tfles`, `--turb`, `--dt-rule cell`, checkpoint and restart, a closed box
-  (P0(t)). The tables are per face (`bU`, `bT`, `bY`): a burner's rows need no new
-  device path, the cost is its stats and its gates.
+- Low-Mach FV: not built, rejected by name: the 3D slot and the round nozzle, the
+  burner's `--profile-dt`, `--turb` on a polyMesh or the burner (M5: the planar box only), a closed
+  box (P0(t)), gravity on the planar flame, `--rim` on a polyMesh (its wall patch is the
+  tube). Built in M3: two reactants, the 2D slot burner, open faces (`type = "open"`,
+  `--laterals open`), gravity (the face force), the rim (the staircase as a Wall patch);
+  in M4: LES and TFLES ("Low-Mach LES", refusals in "Low-Mach combinations").
 
 See `issues.md` item 79.

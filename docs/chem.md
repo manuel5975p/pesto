@@ -156,7 +156,8 @@ to 2e-16). SL = ∫ω dx / (ρ (Y_F − Y_F,rem))_ref (`FlameRun::yFBurnt`; 0 =
 the shipped expression bit for bit); stats append zMin, zMax. Rejected by
 name: `--mode bunsen` (needs `--physics lowmach`, not built), diffusion /
 candle / chamber, `--fuel-y`, `--damkohler`, `--cells-per-unit`,
-`--ignition`, `--les`, `--tfles`, `--turb`; φ outside [1.05, 1.6]. Label:
+`--ignition`, `--les` (structured; the FV route takes it: docs/fvcomp.md "Air-methane"),
+`--tfles`, `--turb`; φ outside [1.05, 1.6]. Label:
 `DNS [partially premixed two-reactant F + 3.99 O -> 4.99 P (rich jet
 phi=1.3, s=3.99, Y_O2=0.233: …), unit S_L at phi, …]`.
 
@@ -840,7 +841,7 @@ ranks (exec 142 s).
 Full record `plans/verify/impl_foamflame_G3.md`; tooling as G1/G2 plus the
 geometries `diffusion2d` / `candle2d` (`foamflame/cases.py`: ports of
 `diffusionInflow`, `burkeSchumann`, `diffusionIC`, `candleAmbientP`, the
-config.cpp grid), `foamflame/observejet.py` (`measureJet` verbatim + the
+`dns/config/flame_modes.cpp` grid), `foamflame/observejet.py` (`measureJet` verbatim + the
 runner's diffusion stats row), `model.si_map_diff`.
 
 **Case.** `--mode diffusion` defaults (W 16 l, s 1, Y_F1 = Y_O2 = 1, Z_st
@@ -1920,7 +1921,7 @@ arrays are filled at j + ny k (the slot repeated over z), `bunsenIC` is
 extruded over z, `--les`/`--sgs`/`--tfles` take the premixed 3D machinery
 (`Eddy`/`Thick` species instantiations with `Row`, the open-row μ_t copy).
 Files: `config` (`bunsenGeometry` nz, the shared `flameTurbSetup`),
-`flame1d` (`addBunsenTurbulence`), `dns_main` (rows, the J-weighted box),
+`flame1d` (`addBunsenTurbulence`), `dns/drive/flame.cpp` (rows, the J-weighted box),
 `runner_flame` (the `b3` branch), `tools/chem/turb_render.py`.
 
 **Turbulent jet** (`--turb U --turb-length L --seed S`): the same
@@ -2058,7 +2059,7 @@ mean (an axisymmetric cone's span mean is not a cone); ST = burn / (π R
 hypot(H, R)), R = D/2; `SLflank` is NaN (per unit span). The periodic box
 holds a lattice of jets one box apart (jet interaction not measured).
 Files: `bunsen`, `config` (`bunsenGeometry`), `flame1d` (`bunsenRoundIC`),
-`dns_main` (rows), `runner_flame` (`axialPlane`).
+`dns/drive/flame.cpp` (rows), `runner_flame` (`axialPlane`).
 
 The round cone is SHORTER than the ideal cone (measured, laminar DNS):
 U 10, D 6 δ_th, 4 cells/δ_th, cold
@@ -2314,6 +2315,39 @@ FP64 mass tally `state.tally`; no version bump (no warm start: the solve is
 direct). Every loop variable must live in the loop struct (K12): one outside
 it breaks the byte rule silently, and only the chained byte test catches it.
 
+**Extended to the FV routes (masterplan_multiphysics M5)**: `--solver fv` and
+`--polymesh DIR --bc FILE`, both physics, every mode the FV path builds
+(premixed C0 / C2 / C2b, `--les`, `--tfles`, `--compensated`, `--fv-precision
+fp64`; the diffusion jet; the low-Mach planar flame and burner with `--laterals
+open`, `--rim`, `--gravity`). Solvers `flame-fv-compressible` (`runFvComp`) and
+`flame-fv-lowmach` (`runFvLowMach`); phase 1.5 picks the expected name from
+`--physics` AND the route, so a structured checkpoint into an FV run (or back)
+is exit 3 naming both. Their `grid` record is the FaceMesh's (nC, nI, nB, nY),
+compared with the mesh built (exit 3). **The mesh is part of the identity**: a
+`mesh` record, `polyMesh sha256:<hex> bc sha256:<hex>` (every regular file of
+the polyMesh directory, name + sha256 in name order, and the `--bc` file's
+content) or `flags` (the box the case flags define); phase 1.5 compares it by
+text: a changed mesh file or `--bc` file is exit 3 (`--restart: ...: the mesh
+differs from the checkpoint's: ...`) even under the same path. Loop structs
+`FvCompLoop`, `FvLowMachLoop`. State records are the device words raw, F32 at
+FP32 and F64 at `--fv-precision fp64` (`gpu/internal/ckpt_words.hpp`):
+`state.fv.q` (+ `state.fv.lo`, the compensated low words; `state.fv.hits`, the
+SST guard's count, when allocated) for the compressible solver; for the
+low-Mach one the state `state.fvlm.rho`, `rlo`, `ru`, `y<s>`, `ylo<s>`, the
+projection's WARM START and memory `state.fvlm.p` (the PCG's x0 of the next
+stage) and `phi`, `phiB` (the last stage's face mass flux: the next stage's
+Rhie-Chow term of c), the FP64 tallies `state.fvlm.tally` and the uploaded
+`state.fvlm.enthalpy0`. Not carried, by construction: LES mu_t and the TFLES
+F E, E/F, Omega (of each step's input state; `refreshEddy` for dt and stats),
+the burner's per-face rows (tables of the mesh), the AMG hierarchy
+(geometric, built once). `gpu_restart_fv` (`comp`) and `gpu_restart_fvlm`
+(`lm`) prove it: chained (1 + 3 restarts) = straight byte for byte, a
+checkpointing straight run = straight, and its last checkpoint = the chain's
+record for record but `restarts`. The low-Mach FV loop's equal steps to `--tt`
+(`rem / ceil(rem / dt)`) make its trajectory a function of `--tt`: a restart
+that GROWS `--tt` is a valid continuation but not the straight run to the
+larger `--tt` (the structured runners' "grow" equality does not hold there).
+
 ## Low-Mach (`--physics lowmach`; masterplan real_bunsen S4)
 
 The zero-Mach, variable-density, acoustically filtered flame solver: the
@@ -2477,7 +2511,7 @@ single-reactant (C0) or **partially premixed** (`--equivalence`, C2/C2b).
 Files: `dns/lowmach.{hpp,cpp}` (`lmInflowRow`, `lmPartialPremixMix`,
 `lowmachBunsenIC`, `lmPremixedWeight`), `gpu/lowmach` (per-row inflow,
 `cellVelocity`), `gpu/derived` (`flameIndexCentred`), `gpu/runner_lowmach`
-(the cone measurement, the C2 columns, frames), `apps/dns_main.cpp` (rows),
+(the cone measurement, the C2 columns, frames), `dns/drive/flame.cpp` (rows),
 config (bunsen admitted with lowmach; `--pulse` rejected; `--mix-phi`
 rejected on the burner; ny widened to a 7-smooth size into the coflow).
 
@@ -3120,6 +3154,129 @@ brass gas inlet and hose; the proxy lights carry the power-weighted mix of
 the two colours. Test frame (half-scale scout A, t 80, real scale, 1080p,
 96 samples, 4.6 s on gfx1100): `runs/s9/render/g1/f0004.png`.
 
+## Low-Mach LES (`--physics lowmach --les`, `--sgs`, `--tfles`; masterplan_multiphysics M4)
+
+LES and the thickened flame on the low-Mach solvers, structured (`gpu/lowmach`,
+`runner_lowmach`) and FV (`DeviceFvLowMach`, `runner_fvlowmach`) together, each the
+other's oracle. Same flags, rules and labels as the compressible flame ("LES species and
+the thickened flame"): `--les` needs an explicit `--sgs` and `--nz >= 8` (a 2D polyMesh:
+exit 3), sigma is rejected at nz 1, `--efficiency charlette` needs `--les`, F x
+`--cells-per-delta` >= 4, the IC is the oracle thickened by F. Off = the M3 kernels bit
+for bit (`--les`/`--tfles` absent: no new launch, no new instantiation runs).
+
+Model (one expression per term, both solvers; their own kernel instantiations):
+
+```
+mu_t     = rho_c (C Delta)^2 rate(g)          per cell, per RK stage (dns/sgs.hpp: Smagorinsky |S|, sigma D_sigma)
+           Delta^2 = (hx hy hz)^(2/3) (hx hy at nz 1); FV: FvIncompSetup::delta2 (V^(2/3), area in 2D)
+           g: structured = central differences of the cell-centred MAC velocity (kLmCellVelocity),
+              an end cell's missing neighbour itself; FV = the least-squares gradient of (rho u)/rho
+momentum mu + mu_t in the stress (structured: the cell mu array, so edges average it; FV: face mean)
+T, Y_k   rho D + mu_t,f / Sc_t on INTERIOR faces, Sc_t = Pr_t = kLesPrt 0.9 (Le_t = 1: T + (q/cp) Y_F
+           keeps one face formula); boundary faces (inflow, open, wall) molecular
+TFLES    F E rho D + (1 - Omega) mu_t,f / Sc_t there, omega (E/F) (fuel and heat release); gpu/tfles'
+           F, E, Omega frozen over a step from its input state; FV: the same sensor on dns/fvles' face walk
+dt       structured: coef h^2 rho_min / (mu(T_max) max(4/3, FE_max/Pr) + mu_t,max max(4/3, 1/Sc_t));
+         FV and --dt-rule cell: the cell's own mu, mu_t, F E in the per-cell rate. Both read the eddy
+         fields of the CURRENT state (refreshEddy), so a restart is the uninterrupted run byte for byte.
+```
+
+Pairs (`dns/lmmodules`, one decision each, docs/fvincomp.md "Low-Mach combinations"): LES is
+live with C0, C2, C2b (one Sc_t for both reactants: Z(Y) stays linear), gravity and open
+laterals. Refused by name: TFLES with `--equivalence` (F keeps one S_L and E wrinkles one
+(S_L, delta_L): the C2 burner's outer Burke-Schumann sheet is a diffusion flame thickening
+does not preserve, and the sensor's normalisation is the C0 manifold's), TFLES with
+`--laterals open` (the sensor's max filter wraps y and z periodic), LES and TFLES with `--rim`
+(no wall model for mu_t at the staircase; the sensor reads the solid). `--turb`: "Low-Mach
+turbulence" (M5).
+
+Stats: both runners append `mutMax` (LES) and `FEmax`, `Ebar` (TFLES) after `dtPos`.
+
+Measured (gfx1201, simjob, 2026-11-03; `test_gpu_lowmach_les`, ctest `gpu_lowmach_les`,
+`gpu_lowmach_les_smag`, `gpu_lm_matrix`; planar flame sigma 5, beta 8, Pr 0.72, u_in 0.98,
+S_L, delta_th means over [10, 20]):
+
+| gate | case | measured | relation |
+|---|---|---|---|
+| off | `tools/fv/comp_bit_identity.sh` vs faad136 (33 cases); 16 low-Mach routes vs the pre-M4 binary (1D/3D, C2, bunsen 2D/3D, C2 burner, open + gravity, rim, frames; FV box FP32/FP64, 3D, C2, burner, open + gravity, rim) | every artefact | byte-identical (0 failures) |
+| L1 laminar limit | 64 x 4 (x 4), 200 steps, both solvers, FV both precisions: TFLES F 1 uniform and dynamic; LES sigma on a planar 3D flame (rank-1 grad u: D_sigma 0); LES Smagorinsky on a uniform inert stream (grad u 0) | every state field of the DNS run | bitwise |
+| X1 TFLES F 2, FV vs structured | 128 x 4 box, burning front, dt 1e-3, 400 steps | uniform: FV32 1.0e-7, FV64 2.5e-8 vs structured(FP32), FV32 vs FV64 9.4e-8; dynamic: 1.8e-7, 2.3e-8, own 1.8e-7; TFLES moved rho 4.6e-2 | rounding, <= 3 x own |
+| X2 Smagorinsky Cs 0.17, FV vs structured | 1D flame, 2D device level, h 0.25, 0.125, 0.0625, dt 0.03 h^2, t 0.25 | mu_t of one state: 1.2e-2, 3.1e-3, 7.7e-4 of max mu_t (order 1.96, 1.99); rho after the march 1.0e-6, 7.2e-8, 2.4e-8 (the DNS gap 1.7e-8, 1.5e-8, 2.5e-8: rounding reached at h/4) | scheme gap (cell velocity: MAC face mean vs (rho u)/rho), order 2 |
+| restart | TFLES dynamic 1D; Smagorinsky + TFLES + Charlette 3D (nz 8); sigma 3D slot Bunsen (nz 8); 4 cells, a checkpoint at 0.5, stop and resume | stats (and profiles) | byte-identical |
+| S_L, structured 3D planar (ny = nz = 8) | 4, 6, 8 cells | DNS 1.0006462, 0.9925245, 0.9948435; sigma 1.35: the same 7 digits (mutMax 0: bitwise); Smagorinsky 0.17: 1.0008215, 0.9933300, 0.9952609 (+1.8e-4, +8.1e-4, +4.2e-4), mutMax 4.0e-3, 1.9e-3, 1.1e-3 (h^2, of mu_u 0.72) | the LES shift < 1e-3, not monotone in h (the DNS S_L is not either: no order claimed) |
+| same, FV (FP32) | 4, 6 cells (8: not measured, 295 s) | DNS 1.0004300, 0.9925304; Smagorinsky 1.0006183, 0.9933655: the shift +1.9e-4, +8.4e-4 (structured +1.8e-4, +8.1e-4); sigma = DNS to 7 digits, mutMax 9.4e-9 (FP32 rows not bitwise equal on the Morton mesh: D_sigma of the noise) | the solvers' LES shifts agree to 3e-5 |
+| S_L, TFLES F 2, 1D | 4, 6, 8 cells | structured uniform 0.9955989, 0.9981457, 0.9991839 (1 - S_L order 2.1, 2.2: F cells per thickened flame converge to the oracle), dth 3.21, 3.20, 3.20 (2 x DNS); dynamic 0.9948831, 0.9974743, 0.9985314; FV uniform 0.9955994, 0.9981518, 0.9991838; FV dynamic 0.9948844, 0.9974810 (8: not measured) | FV - structured <= 6.7e-6 (FV32's own spread, the L-table's) |
+| 3D slot Bunsen LES (structured) | the default slot burner (G2a's C0, W 12, U 5), nz 8, 4 cells, t [20, 30] | DNS xTip 44.3041, SLflank 0.98289, mFlank 0.99598, ST 1.02351; sigma 1.35: identical (mutMax 0: the z-extruded slot is exactly 2D); Smagorinsky 0.17: xTip 44.2444 (-0.13%), SLflank 0.98432, mFlank 0.99733, ST 1.02483, mutMax 7.1e-3; 1.3 vs 1.5 ms/step | sanity: a laminar slot is no LES test (sigma is 0 on it, Smagorinsky diffuses it by 0.1%) |
+
+Not measured: a turbulent low-Mach LES (no `--turb` on low-Mach), the round-nozzle 3D
+Bunsen under LES (its 144 x 144 cross-section is past a 295 s job at 4 cells), LES vs DNS
+statistics of a turbulent flame (none exists on these solvers yet).
+
+## Low-Mach turbulence (`--physics lowmach --turb`; masterplan_multiphysics M5)
+
+`--turb U [--turb-length L --seed S]` on the low-Mach PLANAR flame (`--nz >= 8`), both
+solvers, the compressible flags' rules (`flameTurbSetup`: l_t >= 4 cells, L_y, L_z >= 6
+l_t; the Mach bound is void at M 0). The ONE generator (`dns/turb_ic`, `flameTurbSpec`'s
+box), read where each solver keeps its velocity:
+
+```
+structured IC   every MAC face m += rho_f w(x_f) u'_a(x_f): turbBoxAt (the FFT box at the
+                face lattice: the face's axis unshifted, the others at the cell centre), column
+                i mod nbx, rho_f the two cells' mean (inflow face P0/(R Tu), outflow the last
+                cell's), w = turbWindow (addTurbulence's)
+structured rows the inflow face per row j + ny k: m = mIn + rho_in u'(-X, (j+1/2) h, (k+1/2) h),
+                v at (0, j h, (k+1/2) h), w at (0, (j+1/2) h, k h) (the tangential edges'
+                positions; TurbSweep, FP64 host, X = sum u_in dt), uploaded before every step
+                (DeviceLowMach::setInflowTurb) and read by the Turb instantiation of kLmMomT:
+                the inflow edge's tangential velocity is the row (vl = 2 v_in - v_r) instead of
+                the antimirror (u_t = 0); off = the kernel bit for bit
+FV IC           rho u += rho w u' at the centroids (dns/fvturb fvLowMachAddTurbulence)
+FV rows         the xlo faces' bU += du, rUb += rho_b du (rho_b = P0/(R T_b)) at the face
+                centres (fvLowMachTurbRows; DeviceFvLowMach::setInflow), the make() tables
+                elsewhere
+```
+
+Pairs (`dns/lmmodules` `Turb`, axis `inflow`): live with C0, C2b, LES (smag, sigma), TFLES
+(uniform, dynamic, Charlette); refused by name with `--laterals open` (the box is periodic in
+y, z), the rim and gravity (the burner's: `--turb` with `--mode bunsen` on low-Mach is exit 2),
+C2 (`--sl-law onestep`: no turbulent number). Also refused: `--hold-flame`, `--checkpoint-dt` /
+`--restart` / `--wall-limit` with `--turb` (the loop carries the sweep in its checkpoint
+fields, but no restart byte gate was run: issues.md M5c3).
+
+Verification (gfx1201, 2026-11-03; `tests/test_gpu_fv_turb.cpp lowmach`, ctest `gpu_lm_turb`
+70 s; `gpu_lm_matrix` the Turb cells):
+
+| gate | case | measured | relation |
+|---|---|---|---|
+| L1 zero amplitude | the CLI's planar box, 4 cells, 24^2, 40 steps | structured: the Turb instantiation with rows (mIn, 0, 0) every step; FV FP32 and FP64: u' 0 rows and the re-set make() tables | byte-identical to the solvers without |
+| L2 structured vs FV | the turbulent planar flame (IC + rows), same dt, t 0.4, 4 and 8 cells/delta_th (24^2, 48^2) | max \|rho_FV - rho_MAC\| 7.70e-4, 1.98e-4 (order 1.96); the laminar march's gap 2.8e-8, 2.4e-8 (rounding) | scheme gap (MAC vs collocated velocity, staggered vs centred rows), order 2 |
+| matrix | `gpu_lm_matrix`: the Turb cells on box3d, sine3d (xlo rows from a small box, u' 0.1) | (a) rows of u' 0 = the cell without Turb bitwise; (b) uniform Y / Z == 1, mass and fuel tallies; (c) rerun; (d) numbering | every generic gate |
+
+Physics number (`tools/chem/turb_fv.sh lm`, the compressible table's case at M 0):
+
+| cells/delta_th | S_c MAC | S_c FV (FP32) | FV - MAC | laminar S_c MAC / FV (same window, 8^2) |
+|---|---|---|---|---|
+| 4 (48^2) | 1.04828 | 1.04898 | +6.7e-4 | 1.00848 / 1.00829 |
+| 6 (72^2) | 1.05635 | 1.05671 | +3.4e-4 | 0.99657 / 0.99657 |
+| 8 (96^2) | 1.05781 | 1.05809 | +2.6e-4 | 0.99925 / 0.99925 |
+
+S_T/S_L 1.039, 1.060, 1.059 (MAC; FV 1.040, 1.060, 1.059) over the IC's decay (u'/S_L 4 at t
+0, Re_t 17.8, t in [0.5, 2]); the solvers' gap shrinks (order 1.7, 0.9) and sits under the
+grid change of S_c itself (8e-3, 1.5e-3). The compressible box at M 0.02 reads S_c 1.052
+(structured) at 8 cells: the M 0.02 start transient (its laminar S_c is 1.020 in the same
+window).
+
+The pairs at 4 cells/delta_th (48^2), the same window:
+
+| cell | S_c MAC | S_c FV | FV - MAC |
+|---|---|---|---|
+| C0 + turb (DNS) | 1.04828 | 1.04898 | +6.7e-4 |
+| + LES smag 0.17 | 1.05955 | 1.05008 | -9.0e-3: the Smagorinsky mu_t scheme gap (LF9), larger under turbulence |
+| + LES sigma 1.35 | 1.05458 | 1.04878 | -5.5e-3 (sigma's gap, the same cell-velocity definitions) |
+| + TFLES F 2 (dynamic) | 1.16021 | 1.16107 | +7.4e-4 (laminar TFLES MAC 1.10592 in this window) |
+| + TFLES F 2 + sigma + Charlette | 1.16237 | 1.16119 | -1.0e-3 |
+| C2b phi 1.3 + turb | 1.04023 | 1.04078 | +5.3e-4 |
+
 ## Real Bunsen (masterplan real_bunsen S10, 2026-11-01)
 
 The masterplan's S10 command set verbatim (frozen binary `build/s10/dns`,
@@ -3232,7 +3389,7 @@ A closed 2D combustion chamber, model C0 as above, at M_flame 0.02
 (inflated; the label says so). Files: `dns/chamber.{hpp,cpp}` (geometry,
 regions, IC, isentropic nozzle), `gpu/runner_chamber.{hpp,hip}`, the walled
 instantiation of `kSpeciesStage` (`SpeciesSetup::solid`), validation in
-`config.cpp` (`finishChamber`, `chamberFlagScope`), tool
+`dns/config/flame_modes.cpp` (`finishChamber`) and `flame_scope.cpp` (`chamberFlagScope`), tool
 `tools/chem/chamber_video.py`.
 
 **Geometry** (lengths in δ_th, `--chamber-height` 15, `--chamber-length`
@@ -3352,21 +3509,47 @@ burnt `Outflow`. Rotated 30 deg: S_L 5e-8 off planar; sheared 30 deg: order 2.
 Plain FP32 at M 0.01 scatters S_L ~1e-3 on BOTH solvers: quote FV in FP64 or
 `--compensated`.
 
+LES species and TFLES (`--les --sgs`, `--tfles`, `--tfles-sensor`, `--efficiency`; this
+section's "LES species and the thickened flame") on either route, premixed C0:
+`docs/fvcomp.md` "Species LES and TFLES". Same equations, constants, label, IC; the eddy
+and thickened face terms are the `Eddy` / `Thick` algebra on faces, the sensor's max filter
+walks faces (on the uniform box: the structured filter, Omega 8e-7 off it in FP32), no
+open-row mu_t copy (the FV gradient reads the boundary face). FV vs structured on one
+periodic 3D box: rounding over 300 steps, LES, TFLES and both. `--turb` is not built there.
+
 `--mode diffusion` (model C1) on any FaceMesh: `docs/fvcomp.md` "Diffusion flame":
 one limiter shared per face, the jet's row per FACE (a fixed face, Fick and Fourier
 through it: foam's G3a inflow, not the pinned first cell). Candle, chamber, bunsen,
 wick exit 2 by name.
 
+`--equivalence` (models C2, C2b, `--sl-law`, `--stoich`, `--ox-y`, `--mix-phi`) on either
+compressible route: `docs/fvcomp.md` "Air-methane". The two-reactant face kernels of C1 with
+the premix carried in (every far / inflow patch: the fresh premix, every outflow: the burnt
+one; a `y` in a polyMesh's `--bc` is exit 2), C2b's `ln C(xi)` in the cell pass and the
+chemistry dt (`kChemCellPass2Phi`'s and `ChemRate2Phi`'s expressions), the same oracle, IC,
+label and `zMin`, `zMax` columns. LES (`--les --sgs`, 3D) works with it there; TFLES is refused
+by name (premixed C0 only), as on the structured flame. Same mesh, same dt: rounding vs
+`kSpeciesStage2` (R1); 1D FP64 S_L +3.0e-3 at 15 cells, Z exact in FP64.
+
 `--physics lowmach` on either route: the low-Mach stage on faces, `docs/fvincomp.md`
 "Low-Mach": same units, same IC on the box, same stats columns, the 1D flame equal to
-the structured low-Mach flame on the same mesh. Planar C0 only; the burner, `--rim`,
-open laterals, gravity, `--equivalence`, checkpoints exit 2 by name.
+the structured low-Mach flame on the same mesh. Built: planar C0, `--equivalence` (C2,
+C2b: the two-reactant stage on faces, rounding vs `kLmCellPass<true, Phi>`), and the 2D
+slot `--mode bunsen` (per-face inflow rows, `lowmachBunsenIC` / `lmBunsenPoint`, `--dt-rule
+cell`, the cone columns on a pixel = cell plane), and on it `--laterals open` (the `open`
+face kind: this page's "Low-Mach open laterals" face rule, one per face by its own flux's
+sign), `--gravity` (`addBuoyancyLm` as a face force, hydrostatics in p) and `--rim` (the
+staircase tube's cells removed, its faces an isothermal `rim` Wall patch: the structured
+staircase on the same cells is the oracle), with the open and rim stats columns and the rim's
+anchoring guards: `docs/fvincomp.md` "Open faces, gravity, rim". 3D and the round nozzle,
+checkpoints exit 2 by name.
 
 ## Not built
 
 Le ≠ 1 (`--lewis` unregistered until an oracle exists), curvilinear,
 compensated, RANS species (asserted), LES at nz == 1, LES/TFLES species for
-the two-reactant and walled kernels (diffusion, candle, chamber), a separate
+the two-reactant and walled kernels (diffusion, candle, chamber; the FV path takes LES with
+`--equivalence`, docs/fvcomp.md "Air-methane"), a separate
 Sc_t, thickened viscosity, SGS/thickening inside the NSCBC rows (the LODI
 transverse flux ignores μ_t), Colin's efficiency (needs a global Re_t), a
 dynamic Charlette β, nz > 1 for diffusion/candle/chamber, a cold-coflow
@@ -3384,7 +3567,7 @@ compressible burner (the low-Mach burner has it: S7), unequal W, a
 counterflow/strained-flame oracle, the low-Mach solver beyond the premixed
 1D/2D/3D flame and the burner with open laterals, gravity and the
 staircase tube rim (a sub-cell immersed wall for the round tube,
-LES/TFLES/`--turb`, point-implicit chemistry, a low-Mach `--mode candle`
+`--turb` (LES and TFLES are built: "Low-Mach LES"), point-implicit chemistry, a low-Mach `--mode candle`
 (the S7 cross-check drives the solver through its API), the rim on the
 planar flame or the compressible burner);
 the planar flame's x-hi backflow still carries its own scalars;

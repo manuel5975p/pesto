@@ -87,20 +87,10 @@ Case caseOf(std::vector<std::string> args)
     return *c;
 }
 
-// The runner's TflesSetup of a validated case (apps/dns_main.cpp).
+// The runner's TflesSetup of a validated case (dns/flame1d: runFlame's).
 TflesSetup tflesOf(const Case& c)
 {
-    TflesSetup s;
-    s.F = c.flameTfles;
-    s.uniform = c.flameTflesUniform;
-    s.charlette = c.flameCharlette;
-    s.deltaL = c.flameEig.dthOverDD;
-    s.nuU = c.prandtl;
-    const double thetaS = kTflesTaFraction * c.flameModel.theta();
-    s.TaS = thetaS * c.flameTu;
-    s.lnAs = -tflesSensorLogMax(c.flameModel.sigma, thetaS);
-    s.dilate = c.flameTflesDilate;
-    return s;
+    return flameTflesSetup(c, c.flameModel.sigma, c.flameTflesDilate);
 }
 
 std::string slurp(const std::string& path)

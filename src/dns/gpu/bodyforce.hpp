@@ -7,6 +7,9 @@
 
 #include <array>
 #include <expected>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace dns::gpu {
 
@@ -32,6 +35,19 @@ BodyBox bodyBox(const GpuGrid&, const std::array<double, 6>& worldBox,
 // Index-box overlap test: two overlapping tally boxes would each count the
 // shared surface, so the caller must not emit per-object series for them.
 bool overlaps(const BodyBox&, const BodyBox&);
+
+// A labelled tally box (the per-object scene series).
+struct NamedBodyBox
+{
+    std::string name;
+    BodyBox box;
+};
+
+// The per-object scene tallies: bodyBox of each object's world box {xlo,ylo,zlo,xhi,yhi,zhi},
+// an object spanning the whole z extent lz (3D) keeping every interior layer. Error: the
+// first overlapping pair's names, in object order (each would count the shared surface).
+std::expected<std::vector<NamedBodyBox>, std::pair<std::string, std::string>>
+objectTallyBoxes(const GpuGrid& g, double lz, const std::vector<std::pair<std::string, std::array<double, 6>>>& objects);
 
 class DeviceBodyForce
 {
