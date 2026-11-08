@@ -9,8 +9,13 @@ Open problems: **`issues.md`**. Cheap runnable recipes with measured numbers:
 - Incompressible: staggered MAC grid, 2nd-order central, skew-symmetric
   (KE-conserving) advection, SSP-RK3 with a pressure projection per stage.
 - Compressible: conservative (ρ, ρu, ρv, ρw, E), Kennedy–Gruber KE-consistent
-  central fluxes, SSP-RK3, fully explicit, **no shock capturing** (smooth
-  subsonic flow only).
+  central fluxes, SSP-RK3, fully explicit. **No shock capturing by default**
+  (smooth subsonic flow); `--shock hll` adds a pressure-sensed first-order HLL
+  pass on `dns flow`, `dns flame --mode premixed|chamber` and `dns bench`, and an
+  outflow row that passes M 1: a chamber's jet chokes (`docs/shock.md`). On a
+  polyMesh (`--physics compressible --polymesh --bc`, FV): a body-fitted nozzle,
+  planar or `wedge`, stagnation inlet, half-Riemann exit, a sensed face term and a
+  background D3, rhoCentralFoam parity (`docs/nozzle.md`).
 - Bodies: cut cells + sharp ghost-fill wall (incompressible), sharp ghost-mirror
   wall (compressible), analytic shapes, STL/glTF meshes, multi-object scenes.
 - Meshes: uniform Cartesian, tanh wall stretching, focal clustering

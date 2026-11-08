@@ -671,6 +671,29 @@ void inventoryGate()
     check(axis, "inventory: two modules of one axis are exclusive");
     check(named, "inventory: every refusal has its text and its reason");
 
+    // G9: Shock's rows, every text verbatim; a pair left out would read Live.
+    using M = FvModule;
+    const std::pair<std::vector<M>, std::string_view> shockRows[] = {
+        {{M::ChemC0, M::ChemC1, M::ChemC2b}, "FV --shock with species: not built (the chamber is the next cycle)"},
+        {{M::LesSmag, M::LesSigma}, "FV --shock with LES: not built (no gate)"},
+        {{M::TflesUniform, M::TflesDynamic, M::TflesEfficiency}, "FV --shock with TFLES: not built (no gate)"},
+        {{M::RansSa, M::RansSst}, "FV --shock with RANS: not built (no gate; the scalars ride F[0])"},
+        {{M::Gravity}, "FV --shock with gravity: not built (no consumer)"},
+        {{M::BodyForce}, "FV --shock with a body force: not built (no consumer)"},
+        {{M::Turb}, "FV --shock with --turb: not built (no consumer)"},
+        {{M::Steady}, "FV --shock with local time stepping: not built (the sensor flickers; the structured steady march refuses it too)"}};
+    bool texts = true;
+    for (const auto& [ms, text] : shockRows)
+        for (const M m : ms) {
+            const FvPairRule r = fvPair(M::Shock, m);
+            texts = texts && r.decision == FvPairDecision::Refused && r.message == text && !r.why.empty();
+        }
+    check(texts, "G9: every Shock refusal verbatim");
+    check(fvPair(M::Shock, M::Fp64).decision == FvPairDecision::Live && fvPair(M::Shock, M::Compensated).decision == FvPairDecision::Live &&
+              fvPair(M::Shock, M::Fp64).gate == "gpu_fv_nozzle",
+          "G9: Fp64, Compensated live on gpu_fv_nozzle");
+    check(fvCombinationsMarkdown().find("capture") != std::string::npos, "G9: the generated table carries the capture axis");
+
     const Grid g = Grid::make(6, 5, 1, 1.2, 1.0, 0.1);
     const StructuredSpec sp{.lo = {0, 0, 0},
                             .hi = {5, 4, 0},

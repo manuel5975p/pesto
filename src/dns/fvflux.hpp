@@ -21,6 +21,7 @@
 #include "dns/chem.hpp"
 #include "dns/dual.hpp"
 #include "dns/hd.hpp"
+#include "dns/shockflux.hpp"
 #include "dns/transport.hpp"
 
 #include <cmath>
@@ -288,8 +289,13 @@ DNS_HD inline T fvThickEnergyFlux(T FEf, T Omf, T nutf, T kapf, T kapLes, T gTS,
 }
 
 // Boundary kinds of the FV path (masterplan §2.3). Cyclic is an internal
-// face; Empty carries no flux (the 2D restriction).
-enum class FvBcKind : std::uint8_t { Wall, Slip, Inflow, Outflow, Far, Empty };
+// face; Empty carries no flux (the 2D restriction). Total: OpenFOAM's inlet
+// fixed point (docs/nozzle.md).
+enum class FvBcKind : std::uint8_t { Wall, Slip, Inflow, Outflow, Far, Empty, Total };
+
+// What an Outflow's state is (docs/nozzle.md): Fixed the shipped row, Extrapolate
+// zeroGradient, Riemann the half-Riemann problem of the owner against pOut.
+enum class FvExit : std::uint8_t { Fixed, Extrapolate, Riemann };
 
 // One patch's boundary condition. Trivially copyable (a device copy is a
 // memcpy). Only the members of `kind` are read.
@@ -325,6 +331,12 @@ struct FvBc
     // Outflow: a backflow face carries the owner's Y too, never y (the jet's outflow:
     // docs/chem.md item 4, y would be the jet's fuel).
     bool ownY = false;
+    // Total: stagnation pressure and temperature (fvBoundaryState). No viscous flux.
+    double pTotal = 0, tTotal = 0;
+    // Outflow: the state rule; Fixed reads the members above bit for bit.
+    FvExit exit = FvExit::Fixed;
+    // Slip: a `wedge` side, read by the tables only (entS, diffCoef); no kernel reads it.
+    bool wedge = false;
 };
 
 // The species rows and the one irreversible step of model C0 (docs/chem.md):
@@ -364,9 +376,62 @@ DNS_HD inline void fvWallVelocity(const FvBc& bc, const G x[3], double u[3])
 template <class T>
 DNS_HD inline T fvBoundaryY(const FvBc& bc, int s, T YP, T mdot)
 {
-    const bool open = bc.kind == FvBcKind::Inflow || bc.kind == FvBcKind::Outflow || bc.kind == FvBcKind::Far;
+    const bool open = bc.kind == FvBcKind::Inflow || bc.kind == FvBcKind::Outflow || bc.kind == FvBcKind::Far ||
+                      bc.kind == FvBcKind::Total;
     if (bc.diffusive) return T(bc.y[s]);
     return open && !bc.ownY && value(mdot) < 0.0 ? T(bc.y[s]) : YP;
+}
+
+// The half-Riemann problem of owner P against the ambient pressure a = bc.pOut, sampled
+// at the face, n outward (Toro's star state with the right wave absent): the exit of a
+// nozzle, per face, so a subsonic layer under a supersonic core takes its own branch.
+//   a >= p: shock. Leaves (S >= 0): P. Enters: rho*, u*, p = a, tangential of P.
+//   a < p:  fan. Supersonic: P. Subsonic: isentropic at a. Transonic: the sonic state.
+//   u* < 0: backflow, p = a, T = bc.tBack, normal velocity u*.
+// Continuous across every branch but the contact at u* = 0. Pre: P.rho, P.p, a > 0.
+template <class T>
+DNS_HD inline FvPrim<T> fvExitState(const FvBc& bc, const FvPrim<T>& P, const T n[3], double gamma, double Rgas)
+{
+    using std::pow;
+    using std::sqrt;
+    const T a = T(bc.pOut), un = P.u[0] * n[0] + P.u[1] * n[1] + P.u[2] * n[2];
+    const T c = sqrt(T(gamma) * P.p / P.rho);
+    const double m = (gamma - 1.0) / (gamma + 1.0), gm1 = gamma - 1.0;
+    auto stateAt = [&](T rho, T p, T unb) {
+        FvPrim<T> b = P;
+        b.rho = rho;
+        b.p = p;
+        for (int k = 0; k < 3; ++k) b.u[k] = P.u[k] + (unb - un) * n[k];
+        b.temp = p / (rho * T(Rgas));
+        const T ke = T(0.5) * (b.u[0] * b.u[0] + b.u[1] * b.u[1] + b.u[2] * b.u[2]);
+        b.e = p / (T(gm1) * rho) + ke;
+        return b;
+    };
+    auto backflow = [&](T us) {
+        FvPrim<T> b = P;
+        for (int k = 0; k < 3; ++k) b.u[k] = us * n[k];
+        b.temp = T(bc.tBack);
+        b.p = a;
+        b.rho = a / (T(Rgas) * b.temp);
+        const T ke = T(0.5) * (b.u[0] * b.u[0] + b.u[1] * b.u[1] + b.u[2] * b.u[2]);
+        b.e = a / (T(gm1) * b.rho) + ke;
+        return b;
+    };
+    const T r = a / P.p;
+    if (value(r) >= 1.0) {
+        const T S = un - c * sqrt(T((gamma + 1.0) / (2.0 * gamma)) * r + T(gm1 / (2.0 * gamma)));
+        if (value(S) >= 0.0) return P;
+        const T us = un - (a - P.p) * sqrt(T(2.0 / (gamma + 1.0)) / (P.rho * (a + T(m) * P.p)));
+        if (value(us) < 0.0) return backflow(us);
+        return stateAt(P.rho * (r + T(m)) / (T(m) * r + T(1.0)), a, us);
+    }
+    if (value(un) - value(c) >= 0.0) return P;
+    const T k = pow(r, gm1 / (2.0 * gamma));
+    const T us = un + T(2.0 / gm1) * c * (T(1.0) - k), cs = c * k;
+    if (value(us) < 0.0) return backflow(us);
+    if (value(us) - value(cs) <= 0.0) return stateAt(P.rho * pow(r, 1.0 / gamma), a, us);
+    const T cq = T(m) * (un + T(2.0 / gm1) * c), q = cq / c;
+    return stateAt(P.rho * pow(q, 2.0 / gm1), P.p * pow(q, 2.0 * gamma / gm1), cq);
 }
 
 // The boundary state of face (S, Cf) of owner P: what the boundary flux and
@@ -376,7 +441,11 @@ DNS_HD inline T fvBoundaryY(const FvBc& bc, int s, T YP, T mdot)
 //   Slip:    P with the normal velocity removed.
 //   Inflow:  u_in, T_in, p = p_P + rho_P c_P (u_n,P - u_n,in).
 //   Outflow: p_out, u_P and T_P; backflow: normal u only, T_back. `characteristic`,
-//            leaving: p_out, the owner's entropy and outgoing invariant.
+//            leaving: p_out, the owner's entropy and outgoing invariant. Extrapolate:
+//            P. Riemann: fvExitState.
+//   Total:   OpenFOAM's totalPressure + totalTemperature + pressureInletOutletVelocity
+//            fixed point. Leaving (u_P.n >= 0): u_P, T0, p0. Entering: normal velocity
+//            of P, T = T0 - |u|^2/(2 cp), p = p0 (T/T0)^(gamma/(gamma-1)).
 //   Far:     1D characteristic state between P and the freestream F (Riemann
 //            invariants u_n +- 2c/(gamma-1); entropy and tangential velocity
 //            from the upwind side; supersonic: all from the upwind side).
@@ -423,6 +492,8 @@ DNS_HD inline FvPrim<T> fvBoundaryState(const FvBc& bc, const FvPrim<T>& P, cons
         return b;
     }
     case FvBcKind::Outflow: {
+        if (bc.exit == FvExit::Extrapolate) return P;
+        if (bc.exit == FvExit::Riemann) return fvExitState(bc, P, n, gamma, Rgas);
         if (bc.characteristic && value(un(P.u)) >= 0.0) {
             const T r = pow(T(bc.pOut) / P.p, 1.0 / gamma), cP = sqrt(T(gamma) * P.p / P.rho);
             const T dun = T(2.0 / (gamma - 1.0)) * cP * (T(1.0) - pow(r, 0.5 * (gamma - 1.0)));
@@ -464,6 +535,21 @@ DNS_HD inline FvPrim<T> fvBoundaryState(const FvBc& bc, const FvPrim<T>& P, cons
         return b;
     }
     case FvBcKind::Empty: return b;
+    case FvBcKind::Total: {
+        const T unP = un(P.u);
+        if (value(unP) >= 0.0) {
+            b.p = T(bc.pTotal);
+            b.temp = T(bc.tTotal);
+        } else {
+            const double cp = gamma * Rgas / (gamma - 1.0);
+            for (int k = 0; k < 3; ++k) b.u[k] = unP * n[k];
+            b.temp = T(bc.tTotal) - ke(b.u) / T(cp);
+            b.p = T(bc.pTotal) * pow(b.temp / T(bc.tTotal), gamma / (gamma - 1.0));
+        }
+        b.rho = b.p / (T(Rgas) * b.temp);
+        b.e = b.p / (T(gamma - 1.0) * b.rho) + ke(b.u);
+        return b;
+    }
     }
     return b;
 }
@@ -475,7 +561,7 @@ DNS_HD inline FvPrim<T> fvBoundaryState(const FvBc& bc, const FvPrim<T>& P, cons
 //   Wall:  {0, p_P S - tau.S, p_P u_w.S - u_w.(tau.S) - q}, q = kappa grad T.S
 //          isothermal, EXACTLY 0 adiabatic: no leak by construction (G7).
 //   Slip:  {0, p_P S - (n.tau.S) n, 0}: zero shear, zero heat, no work.
-//   Inflow, Outflow, Far: the Euler flux of B (no viscous flux; a `diffusive`
+//   Inflow, Outflow, Far, Total: the Euler flux of B (no viscous flux; a `diffusive`
 //   Inflow adds -tau.S, -u_b.(tau.S) - q as an internal face).
 //   Empty: zero.
 template <class T, class G>
@@ -519,10 +605,43 @@ DNS_HD inline FvFlux<T> fvBoundaryFlux(const FvBc& bc, const FvPrim<T>& P, const
         return f;
     }
     case FvBcKind::Outflow:
-    case FvBcKind::Far: return fvEulerFlux(B, S);
+    case FvBcKind::Far:
+    case FvBcKind::Total: return fvEulerFlux(B, S);
     case FvBcKind::Empty: break;
     }
     return {zero, {zero, zero, zero}, zero};
+}
+
+// The third difference of one row along a mesh line (P-, P, N, N+), the background
+// term of FV --shock hll (docs/nozzle.md): the grouping makes a uniform field exactly 0.
+template <class T>
+DNS_HD inline T fvD4Row(T pm, T p, T n, T np)
+{
+    return (np - pm) - T(3.0) * (n - p);
+}
+
+// |S| D of an internal face (docs/nozzle.md): shockFaceDelta of the two cells on S's unit
+// normal, the flux F_KG + sigma (F_HLL - F_KG) minus F_KG, rows rho, m, E. Pre: sigma > 0.
+template <class T, class G>
+DNS_HD inline void fvShockFlux(T sigma, const FvPrim<T>& A, const FvPrim<T>& B, const G S[3], double gamma, T o[5])
+{
+    using std::sqrt;
+    const double mag = sqrt(double(S[0]) * double(S[0]) + double(S[1]) * double(S[1]) + double(S[2]) * double(S[2]));
+    const T n[3] = {T(double(S[0]) / mag), T(double(S[1]) / mag), T(double(S[2]) / mag)};
+    const ShockState<T> L{A.rho, {A.u[0], A.u[1], A.u[2]}, A.p, A.e, T(gamma)};
+    const ShockState<T> R{B.rho, {B.u[0], B.u[1], B.u[2]}, B.p, B.e, T(gamma)};
+    const ShockDelta<T> D = shockFaceDelta(sigma, L, R, n);
+    for (int k = 0; k < 5; ++k) o[k] = T(mag) * D.v[k];
+}
+
+// The rate of the background term of an internal face: eps (1 - sigma) |u_f.S|, u_f the
+// face mean. Zero on a wall-normal face of a boundary layer by construction.
+template <class T, class G>
+DNS_HD inline T fvD4Rate(T eps, T sigma, const FvPrim<T>& A, const FvPrim<T>& B, const G S[3])
+{
+    using std::fabs;
+    const T us = T(0.5) * ((A.u[0] + B.u[0]) * T(S[0]) + (A.u[1] + B.u[1]) * T(S[1]) + (A.u[2] + B.u[2]) * T(S[2]));
+    return eps * (T(1.0) - sigma) * fabs(us);
 }
 
 // ln(a/b)/(2 xi), xi = (a - b)/(a + b): log mean L(a, b) = (a - b)/ln(a/b) =

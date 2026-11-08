@@ -2,7 +2,8 @@
 // uniform Cartesian or distorted regular (curvilinear, see curvmesh.hpp);
 // CPU double-precision reference, fully explicit (no elliptic solve).
 // nz == 1 is the exact 2D restriction (z stencils cancel identically).
-// Smooth flows only: central KE-consistent fluxes carry no shock capturing.
+// Smooth flows only: central KE-consistent fluxes carry no shock capturing here.
+// Shock capturing is the GPU solver's additive --shock pass (docs/shock.md).
 #pragma once
 
 #include "dns/grid.hpp"

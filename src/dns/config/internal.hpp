@@ -70,8 +70,19 @@ std::optional<ConfigError> validateFrameOutputs(const RawConfig& r, Case& c);
 // Each rule below was spelled out per subcommand; one definition each now, with
 // the message text unchanged. Every helper returns the error rather than
 // throwing it, so the caller's check ORDER -- first error wins -- is untouched.
-// The compressible Mach range.
-std::optional<ConfigError> checkMach(double mach);
+// The compressible Mach range. shock: --shock hll's text; the limit is the same.
+std::optional<ConfigError> checkMach(double mach, bool shock = false);
+
+// --shock's scope, by name, exit 2. shockRouteScope: BEFORE the routes, whose
+// allow-lists would otherwise answer first: the meshes and closures it is not
+// built with, physics, --solver. shockFlagScope: on the route's finished Case
+// (far, body, flame mode).
+std::optional<ConfigError> shockRouteScope(const RawConfig& r);
+std::optional<ConfigError> shockFlagScope(const RawConfig& r, const Case& c);
+
+// --shock hll's dt cadence: the sticky rule unless --dt-recompute was given; a
+// given N > 1 warns. Pre: c.dtRecompute resolved.
+void shockCadence(const RawConfig& r, Case& c);
 
 // The z cell count: 1 is the exact 2D restriction, otherwise >= 4.
 // `belowOne` is the subcommand's own wording for nz < 1.

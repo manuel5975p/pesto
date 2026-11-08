@@ -54,9 +54,13 @@ struct FlameLoop
     // --turb: the swept distance (FP64 host) and the current inflow target
     // (held over a step; --hold-flame moves it at stats rows).
     double sweep = 0, uNow, sEma, tCtl = 0, xI0 = NAN;
+    // --shock: the sticky dt cadence's state (internal::shockDtEvery); a record
+    // only under --shock, so an off checkpoint keeps its records.
+    bool shockHot = false, shockOn;
 
     explicit FlameLoop(const FlameRun& r)
-        : cad{r.statsEvery}, prof(r.profileDt), uNow(r.uIn), sEma(r.uIn)
+        : cad{r.statsEvery}, prof(r.profileDt), uNow(r.uIn), sEma(r.uIn),
+          shockOn(r.shock != ShockMode::None)
     {
     }
 
@@ -82,6 +86,7 @@ struct FlameLoop
         f("sEma", sEma);
         f("tCtl", tCtl);
         f("xI0", xI0);
+        if (shockOn) f("shockHot", shockHot);
     }
 };
 
@@ -118,6 +123,13 @@ std::expected<RunStats, RunError> runFlame(
         sp.tflesOm = tf->om();
     }
     if (!dev->enableSpecies(sp)) return fail(6, "species allocation failed");
+    const bool shockOn = r.shock != ShockMode::None;
+    if (shockOn) { // x NSCBC rows, y and z periodic
+        ShockSetup ss;
+        ss.open[0] = ss.nscbc[0] = true;
+        ss.apply = r.shock == ShockMode::Hll;
+        if (!dev->enableShock(ss)) return fail(6, "shock allocation failed");
+    }
     auto ds = DeviceCompState::make(g.size(), 0, false, r.sp.nY);
     if (!ds) return fail(6, "GPU allocation failed");
 
@@ -142,6 +154,7 @@ std::expected<RunStats, RunError> runFlame(
     // Candle: the top is the ambient column's far field; air drawn back in
     // through it relaxes to the ambient density there (rho_a = p_a/(R T0)).
     if (r.gravity > 0) nc.rhoInf = r.pB / (r.tr.Rgas * r.Tu);
+    nc.superOutflow = r.shock == ShockMode::Hll;
     auto nscm = DeviceCompNscbc::make(g, nc);
     if (!nscm) return fail(6, "NSCBC init failed");
     DeviceCompNscbc nsc = std::move(*nscm);
@@ -273,6 +286,11 @@ std::expected<RunStats, RunError> runFlame(
     // TFLES: the Omega-weighted mean efficiency and the largest F E.
     const std::size_t nBase = cols.size();
     if (tf) cols.insert(cols.end(), {"Ebar", "FEmax"});
+    // --shock: appended LAST, so off stats are bytes and on == off compares
+    // after a cut.
+    if (shockOn) cols.insert(cols.end(), {"shockCells", "shockMax", "rhoMin", "pMin", "openMach"});
+    const bool shockSensor = r.shock == ShockMode::Sense;
+    if (shockSensor) cols.push_back("shockBurnMax");
     // pMean's reference: p0, or the candle's ambient column averaged over
     // the rows (p_a(x) at the cell centres).
     double pRefMean = r.pB;
@@ -343,17 +361,28 @@ std::expected<RunStats, RunError> runFlame(
     };
     DeviceBuffer<double> tflesScratch;
     std::vector<double> tfs;
-    // A stats row: the mode's base columns, then (TFLES) Ebar, FEmax.
+    // A stats row: the mode's base columns, then (TFLES) Ebar, FEmax, then
+    // (--shock) the row of the state the base columns measured.
     std::vector<double> rowBuf, rowBuf3;
+    ShockRow shockNow;
+    double shockPeak = 0, shockBurn = 0, omegaPeak = 0;
     auto emitRow = [&](std::span<const double> base, double Ebar,
                        double FEmax) {
-        if (!tf) {
+        if (!tf && !shockOn) {
             out.row("stats", base.first(nBase));
             return;
         }
         rowBuf.assign(base.begin(), base.begin() + std::ptrdiff_t(nBase));
-        rowBuf.push_back(Ebar);
-        rowBuf.push_back(FEmax);
+        if (tf) {
+            rowBuf.push_back(Ebar);
+            rowBuf.push_back(FEmax);
+        }
+        if (shockOn) {
+            rowBuf.insert(rowBuf.end(), {shockNow.cells, shockNow.top, shockNow.rhoMin, shockNow.pMin,
+                                         shockNow.openMach});
+            if (shockSensor) rowBuf.push_back(shockBurn);
+            shockPeak = std::max(shockPeak, shockNow.cells);
+        }
         out.row("stats", rowBuf);
     };
     DeviceBuffer<double> turbScratch;
@@ -729,6 +758,8 @@ std::expected<RunStats, RunError> runFlame(
     double &lastHits = L.lastHits, &lastMin = L.lastMin, &lastMax = L.lastMax;
     double &sweep = L.sweep, &uNow = L.uNow, &sEma = L.sEma, &tCtl = L.tCtl,
            &xI0 = L.xI0;
+    bool& shockHot = L.shockHot;
+    double rowGuard = 0; // internal::shockOpenRow, at the dt cadence; never a record
     const double guard = nb * hx + 2 * r.dth;
     const double Lx = g.nx * hx;
     // --restart: the loop where the checkpoint left it; the freestream the
@@ -801,10 +832,13 @@ std::expected<RunStats, RunError> runFlame(
             dev->primitives(*ds);
             tf->update(*ds, dev->u(), dev->v(), dev->w(), dev->T());
         }
+        const int dtEvery = internal::shockDtEvery(r.shockDtAuto, r.dtRecompute, sinceDt, shockHot, t,
+                                                   [&] { return dev->shockSense(*ds, *red); });
         if (auto e = internal::recomputeDt(
-                sinceDt, dtStab, r.dtRecompute, r.dtMargin, 1e-9,
+                sinceDt, dtStab, dtEvery, r.dtMargin, 1e-9,
                 [&] {
                     double a = dev->stableDt(*ds, *red, r.cfl);
+                    if (r.shock == ShockMode::Hll) rowGuard = dev->shockRowGuard(*ds, *red);
                     if (tf)
                         a = std::min(a, tflesStableDt(*dev, *ds,
                                                       tf->feField(), *red));
@@ -814,6 +848,7 @@ std::expected<RunStats, RunError> runFlame(
                 });
             !e)
             return fail(7, e.error());
+        if (auto e = internal::shockOpenRow(rowGuard, t); !e) return std::unexpected(e.error());
         const double dt = std::min(r.tEnd - t, dtStab);
         // The pulse is held over the step (the stages see its start value).
         if (rows && r.geom.pulse > 0) nsc.setInflowPulse(jetNow(t));
@@ -838,6 +873,10 @@ std::expected<RunStats, RunError> runFlame(
             if (!std::isfinite(m->mass) || !std::isfinite(m->Tmax) ||
                 (!rows && !std::isfinite(m->xf)))
                 return fail(7, "flame state is not finite (diverged)");
+            if (shockOn) {
+                shockNow = dev->shockRow(*ds, *red);
+                if (shockSensor) shockBurn = dev->shockBurnMax(omegaPeak, *red);
+            }
             lastHits = m->yHits;
             lastMin = m->yMin;
             lastMax = m->yMax;
@@ -1096,6 +1135,7 @@ std::expected<RunStats, RunError> runFlame(
                      "[%.3g, 1%+.3g], %.3g ulp of 1 above\n",
                      lastHits, lastMin, lastMax - 1,
                      (lastMax - 1) / std::ldexp(1.0, -23));
+    if (shockOn) internal::shockReport(shockPeak, g.size());
     std::printf("label: %s\n", r.label.c_str());
     // ms/step over THIS job's steps (a restart's steps0 came before it).
     st.steps = steps;

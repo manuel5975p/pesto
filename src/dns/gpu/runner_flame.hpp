@@ -56,6 +56,10 @@ struct FlameRun
     int statsEvery = 200;
     double profileDt = 0;
     std::string label;       // flameRunLabel(), printed with the progress line
+    // --shock (docs/shock.md): no launch at None, no shock stats columns.
+    // shockDtAuto: the sticky dt cadence (internal/run_loop.hpp shockDtEvery).
+    ShockMode shock = ShockMode::None;
+    bool shockDtAuto = false;
 
     // --mode bunsen (dns/bunsen.hpp). bunsen == false is the 1D runner bit
     // for bit. Per-row x-lo inflow at j + ny k: the u target, the jet weight

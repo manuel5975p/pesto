@@ -233,7 +233,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--planes", &c.planes}, {"--png-down", &c.pngDown},
              {"--vort-max", &c.vortMax}, {"--polymesh", &c.polymesh},
              {"--bc", &c.bc}, {"--tt", &c.ttFv}, {"--frame-box", &c.frameBox},
-             {"--frame-n", &c.frameN},
+             {"--frame-n", &c.frameN}, {"--shock-d4", &c.shockD4}, {"--foam-write", &c.foamWrite},
+             {"--gamma", &c.gamma},
              {"--fv-coupled", &c.fvCoupled}, {"--fv-coupled-eta", &c.fvCoupledEta},
              {"--fv-coupled-alpha", &c.fvCoupledAlpha},
              {"--export", &c.exportCase}, {"--re-tau", &c.reTau}});
@@ -339,7 +340,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
 
     int physicsSel = int(c.physics), farSel = int(c.far), backendSel = int(c.backend),
         sgsSel = int(c.sgs);
-    int abcSel = int(c.nscbcAbc);
+    int abcSel = int(c.nscbcAbc), shockSel = int(c.shock);
     std::vector<EnumOpt> enums;
     // prop and mesh never touch a GPU, so they have no backend to choose.
     if (!hostOnly)
@@ -401,6 +402,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         enums.push_back({"--solver",
                          {{"structured", int(SolverKind::Structured)}, {"fv", int(SolverKind::Fv)}},
                          &c.solver});
+    if (c.sub == Subcommand::Flow || c.sub == Subcommand::Flame || c.sub == Subcommand::Bench)
+        enums.push_back({"--shock", enumValues(shockNames()), &shockSel});
     if (c.sub == Subcommand::Conv) {
         enums.push_back({"--solver",
                          {{"structured", int(SolverKind::Structured)}, {"fv", int(SolverKind::Fv)}},
@@ -459,6 +462,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
         flags.push_back({"--temp", &c.tempFrames});
         flags.push_back({"--thin-seal", &c.thinSeal});
         flags.push_back({"--fv-coupled-check", &c.fvCoupledCheck});
+        flags.push_back({"--inviscid", &c.inviscid});
     }
     if (c.sub == Subcommand::Flow || c.sub == Subcommand::Channel || c.sub == Subcommand::Flame ||
         c.sub == Subcommand::Conv)
@@ -562,6 +566,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
     c.far = FarField(farSel);
     c.sgs = SgsModel(sgsSel);
     c.nscbcAbc = NscbcAbc(abcSel);
+    c.shock = ShockMode(shockSel);
     // prop's --out is an optional CSV path: absent = no file. mesh has none.
     if (!c.given.contains("--out") && !hostOnly) c.out = string(sub);
 
@@ -1384,6 +1389,22 @@ RUN LENGTH
                      slower than explicit, and does not converge from a
                      cold start on the Re 1e4 wedge (docs/rans.md).
                                                                [explicit]
+  --shock MODE       none|hll|sense (--far nscbc, uniform mesh; docs/shock.md):
+                     hll adds NUMERICAL dissipation in sensed cells (pressure
+                     sensor, two-point HLL, Davis speeds); sense runs the sensor
+                     alone, the central solver bit for bit. Appends stats
+                     columns. --cfl <= 0.6 at nz 1, 0.4 at nz > 1.   [none]
+                     On --physics compressible --polymesh DIR --bc FILE: whole
+                     mesh lines, HLL + a background D3 (docs/nozzle.md), `total`,
+                     `wedge` patches, exit = "extrapolate"|"riemann", [nozzle]
+                     rest state + --ramp on p0; --cfl <= 1.2.
+  --shock-d4 EPS     the background D3 of FV --shock hll, eps (1 - sigma) |u.S|,
+                     in [0, 0.125]                                   [0.0625]
+  --inviscid         FV --shock hll polyMesh route: mu 0, no --re, walls slip
+  --foam-write DT    --polymesh: PREFIX_foam/<t>/{p,T,U,rho} every DT, polyMesh
+                     cell order, 17 digits
+  --gamma G          compressible --polymesh: a constant ratio of specific
+                     heats, in (1, 1.67]                                [1.4]
   --compensated      compressible time march on the compensated state
                      (FP32 hi + lo per field, the explicit --steady
                      march's), so an update below ulp(q)/2 is kept
@@ -1784,6 +1805,7 @@ R"(dns bench — step-time and throughput benchmark
   --mach M         compressible only: uniform pressure 1/(gamma M^2) [0.2]
   --les CS         compressible only: time the SGS path too          [off]
   --sgs smag|sigma which nut(grad u) --les uses                    [smag]
+  --shock MODE     compressible only: none|hll|sense                [none]
   Reports ms/step, Mcell-updates/s and the VRAM this run allocates.
 )";
     case Subcommand::Flame:
@@ -1924,6 +1946,11 @@ and --mode diffusion, model C1).
   --nscbc-etain E      inflow relax stiffness, as dns flow         [100]
   --nscbc-sink N       sink band per open face, cells; 0 = off      [16]
   --nscbc-sink-amp A   sink strength, (0, 2]                         [1]
+  --shock MODE         none|hll|sense (--mode premixed, chamber; docs/shock.md):
+                       hll adds NUMERICAL dissipation in sensed cells; sense runs
+                       the sensor alone, the central solver bit for bit. Appends
+                       stats columns. --mach <= 0.05, --cfl <= 0.6 at nz 1, 0.4
+                       at nz > 1.                                    [none]
   --tt T               run length in flame times delta_D/S_L        [10]
   --cfl C              acoustic CFL                                [0.4]
   --dt-recompute N     steps between dt recomputations             [16]

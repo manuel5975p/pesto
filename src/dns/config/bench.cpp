@@ -38,7 +38,7 @@ std::expected<Case, ConfigError> validateBench(const RawConfig& r, Case c)
         return bad(2, "--nu", "must be finite and >= 0");
     c.mach = r.mach;
     if (r.physics == Physics::Compressible) {
-        if (auto e = checkMach(c.mach); e) return std::unexpected(*e);
+        if (auto e = checkMach(c.mach, r.shock == ShockMode::Hll); e) return std::unexpected(*e);
     } else if (r.given.contains("--mach")) {
         return bad(2, "--mach", "--mach is compressible-only");
     }

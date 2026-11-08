@@ -12,6 +12,7 @@
 #include "dns/gpu/device_buffer.hpp"
 #include "dns/gpu/index.hpp"
 #include "dns/gpu/reductions.hpp"
+#include "dns/gpu/shock.hpp"
 
 #include <cstdint>
 #include <expected>
@@ -568,6 +569,31 @@ public:
     // RANS: the wall distance enableRans uploaded (FP32, g.size()).
     const DeviceScalar& wallDistance() const { return wd_; }
 
+    // --- Shock capturing (dns/shockflux.hpp, gpu/shock.hpp, docs/shock.md) ---
+    // Install --shock: two byte buffers, sensor once per step, kShockFaces after
+    // the species stage. Never calling it keeps step() bit for bit.
+    // Pre: !curvilinear(), !rans(), !mrfActive(), !precond(), s.solid outlives
+    // the solver.
+    std::expected<void, hipError_t> enableShock(const ShockSetup& s);
+    bool shock() const { return shk_.has_value(); }
+    // Cells sensed on state s: primitives + sense + one reduction. Pure: writes
+    // no state (the scratch primitives are s's after it). Pre: shock().
+    double shockSense(const DeviceCompState& s, ReduceScratch& r);
+    // The stats row of state s (shockSense + reductions). Pre: shock().
+    ShockRow shockRow(const DeviceCompState& s, ReduceScratch& r, const ShockRegions& reg = {});
+    // The guard's number on s, DeviceShock::rowGuard. Pure. Pre: shock().
+    double shockRowGuard(const DeviceCompState& s, ReduceScratch& r) const;
+    // The bytes of s (primitives + sense + a download). Pure. Pre: shock().
+    [[nodiscard]] hipError_t shockBytes(const DeviceCompState& s, std::vector<std::uint8_t>& out);
+    // --shock sense: the flame's v, DeviceShock::burnMax. Pre: shockRow and
+    // updateChem ran on the same state, the mode is sense.
+    double shockBurnMax(double& omegaPeak, ReduceScratch& r) const;
+    // Sensed cells burning, DeviceShock::burnCells. Pre: as shockBurnMax, either mode.
+    double shockBurnCells(double& omegaPeak, ReduceScratch& r) const;
+    // --shock sense: the k largest raw v of s, largest first (the end-of-run
+    // report). Pre: shock(), the mode is sense.
+    std::expected<std::vector<ShockPeak>, hipError_t> shockPeaks(const DeviceCompState& s, std::size_t k);
+
     // Primitives of s into the internal scratch (valid until next step call);
     // exposed for app-side diagnostics/BC kernels.
     void primitives(const DeviceCompState& s);
@@ -734,6 +760,8 @@ private:
     DeviceScalar ycache_[kMaxY], omega_;
     DeviceScalar yinRow_[kMaxY]; // SpeciesSetup::yInRow on the device
     DeviceScalar sootF_, sootO_; // soot rates (SpeciesSetup::soot >= 0)
+    std::optional<DeviceShock> shk_; // enableShock; empty = no launch
+    bool shockFresh_ = false;        // the next stage is the step's first
     std::function<void(DeviceCompState&)> hook_;
     bool hookAtEntry_ = true; // setStageHook's Idempotent::no
     CellRange stageRange_{};  // setStageRange; the whole grid by default

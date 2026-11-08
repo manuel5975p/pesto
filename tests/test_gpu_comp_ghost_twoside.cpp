@@ -32,6 +32,7 @@
 #include "dns/gpu/comp_ghost.hpp"
 
 #include "gpu_test_util.hpp"
+#include "shock_test_util.hpp"
 #include "check.hpp"
 
 #include <algorithm>
@@ -139,6 +140,7 @@ void run(const Rig& rig)
                 tb.nSide(), tb.sideSkipped, hn);
     check(tb.nSide() > 0, rig.name + ": the necks are two-sided (premise)");
     check(tb.sideSkipped == 0, rig.name + ": every wrong-side face imaged");
+    test::shockIfAsked(*dev, *gh, g, !rig.focal);
     dev->setStageHook([&](gpu::DeviceCompState& s) { gh->apply(s); });
     dev->setRhsHook([&](const gpu::DeviceCompState& s,
                         gpu::DeviceCompState& out,

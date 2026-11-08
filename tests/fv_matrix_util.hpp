@@ -188,6 +188,7 @@ inline FvConfig matrixConfig(const FvModuleSet& s, const FaceMesh& fm, const std
         c.turb = true;
         turbRows(fm, c, k.turbAmp);
     }
+    if (has(s, FvModule::Shock)) c.shock = {.mode = ShockMode::Hll, .eps4 = kFvShockEps4};
     return c;
 }
 
@@ -215,6 +216,9 @@ inline std::vector<FvModuleSet> matrixCells(bool live)
             add(two);
         }
     }
+    FvModuleSet shock; // past the precision axis in the enum, a model module
+    shock.set(std::size_t(FvModule::Shock));
+    add(shock);
     std::ranges::sort(v, {}, [](const FvModuleSet& s) { return s.to_ullong(); });
     return v;
 }

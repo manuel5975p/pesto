@@ -16,6 +16,7 @@
 #include "dns/rotor.hpp"
 #include "dns/runmeta.hpp"
 #include "dns/sgs.hpp"
+#include "dns/shockflux.hpp"
 #include "dns/wick.hpp"
 
 #include <array>
@@ -66,6 +67,7 @@ std::span<const char* const> farFieldNames();
 std::span<const char* const> physicsNames();
 std::span<const char* const> sgsModelNames();
 std::span<const char* const> nscbcAbcNames();
+std::span<const char* const> shockNames();
 std::span<const char* const> subcommandNames();
 std::span<const char* const> steadySchemeNames();
 const char* name(BodyKind);
@@ -73,6 +75,7 @@ const char* name(FarField);
 const char* name(Physics);
 const char* name(SgsModel);
 const char* name(NscbcAbc);
+const char* name(ShockMode);
 const char* name(Subcommand);
 const char* name(SteadyScheme);
 // The inverses the parsers need; nullopt when `s` is not a keyword.
@@ -243,6 +246,7 @@ struct RawConfig
     double steady = 0.0;   // >0: stop at this steady residual instead of tEnd
     int seq = 1;           // grid-sequencing levels; 1 = solve on --n directly
     bool compensated = false; // --compensated: two-word state on a time march
+    ShockMode shock = ShockMode::None; // --shock (flow, flame, bench)
 
     // output
     std::set<Emit> emit;
@@ -442,6 +446,10 @@ struct RawConfig
     std::optional<FvBcSpec> fvBc;
     int frameN = 512;
     double ttFv = 0;
+    // --shock-d4 (FV hll's background eps), --inviscid, --foam-write DT (docs/nozzle.md).
+    double shockD4 = kFvShockEps4, foamWrite = 0;
+    bool inviscid = false;
+    double gamma = kGammaAir; // --gamma: the FV polyMesh route's constant gamma
     // --mesh-perturb A, --mesh-perturb-kind: `dns tgv --solver fv`'s box.
     double meshPerturb = 0;
     int meshPerturbKind = 0;
@@ -475,6 +483,14 @@ public:
     // field (gpu/comp.hpp DeviceCompState::lo) on a TIME march too. The
     // explicit --steady march always has it; off = the plain FP32 state.
     bool compensated = false;
+    // --shock (docs/shock.md). shockDtAuto: hll with no --dt-recompute, the sticky
+    // cadence (internal/run_loop.hpp shockDtEvery).
+    ShockMode shock = ShockMode::None;
+    bool shockDtAuto = false;
+    // FV hll (docs/nozzle.md): the background eps, mu 0, --foam-write DT.
+    double shockEps4 = 0, foamWrite = 0;
+    bool inviscid = false;
+    double fvGamma = kGammaAir; // --gamma, the polyMesh route
     double cs = 0, dr = 0, aspect = 0;
     SgsModel sgsModel = SgsModel::Smagorinsky;
 

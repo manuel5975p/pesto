@@ -54,6 +54,10 @@ struct ChamberRun
     double dtMargin = 0.95;
     int statsEvery = 20;
     std::string label;
+    // --shock (docs/shock.md): no launch at None, no shock stats columns.
+    // shockDtAuto: the sticky dt cadence (internal/run_loop.hpp shockDtEvery).
+    ShockMode shock = ShockMode::None;
+    bool shockDtAuto = false;
 };
 
 // The injection rate factor at time t: sin^2(pi t / (2 ramp)) below ramp, 1

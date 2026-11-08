@@ -383,7 +383,7 @@ std::optional<ConfigError> flowPhysics(const RawConfig& r, Case& c)
     c.mach = r.mach;
     if (comp)
     {
-        if (auto e = checkMach(c.mach); e) return e;
+        if (auto e = checkMach(c.mach, r.shock == ShockMode::Hll); e) return e;
         if (r.given.contains("--tol"))
             return err(2, "--tol", "compressible runs are fully explicit; there is "
                                    "no pressure solve to converge");

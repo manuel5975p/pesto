@@ -55,6 +55,8 @@ struct RunMeta
     // The SI echo of the low-Mach burner (--si-delta-d, --si-sl; S9): a JSON
     // object {"deltaD" (m), "SL" (m/s)} the renderer scales by; "" = absent.
     std::string si{};
+    // --shock's mode, "" (key absent) under --shock none.
+    std::string shock{};
 
     // The six grid fields from the grid the artefacts are written on.
     void setGrid(const Grid& g)

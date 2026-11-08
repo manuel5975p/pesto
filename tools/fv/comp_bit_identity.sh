@@ -2,6 +2,7 @@
 # Existing paths unmoved by the compressible FV family (docs/fvcomp.md): byte
 # compares stats and fields of a pre-change binary vs this tree's, one simjob
 # per run. Usage: comp_bit_identity.sh BASE_BINARY NEW_BINARY [OUTDIR]
+# ONLY=REGEX runs the tags it matches (tools/fv: --shock, masterplan_shockflux).
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 BASE=$1; NEW=$2; OUT=${3:-/tmp/dns/bit}
@@ -9,6 +10,7 @@ mkdir -p "$OUT"
 fails=0
 run() { # tag -- args
     local tag=$1; shift
+    [[ -n "${ONLY:-}" && ! $tag =~ $ONLY ]] && return
     for w in base new; do
         local exe=$BASE; [ $w = new ] && exe=$NEW
         rm -rf "$OUT/$tag.$w"*
@@ -97,5 +99,19 @@ run fvconvb conv --solver fv --physics incompressible --n 48 --ny 24 --nz 1 --ra
 run fvconvbr conv --solver fv --physics incompressible --n 32 --ny 16 --nz 1 --rayleigh 5e4 --tt 2 --mesh-perturb 0.2 \
     --mesh-perturb-kind random --fv-precision fp64 --emit stats
 run fvconvb3 conv --solver fv --physics incompressible --n 16 --ny 8 --nz 16 --rayleigh 1e5 --aspect 2 --tt 2 --emit stats
+# --shock (masterplan_shockflux): the chamber, a sigma 10 flame, the wick, the channels: stage() gained a branch.
+run chamber flame --mode chamber --tt 0.5 --emit stats --emit bin
+run flamesig10 flame --expansion 10 --cells-per-delta 4 --tt 1 --emit stats
+run wick flame --mode candle --wick --tt 0.2 --emit stats
+run chan3d channel --n 32 --ny 32 --nz 16 --tt 0.05 --emit stats
+run chanrans channel --n 16 --ny 32 --nz 1 --rans sa-neg --tt 0.05 --emit stats
+# masterplan_cdnozzle: the rows the nozzle's edits cross (FV RANS, LTS, --shock structured).
+run fvrans flow --physics compressible --solver fv --ogrid --body cylinder --n 96 --ny 48 --re 1000 --mach 0.2 --ft 0.02 --rans sst-2003m --emit stats
+run fvsteady flow --physics compressible --solver fv --ogrid --body cylinder --n 96 --ny 48 --re 40 --mach 0.2 --steady 1e-3 --steady-steps 200 --compensated --emit stats
+run fvpolysteady flow --physics compressible --polymesh "$ROOT/tests/data/mesh/cyl2d_snappy" --bc "$ROOT/examples/fvcomp_cyl2d_snappy.toml" --re 40 --mach 0.2 --steady 1e-3 --steady-steps 200 --emit stats
+run shockhll flow --physics compressible --body none --n 96 --ny 64 --re 100 --mach 0.3 --ft 0.2 --far nscbc --shock hll --emit stats
+run shocksense flow --physics compressible --body cylinder --n 192 --ny 128 --re 100 --mach 0.2 --ft 0.3 --far nscbc --shock sense --emit stats
+run shockflame flame --expansion 10 --cells-per-delta 4 --tt 1 --shock hll --emit stats
+run shockchamber flame --mode chamber --tt 0.5 --shock hll --emit stats
 echo "failures: $fails"
 exit $fails

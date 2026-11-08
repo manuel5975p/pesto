@@ -87,7 +87,7 @@ direction = [1, 0, 0]      # freestream
 lift = [0, 1, 0]           # normal to direction
 
 [patch.NAME]               # one per non-cyclic, non-empty mesh patch
-type = "wall"              # wall | slip | inflow | outflow | far | empty
+type = "wall"              # wall | slip | inflow | outflow | far | empty | total | wedge
 thermal = "isothermal"     # wall: adiabatic (default) | isothermal
 twall = 1.1                # T_w / T_inf
 u = [0, 0, 0]              # wall velocity / U
@@ -95,11 +95,14 @@ omega = [0, 0, 0]          # wall rotation
 origin = [0, 0, 0]
 force = true               # wall default true, slip default false
 # inflow: u (default the freestream), t (T / T_inf)
-# outflow: p (p / p_inf), tback (T / T_inf at backflow)
+# outflow: p (p / p_inf), tback (T / T_inf at backflow), exit = fixed | extrapolate | riemann
+# total: p0, t0 (ratios), --shock hll + [nozzle] only (docs/nozzle.md)
 ```
 
 Bound against the patch list: an unbound patch, a binding with no patch, a bound
-cyclic (an internal face), `wedge`: exit 3 by name. `examples/fvcomp_cyl2d_snappy.toml`.
+cyclic (an internal face), `wedge` off the `--shock` route: exit 3 by name.
+`examples/fvcomp_cyl2d_snappy.toml`. `[nozzle]` (`p`, `t`, `astar`, `axis`), `total`,
+`wedge` and `exit` are the nozzle route's, `docs/nozzle.md`.
 
 Box units: rho 1, U 1, `p = 1/(gamma M^2)`, `T = p`, `mu = L/Re`.
 
@@ -305,69 +308,85 @@ is the candle's (M5a, "Hydrostatic ambient"): gravity x open patches and gravity
 | steady LTS | time | `--steady TOL (DeviceFvComp::localDt)` |
 | compensated | precision | `--compensated` |
 | FP64 | precision | `--fv-precision fp64` |
+| shock | capture | `--shock hll|sense --polymesh` |
 
 Pair matrix: L live, R refused, x one axis (exclusive).
 
-|   | LES smag | LES sigma | TFLES uniform | TFLES dynamic | Charlette | RANS SA | RANS SST | C0 | C1 | C2b | gravity | bodyForce | turb | steady LTS | compensated | FP64 |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| LES smag | . | x | L | L | L | x | x | L | L | L | L | L | L | R | L | L |
-| LES sigma | x | . | L | L | L | x | x | L | L | L | L | L | L | R | L | L |
-| TFLES uniform | L | L | . | x | L | R | R | L | R | R | L | L | L | R | L | L |
-| TFLES dynamic | L | L | x | . | L | R | R | L | R | R | L | L | L | R | L | L |
-| Charlette | L | L | L | L | . | R | R | L | R | R | L | L | L | R | L | L |
-| RANS SA | x | x | R | R | R | . | x | R | R | R | R | L | R | L | L | L |
-| RANS SST | x | x | R | R | R | x | . | R | R | R | R | L | R | L | L | L |
-| C0 | L | L | L | L | L | R | R | . | x | x | L | L | L | R | L | L |
-| C1 | L | L | R | R | R | R | R | x | . | x | L | L | R | R | L | L |
-| C2b | L | L | R | R | R | R | R | x | x | . | L | L | L | R | L | L |
-| gravity | L | L | L | L | L | R | R | L | L | L | . | L | R | R | L | L |
-| bodyForce | L | L | L | L | L | L | L | L | L | L | L | . | R | L | L | L |
-| turb | L | L | L | L | L | R | R | L | R | L | R | R | . | R | L | L |
-| steady LTS | R | R | R | R | R | L | L | R | R | R | R | L | R | . | L | L |
-| compensated | L | L | L | L | L | L | L | L | L | L | L | L | L | L | . | x |
-| FP64 | L | L | L | L | L | L | L | L | L | L | L | L | L | L | x | . |
+|   | LES smag | LES sigma | TFLES uniform | TFLES dynamic | Charlette | RANS SA | RANS SST | C0 | C1 | C2b | gravity | bodyForce | turb | steady LTS | compensated | FP64 | shock |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| LES smag | . | x | L | L | L | x | x | L | L | L | L | L | L | R | L | L | R |
+| LES sigma | x | . | L | L | L | x | x | L | L | L | L | L | L | R | L | L | R |
+| TFLES uniform | L | L | . | x | L | R | R | L | R | R | L | L | L | R | L | L | R |
+| TFLES dynamic | L | L | x | . | L | R | R | L | R | R | L | L | L | R | L | L | R |
+| Charlette | L | L | L | L | . | R | R | L | R | R | L | L | L | R | L | L | R |
+| RANS SA | x | x | R | R | R | . | x | R | R | R | R | L | R | L | L | L | R |
+| RANS SST | x | x | R | R | R | x | . | R | R | R | R | L | R | L | L | L | R |
+| C0 | L | L | L | L | L | R | R | . | x | x | L | L | L | R | L | L | R |
+| C1 | L | L | R | R | R | R | R | x | . | x | L | L | R | R | L | L | R |
+| C2b | L | L | R | R | R | R | R | x | x | . | L | L | L | R | L | L | R |
+| gravity | L | L | L | L | L | R | R | L | L | L | . | L | R | R | L | L | R |
+| bodyForce | L | L | L | L | L | L | L | L | L | L | L | . | R | L | L | L | R |
+| turb | L | L | L | L | L | R | R | L | R | L | R | R | . | R | L | L | R |
+| steady LTS | R | R | R | R | R | L | L | R | R | R | R | L | R | . | L | L | R |
+| compensated | L | L | L | L | L | L | L | L | L | L | L | L | L | L | . | x | L |
+| FP64 | L | L | L | L | L | L | L | L | L | L | L | L | L | L | x | . | L |
+| shock | R | R | R | R | R | R | R | R | R | R | R | R | R | R | L | L | . |
 
 | Pair | Decision | Error text | Why |
 |---|---|---|---|
 | LES smag + RANS SA | exclusive | `FV: LES and RANS put two eddy viscosities in one slot` | mu_t has one slot (nut); one model owns it |
 | LES smag + RANS SST | exclusive | `FV: LES and RANS put two eddy viscosities in one slot` | mu_t has one slot (nut); one model owns it |
 | LES smag + steady LTS | refused | `FV LES with local time stepping: LES is time-accurate (pseudo-time has no filtered field)` | an LES statistic is a time average of a filtered unsteady field; the structured validator refuses the same pair |
+| LES smag + shock | refused | `FV --shock with LES: not built (no gate)` | no nozzle rung runs LES; the background term has no filter width |
 | LES sigma + RANS SA | exclusive | `FV: LES and RANS put two eddy viscosities in one slot` | mu_t has one slot (nut); one model owns it |
 | LES sigma + RANS SST | exclusive | `FV: LES and RANS put two eddy viscosities in one slot` | mu_t has one slot (nut); one model owns it |
 | LES sigma + steady LTS | refused | `FV LES with local time stepping: LES is time-accurate (pseudo-time has no filtered field)` | an LES statistic is a time average of a filtered unsteady field; the structured validator refuses the same pair |
+| LES sigma + shock | refused | `FV --shock with LES: not built (no gate)` | no nozzle rung runs LES; the background term has no filter width |
 | TFLES uniform + RANS SA | refused | `FV TFLES with RANS: the thickened flame is a resolved (DNS / LES) flame` | TFLES thickens a flame the grid carries; a RANS mean flame has none |
 | TFLES uniform + RANS SST | refused | `FV TFLES with RANS: the thickened flame is a resolved (DNS / LES) flame` | TFLES thickens a flame the grid carries; a RANS mean flame has none |
 | TFLES uniform + C1 | refused | `FV TFLES: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening and its sensor are the premixed step's (kChemCellPass<true>) |
 | TFLES uniform + C2b | refused | `FV TFLES with --equivalence: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening, its sensor (the one-step rate at Ta/2) and Charlette's E are the premixed step's; a two-reactant TFLES would thicken the partially premixed jet's outer diffusion sheet too, which no model here defines (the structured --equivalence refuses --tfles alike) |
 | TFLES uniform + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
+| TFLES uniform + shock | refused | `FV --shock with TFLES: not built (no gate)` | TFLES is a premixed flame's; species with --shock are refused |
 | TFLES dynamic + RANS SA | refused | `FV TFLES with RANS: the thickened flame is a resolved (DNS / LES) flame` | TFLES thickens a flame the grid carries; a RANS mean flame has none |
 | TFLES dynamic + RANS SST | refused | `FV TFLES with RANS: the thickened flame is a resolved (DNS / LES) flame` | TFLES thickens a flame the grid carries; a RANS mean flame has none |
 | TFLES dynamic + C1 | refused | `FV TFLES: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening and its sensor are the premixed step's (kChemCellPass<true>) |
 | TFLES dynamic + C2b | refused | `FV TFLES with --equivalence: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening, its sensor (the one-step rate at Ta/2) and Charlette's E are the premixed step's; a two-reactant TFLES would thicken the partially premixed jet's outer diffusion sheet too, which no model here defines (the structured --equivalence refuses --tfles alike) |
 | TFLES dynamic + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
+| TFLES dynamic + shock | refused | `FV --shock with TFLES: not built (no gate)` | TFLES is a premixed flame's; species with --shock are refused |
 | Charlette + RANS SA | refused | `FV TFLES efficiency (Charlette) with RANS: it reads an LES sub-grid velocity` | Charlette's u' is the filtered field's (Colin's operator), RANS has none |
 | Charlette + RANS SST | refused | `FV TFLES efficiency (Charlette) with RANS: it reads an LES sub-grid velocity` | Charlette's u' is the filtered field's (Colin's operator), RANS has none |
 | Charlette + C1 | refused | `FV TFLES: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening and its sensor are the premixed step's (kChemCellPass<true>) |
 | Charlette + C2b | refused | `FV TFLES with --equivalence: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening, its sensor (the one-step rate at Ta/2) and Charlette's E are the premixed step's; a two-reactant TFLES would thicken the partially premixed jet's outer diffusion sheet too, which no model here defines (the structured --equivalence refuses --tfles alike) |
 | Charlette + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
+| Charlette + shock | refused | `FV --shock with TFLES: not built (no gate)` | TFLES is a premixed flame's; species with --shock are refused |
 | RANS SA + C0 | refused | `FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)` | a RANS flame needs a mean reaction-rate closure (Arrhenius of the mean state is not the mean rate) and a turbulent scalar flux; neither is built |
 | RANS SA + C1 | refused | `FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)` | a RANS flame needs a mean reaction-rate closure (Arrhenius of the mean state is not the mean rate) and a turbulent scalar flux; neither is built |
 | RANS SA + C2b | refused | `FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)` | a RANS flame needs a mean reaction-rate closure (Arrhenius of the mean state is not the mean rate) and a turbulent scalar flux; neither is built |
 | RANS SA + gravity | refused | `FV RANS with gravity: not built (no buoyancy term in the closures)` | the closures carry no buoyancy production: an unstable stratification produces no k or nu~, so a RANS convection cell (gravity's customer, dns conv) would decay toward laminar. Wrong physics, not a small gap |
 | RANS SA + turb | refused | `FV --turb with RANS: synthetic fluctuations on an ensemble mean` | a RANS field is the ensemble mean: resolved fluctuations at its inflow are no RANS input (that is k and omega / nu~ at the patch), and the RANS flame is refused anyway |
+| RANS SA + shock | refused | `FV --shock with RANS: not built (no gate; the scalars ride F[0])` | F[0] would carry the hybrid mass flux under the scalars: ungated |
 | RANS SST + C0 | refused | `FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)` | a RANS flame needs a mean reaction-rate closure (Arrhenius of the mean state is not the mean rate) and a turbulent scalar flux; neither is built |
 | RANS SST + C1 | refused | `FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)` | a RANS flame needs a mean reaction-rate closure (Arrhenius of the mean state is not the mean rate) and a turbulent scalar flux; neither is built |
 | RANS SST + C2b | refused | `FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)` | a RANS flame needs a mean reaction-rate closure (Arrhenius of the mean state is not the mean rate) and a turbulent scalar flux; neither is built |
 | RANS SST + gravity | refused | `FV RANS with gravity: not built (no buoyancy term in the closures)` | the closures carry no buoyancy production: an unstable stratification produces no k or nu~, so a RANS convection cell (gravity's customer, dns conv) would decay toward laminar. Wrong physics, not a small gap |
 | RANS SST + turb | refused | `FV --turb with RANS: synthetic fluctuations on an ensemble mean` | a RANS field is the ensemble mean: resolved fluctuations at its inflow are no RANS input (that is k and omega / nu~ at the patch), and the RANS flame is refused anyway |
+| RANS SST + shock | refused | `FV --shock with RANS: not built (no gate; the scalars ride F[0])` | F[0] would carry the hybrid mass flux under the scalars: ungated |
 | C0 + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
+| C0 + shock | refused | `FV --shock with species: not built (the chamber is the next cycle)` | no FV injector or holder, the line sensor is unbracketed on a flame (issues.md Z10) |
 | C1 + turb | refused | `FV --turb with model C1 / C2 (--mode diffusion, --sl-law onestep): not built (the turbulent box is measured on C0 and C2b)` | the slot jet takes no --turb on any solver; the one-step C2 premix is C1's stage and has no turbulent number |
 | C1 + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
+| C1 + shock | refused | `FV --shock with species: not built (the chamber is the next cycle)` | no FV injector or holder, the line sensor is unbracketed on a flame (issues.md Z10) |
 | C2b + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
+| C2b + shock | refused | `FV --shock with species: not built (the chamber is the next cycle)` | no FV injector or holder, the line sensor is unbracketed on a flame (issues.md Z10) |
 | gravity + turb | refused | `FV --turb with gravity: not built (the box's inflow is an open patch)` | gravity needs a closed domain (no hydrostatic ambient on open patches); --turb needs an open inflow |
 | gravity + steady LTS | refused | `FV local time stepping with gravity: not built` | kFvGravity takes the bare cr: under LTS the fixed point would move with lts |
+| gravity + shock | refused | `FV --shock with gravity: not built (no consumer)` | no rung has both; the hydrostatic balance is unproven under D3 |
 | bodyForce + turb | refused | `FV --turb with a body force: not built (the drive's channel has no inflow)` | the box is swept through an inflow patch; the driven channel is closed |
+| bodyForce + shock | refused | `FV --shock with a body force: not built (no consumer)` | the driven channel is subsonic: nothing to capture |
 | turb + steady LTS | refused | `FV --turb with local time stepping: the swept inflow is time-accurate` | the rows follow X = sum U dt; pseudo-time has no physical sweep |
+| turb + shock | refused | `FV --shock with --turb: not built (no consumer)` | --turb is the premixed flame box's; species with --shock are refused |
+| steady LTS + shock | refused | `FV --shock with local time stepping: not built (the sensor flickers; the structured steady march refuses it too)` | a frozen or live sensor both left the host LTS residual flat at 3.7e-3 on a Total inlet (issues.md Z7); the time march is the route |
 | compensated + FP64 | exclusive | `--compensated is the FP32 state's low word: FP64 has no update floor to lift` | the two-word state lifts FP32's update floor; FP64 has none |
 | turb without C0 or C2b | requirement | `FV --turb: the premixed flame box (C0, C2b; dns flame --mode premixed --solver fv)` | |
 | TFLES uniform without C0 | requirement | `FV TFLES: the thickened flame is premixed species only (FvChem ox < 0)` | |
@@ -421,9 +440,11 @@ Pair matrix: L live, R refused, x one axis (exclusive).
 | bodyForce + steady LTS | gpu_fv_rans |
 | turb + compensated | gpu_fv_turb (IC, rows, trajectory X), tools/chem/turb_fv.sh comp, pairs (S_c, area vs structured) |
 | turb + FP64 | gpu_fv_turb (IC, rows, trajectory X), tools/chem/turb_fv.sh comp, pairs (S_c, area vs structured) |
+| compensated + shock | gpu_fv_nozzle |
+| FP64 + shock | gpu_fv_nozzle |
 
 <!-- generated: test_gpu_fv_matrix markdown (tests/test_gpu_fv_matrix.cpp) -->
-Harness rows (`gpu_fv_matrix`, 55 live cells on the meshes box 8x6x5 periodic, box_cyclic, box_refined, cyl2d_snappy; gravity on the open set through the hydrostatic ambient's rows). oracle: double vs FvRef, max relative over every pass, 3 steps; orders: Source / Morton / ColourMajor, 3 FP64 steps; rest: |rhs - source| / (p sum|S| / V), FP64 / FP32 on the closed set, open rest on the open set at rest (gravity, cyl2d_snappy: Far, Outflow, Inflow faces); mass, energy: 10 FP64 steps; Z: max|Z(Y) - tracer|, FP64 / FP32, 20 steps. Steady LTS cells: the oracle is the rhs and stableDt (FvRef has no LTS), mass n/a (LTS drifts it). Energy n/a with the drive (its work).
+Harness rows (`gpu_fv_matrix`, 56 live cells on the meshes box 8x6x5 periodic, box_cyclic, box_refined, cyl2d_snappy; gravity on the open set through the hydrostatic ambient's rows). oracle: double vs FvRef, max relative over every pass, 3 steps; orders: Source / Morton / ColourMajor, 3 FP64 steps; rest: |rhs - source| / (p sum|S| / V), FP64 / FP32 on the closed set, open rest on the open set at rest (gravity, cyl2d_snappy: Far, Outflow, Inflow faces); mass, energy: 10 FP64 steps; Z: max|Z(Y) - tracer|, FP64 / FP32, 20 steps. Steady LTS cells: the oracle is the rhs and stableDt (FvRef has no LTS), mass n/a (LTS drifts it). Energy n/a with the drive (its work).
 
 | Cell | oracle | f32 vs f64 | orders | rest FP64 / FP32 | open rest | mass | energy | pow2 Y | Z == tracer | inert | rerun |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -447,20 +468,20 @@ Harness rows (`gpu_fv_matrix`, 55 live cells on the meshes box 8x6x5 periodic, b
 | C1 | 4.8e-15 | 2.7e-06 | 4.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 1.8e-15 | exact | 1.4e-15 / 6.9e-07 | passive species: bitwise | byte-identical |
 | LES smag + C1 | 4.7e-15 | 3.2e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 3.1e-15 | 2.2e-15 | exact | 1.3e-15 / 7.0e-07 | passive species: bitwise | byte-identical |
 | LES sigma + C1 | 1.3e-14 | 2.7e-06 | 4.5e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | 1.8e-15 | exact | 1.4e-15 / 6.9e-07 | passive species: bitwise | byte-identical |
-| C2b | 4.8e-15 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.2e-16 | 8.9e-16 | exact | 1.3e-15 / 7.4e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
-| LES smag + C2b | 4.7e-15 | 3.2e-06 | 4.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.0e-15 | 1.3e-15 | exact | 1.2e-15 / 8.4e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
-| LES sigma + C2b | 1.3e-14 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 8.9e-16 | exact | 1.3e-15 / 7.4e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
+| C2b | 4.8e-15 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.2e-16 | 8.9e-16 | exact | 1.4e-15 / 7.4e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
+| LES smag + C2b | 4.7e-15 | 3.2e-06 | 4.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.0e-15 | 1.3e-15 | exact | 1.1e-15 / 8.4e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
+| LES sigma + C2b | 1.3e-14 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 8.9e-16 | exact | 1.4e-15 / 7.4e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
 | gravity | 4.7e-15 | 4.3e-06 | 3.2e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 1.4e-15 | 4.4e-16 | n/a | n/a | n/a | byte-identical |
 | LES smag + gravity | 4.4e-15 | 4.3e-06 | 3.2e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 8.9e-16 | 1.1e-15 | n/a | n/a | n/a | byte-identical |
 | LES sigma + gravity | 1.3e-14 | 5.3e-06 | 3.7e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 1.4e-15 | 4.4e-16 | n/a | n/a | n/a | byte-identical |
 | C0 + gravity | 4.8e-15 | 2.4e-06 | 4.0e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 1.1e-15 | 4.4e-16 | exact | n/a | passive species: bitwise | byte-identical |
 | TFLES uniform + C0 + gravity | 4.8e-15 | 2.4e-06 | 3.3e-16 | 1.0e-15 / 4.5e-07 | 1.0e-15 / 4.5e-07 | 4.4e-16 | 8.9e-16 | exact | n/a | TFLES F 1: bitwise | byte-identical |
 | TFLES dynamic + C0 + gravity | 4.8e-15 | 2.4e-06 | 3.2e-16 | 5.4e-16 / 2.4e-07 | 5.4e-16 / 2.4e-07 | 1.7e-15 | 2.0e-15 | exact | n/a | TFLES F 1: bitwise | byte-identical |
-| LES smag + TFLES uniform + Charlette + C0 + gravity | 4.4e-15 | 2.8e-06 | 3.7e-16 | 1.0e-15 / 4.5e-07 | 1.0e-15 / 4.5e-07 | 8.9e-16 | 4.4e-16 | exact | n/a | n/a | byte-identical |
+| LES smag + TFLES uniform + Charlette + C0 + gravity | 4.4e-15 | 2.8e-06 | 3.1e-16 | 1.0e-15 / 4.5e-07 | 1.0e-15 / 4.5e-07 | 8.9e-16 | 4.4e-16 | exact | n/a | n/a | byte-identical |
 | C1 + gravity | 4.8e-15 | 2.4e-06 | 4.5e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 4.4e-16 | 8.9e-16 | exact | 1.7e-15 / 6.9e-07 | passive species: bitwise | byte-identical |
 | C2b + gravity | 4.8e-15 | 2.4e-06 | 4.5e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 8.9e-16 | 2.4e-15 | exact | 1.2e-15 / 8.0e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
 | bodyForce | 4.7e-15 | 4.3e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.3e-15 | n/a | n/a | n/a | n/a | byte-identical |
-| LES smag + bodyForce | 4.4e-15 | 4.3e-06 | 4.7e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | n/a | n/a | n/a | byte-identical |
+| LES smag + bodyForce | 4.4e-15 | 4.3e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | n/a | n/a | n/a | byte-identical |
 | LES sigma + bodyForce | 1.3e-14 | 5.3e-06 | 4.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.3e-15 | n/a | n/a | n/a | n/a | byte-identical |
 | RANS SA + bodyForce | 3.8e-15 | 3.6e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | n/a | n/a | n/a | RANS scalars 0: bitwise | byte-identical |
 | RANS SST + bodyForce | 3.5e-15 | 4.7e-06 | 4.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | n/a | n/a | RANS scalars 0: bitwise | byte-identical |
@@ -468,7 +489,7 @@ Harness rows (`gpu_fv_matrix`, 55 live cells on the meshes box 8x6x5 periodic, b
 | TFLES uniform + C0 + bodyForce | 4.8e-15 | 2.7e-06 | 3.0e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | exact | n/a | TFLES F 1: bitwise | byte-identical |
 | TFLES dynamic + C0 + bodyForce | 4.8e-15 | 2.7e-06 | 4.6e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | n/a | exact | n/a | TFLES F 1: bitwise | byte-identical |
 | LES smag + TFLES uniform + Charlette + C0 + bodyForce | 4.7e-15 | 3.2e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | exact | n/a | n/a | byte-identical |
-| C1 + bodyForce | 4.8e-15 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | exact | 1.1e-15 / 5.8e-07 | passive species: bitwise | byte-identical |
+| C1 + bodyForce | 4.8e-15 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | exact | 1.4e-15 / 5.8e-07 | passive species: bitwise | byte-identical |
 | C2b + bodyForce | 4.8e-15 | 2.7e-06 | 3.8e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.3e-15 | n/a | exact | 1.6e-15 / 7.5e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
 | gravity + bodyForce | 4.7e-15 | 4.3e-06 | 3.4e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 4.4e-16 | n/a | n/a | n/a | n/a | byte-identical |
 | C0 + turb | 4.8e-15 | 2.7e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | 7.8e-16 | exact | n/a | passive species, turb u' 0: bitwise | byte-identical |
@@ -477,18 +498,19 @@ Harness rows (`gpu_fv_matrix`, 55 live cells on the meshes box 8x6x5 periodic, b
 | TFLES uniform + C0 + turb | 4.8e-15 | 2.7e-06 | 3.0e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.0e-15 | 8.9e-16 | exact | n/a | TFLES F 1, turb u' 0: bitwise | byte-identical |
 | TFLES dynamic + C0 + turb | 4.8e-15 | 2.7e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | 8.9e-16 | exact | n/a | TFLES F 1, turb u' 0: bitwise | byte-identical |
 | LES smag + TFLES uniform + Charlette + C0 + turb | 4.7e-15 | 3.2e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 8.9e-16 | 1.3e-15 | exact | n/a | turb u' 0: bitwise | byte-identical |
-| C2b + turb | 4.8e-15 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.2e-16 | 8.9e-16 | exact | 1.3e-15 / 7.4e-07 | passive species, C(xi) 1 = C1, turb u' 0: bitwise | byte-identical |
+| C2b + turb | 4.8e-15 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.2e-16 | 8.9e-16 | exact | 1.4e-15 / 7.4e-07 | passive species, C(xi) 1 = C1, turb u' 0: bitwise | byte-identical |
 | steady LTS | 4.7e-15 | 4.3e-06 | 5.2e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical |
 | RANS SA + steady LTS | 3.8e-15 | 3.6e-06 | 5.4e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical |
 | RANS SST + steady LTS | 3.3e-15 | 4.7e-06 | 5.0e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical |
 | bodyForce + steady LTS | 4.7e-15 | 4.3e-06 | 8.6e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical |
+| shock | 3.0e-15 | 2.8e-06 | 4.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.3e-15 | 1.7e-15 | n/a | n/a | n/a | byte-identical |
 
 Regenerate: `test_gpu_fv_matrix markdown` (via simjob) prints everything from the first
 `<!-- generated` marker to here.
 
 ## Cross-verification
 
-OpenFOAM is absent here: the structured solver is the oracle. **This table is
+OpenFOAM is absent here (the nozzle's rows at the end of the table are the exception: rhoCentralFoam, docs/nozzle.md): the structured solver is the oracle. **This table is
 the template every later phase fills in.** Relation: *bitwise*, *rounding* (the
 schemes are pinned equal, growth is a bug), *order p* (the discretizations differ
 legitimately, the difference must shrink at p), *converged limit* (two different
@@ -515,6 +537,11 @@ models, compared at convergence, never bitwise).
 | same | same | cl rms, t 200-316 | none claimed | 0.271402, 0.270738 / 0.203835, 0.203496 / 0.235742, 0.235656: 6.6e-4 / 3.4e-4 / 8.6e-5. cl rms itself non-monotone in h, window not shown to be a limit cycle |
 | immersed `DeviceComp` ghost wall vs FV body-fitted | Re 40: 40 D box NSCBC vs 40 D diameter disc, not the same domain | cd | converged limit, two walls | immersed 12.8 cells/D 1.5714 (flat t 64-80, cl 0.03), 25.6 cells/D 1.5791 at t 51 and still falling. FV 384x192 1.5729. CONVERGENCE NOT MEASURED |
 | plain FP32 vs FP64 (FV) | Re 40, 128x64 | cd, settled | "FP32 on a steady flow" | 1.5665-1.5764 vs 1.571630 |
+| FV(FP64) `force` vs rhoCentralFoam Kurganov + upwind (T1, `gpu_fv_nozzle`) | N-C 80x16: A, B (shock), W (20 deg wedge) | every cell p, T, U at the fixed point | rounding | 1.2e-14, 3.4e-13, 1.5e-14 |
+| FV(FP64) hybrid + D3 vs rhoCentralFoam vanLeer (T2) | N-C A 160x32, 320x64 | time means: vol L1 p; wall p; Cd; Cf | converging, order >= 1 | 1.61e-3, 1.07e-3 (0.59); 1.38e-3, 9.6e-4 (0.53); 1.2e-4, 5.0e-5; 3.5e-4, 2.4e-4. UNMET on order: see docs/nozzle.md |
+| same (T2) | N-C B, p_b 0.6 | vol L1 p; wall p; x_s; Cf | same | 3.84e-3, 2.37e-3 (0.70); 3.32e-3, 1.99e-3 (0.74); 0.18 h, 0.41 h; 3.6e-5, 2.6e-4 |
+| FV(FP64) vs exact source flow | 15 deg sector, 64, 128, 256 | L1 p | order 2 | 4.97e-4, 1.28e-4, 3.25e-5 (1.98) |
+| FV(FP64) vs Sauer | parabola R 20, 280x32 | dM/dx, sonic x, Cd | converged limit | -2.34%, -1.20%, -3.6e-5 |
 
 Orders above rest on 3 levels and nothing finer. Finer rungs: "not measured",
 see "Reproducing the long numbers".

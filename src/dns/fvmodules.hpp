@@ -39,6 +39,7 @@ enum class FvModule : std::uint8_t
     Steady,    // local time stepping (DeviceFvComp::localDt)
     Compensated,
     Fp64,
+    Shock, // --shock hll|sense on a polyMesh (dns/fvshock, docs/nozzle.md)
     Count
 };
 inline constexpr std::size_t kFvModuleCount = std::size_t(FvModule::Count);
@@ -54,7 +55,8 @@ enum class FvAxis : std::uint8_t
     Drive,
     Inflow, // the turbulent inflow: IC and per-face rows, no stage term
     Time,
-    Precision
+    Precision,
+    Capture // shock capture: the sensor, the HLL face term, the background term
 };
 
 struct FvModuleInfo

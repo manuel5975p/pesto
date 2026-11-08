@@ -3425,6 +3425,19 @@ burnt behind it (oracle profile across x = holder base), all at rest at p0;
 ambient at the coflow. Rhs hook: NSCBC → species re-carry → sink → species
 sink → wall faces → injector.
 
+**A choking chamber** (`--shock hll`, `docs/shock.md`). Under `none` an isentropic
+inverse that chokes is refused; under `hll` it is a warning and the throat is
+captured. Long box, sigma 10, 4 cells: `--expansion 10 --downstream 80 --inject-ramp 4
+--coflow 6`. At inject 16 the jet is underexpanded and the row passes M 2.0, exit 0
+until the blow-off guard: choked for 5.13 flame times from t 26.9, p0/pa mean 5.73
+past t 40 against 5.2 from ṁ at the burnt temperature, a Mach disk near 65 columns
+past the exit (axis M 2.56 to 0.94). `MexitMax` reads the exit column only, and
+the sonic line sits past it: the lip's stair contracts the jet, so at inject 8
+p0Noz/pAmb 2.5 stands at exit Mach 0.82 with static p/pa 1.56 at the exit column and
+`MJet` 1.38 in the ambient. No run reached a settled state: each ends on the
+blow-off guard, exit 8, with half the fuel leaving through the nozzle (inject 12, t
+27.4; 16, t 54.0; 20, t 20.1; a wider holder at 16, t 24.4). issues.md S17, S18.
+
 **Stop guard:** exit 8 on flash-back (injector-band burn > 1e-3 of the
 total after ramp + 2) or blow-off (fuel through the exit > 0.5 of the
 injected after ramp + 2 Lc/U); 7 on a non-finite state.

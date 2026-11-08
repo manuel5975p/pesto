@@ -78,6 +78,48 @@ int main()
     expect("flow --body cylinder --physics compressible --mach inf --dry-run", 1,
            "an infinite number");
 
+    // --shock (masterplan_shockflux gate 9): flow's scope.
+    expect("channel --shock sense --dry-run", 1, "--shock is unknown on channel");
+    expect("tgv --shock sense --dry-run", 1, "--shock is unknown on tgv");
+    expect("flow --body cylinder --physics compressible --shock wobble --dry-run", 1, "an unknown --shock value");
+    expect("flow --body cylinder --physics compressible --shock hll --dry-run", 0, "--shock hll on the uniform box");
+    expect("flow --body cylinder --physics compressible --shock hll --cfl 0.61 --dry-run", 2, "--cfl 0.61 at nz 1");
+    expect("flow --body cylinder --physics compressible --shock hll --cfl 0.6 --dry-run", 0, "--cfl 0.6 at nz 1");
+    expect("flow --body sphere --nz 32 --physics compressible --shock hll --cfl 0.41 --dry-run", 2, "--cfl 0.41 at nz 8");
+    expect("flow --body sphere --nz 32 --physics compressible --shock hll --dry-run", 0, "default --cfl at nz > 1");
+    expect("bench --physics compressible --n 32 --shock hll --dry-run", 0, "--shock hll on the bench");
+    expect("flame --tfles 2 --shock hll --dry-run", 2, "--tfles with hll");
+    expect("flame --tfles 2 --shock sense --dry-run", 0, "--tfles with sense: it measures");
+    expect("flame --cfl 0.61 --shock hll --dry-run", 2, "the flame's --cfl cap");
+    expect("flame --cfl 0.61 --shock sense --dry-run", 0, "sense has no --cfl cap");
+    expect("flame --mode chamber --shock hll --dry-run", 0, "--shock hll on the chamber");
+    expect("flow --body cylinder --physics compressible --re 100 --n 64 --ny 64 --ft 0.1 --shock sense --dry-run", 0,
+           "--shock sense on the compressible uniform box");
+    expect("bench --physics compressible --n 32 --shock sense --dry-run", 0, "--shock sense on the bench");
+    expect("bench --shock sense --dry-run", 2, "--shock is compressible only");
+    expect("flow --body cylinder --shock sense --dry-run", 2, "--shock on incompressible flow");
+    expect("flow --body cylinder --physics compressible --far sponge --shock sense --dry-run", 2, "--shock needs nscbc");
+    expect("flow --body floor --physics compressible --shock sense --dry-run", 2, "--shock with --body floor");
+    expect("flow --body cylinder --physics compressible --ogrid --shock sense --dry-run", 2, "--shock with --ogrid");
+    expect("flow --body cylinder --physics compressible --stretch 2 --shock sense --dry-run", 2, "--shock with --stretch");
+    expect("flow --body cylinder --physics compressible --focal 1,1 --shock sense --dry-run", 2, "--shock with --focal");
+    expect("flow --body cylinder --physics compressible --rans sa-neg --shock sense --dry-run", 2, "--shock with --rans");
+    expect("flow --body cylinder --physics compressible --steady 1e-3 --shock sense --dry-run", 2, "--shock with --steady");
+    expect("flow --body cylinder --physics compressible --precond 2 --shock sense --dry-run", 2, "--shock with --precond");
+    expect("flow --body cylinder --physics compressible --rotor-mach 0.2 --shock sense --dry-run", 2,
+           "--shock with --rotor-mach");
+    expect("flow --body cylinder --physics compressible --rotor-frame mrf --shock sense --dry-run", 2,
+           "--shock with --rotor-frame");
+    expect("flow --body cylinder --physics compressible --thin-seal --shock sense --dry-run", 2, "--shock with --thin-seal");
+    expect("flow --body cylinder --physics compressible --penalize 1 --shock sense --dry-run", 2, "--shock with --penalize");
+    expect("flow --body cylinder --physics compressible --nscbc-strip 8 --shock sense --dry-run", 2,
+           "--shock with --nscbc-strip");
+    expect("flow --body cylinder --physics compressible --pot --shock sense --dry-run", 2, "--shock with --pot");
+    expect("flow --body cylinder --physics compressible --solver fv --shock sense --dry-run", 2, "--shock on --solver fv");
+    expect("flow --body cylinder --physics compressible --solver simple --shock sense --dry-run", 2,
+           "--shock on --solver simple");
+    expect("flow --polymesh x --shock sense --dry-run", 2, "--shock with --polymesh");
+
     // --- 2: config ----------------------------------------------------------
     expect("flow --dry-run", 2, "--body is required");
     expect("flow --body wombat --dry-run", 2, "unrecognised body");

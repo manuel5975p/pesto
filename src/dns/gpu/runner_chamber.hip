@@ -114,11 +114,26 @@ std::expected<RunStats, RunError> runChamber(const Grid& g, const CompState& ic,
     // Region + solid masks on the device; the injector cell list.
     std::vector<std::uint8_t> solidHost(n);
     std::vector<int> inj;
+    int exitCol = g.nx; // ShockRegions::farCol
+    std::vector<int> cavityCells(static_cast<std::size_t>(g.nx), 0);
     for (std::size_t c = 0; c < n; ++c) {
         solidHost[c] = r.regions[c] == std::uint8_t(ChamberRegion::Solid);
         if (r.regions[c] == std::uint8_t(ChamberRegion::Injector))
             inj.push_back(int(c));
+        const int col = int(c % std::size_t(g.nx));
+        if (r.regions[c] == std::uint8_t(ChamberRegion::Exit)) exitCol = std::min(exitCol, col);
+        if (inCavity(r.regions[c])) ++cavityCells[std::size_t(col)];
     }
+    // The narrowest cavity column, the last of a tie (ShockRegions::throatCol).
+    int throatCol = -1;
+    for (int i = 0; i < g.nx; ++i) {
+        const int a = cavityCells[std::size_t(i)];
+        if (a > 0 && (throatCol < 0 || a <= cavityCells[std::size_t(throatCol)])) throatCol = i;
+    }
+    if (r.shock != ShockMode::None)
+        std::printf("shock: geometric throat column i %d, %d cells; exit column i %d, %d cells\n", throatCol,
+                    throatCol < 0 ? 0 : cavityCells[std::size_t(throatCol)], exitCol,
+                    exitCol < g.nx ? cavityCells[std::size_t(exitCol)] : 0);
     if (inj.empty()) return fail(3, "chamber: the injector band has no fluid cells");
     auto solidDev = DeviceBuffer<std::uint8_t>::make(n);
     auto regionDev = DeviceBuffer<std::uint8_t>::make(n);
@@ -171,6 +186,7 @@ std::expected<RunStats, RunError> runChamber(const Grid& g, const CompState& ic,
     nc.Rgas = r.tr.Rgas;
     nc.thermalInflow = r.thermalInflow;
     nc.TInf = r.Tu;
+    nc.superOutflow = r.shock == ShockMode::Hll;
     auto nscm = DeviceCompNscbc::make(g, nc);
     if (!nscm) return fail(6, "NSCBC init failed");
     DeviceCompNscbc nsc = std::move(*nscm);
@@ -188,6 +204,15 @@ std::expected<RunStats, RunError> runChamber(const Grid& g, const CompState& ic,
     double rateNow = 0;
     const double perCell = 1.0 / (double(inj.size()) * dV);
     const double hIn = cp * r.Tu; // enthalpy of the injected gas at rest
+    // --shock (docs/shock.md): x NSCBC rows, y periodic; the ghost wall's solid.
+    const bool shockOn = r.shock != ShockMode::None;
+    if (shockOn) {
+        ShockSetup ss;
+        ss.solid = solidDev->data();
+        ss.open[0] = ss.nscbc[0] = true;
+        ss.apply = r.shock == ShockMode::Hll;
+        if (!dev->enableShock(ss)) return fail(6, "shock allocation failed");
+    }
     dev->setStageHook([&](DeviceCompState& s) { ghost.apply(s); });
     dev->setRhsHook([&](const DeviceCompState& s, DeviceCompState& o,
                         const StageCombine& cmb) {
@@ -215,11 +240,22 @@ std::expected<RunStats, RunError> runChamber(const Grid& g, const CompState& ic,
     if (auto h = internal::checkDevice("the initial condition"); !h)
         return std::unexpected(h.error());
 
-    const std::string cols[] = {
+    std::vector<std::string> cols = {
         "t",     "dt",      "inj",     "injCum",  "fuel",   "burn",
         "burnCav", "outNoz", "outDom", "mdotIn",  "mdotNoz", "Me",
         "pCh",   "p0Noz",   "pAmb",    "h0Noz",   "Tmax",   "mass",
         "energy", "yHits",  "omegaInj", "fx"};
+    // --shock: appended LAST, so off stats are bytes. shockCav*: inCavity cells;
+    // shockLip: the lip column (Exit, AmbientProbe); shockCavRest: the cavity
+    // without Exit.
+    const bool shockSensor = r.shock == ShockMode::Sense;
+    if (shockOn)
+        cols.insert(cols.end(), {"shockCells", "shockMax", "rhoMin", "pMin", "openMach", "shockCav", "shockCavMax",
+                                 "shockLip", "shockCavRest", "MexitMax", "shockCavFar"});
+    if (shockOn) {
+        cols.push_back(shockSensor ? "shockBurnMax" : "shockBurnCells");
+        cols.insert(cols.end(), {"mdotLo", "mdotHi", "MThroat", "pThroat", "p0Throat", "MJet"});
+    }
     if (auto e = out.declareSeries("stats", cols); !e) return fail(4, e.error());
 
     DeviceBuffer<double> colScratch;
@@ -229,7 +265,10 @@ std::expected<RunStats, RunError> runChamber(const Grid& g, const CompState& ic,
         double fuel = 0, burn = 0, burnCav = 0, outNoz = 0, outDom = 0,
                mdotNoz = 0, Me = 0, pCh = 0, p0Noz = 0, pAmb = 0, h0Noz = 0,
                Tmax = 0, mass = 0, energy = 0, yHits = 0, omegaInj = 0, fx = 0;
+        ShockRow sh;
+        double shBurn = 0, mdotLo = 0, mdotHi = 0;
     };
+    double omegaPeak = 0;          // --shock sense: the run's, DeviceShock::burnMax
     const double hy = g.hy * g.hz; // face area of an x face
     auto measure = [&]() -> std::expected<Meas, RunError> {
         ghost.apply(*ds); // idempotent: the step's output left ghosts stale
@@ -288,6 +327,21 @@ std::expected<RunStats, RunError> runChamber(const Grid& g, const CompState& ic,
         M.outDom = (xhi - xlo) * hy;
         M.omegaInj = M.burn > 0 ? wInj / M.burn : 0;
         M.fx = F.fx;
+        if (shockOn) {
+            const ShockRegions reg{regionDev->data(), std::uint8_t(ChamberRegion::Cavity),
+                                   std::uint8_t(ChamberRegion::Exit), std::uint8_t(ChamberRegion::Exit),
+                                   std::uint8_t(ChamberRegion::AmbientProbe), exitCol - 3, throatCol,
+                                   std::uint8_t(ChamberRegion::Ambient)};
+            M.sh = dev->shockRow(*ds, *red, reg);
+            // The flux through the domain's end faces: the row's one-sided LODI
+            // difference telescopes against the interior to this extrapolation.
+            for (int k = 1; k < kChamberRegions; ++k) {
+                M.mdotLo += (1.5 * at(0, k, sMx) - 0.5 * at(1, k, sMx)) * hy;
+                M.mdotHi += (1.5 * at(g.nx - 1, k, sMx) - 0.5 * at(g.nx - 2, k, sMx)) * hy;
+            }
+            if (shockSensor) M.shBurn = dev->shockBurnMax(omegaPeak, *red);
+            else M.shBurn = dev->shockBurnCells(omegaPeak, *red);
+        }
         return M;
     };
 
@@ -315,6 +369,9 @@ std::expected<RunStats, RunError> runChamber(const Grid& g, const CompState& ic,
     const double uInj = r.mdot / spec.Hc; // fresh bulk speed (rho_u = 1)
     const double tFlash = r.ramp + 2.0, tBlow = r.ramp + 2.0 * spec.Lc / uInj;
     double lastHits = 0;
+    bool shockHot = false;  // internal::shockDtEvery
+    double rowGuard = 0;    // internal::shockOpenRow, at the dt cadence
+    double shockPeak = 0;   // the most cells sensed on a stats row
     const auto wall0 = std::chrono::steady_clock::now();
 
     auto emitRow = [&](double tt, double dt, const Meas& m) {
@@ -325,7 +382,37 @@ std::expected<RunStats, RunError> runChamber(const Grid& g, const CompState& ic,
                               m.pCh,     m.p0Noz,    m.pAmb,    m.h0Noz,
                               m.Tmax,    m.mass,     m.energy,  m.yHits,
                               m.omegaInj, m.fx};
-        out.row("stats", row);
+        if (!shockOn) {
+            out.row("stats", row);
+            return;
+        }
+        std::vector<double> full(std::begin(row), std::end(row));
+        full.insert(full.end(), {m.sh.cells, m.sh.top, m.sh.rhoMin, m.sh.pMin, m.sh.openMach, m.sh.cavCells,
+                                 m.sh.cavTop, m.sh.lipCells, m.sh.cavRest, m.sh.exitMach, m.sh.cavFar});
+        if (shockOn)
+            full.insert(full.end(), {m.shBurn, m.mdotLo, m.mdotHi, m.sh.throatMach, m.sh.throatP, m.sh.throatP0, m.sh.jetMach});
+        out.row("stats", full);
+        shockPeak = std::max(shockPeak, m.sh.cells);
+    };
+    // --shock sense: one cell of the end-of-run or running report.
+    auto reportCell = [&](const ShockPeak& p, const char* what, double tt) {
+        const int i = int(p.cell) % g.nx, j = int(p.cell) / g.nx;
+        std::printf("shock: %s v %.4e at i %d j %d (x %.4g y %.4g) region %d t %.4g\n", what, p.v, i, j,
+                    (i + 0.5) * g.hx, (j + 0.5) * g.hy, int(r.regions[p.cell]), tt);
+    };
+    auto cavityPeak = [&](const std::vector<ShockPeak>& top) {
+        return std::ranges::find_if(top, [&](const ShockPeak& p) { return inCavity(r.regions[p.cell]); });
+    };
+    // Past the IC: each time the cavity's v_max grows 5%, its cell.
+    double cavBest = 0;
+    auto cavityWatch = [&](double tt, const Meas& m) -> std::expected<void, RunError> {
+        if (r.shock != ShockMode::Sense || tt < 1 || !(m.sh.cavTop > 1.05 * cavBest)) return {};
+        auto top = dev->shockPeaks(*ds, n);
+        if (!top) return fail(6, "shock sensor download failed");
+        const auto hit = cavityPeak(*top);
+        if (hit != top->end()) reportCell(*hit, "cavity max", tt);
+        cavBest = m.sh.cavTop;
+        return {};
     };
     {
         auto m0 = measure();
@@ -336,16 +423,20 @@ std::expected<RunStats, RunError> runChamber(const Grid& g, const CompState& ic,
 
     while (t < r.tEnd) {
         if (stopRequested()) break;
+        const int dtEvery = internal::shockDtEvery(r.shockDtAuto, r.dtRecompute, sinceDt, shockHot, t,
+                                                   [&] { return dev->shockSense(*ds, *red); });
         if (auto e = internal::recomputeDt(
-                sinceDt, dtStab, r.dtRecompute, r.dtMargin, 1e-9,
+                sinceDt, dtStab, dtEvery, r.dtMargin, 1e-9,
                 [&] {
                     const double a = dev->stableDt(*ds, *red, r.cfl);
+                    if (r.shock == ShockMode::Hll) rowGuard = dev->shockRowGuard(*ds, *red);
                     dtChem = chemStableDt(*dev, *ds, *red);
                     bindChem = dtChem < a;
                     return std::min(a, dtChem);
                 });
             !e)
             return fail(7, e.error());
+        if (auto e = internal::shockOpenRow(rowGuard, t); !e) return std::unexpected(e.error());
         const double dt = std::min(r.tEnd - t, dtStab);
         rateNow = r.mdot * chamberRamp(t, r.ramp);
         dev->step(*ds, Real(dt));
@@ -363,6 +454,7 @@ std::expected<RunStats, RunError> runChamber(const Grid& g, const CompState& ic,
                 return fail(7, std::format("chamber state is not finite at "
                                            "t={:.4g} (diverged)", t));
             emitRow(t, dt, *m);
+            if (auto w = cavityWatch(t, *m); !w) return std::unexpected(w.error());
             lastHits = m->yHits;
             const double inj = r.mdot * chamberRamp(t, r.ramp);
             if (cad.printDue(st.steps, t, r.tEnd)) {
@@ -400,6 +492,16 @@ std::expected<RunStats, RunError> runChamber(const Grid& g, const CompState& ic,
                      "dns: warning: %g cells with Y outside [-1e-6, 1+1e-6] "
                      "at the last stats row (counted, never clamped)\n",
                      lastHits);
+    if (shockOn) internal::shockReport(shockPeak, n);
+    if (r.shock == ShockMode::Sense) {
+        // The sensor's largest v at the end, and the largest in the cavity.
+        ghost.apply(*ds);
+        auto top = dev->shockPeaks(*ds, n);
+        if (!top) return fail(6, "shock sensor download failed");
+        for (std::size_t q = 0; q < std::min<std::size_t>(top->size(), 4); ++q) reportCell((*top)[q], "peak", t);
+        const auto hit = cavityPeak(*top);
+        if (hit != top->end()) reportCell(*hit, "cavity peak", t);
+    }
     std::printf("label: %s\n", r.label.c_str());
     finishTiming(st, wall0, out);
     st.tStop = t;

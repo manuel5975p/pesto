@@ -5,6 +5,7 @@
 #include "dns/fvimodules.hpp"
 
 #include "dns/scene.hpp"
+#include "dns/shockflux.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -127,13 +128,82 @@ std::optional<ConfigError> validateFrameOutputs(const RawConfig& r, Case& c)
     return std::nullopt;
 }
 
-std::optional<ConfigError> checkMach(double mach)
+std::optional<ConfigError> checkMach(double mach, bool shock)
 {
-    if (!(finitePos(mach) && mach < 1))
-        return ConfigError{2, "--mach", "must be in (0,1) -- the flux is "
-                                        "Kennedy-Gruber central with no shock "
-                                        "capturing"};
+    if (finitePos(mach) && mach < 1) return std::nullopt;
+    if (shock) return ConfigError{2, "--mach", "must be in (0,1): the characteristic boundaries are subsonic"};
+    return ConfigError{2, "--mach", "must be in (0,1) -- the flux is "
+                                    "Kennedy-Gruber central with no shock "
+                                    "capturing"};
+}
+
+std::optional<ConfigError> shockRouteScope(const RawConfig& r)
+{
+    if (r.shock == ShockMode::None) return std::nullopt;
+    // dns flow --physics compressible --polymesh: the FV route (docs/nozzle.md).
+    const bool fvPoly = r.sub == Subcommand::Flow && r.physics == Physics::Compressible && r.given.contains("--polymesh");
+    const std::initializer_list<const char*> always = {"--ogrid", "--stretch", "--focal", "--rans", "--steady",
+                                                       "--precond", "--rotor-mach", "--rotor-frame", "--thin-seal", "--penalize",
+                                                       "--nscbc-strip", "--pot"};
+    if (auto e = rejectGiven(r, always,
+                             "is not built with --shock (uniform Cartesian mesh, structured compressible; "
+                             "docs/shock.md)");
+        e)
+        return e;
+    if (!fvPoly)
+        if (auto e = rejectGiven(r, {"--polymesh", "--bc"},
+                                 "is not built with --shock (uniform Cartesian mesh, structured compressible; "
+                                 "docs/shock.md)");
+            e)
+            return e;
+    if (r.physics != Physics::Compressible) return err(2, "--shock", "is compressible only");
+    if (!fvPoly && r.solver != int(SolverKind::Structured))
+        return err(2, "--shock",
+                   std::format("is not built on --solver {}", r.solver == int(SolverKind::Fv) ? "fv" : "simple"));
     return std::nullopt;
+}
+
+std::optional<ConfigError> shockFlagScope(const RawConfig& r, const Case& c)
+{
+    if (r.shock == ShockMode::None) return std::nullopt;
+    if (c.sub == Subcommand::Flow && !r.given.contains("--polymesh")) {
+        if (c.far != FarField::Nscbc) return err(2, "--shock", "needs --far nscbc");
+        if (c.bodyKind == BodyKind::Floor) return err(2, "--shock", "is not built with --body floor");
+    }
+    if (c.sub == Subcommand::Flame) {
+        const char* const modes[] = {"premixed", "bunsen", "diffusion", "candle", "chamber"};
+        if (r.flameMode != 0 && r.flameMode != kFlameModeChamber)
+            return err(2, "--shock",
+                       std::format("is not built for --mode {}: premixed and chamber", modes[r.flameMode]));
+        if (r.given.contains("--equivalence"))
+            return err(2, "--shock", "is not built with --equivalence (two reactants)");
+    }
+    if (r.shock != ShockMode::Hll) return std::nullopt;
+    const std::string noGate = " is not built with --shock hll (no gate yet; --shock sense measures it)";
+    if (c.sub == Subcommand::Flame) {
+        for (const char* f : {"--tfles", "--turb", "--les"})
+            if (r.given.contains(f)) return err(2, f, f + noGate);
+        if (c.mach > kShockMachMax)
+            return err(2, "--mach",
+                       std::format("{:g} above {:g}: the flame trips the sensor (bracket in dns/shockflux.hpp)", c.mach,
+                                   kShockMachMax));
+    }
+    if (c.sub == Subcommand::Bench) return std::nullopt; // a fixed dt, no --cfl
+    const double cap = kShockCflAxisSum / (c.grid.nz > 1 ? 3 : 2);
+    if (c.cfl > cap + 1e-12)
+        return err(2, "--cfl",
+                   std::format("must be <= {:g} with --shock hll: the axis sum {:g} is measured stable, 1.4 diverges",
+                               cap, kShockCflAxisSum));
+    return std::nullopt;
+}
+
+void shockCadence(const RawConfig& r, Case& c)
+{
+    c.shockDtAuto = !r.given.contains("--dt-recompute");
+    if (!c.shockDtAuto && c.dtRecompute > 1)
+        c.warnings.push_back(std::format("--dt-recompute {} under --shock hll: a dt held over steps diverged a 3D Sod "
+                                         "tube from rest at 16 (docs/shock.md)",
+                                         c.dtRecompute));
 }
 
 std::optional<ConfigError> checkNz(int nz, const char* belowOne)
@@ -266,6 +336,12 @@ std::span<const char* const> nscbcAbcNames()
     return kNames;
 }
 
+std::span<const char* const> shockNames()
+{
+    static constexpr const char* kNames[] = {"none", "hll", "sense"};
+    return kNames;
+}
+
 std::span<const char* const> subcommandNames()
 {
     static constexpr const char* kNames[] = {"flow",    "tgv",  "hit",
@@ -289,6 +365,8 @@ const char* name(Physics p) { return nameAt(physicsNames(), std::size_t(p)); }
 const char* name(SgsModel m) { return nameAt(sgsModelNames(), std::size_t(m)); }
 
 const char* name(NscbcAbc a) { return nameAt(nscbcAbcNames(), std::size_t(a)); }
+
+const char* name(ShockMode m) { return nameAt(shockNames(), std::size_t(m)); }
 
 const char* name(Subcommand s)
 {

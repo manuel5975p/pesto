@@ -122,7 +122,7 @@ struct RunOutput::Impl
             "{{\"nx\":{},\"ny\":{},\"nz\":{},\"frames\":{},\"frameDt\":{},"
             "\"D\":{},\"re\":{},\"mach\":{},\"cs\":{},\"les\":{},\"sgs\":\"{}\","
             "\"body\":\"{}\",\"far\":\"{}\",\"physics\":\"{}\",\"kick\":{},"
-            "\"msPerStep\":{}{}{}{}{}{}{}{}{}{}}}\n",
+            "\"msPerStep\":{}{}{}{}{}{}{}{}{}{}{}}}\n",
             meta.nx, meta.ny, meta.nz, frames, meta.frameDt, meta.D, meta.re,
             meta.mach, meta.cs, meta.les ? 1 : 0, meta.sgs, meta.body,
             meta.farField, meta.physics, meta.kick, msPerStep,
@@ -135,7 +135,8 @@ struct RunOutput::Impl
             meta.si.empty() ? std::string() : ",\"si\":" + meta.si,
             completion ? std::format(",\"complete\":{},\"restarts\":{}",
                                      completion->first, completion->second)
-                       : std::string());
+                       : std::string(),
+            key("shock", meta.shock));
     }
 
     void writeJson() const

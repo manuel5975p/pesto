@@ -69,11 +69,21 @@ struct StructuredSpec
     std::array<FoamPatchType, 6> type{};
 };
 
+// fromPolyMesh's opt-ins. wedge: read `wedge` patches (the compressible nozzle route only;
+// every other route keeps the refusal): exactly two planar sides mirrored about z = 0, axis
+// x (docs/nozzle.md). Non-side S, Cf, d and every C get z exactly 0, the second side the
+// bit mirror of the first, so w stays 0.0 at any precision.
+struct FaceMeshOptions
+{
+    bool wedge = false;
+};
+
 // Finite-volume mesh shared by every FV kernel, every builder, and the solver graph.
 struct FaceMesh
 {
     int nC = 0, nI = 0, nB = 0;
     int dim = 3, emptyAxis = -1;                 // 2D: S/d components on emptyAxis exactly 0
+    double wedgeHalf = 0;                        // half angle of a `wedge` mesh, radians; 0 off
     std::vector<int> own, nei;                   // own[nI+nB], nei[nI]; own < nei
     std::array<std::vector<double>, 3> S, Cf, d; // per face
     std::array<std::vector<double>, 3> C;        // per cell
@@ -92,10 +102,10 @@ struct FaceMesh
     // Geometry = OpenFOAM v2606, FP64. Errors (exit 3) by name: open cell
     // (|sum S| > 1e-9 sum |S|), V <= 0, d.S <= 0, cyclic pairs unmatched
     // (> 1e-8 bbox diagonal against the separation), `empty` not a one-cell
-    // extrusion along x|y|z, wedge patches (P8), a cell coupled to itself.
+    // extrusion along x|y|z, wedge patches (P8, unless opt.wedge), a cell coupled to itself.
     // threads <= 0: hardware concurrency; byte-identical for any count.
     static std::expected<FaceMesh, std::string> fromPolyMesh(const PolyMesh&, CellOrder,
-                                                             int threads = 0);
+                                                             int threads = 0, FaceMeshOptions opt = {});
     // polyOf + fromPolyMesh (one geometry definition); srcCell = Grid::idx.
     static std::expected<FaceMesh, std::string> fromCurvMesh(const CurvMesh&, const StructuredSpec&,
                                                              CellOrder, int threads = 0);

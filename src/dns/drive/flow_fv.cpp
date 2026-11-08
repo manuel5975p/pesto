@@ -8,6 +8,7 @@
 #include "dns/ogrid.hpp"
 #include "dns/output.hpp"
 #include "dns/fvincomp.hpp"
+#include "dns/fvnozzle.hpp"
 #include "dns/fvsimple.hpp"
 #include "dns/fvstructured.hpp"
 #include "dns/remap.hpp"
@@ -83,8 +84,8 @@ int runFvCompOn(const Case& c, const FaceMesh& fm, const FvBcSpec& spec, const F
     auto out = RunOutput::make(outputConfig(c, std::format("{{\"app\":\"dns\",\"re\":{},\"mach\":{}", c.re, c.mach)),
                                meta, raster->grid(), std::move(fg));
     if (!out) return die(exitOutput, out.error());
-    const Transport gas = Transport::air(fs.rho * fs.U * D / c.re, fs.T, c.tinfK, c.prandtl, fs.gamma, kRgasBox,
-                                         c.sutherland);
+    const Transport gas = Transport::air(c.inviscid ? 0.0 : fs.rho * fs.U * D / c.re, fs.T, c.tinfK, c.prandtl, fs.gamma,
+                                         kRgasBox, c.sutherland);
     gpu::FvCompRun rr{.label = fvCompLabel(c, fm.dim == 2),
                       .solver = {.tr = gas,
                                  .bc = fvBcsOf(fm, spec, fs, 1.0),
@@ -96,7 +97,8 @@ int runFvCompOn(const Case& c, const FaceMesh& fm, const FvBcSpec& spec, const F
                                           .wallDist = std::move(wallDist),
                                           .phiInf = {c.ransPhiInf[0], c.ransPhiInf[1]}},
                                  .tallied = fvTallyOf(fm, spec),
-                                 .pRef = fs.p},
+                                 .pRef = fs.pRest > 0.0 ? fs.pRest : fs.p,
+                                 .shock = {.mode = c.shock, .eps4 = c.shockEps4}},
                       .spec = spec,
                       .fs = fs,
                       .D = D,
@@ -111,6 +113,17 @@ int runFvCompOn(const Case& c, const FaceMesh& fm, const FvBcSpec& spec, const F
                       .quiet = c.quiet,
                       .steadyTol = c.compSteady ? c.steadyTol : 0.0,
                       .steadySteps = c.steadySteps};
+    if (spec.nozzle) {
+        const auto total = std::ranges::find(spec.patches, FvPatchKind::Total, &FvPatchSpec::kind);
+        rr.nozzle = FvNozzleRun{.astar = spec.nozzle->astar,
+                                .axis = spec.nozzle->axis,
+                                .pRef = rr.solver.pRef,
+                                .p0 = total == spec.patches.end() ? 0.0 : total->p0 * fs.p,
+                                .t0 = total == spec.patches.end() ? 0.0 : total->t0 * fs.T};
+    }
+    rr.shockDtAuto = c.shockDtAuto;
+    rr.foamWrite = c.foamWrite;
+    rr.foamPrefix = c.outPrefix;
     auto res = gpu::runFvComp(fm, c.rans == RansModel::None ? ic : fvWithScalars(ic, c.rans, rr.solver.rans.phiInf), rr,
                               *raster, *out);
     if (!res) return die(res.error().code, res.error().message);
@@ -194,7 +207,12 @@ std::expected<bool, std::pair<int, std::string>> fvPolyCheck(const Case& c)
     if (!man) return Err({exitInput, man.error()});
     std::vector<FvMeshPatch> mp;
     for (const FoamPatch& p : man->patches) mp.push_back({p.name, foamPatchTypeName(p.type)});
-    if (auto r = checkFvBc(c.fvBc, mp); !r) return Err({exitInput, c.fvMeshDir + ": " + r.error()});
+    const bool wedgeOk = c.sub == Subcommand::Flow && c.shock != ShockMode::None;
+    if (auto r = checkFvBc(c.fvBc, mp, wedgeOk); !r) return Err({exitInput, c.fvMeshDir + ": " + r.error()});
+    const bool wedge = std::ranges::any_of(mp, [](const FvMeshPatch& m) { return m.type == "wedge"; });
+    if (wedgeOk && wedge && (c.lesLabel || c.rans != RansModel::None))
+        return Err({2, "a `wedge` mesh takes no --les, --rans (an axisymmetric mean flow)"});
+    if (wedgeOk && c.lesLabel) return Err({2, std::string(fvPair(FvModule::Shock, FvModule::LesSmag).message)});
     const bool twoD = fvMeshIs2D(mp);
     if (twoD && c.lesLabel && c.sgsModel == SgsModel::Sigma)
         return Err({2, "--sgs: sigma: D_sigma is identically ZERO for any 2D flow; this mesh has `empty` patches"});
@@ -207,13 +225,16 @@ int runFvCompPoly(const Case& c)
     if (!twoD) return die(twoD.error().first, twoD.error().second);
     auto pm = readPolyMesh(fvPolyDir(c.fvMeshDir));
     if (!pm) return die(exitInput, pm.error());
-    auto fm = FaceMesh::fromPolyMesh(*pm, CellOrder::Morton);
+    auto fm = FaceMesh::fromPolyMesh(*pm, CellOrder::Morton, 0, {.wedge = c.shock != ShockMode::None});
     if (!fm) return die(exitInput, fm.error());
     if (!haveGpu(c)) return die(exitNoGpu, "no GPU device (dns flow is GPU-only)");
 #if DNS_WITH_GPU
-    const FvFreestream fs = fvFreestreamOf(c.mach, kGammaAir, kRgasBox, c.fvBc.dir);
+    FvFreestream fs = fvFreestreamOf(c.mach, c.fvGamma, kRgasBox, c.fvBc.dir);
+    // A nozzle starts at rest at [nozzle] p, t; the ramp raises the Total row's p0.
+    if (c.fvBc.nozzle) fs.pRest = c.fvBc.nozzle->p * fs.p;
     const double u0 = c.ramp > 0 ? 0.0 : fs.U;
-    const FvState ic = fvUniformState(*fm, fs, u0);
+    const FvState ic = c.fvBc.nozzle ? fvRestState(*fm, fs.pRest, c.fvBc.nozzle->t * fs.T, fs.gamma, kRgasBox)
+                                     : fvUniformState(*fm, fs, u0);
     const double area = c.fvBc.area > 0 ? c.fvBc.area : c.fvBc.length * fvMeshDepth(*fm);
     std::vector<double> wd;
     if (c.rans != RansModel::None) {

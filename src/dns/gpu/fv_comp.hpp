@@ -25,6 +25,9 @@
 // Gravity (dns conv) is two additive passes, never a kernel edit: its face terms
 // after the fluxes, their sum on the stage after the gather.
 //
+// Shock capture (FvCompConfig::shock, docs/nozzle.md): the sensor per step, one face
+// pass on the materialized F. No hot kernel is edited.
+//
 // A boundary face indexes a row of the FvBc table: one row per patch, or
 // FvCompConfig::bcRow's per-face rows (the jet's inflow). GPU-only header.
 #pragma once
@@ -94,6 +97,10 @@ struct FvCompConfig
     std::optional<FvAmbient> ambient{};
     // --turb (M5): FvConfig::turb (the inventory's module; the rows are setBcRows').
     bool turb = false;
+    // Shock capture (FvConfig::shock's terms, docs/nozzle.md): the sensor at each step's
+    // start (kFvShockSense; rhs, evaluate, patchFlux, shockCells form it from the current
+    // state), one face pass after the fluxes. None: no launch, no buffer.
+    FvShock shock{};
 };
 
 // Force and heat on the tallied faces, FP64 sums in ascending face order.
@@ -149,13 +156,17 @@ public:
     std::expected<double, std::string> chemDt(double k);
     // State and the ONE omega of the current state (nC values; empty if nY == 0).
     std::expected<void, std::string> speciesFields(dns::FvState& s, std::vector<double>& omega);
-    // Flux of row r (5 + species) of the current state through each patch, outward,
+    // Flux of row r (0 .. nV - 1) of the current state through each patch, outward,
     // FP64 sum in ascending face order. Errors: a launch failure.
     std::expected<std::vector<double>, std::string> patchFlux(int r);
     // Tally of the current state.
     std::expected<FvSurface, std::string> surface();
     // Sums of the current state.
     std::expected<FvTotals, std::string> totals() const;
+    // --shock: cells with a nonzero byte, and the largest byte, of the current state's
+    // sensor. Errors: no --shock, a launch failure.
+    std::expected<long, std::string> shockCells();
+    std::expected<int, std::string> shockByteMax();
     // Stage writes the SST guard clipped (k >= 0, omega >= floor rho). 0 otherwise.
     std::expected<unsigned long long, std::string> floorHits() const;
     // Per-cell mu_t of the current state (0 without LES or RANS).

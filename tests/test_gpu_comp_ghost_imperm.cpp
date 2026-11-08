@@ -23,6 +23,7 @@
 #include "dns/gpu/comp_ghost.hpp"
 
 #include "gpu_test_util.hpp"
+#include "shock_test_util.hpp"
 #include "check.hpp"
 
 #include <algorithm>
@@ -126,6 +127,7 @@ Drift run(const Rig& rig, bool hook)
     auto ds = gpu::DeviceCompState::make(g.size());
     auto red = gpu::ReduceScratch::make();
     if (!gh || !ds || !red) { check(false, rig.name + ": setup"); return {}; }
+    test::shockIfAsked(*dev, *gh, g, !rig.focal && !rig.mrf);
     dev->setStageHook([&](gpu::DeviceCompState& s) { gh->apply(s); });
     if (hook)
         dev->setRhsHook([&](const gpu::DeviceCompState& s,

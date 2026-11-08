@@ -41,6 +41,7 @@
 #include "dns/trimesh.hpp"
 
 #include "gpu_test_util.hpp"
+#include "shock_test_util.hpp"
 #include "check.hpp"
 #include "mesh_test_util.hpp"
 
@@ -256,6 +257,7 @@ Spin spinUp(const Grid& g, const gpu::GhostSdf& sdf, const Rotor& rot,
     auto ds = gpu::DeviceCompState::make(g.size());
     auto red = gpu::ReduceScratch::make();
     if (!dev || !gh || !ds || !red) { check(false, "spinUp setup"); return {}; }
+    test::shockIfAsked(*dev, *gh, g);
     dev->setStageHook([&](gpu::DeviceCompState& s) { gh->apply(s); });
     auto host = quiescent(g);
     (void)ds->upload(host);
@@ -358,6 +360,7 @@ void splitCartesian(const std::string& name, const Grid& g,
         h.E[c] = pInf / (gamma_ - 1.0) + ke;
     }
     (void)ds->upload(h);
+    test::shockIfAsked(*dev, *gh, g);
     dev->setStageHook([&](gpu::DeviceCompState& s) { gh->apply(s); });
     gh->apply(*ds);
     dev->step(*ds, gpu::Real(dev->stableDt(*ds, *red)));
@@ -434,6 +437,7 @@ void splitInviscidMrf(const std::string& name, const Grid& g,
                           + h.mz[c] * h.mz[c]) / rhoInf;
     }
     (void)ds->upload(h);
+    test::shockIfAsked(*dev, *gh, g);
     dev->setStageHook([&](gpu::DeviceCompState& s) { gh->apply(s); });
     gh->apply(*ds);
     dev->step(*ds, gpu::Real(dev->stableDt(*ds, *red)));

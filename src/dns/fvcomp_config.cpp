@@ -39,12 +39,14 @@ std::expected<FvPatchKind, std::string> kindOf(std::string_view s)
     if (s == "far") return FvPatchKind::Far;
     if (s == "empty") return FvPatchKind::Empty;
     if (s == "open") return FvPatchKind::Open;
-    return Err(std::format("unknown patch type '{}'; one of: wall, slip, inflow, outflow, far, empty, open", s));
+    if (s == "total") return FvPatchKind::Total;
+    if (s == "wedge") return FvPatchKind::Wedge;
+    return Err(std::format("unknown patch type '{}'; one of: wall, slip, inflow, outflow, far, empty, open, total, wedge", s));
 }
 
 const char* kindName(FvPatchKind k)
 {
-    static constexpr const char* n[] = {"wall", "slip", "inflow", "outflow", "far", "empty", "open"};
+    static constexpr const char* n[] = {"wall", "slip", "inflow", "outflow", "far", "empty", "open", "total", "wedge"};
     return n[std::size_t(k)];
 }
 
@@ -61,10 +63,12 @@ std::vector<std::string_view> keysOf(FvPatchKind k)
     case FvPatchKind::Wall: return {"type", "thermal", "twall", "u", "omega", "origin", "force"};
     case FvPatchKind::Slip: return {"type", "force"};
     case FvPatchKind::Inflow: return {"type", "u", "t", "y", "jet"};
-    case FvPatchKind::Outflow: return {"type", "p", "tback", "y", "burnt"};
+    case FvPatchKind::Outflow: return {"type", "p", "tback", "y", "burnt", "exit"};
     case FvPatchKind::Far: return {"type", "y"};
     case FvPatchKind::Empty: return {"type"};
     case FvPatchKind::Open: return {"type", "t", "y"};
+    case FvPatchKind::Total: return {"type", "p0", "t0"};
+    case FvPatchKind::Wedge: return {"type"};
     }
     return {"type"};
 }
@@ -75,7 +79,7 @@ std::expected<FvPatchSpec, std::string> parsePatch(const std::string& name, cons
     if (t.get("kind"))
         return Err(w + ": key 'kind' is the incompressible --bc schema; --physics compressible spells it type");
     const toml::node* ty = t.get("type");
-    if (!ty || !ty->is_string()) return Err(w + ": needs type = \"wall|slip|inflow|outflow|far|empty|open\"");
+    if (!ty || !ty->is_string()) return Err(w + ": needs type = \"wall|slip|inflow|outflow|far|empty|open|total|wedge\"");
     auto kind = kindOf(ty->value_or(std::string()));
     if (!kind) return Err(w + ": " + kind.error());
     FvPatchSpec p{.name = name, .kind = *kind};
@@ -122,6 +126,21 @@ std::expected<FvPatchSpec, std::string> parsePatch(const std::string& name, cons
     if (p.kind == FvPatchKind::Outflow) {
         if (auto r = num("p", p.pOut); !r) return Err(r.error());
         if (auto r = num("tback", p.tBack); !r) return Err(r.error());
+        if (const toml::node* n = t.get("exit")) {
+            const std::string s = n->value_or(std::string());
+            if (s != "fixed" && s != "extrapolate" && s != "riemann")
+                return Err(w + ".exit: must be \"fixed\", \"extrapolate\" or \"riemann\"");
+            p.exit = s == "fixed" ? FvExit::Fixed : s == "extrapolate" ? FvExit::Extrapolate : FvExit::Riemann;
+        }
+        const bool pt = t.contains("p") || t.contains("tback");
+        if (p.exit == FvExit::Extrapolate && pt) return Err(w + ": exit = \"extrapolate\" reads no p, tback: give neither");
+        if (p.exit == FvExit::Riemann && !(t.contains("p") && t.contains("tback")))
+            return Err(w + ": exit = \"riemann\" needs p and tback");
+    }
+    if (p.kind == FvPatchKind::Total) {
+        if (!t.contains("p0") || !t.contains("t0")) return Err(w + ": total needs p0 and t0");
+        if (auto r = num("p0", p.p0); !r) return Err(r.error());
+        if (auto r = num("t0", p.t0); !r) return Err(r.error());
     }
     if (const toml::node* n = t.get("y")) {
         const toml::array* a = n->as_array();
@@ -152,6 +171,30 @@ std::expected<FvPatchSpec, std::string> parsePatch(const std::string& name, cons
         p.tallied = *b;
     }
     return p;
+}
+
+// [nozzle]: p, t, astar required, axis along x unless given.
+std::expected<FvNozzleSpec, std::string> parseNozzle(const toml::table& t)
+{
+    FvNozzleSpec n;
+    for (const auto& [k, v] : t) {
+        const std::string key(k.str());
+        if (key == "axis") {
+            auto a = vec3(v, "nozzle.axis");
+            if (!a) return Err(a.error());
+            const double m = std::hypot((*a)[0], (*a)[1], (*a)[2]);
+            if (!(m > 0)) return Err("nozzle.axis: must not be zero");
+            for (std::size_t i = 0; i < 3; ++i) n.axis[i] = (*a)[i] / m;
+            continue;
+        }
+        if (key != "p" && key != "t" && key != "astar") return Err("[nozzle]: unknown key '" + key + "' (p, t, astar, axis)");
+        double x = 0;
+        if (!number(v, x) || !(x > 0)) return Err("nozzle." + key + ": must be a finite number > 0");
+        (key == "p" ? n.p : key == "t" ? n.t : n.astar) = x;
+    }
+    for (const char* k : {"p", "t", "astar"})
+        if (!t.contains(k)) return Err(std::format("[nozzle]: needs {}", k));
+    return n;
 }
 
 } // namespace
@@ -202,8 +245,14 @@ std::expected<FvBcSpec, std::string> parseFvBc(std::string_view text)
                 if (!p) return Err(p.error());
                 sp.patches.push_back(std::move(*p));
             }
+        } else if (key == "nozzle") {
+            const toml::table* t = v.as_table();
+            if (!t) return Err("[nozzle] must be a table");
+            auto n = parseNozzle(*t);
+            if (!n) return Err(n.error());
+            sp.nozzle = *n;
         } else
-            return Err("unknown top-level key '" + key + "' (reference, patch)");
+            return Err("unknown top-level key '" + key + "' (reference, patch, nozzle)");
     }
     if (sp.patches.empty()) return Err("no [patch.NAME] table");
     const double dl = sp.dir[0] * sp.lift[0] + sp.dir[1] * sp.lift[1] + sp.dir[2] * sp.lift[2];
@@ -226,7 +275,7 @@ std::string FvBcSpec::describe() const
     return s;
 }
 
-std::expected<void, std::string> checkFvBc(const FvBcSpec& spec, std::span<const FvMeshPatch> mesh)
+std::expected<void, std::string> checkFvBc(const FvBcSpec& spec, std::span<const FvMeshPatch> mesh, bool wedgeOk)
 {
     auto bound = [&](const std::string& n) {
         return std::ranges::find(spec.patches, n, &FvPatchSpec::name);
@@ -234,7 +283,12 @@ std::expected<void, std::string> checkFvBc(const FvBcSpec& spec, std::span<const
     bool tally = false;
     for (const FvMeshPatch& m : mesh) {
         const auto it = bound(m.name);
-        if (m.type == "wedge") return Err(std::format("patch `{}`: wedge patches are not supported (FaceMesh P8)", m.name));
+        if (m.type == "wedge") {
+            if (!wedgeOk) return Err(std::format("patch `{}`: wedge patches are not supported (FaceMesh P8)", m.name));
+            if (it != spec.patches.end() && it->kind != FvPatchKind::Wedge)
+                return Err(std::format("patch `{}`: a `wedge` patch takes type = \"wedge\" only", m.name));
+            continue;
+        }
         if (m.type == "cyclic") {
             if (it != spec.patches.end())
                 return Err(std::format("patch `{}`: a cyclic patch is an internal face: do not bind it", m.name));
@@ -249,6 +303,8 @@ std::expected<void, std::string> checkFvBc(const FvBcSpec& spec, std::span<const
             return Err(std::format("patch `{}` ({}) has no [patch.{}] table in the --bc file", m.name, m.type, m.name));
         if (it->kind == FvPatchKind::Empty)
             return Err(std::format("patch `{}`: type = \"empty\" needs an `empty` mesh patch, it is {}", m.name, m.type));
+        if (it->kind == FvPatchKind::Wedge)
+            return Err(std::format("patch `{}`: type = \"wedge\" needs a `wedge` mesh patch, it is {}", m.name, m.type));
         tally = tally || it->tallied;
     }
     for (const FvPatchSpec& p : spec.patches)
@@ -267,6 +323,17 @@ std::string fvBcFlameKey(const FvBcSpec& spec)
         if (p.burnt) return "patch." + p.name + ".burnt";
         if (p.jet) return "patch." + p.name + ".jet";
         if (p.kind == FvPatchKind::Open) return "patch." + p.name + ".type = \"open\"";
+    }
+    return {};
+}
+
+std::string fvBcNozzleKey(const FvBcSpec& spec)
+{
+    if (spec.nozzle) return "[nozzle]";
+    for (const FvPatchSpec& p : spec.patches) {
+        if (p.kind == FvPatchKind::Total) return "patch." + p.name + ".type = \"total\"";
+        if (p.kind == FvPatchKind::Wedge) return "patch." + p.name + ".type = \"wedge\"";
+        if (p.exit != FvExit::Fixed) return "patch." + p.name + ".exit";
     }
     return {};
 }

@@ -284,6 +284,10 @@ std::optional<ConfigError> resolveFvConv(const RawConfig& r, Case& c)
         if (comp)
             if (const std::string k = fvBcFlameKey(*r.fvBc); !k.empty())
                 return ConfigError{2, "--bc", k + " belongs to a dns flame file: dns conv carries no species"};
+        if (comp)
+            if (const std::string k = fvBcNozzleKey(*r.fvBc); !k.empty())
+                return ConfigError{2, "--bc", k + " belongs to the nozzle route (dns flow --shock hll --polymesh): plates "
+                                                  "are wall/slip/empty/cyclic"};
     }
     if (auto e = fvCompCommon(r, c)) return e;
     if (!comp && r.given.contains("--compensated"))

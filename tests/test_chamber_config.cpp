@@ -227,5 +227,52 @@ int main()
                   chamberRunLabel(*off).find("inert") != std::string::npos,
               "--reaction off validates and says inert in the label");
     }
+    // --- --shock sense (masterplan_shockflux gate 9, sense part) ----------
+    {
+        auto s = runCli(ch({"--shock", "sense"}));
+        check(s.has_value() && s->shock == ShockMode::Sense && s->meta.shock == "sense", "--shock sense validates");
+        check(s.has_value() && chamberRunLabel(*s).ends_with("[--shock sense: sensor only, the central solver bit for bit]"),
+              "the chamber label names the sensor, last");
+        check(s.has_value() && s->describe().find("  shock      sense (sensor only, 0.02..0.06, per step") != std::string::npos,
+              "dry-run line");
+        auto off = runCli(ch({}));
+        check(off.has_value() && off->shock == ShockMode::None && off->meta.shock.empty(), "default none");
+        check(off.has_value() && off->describe().find("  shock ") == std::string::npos, "no dry-run line off");
+    }
+    rejects(ch({"--inject-speed", "15", "--shock", "sense"}), 2, "--inject-speed",
+            "sense adds no capture: the choking injection stays rc 2");
+    // --shock hll (gate 9): the choked estimate is a warning, the exact strings.
+    {
+        auto s = runCli(ch({"--inject-speed", "15", "--shock", "hll"}));
+        check(s.has_value() && s->shock == ShockMode::Hll && s->shockDtAuto, "hll takes a choked nozzle, the sticky cadence");
+        const auto has = [&](const std::string& w) {
+            return s.has_value() && std::ranges::any_of(s->warnings, [&](const std::string& x) {
+                       return x.find(w) != std::string::npos;
+                   });
+        };
+        check(has("the sonic throat is captured, the isentropic estimate does not apply"), "the choke warning");
+        check(s.has_value() && s->describe().find("  estimate   choked: no subsonic isentropic exit (captured, --shock hll)\n") !=
+                                   std::string::npos,
+              "the choked estimate line");
+        check(s.has_value() && s->describe().find("  shock      hll (pressure-sensed two-point HLL, sensor 0.02..0.06, per "
+                                                  "step)\n") != std::string::npos,
+              "the hll dry-run line");
+        check(s.has_value() && chamberRunLabel(*s).ends_with(
+                                   "[shock capturing: pressure-sensed two-point HLL (Davis speeds), NUMERICAL dissipation "
+                                   "in sensed cells, shock thickness is the mesh's; central KG elsewhere]"),
+              "the shock suffix, last");
+        auto fast = runCli(ch({"--inject-speed", "6", "--shock", "hll"}));
+        check(fast.has_value() && std::ranges::none_of(fast->warnings, [](const std::string& x) {
+                  return x.find("(> 0.7)") != std::string::npos;
+              }), "hll drops the > 0.7 warning");
+        auto off = runCli(ch({"--inject-speed", "15"}));
+        check(!off && off.error().message.starts_with("chokes the nozzle ("), "none: the rc 2 text");
+        auto given = runCli(ch({"--shock", "hll", "--dt-recompute", "16"}));
+        check(given.has_value() && !given->shockDtAuto &&
+                  std::ranges::any_of(given->warnings, [](const std::string& x) {
+                      return x.find("--dt-recompute 16 under --shock hll") != std::string::npos;
+                  }),
+              "an explicit --dt-recompute wins, with the warning");
+    }
     return dnstest::finish();
 }

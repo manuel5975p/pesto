@@ -4,9 +4,12 @@
 // Pure parse + validate: no mesh, no filesystem, no GPU.
 #pragma once
 
+#include "dns/fvflux.hpp"
+
 #include <array>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -18,7 +21,9 @@ namespace dns {
 // Open: the low-Mach route's sign-of-flux face (dns flame --physics lowmach only;
 // every other route rejects it by name): outflow zero gradient, inflow the ambient
 // tIn, y at rest with face p = -rho_a u_n^2/2.
-enum class FvPatchKind : std::uint8_t { Wall, Slip, Inflow, Outflow, Far, Empty, Open };
+// Total: a stagnation inlet (FvBcKind::Total), Wedge: an axisymmetric side (a Slip row
+// the tables know): the --shock hll polyMesh route's, docs/nozzle.md.
+enum class FvPatchKind : std::uint8_t { Wall, Slip, Inflow, Outflow, Far, Empty, Open, Total, Wedge };
 
 // One patch's condition in freestream units: velocities / U, temperature and
 // pressure ratios to T_inf and p_inf. Only the members of `kind` are read.
@@ -34,6 +39,8 @@ struct FvPatchSpec
     std::array<double, 3> uIn{};
     double tIn = 1;          // Inflow; Open: the ambient T / T_inf
     double pOut = 1, tBack = 1; // Outflow
+    FvExit exit = FvExit::Fixed; // Outflow
+    double p0 = 1, t0 = 1;       // Total: p0 / p_inf, t0 / T_inf
     // dns flame only (a `dns flow` file rejects them by name). Inflow, Outflow,
     // Far: y, the mass fractions an incoming face carries; burnt, an Outflow at
     // the flame's burnt pressure, T_back at T_b.
@@ -42,6 +49,14 @@ struct FvPatchSpec
     // dns flame --mode diffusion only. Inflow: this patch is the slot jet, one FvBc
     // row per face (fvJetRows), a fixed face at the Burke-Schumann row.
     bool jet = false;
+};
+
+// [nozzle] of a --bc file (docs/nozzle.md): the rest state p, t (ratios), the throat area
+// astar the mesh generator measured, the thrust axis (unit).
+struct FvNozzleSpec
+{
+    double p = 1, t = 1, astar = 0;
+    std::array<double, 3> axis{1, 0, 0};
 };
 
 // The whole --bc file. length: L in Re = rho U L / mu. area: force reference
@@ -55,6 +70,7 @@ struct FvBcSpec
     double length = 1, area = 0;
     std::array<double, 3> dir{1, 0, 0}, lift{0, 1, 0}, origin{0, 0, 0};
     bool hasOrigin = false;
+    std::optional<FvNozzleSpec> nozzle{};
 
     // The resolved table, one line per patch (--dry-run).
     std::string describe() const;
@@ -72,9 +88,13 @@ struct FvMeshPatch
 // Every patch bound exactly once. Pre: spec parsed. Errors, by name: a mesh
 // patch the file does not bind, a binding with no patch, cyclic patches bound
 // (they are internal faces), `empty` vs Empty mismatch (an `empty` patch may be
-// left out), `wedge` patches, a tally patch on no wall, a missing reference
-// area on a 3D mesh with a tally.
-std::expected<void, std::string> checkFvBc(const FvBcSpec& spec, std::span<const FvMeshPatch> mesh);
+// left out), `wedge` patches unless wedgeOk (then left out or bound type = "wedge"), a
+// tally patch on no wall, a missing reference area on a 3D mesh with a tally.
+std::expected<void, std::string> checkFvBc(const FvBcSpec& spec, std::span<const FvMeshPatch> mesh, bool wedgeOk = false);
+
+// The first thing in this file only the nozzle route reads ("" if none): `total`,
+// `wedge`, exit, [nozzle]. Every other route refuses it by name.
+std::string fvBcNozzleKey(const FvBcSpec& spec);
 
 // The first key of this file that only `dns flame` reads, "" if none.
 std::string fvBcFlameKey(const FvBcSpec& spec);

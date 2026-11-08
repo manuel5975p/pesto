@@ -19,10 +19,15 @@ std::expected<FvLowMachBcs, std::string> fvLowMachBcs(const FvBcSpec& spec, doub
     FvLowMachBcs b;
     b.flow.uRef = U;
     bool open = false;
+    if (spec.nozzle) return bad("[nozzle]: the compressible nozzle route's table (dns flow --shock hll --polymesh)");
     for (const FvPatchSpec& p : spec.patches) {
         if (p.kind == FvPatchKind::Empty) continue;
         FvIncompPatch o{.name = p.name};
         switch (p.kind) {
+        case FvPatchKind::Total:
+            return bad(std::format("patch.{}: type = \"total\": a low-Mach inlet has no stagnation state (inflow, outflow)", p.name));
+        case FvPatchKind::Wedge:
+            return bad(std::format("patch.{}: type = \"wedge\": the wedge is the compressible nozzle route's", p.name));
         case FvPatchKind::Far:
             return bad(std::format("patch.{}: type = \"far\": a low-Mach face has no characteristic state "
                                    "(inflow, outflow)",
@@ -56,6 +61,8 @@ std::expected<FvLowMachBcs, std::string> fvLowMachBcs(const FvBcSpec& spec, doub
             if (p.pOut != 1.0) return bad(std::format("patch.{}: p: the dynamic pressure is 0 on the outflow", p.name));
             if (p.tBack != 1.0)
                 return bad(std::format("patch.{}: tback: its scalars are zero gradient both ways", p.name));
+            if (p.exit != FvExit::Fixed)
+                return bad(std::format("patch.{}: exit: the low-Mach outflow is p = 0 by its own flux's sign", p.name));
             o.kind = FvIncompBc::Outflow;
             open = true;
             break;

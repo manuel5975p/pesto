@@ -481,6 +481,14 @@ int runFlowCompressible(const Case& c, CaseGeometry& geo)
         rr.label = flowRunLabel(c);
         std::printf("# %s\n", rr.label.c_str());
     }
+    // --shock: the label is not the empty DNS/LES one any more.
+    else if (c.shock != ShockMode::None)
+    {
+        rr.label = flowRunLabel(c);
+        std::printf("# %s\n", rr.label.c_str());
+    }
+    rr.shock = c.shock;
+    rr.shockDtAuto = c.shockDtAuto;
     // --steady-sample: the stop/stats cadence of the pseudo-time march only;
     // a time march keeps its 200.
     if (c.compSteady)

@@ -29,7 +29,9 @@
 #include "dns/fvles.hpp"
 #include "dns/fvmodules.hpp"
 #include "dns/fvrans.hpp"
+#include "dns/fvshock.hpp"
 #include "dns/sgs.hpp"
+#include "dns/shockflux.hpp"
 #include "dns/tfles.hpp"
 #include "dns/transport.hpp"
 
@@ -91,6 +93,18 @@ struct FvAmbient
     std::array<double, 3> x0{};
 };
 
+// Shock capture of an FV run (docs/nozzle.md): one post-pass over the internal faces,
+// F += |S| D(sigma_f) + eps4 (1 - sigma_f) |u_f.S| D3 (dns/fvflux.hpp fvShockFlux,
+// fvD4Rate, fvD4Row), sigma from the pressure sensor along mesh lines (dns/fvshock), once
+// per step on the step's input. Sense: the bytes alone, no flux term. force (TEST ONLY):
+// bytes 255, sigma 1 everywhere: HLL + Davis, rhoCentralFoam's Kurganov + upwind.
+struct FvShock
+{
+    ShockMode mode = ShockMode::None;
+    double eps4 = 0;
+    bool force = false;
+};
+
 // A boundary table: rows (a row per patch first), and per boundary face its row.
 struct FvBcTable
 {
@@ -133,6 +147,7 @@ struct FvConfig
     // synthetic box, rewritten by the caller between steps. No stage term: the
     // inventory's pairs only.
     bool turb = false;
+    FvShock shock{};
 };
 
 // The modules cfg switches on (dns/fvmodules; the precision and time axes are the
@@ -159,7 +174,9 @@ FvState fvAmbientState(const FaceMesh& fm, const FvAmbient& a, const std::array<
 //   diffusive   diff rho V / (mu(T) max(4/3, gamma/Pr) sum_f corr.S)
 // sum_f corr.S is the cell's compact-Laplacian diagonal, so diff 1 puts the
 // checkerboard at lambda dt = -2 on ANY mesh and dimension (issue 15's
-// lesson: never a per-axis 0.25 h^2). Sums over non-empty faces.
+// lesson: never a per-axis 0.25 h^2). Sums over non-empty faces. A `wedge` side is
+// out of the convective sum and its corr.S is the hoop term V sin^2(h)/d_z^2
+// (docs/nozzle.md): neither carries an azimuthal transit the axisymmetric field has.
 struct FvDtLimits
 {
     double cfl = 0.4, diff = 1.0;
@@ -191,6 +208,7 @@ struct FvEval
     std::array<std::vector<double>, 2> tfWork;
     std::array<std::vector<double>, 3> curl;
     std::vector<double> uh;
+    std::vector<std::uint8_t> sigma; // shock sensor bytes per cell, else empty
 };
 
 class FvRef
@@ -212,6 +230,8 @@ public:
     int nV() const { return nV_; }
     // TFLES only: the sensor walk and edge layers (empty otherwise).
     const FvTflesWalk& tflesWalk() const { return walk_; }
+    // --shock only: the sensor's mesh lines (empty otherwise).
+    const FvShockLines& shockLines() const { return lines_; }
     // LES or TFLES: Delta^2 per cell (empty otherwise).
     const std::vector<double>& lesDelta2() const { return delta2_; }
     // Per cell sum_f corr . S over active faces: the diffusive dt's denominator.
@@ -261,6 +281,9 @@ private:
     void ransFaces(FvEval& ev, std::size_t lo, std::size_t hi) const;
     void ransGather(const FvEval& ev, const Stage& st, std::size_t lo, std::size_t hi) const;
     void lesCells(FvEval& ev, std::size_t lo, std::size_t hi) const;
+    // Sensor bytes of ev's primitives (serial), the flux post-pass on state q.
+    void shockSense(FvEval& ev) const;
+    void shockFaces(const double* q, FvEval& ev, std::size_t lo, std::size_t hi) const;
     // TFLES coefficients of state q: raw sensor and curl, a dilation pass per walked
     // axis, Colin's u', the combine. Every pass writes its own cells; sync between.
     void tflesRaw(const double* q, FvEval& ev, std::size_t lo, std::size_t hi) const;
@@ -279,6 +302,7 @@ private:
     std::vector<int> patchOf_;     // patch per boundary face
     std::vector<double> diffCoef_; // per cell sum_f corr . S
     FvTflesWalk walk_;             // TFLES
+    FvShockLines lines_;           // --shock
     std::vector<double> delta2_;   // LES, TFLES (Colin's h = sqrt Delta^2)
     int workers_ = 1, nV_ = kFvMeanVars;
 };

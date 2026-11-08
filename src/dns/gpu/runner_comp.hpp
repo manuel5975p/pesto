@@ -168,6 +168,10 @@ struct CompRun
     // The run label (dns/rans_label): the progress line's tail. Empty on a
     // DNS/LES run, whose line is unchanged.
     std::string label;
+    // --shock (docs/shock.md): no launch at None, no shock stats columns.
+    // shockDtAuto: the sticky dt cadence (internal/run_loop.hpp shockDtEvery).
+    ShockMode shock = ShockMode::None;
+    bool shockDtAuto = false;
 };
 
 // `ic` is the initial conservative state; `sdf` is the body, used to build the

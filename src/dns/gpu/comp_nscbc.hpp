@@ -144,6 +144,12 @@ public:
         // offset its p by L (rho_a - rho) g / sigma. Both 0 = the shipped
         // kernel. Per-row targets, uniform mesh, !openY/!openZ only.
         double hydroLo = 0, hydroHi = 0;
+        // --shock hll (docs/shock.md): the x-hi row may go supersonic. Past u = c
+        // the incoming wave does not exist, so L1 stops being a relaxation:
+        // kNscbcCells<..., Super>, blended from M 0.8, the shipped arithmetic below
+        // it. At un < 0 its L2 to L4 relax to ambient at etaLat instead of reading
+        // a downwind difference. false = the shipped kernel. Uniform mesh.
+        bool superOutflow = false;
     };
 
     // Periodic grid, nx >= 4 (ny/nz >= 4 on open axes); subsonic freestream.

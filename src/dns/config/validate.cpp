@@ -28,6 +28,7 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     c.dryRun = r.dryRun;
     c.outPrefix = r.out;
     c.emit = r.emit;
+    c.shock = r.shock;
 
     // The low-Mach solver is the flame's alone (masterplan real_bunsen S4):
     // every other subcommand rejects it here, before its own validator reads
@@ -45,6 +46,15 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         !(r.sub == Subcommand::Flame && r.physics == Physics::LowMach))
         return bad(2, "--dt-rule", "only applies to dns flame --physics "
                                    "lowmach (the compressible dt is acoustic)");
+
+    if (auto e = shockRouteScope(r)) return std::unexpected(*e);
+    if (r.sub == Subcommand::Flow && !r.given.contains("--polymesh")) {
+        if (r.given.contains("--shock-d4"))
+            return bad(2, "--shock-d4", "is the FV polyMesh route's (the structured solvers carry no background term)");
+        if (r.inviscid) return bad(2, "--inviscid", "needs --shock hll");
+        if (r.given.contains("--foam-write")) return bad(2, "--foam-write", "needs --polymesh");
+        if (r.given.contains("--gamma")) return bad(2, "--gamma", "is the FV polyMesh route's (gamma 1.4 fixed elsewhere)");
+    }
 
     // prop shares none of the grid prologue: its --out is a CSV path, and
     // optional.
@@ -119,13 +129,22 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
     c.re = r.re;
     c.n = r.n;
 
-    if (r.sub == Subcommand::Bench) return validateBench(r, std::move(c));
+    if (r.sub == Subcommand::Bench) {
+        auto b = validateBench(r, std::move(c));
+        if (b)
+            if (auto e = shockFlagScope(r, *b)) return std::unexpected(*e);
+        return b;
+    }
     if (r.sub == Subcommand::Tgv || r.sub == Subcommand::Hit)
         return validatePeriodic(r, std::move(c));
     if (r.sub == Subcommand::Channel) return validateChannel(r, std::move(c));
     if (r.sub == Subcommand::Conv) return validateConv(r, std::move(c));
     if (r.sub == Subcommand::Flame) {
         auto f = validateFlame(r, std::move(c));
+        if (f)
+            if (auto e = shockFlagScope(r, *f); e) return std::unexpected(*e);
+        if (f && r.shock != ShockMode::None) f->meta.shock = name(r.shock);
+        if (f && r.shock == ShockMode::Hll) shockCadence(r, *f);
         if (f)
             if (auto e = resolveFrameStart(r, *f); e) return std::unexpected(*e);
         if (f)
@@ -136,6 +155,9 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
                 if (!r.fvBc) return bad(2, "--bc", "--polymesh needs --bc FILE.toml");
                 f->fvMeshDir = r.polymesh;
                 f->fvBc = *r.fvBc;
+                if (const std::string k = fvBcNozzleKey(f->fvBc); !k.empty())
+                    return bad(2, "--bc", k + " belongs to the nozzle route (dns flow --shock hll --polymesh): the "
+                                              "compressible flame's open faces are far/outflow");
                 if (f->physics != Physics::LowMach)
                     for (const FvPatchSpec& p : f->fvBc.patches)
                         if (p.kind == FvPatchKind::Open)
@@ -180,6 +202,10 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
         return f;
     }
     auto f = validateFlow(r, std::move(c));
+    if (f)
+        if (auto e = shockFlagScope(r, *f); e) return std::unexpected(*e);
+    if (f && r.shock != ShockMode::None) f->meta.shock = name(r.shock);
+    if (f && r.shock == ShockMode::Hll) shockCadence(r, *f);
     if (f && fvStructured) {
         f->fvMode = FvCompMode::Structured;
         if (auto e = fvCompCommon(r, *f)) return std::unexpected(*e);

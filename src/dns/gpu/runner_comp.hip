@@ -166,6 +166,7 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         nc.thermalInflow = r.nscbcThermalInflow;
         nc.Rgas = r.tr.Rgas;
         nc.TInf = r.pInf / (r.rhoInf * r.tr.Rgas);
+        nc.superOutflow = r.shock == ShockMode::Hll;
         // Focal: the boundary rows read tabulated cell centres (the same
         // doubles as the map; the stage hook below passes this fremap).
         auto m = focal && !stretched ? DeviceCompNscbc::make(g, nc, fremap)
@@ -532,6 +533,32 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     }
     if (compensated && !dev->enableCompensation())
         return fail(6, "GPU allocation failed (compensated state)");
+    // --shock (docs/shock.md): x NSCBC; y, z NSCBC under --open, mirror rows
+    // otherwise, so no axis is periodic. The solid mask outlives the solver's
+    // last step (it is read inside step()).
+    const bool shockOn = r.shock != ShockMode::None;
+    DeviceBuffer<std::uint8_t> shockSolid;
+    if (shockOn)
+    {
+        ShockSetup ss;
+        ss.apply = r.shock == ShockMode::Hll;
+        ss.open[0] = ss.open[1] = true;
+        ss.open[2] = g.nz > 1;
+        ss.nscbc[0] = true;
+        ss.nscbc[1] = r.open;
+        ss.nscbc[2] = r.open && g.nz > 1;
+        if (!ghost->solidCells().empty())
+        {
+            std::vector<std::uint8_t> mask(g.size(), 0);
+            for (int c : ghost->solidCells()) mask[std::size_t(c)] = 1;
+            auto m = DeviceBuffer<std::uint8_t>::make(g.size());
+            if (!m || m->upload(mask.data()) != hipSuccess)
+                return fail(6, "GPU allocation failed (--shock)");
+            shockSolid = std::move(*m);
+            ss.solid = shockSolid.data();
+        }
+        if (!dev->enableShock(ss)) return fail(6, "GPU allocation failed (--shock)");
+    }
 
     // --penalize: the band decay rides the stage hook (runs once per RK
     // stage, so each application carries dt/3; penDt is set per step below).
@@ -614,6 +641,8 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                     {"iter", "resid", "resU", "resE", "resT", "remaining"});
     // The frozen rotor's stop monitor, int (rho u_a - rho_inf U_a) dV.
     if (rotorSteady) cols.push_back("jet");
+    // --shock: appended LAST, so off stats are bytes.
+    if (shockOn) cols.insert(cols.end(), {"shockCells", "shockMax", "rhoMin", "pMin", "openMach"});
     if (auto e = out.declareSeries("stats", cols); !e)
         return fail(4, e.error());
     const int shaftAxis = rotorAxisIndex(r.rotor.axis);
@@ -682,6 +711,9 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
     internal::StatsCadence cad{r.statsEvery};
     double dtStab = 0.0;
     int sinceDt = 1 << 30;
+    bool shockHot = false;  // internal::shockDtEvery
+    double rowGuard = 0;    // internal::shockOpenRow, at the dt cadence
+    double shockPeak = 0;   // the most cells sensed on a stats row
     // Potential-correction wake source: EMA of F_drag/(rhoInf uInf), fed only
     // past the quiet-start ramp (the ramp's inertial force is not drag).
     internal::WakeEma wake{.tLast = r.ramp};
@@ -942,11 +974,17 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
         if (stopRequested()) break;
         // 1e-6: the compressible collapse threshold. NOT shared with the
         // channel's 1e-9 -- the dt scales differ.
+        const int dtEvery = internal::shockDtEvery(r.shockDtAuto, r.dtRecompute, sinceDt, shockHot, t,
+                                                   [&] { return dev->shockSense(*ds, *red); });
         if (auto e = internal::recomputeDt(
-                sinceDt, dtStab, r.dtRecompute, r.dtMargin, 1e-6,
-                [&] { return dev->stableDt(*ds, *red, r.cfl); });
+                sinceDt, dtStab, dtEvery, r.dtMargin, 1e-6,
+                [&] {
+                    if (r.shock == ShockMode::Hll) rowGuard = dev->shockRowGuard(*ds, *red);
+                    return dev->stableDt(*ds, *red, r.cfl);
+                });
             !e)
             return fail(7, e.error());
+        if (auto e = internal::shockOpenRow(rowGuard, t); !e) return std::unexpected(e.error());
         const double dt = std::min(r.tEnd - t, dtStab);
 
         // Advance the geometry to this step's azimuth, ONCE per step rather
@@ -1077,6 +1115,14 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                                       rx.ypMax, rx.ypMean, rx.hits};
                 out.row("stats", row);
             }
+            else if (shockOn)
+            {
+                const ShockRow sh = dev->shockRow(*ds, *red);
+                const double row[] = {t,     dt,        st.cd,   st.cl,   st.cs,      wmax,
+                                      F.heat, sh.cells, sh.top, sh.rhoMin, sh.pMin, sh.openMach};
+                out.row("stats", row);
+                shockPeak = std::max(shockPeak, sh.cells);
+            }
             else
             {
                 const double row[] = {t, dt, st.cd, st.cl, st.cs, wmax, F.heat};
@@ -1149,6 +1195,11 @@ runCompressible(const Grid& g, const CompState& ic, const Sdf& sdf,
                     "shaft momentum %+.6e, shaft moment %+.6e (fluid gain)\n",
                     swTotal[0], swTotal[1], swTotal[2]);
     if (auto e = writeSurface(); !e) return std::unexpected(e.error());
+    if (shockOn)
+    {
+        internal::shockReport(shockPeak, g.size());
+        std::printf("label: %s\n", r.label.c_str());
+    }
     finishTiming(st, wall0, out);
     return st;
 }

@@ -5,14 +5,29 @@
 # and ref/<last> (U, p, phi) and ref/residuals.csv (initial residuals per
 # iteration from log.simpleFoam). Host only, no OpenFOAM needed.
 #   tools/fv/make_test_data.sh runs/fv/if [CASE...]
+# nozzle_A nozzle_B nozzle_W nozzle_G (tools/fv/nozzle_cases.py ROOT A B W G, rhoCentralFoam, 80x16): the
+# mesh, 0/, bc.toml, ref/<last>/{p,T,U,rho}.
 set -euo pipefail
 root=$1
 shift
 cases=${*:-cavity cavity_skew channel duct cavity_lim mrf2}
 here=$(cd "$(dirname "$0")/../.." && pwd)
 for c in $cases; do
-    src=$root/$c
     dst=$here/tests/data/fv/$c
+    if [[ $c == nozzle_* ]]; then
+        src=$root/${c#nozzle_}
+        rm -rf "$dst"
+        mkdir -p "$dst/constant/polyMesh" "$dst/0"
+        cp "$src"/0/{p,T,U} "$dst/0/"
+        cp "$src"/bc.toml "$dst/"
+        cp "$src"/constant/polyMesh/{boundary,faces,neighbour,owner,points} "$dst/constant/polyMesh/"
+        last=$(ls -d "$src"/[0-9]* | xargs -n1 basename | sort -n | tail -1)
+        mkdir -p "$dst/ref/$last"
+        cp "$src/$last"/{p,T,U,rho} "$dst/ref/$last/"
+        echo "wrote $dst ($(du -sh "$dst" | cut -f1))"
+        continue
+    fi
+    src=$root/$c
     rm -rf "$dst"
     mkdir -p "$dst/constant/polyMesh" "$dst/system" "$dst/0" "$dst/ref"
     cp "$src"/0/U "$src"/0/p "$dst/0/"

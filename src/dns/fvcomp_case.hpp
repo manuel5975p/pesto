@@ -21,19 +21,21 @@ namespace dns {
 struct CompState;
 
 // rho, U, p, T of the freestream, along dir. pBurnt, tBurnt: what a `burnt`
-// Outflow reads (dns flame; unread otherwise).
+// Outflow reads (dns flame; unread otherwise). pRest: the pressure a nozzle's Total
+// row ramps from (fvBcOf at frac < 1; unread otherwise).
 struct FvFreestream
 {
     double rho = 1, U = 1, p = 1, T = 1, gamma = 1.4;
     std::array<double, 3> dir{1, 0, 0};
     double pBurnt = 1, tBurnt = 1;
+    double pRest = 0;
 };
 
 // A freestream of Mach M at unit rho and U: p = rho U^2 / (gamma M^2), T = p / (rho R).
 FvFreestream fvFreestreamOf(double mach, double gamma, double Rgas, std::array<double, 3> dir);
 
 // FvBc of one patch at ramp fraction frac in [0, 1] (the freestream velocity is
-// frac U; 1 = the converged table).
+// frac U; a Total row's p0 runs pRest + frac (p0 - pRest); 1 = the converged table).
 FvBc fvBcOf(const FvPatchSpec& p, const FvFreestream& f, double frac);
 
 // One FvBc per fm.patches entry, one tally flag per patch.

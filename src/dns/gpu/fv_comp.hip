@@ -360,6 +360,63 @@ __global__ void __launch_bounds__(kT) kFvGravity(View<R> m, R cr, const R* Gf, R
     }
 }
 
+// The sensor of the state P was formed from: fvShockSense, whole lines only.
+template <class R>
+__global__ void __launch_bounds__(kT) kFvShockSense(int nC, const int* lineStart, const int* line, const R* P, std::uint8_t* sb)
+{
+    const int c = int(blockIdx.x) * kT + int(threadIdx.x);
+    if (c >= nC) return;
+    const R pc = P[std::size_t(kPrim) * std::size_t(c) + 5];
+    R v = R(0.0);
+    for (int l = lineStart[c]; l < lineStart[c + 1]; ++l) {
+        const R jump = shockJump(P[std::size_t(kPrim) * std::size_t(line[2 * l]) + 5], pc, P[std::size_t(kPrim) * std::size_t(line[2 * l + 1]) + 5]);
+        v = jump > v || jump != jump ? jump : v; // a NaN sticks
+    }
+    sb[c] = shockByte(v);
+}
+
+// Test only: sigma 1 on every cell.
+__global__ void kFvShockForce(int nC, std::uint8_t* sb)
+{
+    const int c = int(blockIdx.x) * kT + int(threadIdx.x);
+    if (c >= nC) return;
+    sb[c] = 255;
+}
+
+// FvRef::shockFaces: F += |S| D + eps (1 - sigma) |u_f.S| D3, one write per face, so
+// conservation holds by construction. s: the state P was formed from.
+template <class R>
+__global__ void __launch_bounds__(kT) kFvShockFace(View<R> m, double gamma, R eps, const int* fLine, const std::uint8_t* sb,
+                                                   const R* s, const R* P, R* F)
+{
+    const int f = int(blockIdx.x) * kT + int(threadIdx.x);
+    if (f >= m.nI) return;
+    const FaceRow<R>& r = m.face[f];
+    const int pm = fLine[2 * f], np = fLine[2 * f + 1];
+    int sg = sb[r.own] > sb[r.nei] ? sb[r.own] : sb[r.nei];
+    if (pm >= 0 && sb[pm] > sg) sg = sb[pm];
+    if (np >= 0 && sb[np] > sg) sg = sb[np];
+    if (sg == 0 && eps == R(0.0)) return;
+    const FvPrim<R> A = primOf(P, r.own), B = primOf(P, r.nei);
+    const R sigma = R(sg) / R(255.0);
+    R* w = F + std::size_t(m.nV) * std::size_t(f);
+    if (sg > 0) {
+        R d[5];
+        fvShockFlux(sigma, A, B, r.S, gamma, d);
+#pragma unroll
+        for (int k = 0; k < 5; ++k) w[k] += d[k];
+    }
+    if (pm < 0 || np < 0 || sg == 255 || eps == R(0.0)) return;
+    const R l = fvD4Rate(eps, sigma, A, B, r.S);
+    const std::size_t nC = std::size_t(m.nC);
+#pragma unroll
+    for (int k = 0; k < 5; ++k) {
+        const std::size_t o = std::size_t(k) * nC;
+        const R a = l * fvD4Row(s[o + std::size_t(pm)], s[o + std::size_t(r.own)], s[o + std::size_t(r.nei)], s[o + std::size_t(np)]);
+        if (a != R(0.0)) w[k] += a; // a uniform row keeps F's bytes, -0.0 included
+    }
+}
+
 // Per-cell dt (FvRef::stableDt's bound); a non-positive or non-finite rho, p
 // writes -1. Les: mu_t adds at its own factor. Rans: 1 SA (its scalar's bound on
 // the first field), 2 SST; a non-finite mu_t writes -1.
@@ -1161,6 +1218,8 @@ struct DeviceFvComp::Impl
     virtual std::expected<std::vector<double>, std::string> eddyViscosity() = 0;
     virtual std::expected<DeviceFvComp::TflesStats, std::string> tflesStats() = 0;
     virtual std::expected<unsigned long long, std::string> floorHits() const = 0;
+    virtual std::expected<long, std::string> shockCells() = 0;
+    virtual std::expected<int, std::string> shockByteMax() = 0;
     virtual std::expected<void, std::string> cellFields(std::array<std::vector<double>, 7>&,
                                                         std::array<std::vector<double>, 12>&) = 0;
     virtual void boost(const std::array<double, 3>&) = 0;
@@ -1227,6 +1286,11 @@ struct FvCompImpl final : DeviceFvComp::Impl
     DeviceBuffer<R> fe, eof, omT, tfA, tfB, curl, uh, lapW, hc, coef;
     DeviceBuffer<int> walk;
     DeviceBuffer<std::uint8_t> edge;
+    // --shock: the sensor bytes, the mesh lines; shockFlux: the face pass runs (hll).
+    bool shockOn = false, shockFlux = false, shockForce = false;
+    R eps4 = R(0.0);
+    DeviceBuffer<std::uint8_t> sb;
+    DeviceBuffer<int> lineStart, line, fLine;
     mutable ReduceScratch red;
     Gas<R> gas{};
 
@@ -1287,13 +1351,28 @@ struct FvCompImpl final : DeviceFvComp::Impl
                                                                         nut.data(), F.data());
     }
 
-    void faces()
+    // s: the state P was formed from.
+    void faces(const R* s)
     {
         if (les || rans) facesAs<true, true>();
         else if (visc) facesAs<true, false>();
         else facesAs<false, false>();
+        if (shockFlux)
+            kFvShockFace<R><<<blocksOf(std::size_t(nI)), kT>>>(view(), gamma, eps4, fLine.data(), sb.data(), s, P.data(), F.data());
         if (hasG)
             kFvGravFace<R><<<blocksOf(std::size_t(nI)), kT>>>(view(), grav[0], grav[1], grav[2], P.data(), F.data(), Gf.data());
+    }
+
+    // The sensor bytes of state s (FvRef::shockSense): primitives, then the lines.
+    void shockUpdate(const R* s)
+    {
+        const unsigned nc = blocksOf(std::size_t(nC));
+        if (shockForce) {
+            kFvShockForce<<<nc, kT>>>(nC, sb.data());
+            return;
+        }
+        kFvPrim<R><<<nc, kT>>>(view(), s, P.data());
+        kFvShockSense<R><<<nc, kT>>>(nC, lineStart.data(), line.data(), P.data(), sb.data());
     }
 
     // The species passes before the mean-flow gradients: Y, omega, boundary Y.
@@ -1416,7 +1495,7 @@ struct FvCompImpl final : DeviceFvComp::Impl
         primsOf(b);
         if (sp.nY) speciesCells(b);
         gradsAndNut(b);
-        faces();
+        faces(b);
         if (sp.nY) speciesFaces();
     }
 
@@ -1443,6 +1522,7 @@ struct FvCompImpl final : DeviceFvComp::Impl
         const R cb1 = R(0.25), cb2 = R(2.0 / 3.0);
         const R dtR = R(dt);
         if (thick) tflesUpdate(q.data()); // F, E, Omega of the step's input state
+        if (shockOn) shockUpdate(q.data()); // the sensor of the step's input state
         if (compensated) {
             stagePair(q.data(), l.data(), q.data(), l.data(), q1.data(), l1.data(), R(0.0), dtR);
             stagePair(q.data(), l.data(), q1.data(), l1.data(), q2.data(), l2.data(), cb1, cb1 * dtR);
@@ -1509,6 +1589,7 @@ struct FvCompImpl final : DeviceFvComp::Impl
     std::expected<void, std::string> rhs(dns::FvState& out) override
     {
         if (thick) tflesUpdate(q.data());
+        if (shockOn) shockUpdate(q.data());
         stage(q.data(), q.data(), q1.data(), R(0.0), R(0.0), R(1.0), true);
         if (auto c = check("rhs"); !c) return c;
         out.nV = nState;
@@ -1573,6 +1654,11 @@ struct FvCompImpl final : DeviceFvComp::Impl
         }
         if (les)
             if (auto r = fetch(nut, ev.nut, "eddy viscosity"); !r) return r;
+        ev.sigma.clear();
+        if (shockOn) {
+            ev.sigma.resize(n);
+            if (const hipError_t e = sb.download(ev.sigma.data()); e != hipSuccess) return std::unexpected(hipErr("sensor", e));
+        }
         if (thick) {
             if (auto r = fetch(fe, ev.fe, "TFLES F E"); !r) return r;
             if (auto r = fetch(eof, ev.eof, "TFLES E/F"); !r) return r;
@@ -1655,6 +1741,7 @@ struct FvCompImpl final : DeviceFvComp::Impl
 
     std::expected<std::vector<double>, std::string> patchFlux(int row) override
     {
+        if (shockOn) shockUpdate(q.data());
         rhsPasses(q.data());
         if (auto c = check("patch flux"); !c) return std::unexpected(c.error());
         std::vector<double> t, o(bcHost.size(), 0.0);
@@ -1748,6 +1835,32 @@ struct FvCompImpl final : DeviceFvComp::Impl
         }
         s.area = tallyArea;
         return s;
+    }
+
+    // The bytes of the current state, host copy.
+    std::expected<std::vector<std::uint8_t>, std::string> shockBytes()
+    {
+        if (!shockOn) return std::unexpected("FV sensor: no --shock");
+        shockUpdate(q.data());
+        if (auto c = check("sensor"); !c) return std::unexpected(c.error());
+        std::vector<std::uint8_t> b;
+        b.resize(std::size_t(nC));
+        if (const hipError_t e = sb.download(b.data()); e != hipSuccess) return std::unexpected(hipErr("sensor", e));
+        return b;
+    }
+
+    std::expected<long, std::string> shockCells() override
+    {
+        auto b = shockBytes();
+        if (!b) return std::unexpected(b.error());
+        return long(std::ranges::count_if(*b, [](std::uint8_t v) { return v != 0; }));
+    }
+
+    std::expected<int, std::string> shockByteMax() override
+    {
+        auto b = shockBytes();
+        if (!b) return std::unexpected(b.error());
+        return int(*std::ranges::max_element(*b));
     }
 
     std::expected<std::vector<double>, std::string> eddyViscosity() override
@@ -1876,7 +1989,8 @@ struct FvCompImpl final : DeviceFvComp::Impl
     {
         std::size_t s = face.size() * sizeof(FaceRow<R>) + bnd.size() * sizeof(BndRow<R>) +
                         bcs.size() * sizeof(FvBc) + gEnt.size() * sizeof(GradEnt<R>) +
-                        (cStart.size() + gFace.size() + tallyList.size()) * sizeof(int);
+                        (cStart.size() + gFace.size() + tallyList.size() + lineStart.size() + line.size() + fLine.size()) * sizeof(int) +
+                        sb.size();
         for (const auto* b : {&Vd, &diffC, &cd, &entS, &q, &q1, &q2, &l, &l1, &l2, &P, &B, &G, &F, &Gf, &nut, &dtc, &tally, &Y,
                               &Yb, &GY, &om, &dw, &Ph, &Bh, &Gh, &f1, &Sr, &Ft, &lts, &fe, &eof, &omT, &tfA, &tfB, &curl, &uh,
                               &lapW, &hc, &coef})
@@ -1912,7 +2026,8 @@ std::expected<std::unique_ptr<DeviceFvComp::Impl>, std::string> makeImpl(const F
                       .bodyForce = cfg.bodyForce,
                       .les = {.cs = cfg.csLes, .sgs = cfg.sgs, .prt = cfg.prt},
                       .tfles = cfg.tfles,
-                      .turb = cfg.turb};
+                      .turb = cfg.turb,
+                      .shock = cfg.shock};
     // The model pairs (dns/fvmodules): FvRef::make refuses each by name.
     auto ref = FvRef::make(fm, rc, threads);
     if (!ref) return std::unexpected(std::move(ref.error()));
@@ -1980,6 +2095,10 @@ std::expected<std::unique_ptr<DeviceFvComp::Impl>, std::string> makeImpl(const F
     I.ransOnly = cfg.rans.transportOnly;
     I.nT = ransScalars(cfg.rans.model);
     I.nState = I.nV + I.nT;
+    I.shockOn = cfg.shock.mode != ShockMode::None;
+    I.shockFlux = cfg.shock.mode == ShockMode::Hll;
+    I.shockForce = cfg.shock.force;
+    I.eps4 = R(cfg.shock.eps4);
     I.phiInf[0] = R(cfg.rans.phiInf[0]);
     I.phiInf[1] = R(cfg.rans.phiInf[1]);
     I.omegaFloor = R(cfg.rans.omegaFloor);
@@ -2054,9 +2173,10 @@ std::expected<std::unique_ptr<DeviceFvComp::Impl>, std::string> makeImpl(const F
             GradEnt<R> e;
             e.other = internal ? (own ? fm.nei[f] : fm.own[f]) : ~compact[f - nIs];
             const auto& w = own ? gw.own : gw.nei;
+            const bool side = !internal && cfg.bc[std::size_t(ref->bcOf()[f - nIs])].wedge; // out of the dt sum
             for (std::size_t k = 0; k < 3; ++k) {
                 e.w[k] = R(w[k][f]);
-                entS.push_back(R(fm.S[k][f]));
+                entS.push_back(side ? R(0.0) : R(fm.S[k][f]));
             }
             ents.push_back(e);
         }
@@ -2168,6 +2288,13 @@ std::expected<std::unique_ptr<DeviceFvComp::Impl>, std::string> makeImpl(const F
         take(I.hc, uploaded(hcv, "TFLES h"));
         take(I.coef, uploaded(cov, "TFLES Colin"));
     }
+    if (I.shockOn) {
+        const FvShockLines& sl = ref->shockLines();
+        take(I.sb, sized<std::uint8_t>(nCs, "sensor"));
+        take(I.lineStart, uploaded(sl.lineStart, "sensor lines"));
+        take(I.line, uploaded(sl.line, "sensor lines"));
+        take(I.fLine, uploaded(sl.faceLine, "sensor lines"));
+    }
     if (err) return std::unexpected(std::move(*err));
     // A uniform sensor without the efficiency is constant: formed here, once.
     if (I.thick && cfg.tfles->uniform && !cfg.tfles->charlette)
@@ -2212,6 +2339,8 @@ std::expected<FvSurface, std::string> DeviceFvComp::surface() { return p_->surfa
 std::expected<std::vector<double>, std::string> DeviceFvComp::eddyViscosity() { return p_->eddyViscosity(); }
 std::expected<DeviceFvComp::TflesStats, std::string> DeviceFvComp::tflesStats() { return p_->tflesStats(); }
 std::expected<unsigned long long, std::string> DeviceFvComp::floorHits() const { return p_->floorHits(); }
+std::expected<long, std::string> DeviceFvComp::shockCells() { return p_->shockCells(); }
+std::expected<int, std::string> DeviceFvComp::shockByteMax() { return p_->shockByteMax(); }
 std::expected<void, std::string> DeviceFvComp::cellFields(std::array<std::vector<double>, 7>& prim,
                                                           std::array<std::vector<double>, 12>& grad)
 {

@@ -539,6 +539,106 @@ void compensated()
 
 } // namespace
 
+// S1 (G11): the shock passes, double instantiation vs FvRef on the nozzle B, the wedge and a
+// 30 deg sheared box, a pressure step on each so the sensor fires; rerun memcmp.
+void shockOracle()
+{
+    std::printf("S1 --shock hll vs FvRef, every pass, sensed\n");
+    namespace fs = std::filesystem;
+    const fs::path data = fs::path(DNS_MESH_DATA) / ".." / "fv";
+    struct C
+    {
+        std::string name;
+        FaceMesh fm;
+    };
+    std::vector<C> cs;
+    for (const char* n : {"nozzle_B", "nozzle_W"}) {
+        const PolyMesh pm = orDie(readPolyMesh(data / n / "constant/polyMesh"), n);
+        cs.push_back({n, orDie(FaceMesh::fromPolyMesh(pm, CellOrder::Morton, 0, {.wedge = true}), n)});
+    }
+    {
+        const Grid g = Grid::make(48, 24, 1, 1.0, 0.5, 0.1);
+        const StructuredSpec sp{.lo = {0, 0, 0},
+                                .hi = {47, 23, 0},
+                                .name = {"inlet", "outlet", "wall", "axis", "back", "front"},
+                                .type = {FoamPatchType::Patch, FoamPatchType::Patch, FoamPatchType::Wall, FoamPatchType::Wall,
+                                         FoamPatchType::Empty, FoamPatchType::Empty}};
+        PolyMesh pm = orDie(FaceMesh::polyOf(CurvMesh::uniform(g), sp), "shear");
+        for (std::size_t i = 0; i < pm.px.size(); ++i) pm.px[i] += pm.py[i] * std::tan(30.0 * std::numbers::pi / 180);
+        cs.push_back({"shear box 30 deg", orDie(FaceMesh::fromPolyMesh(pm, CellOrder::Morton), "shear")});
+    }
+    for (const C& k : cs) {
+        const FaceMesh& fm = k.fm;
+        const Transport tr = Transport::air(1e-3, 1.0, 0.0, 0.72, kGamma, 1.0, false);
+        std::vector<FvBc> bc;
+        for (const MeshPatch& p : fm.patches) {
+            FvBc b;
+            b.kind = FvBcKind::Slip;
+            if (p.type == FoamPatchType::Empty) b.kind = FvBcKind::Empty;
+            if (p.type == FoamPatchType::Wedge) b.wedge = true;
+            if (p.name == "inlet") {
+                b.kind = FvBcKind::Total;
+                b.pTotal = 2.0;
+                b.tTotal = 2.0;
+            }
+            if (p.name == "outlet") {
+                b.kind = FvBcKind::Outflow;
+                b.exit = p.name == "outlet" && k.name == "nozzle_B" ? FvExit::Riemann : FvExit::Fixed;
+                b.pOut = 0.5;
+                b.tBack = 1.0;
+            }
+            if (p.name == "wall") b.kind = FvBcKind::Wall;
+            bc.push_back(b);
+        }
+        FvState s = FvState::zeros(fm.nC);
+        const double xm = 0.5 * (*std::ranges::max_element(fm.C[0]) + *std::ranges::min_element(fm.C[0]));
+        for (std::size_t c = 0; c < std::size_t(fm.nC); ++c) {
+            const bool hi = fm.C[0][c] + 0.3 * fm.C[1][c] > xm;
+            const double p = hi ? 1.0 : 2.5, rho = hi ? 1.0 : 1.8, u = hi ? 0.1 : 0.5;
+            s.var(0)[c] = rho;
+            s.var(1)[c] = rho * u;
+            s.var(4)[c] = p / (kGamma - 1.0) + 0.5 * rho * u * u;
+        }
+        FvConfig rc{.tr = tr, .bc = bc};
+        rc.shock = {.mode = ShockMode::Hll, .eps4 = kFvShockEps4};
+        const FvRef ref = orDie(FvRef::make(fm, rc), k.name);
+        FvEval ev, dv;
+        FvState rR, rD;
+        ref.evaluate(s, ev, rR);
+        const FvCompConfig dc{.tr = tr, .bc = bc, .precision = FvPrecision::Fp64, .shock = rc.shock};
+        auto d = orDie(DeviceFvComp::make(fm, dc), k.name);
+        orDie(d.upload(s), k.name);
+        orDie(d.evaluate(dv, rD), k.name);
+        const long sensed = std::ranges::count_if(ev.sigma, [](std::uint8_t b) { return b != 0; });
+        double eF = 0.0;
+        for (std::size_t r = 0; r < 5; ++r) {
+            double e = 0.0, sc = 0.0;
+            for (std::size_t f = 0; f < ev.F[r].size(); ++f) {
+                e = std::max(e, std::abs(ev.F[r][f] - dv.F[r][f]));
+                sc = std::max(sc, std::abs(ev.F[r][f]));
+            }
+            eF = std::max(eF, sc == 0 ? e : e / sc);
+        }
+        const double eR = relDiff(rD.q, rR.q, 5, fm.nC);
+        const double dtR = orDie(ref.stableDt(s, {.cfl = 0.4}), "dt"), dtD = orDie(d.stableDt({.cfl = 0.4}), "dt");
+        FvState sR = s, sD, sD2;
+        ref.march(sR, dtR, 3);
+        for (int i = 0; i < 3; ++i) d.step(dtR);
+        orDie(d.download(sD), k.name);
+        const double eM = relDiff(sD.q, sR.q, 5, fm.nC);
+        auto d2 = orDie(DeviceFvComp::make(fm, dc), k.name);
+        orDie(d2.upload(s), k.name);
+        for (int i = 0; i < 3; ++i) d2.step(dtR);
+        orDie(d2.download(sD2), k.name);
+        std::printf("  %s: %ld sensed; rhs %.2e, fluxes %.2e, dt %.2e, 3 steps %.2e\n", k.name.c_str(), sensed, eR, eF, std::abs(dtD / dtR - 1), eM);
+        check(sensed > 0, "sensed > 0 (a live gate)");
+        check(ev.sigma == dv.sigma, "sensor bytes equal");
+        check(eR <= 1e-13 && eF <= 1e-13 && eM <= 1e-13, "every pass <= 1e-13");
+        check(std::abs(dtD / dtR - 1) <= 1e-13, "stableDt <= 1e-13");
+        check(std::memcmp(sD.q.data(), sD2.q.data(), sD.q.size() * sizeof(double)) == 0, "rerun memcmp");
+    }
+}
+
 int main()
 {
     dns::test::requireDeviceOrSkip();
@@ -552,5 +652,6 @@ int main()
     les();
     tally();
     compensated();
+    shockOracle();
     return dnstest::finish();
 }

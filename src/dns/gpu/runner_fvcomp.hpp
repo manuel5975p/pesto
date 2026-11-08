@@ -8,6 +8,7 @@
 #include "dns/facemesh.hpp"
 #include "dns/fvcomp_case.hpp"
 #include "dns/fvflame.hpp"
+#include "dns/fvnozzle.hpp"
 #include "dns/fvraster.hpp"
 #include "dns/gpu/fv_comp.hpp"
 #include "dns/gpu/run_result.hpp"
@@ -65,6 +66,14 @@ struct FvCompRun
     const TurbSweep* turbSweep = nullptr;
     const FvPatchSpec* turbPatch = nullptr;
     int turbFirst = 0;
+    // A nozzle on a Total inlet (docs/nozzle.md): the ramp raises the Total row's p0, no
+    // boost; the stats append mdotIn mdotOut Fwall Fin Fexit Cd Cf. Empty: off.
+    std::optional<FvNozzleRun> nozzle{};
+    // --shock hll: the sticky dt cadence (internal::shockDtEvery), unless --dt-recompute.
+    bool shockDtAuto = false;
+    // > 0: --foam-write, PREFIX_foam/<t>/{p,T,U,rho} every foamWrite, source cell order.
+    double foamWrite = 0;
+    std::string foamPrefix{};
 };
 
 // Pre: ic sized for fm; out made on raster.grid(); ckpt active only with ramp 0

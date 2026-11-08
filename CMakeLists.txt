@@ -80,6 +80,8 @@ add_library(dns_core
     src/dns/fvimodules.cpp
     src/dns/fvraster.cpp
     src/dns/fvref.cpp
+    src/dns/fvshock.cpp
+    src/dns/fvnozzle.cpp
     src/dns/cutcell.cpp
     src/dns/diagnostics.cpp
     src/dns/facemesh.cpp
@@ -231,6 +233,7 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/runner_lowmach.hip
     src/dns/gpu/runner_periodic.hip
     src/dns/gpu/runner_wick.hip
+    src/dns/gpu/shock.hip
     src/dns/gpu/species.hip
     src/dns/gpu/tfles.hip
     src/dns/gpu/timestepper.hip
@@ -554,6 +557,21 @@ if(BUILD_TESTING)
     # march (3 nested meshes, threaded) on its own so ctest runs them apart.
     add_test(NAME fvref_mms COMMAND test_fvref mms)
     set_tests_properties(fvref_mms PROPERTIES TIMEOUT 300)
+    # The nozzle's host gates (docs/nozzle.md): rows, wedge, T1 residual, hoop bound; test_fvshock
+    # the sensor's mesh lines.
+    foreach(m total exit bits wedge wedgew t1r hoop)
+        add_test(NAME fvref_${m} COMMAND test_fvref ${m})
+        set_tests_properties(fvref_${m} PROPERTIES TIMEOUT 300 LABELS "nozzle;fast")
+    endforeach()
+    add_executable(test_fvshock tests/test_fvshock.cpp)
+    target_link_libraries(test_fvshock PRIVATE dns_core)
+    target_compile_definitions(test_fvshock PRIVATE DNS_MESH_DATA="${DNS_MESH_DATA}")
+    add_test(NAME fvshock COMMAND test_fvshock)
+    set_tests_properties(fvshock PROPERTIES TIMEOUT 120 LABELS "nozzle;fast")
+    add_test(NAME shockflux_fv COMMAND test_shockflux fv)
+    set_tests_properties(shockflux_fv PROPERTIES TIMEOUT 120 LABELS "nozzle;fast")
+    add_test(NAME facemesh_wedge COMMAND test_facemesh wedge)
+    set_tests_properties(facemesh_wedge PROPERTIES TIMEOUT 120 LABELS "nozzle;fast")
     # AMG setup gate (docs/la.md, masterplan_meshsolver P5 "Setup"): the host
     # hierarchy of a 6M-cell 7-point graph <= 3 s, two setups identical.
     add_test(NAME amg_setup COMMAND test_amg setup)
@@ -588,8 +606,23 @@ if(BUILD_TESTING)
     set_tests_properties(cli_defaults comp_axis_permute blockband channel_line
                          pseudo_time PROPERTIES TIMEOUT 60)
 
+    # --shock's host ladder (masterplan_shockflux gates 1-8, docs/shock.md): the
+    # 1D marcher on dns/shockflux.hpp. Threads for the Shu-Osher reference.
+    add_executable(test_shockflux tests/test_shockflux.cpp)
+    target_link_libraries(test_shockflux PRIVATE dns_core)
+    foreach(m unit riemann shuosher nozzle weak contact species wall)
+        add_test(NAME shockflux_${m} COMMAND test_shockflux ${m})
+        set_tests_properties(shockflux_${m} PROPERTIES TIMEOUT 120 LABELS "shock;fast")
+    endforeach()
+
     # The exit-code contract, driven through the real binary. GPU-free: every
     # case is reachable in phases 1-3a.
+    # G26: the nozzle route's refusals, verbatim, through the binary (docs/nozzle.md).
+    add_executable(test_nozzle_cli tests/test_nozzle_cli.cpp)
+    target_compile_definitions(test_nozzle_cli PRIVATE DNS_BIN="$<TARGET_FILE:dns>" DNS_MESH_DATA="${DNS_MESH_DATA}")
+    add_dependencies(test_nozzle_cli dns)
+    add_test(NAME nozzle_cli COMMAND test_nozzle_cli)
+    set_tests_properties(nozzle_cli PROPERTIES TIMEOUT 120 LABELS "nozzle;fast")
     add_executable(test_errors tests/test_errors.cpp)
     target_link_libraries(test_errors PRIVATE dns_core)
     target_compile_definitions(test_errors PRIVATE DNS_BIN="$<TARGET_FILE:dns>"
@@ -780,6 +813,15 @@ if(BUILD_TESTING)
         add_test(NAME gpu_fv_rans_channel COMMAND test_gpu_fv_rans channel)
         set_tests_properties(gpu_fv_rans PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
         set_tests_properties(gpu_fv_rans_channel PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 280)
+        # The nozzle (docs/nozzle.md): T1 vs rhoCentralFoam, the wedge, the exit rows, the anchors.
+        add_executable(test_gpu_fv_nozzle tests/test_gpu_fv_nozzle.cpp)
+        target_link_libraries(test_gpu_fv_nozzle PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_fv_nozzle PRIVATE DNS_MESH_DATA="${DNS_MESH_DATA}" DNS_BIN="$<TARGET_FILE:dns>")
+        add_dependencies(test_gpu_fv_nozzle dns)
+        foreach(m fixed wedge reflect dt source silent exit sauer cdladder fp32 sense gamma)
+            add_test(NAME gpu_fv_nozzle_${m} COMMAND test_gpu_fv_nozzle ${m})
+            set_tests_properties(gpu_fv_nozzle_${m} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 LABELS "nozzle")
+        endforeach()
         add_executable(test_gpu_fv_cross tests/test_gpu_fv_cross.cpp)
         target_link_libraries(test_gpu_fv_cross PRIVATE dns_gpu)
         target_compile_definitions(test_gpu_fv_cross PRIVATE DNS_BIN="$<TARGET_FILE:dns>"
@@ -904,6 +946,30 @@ if(BUILD_TESTING)
         target_compile_definitions(test_gpu_la_ref PRIVATE DNS_MESH_DATA="${DNS_MESH_DATA}")
         add_test(NAME gpu_la_ref COMMAND test_gpu_la_ref)
         set_tests_properties(gpu_la_ref PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+        # --shock on the device (masterplan_shockflux): through the built binary.
+        add_executable(test_gpu_shock tests/test_gpu_shock.hip)
+        if(DNS_WITH_CUDA)
+            set_source_files_properties(tests/test_gpu_shock.hip PROPERTIES LANGUAGE CUDA)
+        endif()
+        target_link_libraries(test_gpu_shock PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_shock PRIVATE DNS_BIN="$<TARGET_FILE:dns>"
+                                   DNS_TEST_DIR="${CMAKE_CURRENT_BINARY_DIR}/shock_tmp")
+        add_dependencies(test_gpu_shock dns)
+        foreach(m sense sensor riemann shuosher aligned vortex contact conservation extrude ghost open
+                  uniformy flame quiet lip cadence restart nozzle oblique 3d chamber choked guard)
+            add_test(NAME gpu_shock_${m} COMMAND test_gpu_shock ${m})
+            set_tests_properties(gpu_shock_${m} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 LABELS shock)
+        endforeach()
+        foreach(m bytes pass nozzle shock contact)
+            add_test(NAME gpu_outflow_${m} COMMAND test_gpu_shock outflow_${m})
+            set_tests_properties(gpu_outflow_${m} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300 LABELS shock)
+        endforeach()
+        # The ghost-wall tests again with --shock installed (gate 24): unchanged.
+        foreach(t closure imperm twoside)
+            add_test(NAME gpu_shock_ghost_${t} COMMAND test_gpu_comp_ghost_${t})
+            set_tests_properties(gpu_shock_ghost_${t} PROPERTIES ENVIRONMENT DNS_TEST_SHOCK=1
+                                 SKIP_RETURN_CODE 77 TIMEOUT 120 LABELS shock)
+        endforeach()
         # The RANS / LES / MRF tier caps at 180 s (the val tier keeps its own).
         set_tests_properties(gpu_tgv gpu_comp_les gpu_les_smag gpu_rotor_wall
             gpu_rotor_table gpu_mrf gpu_channel PROPERTIES TIMEOUT 180)

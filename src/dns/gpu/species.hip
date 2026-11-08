@@ -82,22 +82,6 @@ __global__ void kChemCellPass2Soot(GpuGrid g, int nY, const Real* rho,
         arrheniusRate2(sr.lnAox, sr.Taox, r, Y[sr.soot][c], Y[ox][c], t);
 }
 
-// Wrap-aware offsets from cell (i,j,k) to its SECOND neighbours along each
-// axis (p = +2, m = -2); a degenerate axis (n == 1) gives 0, the self-wrap.
-// Pre: n >= 3 on every non-degenerate axis.
-__device__ inline Offsets offsets2At(const GpuGrid& g, int i, int j, int k)
-{
-    const int q[3] = {i, j, k}, n[3] = {g.nx, g.ny, g.nz};
-    const std::ptrdiff_t s[3] = {1, g.nx, std::ptrdiff_t(g.nx) * g.ny};
-    Offsets o;
-    for (int a = 0; a < 3; ++a) {
-        const int up = (q[a] + 2) % n[a], dn = ((q[a] - 2) % n[a] + n[a]) % n[a];
-        o.p[a] = std::ptrdiff_t(up - q[a]) * s[a];
-        o.m[a] = std::ptrdiff_t(dn - q[a]) * s[a];
-    }
-    return o;
-}
-
 // The face formula (Face, mcSlope, the shared limiter, faceY2) lives in
 // gpu/internal/species_face.hpp, read by the low-Mach solver too (D7).
 using internal::Face;

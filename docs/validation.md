@@ -434,6 +434,54 @@ FP32 max to 1e-14. Step cost on the 128³ sphere, Re 1e4, NSCBC, `--ft 0.05`,
 in ms/step: DNS 4.24, smag 0.17 4.74, σ 1.35 4.93, focal ratio 2 smag 6.06,
 focal ratio 2 σ 6.22 (targets ≤ 4.5 / ≤ 4.8 missed: issues.md 26).
 
+### Shock capture (`ctest -L shock`, `docs/shock.md`)
+
+One run on one binary: dns sha256 ada26623d6fa621a, 37 of 39 pass, the 13 byte rows
+equal the base binary. DNS, FP32 device, `--shock hll` unless named.
+
+| gate | test | device number |
+|---|---|---|
+| Riemann | `gpu_shock_riemann`, `shockflux_riemann` | L1 rho N 400: Sod 3.89e-3, Lax 1.45e-2, 123 7.35e-3, blast 9.27e-2, M3 1.10e-2; device vs host 2e-7 to 6e-5, at the host's own FP32 distance |
+| Shu-Osher | `gpu_shock_shuosher` | L1 rho N 200, 400, 800: 0.109, 0.096, 0.047 |
+| aligned | `gpu_shock_aligned` | Quirk Ms 6 v_max/S 1.187e-5, spread 0; standing M 5 7.9e-5 |
+| vortex | `gpu_shock_vortex` | N 80 ratio to KG 1.224, 0 cells sensed from N 160, order 1.995 |
+| contact | `gpu_shock_contact` | M 1 peak 0.225, M 3 0.593 |
+| conservation | `gpu_shock_conservation` | twin mass 9.1e-8, E 1.6e-7; ratio to control LES 0.89, 0.48, plain 0.76, 0.51 |
+| wall | `gpu_shock_ghost` | 6 cases, 0 unsensed crossings, `fc` exactly 0; 0 deg plateau -4.3e-4 to -2.9e-3 |
+| open row | `gpu_shock_open` | rows bitwise against off; blast exit Mach 0.616 |
+| uniform Y | `gpu_shock_uniformy` | no block 0 mismatches; block 154631 against control 131216, max 9.76e-7, control 9.65e-7 (S10, open) |
+| flame | `gpu_shock_flame` | 0 cells at 4, 6 cells; teeth -93.4% |
+| quiet | `gpu_shock_quiet` | `hll` bytes = `none`, default flags, sigma 5, 10, `comp` |
+| lip | `gpu_shock_lip` | Me 0.929%, pCh/pAmb 0.290%, burn/inj 0.040%, pCh rms 7.74%, frequency 0.039%; 2 cells, sigma 0.305 |
+| nozzle | `gpu_shock_nozzle` | shock +0.73, +0.40 cells, N 200, 400; L1 p 2.50e-3, 1.49e-3; Mpk 2.991 |
+| oblique | `gpu_shock_oblique` | M 3 p2 -1.05e-3, overshoot 0.022; M 5 -8.53e-3, 0.037 |
+| 3D | `gpu_shock_3d` | blast and diagonal Sod, cfl 0.4, 0.5, stable |
+| chamber | `gpu_shock_chamber` | exit 0, budget -9.4e-4; burning 50, past the window 16: UNMET |
+| choked | `gpu_shock_choked` | inject 16, tt 34: 5.13 flame times, budget -7.6e-4, exit 0; burning 51: UNMET |
+| guard | `gpu_shock_guard` | exit 7 on all four rows, the exact string |
+| outflow | `gpu_outflow_{bytes,pass,nozzle,shock,contact}` | `docs/shock.md` "The outflow" |
+
+### Nozzle (`ctest -L nozzle`, `docs/nozzle.md`)
+
+Device, FP64 unless named, gfx1100. `gpu_fv_nozzle_MODE`, `fvref_MODE`. Foam is rhoCentralFoam v2606 through simjob.
+
+| gate | test | number |
+|---|---|---|
+| T1 residual | `fvref_t1r` | FvRef force at foam's field: A 5.2e-15, B 5.9e-15, W 1.2e-14; KG control 0.077, 0.115, 0.085 |
+| T1 run | `gpu_fv_nozzle_fixed`, `_wedge` | every cell vs foam: A 1.2e-14, B 3.4e-13, W 1.5e-14; mdot vs foam 6.9e-15, 2.2e-16, 2.0e-15; 67951 steps |
+| rows | `fvref_total`, `_exit`, `_bits` | Total 1.8e-16; exit vs exact sampler 2.9e-15; 80000 unset rows the shipped bytes |
+| wedge | `fvref_wedge`, `_wedgew`, `facemesh_wedge` | 5 vs 20 deg 7.0e-15, cos form 1.3e-2; w 0.0 after 1000 viscous steps, FP32 and FP64 |
+| dt | `gpu_fv_nozzle_dt` | sides out / in 11.99, same fixed point 8.7e-14 |
+| hoop | `fvref_hoop` | lambda dt / 2: 0.37 uniform, 0.58 tanh; no side term 1.21 to 1.26 |
+| source | `gpu_fv_nozzle_source` | L1 p 4.97e-4, 1.28e-4, 3.25e-5, order 1.98; wall 2.36e-5, sawtooth 7.2e-6; eps 0 order 1.00 |
+| sensor | `fvshock`, `gpu_fv_nozzle_silent` | periodic bytes = structured; `nc-smooth` 200x40 0 sensed; a1 100x20 0 vs 15 under the centre rule |
+| reflection | `gpu_fv_nozzle_reflect` | plateau -2.17e-3, 2.98e-4, -1.37e-3 at Ms 2, 3, 6; 30 deg wall 78 faces, 0 unsensed |
+| exit | `gpu_fv_nozzle_exit` | rest M 3.334, characteristic 0.797; p_e/p0 0.5001, extrapolate 0.0162; G-std 1.093, bare 1.166 |
+| Sauer | `gpu_fv_nozzle_sauer` | dM/dx -2.34%, sonic x -1.20%, Cd 0.999897 vs 0.999933 |
+| Cd ladder | `gpu_fv_nozzle_cdladder` | Richardson 0.02426, -3.0% of (g + 1)/96; budget 4e-6, mdot 9e-6 |
+| FP32 | `gpu_fv_nozzle_fp32` | compensated x_s 0.000 cells, mdot 1e-8; plain 2.0e-5 |
+| matrix | `gpu_fv_comp`, `gpu_fv_cross` X6, `gpu_fv_matrix` | FV64 vs FvRef 3e-15; FV32 vs structured 1.85e-6 (own 1.64e-6), bytes 0 off |
+
 ## Tolerance adjustments vs the original plan
 
 Recorded per the rule "widen only with written justification":

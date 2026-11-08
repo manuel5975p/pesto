@@ -209,7 +209,8 @@ FvCompConfig devOf(const FvConfig& c, FvPrecision pr, bool comp = false)
             .bodyForce = c.bodyForce,
             .gravity = c.gravity,
             .ambient = c.ambient,
-            .turb = c.turb};
+            .turb = c.turb,
+            .shock = c.shock};
 }
 
 bool sameBytes(const std::vector<double>& a, const std::vector<double>& b)
@@ -624,6 +625,49 @@ void tiedSensor(const std::vector<MeshCase>& ms)
     }
 }
 
+// G13: a silent, uniform field through the shock passes is the stage's bytes: rest and a
+// uniform flow on the closed-free periodic box, FP32, compensated, FP64; every byte 0, D3 exactly 0.
+void shockInert(const std::vector<MeshCase>& ms)
+{
+    std::printf("Shock: the rhs of rest and of a uniform flow bitwise, FP32, compensated, FP64\n");
+    const MeshCase& m = ms.front();
+    const FaceMesh& fm = m.fm[1];
+    const FvState rest = [&] {
+        FvState s = FvState::zeros(fm.nC);
+        for (int c = 0; c < fm.nC; ++c) {
+            s.var(0)[c] = 1.0;
+            s.var(4)[c] = 3.0;
+        }
+        return s;
+    }();
+    FvState flow = rest;
+    for (int c = 0; c < fm.nC; ++c) {
+        // Values on which the ungrouped D3 row rounds, FP32 and FP64: the grouping's teeth.
+        flow.var(1)[c] = 0.295;
+        flow.var(2)[c] = -0.149;
+        flow.var(3)[c] = 0.168;
+        flow.var(4)[c] = 3.0 + 0.5 * (0.295 * 0.295 + 0.149 * 0.149 + 0.168 * 0.168);
+    }
+    for (const auto& [pr, comp, tag] : {std::tuple{FvPrecision::Fp32, false, "FP32"}, std::tuple{FvPrecision::Fp32, true, "compensated"},
+                                        std::tuple{FvPrecision::Fp64, false, "FP64"}}) {
+        for (const FvState* s0 : std::array<const FvState*, 2>{&rest, &flow}) {
+            FvConfig on = fvm::matrixConfig(fvModuleSet({FvModule::Shock}), fm, m.closed[1], m.tr), off = on;
+            off.shock = {};
+            const bool periodicBox = std::ranges::all_of(m.closed[1], [](const FvBc& b) { return b.kind == FvBcKind::Empty; }) || m.closed[1].empty();
+            if (!periodicBox) continue;
+            auto a = orDie(DeviceFvComp::make(fm, devOf(on, pr, comp)), "on"), b = orDie(DeviceFvComp::make(fm, devOf(off, pr, comp)), "off");
+            orDie(a.upload(*s0), "on");
+            orDie(b.upload(*s0), "off");
+            // The rhs: past the first stage the rounding of Sum S (FP64 ~1e-16) is a field D3 may act on.
+            FvState x, y;
+            orDie(a.rhs(x), "on");
+            orDie(b.rhs(y), "off");
+            check(orDie(a.shockCells(), "cells") == 0 && x.q.size() == y.q.size() && std::memcmp(x.q.data(), y.q.data(), x.q.size() * sizeof(double)) == 0,
+                  std::format("{} {}: bytes equal off", tag, s0 == &rest ? "rest" : "uniform flow"));
+        }
+    }
+}
+
 void matrix(bool markdown)
 {
     const auto t0 = std::chrono::steady_clock::now();
@@ -644,6 +688,7 @@ void matrix(bool markdown)
     const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::printf("  %zu live cells, %.1f s\n", rows.size(), sec);
     tiedSensor(ms);
+    shockInert(ms);
     if (!markdown) return;
     std::printf("%s", fvCombinationsMarkdown().c_str());
     std::printf("\n<!-- generated: test_gpu_fv_matrix markdown (tests/test_gpu_fv_matrix.cpp) -->\n");

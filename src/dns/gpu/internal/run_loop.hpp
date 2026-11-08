@@ -215,6 +215,43 @@ recomputeDt(int& sinceDt, double& dtStab, int recomputeEvery, double margin,
     return {};
 }
 
+// The dt cadence under --shock hll: the route's default until a cell is sensed,
+// then every step for the rest of the run (hot is sticky). A silent sensor keeps
+// default dt, so `hll` == `none` byte for byte; a sharp IC is hot from step 0.
+// sense: cells sensed on the state dt is about to read. Pre: autoOn only when
+// --dt-recompute was not given. `every` as recomputeDt's recomputeEvery.
+template <class SenseFn>
+int shockDtEvery(bool autoOn, int every, int sinceDt, bool& hot, double t, SenseFn&& sense)
+{
+    if (autoOn && !hot && sinceDt + 1 >= every && sense() > 0) {
+        hot = true;
+        std::printf("shock: hot at t=%.6g: dt every step from here\n", t);
+    }
+    return hot ? 1 : every;
+}
+
+// The open-row guard of --shock hll, on DeviceComp::shockRowGuard at the dt
+// cadence: x-lo, the laterals and inflow on x-hi are subsonic only, the next
+// thing they produce is a non-finite dt, also exit 7. x-hi may go supersonic
+// while it flows out (kNscbcCells Super, docs/shock.md).
+inline std::expected<void, RunError> shockOpenRow(double openMach, double t)
+{
+    if (!(openMach >= 1)) return {};
+    return fail(7, std::format("supersonic flow on the open row at t={:.4g} (|u_n|/c = {:.3g}): "
+                               "the NSCBC boundary is subsonic only (docs/shock.md)",
+                               t, openMach));
+}
+
+// The end-of-run line of a --shock run: peak = the most cells sensed on a row.
+inline void shockReport(double peak, std::size_t cells)
+{
+    if (peak > 0) {
+        std::printf("shock: at most %.0f cells sensed (%.2f%%)\n", peak, 100.0 * peak / double(cells));
+        return;
+    }
+    std::printf("shock: 0 cells sensed: the central solver byte for byte\n");
+}
+
 // One-sided 2nd-order wall gradient of a quantity whose WALL VALUE is pinned
 // to zero, from its first two off-wall values: f'(0) = (f1 d2^2 - f2 d1^2) /
 // (d1 d2 (d2 - d1)). Both wall-bounded runners measure a wall flux this way --

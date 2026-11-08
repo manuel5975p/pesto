@@ -495,8 +495,78 @@ int f8()
 
 } // namespace
 
+// --- G4: the wedge opt-in ---------------------------------------------------------
+
+int wedgeGate()
+{
+    std::printf("G4 wedge polyMesh: digits, pins, refusals\n");
+    const fs::path dir = fs::path(DNS_MESH_DATA) / ".." / "fv" / "nozzle_W" / "constant/polyMesh";
+    auto pm0 = readPolyMesh(dir);
+    check(pm0.has_value(), "the wedge reads");
+    const PolyMesh& pm = *pm0;
+    // The default route: the shipped text, verbatim.
+    auto off = FaceMesh::fromPolyMesh(pm, CellOrder::Source);
+    check(!off && off.error() == "mesh: patch 'back' is a wedge: axisymmetric FaceMeshes are not built yet (masterplan_meshsolver P8)",
+          "default route still refuses by the shipped text");
+    const FaceMesh m = buildOrDie(FaceMesh::fromPolyMesh(pm, CellOrder::Source, 0, {.wedge = true}), "W");
+    double vt = 0, vmin = 1e300, vmax = 0;
+    for (double v : m.V) {
+        vt += v;
+        vmin = std::min(vmin, v);
+        vmax = std::max(vmax, v);
+    }
+    // checkMesh, nozzle_W (job 1480): Min volume = 8.3479516785267782e-05. Max volume =
+    // 0.016122881740887988.  Total volume = 5.948715105106146.
+    std::printf("  V min %.17g max %.17g total %.17g\n", vmin, vmax, vt);
+    check(std::abs(vt / 5.948715105106146 - 1) <= 1e-13, "sum V == checkMesh's Total volume");
+    check(std::abs(vmin / 8.3479516785267782e-05 - 1) <= 1e-13, "min V == checkMesh's");
+    check(std::abs(vmax / 0.016122881740887988 - 1) <= 1e-13, "max V == checkMesh's");
+    check(m.dim == 3 && m.emptyAxis == -1 && std::abs(m.wedgeHalf * 180 / std::numbers::pi - 10) < 1e-9, "dim 3, half angle 10 deg");
+    bool sz = true;
+    std::vector<char> isSide(std::size_t(m.nB), 0);
+    const MeshPatch* a = nullptr;
+    const MeshPatch* b = nullptr;
+    for (const MeshPatch& p : m.patches)
+        if (p.type == FoamPatchType::Wedge) {
+            (a ? b : a) = &p;
+            std::fill_n(isSide.begin() + p.first, p.count, char(1));
+        }
+    for (std::size_t f = 0; f < std::size_t(m.nI) + std::size_t(m.nB); ++f) {
+        if (f >= std::size_t(m.nI) && isSide[f - std::size_t(m.nI)]) continue;
+        sz = sz && m.S[2][f] == 0.0 && m.Cf[2][f] == 0.0 && m.d[2][f] == 0.0;
+    }
+    check(sz, "every non-side S_z, Cf_z, d_z exactly 0");
+    check(std::ranges::all_of(m.C[2], [](double z) { return z == 0.0; }), "every C_z exactly 0");
+    bool mir = a && b && a->count == b->count;
+    for (int q = 0; mir && q < a->count; ++q) {
+        const std::size_t x = std::size_t(m.nI + a->first + q);
+        std::size_t y = std::size_t(m.nI + b->first);
+        while (m.own[y] != m.own[x]) ++y;
+        mir = m.S[0][x] == m.S[0][y] && m.S[1][x] == m.S[1][y] && m.S[2][x] == -m.S[2][y] && m.Cf[0][x] == m.Cf[0][y] &&
+              m.Cf[1][x] == m.Cf[1][y] && m.Cf[2][x] == -m.Cf[2][y] && m.d[2][x] == -m.d[2][y];
+    }
+    check(mir, "side pairs bit mirror");
+    // Refusals: drop the opt-in's preconditions one by one.
+    auto refused = [&](PolyMesh q, const std::string& text, const std::string& what) {
+        auto r = FaceMesh::fromPolyMesh(q, CellOrder::Source, 0, {.wedge = true});
+        check(!r && r.error().find(text) != std::string::npos, what + (r ? "" : ": " + r.error()));
+    };
+    PolyMesh one = pm;
+    one.man.patches[3].type = FoamPatchType::Symmetry;
+    refused(one, "mesh: wedge: patches 'front', '' must be two planar mirror sides about z = 0 with axis x (FaceMesh P8)", "one side: refused");
+    PolyMesh tilt = pm;
+    for (std::size_t i = 0; i < tilt.px.size(); ++i) tilt.pz[i] += tilt.pz[i] > 0 ? 0.01 * tilt.py[i] * tilt.py[i] : 0.0;
+    refused(tilt, "must be two planar mirror sides", "a warped side: refused");
+    PolyMesh skew = pm;
+    for (std::size_t i = 0; i < skew.px.size(); ++i)
+        if (skew.pz[i] > 0) skew.pz[i] *= 1.001;
+    refused(skew, "must be two planar mirror sides", "unequal angles: refused");
+    return dnstest::finish();
+}
+
 int main(int argc, char** argv)
 {
+    if (argc > 1 && std::string(argv[1]) == "wedge") return wedgeGate();
     if (argc > 1 && std::string(argv[1]) == "mb") return f8();
     f1f2();
     f3();

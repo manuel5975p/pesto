@@ -850,6 +850,10 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
     const ViscView vv = viscView(tr_);
     const PrimView q{s.rho.data(), u_.data(), v_.data(), w_.data(), e_.data(),
                      p_.data(), T_.data()};
+    if (shockFresh_) { // --shock: the sensor of this step's input, held over its stages
+        shk_->sense(p_.data());
+        shockFresh_ = false;
+    }
     const std::size_t n = g_.size();
     const Real kapLes = Real(tr_.cp() / prt_); // eddy conductivity scale
     const Real* nutp = nullptr;
@@ -956,7 +960,70 @@ void DeviceComp::stage(const DeviceCompState& s, const StageCombine& cmb,
         sv.omegaOx = sootO_.data();
         species::stage(g_, vv, q, cmb, *sc, sv, out);
     }
+    if (shk_ && shk_->applies()) { // --shock: additive, before the rhs hook owns its rows
+        const Real* Y[kMaxY] = {ycache_[0].data(), ycache_[1].data(), ycache_[2].data(), ycache_[3].data()};
+        shk_->faces(q, cmb, Real(tr_.gamma), Y, sp_.nY, out);
+    }
     if (rhsHook_) rhsHook_(s, out, cmb);
+}
+
+std::expected<void, hipError_t> DeviceComp::enableShock(const ShockSetup& s)
+{
+    assert(!curvilinear() && !rans() && !mrf_ && !precond());
+    auto m = DeviceShock::make(g_, s);
+    if (!m) return std::unexpected(m.error());
+    shk_ = std::move(*m);
+    return {};
+}
+
+double DeviceComp::shockSense(const DeviceCompState& s, ReduceScratch& r)
+{
+    assert(shock());
+    primitives(s);
+    shk_->sense(p_.data());
+    return shk_->count(r);
+}
+
+ShockRow DeviceComp::shockRow(const DeviceCompState& s, ReduceScratch& r, const ShockRegions& reg)
+{
+    assert(shock());
+    primitives(s);
+    shk_->sense(p_.data());
+    return shk_->row(s.rho.data(), u_.data(), v_.data(), w_.data(), p_.data(), Real(tr_.gamma), reg, r);
+}
+
+double DeviceComp::shockRowGuard(const DeviceCompState& s, ReduceScratch& r) const
+{
+    assert(shock());
+    return shk_->rowGuard(s.rho.data(), s.mx.data(), s.my.data(), s.mz.data(), s.E.data(), Real(tr_.gamma), r);
+}
+
+hipError_t DeviceComp::shockBytes(const DeviceCompState& s, std::vector<std::uint8_t>& out)
+{
+    assert(shock());
+    primitives(s);
+    shk_->sense(p_.data());
+    return shk_->bytes(out);
+}
+
+double DeviceComp::shockBurnCells(double& omegaPeak, ReduceScratch& r) const
+{
+    assert(shock() && nSpecies() > 0);
+    return shk_->burnCells(omega_.data(), omegaPeak, r);
+}
+
+double DeviceComp::shockBurnMax(double& omegaPeak, ReduceScratch& r) const
+{
+    assert(shock() && nSpecies() > 0);
+    return shk_->burnMax(omega_.data(), omegaPeak, r);
+}
+
+std::expected<std::vector<ShockPeak>, hipError_t> DeviceComp::shockPeaks(const DeviceCompState& s, std::size_t k)
+{
+    assert(shock());
+    primitives(s);
+    shk_->sense(p_.data());
+    return shk_->peaks(k);
 }
 
 void DeviceComp::chemCellPass(const DeviceCompState& s)
@@ -1118,6 +1185,7 @@ void penalizeMomentum(const GpuGrid& g, const DeviceScalar& lam, Real eta,
 
 void DeviceComp::step(DeviceCompState& s, Real dt)
 {
+    shockFresh_ = shk_.has_value();
     // Shu-Osher SSP-RK3. Each stage writes its combination straight out of the
     // rhs kernel, so two stage buffers suffice: q1_ is free again after stage
     // 2 consumed it, stage 3 writes there, and the result is swapped into s.
@@ -1648,6 +1716,7 @@ hipError_t DeviceComp::uploadLts(const std::vector<Real>& ratios)
 
 void DeviceComp::residualInto(const DeviceCompState& s, DeviceCompState& out)
 {
+    assert(!shock()); // steady marches refuse --shock (flicker, docs/shock.md)
     assert(s.nT == nTurb() && out.nT == s.nT && &out != &s);
     assert(nSpecies() == 0); // species residuals: out of scope (docs/chem.md)
     // ca = cb = 0, cr = 1, no lts: the mean-flow kernel and every hook then

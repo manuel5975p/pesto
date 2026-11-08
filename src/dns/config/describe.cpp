@@ -34,6 +34,15 @@ namespace dns {
 std::string Case::describe() const
 {
     std::string s = describeCase();
+    if (shock == ShockMode::Hll && fvMode == FvCompMode::PolyMesh)
+        s += std::format("  shock      hll (mesh lines, stride 2, {:g}..{:g}, per step) + D4 eps {:g} |u.S|\n", kShockTh1,
+                         kShockTh2, shockEps4);
+    else if (shock == ShockMode::Hll)
+        s += std::format("  shock      hll (pressure-sensed two-point HLL, sensor {:g}..{:g}, per step)\n", kShockTh1,
+                         kShockTh2);
+    if (shock == ShockMode::Sense)
+        s += std::format("  shock      sense (sensor only, {:g}..{:g}, per step: the central solver bit for bit)\n",
+                         kShockTh1, kShockTh2);
     if (fvMode == FvCompMode::Structured && sub == Subcommand::Flame)
         s += std::format("  solver     {}\n  patches    {}\n  frames     uniform plane, containing cell per pixel, long "
                          "side {}\n",
@@ -128,7 +137,9 @@ std::string Case::describeCase() const
                            "  frames     uniform plane, containing cell per pixel, long side {}\n"
                            "  out        {}\n{}",
                            fvMeshDir, re, fvBc.length, mach, prandtl, sutherland ? "sutherland" : "constant",
-                           lesLabel ? lesRunLabel(sgsModel, cs, false) : std::string("DNS"),
+                           lesLabel                  ? lesRunLabel(sgsModel, cs, false)
+                           : shock == ShockMode::Hll ? std::string(inviscid ? "Euler" : "laminar")
+                                                     : std::string("DNS"),
                            fvPrecisionName(fvPrecision), tEnd, ramp, cfl, fvFrameN, outPrefix, fvBc.describe());
     if (fvIncomp)
     {

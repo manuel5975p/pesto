@@ -77,6 +77,7 @@ void faceGeometry(const PolyMesh& m, std::size_t f, V3& Cf, V3& S)
 struct SrcMesh
 {
     int nC = 0, dim = 3, emptyAxis = -1;
+    double wedgeHalf = 0;
     std::vector<V3> C;
     std::vector<double> V;
     // internal faces (polyMesh internal + merged cyclic pairs)
@@ -106,7 +107,75 @@ struct BlockErrors
     }
 };
 
-std::expected<SrcMesh, string> buildSource(const PolyMesh& pm, int threads)
+// `wedge` sides of s: exactly two planar patches mirrored about z = 0, axis x. Sets
+// wedgeHalf; pins z of every non-side S, Cf, d and every C to exactly 0 after checking it,
+// and writes the second side as the bit mirror of the first (FaceMeshOptions::wedge).
+// Geometry is in source numbering, patches in polyMesh order.
+std::expected<void, string> pinWedge(SrcMesh& s)
+{
+    std::vector<std::size_t> sides;
+    for (std::size_t p = 0; p < s.patches.size(); ++p)
+        if (s.patches[p].type == FoamPatchType::Wedge) sides.push_back(p);
+    const std::string a = sides.empty() ? std::string() : s.patches[sides[0]].name;
+    const std::string b = sides.size() > 1 ? s.patches[sides[1]].name : std::string();
+    const std::string bad = std::format("mesh: wedge: patches '{}', '{}' must be two planar mirror sides about z = 0 with "
+                                        "axis x (FaceMesh P8)",
+                                        a, b);
+    if (sides.size() != 2 || s.patches[sides[0]].count != s.patches[sides[1]].count || s.patches[sides[0]].count == 0)
+        return std::unexpected(bad);
+    const MeshPatch &pa = s.patches[sides[0]], &pb = s.patches[sides[1]];
+    constexpr double kTol = 1e-12;
+    // Planar through the axis: one unit normal, no x part, every face centre on the plane.
+    const auto unit = [](const V3& v) { return (1.0 / mag(v)) * v; };
+    const V3 na = unit(s.bS[std::size_t(pa.first)]), nb = unit(s.bS[std::size_t(pb.first)]);
+    const auto planar = [&](const MeshPatch& p, const V3& n) {
+        for (int q = p.first; q < p.first + p.count; ++q) {
+            const std::size_t f = std::size_t(q);
+            if (mag(unit(s.bS[f]) - n) > kTol || std::abs(n[0]) > kTol) return false;
+            if (std::abs(dot(s.bCf[f], n)) > kTol * mag(s.bCf[f])) return false;
+        }
+        return true;
+    };
+    if (!planar(pa, na) || !planar(pb, nb)) return std::unexpected(bad);
+    if (std::abs(na[1] - nb[1]) > kTol || std::abs(na[2] + nb[2]) > kTol || !(std::abs(na[2]) > 0))
+        return std::unexpected(bad);
+    s.wedgeHalf = std::atan2(std::abs(na[1]), std::abs(na[2]));
+    // Every other face: S_z verified 0, then pinned.
+    std::vector<char> side(s.bS.size(), 0);
+    std::fill_n(side.begin() + pa.first, pa.count, char(1));
+    std::fill_n(side.begin() + pb.first, pb.count, char(1));
+    const auto inPlane = [&](const V3& S) { return std::abs(S[2]) <= kTol * mag(S); };
+    for (std::size_t f = 0; f < s.iS.size(); ++f)
+        if (!inPlane(s.iS[f])) return std::unexpected(bad);
+    for (std::size_t f = 0; f < s.bS.size(); ++f)
+        if (!side[f] && !inPlane(s.bS[f])) return std::unexpected(bad);
+    for (V3& c : s.C) c[2] = 0.0;
+    for (std::size_t f = 0; f < s.iS.size(); ++f) s.iS[f][2] = s.iCf[f][2] = s.iD[f][2] = 0.0;
+    for (std::size_t f = 0; f < s.bS.size(); ++f) {
+        if (!side[f]) s.bS[f][2] = s.bCf[f][2] = 0.0;
+        s.bD[f] = s.bCf[f] - s.C[std::size_t(s.bOwn[f])];
+    }
+    // Sides, paired by owner: verified mirror, then the second is the first's bit mirror.
+    std::vector<int> partner(std::size_t(s.nC), -1);
+    for (int q = pa.first; q < pa.first + pa.count; ++q) partner[std::size_t(s.bOwn[std::size_t(q)])] = q;
+    const auto mirror = [](const V3& v) { return V3{v[0], v[1], -v[2]}; };
+    for (int q = pb.first; q < pb.first + pb.count; ++q) {
+        const std::size_t f = std::size_t(q);
+        const int o = partner[std::size_t(s.bOwn[f])];
+        const std::string msg = std::format("mesh: wedge: face {} of patch '{}' is not the mirror of its partner", s.bSrc[f], pb.name);
+        if (o < 0) return std::unexpected(msg);
+        const std::size_t g = std::size_t(o);
+        const double scale = mag(s.bCf[g]);
+        if (mag(s.bS[f] - mirror(s.bS[g])) > kTol * mag(s.bS[g]) || mag(s.bCf[f] - mirror(s.bCf[g])) > kTol * scale)
+            return std::unexpected(msg);
+        s.bS[f] = mirror(s.bS[g]);
+        s.bCf[f] = mirror(s.bCf[g]);
+        s.bD[f] = mirror(s.bD[g]);
+    }
+    return {};
+}
+
+std::expected<SrcMesh, string> buildSource(const PolyMesh& pm, int threads, FaceMeshOptions opt)
 {
     const auto& man = pm.man;
     const std::size_t nF = std::size_t(man.nFaces), nI = std::size_t(man.nInternalFaces);
@@ -117,7 +186,7 @@ std::expected<SrcMesh, string> buildSource(const PolyMesh& pm, int threads)
         || pm.pz.size() != pm.px.size())
         return std::unexpected("mesh: PolyMesh arrays do not match its manifest counts");
     for (const auto& p : man.patches)
-        if (p.type == FoamPatchType::Wedge)
+        if (p.type == FoamPatchType::Wedge && !opt.wedge)
             return std::unexpected("mesh: patch '" + p.name
                                    + "' is a wedge: axisymmetric FaceMeshes are not built yet "
                                      "(masterplan_meshsolver P8)");
@@ -341,6 +410,9 @@ std::expected<SrcMesh, string> buildSource(const PolyMesh& pm, int threads)
                     s.bS[std::size_t(q)][a] = s.bD[std::size_t(q)][a] = 0.0;
     }
 
+    if (std::ranges::any_of(man.patches, [](const FoamPatch& p) { return p.type == FoamPatchType::Wedge; }))
+        if (auto w = pinWedge(s); !w) return std::unexpected(w.error());
+
     for (std::size_t f = 0; f < s.iS.size(); ++f)
         if (!(dot(s.iD[f], s.iS[f]) > 0))
             return std::unexpected(std::format("mesh: face {} between cells {} and {}: d.S <= 0 "
@@ -401,6 +473,7 @@ FaceMesh assemble(const SrcMesh& s, const std::vector<int>& perm, CellOrder orde
     m.nC = s.nC;
     m.dim = s.dim;
     m.emptyAxis = s.emptyAxis;
+    m.wedgeHalf = s.wedgeHalf;
     std::vector<int> newOf(std::size_t(s.nC));
     for (int n = 0; n < s.nC; ++n) newOf[std::size_t(perm[std::size_t(n)])] = n;
 
@@ -507,9 +580,10 @@ std::span<const char* const> cellOrderNames()
     return kNames;
 }
 
-std::expected<FaceMesh, std::string> FaceMesh::fromPolyMesh(const PolyMesh& pm, CellOrder order, int threads)
+std::expected<FaceMesh, std::string> FaceMesh::fromPolyMesh(const PolyMesh& pm, CellOrder order, int threads,
+                                                            FaceMeshOptions opt)
 {
-    auto s = buildSource(pm, threads);
+    auto s = buildSource(pm, threads, opt);
     if (!s) return std::unexpected(s.error());
     if (order == CellOrder::Source) {
         std::vector<int> id(std::size_t(s->nC));

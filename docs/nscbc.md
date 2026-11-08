@@ -62,6 +62,35 @@ proportional to un and shut off smoothly through a stagnation, and the brief
 inflow advects back out (vortex-on-face residual 0.0280 at a swirl 2× the
 freestream, 0.0513 at 4×; pinned by `backflowVortexResidual`).
 
+**That holds for a brief inflow, not a sustained one.** At un < 0 the λ = u
+amplitudes are downwind differences: a row cell grows off its neighbour at rate
+|un|/h. A chamber jet's head drew un −8 in over 2 flame times on the 8 S_L long
+box: row ρ 1.4 → 72, T/Tu 0.012, then the state failed (budget at the coldest row
+cell: L2 +2.6 to +3.0 per unit time against a measured T e-fold rate of 2.6;
+issues.md S15). The Hydro top and `--shock hll` each carry the cure; the shipped row
+without `--shock hll` does not.
+
+### Outflow past M 1 and in backflow (`--shock hll` only, `kNscbcCells<..., Super>`)
+
+Past un = c the incoming wave does not exist: a relaxation there overdetermines the
+row (a fully supersonic nozzle's exit, shipped row: M 1.85 to 2.66 off exact). With
+M = un/c at the row cell:
+
+- M ≤ 0.8: the shipped arithmetic, no added operation;
+- 0.8 < M < 1: L1 = fac Lin + (1 − fac) Lout1, fac = (1 − M)/0.2;
+- M ≥ 1: L1 = Lout1 = (un − c)(∂p − ρc ∂u), no target, no transverse term;
+- un < 0: w = 1 + tanh(un/(0.01 c)), L2..L4 = w Lout + (1 − w) Lin, the lateral
+  branch's relaxation to ambient at `etaLat`, targets ρ∞, tgt. One-sided: un ≥ 0
+  moves no bit.
+
+`--shock none` and `sense` run the shipped kernel. The species face already carries
+`yIn` on backflow. The open-row guard reads x-lo, the laterals and inflow on x-hi at
+the dt cadence; x-hi flowing out is the row's own. `docs/shock.md`; gates 30, 32 to
+36.
+
+The sensor's mask, sigma 0 on every face touching an open row, is `--shock`'s other
+boundary rule: the row carries no D (gate 25, bitwise row against off).
+
 ### Inflow (i = 0, subsonic)
 
 L1 leaves; incoming L5/L2/L3/L4 relax (u, ρ, v, w) toward freestream at rate

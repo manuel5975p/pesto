@@ -21,7 +21,7 @@ and (optional) `cellZones` of a `constant/polyMesh` directory:
 | format | `ascii`, `binary`; `arch` LSB, `label=32` or `label=64` (narrowed to int32, range-checked), `scalar=64` | `*.gz`, MSB, `scalar≠64`, uniform lists `N{…}`, binary non-compact `faceList` |
 | faces | `faceList` (ASCII), `faceCompactList` (ASCII or binary) | faces with < 3 nodes, labels out of range, truncated lists |
 | topology | owner < neighbour on internal faces; patches tiling `[nInternalFaces, nFaces)` in order | `owner ≥ neighbour`, gaps or overlaps between patches |
-| patches | `wall`, `patch`, `symmetry`, `symmetryPlane`, `empty`, `cyclic` (`transform translational`/`unknown`/`coincidentFullMatch`/`noOrdering`), `wedge` (reader only) | `processor*` ("decomposed: run reconstructParMesh"), `cyclicAMI`, `cyclicACMI`, `nonConformal*`, `mapped*`, cyclic `rotational`, unpaired cyclics, any other type |
+| patches | `wall`, `patch`, `symmetry`, `symmetryPlane`, `empty`, `cyclic` (`transform translational`/`unknown`/`coincidentFullMatch`/`noOrdering`), `wedge` (reader; FaceMesh under `FaceMeshOptions::wedge`, the compressible nozzle route, docs/nozzle.md) | `processor*` ("decomposed: run reconstructParMesh"), `cyclicAMI`, `cyclicACMI`, `nonConformal*`, `mapped*`, cyclic `rotational`, unpaired cyclics, any other type |
 | dictionaries | plain entries, `inGroups`, header `meta {}` | `#include`, `#calc` and every other `#` directive |
 | cellZones | ascending after read | a cell in two zones, a cell listed twice |
 
@@ -99,7 +99,10 @@ plane k = 1, sides `symmetry`.
   `fromCurvMesh`: `srcCell` = `Grid::idx`, `srcFace` = the `polyOf` face).
 - **Validation** (exit 3, named): open cell (`|Σ S| > 1e-9 Σ|S|`), `V ≤ 0`,
   `d·S ≤ 0`, cells with < 4 faces, unmatched cyclics, bad `empty`, `wedge`
-  patches (the axisymmetric FaceMesh is P8).
+  patches (the axisymmetric FaceMesh is P8; `FaceMeshOptions::wedge` opens it on one route:
+  exactly two planar sides mirrored about z = 0, axis x, y = r form. Every C_z and non-side
+  S_z, Cf_z, d_z exactly 0, the second side the first's bit mirror, `wedgeHalf` set, `dim`
+  stays 3. docs/nozzle.md).
 
 ## Ordering
 

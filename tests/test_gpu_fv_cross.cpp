@@ -116,6 +116,88 @@ void x1()
                       own));
 }
 
+// X6 (G12): the periodic double shock on a uniform box, eps 0. FP64 == FvRef; FP32 vs the
+// structured --shock hll: inside 2 x the FV FP32 run's own distance from FP64; bytes within 1.
+void x6()
+{
+    std::printf("X6 uniform periodic double shock, 400 x 4, FV vs FvRef vs structured --shock hll\n");
+    const int n = 400, ny = 4;
+    const Grid g = Grid::make(n, ny, 1, 1.0, double(ny) / n, 1.0 / n);
+    const Transport tr = Transport::constant(kGamma, 1e-4);
+    const FaceMesh fm = orDie(FaceMesh::fromCurvMesh(CurvMesh::uniform(g), periodicSpec(g), CellOrder::Morton), "x6");
+    CompState ic = CompState::zeros(g);
+    for (int j = 0; j < ny; ++j)
+        for (int i = 0; i < n; ++i) {
+            const double x = (i + 0.5) / n, p = x > 0.25 && x < 0.75 ? 5.0 : 1.0, rho = x > 0.25 && x < 0.75 ? 2.0 : 1.0;
+            const std::size_t c = g.idx(i, j, 0);
+            ic.rho[c] = rho;
+            ic.E[c] = p / (kGamma - 1.0);
+        }
+    const FvState s0 = toFv(fm, ic);
+    const FvShock sh{.mode = ShockMode::Hll, .eps4 = 0.0};
+    FvConfig rc{.tr = tr, .bc = {}};
+    rc.shock = sh;
+    for (const MeshPatch& p : fm.patches) {
+        FvBc e;
+        e.kind = FvBcKind::Empty;
+        (void)p;
+        rc.bc.push_back(e);
+    }
+    const FvRef ref = orDie(FvRef::make(fm, rc), "x6");
+    const double dt = 0.5 * orDie(ref.stableDt(s0, {.cfl = 0.4}), "dt");
+    FvState sR = s0;
+    auto d64 = orDie(DeviceFvComp::make(fm, {.tr = tr, .bc = rc.bc, .precision = FvPrecision::Fp64, .shock = sh}), "x6");
+    auto d32 = orDie(DeviceFvComp::make(fm, {.tr = tr, .bc = rc.bc, .precision = FvPrecision::Fp32, .shock = sh}), "x6");
+    orDie(d64.upload(s0), "x6");
+    orDie(d32.upload(s0), "x6");
+    auto str = orDieH(gpu::DeviceComp::make(g, tr));
+    auto ds = gpu::DeviceCompState::make(g.size());
+    if (!ds || ds->upload(ic) != hipSuccess || !str.enableShock({})) std::exit(1);
+    constexpr int kN = 150;
+    ref.march(sR, dt, kN);
+    for (int i = 0; i < kN; ++i) {
+        d64.step(dt);
+        d32.step(dt);
+        str.step(*ds, gpu::Real(dt));
+    }
+    FvState a, b;
+    CompState sh2 = CompState::zeros(g);
+    orDie(d64.download(a), "x6");
+    orDie(d32.download(b), "x6");
+    if (ds->download(sh2) != hipSuccess) std::exit(1);
+    const FvState sf = toFv(fm, sh2);
+    // The flow is 1D: rows my, mz are 0 to rounding, a relative row metric would read that noise.
+    const auto rows = [&](const FvState& x, const FvState& y) {
+        double w = 0.0;
+        for (int v : {0, 1, 4}) {
+            double e = 0.0, sc = 0.0;
+            for (int c = 0; c < fm.nC; ++c) {
+                e = std::max(e, std::abs(x.var(v)[c] - y.var(v)[c]));
+                sc = std::max(sc, std::abs(y.var(v)[c]));
+            }
+            w = std::max(w, e / sc);
+        }
+        return w;
+    };
+    const double e64 = rows(a, sR), e32 = rows(b, sf), own = rows(b, a);
+    std::vector<std::uint8_t> sb;
+    if (str.shockBytes(*ds, sb) != hipSuccess) std::exit(1);
+    FvEval ev;
+    FvState o;
+    orDie(d32.evaluate(ev, o), "x6");
+    long worst = 0, sensed = 0;
+    for (std::size_t c = 0; c < std::size_t(fm.nC); ++c) {
+        const std::size_t q = std::size_t(fm.srcCell[c]);
+        worst = std::max(worst, std::labs(long(ev.sigma[c]) - long(sb[q])));
+        sensed += ev.sigma[c] != 0;
+    }
+    std::printf("  %d steps, %ld sensed: FV64 - FvRef %.2e; FV32 - structured %.2e, own FP32 - FP64 %.2e; bytes off by %ld\n", kN, sensed, e64, e32, own, worst);
+    check(sensed > 0, "sensed > 0");
+    check(e64 <= 1e-13, "FP64 vs the oracle <= 1e-13");
+    check(e32 <= 2.0 * own, "FP32 vs structured <= 2 x own FP32 vs FP64");
+    check(worst <= 1, "bytes within 1");
+}
+
 void x2()
 {
     std::printf("X2 LES, TGV 32^3 M 0.3 Re 2000, FV(FP32) vs DeviceComp, same dt\n");
@@ -353,5 +435,6 @@ int main(int argc, char** argv)
     x1();
     x2();
     x3();
+    x6();
     return dnstest::finish();
 }

@@ -160,6 +160,39 @@ void fvRansResolve(const RawConfig& r, Case& c)
 
 namespace dns::cfg {
 
+namespace {
+
+// The nozzle route's flags and --bc tables on `dns flow --physics compressible --polymesh`
+// (docs/nozzle.md), by name. Pre: r.fvBc set.
+std::optional<ConfigError> fvNozzleScope(const RawConfig& r)
+{
+    const bool hll = r.shock == ShockMode::Hll;
+    const FvBcSpec& bc = *r.fvBc;
+    const bool hasTotal = std::ranges::any_of(bc.patches, [](const FvPatchSpec& p) { return p.kind == FvPatchKind::Total; });
+    if (r.given.contains("--shock-d4") && !hll) return ConfigError{2, "--shock-d4", "needs --shock hll"};
+    if (r.given.contains("--shock-d4") && !(r.shockD4 >= 0.0 && r.shockD4 <= kFvShockEps4Max))
+        return ConfigError{2, "--shock-d4", "must be in [0, 0.125]"};
+    if (r.inviscid) {
+        if (!hll) return ConfigError{2, "--inviscid", "needs --shock hll"};
+        if (r.given.contains("--re")) return ConfigError{2, "--inviscid", "--re is the viscous number: give one of them"};
+        for (const char* f : {"--visc", "--prandtl", "--tinf"})
+            if (r.given.contains(f)) return ConfigError{2, "--inviscid", "no viscous flag with it (--visc, --prandtl, --tinf)"};
+        for (const FvPatchSpec& p : bc.patches)
+            if (p.kind == FvPatchKind::Wall)
+                return ConfigError{2, "--bc", std::format("patch `{}`: --inviscid: a no-slip wall needs viscosity, use type = \"slip\"", p.name)};
+    }
+    if (bc.nozzle && !hll) return ConfigError{2, "--bc", "[nozzle] needs --shock hll"};
+    if (hasTotal && !bc.nozzle) return ConfigError{2, "--bc", "a total patch needs [nozzle] (the rest state)"};
+    if (r.given.contains("--foam-write") && !(r.foamWrite > 0.0 && std::isfinite(r.foamWrite)))
+        return ConfigError{2, "--foam-write", "must be finite and > 0"};
+    if (r.given.contains("--gamma") && !(r.gamma > 1.0 && r.gamma <= 1.67)) return ConfigError{2, "--gamma", "must be in (1, 1.67]"};
+    if (hll && r.given.contains("--cfl") && r.cfl > kShockCflAxisSum + 1e-12)
+        return ConfigError{2, "--cfl", "must be <= 1.2 on the FV path: the Sigma form is already the axis sum (docs/shock.md)"};
+    return std::nullopt;
+}
+
+} // namespace
+
 std::expected<Case, ConfigError> validateFvCompMesh(const RawConfig& r, Case c)
 {
     static const char* const allowed[] = {"--polymesh", "--bc",      "--physics",    "--re",        "--mach",
@@ -169,7 +202,8 @@ std::expected<Case, ConfigError> validateFvCompMesh(const RawConfig& r, Case c)
                                           "--vort-max", "--vort-map", "--speed-map", "--dt-recompute", "--frame-box",
                                           "--frame-n",  "--backend", "--quiet",      "--dry-run",   "--compensated",
                                           "--solver",   "--rans",    "--rans-nutinf", "--rans-kinf", "--rans-mutinf",
-                                          "--steady",   "--steady-steps"};
+                                          "--steady",   "--steady-steps", "--shock", "--shock-d4", "--inviscid",
+                                          "--foam-write", "--gamma"};
     for (const auto& g : r.given)
         if (std::ranges::none_of(allowed, [&](const char* a) { return g == a; }))
             return bad(2, "--polymesh", g + " is not a flag of the compressible FV path on a polyMesh (docs/fvcomp.md)");
@@ -179,8 +213,11 @@ std::expected<Case, ConfigError> validateFvCompMesh(const RawConfig& r, Case c)
     if (c.outPrefix.empty()) return bad(2, "--out", "output prefix must not be empty");
     if (c.outPrefix.find_first_of("\"\\\n\r\t") != std::string::npos)
         return bad(2, "--out", "output prefix must not contain quotes, backslashes or control characters");
-    if (!r.given.contains("--re") || !finitePos(r.re)) return bad(2, "--re", "required, finite and > 0");
-    if (!r.given.contains("--mach") || !finitePos(r.mach) || r.mach >= 1.0)
+    const bool hll = r.shock == ShockMode::Hll;
+    if (auto e = fvNozzleScope(r)) return std::unexpected(*e);
+    if (!r.inviscid && (!r.given.contains("--re") || !finitePos(r.re))) return bad(2, "--re", "required, finite and > 0");
+    if (hll && (!r.given.contains("--mach") || !finitePos(r.mach))) return bad(2, "--mach", "must be finite and > 0");
+    if (!hll && (!r.given.contains("--mach") || !finitePos(r.mach) || r.mach >= 1.0))
         return bad(2, "--mach", "required, in (0, 1): the KG flux has no shock capturing");
     const bool steady = r.given.contains("--steady");
     if (steady) {
@@ -205,7 +242,13 @@ std::expected<Case, ConfigError> validateFvCompMesh(const RawConfig& r, Case c)
     c.fvMode = FvCompMode::PolyMesh;
     c.fvMeshDir = r.polymesh;
     c.fvBc = *r.fvBc;
-    c.re = r.re;
+    c.re = r.inviscid ? 0.0 : r.re;
+    c.inviscid = r.inviscid;
+    c.foamWrite = r.foamWrite;
+    c.fvGamma = r.gamma;
+    c.shockEps4 = hll ? r.shockD4 : 0.0;
+    if (r.shock != ShockMode::None) c.meta.shock = name(r.shock);
+    if (hll) shockCadence(r, c);
     c.mach = r.mach;
     c.uInf = 1.0;
     c.tEnd = r.ttFv * r.fvBc->length / c.uInf;
@@ -230,12 +273,13 @@ std::expected<Case, ConfigError> validateFvCompMesh(const RawConfig& r, Case c)
     c.vortMax = r.vortMax;
     c.vortAsinh = r.vortMap == 1;
     c.speedDelta = r.speedMap == 1;
-    c.nu = c.uInf * r.fvBc->length / c.re;
+    c.nu = r.inviscid ? 0.0 : c.uInf * r.fvBc->length / c.re;
     fvRansResolve(r, c);
     c.meta = {.D = r.fvBc->length, .re = c.re, .mach = c.mach, .frameDt = c.fdt, .cs = c.cs, .les = c.lesLabel,
               .body = "polymesh", .farField = "fv", .physics = "compressible", .kick = 0,
               .sgs = c.lesLabel ? std::string(name(c.sgsModel)) : std::string(),
               .rans = c.rans == RansModel::None ? std::string() : std::string(ransName(c.rans)), .steady = {}};
+    if (r.shock != ShockMode::None) c.meta.shock = name(r.shock);
     if (auto e = fvCompCommon(r, c)) return std::unexpected(*e);
     return c;
 }

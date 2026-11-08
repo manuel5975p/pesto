@@ -785,5 +785,38 @@ int main()
                 "--mix-phi",
                 std::string("--mix-phi ") + bad +
                     " rejected ([0.6, jet phi], |phi - 1| >= 0.01)");
+    // --shock sense (masterplan_shockflux gate 9, sense part): the premixed and
+    // chamber routes; every other flame route by name.
+    {
+        auto s = runCli({"flame", "--shock", "sense"});
+        check(s.has_value() && s->shock == ShockMode::Sense, "--shock sense validates on the planar flame");
+        check(s.has_value() && flameRunLabel(*s).ends_with("[--shock sense: sensor only, the central solver bit for bit]"),
+              "the flame label names the sensor, last");
+        auto d = runCli({"flame", "--turb", "1", "--turb-length", "1", "--cells-per-delta", "4", "--ny", "24", "--nz", "24",
+                         "--upstream", "6", "--downstream", "4", "--shock", "sense"});
+        check(d.has_value(), "sense measures a --turb box");
+    }
+    for (const char* mode : {"bunsen", "diffusion", "candle"})
+        rejects({"flame", "--mode", mode, "--shock", "sense"}, 2, "--shock",
+                std::string("--shock rejected with --mode ") + mode);
+    rejects({"flame", "--mode", "candle", "--wick", "--shock", "sense"}, 2, "--shock", "--shock rejected with --wick");
+    rejects({"flame", "--equivalence", "1.3", "--shock", "sense"}, 2, "--shock", "--shock rejected with --equivalence");
+    rejects({"flame", "--solver", "fv", "--shock", "sense"}, 2, "--shock", "--shock rejected on --solver fv");
+    rejects({"flame", "--physics", "lowmach", "--shock", "sense"}, 2, "--shock", "--shock rejected on lowmach");
+    // --shock hll (gate 9): no gate yet on these; sense still measures them.
+    rejects({"flame", "--shock", "hll", "--tfles", "2"}, 2, "--tfles", "--tfles with hll");
+    rejects({"flame", "--shock", "hll", "--turb", "1", "--turb-length", "1", "--cells-per-delta", "4", "--ny", "24", "--nz",
+             "24", "--upstream", "6", "--downstream", "4"},
+            2, "--turb", "--turb with hll");
+    rejects({"flame", "--shock", "hll", "--les", "1.35", "--sgs", "sigma", "--nz", "8", "--ny", "8", "--cells-per-delta", "6"},
+            2, "--les", "--les with hll");
+    rejects({"flame", "--shock", "hll", "--cfl", "0.61"}, 2, "--cfl", "--cfl 0.61 at nz 1");
+    rejects({"flame", "--shock", "hll", "--cfl", "0.41", "--nz", "8", "--ny", "8"}, 2, "--cfl", "--cfl 0.41 at nz 8");
+    {
+        auto s = runCli({"flame", "--shock", "hll", "--cfl", "0.6"});
+        check(s.has_value() && s->shockDtAuto, "--cfl 0.6 at nz 1, the sticky cadence");
+        auto m = runCli({"flame", "--shock", "hll", "--mach", "0.05"});
+        check(m.has_value(), "--mach 0.05 is the bound");
+    }
     return dnstest::finish();
 }

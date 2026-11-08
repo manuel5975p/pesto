@@ -87,6 +87,9 @@ int runBench(const Case& c)
         auto D = gpu::DeviceComp::make(g, gamma, c.nu, c.cs, c.sgsModel);
         auto S = gpu::DeviceCompState::make(g.size());
         if (!D || !S) return die(exitResource, "GPU init failed");
+        if (c.shock != ShockMode::None &&
+            !D->enableShock({.apply = c.shock == ShockMode::Hll}))
+            return die(exitResource, "GPU init failed");
         if (S->upload(benchCompState(g, U, gamma, c.mach)) != hipSuccess)
             return die(exitResource, "GPU upload failed");
         const auto vram = benchVramGiB(freeBefore);

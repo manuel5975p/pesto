@@ -1,5 +1,6 @@
 #include "dns/gpu/runner_fvcomp.hpp"
 
+#include "dns/foamio.hpp"
 #include "dns/fvturb.hpp"
 
 #include "dns/gpu/chem.hpp"
@@ -17,6 +18,7 @@
 #include <cmath>
 #include <cstdio>
 #include <format>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <vector>
@@ -50,6 +52,56 @@ std::vector<double> vorticity(const std::array<std::vector<double>, 12>& g, bool
 double dot3(const std::array<double, 3>& a, const std::array<double, 3>& b)
 {
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+// One field's patches of a --foam-write time: B's values, each patch in source face order;
+// `empty` and `wedge` by their constraint. read: a boundary state's value(s), nc per face.
+template <class Read>
+std::vector<FoamPatchOut> foamPatches(const FaceMesh& fm, const std::vector<FvPrim<double>>& bnd, int nc, Read&& read)
+{
+    std::vector<FoamPatchOut> o;
+    for (const MeshPatch& m : fm.patches) {
+        FoamPatchOut q{.name = m.name, .constraint = {}, .values = {}};
+        if (m.type == FoamPatchType::Empty || m.type == FoamPatchType::Wedge) {
+            q.constraint = m.type == FoamPatchType::Empty ? "empty" : "wedge";
+            o.push_back(std::move(q));
+            continue;
+        }
+        std::vector<int> order(std::size_t(m.count));
+        std::iota(order.begin(), order.end(), m.first);
+        std::ranges::sort(order, {}, [&](int b) { return fm.srcFace[std::size_t(fm.nI + b)]; });
+        q.values.resize(order.size() * std::size_t(nc));
+        for (std::size_t i = 0; i < order.size(); ++i) read(bnd[std::size_t(order[i])], q.values.data() + i * std::size_t(nc));
+        o.push_back(std::move(q));
+    }
+    return o;
+}
+
+// --foam-write: DIR/<t>/{p,T,U,rho} of the state s, source cell order, 17 digits, boundary
+// values from B (bnd: per FaceMesh boundary face). tools/fv/foamdiff.py reads the cells.
+std::expected<void, std::string> writeFoamTime(const FaceMesh& fm, const dns::FvState& s, const std::vector<FvPrim<double>>& bnd, double gamma,
+                                               double Rgas, const std::string& prefix, double t)
+{
+    const std::size_t n = std::size_t(fm.nC);
+    std::vector<double> p(n), T(n), rho(n), U(3 * n);
+    for (std::size_t c = 0; c < n; ++c) {
+        const std::size_t o = std::size_t(fm.srcCell[c]);
+        const FvPrim<double> q = fvPrimOf(s.var(0)[c], s.var(1)[c], s.var(2)[c], s.var(3)[c], s.var(4)[c], gamma, Rgas);
+        p[o] = q.p;
+        T[o] = q.temp;
+        rho[o] = q.rho;
+        for (std::size_t k = 0; k < 3; ++k) U[3 * o + k] = q.u[k];
+    }
+    const std::filesystem::path dir = std::filesystem::path(prefix + "_foam") / std::format("{:.12g}", t);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return std::unexpected(std::format("{}: {}", dir.string(), ec.message()));
+    const auto scalar = [&](auto&& f) { return foamPatches(fm, bnd, 1, [&](const FvPrim<double>& b, double* o) { o[0] = f(b); }); };
+    if (auto r = writeFoamField(dir, "p", 1, false, "[1 -1 -2 0 0 0 0]", p, scalar([](const FvPrim<double>& b) { return b.p; }), 17); !r) return r;
+    if (auto r = writeFoamField(dir, "T", 1, false, "[0 0 0 1 0 0 0]", T, scalar([](const FvPrim<double>& b) { return b.temp; }), 17); !r) return r;
+    if (auto r = writeFoamField(dir, "rho", 1, false, "[1 -3 0 0 0 0 0]", rho, scalar([](const FvPrim<double>& b) { return b.rho; }), 17); !r) return r;
+    const auto uB = foamPatches(fm, bnd, 3, [](const FvPrim<double>& b, double* o) { std::ranges::copy(b.u, o); });
+    return writeFoamField(dir, "U", 3, false, "[0 1 -1 0 0 0 0]", U, uB, 17);
 }
 
 // runFvComp's loop state: EVERY host variable the time loop carries from one
@@ -110,8 +162,9 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
     auto retarget = [&](double frac) -> std::expected<void, RunError> {
         for (std::size_t p = 0; p < fm.patches.size(); ++p) {
             if (fm.patches[p].type == FoamPatchType::Empty) continue;
+            if (fm.patches[p].type == FoamPatchType::Wedge) continue;
             const auto it = std::ranges::find(r.spec.patches, fm.patches[p].name, &FvPatchSpec::name);
-            if (it->kind != FvPatchKind::Far && it->kind != FvPatchKind::Inflow) continue;
+            if (it->kind != FvPatchKind::Far && it->kind != FvPatchKind::Inflow && it->kind != FvPatchKind::Total) continue;
             if (auto e = dev.setBc(int(p), fvBcOf(*it, r.fs, frac)); !e) return fail(6, e.error());
         }
         return {};
@@ -158,6 +211,9 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
     // uniform box) and I0 = SL/area.
     const bool areaCols = r.flame && r.turbSweep;
     if (areaCols) cols.insert(cols.end(), {"area", "I0"});
+    const bool shockCols = r.solver.shock.mode != ShockMode::None;
+    if (shockCols) cols.insert(cols.end(), {"shockCells", "byteMax"});
+    if (r.nozzle) cols.insert(cols.end(), {"mdotIn", "mdotOut", "Fwall", "Fin", "Fexit", "Cd", "Cf"});
     if (auto e = out.declareSeries("stats", cols, r.label); !e) return fail(4, e.error());
     if (r.flame) {
         const std::string pcols[] = {"t", "x", "T", "rho", "u", "p", "Y", "omega"};
@@ -405,6 +461,7 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
         return {};
     };
 
+    long lastCells = 0;
     auto statsRow = [&](double dt) -> std::expected<void, RunError> {
         auto s = dev.surface();
         if (!s) return fail(7, s.error());
@@ -426,6 +483,27 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
                 if (!h) return fail(6, h.error());
                 row.push_back(double(*h));
             }
+        }
+        if (shockCols) {
+            auto n = dev.shockCells();
+            if (!n) return fail(6, n.error());
+            auto m = dev.shockByteMax();
+            if (!m) return fail(6, m.error());
+            lastCells = *n;
+            row.push_back(double(*n));
+            row.push_back(double(*m));
+        }
+        if (r.nozzle) {
+            auto mass = dev.patchFlux(0);
+            if (!mass) return fail(6, mass.error());
+            std::array<std::vector<double>, 3> mom;
+            for (int k = 0; k < 3; ++k) {
+                auto v = dev.patchFlux(1 + k);
+                if (!v) return fail(6, v.error());
+                mom[std::size_t(k)] = std::move(*v);
+            }
+            const FvNozzleRow z = fvNozzleRow(r.solver.bc, *mass, mom, F, *r.nozzle, r.solver.tr.gamma, r.solver.tr.Rgas);
+            row.insert(row.end(), {z.mdotIn, z.mdotOut, z.Fwall, z.Fin, z.Fexit, z.Cd, z.Cf});
         }
         out.row("stats", row);
         return {};
@@ -486,6 +564,18 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
     double& sweep = L.sweep;
     std::array<std::vector<double>, 3> turbU;
     std::vector<FvBc> turbRows(r.turbSweep ? r.turbSweep->points() : 0);
+    // --shock hll: default cadence until a cell is sensed, then every step. Off the
+    // checkpointed record: checkpoints are refused on this route.
+    bool shockHot = false;
+    double nextFoam = r.foamWrite;
+    auto writeFoam = [&]() -> std::expected<void, RunError> {
+        dns::FvState s, rr;
+        FvEval ev;
+        if (auto e = dev.evaluate(ev, rr); !e) return fail(6, e.error());
+        if (auto e = dev.download(s); !e) return fail(6, e.error());
+        if (auto e = writeFoamTime(fm, s, ev.bnd, r.solver.tr.gamma, r.solver.tr.Rgas, r.foamPrefix, t); !e) return fail(4, e.error());
+        return {};
+    };
     while (t < r.tEnd) {
         if (stopRequested()) {
             // SIGINT / SIGTERM with checkpoints on: keep this step boundary.
@@ -500,7 +590,11 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
         }
         // Collapse is relative: a real mesh's dt has no absolute scale.
         std::string diverged;
-        if (auto e = internal::recomputeDt(sinceDt, dtStab, r.dtRecompute, r.dtMargin, 1e-4 * dtFirst, [&] {
+        const int dtEvery = internal::shockDtEvery(r.shockDtAuto, r.dtRecompute, sinceDt, shockHot, t, [&] {
+            auto n = dev.shockCells();
+            return n ? *n : 0L;
+        });
+        if (auto e = internal::recomputeDt(sinceDt, dtStab, dtEvery, r.dtMargin, 1e-4 * dtFirst, [&] {
                 auto d = dev.stableDt({.cfl = r.cfl});
                 if (!d) diverged = d.error();
                 if (!d) return -1.0;
@@ -533,7 +627,7 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
             // then the open patches retarget.
             const double frac = rampFrac(t + dt, r.ramp), uNew = r.fs.U * frac;
             const double du = uNew - uCur;
-            dev.boost({du * dir[0], du * dir[1], du * dir[2]});
+            if (!r.nozzle) dev.boost({du * dir[0], du * dir[1], du * dir[2]});
             uCur = uNew;
             if (auto e = retarget(frac); !e) return std::unexpected(e.error());
         }
@@ -552,6 +646,10 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
         }
         if (out.wantsAnyFrame(t))
             if (auto e = writeFrame(t); !e) return std::unexpected(e.error());
+        if (r.foamWrite > 0 && (t >= nextFoam - 1e-12 * r.tEnd || t >= r.tEnd)) {
+            if (auto e = writeFoam(); !e) return std::unexpected(e.error());
+            nextFoam += r.foamWrite;
+        }
         if (!burning && !r.quiet && cad.printDue(step, t, r.tEnd)) {
             std::printf("step %ld t %.5g dt %.4g cd %.6f cl %.6f\n", step, t, dt, st.cd, st.cl);
             std::fflush(stdout);

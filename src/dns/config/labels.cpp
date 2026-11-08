@@ -36,6 +36,11 @@ double channelPRef(double reTau, double mach)
     return (ub / mach) * (ub / mach) / kGammaAir;
 }
 
+// What FV --shock appends: the background term runs on a silent run too.
+inline constexpr const char* kFvShockSuffix =
+    " [shock capturing: pressure-sensed two-point HLL (Davis speeds) + background D4 eps {:g} |u.S|: NUMERICAL "
+    "dissipation everywhere, not DNS; shock thickness is the mesh's]";
+
 std::string fvCompLabel(const Case& c, bool twoD)
 {
     const std::string mesh =
@@ -52,10 +57,14 @@ std::string fvCompLabel(const Case& c, bool twoD)
     const std::string model =
         c.compSteady ? ransRunLabel(RansModel::None, RansMode::SteadyExplicit)
         : c.lesLabel ? lesRunLabel(c.sgsModel, c.cs, twoD)
+        : c.shock == ShockMode::Hll ? std::string(c.inviscid ? "Euler" : "laminar")
                    : std::string("DNS") + (twoD ? " (2D: qualitative only, no vortex stretching)" : "");
-    return std::format("[FV path, {}, {}{}] compressible {}: Kennedy-Gruber face flux, least-squares gradients, "
-                       "SSP-RK3",
-                       mesh, fvPrecisionName(c.fvPrecision), c.compensated ? " compensated" : "", model);
+    const std::string sense = c.shock == ShockMode::Sense ? " [--shock sense: sensor only, the central solver bit for bit]" : "";
+    const std::string hll = c.shock == ShockMode::Hll ? std::vformat(kFvShockSuffix, std::make_format_args(c.shockEps4)) : "";
+    const std::string gam = c.fvGamma != kGammaAir ? std::format(" gamma {:g}", c.fvGamma) : "";
+    return std::format("[FV path, {}, {}{}] compressible{} {}: Kennedy-Gruber face flux, least-squares gradients, "
+                       "SSP-RK3{}{}",
+                       mesh, fvPrecisionName(c.fvPrecision), c.compensated ? " compensated" : "", gam, model, sense, hll);
 }
 
 } // namespace dns
@@ -103,6 +112,23 @@ std::string fvFlameLabel(const Case& c)
            fvTurbText(c);
 }
 
+namespace {
+
+// What --shock appends to a run label: DNS holds only where sigma = 0.
+inline constexpr const char* kShockSuffix =
+    " [shock capturing: pressure-sensed two-point HLL (Davis speeds), NUMERICAL "
+    "dissipation in sensed cells, shock thickness is the mesh's; central KG elsewhere]";
+inline constexpr const char* kShockSenseSuffix = " [--shock sense: sensor only, the central solver bit for bit]";
+
+std::string shockSuffix(const Case& c)
+{
+    return c.shock == ShockMode::Hll     ? kShockSuffix
+           : c.shock == ShockMode::Sense ? kShockSenseSuffix
+                                         : "";
+}
+
+} // namespace
+
 std::string flowRunLabel(const Case& c)
 {
     const bool rans = c.rans != RansModel::None;
@@ -147,6 +173,8 @@ std::string flowRunLabel(const Case& c)
     }
     if (wedge) return "DNS" + geo + std::string(kAxisymUnsteady);
     if (!geo.empty()) return "DNS" + geo;
+    if (c.shock != ShockMode::None)
+        return (c.lesLabel ? lesRunLabel(c.sgsModel, c.cs, c.grid.nz == 1) : std::string("DNS")) + shockSuffix(c);
     return {};
 }
 
@@ -408,7 +436,7 @@ std::string flameRunLabel(const Case& c)
                           c.grid.nz > 1 ? c.grid.nz * c.grid.hz : 0.0, false,
                           c.lmOpenY)
             : std::string()) +
-           lmTail;
+           lmTail + (c.chamberMode ? std::string() : shockSuffix(c));
 }
 
 std::string chamberRunLabel(const Case& c)
@@ -419,7 +447,8 @@ std::string chamberRunLabel(const Case& c)
            "position, NOT body-fitted; species flux zero through wall faces], "
            "injector = volumetric mass-flow source band" +
            (c.chamberReaction ? std::string()
-                              : std::string(" [--reaction off: inert]"));
+                              : std::string(" [--reaction off: inert]")) +
+           shockSuffix(c);
 }
 
 std::string wickRunLabel(const Case& c)
@@ -528,7 +557,10 @@ std::string describeChamber(const Case& c)
     const auto nz = isentropicNozzle(c.chamberMdot, sig * Tu, s.He, Tu,
                                      kGammaAir, kRgasBox);
     const double cb = std::sqrt(sig) / c.mach;
-    const double ue = nz ? nz->Me * cb : 0.0;
+    const std::string estimate =
+        nz ? std::format("  estimate   isentropic exit (T0 = Tb, p_e = p0): Me = {:.4g}, u_e = {:.4g}, p0/p_amb = {:.6g}\n",
+                         nz->Me, nz->Me * cb, nz->p0 / Tu)
+           : std::string("  estimate   choked: no subsonic isentropic exit (captured, --shock hll)\n");
     return std::format(
         "case:\n"
         "  mode       closed 2D combustion chamber (dns flame --mode chamber)\n"
@@ -549,8 +581,7 @@ std::string describeChamber(const Case& c)
         "(etaIn {:.4g}), p = p0; sink {} cells, amp {:.3g}\n"
         "  IC         cavity fresh up to the holder base, burnt behind it "
         "(oracle profile), at rest, p0\n"
-        "  estimate   isentropic exit (T0 = Tb, p_e = p0): Me = {:.4g}, u_e = "
-        "{:.4g}, p0/p_amb = {:.6g}\n"
+        "{}"
         "  run        tt = {:.6g} flame times  cfl = {:.3g}\n"
         "  label      {}\n"
         "  out        {}\n",
@@ -559,8 +590,7 @@ std::string describeChamber(const Case& c)
         c.grid.ny * c.h, s.Lc + s.Ln, s.Hc, s.xb(), s.tw, s.Ln, s.He, s.xe(),
         s.Hc / s.He, s.xg, s.Hg, s.xBase(), s.xb() + s.wInj, c.flameUIn,
         c.chamberMdot, c.chamberRamp, c.chamberCoflow, c.nscbcEtaIn,
-        c.nscbcSink, c.nscbcSinkAmp, nz ? nz->Me : 0.0, ue,
-        nz ? nz->p0 / Tu : 0.0, c.ft, c.cfl, chamberRunLabel(c), c.outPrefix);
+        c.nscbcSink, c.nscbcSinkAmp, estimate, c.ft, c.cfl, chamberRunLabel(c), c.outPrefix);
 }
 
 std::string describeLowMachBunsen(const Case& c)

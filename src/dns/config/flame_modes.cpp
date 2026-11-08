@@ -101,12 +101,17 @@ std::expected<Case, ConfigError> finishChamber(const RawConfig& r, Case c)
     const double Tu = c.flameTu, sig = c.flameModel.sigma;
     auto nz = isentropicNozzle(c.chamberMdot, sig * Tu, s.He, Tu, kGammaAir,
                                kRgasBox);
-    if (!nz)
+    const bool capture = r.shock == ShockMode::Hll;
+    if (!nz && capture)
+        c.warnings.push_back(std::format("the nozzle chokes ({}): the sonic throat is captured, the isentropic "
+                                         "estimate does not apply",
+                                         nz.error()));
+    if (!nz && !capture)
         return bad(2, "--inject-speed", std::format(
                        "chokes the nozzle ({}): lower --inject-speed or "
                        "--nozzle-ratio, or raise --mach",
                        nz.error()));
-    if (nz->Me > 0.7)
+    if (nz && nz->Me > 0.7 && !capture)
         c.warnings.push_back(std::format(
             "the isentropic exit Mach is {:.3g} (> 0.7): the central flux has "
             "no shock capturing", nz->Me));

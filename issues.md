@@ -1397,6 +1397,419 @@ Measured gfx1100 via simjob, 2026-10-28, defaults (4 cells/δ_th) and the
   0.344% → 0.357% → 0.361%); the quoted 6.7% / 0.36% are the [75, 80]
   values. tt 80 does not show a flat envelope.
 
+### Shock capturing (`--shock`, docs/shock.md)
+
+Plan: `plans/masterplan_shockflux.md`. [R] = its NumPy review harness, no GPU.
+Baseline at 644e596: `dns bench --physics compressible --n 256` 20.24 ms/step,
+1.46 GiB; `dns flame --mode chamber --tt 3` 0.42 ms/step (gfx1100, `--bench`).
+
+- S1. **KG is not pressure-equilibrium preserving.** `rm ua em` with
+  `e = E/rho` gives `p/(gamma-1) (rho_a + rho_b)(1/rho_a + 1/rho_b)/4 !=
+  p/(gamma-1)` at a density jump. Density ratio 10, uniform p, u, 200 cells,
+  KG alone, max dp/p [R]: M 0.02 sharp 3.93e-2, tanh 2 cells 5.24e-4; M 0.3
+  sharp 0.51, tanh 2 7.6e-3; M 1 sharp diverged, tanh 2 4.25e-2; M 3 sharp
+  diverged, tanh 2 0.10. A supersonic contact kills KG with no shock in
+  sight. The pressure sensor rescues the sharp case (M 1: 0.23, M 3: 0.59),
+  stability rather than accuracy. Bears on C2 (Tmax above Tb) and every flame
+  run. A PEP flux (KEEP-PE, Shima, memory) would fix it at the root but moves
+  every anchor: not in this cycle.
+- S2. **Outflow rc 7, not understood.** `dns: stable dt is not finite and
+  positive (the state diverged)`, exit 7, from starting vortices at the
+  outflow. From the brief: `--inject-ramp 4 --coflow 12` fails; `--downstream
+  80 --inject-ramp 4 --coflow 6` passes; the sigma 10 chamber default
+  diverges. `--shock` is masked on the rows and no evidence ties this to a
+  shock. Candidates, unseparated: NSCBC at a vortex crossing, the coflow
+  ratio, `--inject-ramp`, sink. Not a threshold to tune. Measured with `--shock
+  sense` (central solver, step 3): `flame --mode chamber --expansion 10 --tt 60`
+  exits 7 with `dns: chamber state is not finite at t=14.79 (diverged)`, not the
+  brief's dt text; the open-row |u_n|/c reads 0.36 at t 13.7, 1.45 at t 14.74,
+  max sensed cells 30, then 111, then 148 at t 14.78, all but 2 outside the
+  cavity. `flame --mode chamber --tt 60` (sigma 5) runs, open-row Mach max 0.383.
+  **Step 9's reruns, the corrected flags (A8): base `--mode chamber --expansion 10
+  --cells-per-delta 6 --inject-speed 4`.** `--inject-ramp 4 --coflow 12 --tt 30`:
+  none rc 7, `dns: dt collapsed -- the state diverged` at t ~4.98, the original
+  failure, reproduced; hll rc 7, `dns: supersonic flow on the open row at t=16.59
+  (|u_n|/c = 1.01): the NSCBC boundary is subsonic only (docs/shock.md)`, 530 x 228,
+  1753 cells (1.45%), so `hll` carries it 11.6 flame times further into the guard. `--downstream
+  80 --inject-ramp 4 --coflow 6 --tt 80`, 770 x 228: none rc 0; hll rc 0, 332 cells
+  (0.19%), Me max 0.696 vs 0.728, exit-column local Mach max 0.741, 16 cavity cells
+  off Exit. Base alone (the sigma 10 default at 6 cells, tt 60): none rc 7, `dns:
+  stable dt is not finite and positive (the state diverged)` at t ~9.66; hll rc 7,
+  `dns: supersonic flow on the open row at t=9.614 (|u_n|/c = 2.27): the NSCBC
+  boundary is subsonic only (docs/shock.md)`. So `--shock hll` does not cure the
+  outflow divergence, as the plan expected.
+  **Separate datum, sigma 5, 4 cells, 364 x 152, NOT the original failure:**
+  `--inject-ramp 4 --coflow 12`: none rc 0; hll rc 7, `dns: supersonic flow on the
+  open row at t=52.28 (|u_n|/c = 1): the NSCBC boundary is subsonic only
+  (docs/shock.md)`. Under `sense` (no D, the none solver) the open row never reads
+  1 at stats cadence: max 0.953 at t 9.18, 0.762 in t 48-56. So at t 52 the sonic
+  row is `hll`'s trajectory, not inherited there; it had reached 0.95 at t 9 without
+  D. Stats cadence, so a shorter excursion is not excluded. Mechanism not separated.
+  Sigma 10, 4 cells: `--expansion 10`: none rc 7, `dns: chamber state is not
+  finite at t=14.79 (diverged)`; hll rc 7, guard at t=12.95, |u_n|/c = 1.01.
+- S3. **The staircase at M > 1.** Input to the geometry cycle. M 3 over
+  blocked cells, `kWallRhs` rule, no ghost image [R]: exact p2/p1 vs mean wall
+  p: compression 10 deg ny 60 2.054 vs 2.096 (18% marked), ny 120 1.992 (9.5%);
+  compression 5 deg ny 60 1.454 vs 1.694 (25%); expansion 10 deg ny 60 0.431
+  vs 0.631 (14%), ny 120 0.461 (8.6%); expansion 5 deg ny 60 0.668 vs 0.808
+  (13%). Every stair is a shock or fan source. A diverging nozzle is the
+  expansion row: +46% at ~50 cells of wall, +7% at ~100. Gentler walls are
+  worse per stair. A CD nozzle needs >= 100 cells along the diverging wall, or
+  a body-fitted mesh. Where the CD nozzle lives (FV vs structured curvilinear)
+  is raised at the geometry cycle: masterplan_shockflux section 11.
+- S4. **Gate 5's first bracket was the wrong sensor's.** Masterplan section 3.2
+  quotes the moving-shock ringing of `S3` with 6-neighbour dilation
+  (`Cfg.dil='cell'`, FP64: Ms 1.2 0.033, 1.5 0.045, 2 0.027, 3 0.017, 6 0.010);
+  decision 5 ships axis dilation. Host port (`shockflux_weak`, FP32): 0.0607,
+  0.0061, 0.0092, 0.0150, 0.0127; the review harness at `dil='axis'`, FP32:
+  0.0608, 0.0061, 0.0092, 0.0152, 0.0128. Ms 1.2 missed the first band 0.06.
+  Not a port bug. Amendment A3: the user set the Ms 1.2 band to 0.07 with the
+  axis brackets in gate 5; no other band moved. Not a device re-baseline.
+  **Amendment A5 (user decision): FP32 gates are control-relative.** Rerun: gate
+  15 passes, near-vacuum rungs at 2 x the rung's host FP32 vs FP64 gap. Gate 22
+  passes: controls are the same model, no --shock, a smooth wave driven at the
+  shock run's own dt sequence, equal steps. LES mass 3.23e-5, E 8.70e-6 vs
+  control 3.63e-5, 1.81e-5 (ratio 0.89, 0.48, 5290 steps: the LES dt is ~10x
+  smaller); plain 2.83e-6, 1.01e-6 vs 3.71e-6, 1.98e-6 (0.76, 0.51, 503 steps);
+  compensated 1.01e-8, 5.20e-9 (absolute, control 2.34e-10, 2.74e-10). The cause
+  of the plain FP32 drift stays UNPROVEN (FMA, the second write on a sensed cell
+  are candidates, neither tested); the controls show only that the untouched
+  solver drifts as much at the same steps.
+  **Device numbers, step 4, first run: gates 15 and 22 failed as first written.**
+  Gate 15, N 200, device vs host FP32 twin (relative L1 rho; band 1e-5): Sod
+  5.97e-7, Lax 3.85e-6, 1-2-3 2.86e-6, blast 3.23e-6, M3 1.02e-6, p ratio 1e5
+  3.16e-6, coll 1.82e-7 pass; the near-vacuum rungs fail: u +-5 2.33e-5, +-8
+  2.42e-5, +-16 5.75e-5 (rho min ~1.5e-3). The host's own FP32 vs FP64 on those
+  rungs: 1.83e-5, 2.13e-5, 3.68e-5, so the band sits under the FP32 rounding
+  scale of a near-vacuum state. Step counts equal, rho, p > 0 everywhere.
+  Gate 22, periodic double shock, FP32, 400 x 4, t 0.1 (band 1e-6): plain mass
+  2.83e-6, E 1.01e-6 (prototype 3.1e-7, 3.7e-7: 9x, so section 8's re-baseline
+  stops); LES (Cs 0.17, mu 0) 3.23e-5, 8.70e-6; compensated 1.01e-8, 5.20e-9
+  pass. Host FP32 twin on this IC 9.11e-8, 1.64e-7. Control, no --shock, a
+  smooth wave at the same step scale, 0 sensed: device KG mass 3.93e-6, host
+  1.02e-6. So the plain device stage write drifts this much on its own: the
+  correction's rhs is conservative (compensated 1e-8) and the plain FP32 stage
+  (FMA, two writes on a sensed cell) is what the band meets. Cause not proven.
+  Passed at step 4: gate 16 Shu-Osher N 400 5.26e-6; 19 Quirk vmax/S 1.19e-5,
+  spread 0, standing M 5 7.9e-5; 20 vortex N 160, 320 0 sensed, bytes equal,
+  order 1.995, N 80 1.224 x KG; 21 contact, M 1 .225, M 3 .593; 26 extrusion
+  and permutation bitwise.
+- S5. **Wrinkled flame v_max: 9.03e-4** (5.56e-4 past t 1), `--shock sense`,
+  `--turb 1 --turb-length 1 --cells-per-delta 4 --ny 24 --nz 24 --upstream 6
+  --downstream 4 --tt 3` (M 0.01, default; 0 cells sensed). In burning cells
+  2.38e-4 (rerun after A1: the same). One short box; not a developed brush.
+- S6. **3D CFL bracket on the device.** 64^3, every-step dt, hot from step 0: blast
+  and diagonal Sod from rest run at cfl 0.4 AND 0.5 (rho min 0.0614, 0.125; 0.0616,
+  0.0821), so the review's "0.5 fails all 5" (N 48, FP64) did not reproduce on
+  these 2 cases. Upper bracket unmeasured on the device; the cap stays 0.4.
+- S11. **Gate 29 FAILED on both boxes; the plan stopped at step 9.** Long box as
+  written (A8), `flame --mode chamber --expansion 10 --inject-speed 8 --downstream
+  80 --inject-ramp 4 --coflow 6 --shock hll --tt 20`, 524 x 152: rc 7, `dns: stable
+  dt is not finite and positive (the state diverged)` at t 10.76, not the guard's
+  text; open-row Mach 0.727 on the last row and its max; pMin 1933 -> 938 over the
+  last 4 rows, rhoMin steady 0.1415; 14 cavity cells off Exit (band 0) from t 4.69.
+  The throat does NOT choke: Me max 0.649, exit-column local Mach max 0.681,
+  p0Noz/pAmb max 1.693. Cell not located on the long box; the same signature as
+  the short box.
+  Short box, first form, located with a temporary per-step diagnostic (removed):
+  under `hll` the jet's head reaches x-hi and the state fails ON THE OUTFLOW ROW:
+  i 363 (last row), sink band, no wall within 2, ambient region, not lip, not
+  stair; local |u|/c 0.92, 1.03, 1.10 at the row at t 5.35, 5.60, 5.82, pMin 273
+  at (363, 51) at t 5.8228; first NaN at t 5.8233, read at (0, 50) across the wrap.
+  The guard samples |u_n|/c at stats cadence: 0.906 was its max. Without D, under
+  `sense` (the choke refusal bypassed for this run only), it dies EARLIER and
+  ELSEWHERE: t 3.764, (323, 73..75), x 127, in the jet in the ambient, 25 cells
+  short of the sink, rho 5e-4, p < 0, first bad field p. So `hll` does not cause
+  the failure: it carries the jet head 1.4 flame times and ~90 cells further,
+  into the row, and the outflow takes over (S2). Off-Exit cavity cells: i 185, 186,
+  j 65-67 and 84-86, the mirror pair at the nozzle wall 1-2 columns upstream of
+  the lips, wall within 2, omega/peak ~1e-16, T/Tu 10.6-10.9: burnt gas at the
+  contraction's last stair, no flame there. They are the lip's neighbours as the
+  exit speeds up, bytes 7 to 77 at the first rows. Mass balance read only at rc 0.
+  Long box located (step 9b, temporary per-step diagnostic, removed): ON THE ROW,
+  (523, 46) of 524 x 152, x 205.52, y 18.26, no wall within 2. Row |u_n|/c max
+  0.725 at t 10.704, 0.727 at t 10.761 with p at that cell already 881 (pMin 1934
+  before), then 817, 744, 660, 557, 424, 203 one step apart, t 10.7608 to 10.7640;
+  local Mach 0.959 at 424, 1.835 at 203 (row |u_n|/c 1.547); first NaN t 10.7645,
+  read at (0, 45) across the wrap. The collapse STARTS BELOW M 0.8, the bottom of
+  A9's blend: `Super` is the shipped row until the cell is already falling. Whether
+  A9 cures it is unmeasured: gates 29, 29b not run (S13).
+- S13. **Step 9b stopped at gates 33 and 34.** Build, guard and A9's kernel done
+  (`kNscbcCells<..., Super>`, `shockRowGuard` at the dt cadence). Gate 32 bytes, 13
+  rows, sense, quiet: pass. Gate 35 pass: left behind Ms 2 1.116e-2, Ms 3 1.595e-2
+  of the jump, sink off 1.366e-2, 1.680e-2, shipped row 2.925e-2, 4.302e-2. Gate 30
+  pass. Gate 33: all four pulses leave at <= 8.2e-4; FAILS its teeth at M 3 entropy,
+  Super 8.171e-4, shipped 8.159e-4: rig has `pInf = p0`, so an entropy pulse leaves
+  Lin 0 and the true L1 0, and the two rows are the same row by construction; the
+  8e-4 is the interior's dispersive tail, before-exit error 7.0e-3, not the row.
+  Report-only rerun at pInf/p 0.8, 1.25: Super unchanged to all digits, shipped
+  3.8e-2 to 9.6e-2, 51 to 484 x worse: the teeth live in a back pressure the jet
+  does not match, not in the pulse. Gate 34: fails at N 400 M, 2.74e-5 against 2 x
+  held 7.40e-6; N 200 passes. Held M error is not monotone, 2.66e-4, 7.00e-5, 7.40e-6,
+  1.88e-5 at N 100, 200, 400, 800, and held p falls to 5.6e-7 at N 800: FP32 noise
+  under a higher-order held row, while the row is first order on purpose (Super M
+  2.27e-4, 5.80e-5, 2.74e-5, 1.06e-5; p 6.39e-4, 1.63e-4, 4.79e-5, 2.62e-5).
+  Shipped row 1.85, 2.66 in M at N 200, 400. Both gates need a ruling: neither band
+  nor rig was changed after the failure. Ruled (A10): gate 33 pass, 7.517e-4,
+  1.732e-4, 8.171e-4, 1.584e-4; Super at pInf/p 0.8, 1.25 unchanged, shipped 51 to
+  484 x. Gate 34 pass, order N 200 to 800 M 1.23, p 1.32. The extrapolated reference
+  quoted in A10 and S13's first form, M 3.2e-4, 1.6e-4, was NOT that row: a test bug,
+  the rig's march died after one step (`dt 0 at t=0.0006997 step 1`, the stage hook
+  acts on a stage's input, so stableDt read rows 0, nt - 1 with the wrap's flux, E < 0)
+  and nothing checked it. Fixed: M 1.697e-3, 8.609e-4, 4.220e-4; p 8.321e-3, 4.217e-3,
+  2.109e-3 at N 200, 400, 800.
+- S14. **Gate 29 FAILED on the Super build: a SUBSONIC row collapse, A9 is not the
+  fix.** Long box unchanged: rc 7, `dns: stable dt is not finite and positive (the
+  state diverged)` at t 10.76, Me max 0.649, MexitMax 0.681, p0Noz/pAmb 1.693, 58
+  cells 0.073%, no choke; the failure time and numbers of the build before A9. Trace
+  of the row's lowest-p cell (temporary diagnostic, removed): no row cell has Mn > 0.8
+  at t 10.7634 (Mn max 0.756); 2 cells at t 10.7640, the last step. The cell is NEAR-STAGNANT on the row with the jet's flow
+  running ALONG it: (523, 43), y 17.08: t 10.61 Mn 0.011, v -8.15, rho 1.01, T/Tu
+  1.09; t 10.71 Mn 0.001, v -12.59, rho 1.60, T/Tu 0.70. Then (523, 46), y 18.26: t
+  10.748 Mn 0.059, v -6.66, rho 6.88, T/Tu 0.130, p/p0 0.89, the first row cell under
+  0.9 p0. T/Tu 0.13 is far below any fluid in the box (Tu is the coldest): an
+  unphysical heavy cell built on the row, p about 1.1 p0 throughout, the neighbour
+  i 522 at 1.21 p0. From it the cell empties outward: Mn 0.11, 0.17, 0.23, 0.34, 0.45,
+  0.76 at p/p0 0.80, 0.67, 0.58, 0.46, 0.37, 0.24 (t 10.7528 to 10.7634), then Mn 1.56,
+  M 1.85, p/p0 0.11 at t 10.7640, one step before the NaN. Lin 5e2 against the true
+  L1 3e4, the transverse term 100 x the relaxation.
+  Reading (not proved): rho and T pile up on a row where un ~ 0 turns off L2, L3, L4
+  (all proportional to un), the sink and D do nothing there (D masked, sink under
+  the overwrite), and the row's only y transport is the central flux. No `Super`,
+  no term past M 0.8 reaches it. A design decision, not a tuning. **That reading is
+  superseded by S15**: the row's lowest-p cell is the end of it, not its start.
+- S15. **The row collapse is BACKFLOW through x-hi: L2's downwind difference, not a
+  contact sliding along the row. `kShockRow` not built (A12 step 2 stopped).** Trace
+  of the row's COLDEST cell from t 0, long box (temporary diagnostic, removed): row
+  T/Tu 1.04 at t 8.53, then 0.82, 0.62, 0.475, 0.36, 0.28 at t 8.82 to 9.22, 0.13 at
+  9.54, 0.012 at 10.69; that is the mirror pair j 37..45 and 105..110, y 14.7..17.9
+  and its image. Backflow all the way, rate of rho per unit time against L2's:
+  t 8.80 un -8.15, inner -8.02, rho 1.38 (inner 1.21), L2 +2.62, transverse -0.61;
+  t 9.21 un -5.95, rho 4.14 (3.33), +2.99, -0.23; t 9.81 un -4.00, rho 16.5 (13.5),
+  +1.83, -0.69; t 10.6 un -1.41, rho 72.2 (54.3), +0.99, +1.53. Measured e-fold of T
+  from the list above, 0.38 t: rate 2.6. So L2 = un (c^2 dr - dp) at un < 0 is a
+  DOWNWIND difference, d ln(rho)/dt = |un| (rho - rho_in)/(h rho): the row cell runs
+  away from its neighbour and the backflow carries it in (the inner cell tracks it).
+  comp_nscbc.hip's "Deliberately NO backflow model" comment measured a rig to 4 x
+  freestream swirl; here backflow of 1.4 to 8 S_L is sustained over 2 time units,
+  against coflow +6, and rho reaches 72. Why the flow turns inward there is not
+  measured. S14's cell (523, 46) is where the heavy cold pool's p finally lets go.
+  Row sensor, stride along the row, on the same run: max 0.0010 at t 9.02 when T/Tu is
+  already 0.475, 0.0061 at t 9.74 (T/Tu 0.09), first reaches th1 0.02 at t ~10.08,
+  T/Tu 0.05. Does NOT fire in time; a density term or a lower th1 was ruled out, and
+  HLL on transverse faces would not touch an L2 runaway in any case.
+  Gate 36(a), `test_gpu_shock outflow_contact_a`, 96 x 152, h 0.392589, p0 1785.71,
+  mu 0.72, sink 16, slab T/Tu 10, 60 cells deep, u 0, 5 transits, no adjustment: V 20
+  (M 0.4 on the cold gas): collapse, row T/Tu 0.009, p/p0 0.063, `dt 0 at t=11.84
+  step 12496`, first T/Tu < 0.5 at the row (i 95) t 9.08, p/p0 0.965, Mn -0.273: in
+  BACKFLOW, as above; gap 20 control min T/Tu 0.908, no collapse. V 10 (M 0.2): no
+  collapse, row T/Tu 0.846, p/p0 0.837, control 0.918. The rig's sensor fires at t
+  0.013 only because the IC is a one-cell jump, peak 0.71. So 36(a)'s signature holds
+  at M 0.4, not at M 0.2, and its un < 0 at the onset points at S15's mechanism too.
+  `kNscbcCells` stays as A9 left it; a backflow form for L2 to L4 is a "Not edited"
+  decision and CLAUDE.md's "no backflow model" invariant is measured against it.
+- S16. **Gate 36(b) FAILED on its bitwise clause; the shipped re-carry is not bitwise
+  under a transverse jump.** A13's blend built in `Super`. On the V 20 rig (DNS,
+  `--shock hll`, uniform Y 1/2, chamber hook order), 10 transits: rho, p > 0, row
+  T/Tu min 0.720 (shipped 0.009, collapse): the collapse is cured there. But row p/p0
+  min 0.124, rho 0.036, box p/p0 min 0.098, unexplained, no band on it; 66.3% of row
+  samples in backflow, 0.36 of a box at rho 1 taken in. `rhoY == Y rho` on the row: off
+  on 176409 of 206720 row samples, max |Y - 1/2| 1.766e-6, about 30 ulp, first at
+  step 2 to 3 on i 95 only, 1 ulp (rhoY 1.99b6a8p-5 vs 1.99b6aap-5), at j beside the
+  contact. NOT the blend: the same rig on the shipped row is off from step 3, 87919 of
+  95000, max 2.220e-6 at 3 transits, with sink off, shock off and mu 0 each too.
+  `kSpeciesOpenFix`'s `y / rs * oRho` holds Y to the bit only while `y` is exactly
+  half of `rs`; a row with a strong transverse mass flux breaks that by rounding.
+  Which rounding is not isolated. Gate 23 stays green: its rows see no transverse
+  jump. CLAUDE.md's "exact to the bit through every stage, hook and band" is
+  untested against this case. `kSpeciesStage:247` already carries `yIn` on backflow
+  at x-hi, and the chamber's `yIn` is 0, so ambient Y needs no kernel change.
+  `rTgt` on the chamber is `rhoI` = 1 (with `--nscbc-tinflow`, p/(R Tu)): cold ambient.
+  Ruled: gate 36(b) is control-relative, row |Y - 1/2| <= 2 x shipped at 3 transits,
+  where both rows live (the shipped row collapses in transit 4): 1.766e-6 against
+  2.220e-6, pass. OPEN: `kSpeciesOpenFix` is left alone this cycle, and CLAUDE.md's
+  "exact to the bit through every stage, hook and band" is NOT true on this rig.
+- S17. **Gate 29 on the blend build: the row collapse is cured; two clauses and the
+  mass clause fail, none on the row.** Long box, DNS + `--shock hll`, tt 20: rc 0,
+  t end 20, at most 224 cells sensed (0.28%; 90 at stats rows). Row (temporary
+  diagnostic, removed): backflow 12 cells at t 8.1, un min -2.53; 30 at t 9.1, -5.37;
+  none from t 10.1 on, which reads as the jet head's passage, not sustained
+  entrainment (S15's reading), unproved. Row rho max 1.21 (was 72), T/Tu min 1.05
+  (was 0.012), row Y 0 to 1.6e-3: bounded, near ambient. `Super` acted: row Mn max
+  1.034 with 6 cells M >= 1 at t 17 to 18.5 (openMach 1.03), 18 cells above 0.8.
+  pMin/p0 stays >= 0.87: rig's dip to 0.124 does not appear.
+  Throat: Me max 0.791, MexitMax 0.824, p0Noz/pAmb max 2.54 at t 15.9, 2.04 at t 20:
+  NOT choked, and unsteady: p0Noz/pAmb 1.81 at t 12.9 rises to 2.54 in 3 t, then falls.
+  Clause 1, burning: 36 sensed cells at most, t 13.4 to 15.4, 0 elsewhere. Clause 2,
+  cavity past Exit's 3 columns: 2 to 12 cells from t 12.9, all at i 182, 183, 4 and 5
+  columns upstream of Exit 187. All wall <= 2, region Cavity, mirror pair j 63..66 and
+  85..88: the contraction's last stairs. The sensor reads the stair, not the flame:
+  at t 12.86, Y 0, T/Tu 9.6, omega 0: (183, 64) byte 2, vx 0.0202, p[i-2..i+2] 3162
+  3104 3077 2767 3246. From t 13.4 unburnt gas reaches those stairs (Y 0.1 to 0.7,
+  T/Tu 3 to 9.6) and burns ON them, omega/peak 0.01 to 0.76, bytes 5 to 255, vx 0.02
+  to 0.21, vy 0.007 to 0.08; (186, 65) p[i-2..i+2] 3204 3197 3514 2655 1649. Sensed
+  burning cells, samples by column i 182..188 over the run, listing capped at 10 per
+  row: 8, 9, 18, 21, 17, 6, 2; of all listed, none off a wall.
+  Mass clause, as coded mdotNoz/mdotIn over the late half: 0.819, mdotNoz 120 to 174
+  against 188.4: the cavity is not steady at tt 20, p0Noz moves 20% in 5 t. That clause
+  assumes a steady exit it does not have here; no storage column to close it with.
+  Y outside bounds: 1 to 249 cells, i >= 38 on the diagnostic, never on the row.
+  Inject 4, tt 20, both exit 0: `yHits` none max 68 mean 14.9, hll max 56 mean 14.0:
+  `--shock hll` does not add them.
+  A14: the burning and window clauses stay UNMET (a real limit of D on a staircase;
+  the fix is a body-fitted wall). The mass clause became the exact budget: domain mass
+  change against the integrals of inflow, injection and outflow. It needed the flux
+  through the END FACES: `1.5 row - 0.5 inner`, what a one-sided LODI row telescopes
+  to; the row's own rho u read -1.68e-3, this -9.4e-4 of 3392 injected.
+- S18. **The chamber chokes, on the long box, and blows off.** DNS + `--shock hll`.
+  p0Noz/pAmb 2.5 at exit Mach 0.82 is RESOLVED: the sonic line is past the geometric
+  throat, which is the exit column i 187, 20 cells. At t 16.2, inject 8: throat MThroat
+  0.820, isentropic p0/pa 2.37, static p/pa 1.56, so the exit is not at ambient: the
+  jet expands past it, `MJet` 1.38. The lip's stair contracts the jet (a vena
+  contracta); the axis is M 0.78 at the exit and passes 1 about 5 columns on. So the
+  flow is sonic downstream of the exit well before `MexitMax` reads 0.98.
+  Inject 12: never choked, exit 8 at t 27.4. Inject 16: choked, longest span 5.13 from
+  t 26.9, 24.4 in all; exit 8 at t 53.97. Inject 20: 2.07 from t 18.07, exit 8 at t
+  20.14 (at tt 20, 1.93). Inject 24 is past `--inject-speed`'s cap, 20. Each exit 8 is
+  the same guard, `dns: blow-off: 0.502 of the injected fuel leaves through the nozzle
+  at t=20.14 (lower --inject-speed or raise --holder-height)`, not the solver, and
+  raising the holder made it earlier: 16, `--holder-height` 7: t 24.37. So no settled
+  or periodic state was reached: UNMET. The late chamber is a pressure surge of ~8 t
+  with outNoz/inj 0 to 0.5, and at inject 16 p0/pa keeps climbing, mean 5.73, t >= 40,
+  range 4.83 to 7.34, against the burnt choked value 5.2 from mdot (48 per unit
+  throat height, sqrt(R T_b) 133, /0.685).
+  Jet structure, inject 16, t 50: axis M to 2.56, a Mach disk ~65 columns past the
+  exit, axis M 0.94, p/pa 0.29 to 2.75 across it, then a second cell to M 2.11, sensed
+  cells per 10 columns past the exit 122 25 0 9 76 66 177 58, then 2 45, 26 53, 54 at
+  the later cells. Inject 20, t 20:
+  M 2.26 to 1.04, three cells. Sensed: inject 16, t >= 40, 1.24% mean, 2.1% peak.
+  Row: openMach max 2.0 (inject 16): `Super` carries it.
+- S19. **Gate 31's sensed rig is UNMET.** Quiet `hll`, `dns bench` 256^3: 22.64 against
+  20.92 ms/step, +8.2%, pass; 1.49 GiB. Default chamber 0.56 against 0.47, +19%, on a
+  case that is not quiet (lip, S7). Rig with 9.38% sensed, band +40%: +82.1%, +131% on
+  a rerun (off 10.27, 10.51; hll 18.70, 24.28: the inviscid baseline is half of
+  `dns bench`'s and the hll number moved 30% between runs), viscous pair +42.7%, 20.20
+  to 28.83. Budget: ~1.7 ms/step quiet overhead, ~6.7 ms/step `kShockFaces` over 3
+  stages at 2 evaluations per face. Levers: sense + mask in one launch cannot be done
+  (the mask reads neighbours' bytes, a race in one launch), the zero-sensed skip acts
+  on quiet runs only. A per-face buffer would halve the evaluations, at memory and
+  launches beyond the plan: not built.
+- S12. **The chamber is not hot from step 0.** Default chamber, `hll`: hot at t
+  4.371, not 0 (A4, gate 27 state step 0). Under `sense` 58 cells read at t 0.027;
+  under `hll` 0 at that row with dt already moved at ~t 0.3: D fired between the
+  16-step cadence checks and damped the transient, so dt stayed on the default
+  cadence through it. Sigma 10: hot at 0.0151. Plan 5.5 accepts this latency.
+- S7. **Gate 14 failed: the plan stopped at step 3 by its stop rule.** Device,
+  `--shock sense`, M 0.02, 4 cells (FP32): planar sigma 5, 10 v_max 8.98e-4,
+  2.14e-3 (t 0..20, 0 cells sensed; prototype 3.12e-3 is the sigma 10 line). The
+  chamber's cavity reads 4.07e-2 at sigma 5 (t <= 60), 5.83e-2 at sigma 10 (t < 10)
+  against the stop value 0.0133. A design decision, not a threshold edit.
+  **Where**: exactly 2 cavity cells above th1 from t ~3 on, the mirror pair at
+  the nozzle lips, last column of the cavity: i 187, j 66 and 85 (x 75.08, the
+  exit x_e 75.28; region Exit). Peak list at t 60, sigma 5: 3.80e-2 those two,
+  then 1.48e-2 at (188, 65), (188, 86) in the ambient beside the lip. The first
+  version of this entry blamed the blocked read: WRONG, see the outcome below.
+  With no solid within +-2 on either axis, the cavity's largest
+  v is still at the lip column: i 185, j 66, x 74.28: 1.35e-2 at sigma 5 (t 60),
+  1.40e-2 (t 20), 1.43e-2 at sigma 10 (t 12), so the band fails there too, by
+  1.6-7.7%. **Upstream of the contraction (x < x_n), whole stencil, the
+  flame's own number: 3.31e-3 at sigma 5 (t 60), 1.31e-3 (t 20), 2.56e-3 at
+  sigma 10 (t 12)**: the prototype's 3.12e-3 holds, end-of-run snapshots only.
+  So the flame does not trip the sensor; the lip's subsonic corner does, at Me
+  ~0.4 (sigma 5). IC transient, t < 1: 58 cells sensed (66 at sigma 10), 2 (12)
+  in the cavity, max 3.39e-2 (3.10e-2). Under `hll` the two lip cells would
+  run at sigma 0.45 (v 3.80e-2) to 0.96 (v 5.83e-2) on their windows' faces,
+  every step, inside the nozzle's subsonic flow.
+  Options for the user (masterplan step 3): the stop rule's own (S2's `kap`
+  gate or a Mach gate plus triggers, or a higher th1 paid in weak-shock
+  quality), or read the gate in the flame only and mask the blocked read
+  (sigma 0 when a stride is blocked, or the lip's cells), which is not in the
+  plan. Steps 4-11 not run. Code past step 3 was written and removed unrun.
+  Sensor cost, `--bench`, `--shock sense` (raw v kept): `dns bench` n 256 21.59
+  vs 20.45 ms/step (+5.6%), 1.55 vs 1.46 GiB; chamber 0.45 vs 0.43 ms/step.
+  **Outcome after A1, A2 (blocked axis reads nothing): gate 14 (a) passes, (b)
+  fails, the plan stopped again at step 3.** Whole run, t >= 1, stats cadence:
+  (a) burning cells v_max: planar 8.98e-4, 2.14e-3; chamber sigma 5 4.18e-3
+  (t <= 60), sigma 10 6.83e-3 (to the rc 7 at t 14.79), band 0.0133. (b) cavity
+  cells sensed: 2 at both sigma; band 0. A1 changed neither lip reading: cavity
+  v_max 4.0735e-2 and 5.8278e-2, the same digits as before it, same cells:
+  (187, 66), (187, 85). The reason: the wall tip at the lip is ONE staircase cell,
+  (187, 65) (`_mask.bin`: solid at j 65 only at i 187; i 185..189 fluid on j 66).
+  Only the y axis is blocked; the x stride p[185], p[187], p[189] is whole and
+  reads across the exit plane, from inside the nozzle into the ambient. So the
+  reading is a true second difference of the pressure at the sharp lip of a
+  subsonic jet (Me ~0.4), not the first difference S7 first claimed. A1's stated
+  premise does not hold for these cells. Under `hll` they would hold bytes of
+  sigma 0.45-0.52 (sigma 5, v 3.80e-2..4.07e-2) and up to 0.96 (sigma 10), on
+  their windows' faces, every step: derived from v, `hll` was not run.
+  **Gate 14 (b) was rewritten after it failed** (masterplan amendments A2, A4):
+  its first form, 0 sensed in the whole cavity, failed on these 2 lip cells; it
+  now excepts the Exit column: 0 cavity cells off Exit past t 1, at most the 2
+  lip cells above th1. The gate moved to the failure; the failure stands as
+  measured. New gate 12b (bounds fixed before any `hll` run) decides the lips.
+  **A1 was reverted** (masterplan section 1): it changed neither lip reading
+  and cost near-wall faces (S8). The centre substitution of 5.3 is back; gate 14
+  rerun on it passes as rewritten: same (a) and (b) numbers as under A1.
+- S8. **Gate 24 passes after A1's revert and A7's rewrite of its test.** A7:
+  "crosses" is the exact passage, incident and reflected, from the exact shock
+  speeds: within +-4 cells of travel of each, any step with a jump > 10% needs a
+  nonzero window byte. 6 cases, unsensed 0 (faces crossed 16, 645; 16, 713; 16,
+  716). The first form, largest jump over the whole run, was rewritten after it
+  failed on 1 plateau-ripple face. History: A1 reverted after this entry's
+  failure; gate 24 then failed on 1 face, the test's proxy, not a missed shock. On the reverted
+  kernel, unsensed near-wall faces at 30 deg: Ms 1.5 1 of 667, Ms 3 0 of 717, Ms 6
+  0 of 717; 0 deg 0 of 16 each. Plateau -4.3e-4, -1.17e-3, -2.93e-3 (0 deg), -7.8e-3,
+  -8.3e-3, -9.3e-3 (30 deg), |fc| exactly 0. The one face, L (230, 47), y face, d
+  -0.0023: the test takes each face's largest jump over the WHOLE run; this
+  one's, 0.147, is at t 0.204, long after the incident passed (~0.11), in the
+  plateau: p 3.89 3.85 3.989 3.749 4.299 | solid, an odd-even wall ripple, v 0.013.
+  During the incident's own passage its top jump is 0.087 and its window byte
+  255. The gate's near-wall clause and test are unchanged; it stays FAILED as
+  coded. Whether "crosses" means the incident's passage is the user's call.
+  **The A1-era unexplained case, jump 1.1, LL with a whole y stride, byte 0: no
+  timing bug, no kernel bug.** Bytes and jumps are read from the same state in
+  the same step (`shockBytes` on the state the p comes from). Face L (208, 85), Ms
+  6, t 0.02664: p at(-3..1) 24, 19.7, 14.36, 10.88, 5.179; bytes 146 0 0 0 0. LL
+  = at(-1): v = |5.179 - 28.72 + 24|/(5.179 + 28.72 + 24) = 0.0079: the smeared
+  shock is a nearly LINEAR ramp over the stride, and the sensor is exact-zero on
+  linear by design. The jump-of-1.1 estimate of 0.2 assumed a one-face step. Only
+  at(-3), at the ramp's top, reads the curvature. A blocked cell with the centre
+  substitution reads the ramp as a first difference, which is what A1 removed.
+  First form of this entry, under A1 (all numbers below):
+  Ms 1.5, 3, 6 onto an immersed plane, sub-cell offset, ghost wall,
+  device. Passes: plateau p -5.3e-4, -1.14e-3, -2.93e-3 (0 deg), -7.7e-3, -8.1e-3,
+  -9.1e-3 (30 deg, 256^2), band 2%; |fc| exactly 0 everywhere; 0 deg: all 16
+  near-wall faces sensed. Fails: at 30 deg, near-wall faces the shock crossed
+  (jump > 10%) with sigma_f 0 at their largest jump: 48 of 714, 37 of 717, 19 of
+  717. They are y faces one cell off the wall (d -0.002 to -0.005, h 0.0039), jumps
+  0.12 to 1.1. Window read directly from the mask: on a typical y face R and RR
+  (and often L) have a solid within +-2 on both axes, so they read nothing; LL
+  keeps a whole y stride, x blocked, and read below th1 at that moment. One x face
+  had 2 whole-stencil cells and a 12% jump, below th1. So A1's "the cell 2 away
+  ... hands its byte to every near-wall face" does not hold on a slanted staircase:
+  the byte that would see the jump is the blocked cell's. Cause stated from the
+  sampled faces, not all 104 were inspected. The run stays stable and the plateau
+  is right; those faces run bare KG with `kWallRhs` beside them. Gate unchanged, a
+  design question. The closure, imperm, twoside tests with `enableShock` pass unchanged;
+  `gpu_nscbc_order`, `gpu_comp_sink` pass. Gate 22's zero through-wall mass reads
+  this rig's |fc| == 0.
+- S9. **Gate 25 redefined (A6): "in reach" had no definition.** First form,
+  blast slab p ratio 3, NSCBC + sink, 320 x 8: rows bitwise equal to off for 409
+  steps of 1177, then 1 ulp (1.49e-8) with the nearest sensed cell 12 rows off a
+  face: a difference made anywhere reaches a row at finite stencil speed, so
+  bitwise equality over a run proves nothing about the mask. A6's form passes: one
+  stage from one state with strong jumps at the open rows, testForce vs off, rows
+  0 and n-1 bitwise equal on all fields, rows 2, n-3 differ (teeth). Blast through
+  x-hi finite, open-row Mach max 0.616, max sensed 5.94%.
+- S10. **OPEN, solver defect without --shock: rhoY != Y rho at a solid.** Gate 23
+  under A6 passes: no solid, rhoY == Y rho bitwise (0 mismatches, 753 steps,
+  NSCBC rows, sink, species sink); with a solid, max |rhoY - Y rho|/rho 9.76e-7
+  (154631 mismatched cell-steps) vs no-shock control 9.65e-7 (131216), same 771
+  steps and dt, band 2 x. The control's magnitude is the defect: 9.65e-7, first
+  at step 1, i 217, j 11, the block's face, worst at step 389, i 217, j 13. Walled
+  species kernel vs `applyRhs` rho at a wall face. Not caused by `kShockFaces`;
+  `kWallRhs`, `applyRhs` and the walled species kernels were not touched.
+
 ## FaceMesh / FV path (`docs/mesh.md`, `docs/fv.md`, `plans/masterplan_meshsolver.md`)
 
 56. **The FaceMesh and the CPU FP64 FV oracle (its GPU family: item 78).**
@@ -2135,6 +2548,57 @@ FI3. **LES of the Boussinesq layer has no structured counterpart** (`dns conv --
     exists (MAC LES runs only around a body in runner_incomp). Not measured.
     The interior nuFlux column is resolved + molecular (no SGS heat flux); the wall columns
     are exact (walls carry no nut_f).
+
+### Converging-diverging nozzle (`docs/nozzle.md`)
+
+Plan: `plans/masterplan_cdnozzle.md`, amendments at its top. T1 holds: device vs rhoCentralFoam
+at sigma 1 to 3.4e-13 of scale on every cell, shock and wedge included.
+
+- Z1. KG vs MUSCL in smooth flow, band vs limiter at a shock: T2 is a gap, order quoted. **G23's
+  order >= 1 is UNMET** on two levels: A vol L1 p 0.59, wall 0.53; B 0.70, 0.74; every 160 band met. The
+  gap past x 1.5 is a flat offset, see Z4. 640 foam cut: dns alone there, Cd 0.995697, 0.995727, 0.995741,
+  Cf 1.440293, 1.440341, 1.440369 at 160, 320, 640.
+- Z2. Wall `p_P` first order in both solvers; viscous inlet face absent (`Total`), foam has one.
+- Z3. `Slip` vs `wedge` rotation: `cos(dphi/2)` on laminar gradients.
+- Z4. Foam's non-settling at vanLeer, cause not measured (A3 E4). Measured here on case A: in the
+  supersonic cone foam's p0 error is -1.6e-3, -9.7e-4 at 160, 320 (order 0.74) and its T0 error -3.4e-4,
+  -2.4e-4; dns -3.4e-4, -6.9e-5 (order 2.3), T0 5.5e-6, 1.7e-6. So the flat +2e-3 wall offset past x 1.5
+  is mostly foam's. Its cause inside foam (Euler in time on a low-dissipation flux?) is not proved.
+- Z5. Axis focus: a pointwise axis M is no parity number. B exit axis M gap 9.6e-3, 1.40e-2 at 160, 320: it
+  grows; vanLeer vs Minmod 1.2e-2, 4.0e-3. Cause open.
+- Z6. Post-shock wall p0 3.0% gap [A1]: unexplained, not re-read by a gate.
+- Z7. LTS on `Total`: stall [R] vs A2's 2.3e-12 on Riemann: open, `--steady` refused meanwhile.
+- Z8. Structured steady odd-even: gate 34's order 1.23 may be the same mode: unproven. No structured D3.
+- Z9. Foam's one-row L1 p 2e-3 vs dns 4e-5 [A2 E11]: unexplained, not dns's.
+- Z10. Line sensor on a flame unbracketed: `Shock + C0` refused.
+- Z11. Line sensor on tets, snappy cells: no opposite means no line; unmeasured.
+- Z12. Total inlet under sonic backflow diverged once [A3]; no guard built, exit 7 by `stableDt`.
+- Z13. Hoop term: one-column model, u_r only, Pr 2; G24 is the proof: 0.37 uniform, 0.58 tanh of the bound, on
+  w = 0 only. `d_z` in the formula, not `|d|`: amendment A5.
+- Z14. `FvRaster` on a wedge: built, PNG frames of `nozzle_W` show the z = 0 plane, read by eye once; no gate.
+- Z15. Plume box: next cycle. Needs `Far` p, t, u; S1 contact; foam domain ladder; RANS for real separation.
+- Z16. FP32 D3 and FMA: G25 reads compensated -1.6e-8 mdot, 0.000 cells x_s vs FP64, plain -2.0e-5, on the
+  planar B at t* 150; FMA itself not separated.
+- Z17. **The chamber rings past t* 1800 on the `nc` wedge**: out/in - 1 reads +-3e-3 at single samples, a mean of
+  800 samples reads 9.1e-6. Exit mdot flat (the throat is choked). Amplitude, period, driver not measured; `Total`
+  reflects and lambda |u.S| damps little at M 0.1. T2 is on time means for this reason as well as Z4. Cd itself
+  creeps until t* ~1500 (0.99596 at 300).
+- Z18. **G22 passes by 0.04%**: Richardson d R^2 0.02426, -3.0% of (g + 1)/96 at 200, 240, 320 x 40, with
+  A1's 0.0253 on another contour. Not a margin to rely on.
+- Z19. **An MPI_ERR_TRUNCATE killed foam at 160 x 48 np 12** at its first step (`method simple`, n (6 2 1)); 320 x
+  96 ran. Cause not looked at; level 160 ran serial.
+- Z21. **T3 is unsettled.** G28 UNMET: wall L1 p 1.1e-3, 2.0e-3 at 160x48, 320x96, Cd gap 2.4e-4, 2.5e-4, tau 16%, 10%;
+  a foam mean window of 17 t* against the ring (dns window halves 1.1e-3). G29 UNMET: foam at t* 76 is not settled, Cd
+  0.99982 vs dns 0.993 at t* 70, 0.9889 at 140. Rerun both to t 0.6 with a 0.3 s window before reading a scheme gap off
+  them: ~50 foam minutes at 320. Foam's vanLeer stage on the 5 deg wedge dies at maxCo 1 (sigFpe), runs at 0.3.
+- Z20. **The exit row of a boundary layer.** `riemann` at p_b 0.05 sets p on the layer's subsonic faces: wall p
+  14% below foam's zeroGradient in the last cells (a real change of problem, not a gap). T3 runs `extrapolate` from
+  rest + ramp: it starts, ungated as a start. A viscous nozzle's production exit needs a plume box (Z15) to mean
+  anything.
+- Z22. **T2's shock position and axis M do not close.** B x_s gap 0.0109, 0.0124 at 160, 320 (`0.18 h, 0.41 h`: h halves,
+  the length grows 13%); exit axis M gap A 7.5e-4, 1.6e-3, B 9.6e-3, 1.4e-2, both rising. Only volume, wall, mdot and
+  A's Cf fall (B's Cf rises 3.6e-5, 2.6e-4). dns x_s 3.0716, 3.0696, 3.074: not monotone; foam 3.0825, 3.0820 at 160,
+  320. A flat gap is a bug or a stated model gap: unattributed. Needs foam at 640 (cut).
 
 ## Older open items (details in CLAUDE.md)
 

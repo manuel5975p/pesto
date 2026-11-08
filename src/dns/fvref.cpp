@@ -48,6 +48,11 @@ std::expected<void, std::string> checkBc(const FvBc& bc, const MeshPatch& p, int
         return std::unexpected(std::format("patch `{}`: {}", p.name,
                                            empty ? "an `empty` patch takes the Empty kind only"
                                                  : "the Empty kind is for `empty` patches only"));
+    const bool wedge = p.type == FoamPatchType::Wedge;
+    if (wedge != (bc.kind == FvBcKind::Slip && bc.wedge))
+        return std::unexpected(std::format("patch `{}`: {}", p.name,
+                                           wedge ? "a `wedge` patch takes the wedge Slip row only"
+                                                 : "the wedge Slip row is for `wedge` patches only"));
     const int e = emptyAxis;
     switch (bc.kind) {
     case FvBcKind::Wall:
@@ -75,8 +80,13 @@ std::expected<void, std::string> checkBc(const FvBc& bc, const MeshPatch& p, int
                                                p.name));
         return {};
     case FvBcKind::Outflow:
+        if (bc.exit == FvExit::Extrapolate) return {};
         if (!(bc.pOut > 0.0 && std::isfinite(bc.pOut)) || !(bc.tBack > 0.0 && std::isfinite(bc.tBack)))
             return std::unexpected(std::format("patch `{}`: outflow needs p > 0 and a backflow T > 0", p.name));
+        return {};
+    case FvBcKind::Total:
+        if (!(bc.pTotal > 0.0 && std::isfinite(bc.pTotal)) || !(bc.tTotal > 0.0 && std::isfinite(bc.tTotal)))
+            return std::unexpected(std::format("patch `{}`: total needs p0 > 0 and t0 > 0", p.name));
         return {};
     case FvBcKind::Far: {
         const FvPrim<double> F =
@@ -126,6 +136,7 @@ FvModuleSet fvModulesOf(const FvConfig& cfg)
     on(FvModule::Gravity, nonzero(cfg.gravity));
     on(FvModule::BodyForce, nonzero(cfg.bodyForce));
     on(FvModule::Turb, cfg.turb);
+    on(FvModule::Shock, cfg.shock.mode != ShockMode::None);
     return s;
 }
 
@@ -217,6 +228,7 @@ std::expected<FvRef, std::string> FvRef::make(const FaceMesh& fm, FvConfig cfg, 
     const FvLes& les = cfg.les;
     if (!(les.cs >= 0.0) || !std::isfinite(les.cs) || !(les.prt > 0.0))
         return std::unexpected("FV LES: needs Cs >= 0 and Pr_t > 0");
+    if (!(cfg.shock.eps4 >= 0.0 && cfg.shock.eps4 <= kFvShockEps4Max)) return std::unexpected("FV --shock-d4: must be in [0, 0.125]");
     const bool lesOn = les.cs > 0.0;
     // Every pair and requirement of the configured modules: the inventory (dns/fvmodules,
     // docs/fvcomp.md "Combinations"), by name.
@@ -311,6 +323,13 @@ std::expected<FvRef, std::string> FvRef::make(const FaceMesh& fm, FvConfig cfg, 
         for (int q = fm.cellStart[c]; q < fm.cellStart[c + 1]; ++q) {
             const std::size_t f = std::size_t(fm.cellFace[std::size_t(q)]);
             if (!r.geom_.active[f]) continue;
+            if (f >= std::size_t(fm.nI) && r.cfg_.bc[std::size_t(r.bcOf_[f - std::size_t(fm.nI)])].wedge) {
+                // d_z, the cell's half width: d's in-plane part is a centroid offset, 1/6 dr on a
+                // prism, and it would hide the term at a small angle.
+                const double sh = std::sin(fm.wedgeHalf);
+                s += fm.V[c] * sh * sh / (fm.d[2][f] * fm.d[2][f]);
+                continue;
+            }
             s += r.geom_.corr[0][f] * fm.S[0][f] + r.geom_.corr[1][f] * fm.S[1][f] +
                  r.geom_.corr[2][f] * fm.S[2][f];
         }
@@ -325,6 +344,7 @@ std::expected<FvRef, std::string> FvRef::make(const FaceMesh& fm, FvConfig cfg, 
             return std::unexpected("FV RANS: the wall distance must be positive on every cell");
     }
     r.nV_ = kFvMeanVars + r.cfg_.chem.nY + ransScalars(rc.model);
+    if (r.cfg_.shock.mode != ShockMode::None) r.lines_ = fvShockLines(fm, r.geom_);
     if (lesOn || r.cfg_.tfles) r.delta2_ = fvLesDelta2(fm);
     if (r.cfg_.tfles) {
         auto w = fvTflesWalk(fm, r.geom_);
@@ -462,6 +482,45 @@ void FvRef::faces(FvEval& ev, std::size_t lo, std::size_t hi) const
         ev.F[2][f] = F.m[1];
         ev.F[3][f] = F.m[2];
         ev.F[4][f] = F.E;
+    }
+}
+
+void FvRef::shockSense(FvEval& ev) const
+{
+    if (cfg_.shock.force) {
+        std::ranges::fill(ev.sigma, std::uint8_t(255));
+        return;
+    }
+    fvShockSense(lines_, ev.prim[5], ev.sigma);
+}
+
+// One write per face, ascending: conservative by construction (docs/nozzle.md, kFvShockFace).
+void FvRef::shockFaces(const double* q, FvEval& ev, std::size_t lo, std::size_t hi) const
+{
+    const FaceMesh& m = *fm_;
+    const std::size_t nI = std::size_t(m.nI), nC = std::size_t(m.nC);
+    const double eps = cfg_.shock.eps4, g = cfg_.tr.gamma;
+    for (std::size_t f = lo; f < std::min(hi, nI); ++f) {
+        const std::size_t o = std::size_t(m.own[f]), n = std::size_t(m.nei[f]);
+        const int pm = lines_.faceLine[2 * f], np = lines_.faceLine[2 * f + 1];
+        std::uint8_t sg = std::max(ev.sigma[o], ev.sigma[n]);
+        if (pm >= 0) sg = std::max(sg, ev.sigma[std::size_t(pm)]);
+        if (np >= 0) sg = std::max(sg, ev.sigma[std::size_t(np)]);
+        if (sg == 0 && eps == 0.0) continue;
+        const FvPrim<double> A = primAt(ev, o), B = primAt(ev, n);
+        const V3 S = at(m.S, f);
+        const double sigma = double(sg) / 255.0;
+        if (sg > 0) {
+            double d[5];
+            fvShockFlux(sigma, A, B, S.data(), g, d);
+            for (std::size_t k = 0; k < 5; ++k) ev.F[k][f] += d[k];
+        }
+        if (pm < 0 || np < 0 || sg == 255 || eps == 0.0) continue;
+        const double l = fvD4Rate(eps, sigma, A, B, S.data());
+        for (std::size_t k = 0; k < 5; ++k) {
+            const double a = l * fvD4Row(q[k * nC + std::size_t(pm)], q[k * nC + o], q[k * nC + n], q[k * nC + std::size_t(np)]);
+            if (a != 0.0) ev.F[k][f] += a; // a uniform row keeps F's bytes, -0.0 included
+        }
     }
 }
 
@@ -937,6 +996,7 @@ void FvRef::sizeEval(FvEval& ev) const
     for (auto& g : ev.grad) g.assign(nC, 0.0);
     for (auto& F : ev.F) F.assign(nF, 0.0);
     if (cfg_.les.cs > 0.0) ev.nut.assign(nC, 0.0);
+    if (cfg_.shock.mode != ShockMode::None) ev.sigma.assign(nC, 0);
     if (cfg_.tfles) {
         for (auto* v : {&ev.fe, &ev.eof, &ev.om, &ev.uh, &ev.tfWork[0], &ev.tfWork[1], &ev.curl[0], &ev.curl[1], &ev.curl[2]})
             v->assign(nC, 0.0);
@@ -960,6 +1020,7 @@ void FvRef::evaluate(const FvState& s, FvEval& ev, FvState& out, const FvState* 
     if (out.nV != s.nV || out.nC != s.nC) out = FvState::zeros(s.nC, s.nV);
     const bool les = cfg_.les.cs > 0.0, thick = cfg_.tfles.has_value();
     const bool viscous = cfg_.tr.muRef > 0.0 || les, species = cfg_.chem.nY > 0, rans = cfg_.rans.model != RansModel::None;
+    const bool sensed = cfg_.shock.mode != ShockMode::None, shockFlux = cfg_.shock.mode == ShockMode::Hll;
     Stage st;
     st.out = out.q.data();
     st.src = src ? src->q.data() : nullptr;
@@ -969,6 +1030,10 @@ void FvRef::evaluate(const FvState& s, FvEval& ev, FvState& out, const FvState* 
         auto [f0, f1] = part(nF, w, nw);
         prims(s.q.data(), ev, c0, c1);
         sync();
+        if (sensed) {
+            if (w == 0) shockSense(ev);
+            sync();
+        }
         bndStates(ev, b0, b1);
         sync();
         // The cell gradients first: mu_t and TFLES's coefficients read them, the species
@@ -1002,6 +1067,10 @@ void FvRef::evaluate(const FvState& s, FvEval& ev, FvState& out, const FvState* 
         }
         faces(ev, f0, f1);
         sync();
+        if (shockFlux) {
+            shockFaces(s.q.data(), ev, f0, f1);
+            sync();
+        }
         if (species) {
             speciesFaces(ev, f0, f1);
             sync();
@@ -1031,6 +1100,7 @@ void FvRef::march(FvState& s, double dt, int steps, const FvState* src) const
     FvState q1 = FvState::zeros(s.nC, s.nV), q2 = FvState::zeros(s.nC, s.nV);
     const bool les = cfg_.les.cs > 0.0, thick = cfg_.tfles.has_value();
     const bool viscous = cfg_.tr.muRef > 0.0 || les, species = cfg_.chem.nY > 0, rans = cfg_.rans.model != RansModel::None;
+    const bool sensed = cfg_.shock.mode != ShockMode::None, shockFlux = cfg_.shock.mode == ShockMode::Hll;
     // SSP-RK3 in the fused form out = ca a + cb b + cr R(b), ca = 1 - cb.
     const double cbs[3] = {0.0, 0.25, 2.0 / 3.0};
     const double* bs[3] = {s.q.data(), q1.q.data(), q2.q.data()};
@@ -1043,6 +1113,11 @@ void FvRef::march(FvState& s, double dt, int steps, const FvState* src) const
             for (int k = 0; k < 3; ++k) {
                 prims(bs[k], ev, c0, c1);
                 sync();
+                // The sensor: of the step's INPUT state, held over its stages.
+                if (sensed && k == 0) {
+                    if (w == 0) shockSense(ev);
+                    sync();
+                }
                 bndStates(ev, b0, b1);
                 sync();
                 if (viscous) {
@@ -1075,6 +1150,10 @@ void FvRef::march(FvState& s, double dt, int steps, const FvState* src) const
                 }
                 faces(ev, f0, f1);
                 sync();
+                if (shockFlux) {
+                    shockFaces(bs[k], ev, f0, f1);
+                    sync();
+                }
                 if (species) {
                     speciesFaces(ev, f0, f1);
                     sync();
@@ -1158,6 +1237,7 @@ std::expected<double, std::string> FvRef::stableDt(const FvState& s, FvDtLimits 
             for (int q = m.cellStart[c]; q < m.cellStart[c + 1]; ++q) {
                 const std::size_t f = std::size_t(m.cellFace[std::size_t(q)]);
                 if (!geom_.active[f]) continue;
+                if (f >= std::size_t(m.nI) && cfg_.bc[std::size_t(bcOf_[f - std::size_t(m.nI)])].wedge) continue;
                 const double Sx = m.S[0][f], Sy = m.S[1][f], Sz = m.S[2][f];
                 sum += std::abs(p.u[0] * Sx + p.u[1] * Sy + p.u[2] * Sz) + cs * std::sqrt(Sx * Sx + Sy * Sy + Sz * Sz);
             }

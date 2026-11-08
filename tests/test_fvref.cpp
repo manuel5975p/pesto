@@ -14,6 +14,7 @@
 //   E4  cell orders agree   E5  Dual / float instantiations of fvflux
 //   E6  u checkerboard on 100:1 cells, Pr 0.72/2/7: the momentum 4/3
 #include "dns/fvref.hpp"
+#include "fvref_nozzle.hpp"
 
 #include "dns/comp.hpp"
 #include "dns/curvmesh.hpp"
@@ -1102,6 +1103,13 @@ void hydrostaticAmbient()
 int main(int argc, char** argv)
 {
     if (argc > 1 && std::string(argv[1]) == "mms") return mms();
+    if (argc > 1 && std::string(argv[1]) == "total") return dnstest::noz::total();
+    if (argc > 1 && std::string(argv[1]) == "exit") return dnstest::noz::exitRow();
+    if (argc > 1 && std::string(argv[1]) == "bits") return dnstest::noz::bits();
+    if (argc > 1 && std::string(argv[1]) == "wedge") return dnstest::noz::wedge();
+    if (argc > 1 && std::string(argv[1]) == "wedgew") return dnstest::noz::wedgeW();
+    if (argc > 1 && std::string(argv[1]) == "t1r") return dnstest::noz::t1r();
+    if (argc > 1 && std::string(argv[1]) == "hoop") return dnstest::noz::hoop();
     g1();
     g2();
     g3();

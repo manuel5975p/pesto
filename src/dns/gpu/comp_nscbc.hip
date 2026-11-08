@@ -80,8 +80,14 @@ __global__ void kCentreTable(Focal1D f, double h, int n, double* out)
 // tdw at j + ny k) -- the u target gains tdu, the inflow shear waves relax v,
 // w toward tdv, tdw instead of 0. Its own instantiation; zero rows give the
 // non-Turb arithmetic bit for bit (x + 0 = x, v - 0 = v - 0).
+// Super: a supersonic x-hi row (--shock hll, Config::superOutflow, docs/shock.md).
+// Past un = c the incoming wave does not exist: L1 blends from Lin to the upwind
+// amplitude over M in (0.8, 1), L1 = (un - cs)(dp - r cs dun) at M >= 1, no target,
+// no transverse term; below 0.8 no operation is added. At un < 0 the x-hi L2 to L4
+// take the lateral branch's relaxation to ambient, one sided, un >= 0 unchanged.
+// Its own instantiation.
 template <class Remap, bool Comp, bool Prof, bool Hydro = false,
-          bool Turb = false>
+          bool Turb = false, bool Super = false>
 __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
                             Real gam, PrimView q,
                             int openY, int openZ, int fr, Real invLx, Real invLy,
@@ -357,6 +363,20 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
                 L2 = un * (c2 * dr_ - dp_);
                 L3 = un * dn(vf[t1]);
                 L4 = un * dn(vf[t2]);
+                // Super's backflow (--shock hll, docs/shock.md): at un < 0 those
+                // are DOWNWIND differences, and sustained entrainment runs a row
+                // cell away from its neighbour (the chamber: rho 1.4 to 72 at rate
+                // |un|/h, T/Tu 0.012, issues.md S15; the Hydro top's failure, the
+                // same cure). Gas drawn in through an outlet is ambient gas. One
+                // sided: un >= 0 adds no operation.
+                if constexpr (Super) {
+                    if (un < Real(0)) {
+                        const Real w = Real(1) + tanh(un / (kLatBand * cs));
+                        L2 = w * L2 + (Real(1) - w) * (etaLat * cs * c2 * invL[a] * (r - rTgt));
+                        L3 = w * L3 + (Real(1) - w) * (etaLat * cs * invL[a] * (vc[t1] - tgt[t1]));
+                        L4 = w * L4 + (Real(1) - w) * (etaLat * cs * invL[a] * (vc[t2] - tgt[t2]));
+                    }
+                }
             } else { // lateral: tanh blend outgoing compute <-> incoming relax
                 // (C-infinity across un = 0; both forms vanish at freestream so
                 // the fixed point is exact for any weight).
@@ -375,6 +395,14 @@ __global__ void kNscbcCells(GpuGrid g, Remap R, CurvView cv, ViscView vv,
             if (hi) {
                 L5 = Lout;
                 L1 = Lin;
+                if constexpr (Super) {
+                    const Real M = un / cs;
+                    if (a == 0 && M > Real(0.8)) {
+                        const Real Lout1 = (un - cs) * (dp_ - r * cs * dun);
+                        const Real fac = fmin(fmax((Real(1) - M) / Real(0.2), Real(0)), Real(1));
+                        L1 = fac * Lin + (Real(1) - fac) * Lout1;
+                    }
+                }
             } else {
                 L1 = Lout;
                 L5 = Lin;
@@ -440,9 +468,9 @@ void launchNscbc(const GpuGrid& g, const DeviceCompNscbc::Config& c, double u,
     // Doublet strength tracks the ramped freestream: 2D u a^2, 3D u a^3 / 2.
     const double a2 = c.aBody * c.aBody;
     const double dbl = g.nz == 1 ? u * a2 : 0.5 * u * a2 * c.aBody;
-    auto launch = [&](auto comp, auto prof, auto hydro, auto turb) {
+    auto launch = [&](auto comp, auto prof, auto hydro, auto turb, auto sup) {
         kNscbcCells<Remap, decltype(comp)::value, decltype(prof)::value,
-                    decltype(hydro)::value, decltype(turb)::value>
+                    decltype(hydro)::value, decltype(turb)::value, decltype(sup)::value>
             <<<launchBlocks(nb), blockSize>>>(
             g, R, cv, viscView(d.transport()), Real(c.gamma), q, int(c.openY),
             int(c.openZ), c.floorRows,
@@ -459,31 +487,31 @@ void launchNscbc(const GpuGrid& g, const DeviceCompNscbc::Config& c, double u,
             out.mx.data(), out.my.data(), out.mz.data(), out.E.data());
     };
     internal::withCompensation(cmb, [&](auto comp) {
+        using F = std::false_type;
+        using T = std::true_type;
         // Per-row targets exist on the uniform mesh only (make() refuses
         // them otherwise), so only that instantiation is compiled; the
         // hydrostatic waves ride per-row targets only (make() again); so do
-        // the turbulent rows (setTurbulentInflow), never with Hydro.
+        // the turbulent rows (setTurbulentInflow), never with Hydro. So does
+        // the supersonic row (--shock is uniform-mesh only, shockRouteScope).
         if constexpr (std::is_same_v<Remap, IdentityRemap>) {
+            auto go = [&](auto prof, auto hydro, auto turb) {
+                if (c.superOutflow) launch(comp, prof, hydro, turb, T{});
+                else launch(comp, prof, hydro, turb, F{});
+            };
             const bool turb = rows.tu != nullptr;
             if (rows.u) {
-                if (hydroOn(c))
-                    launch(comp, std::true_type{}, std::true_type{},
-                           std::false_type{});
-                else if (turb)
-                    launch(comp, std::true_type{}, std::false_type{},
-                           std::true_type{});
-                else
-                    launch(comp, std::true_type{}, std::false_type{},
-                           std::false_type{});
+                if (hydroOn(c)) go(T{}, T{}, F{});
+                else if (turb) go(T{}, F{}, T{});
+                else go(T{}, F{}, F{});
                 return;
             }
-            if (turb) {
-                launch(comp, std::false_type{}, std::false_type{},
-                       std::true_type{});
-                return;
-            }
+            if (turb) go(F{}, F{}, T{});
+            else go(F{}, F{}, F{});
+        } else {
+            assert(!c.superOutflow);
+            launch(comp, F{}, F{}, F{}, F{});
         }
-        launch(comp, std::false_type{}, std::false_type{}, std::false_type{});
     });
     checkLastKernel("kNscbcCells");
 }
@@ -526,6 +554,7 @@ std::expected<DeviceCompNscbc, hipError_t> DeviceCompNscbc::make(const Grid& g,
         (!prof || c.openY || c.openZ || !(c.hydroLo <= 0 && c.hydroHi <= 0) ||
          !std::isfinite(c.hydroLo) || !std::isfinite(c.hydroHi)))
         return std::unexpected(hipErrorInvalidValue);
+    if (c.superOutflow && c.potCorrect) return std::unexpected(hipErrorInvalidValue);
 
     std::unique_ptr<NscbcModalAbc> abc;
     if (c.betaModal)

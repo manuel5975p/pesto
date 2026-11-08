@@ -29,6 +29,7 @@ constexpr std::array<FvModuleInfo, kFvModuleCount> kModules{{
     {M::Steady, FvAxis::Time, "steady LTS", "--steady TOL (DeviceFvComp::localDt)"},
     {M::Compensated, FvAxis::Precision, "compensated", "--compensated"},
     {M::Fp64, FvAxis::Precision, "FP64", "--fv-precision fp64"},
+    {M::Shock, FvAxis::Capture, "shock", "--shock hll|sense --polymesh"},
 }};
 
 struct Rule
@@ -84,6 +85,25 @@ constexpr std::string_view kTurbLts = "FV --turb with local time stepping: the s
 constexpr std::string_view kTurbLtsWhy = "the rows follow X = sum U dt; pseudo-time has no physical sweep";
 constexpr std::string_view kCompFp64 = "--compensated is the FP32 state's low word: FP64 has no update floor to lift";
 constexpr std::string_view kCompFp64Why = "the two-word state lifts FP32's update floor; FP64 has none";
+
+constexpr std::string_view kShSpecies = "FV --shock with species: not built (the chamber is the next cycle)";
+constexpr std::string_view kShSpeciesWhy = "no FV injector or holder, the line sensor is unbracketed on a flame (issues.md Z10)";
+constexpr std::string_view kShLes = "FV --shock with LES: not built (no gate)";
+constexpr std::string_view kShLesWhy = "no nozzle rung runs LES; the background term has no filter width";
+constexpr std::string_view kShTfles = "FV --shock with TFLES: not built (no gate)";
+constexpr std::string_view kShTflesWhy = "TFLES is a premixed flame's; species with --shock are refused";
+constexpr std::string_view kShRans = "FV --shock with RANS: not built (no gate; the scalars ride F[0])";
+constexpr std::string_view kShRansWhy = "F[0] would carry the hybrid mass flux under the scalars: ungated";
+constexpr std::string_view kShGrav = "FV --shock with gravity: not built (no consumer)";
+constexpr std::string_view kShGravWhy = "no rung has both; the hydrostatic balance is unproven under D3";
+constexpr std::string_view kShDrive = "FV --shock with a body force: not built (no consumer)";
+constexpr std::string_view kShDriveWhy = "the driven channel is subsonic: nothing to capture";
+constexpr std::string_view kShTurb = "FV --shock with --turb: not built (no consumer)";
+constexpr std::string_view kShTurbWhy = "--turb is the premixed flame box's; species with --shock are refused";
+constexpr std::string_view kShLts = "FV --shock with local time stepping: not built (the sensor flickers; the structured steady march refuses it too)";
+constexpr std::string_view kShLtsWhy =
+    "a frozen or live sensor both left the host LTS residual flat at 3.7e-3 on a Total inlet (issues.md Z7); the time march is the route";
+constexpr std::string_view kShNozzle = "gpu_fv_nozzle";
 
 constexpr FvPairRule refused(std::string_view msg, std::string_view why)
 {
@@ -190,6 +210,23 @@ constexpr std::array kRules{
     Rule{M::Turb, M::Compensated, live(kTurbGate)},
     Rule{M::Turb, M::Fp64, live(kTurbGate)},
     Rule{M::Compensated, M::Fp64, {.decision = D::Exclusive, .message = kCompFp64, .why = kCompFp64Why}},
+    // shock capture: every refusal written (the default of a cross-axis pair is live)
+    Rule{M::Shock, M::Fp64, live(kShNozzle)},
+    Rule{M::Shock, M::Compensated, live(kShNozzle)},
+    Rule{M::Shock, M::ChemC0, refused(kShSpecies, kShSpeciesWhy)},
+    Rule{M::Shock, M::ChemC1, refused(kShSpecies, kShSpeciesWhy)},
+    Rule{M::Shock, M::ChemC2b, refused(kShSpecies, kShSpeciesWhy)},
+    Rule{M::Shock, M::LesSmag, refused(kShLes, kShLesWhy)},
+    Rule{M::Shock, M::LesSigma, refused(kShLes, kShLesWhy)},
+    Rule{M::Shock, M::TflesUniform, refused(kShTfles, kShTflesWhy)},
+    Rule{M::Shock, M::TflesDynamic, refused(kShTfles, kShTflesWhy)},
+    Rule{M::Shock, M::TflesEfficiency, refused(kShTfles, kShTflesWhy)},
+    Rule{M::Shock, M::RansSa, refused(kShRans, kShRansWhy)},
+    Rule{M::Shock, M::RansSst, refused(kShRans, kShRansWhy)},
+    Rule{M::Shock, M::Gravity, refused(kShGrav, kShGravWhy)},
+    Rule{M::Shock, M::BodyForce, refused(kShDrive, kShDriveWhy)},
+    Rule{M::Shock, M::Turb, refused(kShTurb, kShTurbWhy)},
+    Rule{M::Shock, M::Steady, refused(kShLts, kShLtsWhy)},
 };
 
 // Pre-built bit sets (constexpr bitset construction from an integer).
@@ -293,7 +330,7 @@ std::string fvCombinationsMarkdown()
     std::string o = "<!-- generated: dns::fvCombinationsMarkdown (src/dns/fvmodules.cpp); test_gpu_fv_matrix markdown -->\n";
     o += "| Module | Axis | Spelling |\n|---|---|---|\n";
     static constexpr std::string_view axes[] = {"turbulence", "flame",  "efficiency", "chemistry", "gravity",
-                                                "drive",      "inflow", "time",       "precision"};
+                                                "drive",      "inflow", "time",       "precision", "capture"};
     for (const FvModuleInfo& m : kModules)
         o += std::format("| {} | {} | `{}` |\n", m.name, axes[std::size_t(m.axis)], m.spelling);
     o += "\nPair matrix: L live, R refused, x one axis (exclusive).\n\n|   |";

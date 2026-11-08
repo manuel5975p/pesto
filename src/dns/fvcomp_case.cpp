@@ -41,6 +41,16 @@ FvBc fvBcOf(const FvPatchSpec& p, const FvFreestream& f, double frac)
         b.kind = FvBcKind::Outflow;
         b.pOut = p.burnt ? f.pBurnt : p.pOut * f.p;
         b.tBack = p.burnt ? f.tBurnt : p.tBack * f.T;
+        b.exit = p.exit;
+        return b;
+    case FvPatchKind::Total:
+        b.kind = FvBcKind::Total;
+        b.pTotal = frac >= 1.0 ? p.p0 * f.p : f.pRest + frac * (p.p0 * f.p - f.pRest);
+        b.tTotal = p.t0 * f.T;
+        return b;
+    case FvPatchKind::Wedge:
+        b.kind = FvBcKind::Slip;
+        b.wedge = true;
         return b;
     case FvPatchKind::Far: {
         b.kind = FvBcKind::Far;
@@ -75,6 +85,13 @@ std::vector<FvBc> fvBcsOf(const FaceMesh& fm, const FvBcSpec& spec, const FvFree
             v.push_back(e);
             continue;
         }
+        if (m.type == FoamPatchType::Wedge) { // a Slip row, bound or left out of the file
+            FvBc w;
+            w.kind = FvBcKind::Slip;
+            w.wedge = true;
+            v.push_back(w);
+            continue;
+        }
         v.push_back(fvBcOf(*std::ranges::find(spec.patches, m.name, &FvPatchSpec::name), f, frac));
     }
     return v;
@@ -84,7 +101,7 @@ std::vector<std::uint8_t> fvTallyOf(const FaceMesh& fm, const FvBcSpec& spec)
 {
     std::vector<std::uint8_t> v(fm.patches.size(), 0);
     for (std::size_t i = 0; i < fm.patches.size(); ++i) {
-        if (fm.patches[i].type == FoamPatchType::Empty) continue;
+        if (fm.patches[i].type == FoamPatchType::Empty || fm.patches[i].type == FoamPatchType::Wedge) continue;
         v[i] = std::ranges::find(spec.patches, fm.patches[i].name, &FvPatchSpec::name)->tallied ? 1 : 0;
     }
     return v;

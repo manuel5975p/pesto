@@ -87,6 +87,8 @@ int runChamberCase(const Case& c)
     rr.tEnd = c.tEnd;
     rr.dtRecompute = c.dtRecompute;
     rr.label = chamberRunLabel(c);
+    rr.shock = c.shock;
+    rr.shockDtAuto = c.shockDtAuto;
 
     auto res = gpu::runChamber(g, host, rhoY, rr, *out);
     if (!res) return die(res.error().code, res.error().message);
@@ -545,6 +547,8 @@ int runFlame(const Case& c, [[maybe_unused]] const CheckpointContext& ckx)
     rr.dtRecompute = c.dtRecompute;
     rr.profileDt = c.profileDt;
     rr.label = flameRunLabel(c);
+    rr.shock = c.shock;
+    rr.shockDtAuto = c.shockDtAuto;
     if (c.flameTurb > 0) {
         rr.turbBox = std::move(turbBoxHost);
         rr.turbNbx = c.flameTurbNbx;
