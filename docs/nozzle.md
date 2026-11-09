@@ -473,7 +473,7 @@ sources are no boundary flux).
 
 ## Bent invariants
 
-CLAUDE.md is not edited. For the user:
+CLAUDE.md carries masterplan_combclose 7 (combscale S4). The rest, for the user:
 
 - "The reader accepts exactly what the OpenFOAM mesh tools write; everything else REJECTED BY NAME": `wedge` opens on
   one route by opt-in; every other route keeps the text.
@@ -487,7 +487,7 @@ CLAUDE.md is not edited. For the user:
 - "A plain FP32 state wanders ... FP64 rejects it [`--compensated`]": bent by masterplan_combclose K4 (R6). FP64 takes it:
   the plain FP64 stage-3 write is biased (+0.11 ulp per write on mantissas [1, 1.5), issues.md N16, N20), a ledger
   residual linear in steps; `--compensated --fv-precision fp64` is the double-double state (docs/fvcomp.md "Precision:
-  the plain FP64 write is biased"), off = bytes. Proposed wording there.
+  the plain FP64 write is biased"), off = bytes. CLAUDE.md carries it (combscale S4).
 
 ## Proposed CLAUDE.md invariants
 
@@ -525,21 +525,3 @@ CLAUDE.md is not edited. For the user:
   is order h^3 in S_L (G3.3).
 - **A foam parity gap is a two-sided number.** In the supersonic cone foam at vanLeer holds p0 to -9.7e-4 at 320 x 64
   and dns to -6.9e-5: the gap is mostly foam's.
-
-masterplan_combclose 7 (measured K5-K7):
-
-1. In "A plain FP32 state wanders...", replace "FP64 rejects it." with: "FP64 takes it (masterplan_combclose): the plain
-   FP64 stage-3 write `ca a + cb b + cr r` (cb = R(2/3)) rounds `ca a + RN(cb b)` on a non-uniform lattice, +0.11 ulp per
-   write on mantissas [1, 1.5): a ledger residual linear in steps (+7e-15 res_mass per step, G4.1 3.51e-12 at 30 cells).
-   Compensated FP64 = the increment form + a double low word (G4.1 1.65e-16 flat at 30 cells, 3.4e6 steps; +3.1% per
-   step); off = bytes."
-2. "**A reacting-nozzle IC is a steady state of the solved equations**: chamber slabs on the Rayleigh line (m, p + m u,
-   cp T + u^2/2 + q(1 - Y) conserved: `fvRayleighBurnt` at q(1 - Y)), never `premixedPoint`'s low-Mach T = sigma Tu
-   (+1.71e-3 in T0: an entropy slug through the throat at t_e ~ 40 tau, inside every gate window; mdot dip -7.1e-4 ->
-   -1.05e-4, G4.6 mdot -2.2e-4 -> +1.5e-6)."
-3. "**Reacting-nozzle gate windows start at t_e + 10 and span k integer periods of the measured ring** (fixed before the
-   run; `nozzle_react.py report`); every rate is an endpoint ledger difference; Cd on the throat flux. Never a DFT peak
-   list (bins of the record). A twin's Re* is its own rung's y* (the 30-cell twin at the 15-cell y* moved Cd 1e-6)."
-4. "**The Total-fed choked chamber rings in ONE damped mode** (duct + non-compact contraction; fitted P 22.3-22.4 tau,
-   e-fold 32.5-33.6 at 15 and 30 cells; network model 22.68 / 33.8; the Total inlet radiates ~42% of the damping): a
-   start transient, not sustained."

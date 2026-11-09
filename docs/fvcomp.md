@@ -705,11 +705,7 @@ compensated + FP64 is live, and the CLI's explicit refusal is gone.
 | silent-float guard | one step, compensated FP64 vs FP64 (control compensated FP32 vs FP64) | <= 6.4e-16 (control >= 5.0e-8) | <= 1e-14 (control >= 1e-9) |
 | cost | 15-cell reacting rig, tt 3, `--bench`, ms/step plain / compensated | 0.3076 / 0.3170 (+3.1%) | |
 
-**Proposed CLAUDE.md wording** (masterplan_combclose 7 item 1; CLAUDE.md is not edited): in "A plain FP32
-state wanders...", replace "FP64 rejects it." with: "FP64 takes it (masterplan_combclose): the plain FP64
-stage-3 write `ca a + cb b + cr r` (cb = R(2/3)) rounds `ca a + RN(cb b)` on a non-uniform lattice, +0.11 ulp
-per write on mantissas [1, 1.5): a ledger residual linear in steps (+7e-15 res_mass per step, G4.1 3.51e-12 at
-30 cells). Compensated FP64 = the increment form + a double low word; off = bytes."
+CLAUDE.md carries it (combscale S4).
 
 ## Species
 
