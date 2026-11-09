@@ -5,7 +5,7 @@
 // A LOOP STRUCT is the one place a runner keeps every host variable its time
 // loop carries from one step to the next; it exposes them, by name, through
 //   template <class F> void fields(F&& f) { f("t", t); f("steps", steps); ... }
-// (members double, long, int or bool). saveLoop/loadLoop walk that list, so
+// (members double, long, int, bool or std::array<double, N>). saveLoop/loadLoop walk that list, so
 // a variable added to the loop OUTSIDE the struct is not checkpointed and
 // breaks the restart byte rule silently (masterplan real_bunsen K12; the
 // restart tests are the proof).
@@ -17,6 +17,7 @@
 #include "dns/gpu/comp.hpp"
 #include "dns/gpu/run_result.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -31,8 +32,9 @@ namespace dns::gpu::internal {
 
 // The header records every checkpoint carries: "binary", "solver", "case",
 // "grid" (4 counts: nx ny nz nY on a structured grid; nC nI nB nY on a
-// FaceMesh), "t", "steps", "restarts", and "mesh" (the FaceMesh's identity,
-// CheckpointPolicy::mesh) when the policy names one.
+// FaceMesh), "t", "steps", "restarts", "mesh" (the FaceMesh's identity,
+// CheckpointPolicy::mesh) and "bc.sections" (the --bc file's [nozzle]/[thrust]
+// lines) when the policy names them.
 inline void putHeader(Checkpoint& ck, const CheckpointPolicy& cp, const char* solver,
                       const std::array<std::int64_t, 4>& grid, double t, long steps)
 {
@@ -40,6 +42,7 @@ inline void putHeader(Checkpoint& ck, const CheckpointPolicy& cp, const char* so
     ck.putText("solver", solver);
     ck.putText("case", cp.caseText);
     if (!cp.mesh.empty()) ck.putText("mesh", cp.mesh);
+    if (!cp.bcSections.empty()) ck.putText("bc.sections", cp.bcSections);
     ck.putI64("grid", grid);
     ck.putF64("t", t);
     ck.putI64("steps", steps);
@@ -90,12 +93,20 @@ private:
     Clock::time_point jobStart_, lastCk_;
 };
 
+// A loop member that is a fixed-length double array (one F64 record of N values).
+template <class T>
+inline constexpr bool kIsF64Array = false;
+template <std::size_t N>
+inline constexpr bool kIsF64Array<std::array<double, N>> = true;
+
 template <class Loop>
 void saveLoop(Checkpoint& ck, Loop& L)
 {
     L.fields([&](const char* n, auto& v) {
         using T = std::remove_cvref_t<decltype(v)>;
-        if constexpr (std::is_floating_point_v<T>)
+        if constexpr (kIsF64Array<T>)
+            ck.putF64(std::string("loop.") + n, std::vector<double>(v.begin(), v.end()));
+        else if constexpr (std::is_floating_point_v<T>)
             ck.putF64(std::string("loop.") + n, double(v));
         else
             ck.putI64(std::string("loop.") + n, std::int64_t(v));
@@ -112,7 +123,13 @@ std::expected<void, std::string> loadLoop(const Checkpoint& ck, Loop& L)
         if (!err.empty()) return;
         using T = std::remove_cvref_t<decltype(v)>;
         const std::string key = std::string("loop.") + n;
-        if constexpr (std::is_floating_point_v<T>) {
+        if constexpr (kIsF64Array<T>) {
+            auto x = ck.f64(key);
+            if (!x) err = x.error();
+            else if (x->size() != v.size())
+                err = std::format("checkpoint '{}' holds {} values, the run needs {}", key, x->size(), v.size());
+            else std::ranges::copy(*x, v.begin());
+        } else if constexpr (std::is_floating_point_v<T>) {
             auto x = ck.f64Scalar(key);
             if (!x) err = x.error();
             else v = T(*x);

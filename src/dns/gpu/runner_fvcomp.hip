@@ -118,8 +118,20 @@ struct FvCompLoop
     double dtChem = HUGE_VAL, xfPrev = NAN, tPrev = 0, lastHits = 0, lastMin = 0, lastMax = 1;
     bool bindChem = false;
     double sweep = 0.0; // --turb: X = sum U dt, the box's travel past the inflow (FP64)
+    // [thrust] (combscale S1): P0 the IC's six sums; the previous _thrust.csv row's role sums and t
+    // (fvThrustWindow's start). Records only with [thrust], so an off checkpoint keeps its records.
+    FvRow6 P0{};
+    FvRoleSums ledPrev{};
+    double tLedPrev = 0.0;
+    // --shock hll's sticky dt cadence (internal::shockDtEvery); a record only under the auto cadence.
+    bool shockHot = false;
+    bool thrustOn, shockOn;
 
-    explicit FvCompLoop(const FvCompRun& r) : uCur(r.ramp > 0 ? 0.0 : r.fs.U), cad{r.statsEvery}, prof(r.profileDt) {}
+    explicit FvCompLoop(const FvCompRun& r)
+        : uCur(r.ramp > 0 ? 0.0 : r.fs.U), cad{r.statsEvery}, prof(r.profileDt), thrustOn(r.thrust.has_value()),
+          shockOn(r.shockDtAuto)
+    {
+    }
 
     template <class F>
     void fields(F&& f)
@@ -141,6 +153,16 @@ struct FvCompLoop
         f("lastMax", lastMax);
         f("bindChem", bindChem);
         f("sweep", sweep);
+        if (thrustOn) {
+            f("thrust.P0", P0);
+            f("thrust.prevIn", ledPrev.I[0]); // FvRole order In, Exit, Wall, Side (fvnozzle.hpp)
+            f("thrust.prevExit", ledPrev.I[1]);
+            f("thrust.prevWall", ledPrev.I[2]);
+            f("thrust.prevSide", ledPrev.I[3]);
+            f("thrust.prevOmega", ledPrev.omega);
+            f("thrust.tPrev", tLedPrev);
+        }
+        if (shockOn) f("shockHot", shockHot);
     }
 };
 
@@ -155,9 +177,6 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
     if (!made) return fail(made.error().starts_with("FV device") ? 6 : 3, made.error());
     DeviceFvComp& dev = *made;
     if (auto u = dev.upload(ic); !u) return fail(6, u.error());
-    // --restart: the checkpoint's words replace the IC, bit for bit.
-    if (cp.restart)
-        if (auto e = dev.load(*cp.restart); !e) return std::unexpected(e.error());
     // The solver validated the converged table; a ramp starts from frac 0.
     auto retarget = [&](double frac) -> std::expected<void, RunError> {
         for (std::size_t p = 0; p < fm.patches.size(); ++p) {
@@ -171,13 +190,15 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
     };
     if (r.ramp > 0)
         if (auto e = retarget(0.0); !e) return std::unexpected(e.error());
-    // [thrust]: the ledger from the IC on; P0 the IC's sums.
+    RunStats st;
+    FvCompLoop L(r);
+    // [thrust]: the ledger from the IC on; P0 the IC's sums (a restart's come from its records).
     std::vector<FvRole> roles;
     FvThrustCase tk{};
     std::vector<std::uint8_t> pastThroat;
-    FvRoleSums ledPrev{};
-    FvRow6 P0{};
-    double tLedPrev = 0.0;
+    FvRoleSums& ledPrev = L.ledPrev;
+    FvRow6& P0 = L.P0;
+    double& tLedPrev = L.tLedPrev;
     const int fuelRow = r.solver.chem.nY > 0 ? kFvMeanVars + r.solver.chem.fuel : -1;
     if (r.thrust) {
         roles = fvRoles(r.solver.bc, fm);
@@ -190,10 +211,15 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
             pastThroat = fvPastThroat(fm, *r.flame);
         }
         if (auto e = dev.setLedger(true); !e) return fail(e.error().starts_with("FV device") ? 6 : 3, e.error());
-        dns::FvState s0;
-        if (auto e = dev.download(s0); !e) return fail(6, e.error());
-        P0 = fvTotals6(fm, s0, fuelRow);
+        if (!cp.restart) {
+            dns::FvState s0;
+            if (auto e = dev.download(s0); !e) return fail(6, e.error());
+            P0 = fvTotals6(fm, s0, fuelRow);
+        }
     }
+    // --restart: the checkpoint's words replace the IC (and the ledger setLedger zeroed), bit for bit.
+    if (cp.restart)
+        if (auto e = dev.load(*cp.restart); !e) return std::unexpected(e.error());
     if (!r.quiet) {
         std::printf("# %s\n# FV path: %d cells, %d internal faces, %d boundary faces, %.1f MB on the device\n",
                     r.label.c_str(), fm.nC, fm.nI, fm.nB, double(dev.deviceBytes()) / 1048576.0);
@@ -324,8 +350,6 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
         return {};
     };
 
-    RunStats st;
-    FvCompLoop L(r);
     double &t = L.t, &dtStab = L.dtStab, &uCur = L.uCur, &dtFirst = L.dtFirst;
     int& sinceDt = L.sinceDt;
     long& step = L.step;
@@ -624,9 +648,9 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
     double& sweep = L.sweep;
     std::array<std::vector<double>, 3> turbU;
     std::vector<FvBc> turbRows(r.turbSweep ? r.turbSweep->points() : 0);
-    // --shock hll: default cadence until a cell is sensed, then every step. Off the
-    // checkpointed record: checkpoints are refused on this route.
-    bool shockHot = false;
+    // --shock hll: default cadence until a cell is sensed, then every step. Sticky across a
+    // restart: FvCompLoop's "loop.shockHot" (under the auto cadence).
+    bool& shockHot = L.shockHot;
     double nextFoam = r.foamWrite;
     auto writeFoam = [&]() -> std::expected<void, RunError> {
         dns::FvState s, rr;

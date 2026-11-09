@@ -1113,11 +1113,13 @@ if(BUILD_TESTING)
         add_executable(test_gpu_restart_fv tests/test_gpu_restart_fv.cpp)
         target_link_libraries(test_gpu_restart_fv PRIVATE dns_gpu)
         target_compile_definitions(test_gpu_restart_fv PRIVATE
-            DNS_BIN="$<TARGET_FILE:dns>")
+            DNS_BIN="$<TARGET_FILE:dns>" DNS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
         add_dependencies(test_gpu_restart_fv dns)
         add_test(NAME gpu_restart_fv COMMAND test_gpu_restart_fv comp)
         add_test(NAME gpu_restart_fvlm COMMAND test_gpu_restart_fv lm)
-        set_tests_properties(gpu_restart_fv gpu_restart_fvlm
+        # combscale S1: the [thrust] ledger (device words, loop.thrust.*, bc.sections).
+        add_test(NAME gpu_restart_fv_thrust COMMAND test_gpu_restart_fv thrust)
+        set_tests_properties(gpu_restart_fv gpu_restart_fvlm gpu_restart_fv_thrust
             PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
         # dns flame --physics lowmach (masterplan real_bunsen S4): the zero-
         # Mach solver through its API (passive Y bitwise, mass = the FP64

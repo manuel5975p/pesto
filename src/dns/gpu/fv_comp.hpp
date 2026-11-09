@@ -188,13 +188,16 @@ public:
     // Replace one row of the FvBc table. Pre: patch valid, kind unchanged.
     std::expected<void, std::string> setBc(int patch, const FvBc& bc);
     // --checkpoint-dt: every word a step carries to the next, raw (F32 or F64 by
-    // precision): "state.fv.q", the compensated low words "state.fv.lo", the SST
+    // precision): "state.fv.q", the compensated low words "state.fv.lo", the [thrust]
+    // ledger "state.fv.ledger.{I,lo,om,omlo}" (F64, only while setLedger is on), the SST
     // guard's count "state.fv.hits". Nothing else survives a step (eddy, TFLES and
-    // gradient fields are of the step's input state). Errors: exit 6 (download).
+    // gradient fields are of the step's input state; the ledger's ledS/ledPart are
+    // rewritten before every read). Errors: exit 6 (download).
     std::expected<void, RunError> save(Checkpoint& ck) const;
     // --restart: save's records into this solver (same mesh, closure, precision);
-    // after it the next step is the checkpointed run's bit for bit. Errors: a record
-    // missing or mis-sized exit 3, an upload exit 6.
+    // after it the next step is the checkpointed run's bit for bit. Pre: under [thrust],
+    // setLedger(true) first (it zero-allocates the words load overwrites). Errors: a
+    // record missing or mis-sized exit 3, an upload exit 6.
     std::expected<void, RunError> load(const Checkpoint& ck);
     // [thrust]'s impulse ledger (FvLedger, docs/nozzle.md "Thrust"): on zeroes it, and every later
     // step() adds per stage a fixed-order FP64 sum of each patch's materialized boundary F (one

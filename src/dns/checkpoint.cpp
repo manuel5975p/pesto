@@ -405,6 +405,11 @@ std::expected<CheckpointFacts, std::string> checkpointFacts(const Checkpoint& ck
         if (!m) return std::unexpected(m.error());
         f.mesh = *m;
     }
+    if (ck.has("bc.sections")) {
+        auto b = ck.text("bc.sections");
+        if (!b) return std::unexpected(b.error());
+        f.bcSections = *b;
+    }
     f.caseFlags = parseCaseFlagsText(*cs);
     f.nx = int((*grid)[0]);
     f.ny = int((*grid)[1]);

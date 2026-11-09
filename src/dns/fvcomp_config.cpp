@@ -302,6 +302,16 @@ std::string FvBcSpec::describe() const
     return s;
 }
 
+std::string fvBcCheckpointSections(const FvBcSpec& spec)
+{
+    std::string s;
+    if (const auto& z = spec.nozzle)
+        s += std::format("[nozzle] astar {} axis {} {} {}\n", z->astar, z->axis[0], z->axis[1], z->axis[2]);
+    if (const auto& t = spec.thrust)
+        s += std::format("[thrust] pa {}{}\n", t->pa, t->station ? std::format(" station {}", *t->station) : std::string());
+    return s;
+}
+
 std::expected<void, std::string> checkFvBc(const FvBcSpec& spec, std::span<const FvMeshPatch> mesh, bool wedgeOk)
 {
     auto bound = [&](const std::string& n) {

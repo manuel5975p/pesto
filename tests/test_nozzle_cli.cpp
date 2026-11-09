@@ -186,8 +186,6 @@ int main()
     refuses(thr + bc("th3", bcText + "\n[thrust]\npa = -0.1\n"), 3, "[thrust].pa: must be >= 0");
     refuses(thr + bc("th4", bcText + "\n[thrust]\nstation = 1\n"), 3, "[thrust]: needs pa");
     refuses(thr + bc("th5", bcText + "\n[thrust]\npa = 0\nstation = 1\n"), 2, "--bc: [thrust].station is the reacting nozzle's (dns flame)");
-    refuses("flame --polymesh " + dataA + " --bc " + bc("th6", bcText + "\n[thrust]\npa = 0\n") + " --checkpoint-dt 1" + o, 2,
-            "--checkpoint-dt: is not built with [thrust] (the impulse ledger is not checkpointed)");
     refuses("flame --polymesh " + dataA + " --bc " + bc("th7", bcText + "\n[thrust]\npa = 0\n") + o, 2,
             "[nozzle] belongs to the nozzle route (dns flow --shock hll --polymesh)");
     // Shock x C0 on the flame route (masterplan_combnozzle P3): acceptance, label, every text verbatim.
@@ -215,6 +213,10 @@ int main()
         const std::string fh = "flame --polymesh " + dataA + " --upstream 7 --tt 1 --shock hll" + o + " --bc ";
         Out n = dns(fh + bc("sx0", inlet + "y = [1.0]\n[nozzle]\nastar = 0.1\n[thrust]\npa = 0.01\nstation = 1\n"));
         check(n.rc == 0 && n.text.find("thrust     pa 0.01") != std::string::npos, "total + y, [nozzle] astar, [thrust] station: the dry-run passes");
+        // combscale S1: the ledger is checkpointed (gpu_restart_fv_thrust), the refusal is gone.
+        n = dns(fh + bc("sx0", inlet + "y = [1.0]\n[nozzle]\nastar = 0.1\n[thrust]\npa = 0.01\nstation = 1\n") + " --checkpoint-dt 1");
+        if (n.rc != 0 || n.text.find("checkpoint every 1") == std::string::npos) std::printf("    rc %d: %s", n.rc, n.text.c_str());
+        check(n.rc == 0 && n.text.find("checkpoint every 1") != std::string::npos, "[thrust] with --checkpoint-dt: the dry-run passes");
         refuses(fh + bc("sx1", inlet + "y = [1.0]\n[nozzle]\np = 0.1\nastar = 0.1\n"), 2,
                 "--bc: [nozzle].p, t: the flame route starts from the composition IC (docs/nozzle.md \"Reacting\")");
         refuses(fh + bc("sx2", inlet + "y = [1.0]\n[nozzle]\nastar = 0.1\n[thrust]\npa = 0.01\n"), 2,

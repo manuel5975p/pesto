@@ -2068,12 +2068,16 @@ struct FvCompImpl final : DeviceFvComp::Impl
         return h;
     }
 
-    // The carried words: q, the compensated l, the SST guard's count.
+    // The carried words: q, the compensated l, the [thrust] ledger, the SST guard's count.
     std::expected<void, RunError> save(Checkpoint& ck) const override
     {
         if (auto e = internal::putWords(ck, "state.fv.q", q); !e) return e;
         if (compensated)
             if (auto e = internal::putWords(ck, "state.fv.lo", l); !e) return e;
+        if (ledgerOn) // [thrust] (combscale S1): the compensated ledger, raw
+            for (auto [n, b] : {std::pair{"state.fv.ledger.I", &ledI}, {"state.fv.ledger.lo", &ledLo},
+                                {"state.fv.ledger.om", &ledOm}, {"state.fv.ledger.omlo", &ledOmLo}})
+                if (auto e = internal::putWords(ck, n, *b); !e) return e;
         if (hits.size() == 0) return {};
         unsigned long long h = 0;
         if (hits.download(&h) != hipSuccess) return std::unexpected(RunError{6, "checkpoint: floor hits download failed"});
@@ -2086,6 +2090,10 @@ struct FvCompImpl final : DeviceFvComp::Impl
         if (auto e = internal::getWords(ck, "state.fv.q", q); !e) return e;
         if (compensated)
             if (auto e = internal::getWords(ck, "state.fv.lo", l); !e) return e;
+        if (ledgerOn) // [thrust]: save's list (setLedger(true) zero-allocated them)
+            for (auto [n, b] : {std::pair{"state.fv.ledger.I", &ledI}, {"state.fv.ledger.lo", &ledLo},
+                                {"state.fv.ledger.om", &ledOm}, {"state.fv.ledger.omlo", &ledOmLo}})
+                if (auto e = internal::getWords(ck, n, *b); !e) return e;
         if (hits.size() == 0) return {};
         auto h = ck.i64Scalar("state.fv.hits");
         if (!h) return std::unexpected(RunError{3, "--restart: " + h.error()});

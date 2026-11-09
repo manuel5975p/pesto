@@ -19,13 +19,14 @@ namespace dns::drive {
 // Checkpoint / restart facts gathered in phase 1.5 for the flame runs
 // (dns/checkpoint.hpp): the binary's sha256 (only when a checkpoint flag is
 // given), the job's start (--wall-limit counts from it), the restart count, and
-// the FV routes' mesh identity.
+// the FV routes' mesh identity, the --bc file's [nozzle]/[thrust] lines (fvBcCheckpointSections).
 struct CheckpointContext
 {
     std::string binary;
     std::chrono::steady_clock::time_point start;
     long restarts = 0;
     std::string mesh;
+    std::string bcSections;
 };
 
 // Phase 1.5: the INPUT files whose facts the validator reads -- --scene (its

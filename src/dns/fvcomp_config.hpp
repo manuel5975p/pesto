@@ -91,6 +91,10 @@ struct FvBcSpec
 // Strict: an unknown table, key or kind and a wrong type are errors by name.
 std::expected<FvBcSpec, std::string> parseFvBc(std::string_view toml);
 
+// The [nozzle]/[thrust] lines a restart compares BY NAME before the --bc sha (combscale S1); shortest
+// round trip ("{}"); empty without either section. Post: one '\n'-terminated line per present section.
+std::string fvBcCheckpointSections(const FvBcSpec&);
+
 // One mesh patch, as the polyMesh boundary file names it.
 struct FvMeshPatch
 {

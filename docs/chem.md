@@ -2481,7 +2481,15 @@ differs from the checkpoint's: ...`) even under the same path. Loop structs
 `FvCompLoop`, `FvLowMachLoop`. State records are the device words raw, F32 at
 FP32 and F64 at `--fv-precision fp64` (`gpu/internal/ckpt_words.hpp`):
 `state.fv.q` (+ `state.fv.lo`, the compensated low words; `state.fv.hits`, the
-SST guard's count, when allocated) for the compressible solver; for the
+SST guard's count, when allocated; under `[thrust]` the impulse ledger
+`state.fv.ledger.I`, `.lo`, `.om`, `.omlo`, F64 always, with the loop records
+`loop.thrust.P0`, `loop.thrust.prev{In,Exit,Wall,Side,Omega}`,
+`loop.thrust.tPrev`; under `--shock hll`'s auto cadence `loop.shockHot`,
+combscale S1) for the compressible solver. A `[nozzle]`/`[thrust]` `--bc`
+carries the text record `bc.sections` (one line per section, shortest round
+trip), compared section by section in phase 1.5 BEFORE the mesh identity: a
+changed section is exit 3 naming it (`the --bc file's [thrust] differs from
+the checkpoint's: ... vs ...`; docs/nozzle.md "Thrust"); for the
 low-Mach one the state `state.fvlm.rho`, `rlo`, `ru`, `y<s>`, `ylo<s>`, the
 projection's WARM START and memory `state.fvlm.p` (the PCG's x0 of the next
 stage) and `phi`, `phiB` (the last stage's face mass flux: the next stage's
@@ -2490,7 +2498,9 @@ Rhie-Chow term of c), the FP64 tallies `state.fvlm.tally` and the uploaded
 F E, E/F, Omega (of each step's input state; `refreshEddy` for dt and stats),
 the burner's per-face rows (tables of the mesh), the AMG hierarchy
 (geometric, built once). `gpu_restart_fv` (`comp`) and `gpu_restart_fvlm`
-(`lm`) prove it: chained (1 + 3 restarts) = straight byte for byte, a
+(`lm`) prove it, `gpu_restart_fv_thrust` (`thrust`) the reacting nozzle's
+ledger (FP64 plain and compensated, teeth on the ledger and loop records,
+section rejects): chained (1 + 3 restarts) = straight byte for byte, a
 checkpointing straight run = straight, and its last checkpoint = the chain's
 record for record but `restarts`. The low-Mach FV loop's equal steps to `--tt`
 (`rem / ceil(rem / dt)`) make its trajectory a function of `--tt`: a restart

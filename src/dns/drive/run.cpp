@@ -14,6 +14,9 @@
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <optional>
+#include <ranges>
+#include <string_view>
 
 namespace dns::drive {
 
@@ -43,6 +46,27 @@ std::expected<void, int> readFvBcFile(RawConfig& raw)
     return {};
 }
 
+// The first --bc section ([nozzle], [thrust]) whose bc.sections line differs, as
+// "the --bc file's [thrust] differs from the checkpoint's: pa 0.01 vs pa 0.02"
+// (checkpoint first; "(absent)" for a section only one side holds); nullopt when equal.
+std::optional<std::string> bcSectionsDiff(std::string_view ckpt, std::string_view run)
+{
+    auto line = [](std::string_view text, std::string_view tag) -> std::optional<std::string_view> {
+        for (auto part : std::views::split(text, '\n')) {
+            const std::string_view l(part.begin(), part.end());
+            if (l.starts_with(tag) && l.size() > tag.size() && l[tag.size()] == ' ') return l.substr(tag.size() + 1);
+        }
+        return std::nullopt;
+    };
+    for (const std::string_view tag : {"[nozzle]", "[thrust]"}) {
+        const auto a = line(ckpt, tag), b = line(run, tag);
+        if (a == b) continue;
+        return std::format("the --bc file's {} differs from the checkpoint's: {} vs {}", tag, a.value_or("(absent)"),
+                           b.value_or("(absent)"));
+    }
+    return std::nullopt;
+}
+
 // dns flame checkpoints: the binary's fingerprint, the FV routes' mesh identity,
 // and --restart's checkpoint HEADER (no fields) against this invocation --
 // solver, binary, every case-defining flag, mesh: a mismatch is exit 3 by name.
@@ -59,6 +83,7 @@ std::expected<void, int> readFlameCheckpoint(RawConfig& raw, CheckpointContext& 
             auto m = fvMeshIdentity(raw);
             if (!m) return std::unexpected(die(exitInput, "checkpoint: cannot fingerprint the mesh: " + m.error()));
             ckx.mesh = *m;
+            if (raw.fvBc) ckx.bcSections = fvBcCheckpointSections(*raw.fvBc);
         }
     }
     if (!raw.given.contains("--restart")) return {};
@@ -78,6 +103,8 @@ std::expected<void, int> readFlameCheckpoint(RawConfig& raw, CheckpointContext& 
                                                           path, f->binary, ckx.binary)));
     if (auto d = caseFlagsDiff(f->caseFlags, raw.caseFlags))
         return std::unexpected(die(exitInput, "--restart: case differs from the checkpoint: " + *d));
+    if (auto d = bcSectionsDiff(f->bcSections, ckx.bcSections))
+        return std::unexpected(die(exitInput, std::format("--restart: {}: {}", path, *d)));
     if (f->mesh != ckx.mesh)
         return std::unexpected(die(exitInput, std::format("--restart: {}: the mesh differs from the checkpoint's: {} vs {}",
                                                           path, f->mesh.empty() ? "(none)" : f->mesh,

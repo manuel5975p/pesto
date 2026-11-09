@@ -110,6 +110,7 @@ struct CheckpointFacts
 {
     std::string binary, solver;
     std::string mesh; // the "mesh" record; empty when absent (a structured solver)
+    std::string bcSections; // the "bc.sections" record ([nozzle]/[thrust] lines); empty when absent
     CaseFlags caseFlags;
     int nx = 0, ny = 0, nz = 0, nY = 0;
     double t = 0;
@@ -136,6 +137,9 @@ struct CheckpointPolicy
     // files and the --bc file, "flags" for a box the case flags define. Empty:
     // a structured grid (no record).
     std::string mesh;
+    // The --bc file's [nozzle]/[thrust] lines (fvBcCheckpointSections): the "bc.sections" text
+    // record, compared section by section before the mesh. Empty: no record.
+    std::string bcSections;
     const Checkpoint* restart = nullptr; // --restart: the loaded checkpoint
     long restarts = 0;         // this job's restart count (ckpt's + 1)
     bool active() const { return every > 0 || restart != nullptr; }

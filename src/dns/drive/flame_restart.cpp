@@ -70,6 +70,7 @@ CheckpointPolicy flamePolicy(const Case& c, const CheckpointContext& ckx,
     policy.binary = ckx.binary;
     policy.caseText = caseFlagsText(c.caseFlags);
     policy.mesh = ckx.mesh;
+    policy.bcSections = ckx.bcSections;
     policy.restart = restart ? &*restart : nullptr;
     policy.restarts = ckx.restarts;
     return policy;

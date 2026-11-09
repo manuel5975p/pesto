@@ -159,8 +159,20 @@ face passes. The nozzle itself, mostly cold, 0.142.
 
 `[thrust]` in `--bc` (`pa`, required, >= 0, a ratio as `[nozzle] p`; `station`: `dns flame` only, required there,
 the burnt stagnation plane along the axis; needs `[nozzle]`) turns on the impulse ledger and writes `PREFIX_thrust.csv`, 17 digits, one row per stats row. Absent: no
-launch, no buffer, no file, `_stats.csv` byte for byte. `--checkpoint-dt`, `--restart`, `--wall-limit` with it: exit 2
-(the ledger is not checkpointed).
+launch, no buffer, no file, `_stats.csv` byte for byte.
+
+**Checkpoint** (combscale S1). `--checkpoint-dt`, `--restart`, `--wall-limit` take `[thrust]`: the restarted run equals
+the uninterrupted one byte for byte (`_stats`, `_thrust`, `_profiles.csv`; `gpu_restart_fv_thrust`, FP64 plain and
+compensated). Records: the device words `state.fv.ledger.I`, `.lo`, `.om`, `.omlo` (F64 raw, the compensated ledger;
+`ledS`/`ledPart` are rewritten before every read); the host loop `loop.thrust.P0` (the IC's six sums),
+`loop.thrust.prevIn|prevExit|prevWall|prevSide|prevOmega`, `loop.thrust.tPrev` (the previous row's role sums and t,
+`fvThrustWindow`'s start), all only with `[thrust]`; `loop.shockHot` (`--shock hll`'s sticky dt cadence) only under the
+auto cadence. A restart loads the words after `setLedger(true)` (which zero-allocates them). The text record
+`bc.sections` holds the `[nozzle]`/`[thrust]` lines (`fvBcCheckpointSections`, shortest round trip); a restart compares
+them BEFORE the `--bc` sha, so a changed section is exit 3 by its name (`--restart: PATH: the --bc file's [thrust]
+differs from the checkpoint's: pa 0.01 station 46.7682092 vs pa 0.02 station 46.7682092`, a missing section `(absent)`);
+any other `--bc` change is the mesh identity's exit 3. Teeth: zeroing `state.fv.ledger.I`, `loop.thrust.P0` or
+`loop.thrust.prevExit` moves `_thrust.csv`.
 
 **Ledger** (`DeviceFvComp::setLedger`, `FvLedger`, FvRef's twin `march(..., &ledger)`). Per stage, after the fluxes,
 per patch and state row: `S_k = sum_f F_f` over the patch's materialized boundary faces (FP64, one block per patch,
@@ -453,8 +465,8 @@ apart): stopped; G4.10 is decomposed (masterplan_combclose R10: G1.2 + G1.8, T1,
 
 `--steady` (LTS on `Total` stalls on the host, Z7), LES, RANS, two-reactant species (C1, C2b), gravity, body force,
 `--turb`: refused by name (`dns/fvmodules`, axis `capture`). Plume box (P7), 2D / wedge reacting nozzles (P6), viscous
-walls (P7), Shock x C1 / C2b (P8), gamma(T) (P9): next cycle. Structured D3: no. `[thrust]` with checkpoints: refused
-(the ledger is not checkpointed); `[thrust].station` on `dns flow`: refused (the reacting nozzle's burnt station).
+walls (P7), Shock x C1 / C2b (P8), gamma(T) (P9): next cycle. Structured D3: no. `[thrust]` with checkpoints: built
+(combscale S1, "Thrust" above); `[thrust].station` on `dns flow`: refused (the reacting nozzle's burnt station).
 `--inflow-speed` on a `[nozzle]` flame: exit 2 (the throat sets u_u). A `[nozzle]` flame whose mesh has no throat (eps_c
 <= 1), no choke root or a thermally choked chamber: exit 3 by name (`fvReactingNozzleDesign`). The ledger refuses gravity, a body force, RANS and local time stepping (their
 sources are no boundary flux).

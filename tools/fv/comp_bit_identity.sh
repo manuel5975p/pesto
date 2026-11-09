@@ -120,5 +120,12 @@ run fvnozW flow --physics compressible --polymesh "$ROOT/tests/data/fv/nozzle_W"
 FLAMEMESH="$OUT/flmesh"
 python3 "$ROOT/tools/chem/fv_flame_mesh.py" --nx 197 --ny 4 --lx 38.6532 --ly 3.41688 --out "$FLAMEMESH" > /dev/null
 run fvflpoly flame --polymesh "$FLAMEMESH" --bc "$FLAMEMESH/bc.toml" --upstream 14.1335 --inflow-speed 0.98 --tt 2 --fv-precision fp64 --emit stats
+# combscale: the reacting nozzle with [thrust] (the ledger's checkpoint words, bc.sections), three state kinds.
+NOZMESH="$OUT/react15"
+python3 "$ROOT/tools/fv/nozzle_react.py" design --cells 15 --mach 0.042 --sl 0.9945059 --out "$NOZMESH" > /dev/null
+NOZ=(flame --mach 0.042 --expansion 5 --zeldovich 8 --prandtl 0.72 --polymesh "$NOZMESH" --bc "$NOZMESH/bc.toml" --shock hll --upstream 12 --tt 1 --emit stats)
+run fvnozR "${NOZ[@]}" --fv-precision fp64
+run fvnozRc "${NOZ[@]}" --fv-precision fp64 --compensated
+run fvnozR32 "${NOZ[@]}"
 echo "failures: $fails"
 exit $fails

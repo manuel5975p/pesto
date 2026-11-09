@@ -2803,6 +2803,14 @@ combclose (`plans/masterplan_combclose.md`, amendments B1-):
   the `_stats.csv` / `_thrust.csv` comment line, the `--dry-run` label and the run's stdout. Physics bytes unchanged:
   `comp_bit_identity.sh` vs dns.BASE 55 of 56 rows byte-identical, fvpolysteady differs in line 1 of `_stats.csv`
   only (json, mask, data rows equal); an FP64 SA-neg O-grid `--steady` (old vs new binary) differs in line 1 only.
+- N23. **CLOSED (combscale S1): `shockHot` was carried and never checkpointed on the FV flame route**, and the
+  `[thrust]` ledger was refused with checkpoints. `runFvComp`'s `--shock hll` sticky dt cadence lived in a local whose
+  comment said "checkpoints are refused on this route" (false: `dns flame --polymesh --shock hll --checkpoint-dt` passed
+  `resolveCheckpoint`), so a restart after the first sensed cell would have re-entered the default cadence. It is now
+  `FvCompLoop::shockHot`, record `loop.shockHot` only under the auto cadence (runner_flame's pattern); no CLI-reachable
+  teeth (the nozzle senses 0 cells). Same commit: the ledger's device words and `loop.thrust.*` are checkpointed, the
+  device `load` moved after `setLedger(true)` (it re-zeroed the words), the `bc.sections` record names a changed
+  `[nozzle]`/`[thrust]`; `gpu_restart_fv_thrust` (docs/nozzle.md "Thrust").
 
 ## Older open items (details in CLAUDE.md)
 
