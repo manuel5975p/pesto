@@ -2600,6 +2600,26 @@ at sigma 1 to 3.4e-13 of scale on every cell, shock and wedge included.
   A's Cf fall (B's Cf rises 3.6e-5, 2.6e-4). dns x_s 3.0716, 3.0696, 3.074: not monotone; foam 3.0825, 3.0820 at 160,
   320. A flat gap is a bug or a stated model gap: unattributed. Needs foam at 640 (cut).
 
+### Reacting nozzle (`docs/nozzle.md` "Reacting", `plans/masterplan_combnozzle.md`)
+
+P0, the 0D reactor (docs/chem.md "P0: the 0D reactor"; amendments A1–A3):
+- N1. **G0.2 UNMET as specified**: N 2000/4000/8000 orders 2.203, 2.583, finest |ΔY| 3.57e-4 vs order
+  ≥ 2.8, 1e-9. The exact-arithmetic SSP-RK3 recurrence has the same numbers (device gap 1.2e-10 to
+  4.85e-9, counted as G0.2c): the ladder sits in the thermal runaway (J dt ≈ 2 at t_e/2000). Order 2.904,
+  2.961 at 16000/32000/64000 (G0.2b); the 1e-9 needs N ~ 6e5 by truncation, while the device's rounding
+  gap to the exact recurrence grows with N (1.2e-10 at 2000, 4.85e-9 at 64000, ~5e-8 extrapolated to 6e5):
+  1e-9 is not attainable in FP64 at any N on this ODE.
+- N2. **G0.3 UNMET as specified**: the full burn at t_e/8000 ends at Y −4.617e-3, T 3.19e-3 off T_end;
+  that dt is 6.6x the solver's own `chemDt` (kChemDt 0.5) at T_end, where the floored RK3 overshoots
+  past Y 0 and stops reacting. A scalar twin gives −4.61669e-3. Inside the bound (t_e/64000, G0.3b):
+  T_end 2.8e-13. No solver change: `dns flame` never steps past chemDt. A fixed-dt API caller can.
+- N3. **G0.5 UNMET**: chemFoam's `constantProperty volume` is an O(dt) split (its chemistry ODE
+  integrates T at constant pressure inside each step; h is reset to u0 + p_old/rho + int Qdot after):
+  max T error 0.495, 0.391 at t_e/2000, /8000, ignition delay 2.53e-3, 7.06e-4 (order 0.92). And seulex
+  (the plan's ODE) aborts on the runaway in every case: the T row of `StandardChemistryModel::jacobian`
+  is zero. With RKDP45 the constant-pressure reactor matches the cp quadrature to 3.3e-10 (G0.5b):
+  the janaf-constant map is exact; a constant-volume foam reference needs another solver.
+
 ## Older open items (details in CLAUDE.md)
 
 - No anchor for the Re800 compressible cases or `sphere_re300_n160_cd`

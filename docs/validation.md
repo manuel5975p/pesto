@@ -482,6 +482,27 @@ Device, FP64 unless named, gfx1100. `gpu_fv_nozzle_MODE`, `fvref_MODE`. Foam is 
 | FP32 | `gpu_fv_nozzle_fp32` | compensated x_s 0.000 cells, mdot 1e-8; plain 2.0e-5 |
 | matrix | `gpu_fv_comp`, `gpu_fv_cross` X6, `gpu_fv_matrix` | FV64 vs FvRef 3e-15; FV32 vs structured 1.85e-6 (own 1.64e-6), bytes 0 off |
 
+### 0D reactor (`fvref_reactor`, `gpu_fv_flame_reactor`; docs/chem.md "P0: the 0D reactor")
+
+Model C0 σ 5 β 8 at M 0.01 units, constant volume, Y 1, T0 2.5 Tu, FP64, gfx1100. t_e = t(Y 1/2) =
+3.4165470720791 (G7K15 quadrature; mpmath 40 digits 7e-16 away). Anchors are Y(t_e) − 1/2 of the device
+at dt = t_e/N against the exact-arithmetic SSP-RK3 recurrence of the same ODE (`tests/fvref_reactor.hpp`
+`kRk3Shu`; masterplan_combnozzle A1):
+
+| N | device Y(t_e) − 1/2 | exact SSP-RK3 | gap | order |
+|---|---|---|---|---|
+| 2000 | 9.857900e-03 | 9.85789999891e-03 | 1.20e-10 | |
+| 4000 | 2.141028e-03 | 2.14102827172e-03 | 2.41e-10 | 2.203 |
+| 8000 | 3.573968e-04 | 3.57397390223e-04 | 5.98e-10 | 2.583 |
+| 16000 | 5.138231e-05 | 5.13835450750e-05 | 1.23e-09 | 2.798 |
+| 32000 | 6.864559e-06 | 6.86698883116e-06 | 2.43e-09 | 2.904 |
+| 64000 | 8.817549e-07 | 8.86600817518e-07 | 4.85e-09 | 2.961 |
+
+The plan's G0.2 (order ≥ 2.8 and \|ΔY\| ≤ 1e-9 at N 2000/4000/8000) is UNMET by the scheme's own
+truncation constant (the exact recurrence has the same orders); the counted gate is the gap ≤ 1e-8.
+chemFoam (RKDP45, `constantProperty pressure`) vs the cp quadrature: 3.33e-10 max over every step;
+`volume`: 0.495, an O(dt) split (issues.md N3).
+
 ## Tolerance adjustments vs the original plan
 
 Recorded per the rule "widen only with written justification":

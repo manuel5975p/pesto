@@ -13,8 +13,10 @@
 //   E3  Sigma-form dt: checkerboard decays at the bound, grows past it
 //   E4  cell orders agree   E5  Dual / float instantiations of fvflux
 //   E6  u checkerboard on 100:1 cells, Pr 0.72/2/7: the momentum 4/3
+//   `test_fvref reactor`: the 0D reactor's quadrature and FvRef march (fvref_reactor.hpp)
 #include "dns/fvref.hpp"
 #include "fvref_nozzle.hpp"
+#include "fvref_reactor.hpp"
 
 #include "dns/comp.hpp"
 #include "dns/curvmesh.hpp"
@@ -937,6 +939,70 @@ void e5()
 
 int mms(); // G4, below
 
+// fvref_reactor (masterplan_combnozzle P0, docs/chem.md "P0: the 0D reactor"): the closed quadrature
+// of the 0D constant-volume reactor and FvRef's march of it (the device gates are
+// gpu_fv_flame_reactor's).
+//   Q1 G7K15 adaptive on a closed integral   Q2 t(1/2) at constant volume and pressure vs
+//   40-digit references   Q3 t(Y(t)) == t   Q4 the control oracle's Y(t_e)   Q5 Lambda
+//   H1 FvRef: every cell bitwise cell 0's, momentum 0.0, E + q rho Y per step, 2000 steps
+//   H2 FvRef Y(t_e) - 1/2 == the exact-arithmetic SSP-RK3 recurrence (control: Kutta's RK3)
+int reactorHost()
+{
+    namespace r = dnstest::reactor;
+    std::printf("== Q the closed quadrature\n");
+    const double e1 = r::integrate([](double x) { return std::exp(x); }, 0.0, 1.0, 1e-14);
+    const double q1 = std::abs(e1 / (std::numbers::e - 1.0) - 1.0);
+    check(q1 <= 1e-15, std::format("Q1 G7K15 int_0^1 e^x: {:.2e} <= 1e-15", q1));
+    const r::Reactor cv = r::boxReactor(true), cp = r::boxReactor(false);
+    const double te = r::timeTo(cv, 0.5), tp = r::timeTo(cp, 0.5);
+    const double q2v = std::abs(te / r::kTeV - 1.0), q2p = std::abs(tp / r::kTeP - 1.0);
+    std::printf("  t_e = t(1/2): constant volume %.16f (ref %.16f), constant pressure %.16f\n", te, r::kTeV, tp);
+    check(q2v <= 1e-13 && q2p <= 1e-13, std::format("Q2 t(1/2) vs the 40-digit references: {:.2e}, {:.2e} <= 1e-13", q2v, q2p));
+    // The bound: the quadrature's 1e-14 t plus the bisection's |ds| <= 1e-15 as time, ds/k.
+    double q3 = 0.0;
+    for (const double t : {0.1, 1.0, 3.0, 0.999 * te, te, 1.001 * te, 1.01 * te}) {
+        const double y = r::yAt(cv, t), bound = 1e-14 * t + 2e-15 * cv.invRate(std::log(y));
+        q3 = std::max(q3, std::abs(r::timeTo(cv, y) - t) / bound);
+    }
+    check(q3 <= 1.0, std::format("Q3 |t(Y(t)) - t| over (1e-14 t + 2e-15/k): {:.2f} <= 1", q3));
+    const double yc = r::yAt(cp, te), q4 = std::abs(yc - r::kYcpAtTe);
+    std::printf("  the constant-pressure (cp) oracle at t_e: Y %.16f\n", yc);
+    check(q4 <= 1e-12, std::format("Q4 the control oracle's Y(t_e): {:.2e} <= 1e-12", q4));
+    PremixedModel md;
+    md.sigma = r::kSigma;
+    md.beta = r::kBeta;
+    const double lam = orDie(premixedEigen(md), "premixedEigen").Lambda, q5 = std::abs(lam / r::kLambda - 1.0);
+    std::printf("  premixedEigen Lambda %.10f (cached %.10f)\n", lam, r::kLambda);
+    check(q5 <= 1e-12, std::format("Q5 Lambda == the cached oracle's: {:.2e} <= 1e-12", q5));
+
+    std::printf("== H FvRef's 0D march, FP64, dt = t_e/2000\n");
+    const r::ReactorCase rc = orDie(r::reactorCase(), "reactor case");
+    const FvRef ref = orDie(FvRef::make(rc.fm, {.tr = rc.tr, .bc = rc.bc, .chem = rc.chem}, 1), "reactor FvRef");
+    constexpr int kN = 2000;
+    const double dt = te / kN;
+    FvState s = rc.ic;
+    const double S0 = r::coupledEnergy(s, rc.fm, rc.chem.q);
+    double Sprev = S0, dS = 0.0;
+    bool uniform = true;
+    for (int n = 0; n < kN; ++n) {
+        ref.step(s, dt);
+        const double S = r::coupledEnergy(s, rc.fm, rc.chem.q);
+        dS = std::max(dS, std::abs(S - Sprev) / S0);
+        Sprev = S;
+        uniform = uniform && r::uniformAtRest(s);
+    }
+    const double dY = r::cellY(s, 0) - 0.5, tRel = r::cellT(s, 0) / cv.T(0.5) - 1.0;
+    const double h2 = std::abs(dY - r::kRk3Shu[0].second), h2c = std::abs(dY - r::kRk3Kutta2000);
+    std::printf("  %d steps: Y(t_e) - 1/2 = %.15e, T(t_e)/T(1/2) - 1 = %.3e; |E + q rho Y| step max %.2e, total %.2e\n", kN,
+                dY, tRel, dS, std::abs(Sprev / S0 - 1.0));
+    check(uniform, "H1 every cell bitwise cell 0's, momentum exactly 0.0, every step");
+    check(dS <= 1e-14, std::format("H1 Sum V (E + q rho Y) per step {:.2e} <= 1e-14", dS));
+    check(dY > 1e-3 && dY < 2e-2, "H1 live: the march burnt to Y(t_e) ~ 1/2");
+    check(h2 <= 1e-8, std::format("H2 Y(t_e) - 1/2 vs exact SSP-RK3 {:.2e} <= 1e-8", h2));
+    check(h2c > 1e-6, std::format("H2 control: vs Kutta's RK3 {:.2e} > 1e-6 (the gate tells schemes apart)", h2c));
+    return dnstest::finish();
+}
+
 // Well-balanced gravity (docs/fvcomp.md "Gravity"). W1: T linear in the height + ln p
 // its hydrostatic integral, cell values only, is a fixed point on the random mesh:
 // rhs = rounding of the pressure gradient. Isothermal too. W2: an arbitrary state in a
@@ -1110,6 +1176,7 @@ int main(int argc, char** argv)
     if (argc > 1 && std::string(argv[1]) == "wedgew") return dnstest::noz::wedgeW();
     if (argc > 1 && std::string(argv[1]) == "t1r") return dnstest::noz::t1r();
     if (argc > 1 && std::string(argv[1]) == "hoop") return dnstest::noz::hoop();
+    if (argc > 1 && std::string(argv[1]) == "reactor") return reactorHost();
     g1();
     g2();
     g3();

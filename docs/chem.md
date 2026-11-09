@@ -1102,6 +1102,66 @@ M 0.015 (jet Mach 0.3, as G4b), 696 × 144, foam dt 2.25e-3 τ; ideal cone
 - Fields at t 120 vs foam: Z L∞ 1.4e-2 / 8.6e-3 / 2.5e-2.
 - Cost: dns 0.26 ms/step; foam 71 s on 4 ranks.
 
+### P0: the 0D reactor, FV and chemFoam against one quadrature (masterplan_combnozzle, 2026-11-09)
+
+Chemistry alone. Model C0 (σ 5, β 8, Λ 3656401.0984807) in a closed adiabatic box at rest, ρ fixed,
+Y 1, T0 = 2.5 Tu, M 0.01 units. ω/ρ = Λ Y e^(−θ Tu/T): ρ cancels, so
+
+    dY/dt = −Λ Y e^(−θ Tu/T),   T(Y) = T0 + ΔT (1 − Y)
+    ΔT = q/cv = γ (σ − 1) Tu   (constant volume: the FV box; T_end 8.1 Tu)
+    ΔT = q/cp = (σ − 1) Tu     (constant pressure: the control oracle, chemFoam's `pressure`)
+    t(Y) = ∫_{ln Y}^0 ds e^(θ Tu/T(e^s)) / Λ
+
+Oracle: `tests/fvref_reactor.hpp` (adaptive G7K15 in s = ln Y, relative 1e-14 per panel; Y(t) by
+bisection in s) and its Python twin in `tools/chem/chemfoam_reactor.py` (Gauss-Legendre 12 on
+panels of 0.02 in s, Newton in the panel). t(1/2) = 3.4165470720791 (cv), 4.8439408999827
+(cp): both match 40-digit mpmath to 7e-16 and 1.3e-15 (`chemfoam_reactor.py rk3ref` prints every
+reference). FV case: the uniform periodic 4 × 4 × 1 FaceMesh, h = 1 (integer coordinates, so a
+uniform state's face sums cancel exactly). Tests: `fvref_reactor` (host), `gpu_fv_flame_reactor`.
+
+| gate | relation | measured | |
+|---|---|---|---|
+| G0.1 | 2000 steps of t_e/2000: every cell bitwise cell 0's, u v w 0.0 | FP32, FP32 compensated, FP64: exact every 50 steps | PASS |
+| G0.2 | N 2000/4000/8000 (dt t_e/N): order ≥ 2.8, finest \|ΔY\| ≤ 1e-9 | orders 2.203, 2.583 (Y and T); \|ΔY\| 9.86e-3, 2.14e-3, 3.57e-4 | **UNMET** |
+| G0.2 control | the cp oracle must miss | 0.451 | fails as required |
+| G0.2b | N 16000/32000/64000: order ≥ 2.8; \|ΔY\| ≤ 1e-9 | 2.904, 2.961; 8.82e-7 | order PASS, 1e-9 **UNMET** |
+| G0.2c | every rung vs the exact-arithmetic SSP-RK3 recurrence ≤ 1e-8 | 1.2e-10 (N 2000) … 4.85e-9 (N 64000); FvRef 6.7e-11 at 2000 | PASS |
+| G0.2c control | Kutta's RK3 (also order 3) at N 2000 must miss | 6.41e-3 | fails as required |
+| G0.3 | burn to 2 t_e at t_e/8000: Σ V (E + q ρY) per step ≤ 1e-14; T_end 1e-12 | per step 1.01e-15; T 3.19e-3 off, Y −4.617e-3 | energy PASS, T **UNMET** |
+| G0.3b | the same at t_e/64000 | per step 1.01e-15; T 2.76e-13, Y 4.9e-324 | PASS |
+| G0.4 | FvRef vs device, 100 steps from the IC ≤ 1e-13 | 2.60e-15 | PASS |
+| G0.4 | across the runaway (steps 1900..2000), each step from the device state | 2.68e-16 (continuous: 5.90e-13; a 1e-14 ρY perturbation grows ×12.3 there) | PASS |
+| G0.5 | chemFoam `volume` vs the cv quadrature ≤ 1e-5 every step | 0.495 (t_e/2000), 0.391 (t_e/8000) | **UNMET** |
+| G0.5b | chemFoam `pressure` vs the cp quadrature ≤ 1e-5 every step | 3.33e-10; T_end 6.5 Tu exact | PASS |
+| G0.5 control | Hf_P = 1% of Hf_F must miss by > 1e-3 | cp 0.459, cv 0.578 | fails as required |
+
+Why the three UNMET rows are the rigs, not the solver:
+- **G0.2**: Y(t_e) is in the thermal runaway (J dt 1.96 at t_e/2000, positive eigenvalue). The exact
+  SSP-RK3 recurrence itself has orders 2.20, 2.58 there and 3.57e-4 at t_e/8000; it reaches 2.9
+  only at N ≥ 16000, and 1e-9 needs N ~ 6e5, where the device's rounding gap (growing with N,
+  4.85e-9 at 64000) is already larger. G0.2c is the sharp form: the device IS that recurrence.
+- **G0.3**: t_e/8000 is 6.6× the solver's own chemistry bound `chemDt` (`kChemDt` 0.5) at T_end
+  (J dt 3.3 > RK3's 2.51). The floored RK3 overshoots into Y −4.617e-3 (a scalar FP64 twin gives
+  −4.61669e-3) and then never reacts. Inside the bound (G0.3b) the burn ends at T_end to 2.8e-13.
+- **G0.5**: `StandardChemistryModel::derivatives` integrates T at CONSTANT PRESSURE inside every
+  chemistry step (dT = −Σ h_a dc/(ρ c_p)); `constantProperty volume` then resets h = u0 + p_old/ρ +
+  ∫Q̇. So chemFoam's constant-volume reactor is an O(dt) split: ignition-delay error 2.53e-3,
+  7.06e-4 at t_e/2000, /8000 (order 0.92), max T error at the front 0.495, 0.391. Its
+  constant-pressure reactor has no split and matches the cp quadrature to 3.3e-10 at every step:
+  the janaf map, A, Ta and Hf are exact.
+
+chemFoam rig (`tools/chem/chemfoam_reactor.py setup|run|compare [--ode S]`, cases in
+`runs/flames/foam/P0/<S>/`, one CPU job):
+- `readInitialConditions.H` casts the thermo to `reactingMixture<gasHThermoPhysics>`
+  (sutherland + janaf): **hConst is refused**. Constant cp = janaf with a0 = 3.5 in both ranges,
+  a1..a4 = a6 = 0, the offset a5 carrying the heat: h_a,F − h_a,P = R (a5_F − a5_P) = cp (σ − 1)
+  Tu = q, independent of R and Tstd.
+- **seulex aborts on the runaway** (all five cases, `Integration steps greater than maximum
+  10000`, dxDid ~4e-12 s): `StandardChemistryModel::jacobian` leaves the T row zero (no dT'/dc,
+  dT'/dT), and a linearly implicit extrapolation without the runaway's eigenvalue collapses its
+  step. The gated runs use RKDP45 (explicit, absTol 1e-14, relTol 1e-10): the reaction is not
+  stiff here (J ≤ 7624/τ).
+
 ## 2D slot-jet diffusion flame (`--mode diffusion`)
 
 `dns/diffusion.{hpp,cpp}` (core: model, Burke–Schumann state, inflow,
@@ -3315,6 +3375,8 @@ outputs `runs/flames/real2/` (89 GB, 121 volume frames t 230–260).
 | `gpu_flame_rich1d_law` | GPU binary | model C2b: jet + `--mix-phi` 0.7 / 1.05 / 1.2 (+ 1.2 onestep), 15 cells: \|S/r − 1\| < 5e-3, \|(S/S_jet)/r − 1\| < 3e-3, Z within 5e-4 of Z(φ) (~60 s) |
 | `gpu_flame_passive` | GPU API | species off/on bitwise mean flow, uniform Y, passive copies, boundedness |
 | `gpu_flame_conservation` | GPU API | mass, E + qρY, fuel vs rate tally |
+| `fvref_reactor` | host | the 0D reactor's quadrature (G7K15, 40-digit t(1/2), round trip, the cp oracle, Λ) and FvRef's march: bitwise uniform, E + qρY per step, the exact SSP-RK3 recurrence (control Kutta) |
+| `gpu_fv_flame_reactor` | GPU API | the 0D reactor G0.1–G0.4 (section "P0: the 0D reactor"), ~37 s |
 | `gpu_flame1d_grid` / `_mach` / `_suth` | GPU binary | the tables above |
 | `bunsen` | host | inflow profile, cone distance, measureCone / flankMassFlux on drawn cones (8, 16 cells; U 3, 5), the burning qualification |
 | `gpu_flame_passive` (f) | GPU API | uniform per-row inflow (u, ρ, Y) bit for bit the uniform targets |

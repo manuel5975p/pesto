@@ -18,7 +18,10 @@
 //   flame1d (`test_gpu_fv_flame flame1d`): the binary route, 7.5 cells per delta_th
 //   mix (`test_gpu_fv_flame mix`): gpu_diffusion_mix's layer, uniform and wavy mesh
 //   jet (`test_gpu_fv_flame jet`): the binary route of --mode diffusion
+//   reactor (`test_gpu_fv_flame reactor`): the 0D constant-volume reactor, G0.1-G0.4 of
+//      masterplan_combnozzle P0, against fvref_reactor.hpp's closed quadrature
 #include "fv_comp_test_util.hpp"
+#include "fvref_reactor.hpp"
 
 #include "dns/chem.hpp"
 #include "dns/diffusion.hpp"
@@ -801,11 +804,173 @@ int runFlame1d()
 #endif
 }
 
+// The 0D constant-volume reactor (masterplan_combnozzle P0, docs/chem.md "P0: the 0D reactor"): the
+// uniform periodic 4 x 4 x 1 box at rest, C0 sigma 5 beta 8 at M 0.01 units, Y 1, T0 2.5 Tu,
+// against the closed quadrature of fvref_reactor.hpp.
+namespace rx = dnstest::reactor;
+
+FvState reactorMarch(const rx::ReactorCase& rc, FvPrecision pr, bool comp, double dt, int steps,
+                     const std::function<void(int, const FvState&)>& every = {}, int stride = 0)
+{
+    DeviceFvComp d = orDie(DeviceFvComp::make(rc.fm, {.tr = rc.tr, .bc = rc.bc, .precision = pr, .compensated = comp,
+                                                      .chem = rc.chem}),
+                           "reactor");
+    orDie(d.upload(rc.ic), "upload");
+    FvState o;
+    for (int n = 1; n <= steps; ++n) {
+        d.step(dt);
+        if (stride > 0 && n % stride == 0) {
+            orDie(d.download(o), "download");
+            every(n, o);
+        }
+    }
+    orDie(d.download(o), "download");
+    return o;
+}
+
+int runReactor()
+{
+    const rx::ReactorCase rc = orDie(rx::reactorCase(), "reactor case");
+    const rx::Reactor& cv = rc.ode;
+    const double te = rx::timeTo(cv, 0.5), T5 = cv.T(0.5);
+    std::printf("== 0D reactor: t_e = t(Y 1/2) = %.16f, T(1/2) = %.10f Tu, T_end = %.10f Tu\n", te, T5 / rc.Tu,
+                cv.T(0.0) / rc.Tu);
+
+    std::printf("== G0.1 identity: FP32, FP32 compensated, FP64, 2000 steps of t_e/2000\n");
+    struct Mode
+    {
+        const char* tag;
+        FvPrecision pr;
+        bool comp;
+    };
+    for (const Mode md : {Mode{"FP32", FvPrecision::Fp32, false}, Mode{"FP32 compensated", FvPrecision::Fp32, true},
+                          Mode{"FP64", FvPrecision::Fp64, false}}) {
+        bool ok = true;
+        int seen = 0;
+        const FvState o = reactorMarch(rc, md.pr, md.comp, te / 2000, 2000,
+                                       [&](int, const FvState& s) {
+                                           ok = ok && rx::uniformAtRest(s);
+                                           ++seen;
+                                       },
+                                       50);
+        const double y = rx::cellY(o, 0);
+        std::printf("  %s: Y(t_e) %.9f, %d rows checked\n", md.tag, y, seen);
+        check(ok && rx::uniformAtRest(o), std::format("G0.1 {}: every cell bitwise cell 0's, u v w == 0.0", md.tag));
+        check(seen == 40 && y > 0.3 && y < 0.6, std::format("G0.1 {}: live (40 rows, burnt to Y ~ 1/2)", md.tag));
+    }
+
+    std::printf("== G0.2 order in dt, FP64: Y(t_e) - 1/2 and T(t_e)/T(1/2) - 1; G0.2c vs exact SSP-RK3\n");
+    std::vector<double> eY, eT;
+    double finest = 0.0, worstRk = 0.0, kutta = 0.0;
+    for (const auto& [N, ref] : rx::kRk3Shu) {
+        const FvState o = reactorMarch(rc, FvPrecision::Fp64, false, te / N, N);
+        const double dY = rx::cellY(o, 0) - 0.5, dT = rx::cellT(o, 0) / T5 - 1.0;
+        eY.push_back(std::abs(dY));
+        eT.push_back(std::abs(dT));
+        worstRk = std::max(worstRk, std::abs(dY - ref));
+        if (N == 2000) kutta = std::abs(dY - rx::kRk3Kutta2000);
+        if (N == 8000) finest = dY;
+        const std::size_t k = eY.size() - 1;
+        std::printf("  N %6d: dY %.6e  dT %.6e  order Y %.3f T %.3f  |dY - RK3 exact| %.2e\n", N, dY, dT,
+                    k ? std::log2(eY[k - 1] / eY[k]) : 0.0, k ? std::log2(eT[k - 1] / eT[k]) : 0.0, std::abs(dY - ref));
+    }
+    auto ord = [](const std::vector<double>& e, std::size_t k) { return std::log2(e[k] / e[k + 1]); };
+    const double pY = std::min(ord(eY, 0), ord(eY, 1)), pT = std::min(ord(eT, 0), ord(eT, 1));
+    rx::recordUnmet(pY >= 2.8 && pT >= 2.8 && std::abs(finest) <= 1e-9,
+          std::format("G0.2 N 2000/4000/8000: order Y {:.3f}, T {:.3f} >= 2.8; finest |dY| {:.2e} <= 1e-9", pY, pT,
+                      std::abs(finest)));
+    const double yCp = rx::yAt(rx::boxReactor(false), te), ctl = std::abs(0.5 + finest - yCp);
+    std::printf("  control: the constant-pressure oracle Y(t_e) %.9f misses the N 8000 run by %.3e\n", yCp, ctl);
+    check(ctl >= 0.1, std::format("G0.2 control: the cp oracle misses by {:.3e} >= 1e-1 (fails the gate)", ctl));
+    const double pYb = std::min(ord(eY, 3), ord(eY, 4)), pTb = std::min(ord(eT, 3), ord(eT, 4));
+    check(pYb >= 2.8 && pTb >= 2.8, std::format("G0.2b (A1) N 16000/32000/64000: order Y {:.3f}, T {:.3f} >= 2.8", pYb, pTb));
+    rx::recordUnmet(eY[5] <= 1e-9, std::format("G0.2b (A1) N 64000: |dY| {:.2e} <= 1e-9", eY[5]));
+    check(worstRk <= 1e-8, std::format("G0.2c (A1) every rung vs the exact SSP-RK3 recurrence {:.2e} <= 1e-8", worstRk));
+    check(kutta > 1e-6, std::format("G0.2c control: N 2000 vs Kutta's RK3 {:.2e} > 1e-6", kutta));
+
+    const FvRef ref = orDie(FvRef::make(rc.fm, {.tr = rc.tr, .bc = rc.bc, .chem = rc.chem}, 1), "reactor FvRef");
+    std::printf("== G0.3 full burn to 2 t_e, FP64: the plan's t_e/8000 (recorded) and t_e/64000 (A2)\n");
+    const double S0 = rx::coupledEnergy(rc.ic, rc.fm, rc.chem.q), Tend = cv.T(0.0);
+    for (const int N : {8000, 64000}) {
+        double Sprev = S0, dS = 0.0, bound = HUGE_VAL;
+        bool uni = true;
+        int rows = 0;
+        const FvState fin = reactorMarch(rc, FvPrecision::Fp64, false, te / N, 2 * N,
+                                         [&](int, const FvState& s) {
+                                             const double S = rx::coupledEnergy(s, rc.fm, rc.chem.q);
+                                             dS = std::max(dS, std::abs(S - Sprev) / S0);
+                                             Sprev = S;
+                                             uni = uni && rx::uniformAtRest(s);
+                                             bound = std::min(bound, ref.chemDt(s, gpu::kChemDt));
+                                             ++rows;
+                                         },
+                                         1);
+        const double eTend = std::abs(rx::cellT(fin, 0) / Tend - 1.0), yEnd = rx::cellY(fin, 0);
+        std::printf("  N %d, %d steps: dt / min chemDt(kChemDt %.1f) = %.3f; Sum V (E + q rho Y) per step max %.2e, total "
+                    "%.2e; T/T_end - 1 %.2e; Y %.4e\n",
+                    N, rows, gpu::kChemDt, te / N / bound, dS, std::abs(Sprev / S0 - 1.0), eTend, yEnd);
+        const std::string tag = N == 8000 ? "G0.3" : "G0.3b (A2)";
+        check(dS <= 1e-14, std::format("{} t_e/{}: Sum V (E + q rho Y) per step {:.2e} <= 1e-14", tag, N, dS));
+        check(uni && rows == 2 * N, std::format("{} t_e/{}: live, {} rows, every cell cell 0's", tag, N, 2 * N));
+        const bool met = eTend <= 1e-12 && std::abs(yEnd) <= 1e-12;
+        const std::string what = std::format("{} t_e/{}: final T vs T0 + gamma (sigma - 1) Tu {:.2e} <= 1e-12, |Y| {:.2e} "
+                                             "<= 1e-12",
+                                             tag, N, eTend, std::abs(yEnd));
+        if (N == 8000)
+            rx::recordUnmet(met, what);
+        else
+            check(met, what);
+    }
+
+    // G0.4 as planned: 100 consecutive steps of t_e/2000 from the IC. Across the runaway
+    // (steps 1900..2000, Y 0.90 -> 0.51) the ODE itself amplifies rounding: there each step is
+    // compared from the device's own state, and the continuous window's distance is reported next
+    // to FvRef's growth of a 1e-14 rho Y perturbation over the same window (the conditioning).
+    std::printf("== G0.4 FvRef vs device FP64, steps of t_e/2000\n");
+    const double dt = te / 2000;
+    DeviceFvComp d = orDie(DeviceFvComp::make(rc.fm, {.tr = rc.tr, .bc = rc.bc, .precision = FvPrecision::Fp64,
+                                                      .chem = rc.chem}),
+                           "reactor");
+    orDie(d.upload(rc.ic), "upload");
+    FvState o;
+    for (int n = 0; n < 100; ++n) d.step(dt);
+    orDie(d.download(o), "download");
+    FvState h = rc.ic;
+    ref.march(h, dt, 100);
+    const double e0 = relDiff(o.q, h.q, ref.nV(), rc.fm.nC);
+    std::printf("  steps 0..100: Y 1 -> %.6f, |device - FvRef| %.2e\n", rx::cellY(o, 0), e0);
+    check(e0 <= 1e-13 && rx::cellY(o, 0) < 1.0, std::format("G0.4 steps 0..100: full state {:.2e} <= 1e-13 (live: Y falls)", e0));
+    for (int n = 100; n < 1900; ++n) d.step(dt);
+    FvState s1900;
+    orDie(d.download(s1900), "download");
+    double eStep = 0.0;
+    for (int n = 0; n < 100; ++n) {
+        FvState a;
+        orDie(d.download(a), "download");
+        d.step(dt);
+        orDie(d.download(o), "download");
+        ref.step(a, dt);
+        eStep = std::max(eStep, relDiff(o.q, a.q, ref.nV(), rc.fm.nC));
+    }
+    FvState cont = s1900, nudged = s1900;
+    for (std::size_t c = 0; c < std::size_t(rc.fm.nC); ++c) nudged.var(5)[c] *= 1.0 + 1e-14;
+    ref.march(cont, dt, 100);
+    ref.march(nudged, dt, 100);
+    const double eCont = relDiff(o.q, cont.q, ref.nV(), rc.fm.nC), grow = relDiff(nudged.q, cont.q, ref.nV(), rc.fm.nC) / 1e-14;
+    std::printf("  steps 1900..2000 (Y %.4f -> %.4f, dt/chemDt %.2f at t_e): per step |device - FvRef| max %.2e; "
+                "continuous %.2e; a 1e-14 rho Y perturbation grows x%.1f\n",
+                rx::cellY(s1900, 0), rx::cellY(o, 0), dt / ref.chemDt(o, gpu::kChemDt), eStep, eCont, grow);
+    check(eStep <= 1e-13 && rx::cellY(o, 0) < 0.6,
+          std::format("G0.4 steps 1900..2000, each from the device state: {:.2e} <= 1e-13 (live: Y < 0.6)", eStep));
+    return dnstest::finish();
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
     test::requireDeviceOrSkip();
+    if (argc > 1 && std::string(argv[1]) == "reactor") return runReactor();
     if (argc > 1 && std::string(argv[1]) == "flame1d") return runFlame1d();
     if (argc > 1 && std::string(argv[1]) == "jet") return runJet();
     if (argc > 1 && std::string(argv[1]) == "mix") {

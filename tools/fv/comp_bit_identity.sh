@@ -113,5 +113,12 @@ run shockhll flow --physics compressible --body none --n 96 --ny 64 --re 100 --m
 run shocksense flow --physics compressible --body cylinder --n 192 --ny 128 --re 100 --mach 0.2 --ft 0.3 --far nscbc --shock sense --emit stats
 run shockflame flame --expansion 10 --cells-per-delta 4 --tt 1 --shock hll --emit stats
 run shockchamber flame --mode chamber --tt 0.5 --shock hll --emit stats
+# masterplan_combnozzle: the polyMesh nozzles under --shock (the ledger, [thrust] absent) and the
+# FV flame polyMesh route (--gamma absent, --shock absent).
+run fvnozA flow --physics compressible --polymesh "$ROOT/tests/data/fv/nozzle_A" --bc "$ROOT/tests/data/fv/nozzle_A/bc.toml" --shock hll --inviscid --mach 1 --ramp 40 --tt 20 --emit stats
+run fvnozW flow --physics compressible --polymesh "$ROOT/tests/data/fv/nozzle_W" --bc "$ROOT/tests/data/fv/nozzle_W/bc.toml" --shock hll --inviscid --mach 1 --ramp 40 --tt 20 --emit stats
+FLAMEMESH="$OUT/flmesh"
+python3 "$ROOT/tools/chem/fv_flame_mesh.py" --nx 197 --ny 4 --lx 38.6532 --ly 3.41688 --out "$FLAMEMESH" > /dev/null
+run fvflpoly flame --polymesh "$FLAMEMESH" --bc "$FLAMEMESH/bc.toml" --upstream 14.1335 --inflow-speed 0.98 --tt 2 --fv-precision fp64 --emit stats
 echo "failures: $fails"
 exit $fails
