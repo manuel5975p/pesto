@@ -1884,20 +1884,115 @@ void reactTwin()
 }
 
 // The viscous twin of any rung (masterplan_combnozzle A23; no gate, the numbers for nozzle_react.py report):
-// reacttwin NX EPS_C RE_STAR PA T_STAR. The 15-cell twin is NX 4680 EPS_C 6.172901800721939 RE_STAR 736.2624872413062
-// PA 0.010037095719382376; the window is q1dRun's last quarter of T_STAR.
-void reactTwinAt(int nx, double epsC, double reStar, double pa, double tStar)
+// reacttwin NX EPS_C RE_STAR PA T_STAR [GAMMA]. The 15-cell twin is NX 4680 EPS_C 6.172901800721939 RE_STAR
+// 736.2624872413062 PA 0.010037095719382376; the window is q1dRun's last quarter of T_STAR. GAMMA (default 1.4;
+// masterplan_combclose K7): the generator's q1d IC, the gas, Re* = rho0 c0 y*/mu and t* = 1 m / c0 on c0(GAMMA).
+void reactTwinAt(int nx, double epsC, double reStar, double pa, double tStar, double gamma)
 {
-    std::printf("twin: react lc 0, eps_c %.16g, eps_e 2, %d cells, Re* %.16g, pa %.16g, q1d IC, FP64, hll, tt %g t*\n", epsC, nx, reStar, pa, tStar);
-    const Gen g = gen("rtw" + std::to_string(nx), nx, 1,
-                      std::format("--contour react --lc 0 --lcon 6 --ldiv 4 --eps-c {} --eps-e 2 --scale 1 --mode planar --exit riemann --pb {}",
-                                  epsC, pa));
+    std::printf("twin: react lc 0, eps_c %.16g, eps_e 2, %d cells, Re* %.16g, pa %.16g, gamma %g, q1d IC, FP64, hll, tt %g t*\n", epsC, nx,
+                reStar, pa, gamma, tStar);
+    const Gen g = gen(std::format("rtw{}_{}", nx, int(std::lround(gamma * 100))), nx, 1,
+                      std::format("--contour react --lc 0 --lcon 6 --ldiv 4 --eps-c {} --eps-e 2 --scale 1 --mode planar --exit riemann --pb {} "
+                                  "--gamma {}",
+                                  epsC, pa, gamma));
     const Rows rows{.pb = pa * kP0, .exit = FvExit::Riemann};
-    const double rho0 = kP0 / (287.1 * kT0), mu = rho0 * kC0 * 1.0 / reStar;
-    const Q1d v = q1dRun(g, rows, Run{.mu = mu}, tStar, true);
+    const double c0 = std::sqrt(gamma * 287.1 * kT0), rho0 = kP0 / (287.1 * kT0), mu = rho0 * c0 * 1.0 / reStar;
+    // q1dRun counts t* on kC0 (gamma 1.4): rescaled so the run is tStar of this gamma's t* (ratio exactly 1 at 1.4).
+    const Q1d v = q1dRun(g, rows, Run{.mu = mu, .gamma = gamma}, tStar * (kC0 / c0), true);
     std::printf("  viscous: %ld steps %s; Cd %.10f CfVac %.10f; max |v|/c %.2e; window [%g, %g] t*\n", v.steps, v.err.c_str(), v.Cd, v.CfVac,
                 v.vMax, 0.75 * tStar, tStar);
     check(v.err.empty() && v.steps > 2000, "twin live");
+}
+
+// The viscous twin by grid sequencing (masterplan_combclose K3, analysis_combclose_2 B4, its probe's `seq`):
+// reacttwinseq NXC NXF EPS_C RE_STAR PA TC TF. The coarse twin (NXC cells, q1d IC) to TC t*, its state interpolated
+// linearly in x onto NXF cells (v 0), then TF t* more. Windows of 5 t* (ledger): settled iff |mdotOut/mdotIn - 1| <= 1e-5
+// in every window of the last 15 t*; Cd, CfVac over the last 15 t* (the ledger's endpoints). gamma 1.4.
+void reactTwinSeq(int nxC, int nxF, double epsC, double reStar, double pa, double tC, double tF)
+{
+    std::printf("twin seq: react lc 0, eps_c %.16g, eps_e 2, Re* %.16g, pa %.16g; coarse %d cells tt %g t*, fine %d cells tt %g t*\n", epsC,
+                reStar, pa, nxC, tC, nxF, tF);
+    const std::string args =
+        std::format("--contour react --lc 0 --lcon 6 --ldiv 4 --eps-c {} --eps-e 2 --scale 1 --mode planar --exit riemann --pb {}", epsC, pa);
+    const Gen gc = gen(std::format("sc{}", nxC), nxC, 1, args), gf = gen(std::format("sf{}", nxF), nxF, 1, args);
+    const Rows rows{.pb = pa * kP0, .exit = FvExit::Riemann};
+    const double rho0 = kP0 / (287.1 * kT0), mu = rho0 * kC0 * 1.0 / reStar;
+    const Run r{.mu = mu};
+    const double ideal = fvIdealMassFlow(kP0, kT0, kAstar, r.gamma, 287.1);
+    // One march of a twin in n equal windows: per window Cd on mdotOut, out/in - 1, CfVac; the sums at each end.
+    struct Win
+    {
+        double t1, t2, cd, outIn, cf;
+    };
+    const auto march = [&](const Gen& g, const FvState& ic, double tStar, int n, const char* tag, std::vector<Win>& wins,
+                           std::vector<FvRoleSums>& sums, FvState* end) -> bool {
+        FvCompConfig cfg = cfgOf(g.fm, rows, r);
+        auto d = orDie(DeviceFvComp::make(g.fm, cfg), tag);
+        orDie(d.upload(ic), tag);
+        orDie(d.setLedger(true), "ledger");
+        const std::vector<FvRole> roles = fvRoles(cfg.bc, g.fm);
+        const FvThrustCase k{.axis = {1, 0, 0}, .pa = rows.pb, .p0 = kP0, .t0 = kT0, .astar = kAstar, .gamma = r.gamma, .Rgas = 287.1,
+                             .exitArea = fvExitArea(g.fm, roles, {1, 0, 0})};
+        sums.push_back(fvRoleSums(orDie(d.ledger(), "ledger"), roles, -1));
+        double t = 0;
+        long steps = 0;
+        for (int i = 1; i <= n; ++i) {
+            const double tn = tStar / kC0 * i / n;
+            const Marched m = marchTo(d, tn - t, 0.4, 4, 4000000);
+            steps += m.steps;
+            if (!m.err.empty()) {
+                std::printf("  %s: %s\n", tag, m.err.c_str());
+                return false;
+            }
+            sums.push_back(fvRoleSums(orDie(d.ledger(), "ledger"), roles, -1));
+            const FvThrustWindow w = fvThrustWindow(sums[sums.size() - 2], t, sums.back(), tn, k);
+            wins.push_back({t * kC0, tn * kC0, w.mdotOut / ideal, w.mdotOut / w.mdotIn - 1, w.CfVac});
+            std::printf("  %s t* [%6.2f, %6.2f] steps %8ld Cd %.10f out/in-1 %+.2e CfVac %.10f\n", tag, t * kC0, tn * kC0, steps,
+                        wins.back().cd, wins.back().outIn, wins.back().cf);
+            t = tn;
+        }
+        if (end) orDie(d.download(*end), tag);
+        return true;
+    };
+    std::vector<Win> wc, wf;
+    std::vector<FvRoleSums> sc, sf;
+    FvState coarse;
+    if (!march(gc, q1dIc(gc, r.gamma), tC, 4, "coarse", wc, sc, &coarse)) {
+        check(false, "twin seq: the coarse twin marched");
+        return;
+    }
+    // x-sorted coarse centroids, linear interpolation of every conserved row, v 0.
+    std::vector<std::pair<double, int>> xc;
+    for (int c = 0; c < gc.fm.nC; ++c) xc.emplace_back(gc.fm.C[0][std::size_t(c)], c);
+    std::ranges::sort(xc);
+    FvState fine = q1dIc(gf, r.gamma);
+    for (int c = 0; c < gf.fm.nC; ++c) {
+        const double x = gf.fm.C[0][std::size_t(c)];
+        const auto it = std::ranges::lower_bound(xc, std::pair{x, -1});
+        const std::size_t i1 = std::clamp<std::size_t>(std::size_t(it - xc.begin()), 1, xc.size() - 1);
+        const auto [x0, c0] = xc[i1 - 1];
+        const auto [x1, c1] = xc[i1];
+        const double w = std::clamp((x - x0) / (x1 - x0), 0.0, 1.0);
+        for (int v = 0; v < fine.nV; ++v) fine.var(v)[c] = (1 - w) * coarse.var(v)[c0] + w * coarse.var(v)[c1];
+        fine.var(2)[c] = 0.0;
+    }
+    const int n = std::max(1, int(std::lround(tF / 5.0)));
+    if (!march(gf, fine, tF, n, "fine", wf, sf, nullptr)) {
+        check(false, "twin seq: the fine twin marched");
+        return;
+    }
+    const int last = std::min(n, std::max(1, int(std::lround(15.0 / (tF / n)))));
+    double outIn = 0;
+    for (int i = n - last; i < n; ++i) outIn = std::max(outIn, std::abs(wf[std::size_t(i)].outIn));
+    // Cd, CfVac over the last 15 t*: the ledger's endpoints (sums[n - last], sums[n]).
+    const double t1 = wf[std::size_t(n - last)].t1 / kC0, t2 = wf.back().t2 / kC0;
+    const std::vector<FvRole> roles = fvRoles(cfgOf(gf.fm, rows, r).bc, gf.fm);
+    const FvThrustCase k{.axis = {1, 0, 0}, .pa = rows.pb, .p0 = kP0, .t0 = kT0, .astar = kAstar, .gamma = r.gamma, .Rgas = 287.1,
+                         .exitArea = fvExitArea(gf.fm, roles, {1, 0, 0})};
+    const FvThrustWindow w = fvThrustWindow(sf[std::size_t(n - last)], t1, sf.back(), t2, k);
+    std::printf("  fine window [%g, %g] t*: Cd %.10f CfVac %.10f; max |out/in - 1| per window %.2e (settled <= 1e-5: %s)\n", t1 * kC0,
+                t2 * kC0, w.mdotOut / ideal, w.CfVac, outIn, outIn <= 1e-5 ? "yes" : "NO");
+    check(outIn <= 1e-5, std::format("twin seq settled: |out/in - 1| {:.2e} <= 1e-5 per 5 t* over the last 15 t*", outIn));
 }
 
 } // namespace
@@ -1932,8 +2027,12 @@ int main(int argc, char** argv)
     else if (m == "ambient") ambient();
     else if (m == "twin") twin();
     else if (m == "react") reactRun();
-    else if (m == "reacttwin" && argc == 7)
-        reactTwinAt(std::atoi(argv[2]), std::atof(argv[3]), std::atof(argv[4]), std::atof(argv[5]), std::atof(argv[6]));
+    else if (m == "reacttwin" && (argc == 7 || argc == 8))
+        reactTwinAt(std::atoi(argv[2]), std::atof(argv[3]), std::atof(argv[4]), std::atof(argv[5]), std::atof(argv[6]),
+                    argc == 8 ? std::atof(argv[7]) : 1.4);
+    else if (m == "reacttwinseq" && argc == 9)
+        reactTwinSeq(std::atoi(argv[2]), std::atoi(argv[3]), std::atof(argv[4]), std::atof(argv[5]), std::atof(argv[6]), std::atof(argv[7]),
+                     std::atof(argv[8]));
     else if (m == "reacttwin") reactTwin();
     else if (m == "ledger") {
         ledgerGate();

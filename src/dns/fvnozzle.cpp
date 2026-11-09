@@ -199,13 +199,29 @@ std::vector<std::string> fvThrustColumns(bool station)
     for (const char* s : {"Fmom", "Fpres", "Texit", "Twall", "exitSuper", "mdotIn", "mdotOut", "CfVac", "Cf", "cstar"})
         c.emplace_back(s);
     if (station)
-        for (const char* s : {"p0b", "T0b", "CdB", "CfBvac", "CfB"}) c.emplace_back(s);
+        for (const char* s : {"p0b", "T0b", "CdB", "CfBvac", "CfB", "Mst", "Mth"}) c.emplace_back(s);
     return c;
 }
 
-std::vector<double> fvThrustRow(double t, long step, double dt, const FvRow6& P, const FvRow6& P0, const FvRoleSums& now,
-                                const FvThrustWindow& w, const FvExitSample& x, const FvThrustCase& k, const FvStation* b)
+FvStorage fvStorage(const FaceMesh& fm, const FvState& s, const std::array<double, 3>& axis, double station,
+                    std::span<const std::uint8_t> pastThroat)
 {
+    assert(pastThroat.size() == std::size_t(fm.nC));
+    double st = 0, stLo = 0, th = 0, thLo = 0;
+    const double* rho = s.var(0);
+    for (std::size_t c = 0; c < std::size_t(fm.nC); ++c) {
+        const double m = fm.V[c] * rho[c];
+        if (axis[0] * fm.C[0][c] + axis[1] * fm.C[1][c] + axis[2] * fm.C[2][c] > station) neumaier(st, stLo, m);
+        if (pastThroat[c]) neumaier(th, thLo, m);
+    }
+    return {.Mst = st + stLo, .Mth = th + thLo};
+}
+
+std::vector<double> fvThrustRow(double t, long step, double dt, const FvRow6& P, const FvRow6& P0, const FvRoleSums& now,
+                                const FvThrustWindow& w, const FvExitSample& x, const FvThrustCase& k, const FvStation* b,
+                                const FvStorage* m)
+{
+    assert((b == nullptr) == (m == nullptr));
     std::vector<double> v = {t, double(step), dt};
     v.insert(v.end(), P.begin(), P.end());
     for (const FvRow6& r : now.I) v.insert(v.end(), r.begin(), r.end());
@@ -221,7 +237,7 @@ std::vector<double> fvThrustRow(double t, long step, double dt, const FvRow6& P,
     if (!b) return v;
     const double ref = b->p0 * k.astar;
     v.insert(v.end(), {b->p0, b->T0, w.mdotOut / fvIdealMassFlow(b->p0, b->T0, k.astar, k.gamma, k.Rgas), w.Tvac / ref,
-                       (w.Tvac - k.pa * k.exitArea) / ref});
+                       (w.Tvac - k.pa * k.exitArea) / ref, m->Mst, m->Mth});
     return v;
 }
 
@@ -407,6 +423,15 @@ int fvThroatBin(std::span<const double> A, int nCh)
     for (int b = nCh; b < int(A.size()); ++b)
         if (A[std::size_t(b)] > 0.0 && (A[std::size_t(throat)] <= 0.0 || A[std::size_t(b)] < A[std::size_t(throat)])) throat = b;
     return throat;
+}
+
+std::vector<std::uint8_t> fvPastThroat(const FaceMesh& fm, const FvFlameProbe& probe)
+{
+    assert(probe.spec().chamber);
+    const int throat = fvThroatBin(fvBinAreas(fm, probe), probe.chamberBins());
+    std::vector<std::uint8_t> past(std::size_t(fm.nC), 0);
+    for (int c = 0; c < fm.nC; ++c) past[std::size_t(c)] = probe.binOf(c) > throat ? 1 : 0;
+    return past;
 }
 
 } // namespace dns

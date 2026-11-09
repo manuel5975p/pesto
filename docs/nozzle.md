@@ -189,7 +189,10 @@ With `station` (the reacting nozzle, masterplan_combnozzle 2.3) the row appends 
 internal faces whose owner and neighbour centroids straddle the station, the face state is the mean of the two cells'
 primitives, `T0 = T + |u|^2/(2 cp)`, `p0 = p (T0/T)^(gamma/(gamma - 1))`, both weighted by `|rho u.S|` (`fvStation`,
 host, off the row's state); `CdB = mdotOut / (Gamma p0b A*/sqrt(R T0b))`, `CfBvac = Tvac/(p0b A*)`, `CfB` at `pa`, with
-the window's `mdotOut`, `Tvac`.
+the window's `mdotOut`, `Tvac`; then `Mst Mth` (masterplan_combclose 2.2, `fvStorage`): `sum V rho` over the cells with
+`a.C > station` and over the cells past the throat bin (`fvPastThroat`: the probe bin past `fvThroatBin`, the IC's rule),
+Neumaier in ascending cell order of the downloaded state. A window's throat flux `mdotOut + Delta Mth/Delta t` is exact
+and sample-free (no station, `dns flow`: no columns, bytes unchanged).
 
 `Cf` at `pa` is ambient-valid only while `exitSuper == 1`; else it is ambient-dependent and needs the plume box (Z15).
 The CV is the whole mesh; the plume box's exit plane will be a faceZone (OpenFOAM `surfaceFieldValue` integrates the
@@ -312,7 +315,22 @@ inside every gate window (issues.md N13, N15). The oracle table ends at Y 1e-9 (
 carries Y 1e-9 (T0 8.0e-10 under T0b, cp T0 + q Y continuous to 2e-16); G4.12a reads the station's first row 2.7e-10 off
 T0b (`gpu_fv_nozzle_react`). `--inflow-speed` with `[nozzle]`: exit 2
 (`--inflow-speed: the throat sets the fresh velocity on a [nozzle] run`). The probe reads A_ref and the chamber bins
-(docs/fvcomp.md "Stats"); `_thrust.csv` appends the burnt station's `p0b T0b CdB CfBvac CfB` ("Thrust").
+(docs/fvcomp.md "Stats"); `_thrust.csv` appends the burnt station's `p0b T0b CdB CfBvac CfB Mst Mth` ("Thrust").
+
+**The report's window rule (masterplan_combclose 2.4; supersedes A24's peak list).** `nozzle_react.py modes DIR` is
+the linear quasi-1D network (Total inlet, compact moving flame, the exact cosine contraction to M 0.995, throat
+regularity): on the 15-cell rig mode 1 P 22.680 tau, e-fold 33.80; mode 2 9.133 / 10.78; the entropy transit x_f0 ->
+throat t_e 40.207 tau (chamber 6.134, contraction 34.073), t_flush 43.03; controls p-node inlet e-fold 57.70, a compact
+choked nozzle at the chamber's end P 7.283 (the contraction is non-compact). `report` fits `uFresh` on [t_s, tt], t_s =
+t_e + 10, with a damped cosine + quadratic (accepted at resid/amp <= 0.05, |P/P_model - 1| <= 0.1; else P_model) and
+gates W = [tt - kP, tt], k = floor((tt - t_s)/P) >= 1 (else exit 1); every rate is an endpoint ledger difference over
+the same rows; G4.3 on endpoint x_f; G4.5 on the throat flux (exit and station forms beside); G4.6 mdot on the fuel
+inventory's jump velocity with the lab-frame fresh state, split exactly into burn + storage; G4.11 the fit vs the model;
+G4.12 the IC's T0b on the first row and the slug's 4-tau dip about t_e. The legacy [20, 80] and [40, 80] print beside.
+On the archived old-IC runs (K3): fits p15 22.417 / 31.66, p30 22.452 / 32.02, q15 [50, 140] 22.382 / 31.95 (G4.11
+pass); rule window p15 [57.58, 80] dCd (exit form) -4.1e-6, mdot -7.8e-6; p30 -1.7e-6, -3.8e-6; q15 k 4 +5.2e-7,
++2.38e-5; the same runs' legacy [20, 80] mdot -2.20e-4, [40, 80] dCd -1.10e-4; G4.12 a +1.709e-3, b -6.99e-4 / -6.94e-4
+/ -7.08e-4 (all fail as required: the slug).
 
 **The rig** (`nozzle_react.py design --cells 15 --mach 0.042 --sl 0.9945059`): y* 49.97 delta_D, chamber Lc 1 y* (50
 delta_D: the flame at 12 delta_th, 19 delta_th burnt after it), cosine contraction Lcon 6 y* (54 deg max), cosine

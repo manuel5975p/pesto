@@ -174,6 +174,7 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
     // [thrust]: the ledger from the IC on; P0 the IC's sums.
     std::vector<FvRole> roles;
     FvThrustCase tk{};
+    std::vector<std::uint8_t> pastThroat;
     FvRoleSums ledPrev{};
     FvRow6 P0{};
     double tLedPrev = 0.0;
@@ -183,6 +184,11 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
         tk = *r.thrust;
         tk.q = r.solver.chem.nY > 0 ? r.solver.chem.q : 0.0;
         tk.exitArea = fvExitArea(fm, roles, tk.axis);
+        // The station's storage columns (masterplan_combclose 2.2): Mth's cells, the IC's throat rule.
+        if (std::isfinite(tk.station)) {
+            assert(r.flame && r.flame->spec().chamber);
+            pastThroat = fvPastThroat(fm, *r.flame);
+        }
         if (auto e = dev.setLedger(true); !e) return fail(e.error().starts_with("FV device") ? 6 : 3, e.error());
         dns::FvState s0;
         if (auto e = dev.download(s0); !e) return fail(6, e.error());
@@ -555,7 +561,9 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
         // The reacting nozzle's burnt station (masterplan_combnozzle 2.3): host, off the downloaded state.
         const bool station = std::isfinite(tk.station);
         const FvStation b = station ? fvStation(fm, s, tk.axis, tk.station, tk.gamma, tk.Rgas) : FvStation{};
-        out.row("thrust", fvThrustRow(t, step, dt, fvTotals6(fm, s, fuelRow), P0, now, w, x, tk, station ? &b : nullptr));
+        const FvStorage m = station ? fvStorage(fm, s, tk.axis, tk.station, pastThroat) : FvStorage{};
+        out.row("thrust",
+                fvThrustRow(t, step, dt, fvTotals6(fm, s, fuelRow), P0, now, w, x, tk, station ? &b : nullptr, station ? &m : nullptr));
         ledPrev = now;
         tLedPrev = t;
         return {};

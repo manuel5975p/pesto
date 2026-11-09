@@ -13,10 +13,17 @@ constant-area chamber holding a planar C0 flame, a choked cosine nozzle, a riema
       reference (p0, t0 ratios 1), rest at it (no ramp); prints Re* = rho0b c0b y*/mu (flame units, mu = Pr) for --re:
       dns flow --physics compressible --polymesh TDIR --bc TDIR/bc.toml --shock hll --mach 1 --re RE --prandtl 0.72
       --fv-precision fp64 --tt T (the inviscid twin: --inviscid for --re)
-  nozzle_react.py argv DIR [flags]   the dns flame argv of a design (for simjob)
-  nozzle_react.py report DIR PREFIX [--twin TPREFIX] [--start SPREFIX] --sl1d S --p1d P --t1d T [--from T] [--json OUT]
-      the G4 gates (masterplan_combnozzle P4) off PREFIX_stats.csv and PREFIX_thrust.csv over [tt/2, tt] (--from: [T, tt]); the 1D
-      reference: S_L,num and its fresh state (window means of the 1D --shock hll run at the same M, gamma, h)
+  nozzle_react.py argv DIR [--tt T] [--compensated]   the dns flame argv of a design (for simjob)
+  nozzle_react.py modes DIR
+      the chamber's linear acoustic modes (masterplan_combclose 2.4 step 6): P1, e-fold1, P2, e-fold2, the entropy transit
+      t_e (x_f0 -> throat), t_flush (-> exit), and the controls (p-node inlet; compact nozzle at the chamber's end);
+      scipy, cached in DIR/modes.json
+  nozzle_react.py report DIR PREFIX --sl1d S --p1d P --t1d T [--twin TPREFIX | --twin-cd X --twin-cf Y] [--start SPREFIX]
+                         [--from T | --window A B] [--compensated] [--json OUT]
+      the G4 gates (masterplan_combnozzle P4, masterplan_combclose 2.5) off PREFIX_stats.csv and PREFIX_thrust.csv over the
+      rule window W = [tt - k P, tt] (2.4: t_s = t_e + 10, P the ring fitted on uFresh over [t_s, tt] or the model's, k =
+      floor((tt - t_s)/P) >= 1, else exit 1); every rate an endpoint ledger difference; [20, 80], [40, 80] beside as
+      legacy. The 1D reference: S_L,num and its fresh state (window means of the 1D --shock hll run at the same M, gamma, h)
 
 q is the SOLVER's heat release cp (sigma - 1) Tu (masterplan_combnozzle R5): T0b = T0u + (sigma - 1) Tu, never sigma T0u.
 Python twin of dns/fvnozzle fvReactingNozzleDesign (test_fvref react pins the two to 1e-12).
@@ -26,6 +33,8 @@ import json
 import math
 import os
 import sys
+
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nozzle_mesh  # noqa: E402
@@ -192,6 +201,8 @@ def cmdArgv(a):
             repr(a.upstream if a.upstream is not None else m["upstream"]), "--tt", repr(a.tt), "--emit", "stats", "--quiet"]
     if m["gamma"] != 1.4:
         argv += ["--gamma", repr(m["gamma"])]
+    if a.compensated:
+        argv += ["--compensated"]
     print(" ".join(argv))
 
 
@@ -221,7 +232,246 @@ def cmdTwin(a):
     print(json.dumps(dict(nx=nxT, Re=Re, rho0b=rho0, c0b=c0, ystar=m["scale"], pa=pr)))
 
 
-# --- report: the G4 gates ------------------------------------------------------------------------------------------
+# --- modes: the chamber's linear acoustic modes (masterplan_combclose 2.4 step 6) -------------------------------------
+# A port of analysis_combclose_3's net.py + compact.py: quasi-1D linearized Euler in (p', u', sigma' = s'/cp), modes
+# exp(i w t); a Total inlet (p0' = 0, sigma' = 0), the fresh duct to x_f0, a compact moving flame (flame-frame RH +
+# kinematic, S_L constant), the burnt duct and the exact cosine contraction on the design's isentropic base flow,
+# integrated to M_end 0.995, where the throat's regularity l.r = 0 is the root condition. Flame units (rho_u 1, R 1).
+
+def _areaMachSub(ar, g):
+    """fvAreaMach's subsonic root, numpy (60 halvings of [1e-6, 1]; ar <= 1 gives 1)."""
+    ar = np.asarray(ar, float)
+    A = lambda M: (1 / M) * ((2 / (g + 1)) * (1 + (g - 1) / 2 * M * M)) ** ((g + 1) / (2 * (g - 1)))
+    lo, hi = np.full_like(ar, 1e-6), np.ones_like(ar)
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        big = A(mid) >= ar
+        lo, hi = np.where(big, mid, lo), np.where(big, hi, mid)
+    return np.where(ar <= 1.0, 1.0, (lo + hi) / 2)
+
+
+def _areaMachSup(ar, g):
+    ar = np.asarray(ar, float)
+    A = lambda M: (1 / M) * ((2 / (g + 1)) * (1 + (g - 1) / 2 * M * M)) ** ((g + 1) / (2 * (g - 1)))
+    lo, hi = np.ones_like(ar), np.full_like(ar, 60.0)
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        small = A(mid) < ar
+        lo, hi = np.where(small, mid, lo), np.where(small, hi, mid)
+    return np.where(ar <= 1.0, 1.0, (lo + hi) / 2)
+
+
+class Rig:
+    """A design's inviscid base flow on its one-row rig (design.json), flame units."""
+
+    def __init__(self, m):
+        g, M = m["gamma"], m["mach"]
+        u = flameUnits(g, M)
+        self.g, self.cp, self.q = g, u["cp"], u["q"]
+        Tu = u["Tu"]
+        self.T0u, self.p0u = m["t0"] * Tu, m["p0"] * Tu
+        d = design(g, 1.0, self.cp, self.q, SIGMA, m["epsC"], m["epsE"], self.p0u, self.T0u)
+        self.d = d
+        self.Tu, self.pu, self.rhou, self.uu = d["Tu"], d["pu"], d["rhou"], d["uu"]
+        self.cu = math.sqrt(g * self.Tu)
+        b = d["b"]
+        self.ub, self.pb, self.Tb, self.T0b, self.p0b = b["ub"], b["pb"], b["Tb"], b["T0b"], b["p0b"]
+        self.rhob, self.cb = self.pb / self.Tb, math.sqrt(g * self.Tb)
+        S = m["scale"]
+        self.Lc, self.Lcon, self.Ldiv = LC * S, LCON * S, LDIV * S
+        self.epsc, self.epse = m["epsC"], m["epsE"]
+        self.xf = m["upstream"] * DTH
+        self.xth, self.xexit = self.Lc + self.Lcon, self.Lc + self.Lcon + self.Ldiv
+
+    def area(self, x):
+        """A/A* of the contour (nozzle_mesh.reactContour)."""
+        if x <= self.Lc:
+            return self.epsc
+        if x <= self.xth:
+            return 1 + (self.epsc - 1) * (1 + math.cos(math.pi * (x - self.Lc) / self.Lcon)) / 2
+        return 1 + (self.epse - 1) * (1 - math.cos(math.pi * min(x - self.xth, self.Ldiv) / self.Ldiv)) / 2
+
+    def dlnA(self, x):
+        """d ln A/dx on the chamber and the contraction (the operator's domain ends before the throat)."""
+        if x <= self.Lc:
+            return 0.0
+        dA = -(self.epsc - 1) * math.pi / self.Lcon * math.sin(math.pi * (x - self.Lc) / self.Lcon) / 2
+        return dA / self.area(x)
+
+    def base(self, x):
+        """(u, p, rho, du/dx, dp/dx): fresh uniform before x_f0, burnt subsonic isentropic at (p0b, T0b) past it."""
+        g = self.g
+        if x < self.xf:
+            return self.uu, self.pu, self.rhou, 0.0, 0.0
+        M = float(_areaMachSub(self.area(x), g))
+        T = self.T0b / (1 + (g - 1) / 2 * M * M)
+        p = self.p0b * (T / self.T0b) ** (g / (g - 1))
+        u = M * math.sqrt(g * T)
+        L = self.dlnA(x)
+        return u, p, p / T, u * (-L / (1 - M * M)), p * g * M * M / (1 - M * M) * L
+
+    def speeds(self, x, sup=False):
+        """u(x), c(x) on numpy x past x_f0: the chamber's Rayleigh u_b (design), the contour's area-Mach elsewhere."""
+        g = self.g
+        x = np.asarray(x, float)
+        ar = np.array([self.area(v) for v in x])
+        M = _areaMachSup(ar, g) if sup else _areaMachSub(ar, g)
+        T = self.T0b / (1 + (g - 1) / 2 * M * M)
+        u, c = M * np.sqrt(g * T), np.sqrt(g * T)
+        ch = x <= self.Lc
+        return np.where(ch, self.ub, u), np.where(ch, self.cb, c)
+
+    def transit(self):
+        """t_e (x_f0 -> throat), t_flush (x_f0 -> exit), t_ac (inlet -> throat, downstream acoustic)."""
+        n = 200001
+        xs = np.linspace(self.Lc, self.xth, n)
+        u, c = self.speeds(xs)
+        con, conAc = np.trapezoid(1 / u, xs), np.trapezoid(1 / (c + u), xs)
+        xd = np.linspace(self.xth, self.xexit, n)
+        ud, _ = self.speeds(xd, sup=True)
+        ch = (self.Lc - self.xf) / self.ub
+        te = ch + con
+        return dict(t_e=te, t_e_chamber=ch, t_e_contraction=con, t_flush=te + np.trapezoid(1 / ud, xd),
+                    t_ac=self.xf / (self.cu + self.uu) + (self.Lc - self.xf) / (self.cb + self.ub) + conAc,
+                    t_ac_chamber=self.xf / (self.cu + self.uu) + (self.Lc - self.xf) / (self.cb + self.ub))
+
+    # The linearized operator (net.py rhs / funcF): A(x) y' = -r.
+    def _r(self, x, y, w):
+        g = self.g
+        p1, u1, s1 = y
+        u, p, rho, ux, px = self.base(x)
+        L = self.dlnA(x)
+        rho1 = rho * (p1 / (g * p) - s1)
+        r1 = 1j * w * p1 + u1 * px + g * p1 * (ux + u * L) + g * p * u1 * L
+        r2 = 1j * w * u1 + u1 * ux - rho1 / rho ** 2 * px
+        return u, p, rho, r1, r2
+
+    def rhs(self, x, y, w):
+        u, p, rho, r1, r2 = self._r(x, y, w)
+        d = np.linalg.solve(np.array([[u, self.g * p], [1 / rho, u]], complex), -np.array([r1, r2]))
+        return [d[0], d[1], -1j * w * y[2] / u]
+
+    def regularity(self, x, y, w):
+        u, p, rho, r1, r2 = self._r(x, y, w)
+        return (r1 - rho * u * r2) / (self.g * p)
+
+    def inlet(self, kind):
+        """u'(0) = 1. total: p0' = 0, sigma' = 0; pnode: p' = 0 (the control)."""
+        g = self.g
+        if kind == "pnode":
+            return [0.0, 1.0, 0.0]
+        m2 = (g - 1) / 2 * (self.uu / self.cu) ** 2
+        k = g / (g - 1) * m2 / (1 + m2)
+        return [-k * 2 * (1.0 / self.uu) / (1 - k * (1 - 1 / g)) * self.pu, 1.0, 0.0]
+
+    def flameJump(self, y, w):
+        """The moving compact front: flame-frame RH (mass, momentum, energy, q per fresh mass), S_L' = 0."""
+        g, cp = self.g, self.cp
+        p1, u1, s1 = y
+        rho1 = self.rhou * (p1 / (g * self.pu) - s1)
+        T1 = self.Tu * (p1 / self.pu - rho1 / self.rhou)
+        wv = u1
+        m1 = rho1 * self.uu
+        mb = self.rhou * self.uu
+        uu, ub, pb, Tb, rhob = self.uu, self.ub, self.pb, self.Tb, self.rhob
+
+        def res(z):
+            p2, u2, s2 = z[0] + 1j * z[1], z[2] + 1j * z[3], z[4] + 1j * z[5]
+            rho2 = rhob * (p2 / (g * pb) - s2)
+            T2 = Tb * (p2 / pb - rho2 / rhob)
+            e1 = rho2 * ub + rhob * (u2 - wv) - m1
+            e2 = (p1 + m1 * uu + mb * (u1 - wv)) - (p2 + m1 * ub + mb * (u2 - wv))
+            e3 = (cp * T1 + uu * (u1 - wv)) - (cp * T2 + ub * (u2 - wv))
+            return np.array([e1.real, e1.imag, e2.real, e2.imag, e3.real, e3.imag])
+
+        A, b0 = np.zeros((6, 6)), res(np.zeros(6))
+        for i in range(6):
+            e = np.zeros(6)
+            e[i] = 1
+            A[:, i] = res(e) - b0
+        z = np.linalg.solve(A, -b0)
+        return [z[0] + 1j * z[1], z[2] + 1j * z[3], z[4] + 1j * z[5]]
+
+    def shoot(self, w, inlet="total", Mend=0.995, compact=False):
+        from scipy.integrate import solve_ivp
+        w = complex(w)
+        kw = dict(args=(w,), method="DOP853", rtol=1e-10, atol=1e-14)
+        s1 = solve_ivp(self.rhs, (0, self.xf), np.array(self.inlet(inlet), complex), **kw)
+        yb = np.array(self.flameJump(s1.y[:, -1], w), complex)
+        if compact:  # the control: a compact choked nozzle (M' = 0) at the chamber's end
+            s2 = solve_ivp(self.rhs, (self.xf, self.Lc), yb, **kw)
+            p1, u1, sg = s2.y[:, -1]
+            u, p = self.base(self.Lc)[:2]
+            return u1 / u - 0.5 * ((self.g - 1) / self.g * p1 / p + sg)
+        g = self.g
+        Ae = (1 / Mend) * ((2 / (g + 1)) * (1 + (g - 1) / 2 * Mend ** 2)) ** ((g + 1) / (2 * (g - 1)))
+        xe = self.Lc + self.Lcon / math.pi * math.acos(2 * (Ae - 1) / (self.epsc - 1) - 1)
+        s2 = solve_ivp(self.rhs, (self.xf, xe), yb, **kw)
+        return self.regularity(xe, s2.y[:, -1], w)
+
+    def root(self, w0, **kw):
+        from scipy.optimize import fsolve
+
+        def f(z):
+            F = self.shoot(complex(z[0], z[1]), **kw)
+            return [F.real, F.imag]
+
+        z, info, ok, msg = fsolve(f, [w0.real, w0.imag], xtol=1e-12, full_output=True)
+        return complex(z[0], z[1]), ok == 1
+
+
+def _mode(w):
+    return dict(w=[w.real, w.imag], period=2 * math.pi / w.real, efold=1 / w.imag if w.imag else math.inf)
+
+
+def modesOf(ddir, fresh=False):
+    """modes DIR: P1, e-fold1, P2, e-fold2, t_e (+ t_flush, t_ac) and the controls; cached in DIR/modes.json (keyed on
+    design.json)."""
+    m = json.load(open(os.path.join(ddir, "design.json")))
+    path = os.path.join(ddir, "modes.json")
+    if not fresh and os.path.exists(path):
+        c = json.load(open(path))
+        if c.get("design") == m:
+            return c
+    rig = Rig(m)
+    tr = rig.transit()
+    w0 = 2 * math.pi / (4 * tr["t_ac"])
+    w1, ok1 = rig.root(complex(w0, w0 / 9))
+    # Mode 2: the root polished from the next real-axis minimum of |F| (net.py's scan; complex starts near 3 w0 also
+    # land on heavily damped entropy-coupled roots, e-fold ~9 tau, that no real-axis resonance shows).
+    ws = np.linspace(0.5 * w0, 4 * w0, 60)
+    F = [abs(rig.shoot(w)) for w in ws]
+    w2, ok2 = complex(math.nan, math.nan), False
+    for i in range(1, len(ws) - 1):
+        if F[i] < F[i - 1] and F[i] < F[i + 1]:
+            w, ok = rig.root(complex(ws[i], 0.0))
+            if ok and w.real > 1.1 * w1.real:
+                w2, ok2 = w, ok
+                break
+    wp, okp = rig.root(w1, inlet="pnode")
+    wc0 = 2 * math.pi / (4 * tr["t_ac_chamber"])
+    wc, okc = rig.root(complex(wc0, wc0 / 20), compact=True)
+    o = dict(design=m, transit=tr, mode1=_mode(w1), mode2=_mode(w2), control_pnode=_mode(wp), control_compact=_mode(wc),
+             converged=dict(mode1=ok1, mode2=ok2, pnode=okp, compact=okc), w0=w0, x_f0=rig.xf)
+    with open(path, "w") as f:
+        json.dump(o, f, indent=1)
+    return o
+
+
+def cmdModes(a):
+    o = modesOf(a.dir, fresh=True)
+    tr, m1, m2 = o["transit"], o["mode1"], o["mode2"]
+    print(f"mode 1: period {m1['period']:.3f} tau, e-fold {m1['efold']:.2f} tau")
+    print(f"mode 2: period {m2['period']:.3f} tau, e-fold {m2['efold']:.2f} tau")
+    print(f"t_e (x_f0 {o['x_f0']:.3f} -> throat) {tr['t_e']:.3f} tau (chamber {tr['t_e_chamber']:.3f}, contraction "
+          f"{tr['t_e_contraction']:.3f}); t_flush (-> exit) {tr['t_flush']:.3f}; t_ac (inlet -> throat) {tr['t_ac']:.3f}")
+    print(f"control p-node inlet: period {o['control_pnode']['period']:.3f}, e-fold {o['control_pnode']['efold']:.2f} tau")
+    print(f"control compact choked nozzle at the chamber's end: period {o['control_compact']['period']:.3f}, e-fold "
+          f"{o['control_compact']['efold']:.2f} tau")
+    print(f"converged: {o['converged']}")
+
+
+# --- report: the G4 gates (masterplan_combnozzle P4; window rule and estimators masterplan_combclose 2.4, 2.5) -----
 
 A_T, A_P = 2.33532, -0.5  # Oracle.sens() (masterplan_combnozzle R3, A6 G1.4)
 
@@ -233,9 +483,11 @@ def readCsv(path):
     return {k: [float(r[k]) for r in rows] for k in rows[0]}
 
 
-def window(c, t0, t1):
-    idx = [i for i, t in enumerate(c["t"]) if t0 <= t <= t1 + 1e-12]
-    return {k: [v[i] for i in idx] for k, v in c.items()}
+def labelOf(path):
+    with open(path) as f:
+        for l in f:
+            return l[1:].strip() if l.startswith("#") else ""
+    return ""
 
 
 def mean(v):
@@ -247,122 +499,276 @@ def slope(t, x):
     return sum((a - tm) * (b - xm) for a, b in zip(t, x)) / sum((a - tm) ** 2 for a in t)
 
 
-def gates(design, prefix, sl1d, p1d, t1d, tt=None, t0=None):
-    m = json.load(open(os.path.join(design, "design.json")))
-    g, M = m["gamma"], m["mach"]
-    u = flameUnits(g, M)
-    Tu, cp, q = u["Tu"], u["cp"], u["q"]
-    st, th = readCsv(prefix + "_stats.csv"), readCsv(prefix + "_thrust.csv")
-    tt = tt or st["t"][-1]
-    t0 = tt / 2 if t0 is None else t0
-    w, wt = window(st, t0, tt), window(th, t0, tt)
-    o = dict(rows=len(st["t"]), steps=th["step"][-1], window=[wt["t"][0], wt["t"][-1]], tt=tt)
-    # G4.1: the ledger per row, S' = |P_k| + sum |I_k| (+ q |Omega| on E, |Omega| on rho Y).
+def snap(t, ta):
+    """The first row with t >= ta."""
+    return next(i for i, v in enumerate(t) if v >= ta - 1e-12)
+
+
+def fitRing(t, v, ts, pModel, eModel):
+    """2.4 step 3: A e^{-l (t - ts)} cos(w (t - ts) + phi) + c0 + c1 (t - ts) + c2 (t - ts)^2 on [ts, tt]; the least
+    residual rms over the starts. Accepted iff resid/|A| <= 0.05 and |P/P_model - 1| <= 0.10."""
+    from scipy.optimize import curve_fit
+    t, v = np.asarray(t), np.asarray(v)
+    if len(t) < 20:
+        return dict(accepted=False, why=f"{len(t)} rows in [t_s, tt]: no fit")
+    f = lambda t, A, lam, w, ph, c0, c1, c2: A * np.exp(-lam * (t - ts)) * np.cos(w * (t - ts) + ph) + c0 + c1 * (t - ts) \
+        + c2 * (t - ts) ** 2
+    best = None
+    for r in np.arange(0.70, 1.30 + 1e-9, 0.05):
+        for ph in (0.0, 1.5, 3.0, 4.5):
+            try:
+                p, _ = curve_fit(f, t, v, p0=[np.std(v) * 1.4, 1 / eModel, 2 * math.pi / pModel * r, ph, v.mean(), 0, 0],
+                                 maxfev=20000)
+            except Exception:
+                continue
+            rr = float(np.sqrt(np.mean((v - f(t, *p)) ** 2)))
+            if best is None or rr < best[1]:
+                best = (p, rr)
+    if best is None:
+        return dict(accepted=False, why="no fit converged")
+    p, rr = best
+    P, e, A = 2 * math.pi / abs(p[2]), (1 / p[1] if p[1] != 0 else math.inf), abs(p[0])
+    o = dict(period=P, efold=e, amp=A, amp_rel=A / abs(v.mean()), resid_amp=rr / A if A > 0 else math.inf, rows=len(t))
+    why = []
+    if not o["resid_amp"] <= 0.05:
+        why.append(f"resid/amp {o['resid_amp']:.3f} > 0.05")
+    if not abs(P / pModel - 1) <= 0.10:
+        why.append(f"P_fit/P_model - 1 {P / pModel - 1:+.3f} beyond 0.10")
+    o["accepted"], o["why"] = not why, "; ".join(why)
+    return o
+
+
+def windowGates(m, rig, st, th, ta, tb, sl1d, p1d, t1d, twin):
+    """Every windowed gate over [ta, tb] snapped to rows (2.4 step 5, 2.5): i1 = the first row with t >= ta, i2 the last
+    with t <= tb, the same rows in _stats.csv and _thrust.csv; every rate an endpoint ledger difference."""
+    g, cp, q = rig.g, rig.cp, rig.q
+    # One _thrust.csv row per stats row (the stats print 6 digits): the rows are snapped on the ledger's t.
+    assert len(th["t"]) == len(st["t"]) and all(abs(a - b) <= 1e-5 * abs(a) for a, b in zip(th["t"], st["t"])), \
+        "stats and thrust rows differ"
+    i1, i2 = snap(th["t"], ta), max(i for i, v in enumerate(th["t"]) if v <= tb + 1e-12)
+    j1, j2 = i1, i2
+    dt = th["t"][i2] - th["t"][i1]
+    D = lambda k: th[k][i2] - th[k][i1]
+    w = {k: v[j1:j2 + 1] for k, v in st.items()}
+    wt = {k: v[i1:i2 + 1] for k, v in th.items()}
+    o = dict(window=[th["t"][i1], th["t"][i2]], rows=i2 - i1 + 1)
+    # G4.2
+    Sc, uF, pF, TF = mean(w["SL"]), mean(w["uFresh"]), mean(w["pFresh"]), mean(w["TFresh"])
+    dS = A_T * (TF - t1d) / t1d + A_P * (pF - p1d) / p1d
+    corr = abs(dS) > 5e-4 / 4
+    gap = Sc - sl1d * (1 + dS) if corr else Sc - sl1d
+    o["G4.2"] = dict(Sc=Sc, gap=gap, dS_fresh=dS, corrected=corr, band=5e-4, ok=abs(gap) <= 5e-4)
+    # G4.3: endpoint kinematics; the regression slope beside
+    xk = (w["xf"][-1] - w["xf"][0]) / dt
+    sl = slope(w["t"], w["xf"])
+    o["G4.3"] = dict(dxf_dt=xk, uu=uF, gap=xk - (uF - Sc), band=2e-3 * sl1d, ok=abs(xk - (uF - Sc)) <= 2e-3 * sl1d,
+                     regression_slope=sl, regression_gap=sl - (uF - Sc))
+    # G4.4
+    T0b, p0b = mean(wt["T0b"]), mean(wt["p0b"])
+    T0bO = rig.T0u + (SIGMA - 1) * rig.Tu
+    fuel = D("I_exit_ry") / D("Omega")
+    o["G4.4"] = dict(T0b=T0b, rel=T0b / T0bO - 1, fuelOut_burnIn=fuel, ok=abs(T0b / T0bO - 1) <= 1e-4 and abs(fuel) <= 1e-8)
+    # G4.5: the throat flux mOut + Delta Mth / Delta t (exit and station forms beside)
+    mOut, mIn = D("I_exit_mass") / dt, -D("I_in_mass") / dt
+    Tvac = D("I_exit_mx") / dt
+    ideal = m["astar"] * p0b * math.sqrt(g / T0b) * (2 / (g + 1)) ** ((g + 1) / (2 * (g - 1)))
+    hasM = "Mth" in th
+    mTh = mOut + D("Mth") / dt if hasM else math.nan
+    mSt = mOut + D("Mst") / dt if hasM else math.nan
+    CdB = mTh / ideal if hasM else mOut / ideal
+    CfB = Tvac / (p0b * m["astar"])
+    o["G4.5"] = dict(form="throat flux" if hasM else "exit flux (no Mst/Mth columns)", CdB=CdB, CdB_exit=mOut / ideal,
+                     CdB_station=mSt / ideal, contraction_storage=(D("Mst") - D("Mth")) / (dt * mOut) if hasM else math.nan,
+                     CfBvac=CfB, mdotIn=mIn, mdotOut=mOut)
+    if twin:
+        cd, cf = twin
+        o["G4.5"].update(twin_Cd=cd, twin_CfVac=cf, dCd=CdB - cd, dCd_exit=mOut / ideal - cd, dCf=CfB - cf, band=1e-4,
+                         ok=abs(CdB - cd) <= 1e-4 and abs(CfB - cf) <= 1e-4)
+    # G4.6 p0b: A19 unchanged (the flame frame M_u = S_c/c_u, the regression slope's Galilean term)
+    orc = freshAt(g, 1.0, cp, q, Sc / math.sqrt(g * TF), rig.p0u, rig.T0u)
+    rhobA = orc["b"]["pb"] / orc["b"]["Tb"]
+    gal = 0.5 * (rhobA - orc["rhou"]) * sl * sl / rig.p0u
+    loss, lossO = p0b / rig.p0u - 1, orc["b"]["p0b"] / rig.p0u - 1
+    Ac = m["epsC"] * m["astar"]
+    a19 = (mOut - rhobA * sl * Ac) / (orc["m"] * Ac) - 1
+    # G4.6 mdot (2.5): the fuel-inventory jump velocity, the lab-frame fresh state
+    dF, dM, dOm = D("P_ry") / dt, D("P_mass") / dt, D("Omega") / dt
+    Tlab = rig.T0u - uF * uF / (2 * cp)
+    plab = rig.p0u * (Tlab / rig.T0u) ** (g / (g - 1))
+    rhou = plab / Tlab
+    b = rayleighBurnt(g, 1.0, cp, q, Tlab, plab, Sc)
+    rhob = b["pb"] / b["Tb"]
+    mB = rhou * Sc * Ac
+    k = 1 - rhob / rhou
+    xF = dF / (rhou * Ac)
+    g46 = (mOut - rhob * Ac * xF) / mB - 1
+    burn, storage = dOm / mB - 1, -(dM - k * dF) / mB
+    o["G4.6"] = dict(p0b_p0u_m1=loss, oracle=lossO, galilean=gal, gap_p0b=loss - lossO - gal, band_p0b=0.1 * abs(lossO),
+                     ok_p0b=abs(loss - lossO - gal) <= 0.1 * abs(lossO), mdot=g46, band_mdot=1e-4, ok_mdot=abs(g46) <= 1e-4,
+                     burn=burn, storage=storage, ident=g46 - burn - storage, ident_ok=abs(g46 - burn - storage) <= 1e-9,
+                     xF=xF, A19_flame_frame=a19, estimator_term=rhob * Ac * (xF - sl) / mB, rho_u_lab=rhou, rho_b_lab=rhob)
+    o["spans"] = dict(mdotIn=max(wt["mdotIn"]) - min(wt["mdotIn"]), CfBvac=max(wt["CfBvac"]) - min(wt["CfBvac"]),
+                      Sc=max(w["SL"]) - min(w["SL"]))
+    o["G4.8"] = dict(shockCells_max=max(w["shockCells"]), ok=max(w["shockCells"]) == 0)
+    return o
+
+
+def ruleWindow(st, mo, tt, ts):
+    """2.4 steps 3-5: the ring fit on uFresh over [t_s, tt], k = floor((tt - t_s)/P), W = [tt - k P, tt]."""
+    pM, eM = mo["mode1"]["period"], mo["mode1"]["efold"]
+    j = [i for i, t in enumerate(st["t"]) if ts - 1e-12 <= t <= tt + 1e-12]
+    fit = fitRing([st["t"][i] for i in j], [st["uFresh"][i] for i in j], ts, pM, eM)
+    P = fit["period"] if fit["accepted"] else pM
+    k = math.floor((tt - ts) / P)
+    return fit, P, k
+
+
+def g412(th, rig, te, mW):
+    """G4.12: (a) the first row's T0b vs the design's; (b) the slug's dip in 4-tau ledger bins about t_e."""
+    a = th["T0b"][0] / rig.T0b - 1
+    dips = []
+    s = te - 10
+    while s + 4 <= min(te + 10, th["t"][-1]) + 1e-12:
+        i, j = snap(th["t"], s), snap(th["t"], s + 4)
+        if j > i and s >= th["t"][0]:
+            dips.append((s, ((th["I_exit_mass"][j] - th["I_exit_mass"][i]) / (th["t"][j] - th["t"][i])) / mW - 1))
+        s += 0.5
+    d = min(dips, key=lambda x: x[1]) if dips else (math.nan, math.nan)
+    return dict(a=a, band_a=1e-6, ok_a=abs(a) <= 1e-6, T0b_first=th["T0b"][0], T0b_design=rig.T0b, b=d[1], b_at=d[0],
+                band_b=3e-4, ok_b=abs(d[1]) <= 3e-4)
+
+
+def g41(th, q, comp):
+    """G4.1 over every row; G4.1f (compensated): max r <= 1e-13 and the last 10% of rows <= 4 x rows 10%-20%."""
     roles = ("in", "exit", "wall", "side")
-    worst, ctrl = 0.0, 0.0
+    n = len(th["t"])
+    r = [0.0] * n
+    ctrl = 0.0
     for k in ("mass", "mx", "my", "mz", "E", "ry"):
-        for i in range(len(th["t"])):
-            S = abs(th["P_" + k][i]) + sum(abs(th[f"I_{r}_{k}"][i]) for r in roles)
+        for i in range(n):
+            S = abs(th["P_" + k][i]) + sum(abs(th[f"I_{o}_{k}"][i]) for o in roles)
             if k == "E":
                 S += q * abs(th["Omega"][i])
             if k == "ry":
                 S += abs(th["Omega"][i])
+                if S > 0:
+                    ctrl = max(ctrl, abs(th["res_ry"][i] - th["Omega"][i]) / S)
             if S > 0:
-                worst = max(worst, abs(th["res_" + k][i]) / S)
-            if k == "ry" and S > 0:
-                ctrl = max(ctrl, abs(th["res_ry"][i] - th["Omega"][i]) / S)
-    o["G4.1"] = dict(res=worst, band=1e-12, ok=worst <= 1e-12, control_noOmega=ctrl, control_fails=ctrl >= 1e-6)
-    # G4.2: S_c (A_ref) vs the 1D S_L,num, fresh-state corrected (R3).
-    Sc, uF, pF, TF = mean(w["SL"]), mean(w["uFresh"]), mean(w["pFresh"]), mean(w["TFresh"])
-    dS = A_T * (TF - t1d) / t1d + A_P * (pF - p1d) / p1d
-    band = 5e-4
-    corr = abs(dS) > band / 4
-    gap = Sc - sl1d * (1 + dS) if corr else Sc - sl1d
-    o["G4.2"] = dict(Sc=Sc, sl1d=sl1d, dS_fresh=dS, corrected=corr, gap=gap, band=band, ok=abs(gap) <= band,
-                     Sc_span=max(w["SL"]) - min(w["SL"]))
-    # G4.3: x_f's regression slope vs u_u - S_c; control: the shipped vol/L area.
-    sl = slope(w["t"], w["xf"])
-    kin = sl - (uF - Sc)
-    o["G4.3"] = dict(dxf_dt=sl, uu=uF, uu_minus_Sc=uF - Sc, gap=kin, band=2e-3 * sl1d, ok=abs(kin) <= 2e-3 * sl1d)
-    # G4.4: T0b vs T0u + (sigma - 1) Tu; fuelOut / burnIn over the window (the ledger).
-    T0u, p0u = m["t0"] * Tu, m["p0"] * Tu
-    T0b, p0b = mean(wt["T0b"]), mean(wt["p0b"])
-    T0bO = T0u + (SIGMA - 1) * Tu
-    i1, i2 = th["t"].index(wt["t"][0]), th["t"].index(wt["t"][-1])
-    dOm = th["Omega"][i2] - th["Omega"][i1]
-    fuelOut = (th["I_exit_ry"][i2] - th["I_exit_ry"][i1]) / dOm
-    o["G4.4"] = dict(T0b=T0b, T0b_oracle=T0bO, rel=T0b / T0bO - 1, band=1e-4, fuelOut_burnIn=fuelOut, band_fuel=1e-8,
-                     ok=abs(T0b / T0bO - 1) <= 1e-4 and abs(fuelOut) <= 1e-8, control_sigmaT0u=SIGMA * T0u / T0b - 1,
-                     T0b_span=max(wt["T0b"]) - min(wt["T0b"]))
-    # Window means off the ledger.
-    dt = th["t"][i2] - th["t"][i1]
-    mIn = -(th["I_in_mass"][i2] - th["I_in_mass"][i1]) / dt
-    mOut = (th["I_exit_mass"][i2] - th["I_exit_mass"][i1]) / dt
-    Tvac = (th["I_exit_mx"][i2] - th["I_exit_mx"][i1]) / dt
-    ideal = lambda P0, T0: m["astar"] * P0 * math.sqrt(g / T0) * (2 / (g + 1)) ** ((g + 1) / (2 * (g - 1)))
-    o["window"] = dict(mdotIn=mIn, mdotOut=mOut, out_in=mOut / mIn - 1, Tvac=Tvac, p0b=p0b, T0b=T0b, CdB=mOut / ideal(p0b, T0b),
-                       CfBvac=Tvac / (p0b * m["astar"]), CdB_rows=mean(wt["CdB"]), CfBvac_rows=mean(wt["CfBvac"]),
-                       Cd_T0u=mOut / ideal(p0b, T0u), exitSuper_min=min(wt["exitSuper"]),
-                       p_fresh_rms=(mean([(x - pF) ** 2 for x in w["pFresh"]])) ** 0.5 / pF,
-                       u_fresh_span=max(w["uFresh"]) - min(w["uFresh"]), Pmy_over_Pmx=max(abs(a / b) for a, b in zip(th["P_my"], th["P_mx"])))
-    # G4.6: composition at the measured S_c (the flame-frame fresh speed: M_u = S_c / c_u). A drifting flame (x_f' = sl)
-    # adds the Galilean term (rho_b - rho_u) x_f'^2 / 2 to p0b - p0u, and its burnt side carries rho_b x_f' A_c past the
-    # station on top of the burning rate rho_u S_c A_c (masterplan_combnozzle A19); the plan-literal stationary numbers
-    # are kept beside them.
-    Mu = Sc / math.sqrt(g * TF)
-    orc = freshAt(g, 1.0, cp, q, Mu, p0u, T0u)
-    rhob = orc["b"]["pb"] / orc["b"]["Tb"]
-    gal = 0.5 * (rhob - orc["rhou"]) * sl * sl / p0u
-    loss, lossO = p0b / p0u - 1, orc["b"]["p0b"] / p0u - 1
-    Ac = m["epsC"] * m["astar"]
-    mBurn = orc["m"] * Ac
-    mFrame = mOut - rhob * sl * Ac
-    o["G4.6"] = dict(Mu=Mu, p0b_p0u_m1=loss, oracle=lossO, galilean=gal, gap=loss - lossO - gal, gap_stationary=loss - lossO,
-                     band=0.1 * abs(lossO), mdot_out=mOut, mdot_burn_oracle=mBurn, mdot_rel=mFrame / mBurn - 1,
-                     mdot_rel_stationary=mOut / mBurn - 1, band_mdot=1e-4,
-                     ok=abs(loss - lossO - gal) <= 0.1 * abs(lossO) and abs(mFrame / mBurn - 1) <= 1e-4,
-                     control_noHeat=abs(loss), control_fails=abs(loss) > 0.1 * abs(lossO))
-    # G4.8: the sensor.
-    o["G4.8"] = dict(shockCells_max=max(st["shockCells"]), ok=max(st["shockCells"]) == 0)
-    o["series"] = dict(Sc=w["SL"], xf=w["xf"], t=w["t"])
-    o["spans"] = {k: max(wt[k]) - min(wt[k]) for k in ("mdotIn", "mdotOut", "CfBvac", "CdB", "T0b", "p0b")}
+                r[i] = max(r[i], abs(th["res_" + k][i]) / S)
+    worst = max(r)
+    last, early = max(r[int(0.9 * n):]), max(r[int(0.1 * n):max(int(0.2 * n), int(0.1 * n) + 1)])
+    return {"G4.1": dict(res=worst, band=1e-12, ok=worst <= 1e-12, control_noOmega=ctrl, control_fails=ctrl >= 1e-6),
+            "G4.1f": dict(evaluated=comp, res=worst, band=1e-13, last10=last, rows10_20=early,
+                          ratio=last / early if early > 0 else math.inf, ok=worst <= 1e-13 and last <= 4 * early)}
+
+
+def gates(a):
+    """The report (2.4, 2.5): the rule window W (or --from / --window), the legacy windows beside."""
+    m = json.load(open(os.path.join(a.dir, "design.json")))
+    rig = Rig(m)
+    mo = modesOf(a.dir)
+    st, th = readCsv(a.prefix + "_stats.csv"), readCsv(a.prefix + "_thrust.csv")
+    tt = a.tt or th["t"][-1]
+    te = mo["transit"]["t_e"]
+    ts = te + 10
+    comp = a.compensated or "compensated" in labelOf(a.prefix + "_thrust.csv")
+    o = dict(prefix=a.prefix, rows=len(th["t"]), steps=th["step"][-1], tt=tt, compensated=comp)
+    fit, P, k = ruleWindow(st, mo, tt, ts)
+    rule = dict(t_e=te, t_s=ts, t_flush=mo["transit"]["t_flush"], P_model=mo["mode1"]["period"],
+                efold_model=mo["mode1"]["efold"], fit=fit, P=P, P_source="fit" if fit["accepted"] else
+                f"model period (fit refused: {fit.get('why', '')})", k=k)
+    if a.window:
+        W = (a.window[0], a.window[1])
+        rule["W_source"] = "--window"
+    elif getattr(a, "from") is not None:
+        W = (getattr(a, "from"), tt)
+        rule["W_source"] = "--from"
+    else:
+        if k < 1:
+            raise SystemExit(f"run too short: tt {tt:g} < t_s + P = {ts + P:.2f}")
+        W = (tt - k * P, tt)
+        rule["W_source"] = "rule (2.4)"
+    rule["W"] = list(W)
+    o["rule"] = rule
+    twin = None
+    if a.twin_cd is not None:
+        twin = (a.twin_cd, a.twin_cf)
+    elif a.twin:
+        tw = readCsv(a.twin + "_thrust.csv")
+        i1, i2 = snap(tw["t"], tw["t"][-1] - a.twin_window), len(tw["t"]) - 1
+        dtt = tw["t"][i2] - tw["t"][i1]
+        g = m["gamma"]
+        p0, T0 = 1.0 / g, 1.0 / g  # the --mach 1 reference: p0 = T0 = 1/gamma, R 1
+        cd = (tw["I_exit_mass"][i2] - tw["I_exit_mass"][i1]) / dtt / (DEPTH * p0 * math.sqrt(g / T0) * (2 / (g + 1)) ** (
+            (g + 1) / (2 * (g - 1))))
+        twin = (cd, (tw["I_exit_mx"][i2] - tw["I_exit_mx"][i1]) / dtt / (p0 * DEPTH))
+    o["W"] = windowGates(m, rig, st, th, W[0], W[1], a.sl1d, a.p1d, a.t1d, twin)
+    o["legacy"] = {f"[{x:g}, {y:g}]": windowGates(m, rig, st, th, x, y, a.sl1d, a.p1d, a.t1d, twin)
+                   for x, y in ((20.0, 80.0), (40.0, 80.0)) if th["t"][-1] >= y - 1e-9 and th["t"][0] <= x}
+    o.update(g41(th, rig.q, comp))
+    o["G4.11"] = dict(fit=fit, P_model=rule["P_model"], efold_model=rule["efold_model"])
+    if fit["accepted"]:
+        dp, de = fit["period"] / rule["P_model"] - 1, fit["efold"] / rule["efold_model"] - 1
+        o["G4.11"].update(dP=dp, defold=de, ok=abs(dp) <= 0.03 and abs(de) <= 0.15 and fit["resid_amp"] <= 0.05)
+    else:
+        o["G4.11"].update(ok=None, note=f"ring below the fit floor (amplitude {fit.get('amp', math.nan):.3e}): {fit.get('why', '')}")
+    mW = o["W"]["G4.5"]["mdotOut"]
+    o["G4.12"] = g412(th, rig, te, mW)
+    if a.start:
+        s = readCsv(a.start + "_stats.csv"), readCsv(a.start + "_thrust.csv")
+        sw = windowGates(m, rig, s[0], s[1], W[0], W[1], a.sl1d, a.p1d, a.t1d, None)
+        pw = o["W"]
+        res = {}
+        for key, v, sp in (("mdotIn", (pw["G4.5"]["mdotIn"], sw["G4.5"]["mdotIn"]), pw["spans"]["mdotIn"]),
+                           ("CfBvac", (pw["G4.5"]["CfBvac"], sw["G4.5"]["CfBvac"]), pw["spans"]["CfBvac"]),
+                           ("Sc", (pw["G4.2"]["Sc"], sw["G4.2"]["Sc"]), pw["spans"]["Sc"])):
+            res[key] = dict(primary=v[0], start=v[1], diff=v[1] - v[0], band=2 * sp, ok=abs(v[1] - v[0]) <= 2 * sp)
+        res["window"] = sw["window"]
+        o["G4.7b"] = res
     return o
 
 
+def summary(o):
+    """The human lines (the JSON carries everything)."""
+    L = []
+    r = o["rule"]
+    f = r["fit"]
+    L.append(f"rule: t_e {r['t_e']:.3f}, t_s {r['t_s']:.3f}, t_flush {r['t_flush']:.3f}; model P {r['P_model']:.3f} e-fold "
+             f"{r['efold_model']:.2f}; fit " + (f"P {f['period']:.3f} e-fold {f['efold']:.2f} resid/amp {f['resid_amp']:.3f} amp "
+                                                f"{f['amp']:.3e}" if 'period' in f else "none") + f" -> P {r['P']:.3f} ({r['P_source']}), "
+             f"k {r['k']}; W [{r['W'][0]:.3f}, {r['W'][1]:.3f}] ({r['W_source']})")
+
+    def win(name, w):
+        g5, g6 = w["G4.5"], w["G4.6"]
+        s = (f"{name} [{w['window'][0]:.3f}, {w['window'][1]:.3f}]: G4.2 {w['G4.2']['gap']:+.2e}; G4.3 {w['G4.3']['gap']:+.2e} "
+             f"(regression {w['G4.3']['regression_gap']:+.2e}); G4.4 {w['G4.4']['rel']:+.2e} fuel {w['G4.4']['fuelOut_burnIn']:.1e}; ")
+        if "dCd" in g5:
+            s += (f"G4.5 dCd {g5['dCd']:+.2e} ({g5['form']}; exit {g5['dCd_exit']:+.2e}) dCf {g5['dCf']:+.2e}; ")
+        s += (f"G4.6 p0b {g6['gap_p0b']:+.2e} mdot {g6['mdot']:+.3e} = burn {g6['burn']:+.2e} + storage {g6['storage']:+.2e} "
+              f"(ident {g6['ident']:+.1e}; A19 {g6['A19_flame_frame']:+.2e}; regression-estimator term {g6['estimator_term']:+.2e})")
+        if g5["form"] == "throat flux":
+            s += f"; contraction storage {g5['contraction_storage']:+.2e}"
+        return s
+
+    L.append(win("W", o["W"]))
+    for k, w in o["legacy"].items():
+        L.append(win("legacy", w))
+    L.append(f"G4.1 {o['G4.1']['res']:.2e} (ctrl {o['G4.1']['control_noOmega']:.2e}); G4.1f {'evaluated' if o['G4.1f']['evaluated'] else 'reported'}: "
+             f"{o['G4.1f']['res']:.2e}, last10/rows10-20 {o['G4.1f']['ratio']:.2f}")
+    g11 = o["G4.11"]
+    L.append("G4.11 " + (f"dP {g11['dP']:+.3f} de {g11['defold']:+.3f} ok {g11['ok']}" if "dP" in g11 else g11["note"]))
+    g = o["G4.12"]
+    L.append(f"G4.12 a {g['a']:+.3e} (ok {g['ok_a']}); b dip {g['b']:+.3e} at [{g['b_at']:.1f}, {g['b_at'] + 4:.1f}] (ok {g['ok_b']})")
+    if "G4.7b" in o:
+        L.append("G4.7b " + "; ".join(f"{k} {v['diff']:+.2e} (band {v['band']:.1e}, ok {v['ok']})" for k, v in o["G4.7b"].items()
+                                      if k != "window"))
+    return "\n".join(L)
+
+
 def cmdReport(a):
-    o = gates(a.dir, a.prefix, a.sl1d, a.p1d, a.t1d, a.tt, getattr(a, "from"))
-    ser = o.pop("series")
-    if a.twin:
-        tw = readCsv(a.twin + "_thrust.csv")
-        tt = tw["t"][-1]
-        t1 = tt - a.twin_window
-        i1 = min(i for i, t in enumerate(tw["t"]) if t >= t1)
-        i2 = len(tw["t"]) - 1
-        dt = tw["t"][i2] - tw["t"][i1]
-        m = json.load(open(os.path.join(a.dir, "design.json")))
-        g = m["gamma"]
-        mOut = (tw["I_exit_mass"][i2] - tw["I_exit_mass"][i1]) / dt
-        Tv = (tw["I_exit_mx"][i2] - tw["I_exit_mx"][i1]) / dt
-        p0, T0 = 1.0 / g, 1.0 / g  # the --mach 1 reference: p0 = T0 = 1/gamma, R 1
-        Cd = mOut / (DEPTH * p0 * math.sqrt(g / T0) * (2 / (g + 1)) ** ((g + 1) / (2 * (g - 1))))
-        Cf = Tv / (p0 * DEPTH)
-        wd = o["window"]
-        o["G4.5"] = dict(twin_Cd=Cd, twin_CfVac=Cf, CdB=wd["CdB"], CfBvac=wd["CfBvac"], dCd=wd["CdB"] - Cd, dCf=wd["CfBvac"] - Cf,
-                         band=1e-4, ok=abs(wd["CdB"] - Cd) <= 1e-4 and abs(wd["CfBvac"] - Cf) <= 1e-4,
-                         control_Cd_T0u=wd["Cd_T0u"] - Cd, twin_window=[tw["t"][i1], tw["t"][i2]],
-                         twin_viscous_loss_Cd=Cd - 1, twin_viscous_loss_Cf=Cf - cfIdeal(g, m["epsE"]))
-    if a.start:
-        s = gates(a.dir, a.start, a.sl1d, a.p1d, a.t1d, a.tt, getattr(a, "from"))
-        # The band: 2 x the primary's window span of the per-row series (mdotIn, CfBvac: _thrust.csv; S_c: _stats.csv).
-        res = {}
-        for k, v, sp in (("mdot", (o["window"]["mdotIn"], s["window"]["mdotIn"]), o["spans"]["mdotIn"]),
-                         ("CfBvac", (o["window"]["CfBvac"], s["window"]["CfBvac"]), o["spans"]["CfBvac"]),
-                         ("Sc", (o["G4.2"]["Sc"], s["G4.2"]["Sc"]), o["G4.2"]["Sc_span"])):
-            res[k] = dict(primary=v[0], start=v[1], diff=v[1] - v[0], band=2 * sp, ok=abs(v[1] - v[0]) <= 2 * sp)
-        res["xf_offset_end"] = s["series"]["xf"][-1] - ser["xf"][-1]
-        o["G4.7"] = res
-    txt = json.dumps(o, indent=1)
-    print(txt)
+    o = gates(a)
+    txt = json.dumps(o, indent=1, default=float)
+    print(summary(o))
     if a.json:
         open(a.json, "w").write(txt)
 
@@ -394,6 +800,9 @@ def main():
     v.add_argument("dir")
     v.add_argument("--tt", type=float, default=80.0)
     v.add_argument("--upstream", type=float, default=None)
+    v.add_argument("--compensated", action="store_true", help="the compensated state (masterplan_combclose R6)")
+    md = s.add_parser("modes")
+    md.add_argument("dir")
     t = s.add_parser("twin")
     t.add_argument("dir")
     t.add_argument("--p0b", type=float, required=True, help="flame units")
@@ -406,15 +815,21 @@ def main():
     r.add_argument("--p1d", type=float, required=True)
     r.add_argument("--t1d", type=float, required=True)
     r.add_argument("--tt", type=float, default=None)
-    # masterplan_combnozzle A23: the chamber ring (issues.md N14) has 20, 30, 15, 60 tau peaks; --from 20 at tt 80 is
-    # a 60-tau window, an integer number of each. Default tt/2 (the plan's [40, 80]).
-    r.add_argument("--from", type=float, default=None, help="window start (default tt/2)")
+    # masterplan_combclose 2.4 (supersedes A23/A24's peak list): W = [tt - k P, tt] from t_s = t_e + 10, k integer ring
+    # periods; --from / --window override it (the legacy [20, 80] and [40, 80] are printed beside).
+    r.add_argument("--from", type=float, default=None, help="window [T, tt] (overrides the rule)")
+    r.add_argument("--window", type=float, nargs=2, default=None, metavar=("A", "B"), help="window [A, B] (overrides)")
     r.add_argument("--twin", default=None)
     r.add_argument("--twin-window", type=float, default=30.0, help="the twin's window, t* before its end")
-    r.add_argument("--start", default=None)
+    r.add_argument("--twin-cd", type=float, default=None, help="the twin's Cd (test_gpu_fv_nozzle reacttwin*)")
+    r.add_argument("--twin-cf", type=float, default=None, help="the twin's CfVac")
+    r.add_argument("--start", default=None, help="G4.7b: another start's PREFIX, on this run's W")
+    r.add_argument("--compensated", action="store_true", help="evaluate G4.1f (else read off the label)")
     r.add_argument("--json", default=None)
     a = p.parse_args()
-    {"oracle": cmdOracle, "design": cmdDesign, "argv": cmdArgv, "twin": cmdTwin, "report": cmdReport}[a.cmd](a)
+    if a.cmd == "report" and (a.twin_cd is None) != (a.twin_cf is None):
+        p.error("--twin-cd and --twin-cf go together")
+    {"oracle": cmdOracle, "design": cmdDesign, "argv": cmdArgv, "modes": cmdModes, "twin": cmdTwin, "report": cmdReport}[a.cmd](a)
 
 
 if __name__ == "__main__":

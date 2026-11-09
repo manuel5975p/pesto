@@ -2699,6 +2699,12 @@ G4.7, G4.8 PASS at 15 cells; at 30 cells G4.2-G4.4, G4.6 (p0b), G4.8 PASS, G4.1 
   + nozzle, not a scheme ring; not growing over 80 tau; mode not identified (no p frame on one row). Window means of
   40 tau carry its phase (+-1e-4 in Cd); 60-tau windows cancel its peaks. The CLI twin from rest rang +-1e-3 in Cd at
   60-80 t* (A20); from the q1d IC it settles.
+  **Identified (combclose K3): ONE damped linear acoustic mode, a start transient, not sustained.** The "peaks 20, 30,
+  15, 60 tau" are the DFT bins of a 60-tau record (withdrawn). `nozzle_react.py modes` (linear quasi-1D network, Total
+  inlet, compact moving flame, non-compact cosine contraction, throat regularity): mode 1 P 22.680 tau, e-fold 33.80 at
+  15 cells (22.700 / 34.00 at 30); fitted on uFresh: p15 [50.2, 80] 22.417 / 31.66, p30 22.452 / 32.02, q15 [50.2, 140]
+  22.382 / 31.95. Controls: p-node inlet e-fold 57.70 (the Total inlet radiates ~42% of the damping), compact choked
+  nozzle P 7.283. Its old amplitude was the IC slug's (N15); windows now span integer periods from t_e + 10 (2.4).
 - N15. **G4.6's mdot UNMET at 15 AND 30, does not fall** (P4b, A24): (mdotOut - rho_b x_f' A_c) vs rho_u S_c A_c -2.25e-4
   / -2.23e-4 over [20, 80], -1.37e-4 / -1.41e-4 over [40, 80] (order ~0). The composition side closes (the ledger's burn
   rate vs rho_u S_c A_c +7.5e-6); the gap is A19's drift storage model: the ledger's exact chamber mass change dM/dt

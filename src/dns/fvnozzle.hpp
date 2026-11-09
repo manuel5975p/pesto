@@ -109,13 +109,23 @@ FvThrustWindow fvThrustWindow(const FvRoleSums& a, double t1, const FvRoleSums& 
 
 struct FvStation;
 
+// The reacting nozzle's exact storage (masterplan_combclose 2.2): Mst = sum V rho over the cells with axis.C > station,
+// Mth over the cells flagged past the throat (fvPastThroat); Neumaier sums in ascending cell order of the downloaded
+// state. The throat flux of a window is mdotOut + Delta Mth / Delta t, sample-free.
+struct FvStorage
+{
+    double Mst = 0, Mth = 0;
+};
+FvStorage fvStorage(const FaceMesh& fm, const FvState& s, const std::array<double, 3>& axis, double station,
+                    std::span<const std::uint8_t> pastThroat);
+
 // _thrust.csv: the header and one row (R2's columns). res_k = P_k - P0_k + sum_roles I_k - q omega [E]
-// + omega [fuel]: 0 to rounding. station (the reacting nozzle's): p0b T0b CdB CfBvac CfB appended, Cd and
-// Cf on the burnt station's (p0b, T0b) with the window's mdotOut, Tvac. Pre: b non-null iff station.
+// + omega [fuel]: 0 to rounding. station (the reacting nozzle's): p0b T0b CdB CfBvac CfB Mst Mth appended, Cd
+// and Cf on the burnt station's (p0b, T0b) with the window's mdotOut, Tvac. Pre: b, m non-null iff station.
 std::vector<std::string> fvThrustColumns(bool station = false);
 std::vector<double> fvThrustRow(double t, long step, double dt, const FvRow6& P, const FvRow6& P0, const FvRoleSums& now,
                                 const FvThrustWindow& w, const FvExitSample& x, const FvThrustCase& k,
-                                const FvStation* b = nullptr);
+                                const FvStation* b = nullptr, const FvStorage* m = nullptr);
 
 // The exit plane's Mach number from window-mean fluxes per area: f1 mass, f2 momentum + pressure along
 // the normal, f3 energy (the quasi-1D state the conserved fluxes carry). supersonic picks the root.
@@ -180,5 +190,9 @@ std::vector<double> fvBinAreas(const FaceMesh& fm, const FvFlameProbe& probe);
 // The throat bin: the least-area non-empty bin at or past nCh (the first on a tie); nCh if none is non-empty.
 // Pre: nCh < A.size().
 int fvThroatBin(std::span<const double> A, int nCh);
+
+// Per cell 1 iff probe.binOf(c) > the throat bin (fvThroatBin of fvBinAreas, the IC's rule): Mth's cells.
+// Pre: probe.spec().chamber.
+std::vector<std::uint8_t> fvPastThroat(const FaceMesh& fm, const FvFlameProbe& probe);
 
 } // namespace dns
