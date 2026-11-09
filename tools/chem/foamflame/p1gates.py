@@ -163,3 +163,55 @@ def evaluate(root, oracle, si):
     L.append(f"       control (q on cp(1.4) at gamma 1.2, flag form): D {Dm:+.4f} "
              f"{'fails the band: live' if not abs(Dm - G17_D) <= G17_TOL else 'PASSES: dead control'}")
     return out, "\n".join(L)
+
+
+# masterplan_combclose K1: the archived G1.5 / G3.3 M_n ladder (fv1d_hll dns_c*_mn, window [7, 14])
+MN_ARCHIVED = {15: 0.9945059, 30: 0.9918456870897155}
+
+
+def evaluate_mn(root, oracle, si):
+    """masterplan_combclose G1.8 off fv1d_mn / fv1d_mn_stockle's compare.json: the nozzle's flame (M 0.042,
+    gamma 1.4, --shock hll) vs reactingFoam at 15 and 30 cells. S_inf = S30 + (S30 - S15)/(2^p - 1), p from
+    the dns ladder; |S_dns - S_foam| <= max(|S_dns - S_inf|, |S_foam - S_inf|) at 15 and 30, |gap 30| < |gap 15|;
+    the fresh correction in G1.4's form; 1 - gamma M^2 (sigma - 1) printed beside."""
+    fv, st = _load(root, "fv1d_mn"), _load(root, "fv1d_mn_stockle")
+    R = fv["runs"]
+    sig, M, g = 5.0, 0.042, 1.4
+    out, L = {}, []
+
+    def line(gid, ok, text):
+        out[gid] = {"pass": bool(ok), "text": text}
+        L.append(f"{gid:6s} {'PASS' if ok else 'UNMET'}  {text}")
+
+    sd = {N: _sl(R[f"dns_c{N:g}"]) for N in (7.5, 15, 30)}
+    r = (sd[7.5] - sd[15]) / (sd[15] - sd[30])
+    p = math.log2(r) if r > 0 else float("nan")
+    sinf = sd[30] + (sd[30] - sd[15]) / (2 ** p - 1)
+    rep = {N: sd[N] - MN_ARCHIVED[N] for N in MN_ARCHIVED}
+    spans = {N: R[f"dns_c{N:g}"]["SL_series"]["span"] for N in (7.5, 15, 30)}
+    line("G1.8a", all(abs(rep[N]) <= spans[N] for N in rep),
+         f"dns ladder {sd[7.5]:.7f} {sd[15]:.7f} {sd[30]:.7f}, ratio {r:.3f} order {p:.3f}, S_inf {sinf:.7f} "
+         f"(1 - gamma M^2 (sigma - 1) = {sref(g, M, sig):.7f}, S_inf - it {sinf - sref(g, M, sig):+.2e}); vs archived "
+         + " ".join(f"{N:g}: {rep[N]:+.1e} (span {spans[N]:.1e})" for N in rep))
+    aT, ap = sens(root, oracle)
+    Tu = pu = 1.0 / (g * M * M)
+    fresh, band, raw = {}, {}, {}
+    for N in (15, 30):
+        dn, fn = R[f"dns_c{N:g}"], R[f"foam_mclin_c{N:g}"]
+        fresh[N] = aT * (dn["TRef_series"]["mean"] - fn["TRef_series"]["mean"]) / Tu \
+            + ap * (dn["pRef_series"]["mean"] - fn["pRef_series"]["mean"]) / pu
+        band[N] = max(abs(sd[N] - sinf), abs(_sl(fn) - sinf))
+        raw[N] = sd[N] - _sl(fn)
+    corr = any(abs(fresh[N]) > band[N] / 4 for N in fresh)
+    gap = {N: raw[N] - (fresh[N] if corr else 0.0) for N in raw}
+    ok = all(abs(gap[N]) <= band[N] for N in gap) and abs(gap[30]) < abs(gap[15])
+    line("G1.8", ok,
+         "dns - foam " + " ".join(f"{N:g}: {gap[N]:+.3e}" for N in gap) + " vs max own error vs S_inf "
+         + " ".join(f"{band[N]:.3e}" for N in band) + f"; |gap 30| < |gap 15|: {abs(gap[30]) < abs(gap[15])}; foam S_L "
+         + " ".join(f"{_sl(R[f'foam_mclin_c{N:g}']):.7f}" for N in gap) + "; dS_fresh "
+         + " ".join(f"{fresh[N]:+.2e}" for N in fresh) + (" (corrected)" if corr else " (raw S_L compared, <= band/4)"))
+    sc = _sl(st["runs"]["foam_mclin_c15"]) - sd[15]
+    out["G1.8 control"] = {"fails": abs(sc) >= G12_CONTROL, "value": sc}
+    L.append(f"       control (stock Le 1.39, foam 15): gap {sc:+.4f} "
+             f"{'>= 0.1: fails the band, live' if abs(sc) >= G12_CONTROL else '< 0.1: dead control'}")
+    return out, "\n".join(L)

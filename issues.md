@@ -2720,6 +2720,18 @@ G4.7, G4.8 PASS at 15 cells; at 30 cells G4.2-G4.4, G4.6 (p0b), G4.8 PASS, G4.1 
   >= 1e-3" (expected 8.1e-3), not run. The reactingFoam `transonic yes` scout (G4.10) ran 5 CPU min and did NOT settle:
   t 7.8 of 80 tau, mdotIn 31.13 vs mdotOut 30.64 (1.6% transient); stopped. The 30-cell rung ran (A24).
 
+combclose (`plans/masterplan_combclose.md`, amendments B1-):
+- N21. **G1.8 UNMET at 30 cells: dns and reactingFoam differ by a converged O(M²) term at the nozzle's Mach** (K1,
+  docs/chem.md "P1" "At the nozzle's Mach"). Same poly1d files, M 0.042, γ 1.4, dns `--shock hll` FP64: dns − foam
+  +2.620e-3 (15), +2.593e-3 (30), not falling; band (max own error vs the dns Richardson S∞ 0.9909473) 3.56e-3, 1.70e-3.
+  foam's own Richardson limit (p 2) 0.988374 sits 2.57e-3 under S∞ = 0.26 γM²(σ−1); P1's converged gap at M 0.01 (foam
+  0.99939, dns 0.99955) is 0.29 γM²(σ−1): the same fraction, so one O(M²) model difference (N5's 30-cell gap is its
+  M 0.01 value). Term budget: fresh state δS ≤ 8.7e-5, window spans ≤ 1.8e-4 (foam halves), the outlet acts only
+  through the fresh state: none of them. Candidate (not tested): reactingFoam's EEqn carries no viscous work (h + K
+  with −u ∂τ/∂x where the energy equation has τ ∂u/∂x), size ~0.6 γM²(σ−1) by estimate. Which side is right needs a
+  finite-Mach 1D oracle; dns S∞ is +8.3e-4 off the leading-order 1 − γM²(σ−1), foam −1.75e-3. The nozzle is gated on
+  the closed oracle + the 1D FV ladder, not on foam (plan K1 stop): recorded, proceeds. Control (stock Le 1.39) +0.1257.
+
 ## Older open items (details in CLAUDE.md)
 
 - No anchor for the Re800 compressible cases or `sphere_re300_n160_cd`

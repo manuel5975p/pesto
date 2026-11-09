@@ -1208,6 +1208,24 @@ Readings:
   38.7 s at M_n; foam 55 / 104 / 196 s exec (1 core, 14 000 steps), the six side by side in a
   204 s CPU job.
 
+**At the nozzle's Mach (masterplan_combclose K1, G1.8).** Cases `fv1d_mn` (fv1d at M 0.042, γ 1.4,
+dns `--shock hll`, dns 7.5 / 15 / 30, foam 15 / 30) and `fv1d_mn_stockle` (the control, foam 15):
+`foam_flame.py setup|run|compare fv1d_mn`, `foam_flame.py gates-mn` (`p1gates.evaluate_mn`,
+`runs/flames/foam/fv1d_mn/gates.txt`). Same meshes, IC, BCs, schemes and window as P1.
+
+| gate | relation | measured | |
+|---|---|---|---|
+| G1.8a | dns ladder reproduces the archived M_n S_L (G1.5/G3.3) within the span | 1.0050441, 0.9945059, 0.9918457 (+4.8e-8, 0.0); order 1.986, S∞ 0.9909473 (1 − γM²(σ−1) + 8.3e-4) | PASS |
+| G1.8 | \|S_dns − S_foam\| ≤ max(\|S_dns − S∞\|, \|S_foam − S∞\|) at 15 and 30, \|gap 30\| < \|gap 15\| | +2.620e-3 / +2.593e-3 vs 3.559e-3 / 1.695e-3; foam 0.9918861, 0.9892522; δS_fresh +6.5e-5, −8.7e-5 (raw) | **UNMET at 30** |
+| G1.8 control | foam stock Le 1.39 at 15: gap ≥ 0.1 | +0.1257 | fails as required |
+
+Reading: the dns − foam gap does NOT fall with h (2.620e-3 → 2.593e-3); foam's own Richardson
+limit (p 2) is 0.988374, 2.57e-3 under dns' S∞. That is 0.26 γM²(σ−1); P1's converged gap at
+M 0.01 (foam 0.99939, dns Richardson 0.99955) is 1.6e-4 = 0.29 γM²(σ−1): one O(M²) model
+difference, not h, window or fresh state (term budget: δS_fresh ≤ 8.7e-5, window spans ≤ 1.8e-4,
+the outlet acts through the fresh state only). issues.md N21. dns 60.6 s GPU (one job), foam
+83 / 166 s exec (one 174 s CPU job with the stockle run).
+
 ## 2D slot-jet diffusion flame (`--mode diffusion`)
 
 `dns/diffusion.{hpp,cpp}` (core: model, Burke–Schumann state, inflow,

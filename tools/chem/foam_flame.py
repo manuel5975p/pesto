@@ -11,6 +11,8 @@ simjob job specs, and the comparison table.
   foam_flame.py compare CASE            table + runs/flames/foam/CASE/compare.json
   foam_flame.py gates                   masterplan_combnozzle P1 (fv1d, fv1d_stockle,
                                         fv1d_g12 compared first): G1.0-G1.7, controls
+  foam_flame.py gates-mn                masterplan_combclose K1 (fv1d_mn, fv1d_mn_stockle
+                                        compared first): G1.8 at M_n 0.042 --shock hll
 
 Every run goes through the job server (docs/jobs.md): dns as one GPU job
 (one step per rung), OpenFOAM as one CPU job (blockMesh per case, then the
@@ -385,10 +387,22 @@ def cmd_gates():
     print(txt)
 
 
+def cmd_gates_mn():
+    """masterplan_combclose K1: G1.8 off fv1d_mn / fv1d_mn_stockle's compare.json."""
+    from foamflame import p1gates
+    _, o, si, root = context("fv1d_mn")
+    res, txt = p1gates.evaluate_mn(ROOT, o, si)
+    with open(os.path.join(root, "gates.json"), "w") as f:
+        json.dump(res, f, indent=1)
+    with open(os.path.join(root, "gates.txt"), "w") as f:
+        f.write(txt + "\n")
+    print(txt)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["list", "setup", "run", "compare", "gates"])
+    ap.add_argument("cmd", choices=["list", "setup", "run", "compare", "gates", "gates-mn"])
     ap.add_argument("case", nargs="?")
     ap.add_argument("--dns", action="store_true")
     ap.add_argument("--foam", action="store_true")
@@ -403,6 +417,9 @@ def main():
         return
     if a.cmd == "gates":
         cmd_gates()
+        return
+    if a.cmd == "gates-mn":
+        cmd_gates_mn()
         return
     if a.case not in cases.CASES:
         sys.exit(f"unknown case {a.case!r} (foam_flame.py list)")
