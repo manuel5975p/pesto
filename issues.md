@@ -2695,6 +2695,10 @@ G4.7, G4.8 PASS at 15 cells; at 30 cells G4.2-G4.4, G4.6 (p0b), G4.8 PASS, G4.1 
   1.7e-5 between its [30, 40] and [60, 80] windows: not robust); CfBvac -6.9e-6 / -4.2e-5 passes. The flame half is
   h-independent (CdB 0.998976 -> 0.998977 at 30 cells); the 30-cell twin was cut (~13 min GPU, viscous dt), so G4.5 at
   30 is unevaluated. The viscous loss itself (twin - inviscid) is Cd -9.24e-4, CfVac -2.94e-3 at Re* 736.
+  **CLOSED (combclose K5, K6)**: the IC slug (N15). Fixed IC, compensated FP64, rule window: dCd (throat flux) +1.05e-6
+  at 15 (W [50.7, 140], k 4), -8.0e-7 at 30 (W [57.6, 80], k 1) against the 30-cell twin by grid sequencing (Cd
+  0.9990744066, CfVac 1.4546626487, Re* 737.0612 = the 30-cell rig's y*; the analysis' 736.2747 took the 15-cell y*);
+  dCf +1.5e-6 / +2.1e-6.
 - N14. **The Total-fed choked chamber rings, h-independently**: u_u rms 1.0e-3 to 2.6e-3, p0b rms 2.8e-5, CdB per-row rms
   2.1e-4, spectral peaks 20, 30, 15, 60 tau, IDENTICAL at 15 and 30 cells (P4b): a physical oscillation of the chamber
   + nozzle, not a scheme ring; not growing over 80 tau; mode not identified (no p frame on one row). Window means of
@@ -2721,6 +2725,9 @@ G4.7, G4.8 PASS at 15 cells; at 30 cells G4.2-G4.4, G4.6 (p0b), G4.8 PASS, G4.1 
   flux), dCf +1.49e-6, G4.12 b dip -1.05e-4 (old -7.08e-4); contraction storage over W -2.7e-6 of mdot. Legacy [20, 80]
   / [40, 80] mdot -6.7e-5 / -4.3e-5 (old -2.20e-4 / -2.10e-4 through the same estimator): the remainder is the ring's
   phase, which the rule's integer periods cancel. Both gates now hold by ~70x (mdot) and ~100x (Cd) inside 1e-4.
+  30 cells (K6, W [57.619, 80], k 1): mdot +2.126e-5 = burn -5.1e-7 + storage +2.18e-5 (one period's ring residual,
+  contraction storage -1.7e-5), legacy [20, 80] -6.5e-5. "Falling with h" is replaced by the band at each rung (2.5):
+  burn -3.7e-7 / -5.1e-7 sits at the estimator floor.
 - N16. **Re-diagnosed (P4b, A23): the reacting G4.1 growth is the FP64 STATE's rounding, not the ledger.** The ledger is
   now compensated (`fvLedgerAdd`, two-sum; `gpu_fv_nozzle_ledger` N16: 1e5 steps 3.9e-15 flat, the plain hi word
   2.6e-13), and the reacting residual did not change (8.36e-14 / 8.38e-14 old / new at 31 639 steps): res_mass grows
@@ -2737,7 +2744,8 @@ G4.7, G4.8 PASS at 15 cells; at 30 cells G4.2-G4.4, G4.6 (p0b), G4.8 PASS, G4.1 
   10% of rows 1.57e-16 vs rows 10-20% 1.82e-16); plain control 1.48e-13. Off = bytes (bit subset vs dns.BASE, the plain
   `[thrust]` rig vs dns.K3). Cost +3.1% per step (0.3076 vs 0.3170 ms/step, 15-cell reacting rig, `--bench`). The
   full-length gated runs (K5/K6) run compensated. K5 (15 cells, tt 140, 1 473 931 steps): G4.1 2.07e-16, G4.1f flat
-  (last 10% / rows 10-20% 0.87); the old plain q15 9.79e-13.
+  (last 10% / rows 10-20% 0.87); the old plain q15 9.79e-13. K6 (30 cells, tt 80, 3 369 062 steps): 1.65e-16, flat
+  0.76 (plain P4b 3.51e-12): G4.1 at 30 MET.
 - N17. **G4.7 partial**: the start perturbation is x_f + 2 delta_th (`--upstream 14`) only; "p0 IC + 1%" has no knob (none
   built for a test). The flame stays 3.20 delta_D downstream to the end; window mdot, CfBvac, S_c 4.4e-5, 2.2e-6, 3.8e-7.
 - N18. **The viscous one-row v is a field**, max |v|/c 6.9e-3 in the twin (P_my/P_mx 8.7e-4 in the flame run; the flame

@@ -335,23 +335,32 @@ pass); rule window p15 [57.58, 80] dCd (exit form) -4.1e-6, mdot -7.8e-6; p30 -1
 **Fixed-IC gated runs (masterplan_combclose K5-K7)**: the Rayleigh-line IC, `--compensated --fv-precision fp64`, W by the
 rule fixed before each run (`nozzle_react.py report`, twin numbers given verbatim). 15 cells: tt 140, 1 473 931 steps,
 0.323 ms/step (477 s); ring fit P 22.324 / e-fold 32.53 (resid/amp 0.001, amplitude 1.73e-3 in u_u, half the old IC's
-3.40e-3), k 4, W [50.716, 140].
+3.40e-3), k 4, W [50.716, 140]. 30 cells (`design --cells 30 --sl 0.9918456870897155`, 10307 cells): tt 80, 3 369 062
+steps, 0.426 ms/step (1435 s); fit P 22.384 / e-fold 33.63 (model 22.700 / 34.00), k 1, W [57.619, 80]. Its twin by grid
+sequencing (`test_gpu_fv_nozzle reacttwinseq 4685 9370 6.189583245467375 737.0611852427219 0.010036943396590633 80 25`,
+392 s): Cd 0.9990744066, CfVac 1.4546626487 over [10, 25] t* of the fine run, |out/in - 1| <= 1.31e-6 per 5 t*. Its Re*
+is the 30-cell rig's (y* 50.0249); analysis_combclose_2's 736.2747 took the 15-cell y* (ratio 0.998933 = the y* ratio):
+the twin at that Re* read 0.9990733, dCd with it +3.1e-7.
 
-| gate | 15 cells, W | band |
-|---|---|---|
-| G4.1 / G4.1f | 2.07e-16; last 10% / rows 10-20% 0.87 | 1e-12 / 1e-13, 4 |
-| G4.2 S_c - S_L,num | -9.36e-5 | 5e-4 |
-| G4.3 endpoint x_f' vs u_u - S_c | -1.07e-6 (regression -1.01e-5) | 2e-3 S_L |
-| G4.4 T0b; fuelOut/burnIn | -2.07e-6; 0.0 | 1e-4; 1e-8 |
-| G4.5 dCd (throat flux) / dCf vs the twin (0.9990755 / 1.4546618, Re* 736.2625; this run's station 736.2609: dCd shift -2e-9) | +1.05e-6 (exit form +2.38e-7) / +1.49e-6 | 1e-4 |
-| G4.6 p0b vs the oracle | +9.37e-7 | 4.9e-4 |
-| G4.6 mdot = burn + storage | +1.475e-6 = -3.68e-7 + 1.84e-6 (identity -1.9e-16; A19 form +1.23e-5) | 1e-4 |
-| contraction storage over W | -2.67e-6 of mdot | reported (<= 1e-5 predicted) |
-| G4.7b vs the old-IC q15 on W: mdotIn, CfBvac, S_c | -3.45e-3, +2.25e-6, -7.76e-7 (2 x span 0.18, 2.2e-4, 6.0e-5) | 2 x span |
-| G4.8 shockCells | 0 on 7370 rows | 0 |
-| G4.11 fit vs model (22.680 / 33.80) | P -1.6%, e-fold -3.7% | 3% / 15% |
-| G4.12 a / b | +2.69e-10 / dip -1.05e-4 at [44.2, 48.2] | 1e-6 / 3e-4 |
-| legacy [20, 80] / [40, 80] mdot (reported) | -6.68e-5 / -4.30e-5 (dCd -9.9e-6 / -9.9e-6) | |
+| gate | 15 cells, W | 30 cells, W | band |
+|---|---|---|---|
+| G4.1 / G4.1f | 2.07e-16; last 10% / rows 10-20% 0.87 | 1.65e-16; 0.76 | 1e-12 / 1e-13, 4 |
+| G4.2 S_c - S_L,num | -9.36e-5 | -7.49e-5 | 5e-4 |
+| G4.3 endpoint x_f' vs u_u - S_c | -1.07e-6 (regression -1.01e-5) | +6.88e-6 (regression +1.72e-4) | 2e-3 S_L |
+| G4.4 T0b; fuelOut/burnIn | -2.07e-6; 0.0 | -3.00e-6; 0.0 | 1e-4; 1e-8 |
+| G4.5 dCd (throat flux) / dCf vs the twin | +1.05e-6 (exit form +2.38e-7) / +1.49e-6 (twin 0.9990755 / 1.4546618, Re* 736.2625; station 736.2609: shift -2e-9) | -8.01e-7 (exit form +1.63e-6) / +2.08e-6 | 1e-4 |
+| G4.6 p0b vs the oracle | +9.37e-7 | -9.58e-7 | 4.9e-4 |
+| G4.6 mdot = burn + storage | +1.475e-6 = -3.68e-7 + 1.84e-6 (identity -1.9e-16; A19 form +1.23e-5) | +2.126e-5 = -5.11e-7 + 2.18e-5 (identity -2.4e-16; A19 -3.70e-6) | 1e-4 |
+| contraction storage over W | -2.67e-6 of mdot | -1.67e-5 of mdot (k 1) | reported (<= 1e-5 predicted) |
+| G4.7b vs the old-IC q15 on W: mdotIn, CfBvac, S_c | -3.45e-3, +2.25e-6, -7.76e-7 (2 x span 0.18, 2.2e-4, 6.0e-5) | - | 2 x span |
+| G4.8 shockCells | 0 on 7370 rows | 0 on 16846 rows | 0 |
+| G4.11 fit vs model | P -1.6%, e-fold -3.7% | P -1.4%, e-fold -1.1% | 3% / 15% |
+| G4.12 a / b | +2.69e-10 / dip -1.05e-4 at [44.2, 48.2] | -1.96e-10 / -9.85e-5 at [43.9, 47.9] | 1e-6 / 3e-4 |
+| legacy [20, 80] / [40, 80] mdot (reported) | -6.68e-5 / -4.30e-5 (dCd -9.9e-6 / -9.9e-6) | -6.54e-5 / -3.69e-5 (dCd -8.3e-6 / -7.4e-6) | |
+
+`burn` (the ledger's burn rate vs rho_u S_c A_c) is -3.7e-7 at 15 and -5.1e-7 at 30: at the estimator's floor, no h
+trend to read. G4.6 mdot at 30 (+2.1e-5, k 1) is its storage term over ONE period: the k-1 window's ring residual
+(contraction storage -1.7e-5), 5x under the band. The 30-cell rung closes N13 (G4.5 at 30 evaluated) and N16 (G4.1).
 
 Controls, the old-IC q15 (plain FP64) through the same report, fail where stated: G4.1f 9.79e-13 (> 1e-13), legacy
 mdot -2.20e-4 / -2.10e-4, G4.12 a +1.709e-3, b -7.08e-4. On the legacy windows the fixed IC leaves only the ring's phase
