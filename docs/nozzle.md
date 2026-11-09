@@ -332,6 +332,32 @@ pass); rule window p15 [57.58, 80] dCd (exit form) -4.1e-6, mdot -7.8e-6; p30 -1
 +2.38e-5; the same runs' legacy [20, 80] mdot -2.20e-4, [40, 80] dCd -1.10e-4; G4.12 a +1.709e-3, b -6.99e-4 / -6.94e-4
 / -7.08e-4 (all fail as required: the slug).
 
+**Fixed-IC gated runs (masterplan_combclose K5-K7)**: the Rayleigh-line IC, `--compensated --fv-precision fp64`, W by the
+rule fixed before each run (`nozzle_react.py report`, twin numbers given verbatim). 15 cells: tt 140, 1 473 931 steps,
+0.323 ms/step (477 s); ring fit P 22.324 / e-fold 32.53 (resid/amp 0.001, amplitude 1.73e-3 in u_u, half the old IC's
+3.40e-3), k 4, W [50.716, 140].
+
+| gate | 15 cells, W | band |
+|---|---|---|
+| G4.1 / G4.1f | 2.07e-16; last 10% / rows 10-20% 0.87 | 1e-12 / 1e-13, 4 |
+| G4.2 S_c - S_L,num | -9.36e-5 | 5e-4 |
+| G4.3 endpoint x_f' vs u_u - S_c | -1.07e-6 (regression -1.01e-5) | 2e-3 S_L |
+| G4.4 T0b; fuelOut/burnIn | -2.07e-6; 0.0 | 1e-4; 1e-8 |
+| G4.5 dCd (throat flux) / dCf vs the twin (0.9990755 / 1.4546618, Re* 736.2625; this run's station 736.2609: dCd shift -2e-9) | +1.05e-6 (exit form +2.38e-7) / +1.49e-6 | 1e-4 |
+| G4.6 p0b vs the oracle | +9.37e-7 | 4.9e-4 |
+| G4.6 mdot = burn + storage | +1.475e-6 = -3.68e-7 + 1.84e-6 (identity -1.9e-16; A19 form +1.23e-5) | 1e-4 |
+| contraction storage over W | -2.67e-6 of mdot | reported (<= 1e-5 predicted) |
+| G4.7b vs the old-IC q15 on W: mdotIn, CfBvac, S_c | -3.45e-3, +2.25e-6, -7.76e-7 (2 x span 0.18, 2.2e-4, 6.0e-5) | 2 x span |
+| G4.8 shockCells | 0 on 7370 rows | 0 |
+| G4.11 fit vs model (22.680 / 33.80) | P -1.6%, e-fold -3.7% | 3% / 15% |
+| G4.12 a / b | +2.69e-10 / dip -1.05e-4 at [44.2, 48.2] | 1e-6 / 3e-4 |
+| legacy [20, 80] / [40, 80] mdot (reported) | -6.68e-5 / -4.30e-5 (dCd -9.9e-6 / -9.9e-6) | |
+
+Controls, the old-IC q15 (plain FP64) through the same report, fail where stated: G4.1f 9.79e-13 (> 1e-13), legacy
+mdot -2.20e-4 / -2.10e-4, G4.12 a +1.709e-3, b -7.08e-4. On the legacy windows the fixed IC leaves only the ring's phase
+(contraction storage +5.7e-5 / +3.6e-5, its 10-tau bins +-5e-4 at t 10-20 decaying to +7e-6 at 130-140): a window of
+integer periods from t_e + 10 is what cancels it.
+
 **The rig** (`nozzle_react.py design --cells 15 --mach 0.042 --sl 0.9945059`): y* 49.97 delta_D, chamber Lc 1 y* (50
 delta_D: the flame at 12 delta_th, 19 delta_th burnt after it), cosine contraction Lcon 6 y* (54 deg max), cosine
 divergent Ldiv 4 y* to eps_e 2, h = delta_th/15, 5148 cells (nx a multiple of 11: the twin is the same xi grid from

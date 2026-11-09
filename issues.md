@@ -2716,6 +2716,11 @@ G4.7, G4.8 PASS at 15 cells; at 30 cells G4.2-G4.4, G4.6 (p0b), G4.8 PASS, G4.1 
   (mdotOut dip -7.0e-4, the ring re-excited), and its leaving density deficit is the "extra storage". Fixed in K2 (the
   chamber on the Rayleigh line, `fvref_react` R5, G4.12a 2.7e-10 on the first row); the gated rerun is K5. Same cause
   for N13's Cd.
+  **CLOSED at 15 cells (combclose K5)**: fixed IC, compensated FP64, tt 140, rule window W [50.716, 140] (k 4 of the
+  fitted P 22.324): G4.6 mdot +1.475e-6 (= burn -3.68e-7 + storage +1.84e-6, identity 2e-16), G4.5 dCd +1.05e-6 (throat
+  flux), dCf +1.49e-6, G4.12 b dip -1.05e-4 (old -7.08e-4); contraction storage over W -2.7e-6 of mdot. Legacy [20, 80]
+  / [40, 80] mdot -6.7e-5 / -4.3e-5 (old -2.20e-4 / -2.10e-4 through the same estimator): the remainder is the ring's
+  phase, which the rule's integer periods cancel. Both gates now hold by ~70x (mdot) and ~100x (Cd) inside 1e-4.
 - N16. **Re-diagnosed (P4b, A23): the reacting G4.1 growth is the FP64 STATE's rounding, not the ledger.** The ledger is
   now compensated (`fvLedgerAdd`, two-sum; `gpu_fv_nozzle_ledger` N16: 1e5 steps 3.9e-15 flat, the plain hi word
   2.6e-13), and the reacting residual did not change (8.36e-14 / 8.38e-14 old / new at 31 639 steps): res_mass grows
@@ -2731,7 +2736,8 @@ G4.7, G4.8 PASS at 15 cells; at 30 cells G4.2-G4.4, G4.6 (p0b), G4.8 PASS, G4.1 
   plain FP64 write is biased"). N16b (`gpu_fv_nozzle_react`, 15 cells, tt 3, 31 639 steps): max r 2.07e-16, flat (last
   10% of rows 1.57e-16 vs rows 10-20% 1.82e-16); plain control 1.48e-13. Off = bytes (bit subset vs dns.BASE, the plain
   `[thrust]` rig vs dns.K3). Cost +3.1% per step (0.3076 vs 0.3170 ms/step, 15-cell reacting rig, `--bench`). The
-  full-length gated runs (K5/K6) run compensated.
+  full-length gated runs (K5/K6) run compensated. K5 (15 cells, tt 140, 1 473 931 steps): G4.1 2.07e-16, G4.1f flat
+  (last 10% / rows 10-20% 0.87); the old plain q15 9.79e-13.
 - N17. **G4.7 partial**: the start perturbation is x_f + 2 delta_th (`--upstream 14`) only; "p0 IC + 1%" has no knob (none
   built for a test). The flame stays 3.20 delta_D downstream to the end; window mdot, CfBvac, S_c 4.4e-5, 2.2e-6, 3.8e-7.
 - N18. **The viscous one-row v is a field**, max |v|/c 6.9e-3 in the twin (P_my/P_mx 8.7e-4 in the flame run; the flame
