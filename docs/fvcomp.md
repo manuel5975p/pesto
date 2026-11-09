@@ -48,6 +48,10 @@ of the same templates, the same pass order:
   "FP32 on a steady flow". Under `--fv-precision fp64` (masterplan_combclose R6): the
   double-double state (`gpu/word2d.hpp`, the same kernels' R = double instantiation), the
   fix of the plain FP64 stage-3 lattice bias: "Precision: the plain FP64 write is biased".
+  `dns flow --steady` (FV) marches the compensated state in FP32 without the flag, a plain one
+  in FP64 (`fvCompStateCompensated`, the ONE rule the driver runs and the label states; the
+  label read " compensated" on a plain FP64 RANS steady state and omitted it on a compensated
+  FP32 laminar one until combclose K8).
 
 **Quiet start.** `--ramp`: the IC at rest, the freestream raised by exact
 Galilean boosts over `[0, ramp]` with the Far/Inflow rows of the table following,

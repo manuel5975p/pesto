@@ -177,6 +177,28 @@ void cliGate()
         check(fvCompLabel(*rs, true).find("steady (local time stepping: pseudo-time, not time-accurate)") !=
                   std::string::npos,
               "the FV label says pseudo-time");
+    // The label states the state the driver runs (fvCompStateCompensated): a --steady march is compensated in FP32
+    // only; FP64 --steady is plain unless --compensated (combclose K8: it printed " compensated" on a plain FP64 state).
+    if (rs) {
+        auto at = [&](FvPrecision p, bool comp, bool rans) {
+            Case k = *rs;
+            k.fvPrecision = p;
+            k.compensated = comp;
+            if (!rans) k.rans = RansModel::None;
+            return std::pair{fvCompStateCompensated(k), fvCompLabel(k, true)};
+        };
+        for (const bool rans : {true, false}) {
+            const auto [s32, l32] = at(FvPrecision::Fp32, false, rans);
+            const auto [s64, l64] = at(FvPrecision::Fp64, false, rans);
+            const auto [c64, m64] = at(FvPrecision::Fp64, true, rans);
+            check(s32 && l32.find(", FP32 compensated] ") != std::string::npos,
+                  std::format("{} FP32 --steady: the state and the label are compensated", rans ? "RANS" : "laminar"));
+            check(!s64 && l64.find(", FP64] ") != std::string::npos,
+                  std::format("{} FP64 --steady: a plain state, a plain label", rans ? "RANS" : "laminar"));
+            check(c64 && m64.find(", FP64 compensated (double-double state)] ") != std::string::npos,
+                  std::format("{} FP64 --steady --compensated: the double-double label", rans ? "RANS" : "laminar"));
+        }
+    }
     auto rt = runCli({"flow", "--physics", "compressible", "--polymesh", "/tmp/x", "--bc", "b", "--re", "1e4", "--mach",
                       "0.2", "--tt", "1", "--rans", "sa-neg", "--steady", "1e-3"}, true);
     check(!rt && rt.error().field == "--tt", "polyMesh route: --tt with --steady");

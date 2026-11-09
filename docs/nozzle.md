@@ -386,7 +386,8 @@ integer periods from t_e + 10 is what cancels it.
 delta_D: the flame at 12 delta_th, 19 delta_th burnt after it), cosine contraction Lcon 6 y* (54 deg max), cosine
 divergent Ldiv 4 y* to eps_e 2, h = delta_th/15, 5148 cells (nx a multiple of 11: the twin is the same xi grid from
 the contraction start), A* = y* x depth, `pa` 0.01 Tu, station Lc - 2 delta_th, FP64, `--shock hll`, tt 80 tau,
-window [40, 80] off the ledger and the probe. eps_c 6.1729 solves `u_u = S_L,num` (P3's 1D 15-cell hll S_L 0.9945059).
+window [40, 80] off the ledger and the probe (P4; the gated runs since combclose: compensated FP64, tt 140 at 15 cells,
+the rule window). eps_c 6.1729 solves `u_u = S_L,num` (P3's 1D 15-cell hll S_L 0.9945059).
 Not the plan's Lcon 4 y* (64 deg: R8 refuses 1400 cells, the one-row axis face then has no opposite), eps_e 6.25 (the
 exit density sets the viscous dt to 2.5e-5 tau in flame units: 3.1e6 steps), 0.98 S_L (below). 266 s per 80 tau
 (0.316 ms/step, 842 393 steps, dt 9.5e-5 viscous-bound).
@@ -397,7 +398,10 @@ five times the fresh mismatch. The open box's sliding 0.98 S_L drifted -0.1056 S
 80 tau, until its preheat reached the reference slab. At `u_d = S_L,num`: -0.0040. Started 2 delta_th further
 downstream, the flame stays 3.20 delta_D (2 delta_th) downstream to the end, and every window number agrees (G4.7).
 
-| gate | relation | measured (15 cells) | band |
+The table below is the P4 run (OLD IC `premixedPoint`, plain FP64, legacy windows), kept as the record of N13/N15/N16;
+the gates now read the fixed-IC runs above ("Fixed-IC gated runs"). Its relations and controls stand.
+
+| gate | relation | measured (15 cells, old IC) | band |
 |---|---|---|---|
 | G4.1 | ledger res_k / (\|P_k\| + sum \|I_k\| (+ q\|Omega\|, \|Omega\|)), every row of 4212 | 8.7e-13 (grows with steps: 2.5e-13 at t 10; the start run 1.08e-12 at t 80); 30 cells **3.51e-12 UNMET**: the FP64 state's rounding (+7e-15 res_mass per step at both h), not the ledger (compensated, P4b). Cause: the plain stage-3 write's lattice bias (N16); `--compensated` FP64 (combclose K4, N16b, tt 3): 2.07e-16 flat vs plain 1.48e-13 | 1e-12 |
 | G4.1 ctrl | Omega dropped from the rho Y row | 0.45 | fails |
@@ -417,14 +421,17 @@ downstream, the flame stays 3.20 delta_D (2 delta_th) downstream to the end, and
 The twin's own numbers: inviscid CfVac 1.4575996 vs the closed oracle 1.4576001 (-5.1e-7), Cd 0.9999996; the viscous loss
 at Re* 736: Cd -9.24e-4, CfVac -2.94e-3 (physics: the nozzle Re in flame units is ~ (A_c/A) L/delta_D, R5). The viscous
 one-row v is NOT a rounding field: max |v|/c 6.9e-3 in the twin (the slip wall's least-squares gradient carries the
-normal stress into y); P_my/P_mx 8.7e-4 in the flame run. The ring: a persistent thermo-acoustic oscillation of the
-Total-fed choked chamber, u_u rms 1.0e-3 to 2.6e-3 and p0b rms 2.3e-5 to 4.6e-5 per 20 tau window, not growing over 80
-tau (issues.md N14); the gates read ledger window means.
+normal stress into y); P_my/P_mx 8.7e-4 in the flame run. **The ring is ONE damped linear acoustic mode of the
+Total-fed choked chamber + non-compact contraction, a start transient** (issues.md N14): network model P 22.680 tau,
+e-fold 33.80 (15 cells); fitted on u_u over [t_e + 10, tt] 22.324 / 32.53 (K5), 22.384 / 33.63 (K6, 30 cells), 22.438 /
+33.71 at gamma 1.2 (model 22.802 / 35.73). The Total inlet radiates ~42% of the damping (p-node control e-fold 57.70).
+It is h-independent because it is the duct's, not the scheme's. P4's "persistent, not growing, peaks 20, 30, 15, 60
+tau" is withdrawn: those peaks were the DFT bins of a 60-tau record, and the old amplitude (u_u 3.4e-3) was twice the
+fixed IC's (1.7e-3) because the IC slug re-excited it.
 
-**The 30-cell rung** (P4b, masterplan_combnozzle A24; `design --cells 30 --sl 0.9918456870897155`, eps_c 6.18958, 10307
-cells, 3.37e6 steps, 1398 s). The ring is the SAME at 30 cells (p0b rms 2.8e-5, peaks 20, 30, 15, 60 tau): a physical
-oscillation of the chamber, not the scheme's. So the window is fixed before the run to **[20, 80]** (60 tau, an integer
-number of each peak; `nozzle_react.py report --from 20`), the plan's [40, 80] beside it:
+**The 30-cell rung, old IC** (P4b, masterplan_combnozzle A24, superseded by K6 above; `design --cells 30 --sl
+0.9918456870897155`, eps_c 6.18958, 10307 cells, 3.37e6 steps, 1398 s). The window was fixed before that run to
+**[20, 80]** (`nozzle_react.py report --from 20`), the plan's [40, 80] beside it; both carry the IC slug (t_e 40.4):
 
 | gate | 15 [20, 80] | 30 [20, 80] | 15 / 30 [40, 80] | band |
 |---|---|---|---|---|
@@ -437,9 +444,10 @@ number of each peak; `nozzle_react.py report --from 20`), the plan's [40, 80] be
 
 The flame half does not move with h (CdB 0.998976 -> 0.998977). G4.6's mdot does not fall (order ~0): the composition
 closes (the ledger's burn rate vs rho_u S_c A_c +7.5e-6), A19's drift storage `(rho_u - rho_b) A_c x_f'` over-states the
-ledger's exact chamber mass change by 6% at both rungs (issues.md N15). Cut: the eps_c 13.2 row, the gamma 1.2 row (G4.9;
-its dead "off >= 4%" control replaced by "CfBvac vs the gamma-1.4 oracle >= 1e-3", not run). The reactingFoam `transonic
-yes` scout (G4.10) did not settle in 5 CPU min (7.8 of 80 tau, mdotIn/Out 1.6% apart): stopped.
+ledger's exact chamber mass change by 6% at both rungs (issues.md N15: the IC slug's leaving density deficit, closed by
+the Rayleigh-line IC). The eps_c 13.2 row is cut by decision (masterplan_combclose R9); the gamma 1.2 row ran (K7,
+above). The reactingFoam `transonic yes` scout (G4.10) did not settle in 5 CPU min (7.8 of 80 tau, mdotIn/Out 1.6%
+apart): stopped; G4.10 is decomposed (masterplan_combclose R10: G1.2 + G1.8, T1, the oracle + twin).
 
 ## Not built, refused
 
@@ -505,3 +513,21 @@ CLAUDE.md is not edited. For the user:
   is order h^3 in S_L (G3.3).
 - **A foam parity gap is a two-sided number.** In the supersonic cone foam at vanLeer holds p0 to -9.7e-4 at 320 x 64
   and dns to -6.9e-5: the gap is mostly foam's.
+
+masterplan_combclose 7 (measured K5-K7):
+
+1. In "A plain FP32 state wanders...", replace "FP64 rejects it." with: "FP64 takes it (masterplan_combclose): the plain
+   FP64 stage-3 write `ca a + cb b + cr r` (cb = R(2/3)) rounds `ca a + RN(cb b)` on a non-uniform lattice, +0.11 ulp per
+   write on mantissas [1, 1.5): a ledger residual linear in steps (+7e-15 res_mass per step, G4.1 3.51e-12 at 30 cells).
+   Compensated FP64 = the increment form + a double low word (G4.1 1.65e-16 flat at 30 cells, 3.4e6 steps; +3.1% per
+   step); off = bytes."
+2. "**A reacting-nozzle IC is a steady state of the solved equations**: chamber slabs on the Rayleigh line (m, p + m u,
+   cp T + u^2/2 + q(1 - Y) conserved: `fvRayleighBurnt` at q(1 - Y)), never `premixedPoint`'s low-Mach T = sigma Tu
+   (+1.71e-3 in T0: an entropy slug through the throat at t_e ~ 40 tau, inside every gate window; mdot dip -7.1e-4 ->
+   -1.05e-4, G4.6 mdot -2.2e-4 -> +1.5e-6)."
+3. "**Reacting-nozzle gate windows start at t_e + 10 and span k integer periods of the measured ring** (fixed before the
+   run; `nozzle_react.py report`); every rate is an endpoint ledger difference; Cd on the throat flux. Never a DFT peak
+   list (bins of the record). A twin's Re* is its own rung's y* (the 30-cell twin at the 15-cell y* moved Cd 1e-6)."
+4. "**The Total-fed choked chamber rings in ONE damped mode** (duct + non-compact contraction; fitted P 22.3-22.4 tau,
+   e-fold 32.5-33.6 at 15 and 30 cells; network model 22.68 / 33.8; the Total inlet radiates ~42% of the damping): a
+   start transient, not sustained."

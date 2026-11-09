@@ -52,8 +52,7 @@ std::string fvCompLabel(const Case& c, bool twoD)
     if (c.rans != RansModel::None) // a mean-model label: no DNS/LES text, no 2D caveat
         return std::format("[FV path, {}, {}{}] compressible {} [exact wall distance, scalars first-order upwind]: "
                            "Kennedy-Gruber face flux, least-squares gradients, SSP-RK3",
-                           mesh, fvPrecisionName(c.fvPrecision),
-                           c.compensated ? fvCompensatedSuffix(c.fvPrecision, true) : c.compSteady ? " compensated" : "",
+                           mesh, fvPrecisionName(c.fvPrecision), fvCompensatedSuffix(c.fvPrecision, fvCompStateCompensated(c)),
                            ransRunLabel(c.rans, c.compSteady ? RansMode::SteadyExplicit : RansMode::Urans));
     const std::string model =
         c.compSteady ? ransRunLabel(RansModel::None, RansMode::SteadyExplicit)
@@ -65,7 +64,8 @@ std::string fvCompLabel(const Case& c, bool twoD)
     const std::string gam = c.fvGamma != kGammaAir ? std::format(" gamma {:g}", c.fvGamma) : "";
     return std::format("[FV path, {}, {}{}] compressible{} {}: Kennedy-Gruber face flux, least-squares gradients, "
                        "SSP-RK3{}{}",
-                       mesh, fvPrecisionName(c.fvPrecision), fvCompensatedSuffix(c.fvPrecision, c.compensated), gam, model, sense, hll);
+                       mesh, fvPrecisionName(c.fvPrecision), fvCompensatedSuffix(c.fvPrecision, fvCompStateCompensated(c)), gam, model,
+                       sense, hll);
 }
 
 } // namespace dns

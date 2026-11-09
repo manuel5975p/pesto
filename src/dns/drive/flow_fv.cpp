@@ -93,7 +93,7 @@ int runFvCompOn(const Case& c, const FaceMesh& fm, const FvBcSpec& spec, const F
                                  .precision = c.fvPrecision,
                                  .csLes = c.cs,
                                  .sgs = c.sgsModel,
-                                 .compensated = c.compensated || (c.compSteady && c.fvPrecision != FvPrecision::Fp64),
+                                 .compensated = fvCompStateCompensated(c),
                                  .rans = {.model = c.rans,
                                           .wallDist = std::move(wallDist),
                                           .phiInf = {c.ransPhiInf[0], c.ransPhiInf[1]}},

@@ -880,6 +880,12 @@ std::string flowRunLabel(const Case& c);
 // 2D (the polyMesh route knows it from the manifest). Pre: fvMode != Off.
 std::string fvConvLabel(const Case& c, bool twoD);
 std::string fvCompLabel(const Case& c, bool twoD);
+// The compressible FV `dns flow` state is compensated: --compensated, or a --steady FP32 march
+// (an FP64 --steady march is plain). The ONE rule the driver runs and the label states.
+inline bool fvCompStateCompensated(const Case& c)
+{
+    return c.compensated || (c.compSteady && c.fvPrecision != FvPrecision::Fp64);
+}
 // flameRunLabel plus the FV path's mesh, arithmetic and scheme. Pre: c.sub == Flame.
 std::string fvFlameLabel(const Case& c);
 

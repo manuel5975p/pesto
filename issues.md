@@ -2710,6 +2710,10 @@ G4.7, G4.8 PASS at 15 cells; at 30 cells G4.2-G4.4, G4.6 (p0b), G4.8 PASS, G4.1 
   15 cells (22.700 / 34.00 at 30); fitted on uFresh: p15 [50.2, 80] 22.417 / 31.66, p30 22.452 / 32.02, q15 [50.2, 140]
   22.382 / 31.95. Controls: p-node inlet e-fold 57.70 (the Total inlet radiates ~42% of the damping), compact choked
   nozzle P 7.283. Its old amplitude was the IC slug's (N15); windows now span integer periods from t_e + 10 (2.4).
+  Fixed-IC runs (G4.11 pass on all three): K5 15 cells 22.324 / 32.53, K6 30 cells 22.384 / 33.63 (model 22.700 /
+  34.00), K7 gamma 1.2 22.438 / 33.71 (model 22.802 / 35.73); u_u amplitude 1.7e-3 vs 3.4e-3 old IC. Not a defect: a
+  damped start transient the window rule cancels. Open only as a cost: a 1-period window (30 cells, tt 80) leaves
+  ~2e-5 of storage in G4.6 mdot.
 - N15. **G4.6's mdot UNMET at 15 AND 30, does not fall** (P4b, A24): (mdotOut - rho_b x_f' A_c) vs rho_u S_c A_c -2.25e-4
   / -2.23e-4 over [20, 80], -1.37e-4 / -1.41e-4 over [40, 80] (order ~0). The composition side closes (the ledger's burn
   rate vs rho_u S_c A_c +7.5e-6); the gap is A19's drift storage model: the ledger's exact chamber mass change dM/dt
@@ -2748,6 +2752,10 @@ G4.7, G4.8 PASS at 15 cells; at 30 cells G4.2-G4.4, G4.6 (p0b), G4.8 PASS, G4.1 
   0.76 (plain P4b 3.51e-12): G4.1 at 30 MET.
 - N17. **G4.7 partial**: the start perturbation is x_f + 2 delta_th (`--upstream 14`) only; "p0 IC + 1%" has no knob (none
   built for a test). The flame stays 3.20 delta_D downstream to the end; window mdot, CfBvac, S_c 4.4e-5, 2.2e-6, 3.8e-7.
+  **CLOSED (combclose K5, G4.7b; R8)**: "p0 IC + 1%" is replaced ONCE by the old-IC start (q15: the same rig with a
+  1.71e-3 entropy slug and 2x the ring amplitude), compared on the fixed-IC run's W [50.716, 140]: mdotIn -3.45e-3,
+  CfBvac +2.25e-6, S_c -7.76e-7 vs 2 x span 0.18, 2.2e-4, 6.0e-5. (+1% would be u'/u ~ 0.17, 50x today's ring, ~125 tau
+  more to settle.) No knob built.
 - N18. **The viscous one-row v is a field**, max |v|/c 6.9e-3 in the twin (P_my/P_mx 8.7e-4 in the flame run; the flame
   route outputs no v): the slip wall's least-squares gradient carries the normal stress into y. Quasi-1D only inviscid.
 - N19. **Cut** (masterplan_combnozzle section 6; P4b A25): the eps_c 13.2 row and the gamma 1.2 row (G4.9) by GPU budget;
@@ -2785,6 +2793,16 @@ combclose (`plans/masterplan_combclose.md`, amendments B1-):
   MODEL gap of stock reactingFoam (no viscous heating), printed beside, not gated. Any dns-vs-reactingFoam comparison
   at finite Mach (the reacting nozzle's foam twin, G4.10) quotes foam + the work or states the gap (~0.27 γM²(σ−1) in
   S_L for this flame).
+- N22. **CLOSED (combclose K8): the FV `dns flow --steady` label misstated the state.** The driver compensates a
+  `--steady` march in FP32 only (`c.compensated || (compSteady && fp32)`, unchanged since M1); the RANS label printed
+  " compensated" for ANY `--steady` (a plain FP64 state: wrong since 644e596, kept through K4) and the non-RANS label
+  printed nothing on a compensated FP32 laminar `--steady` state. Both now read `fvCompStateCompensated(c)`
+  (config.hpp), the ONE rule the driver runs (`test_fv_comp`: six label/state checks; the RANS FP64 and laminar FP32
+  ones fail on the old code). Label text moves on exactly: RANS `--steady --fv-precision fp64` without `--compensated`
+  ("FP64 compensated" -> "FP64") and laminar `--steady` FP32 without `--compensated` ("FP32" -> "FP32 compensated"), in
+  the `_stats.csv` / `_thrust.csv` comment line, the `--dry-run` label and the run's stdout. Physics bytes unchanged:
+  `comp_bit_identity.sh` vs dns.BASE 55 of 56 rows byte-identical, fvpolysteady differs in line 1 of `_stats.csv`
+  only (json, mask, data rows equal); an FP64 SA-neg O-grid `--steady` (old vs new binary) differs in line 1 only.
 
 ## Older open items (details in CLAUDE.md)
 
