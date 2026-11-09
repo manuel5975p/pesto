@@ -14,8 +14,8 @@ constant-area chamber holding a planar C0 flame, a choked cosine nozzle, a riema
       dns flow --physics compressible --polymesh TDIR --bc TDIR/bc.toml --shock hll --mach 1 --re RE --prandtl 0.72
       --fv-precision fp64 --tt T (the inviscid twin: --inviscid for --re)
   nozzle_react.py argv DIR [flags]   the dns flame argv of a design (for simjob)
-  nozzle_react.py report DIR PREFIX [--twin TPREFIX] [--start SPREFIX] --sl1d S --p1d P --t1d T [--json OUT]
-      the G4 gates (masterplan_combnozzle P4) off PREFIX_stats.csv and PREFIX_thrust.csv over [tt/2, tt]; the 1D
+  nozzle_react.py report DIR PREFIX [--twin TPREFIX] [--start SPREFIX] --sl1d S --p1d P --t1d T [--from T] [--json OUT]
+      the G4 gates (masterplan_combnozzle P4) off PREFIX_stats.csv and PREFIX_thrust.csv over [tt/2, tt] (--from: [T, tt]); the 1D
       reference: S_L,num and its fresh state (window means of the 1D --shock hll run at the same M, gamma, h)
 
 q is the SOLVER's heat release cp (sigma - 1) Tu (masterplan_combnozzle R5): T0b = T0u + (sigma - 1) Tu, never sigma T0u.
@@ -247,14 +247,15 @@ def slope(t, x):
     return sum((a - tm) * (b - xm) for a, b in zip(t, x)) / sum((a - tm) ** 2 for a in t)
 
 
-def gates(design, prefix, sl1d, p1d, t1d, tt=None):
+def gates(design, prefix, sl1d, p1d, t1d, tt=None, t0=None):
     m = json.load(open(os.path.join(design, "design.json")))
     g, M = m["gamma"], m["mach"]
     u = flameUnits(g, M)
     Tu, cp, q = u["Tu"], u["cp"], u["q"]
     st, th = readCsv(prefix + "_stats.csv"), readCsv(prefix + "_thrust.csv")
     tt = tt or st["t"][-1]
-    w, wt = window(st, tt / 2, tt), window(th, tt / 2, tt)
+    t0 = tt / 2 if t0 is None else t0
+    w, wt = window(st, t0, tt), window(th, t0, tt)
     o = dict(rows=len(st["t"]), steps=th["step"][-1], window=[wt["t"][0], wt["t"][-1]], tt=tt)
     # G4.1: the ledger per row, S' = |P_k| + sum |I_k| (+ q |Omega| on E, |Omega| on rho Y).
     roles = ("in", "exit", "wall", "side")
@@ -329,7 +330,7 @@ def gates(design, prefix, sl1d, p1d, t1d, tt=None):
 
 
 def cmdReport(a):
-    o = gates(a.dir, a.prefix, a.sl1d, a.p1d, a.t1d, a.tt)
+    o = gates(a.dir, a.prefix, a.sl1d, a.p1d, a.t1d, a.tt, getattr(a, "from"))
     ser = o.pop("series")
     if a.twin:
         tw = readCsv(a.twin + "_thrust.csv")
@@ -351,7 +352,7 @@ def cmdReport(a):
                          control_Cd_T0u=wd["Cd_T0u"] - Cd, twin_window=[tw["t"][i1], tw["t"][i2]],
                          twin_viscous_loss_Cd=Cd - 1, twin_viscous_loss_Cf=Cf - cfIdeal(g, m["epsE"]))
     if a.start:
-        s = gates(a.dir, a.start, a.sl1d, a.p1d, a.t1d, a.tt)
+        s = gates(a.dir, a.start, a.sl1d, a.p1d, a.t1d, a.tt, getattr(a, "from"))
         # The band: 2 x the primary's window span of the per-row series (mdotIn, CfBvac: _thrust.csv; S_c: _stats.csv).
         res = {}
         for k, v, sp in (("mdot", (o["window"]["mdotIn"], s["window"]["mdotIn"]), o["spans"]["mdotIn"]),
@@ -405,6 +406,9 @@ def main():
     r.add_argument("--p1d", type=float, required=True)
     r.add_argument("--t1d", type=float, required=True)
     r.add_argument("--tt", type=float, default=None)
+    # masterplan_combnozzle A23: the chamber ring (issues.md N14) has 20, 30, 15, 60 tau peaks; --from 20 at tt 80 is
+    # a 60-tau window, an integer number of each. Default tt/2 (the plan's [40, 80]).
+    r.add_argument("--from", type=float, default=None, help="window start (default tt/2)")
     r.add_argument("--twin", default=None)
     r.add_argument("--twin-window", type=float, default=30.0, help="the twin's window, t* before its end")
     r.add_argument("--start", default=None)

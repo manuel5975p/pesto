@@ -62,8 +62,8 @@ std::vector<FvRole> fvRoles(std::span<const FvBc> bc, const FaceMesh& fm);
 // The thrust row's six state rows: mass, the three momenta, E, the fuel's rho Y (0 without species).
 using FvRow6 = std::array<double, 6>;
 
-// The ledger per role (patches summed in patch order) on the six rows, and the omega integral.
-// fuelRow: the fuel's state row (5 + fuel), < 0 without species.
+// The ledger per role (patches summed in patch order) on the six rows, and the omega integral, each
+// patch read compensated (FvLedger::at, omegaSum). fuelRow: the fuel's state row (5 + fuel), < 0 without species.
 struct FvRoleSums
 {
     std::array<FvRow6, kFvRoles> I{};

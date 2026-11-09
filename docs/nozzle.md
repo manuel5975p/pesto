@@ -166,7 +166,10 @@ launch, no buffer, no file, `_stats.csv` byte for byte. `--checkpoint-dt`, `--re
 per patch and state row: `S_k = sum_f F_f` over the patch's materialized boundary faces (FP64, one block per patch,
 thread partials in ascending face order, a shared-memory tree; no atomics), and `sum_c V omega`. At the step's end,
 one thread: `I += (w0 S_0 + w1 S_1) + w2 S_2` with the weights the stage writes used (`fv_comp.hip` `step`):
-`w0 = w1 = cb2 (cb1 dtR)`, `w2 = R(cb2 dtR)`, `cb1 = 1/4`, `cb2 = R(2/3)`, `ca + cb = 1` exactly. So per row k
+`w0 = w1 = cb2 (cb1 dtR)`, `w2 = R(cb2 dtR)`, `cb1 = 1/4`, `cb2 = R(2/3)`, `ca + cb = 1` exactly. The add is
+compensated (`fvLedgerAdd`, Knuth's two-sum, issues.md N16): `I`, `Omega` stay the plain FP64 sums bit for bit, a low
+word carries each add's rounding, every read is `hi + lo` (`FvLedger::at`), so the ledger's own error is one rounding
+at any step count (`gpu_fv_nozzle_ledger` N16: 1e5 steps 3.9e-15 flat; the plain hi word 2.6e-13). So per row k
 
     P_k(t) - P_k(0) + sum_roles I_k = q Omega [E] - Omega [fuel]      to rounding, on any mesh
 
@@ -321,7 +324,7 @@ downstream, the flame stays 3.20 delta_D (2 delta_th) downstream to the end, and
 
 | gate | relation | measured (15 cells) | band |
 |---|---|---|---|
-| G4.1 | ledger res_k / (\|P_k\| + sum \|I_k\| (+ q\|Omega\|, \|Omega\|)), every row of 4212 | 8.7e-13 (grows with steps: 2.5e-13 at t 10; the start run 1.08e-12 at t 80) | 1e-12 |
+| G4.1 | ledger res_k / (\|P_k\| + sum \|I_k\| (+ q\|Omega\|, \|Omega\|)), every row of 4212 | 8.7e-13 (grows with steps: 2.5e-13 at t 10; the start run 1.08e-12 at t 80); 30 cells **3.51e-12 UNMET**: the FP64 state's rounding (+7e-15 res_mass per step at both h), not the ledger (compensated, P4b) | 1e-12 |
 | G4.1 ctrl | Omega dropped from the rho Y row | 0.45 | fails |
 | G4.2 | S_c (A_ref) vs the 1D S_L,num 0.9945059; delta S_fresh -5.9e-5 <= band/4: raw | 0.9944148: -9.1e-5 | 5e-4 |
 | G4.3 | x_f' (regression) vs u_u - S_c | -0.0040060 vs -0.0036810: 3.3e-4 (the 0.98 run: -0.10557 vs -0.10466, 9.1e-4) | 2e-3 S_L |
@@ -341,8 +344,27 @@ at Re* 736: Cd -9.24e-4, CfVac -2.94e-3 (physics: the nozzle Re in flame units i
 one-row v is NOT a rounding field: max |v|/c 6.9e-3 in the twin (the slip wall's least-squares gradient carries the
 normal stress into y); P_my/P_mx 8.7e-4 in the flame run. The ring: a persistent thermo-acoustic oscillation of the
 Total-fed choked chamber, u_u rms 1.0e-3 to 2.6e-3 and p0b rms 2.3e-5 to 4.6e-5 per 20 tau window, not growing over 80
-tau (issues.md N14); the gates read ledger window means. Cut (masterplan_combnozzle section 6 order): the eps_c 13.2 row,
-the gamma 1.2 row (G4.9), the reactingFoam scout (G4.10), the 30-cell rung (G4.6's "falling": UNMET by cut).
+tau (issues.md N14); the gates read ledger window means.
+
+**The 30-cell rung** (P4b, masterplan_combnozzle A24; `design --cells 30 --sl 0.9918456870897155`, eps_c 6.18958, 10307
+cells, 3.37e6 steps, 1398 s). The ring is the SAME at 30 cells (p0b rms 2.8e-5, peaks 20, 30, 15, 60 tau): a physical
+oscillation of the chamber, not the scheme's. So the window is fixed before the run to **[20, 80]** (60 tau, an integer
+number of each peak; `nozzle_react.py report --from 20`), the plan's [40, 80] beside it:
+
+| gate | 15 [20, 80] | 30 [20, 80] | 15 / 30 [40, 80] | band |
+|---|---|---|---|---|
+| G4.2 S_c - S_L,num | -9.32e-5 | -7.38e-5 | -9.11e-5 / -7.15e-5 | 5e-4 |
+| G4.3 | +6.6e-5 | +5.8e-5 | -3.25e-4 / -2.99e-4 | 2e-3 S_L |
+| G4.4 T0b | -1.46e-6 | -1.68e-6 | -9.2e-7 / -1.10e-6 | 1e-4 |
+| G4.5 CdB - Cd_twin | -9.91e-5 (marginal: the twin's own drift 1.7e-5) | twin cut (13 min GPU) | -1.10e-4 / cut | 1e-4 |
+| G4.6 p0b | +2.9e-7 | -1.2e-7 | +3.7e-6 / +3.3e-6 | 4.9e-4 |
+| G4.6 mdot | **-2.25e-4** | **-2.23e-4** | **-1.37e-4 / -1.41e-4** | 1e-4 |
+
+The flame half does not move with h (CdB 0.998976 -> 0.998977). G4.6's mdot does not fall (order ~0): the composition
+closes (the ledger's burn rate vs rho_u S_c A_c +7.5e-6), A19's drift storage `(rho_u - rho_b) A_c x_f'` over-states the
+ledger's exact chamber mass change by 6% at both rungs (issues.md N15). Cut: the eps_c 13.2 row, the gamma 1.2 row (G4.9;
+its dead "off >= 4%" control replaced by "CfBvac vs the gamma-1.4 oracle >= 1e-3", not run). The reactingFoam `transonic
+yes` scout (G4.10) did not settle in 5 CPU min (7.8 of 80 tau, mdotIn/Out 1.6% apart): stopped.
 
 ## Not built, refused
 

@@ -1095,7 +1095,8 @@ void FvRef::march(FvState& s, double dt, int steps, const FvState* src, FvLedger
     const FaceMesh& m = *fm_;
     assert(s.nV == nV_ && s.nC == m.nC && (!src || (src->nV == s.nV && src->nC == s.nC)));
     const int nVl = kFvMeanVars + cfg_.chem.nY, nP = int(m.patches.size());
-    assert(!ledger || (ledger->nV == nVl && ledger->nP == nP && !src && cfg_.rans.model == RansModel::None &&
+    assert(!ledger || (ledger->nV == nVl && ledger->nP == nP && ledger->lo.size() == ledger->I.size() && !src &&
+                       cfg_.rans.model == RansModel::None &&
                        std::ranges::all_of(cfg_.gravity, [](double g) { return g == 0.0; }) &&
                        std::ranges::all_of(cfg_.bodyForce, [](double g) { return g == 0.0; })));
     // The ledger's stage sums: [stage][patch][row], sum V omega per stage.
@@ -1124,8 +1125,9 @@ void FvRef::march(FvState& s, double dt, int steps, const FvState* src, FvLedger
     const double w01 = (2.0 / 3.0) * (0.25 * dt), w2 = (2.0 / 3.0) * dt;
     const auto ledgerStep = [&] {
         const std::size_t n = std::size_t(nP) * std::size_t(nVl);
-        for (std::size_t i = 0; i < n; ++i) ledger->I[i] += (w01 * ledS[i] + w01 * ledS[n + i]) + w2 * ledS[2 * n + i];
-        ledger->omega += (w01 * ledOm[0] + w01 * ledOm[1]) + w2 * ledOm[2];
+        for (std::size_t i = 0; i < n; ++i)
+            fvLedgerAdd(ledger->I[i], ledger->lo[i], (w01 * ledS[i] + w01 * ledS[n + i]) + w2 * ledS[2 * n + i]);
+        fvLedgerAdd(ledger->omega, ledger->omegaLo, (w01 * ledOm[0] + w01 * ledOm[1]) + w2 * ledOm[2]);
     };
     const std::size_t nC = std::size_t(m.nC), nB = std::size_t(m.nB), nF = std::size_t(m.nI) + nB;
     FvEval ev;

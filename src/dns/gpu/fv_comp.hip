@@ -1238,17 +1238,18 @@ __global__ void __launch_bounds__(kT) kFvLedgerOmega(int nC, const R* V, const R
 }
 
 // The step: I += (w0 S0 + w1 S1) + w2 S2 per patch and row; omega likewise from the partials summed in
-// ascending block order per stage. One thread.
+// ascending block order per stage. Compensated (fvLedgerAdd): I, om the plain sums bit for bit, lo, omLo
+// their low words. One thread.
 __global__ void kFvLedgerStep(int n, int nOm, const double* S, const double* part, double w0, double w1, double w2, double* I,
-                              double* om)
+                              double* lo, double* om, double* omLo)
 {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    for (int i = 0; i < n; ++i) I[i] += (w0 * S[i] + w1 * S[n + i]) + w2 * S[2 * n + i];
+    for (int i = 0; i < n; ++i) fvLedgerAdd(I[i], lo[i], (w0 * S[i] + w1 * S[n + i]) + w2 * S[2 * n + i]);
     if (nOm == 0) return;
     double o[3] = {0.0, 0.0, 0.0};
     for (int k = 0; k < 3; ++k)
         for (int b = 0; b < nOm; ++b) o[k] += part[k * nOm + b];
-    om[0] += (w0 * o[0] + w1 * o[1]) + w2 * o[2];
+    fvLedgerAdd(om[0], omLo[0], (w0 * o[0] + w1 * o[1]) + w2 * o[2]);
 }
 
 std::string hipErr(const char* what, hipError_t e)
@@ -1363,11 +1364,12 @@ struct FvCompImpl final : DeviceFvComp::Impl
     mutable ReduceScratch red;
     Gas<R> gas{};
     // [thrust]: the impulse ledger. seg: per patch its compact boundary range; S [3][nP][nV] the
-    // stage sums, part [3][nOm] the stage's V omega partials, I [nP][nV], om the integral.
+    // stage sums, part [3][nOm] the stage's V omega partials, I [nP][nV], om the integral; Lo their
+    // two-sum low words (fvLedgerAdd).
     bool ledgerOn = false, ledgerEq = false;
     int nOm = 0;
     DeviceBuffer<int> ledSeg;
-    DeviceBuffer<double> ledS, ledPart, ledI, ledOm;
+    DeviceBuffer<double> ledS, ledPart, ledI, ledLo, ledOm, ledOmLo;
 
     View<R> view() const
     {
@@ -1607,7 +1609,8 @@ struct FvCompImpl final : DeviceFvComp::Impl
         const double w01 = ledgerEq ? double(dtR) / 3.0 : double(cb2) * double(cb1 * dtR);
         const double w2 = ledgerEq ? double(dtR) / 3.0 : double(R(cb2 * dtR));
         const int n = int((ledSeg.size() - 1) * std::size_t(nV));
-        kFvLedgerStep<<<1, 1>>>(n, nOm, ledS.data(), ledPart.data(), w01, w01, w2, ledI.data(), ledOm.data());
+        kFvLedgerStep<<<1, 1>>>(n, nOm, ledS.data(), ledPart.data(), w01, w01, w2, ledI.data(), ledLo.data(), ledOm.data(),
+                                ledOmLo.data());
     }
 
     void step(double dt) override
@@ -1651,7 +1654,9 @@ struct FvCompImpl final : DeviceFvComp::Impl
         ledS = DeviceBuffer<double>();
         ledPart = DeviceBuffer<double>();
         ledI = DeviceBuffer<double>();
+        ledLo = DeviceBuffer<double>();
         ledOm = DeviceBuffer<double>();
+        ledOmLo = DeviceBuffer<double>();
         nOm = 0;
         if (!on) return {};
         if (hasG || force || rans) return std::unexpected("FV ledger: gravity, a body force or RANS adds sources that are no boundary flux");
@@ -1677,7 +1682,9 @@ struct FvCompImpl final : DeviceFvComp::Impl
         take(ledS, sized<double>(3 * n, "ledger"));
         take(ledPart, sized<double>(3 * std::size_t(std::max(nOm, 1)), "ledger"));
         take(ledI, uploaded(std::vector<double>(std::max<std::size_t>(n, 1), 0.0), "ledger"));
+        take(ledLo, uploaded(std::vector<double>(std::max<std::size_t>(n, 1), 0.0), "ledger"));
         take(ledOm, uploaded(std::vector<double>{0.0}, "ledger"));
+        take(ledOmLo, uploaded(std::vector<double>{0.0}, "ledger"));
         if (err) return std::unexpected(std::move(*err));
         ledgerEq = equalWeights;
         ledgerOn = true;
@@ -1689,9 +1696,12 @@ struct FvCompImpl final : DeviceFvComp::Impl
         if (!ledgerOn) return std::unexpected("FV ledger: off ([thrust] absent)");
         (void)hipDeviceSynchronize();
         FvLedger o = FvLedger::zeros(int(ledSeg.size() - 1), nV);
-        if (!o.I.empty())
+        if (!o.I.empty()) {
             if (const hipError_t e = ledI.download(o.I.data()); e != hipSuccess) return std::unexpected(hipErr("ledger", e));
+            if (const hipError_t e = ledLo.download(o.lo.data()); e != hipSuccess) return std::unexpected(hipErr("ledger", e));
+        }
         if (const hipError_t e = ledOm.download(&o.omega); e != hipSuccess) return std::unexpected(hipErr("ledger", e));
+        if (const hipError_t e = ledOmLo.download(&o.omegaLo); e != hipSuccess) return std::unexpected(hipErr("ledger", e));
         return o;
     }
 

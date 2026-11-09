@@ -111,16 +111,38 @@ struct FvShock
 // the RK3 stage writes used: w0 = w1 = cb2 (cb1 dt), w2 = R(cb2 dt) (exact Shu-Osher 1/6, 1/6,
 // 2/3 in exact arithmetic). omega: the same integral of sum_c V omega (the fuel's sink).
 // Identity per row k: sum_c V q_k(t) - sum_c V q_k(0) + sum_p I[p][k] = q omega [E] - omega [fuel],
-// to rounding, on any mesh.
+// to rounding, on any mesh. Compensated (issues.md N16): I, omega are the plain FP64 sums bit for bit,
+// lo, omegaLo the two-sum low words, so a read's error stays one rounding at any step count.
 struct FvLedger
 {
     int nV = 0, nP = 0;
-    std::vector<double> I; // [patch][nV], outward
+    std::vector<double> I; // [patch][nV], outward; the plain sum (hi word)
     double omega = 0;
+    std::vector<double> lo; // [patch][nV], I's low word
+    double omegaLo = 0;
 
-    static FvLedger zeros(int nP, int nV) { return {nV, nP, std::vector<double>(std::size_t(nP) * std::size_t(nV), 0.0), 0.0}; }
-    double at(int p, int v) const { return I[std::size_t(p) * std::size_t(nV) + std::size_t(v)]; }
+    static FvLedger zeros(int nP, int nV)
+    {
+        const std::size_t n = std::size_t(nP) * std::size_t(nV);
+        return {nV, nP, std::vector<double>(n, 0.0), 0.0, std::vector<double>(n, 0.0), 0.0};
+    }
+    // The compensated value hi + lo of patch p, row v.
+    double at(int p, int v) const
+    {
+        const std::size_t i = std::size_t(p) * std::size_t(nV) + std::size_t(v);
+        return I[i] + lo[i];
+    }
+    double omegaSum() const { return omega + omegaLo; }
 };
+
+// The ledger's add (Knuth's two-sum, no FMA): hi becomes the plain sum hi + v bit for bit, its rounding
+// error goes to lo. Host (FvRef) and device (DeviceFvComp) run this one expression.
+DNS_HD inline void fvLedgerAdd(double& hi, double& lo, double v)
+{
+    const double s = hi + v, bv = s - hi;
+    lo += (hi - (s - bv)) + (v - bv);
+    hi = s;
+}
 
 // A boundary table: rows (a row per patch first), and per boundary face its row.
 struct FvBcTable

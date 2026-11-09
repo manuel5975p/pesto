@@ -99,7 +99,7 @@ FvRoleSums fvRoleSums(const FvLedger& l, std::span<const FvRole> roles, int fuel
 {
     assert(std::size_t(l.nP) == roles.size());
     FvRoleSums o;
-    o.omega = l.omega;
+    o.omega = l.omegaSum();
     for (int p = 0; p < l.nP; ++p) {
         const FvRole r = roles[std::size_t(p)];
         if (r == FvRole::None) continue;

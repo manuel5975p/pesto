@@ -2679,8 +2679,9 @@ needed. Open:
   S_L, and the probe reads ~2e8. Over [2, 4] the flame is inside the guard and S_L 1.631 vs 1.010 (shift 0.62 vs the
   needed 1.8e-2). The force runs' late S_L is a probe artefact, not a speed.
 
-P4, the reacting quasi-1D nozzle (docs/nozzle.md "Reacting"; amendments A17-A22). G4.1-G4.4, G4.6 (p0b), G4.7, G4.8 PASS
-at 15 cells; every control fails as required. Open:
+P4, the reacting quasi-1D nozzle (docs/nozzle.md "Reacting"; amendments A17-A22, P4b A23-A26). G4.1-G4.4, G4.6 (p0b),
+G4.7, G4.8 PASS at 15 cells; at 30 cells G4.2-G4.4, G4.6 (p0b), G4.8 PASS, G4.1 and G4.6 (mdot) UNMET, G4.5 unevaluated
+(twin cut); every control run fails as required. Open:
 - N11. **Rig corrections forced by the plan's own rules and cost** (A17): Lcon 4 y* at eps_c 6.3 slopes to 64 deg and R8
   refuses 1400 one-row cells (the axis face's partner, the wall, at cos -0.43); eps_e 6.25 puts the viscous dt at 2.5e-5
   tau (rho_e 0.052 rho_0b): 3.1e6 steps per 80 tau, past the job cap. The rig is y* 50 delta_D, Lcon 6, Ldiv 4, eps_e 2.
@@ -2688,24 +2689,36 @@ at 15 cells; every control fails as required. Open:
 - N12. **The neutral flame drifts at sigma (u_d - S_c)** (A18): the throat holds the burnt volume flow. The plan's 0.98
   S_L design drifted -0.1056 S_L (8.4 delta_D in 80 tau, preheat into the reference slab); u_d = S_L,num: -0.0040.
   R5's "~0.02 S_L" sizing is wrong by sigma; the kinematic gate holds at both (G4.3).
-- N13. **G4.5 Cd UNMET**: CdB 0.9989657 vs the viscous twin 0.9990755, -1.10e-4 (band 1e-4); CfBvac -4.2e-5 passes.
-  Unseparated: the station's ring-weighted p0b (rms 2e-5 to 5e-5), the twin's Total face vs the flame's station, h (the
-  30-cell rung was cut). The viscous loss itself (twin - inviscid) is Cd -9.24e-4, CfVac -2.94e-3 at Re* 736.
-- N14. **The Total-fed choked chamber rings and does not settle**: u_u rms 1.0e-3 to 2.6e-3, p0b rms 2.3e-5 to 4.6e-5
-  per 20 tau window, alternating, not growing over 80 tau; mode not identified (no p frame on one row). The CLI twin
-  from rest rang +-1e-3 in Cd at 60-80 t* (A20); from the q1d IC it settles.
-- N15. **G4.6's mdot UNMET**: (mdotOut - rho_b x_f' A_c) vs rho_u S_c A_c -1.37e-4 (band 1e-4; the stationary form -9.4e-4).
-  The oracle was written for a stationary flame; the drift's regression slope and the window's chamber-mass change
-  carry 1e-4 here. "Falling with h" UNMET by cut (no 30-cell rung).
-- N16. **G4.1 grows with step count**: the uncompensated FP64 impulse I gives res/S 2.5e-13 at t 10, 8.7e-13 at t 80
-  (842 393 steps); the start run reaches 1.08e-12 over its last rows. A Kahan low word on I would hold 1e-12 at any
-  length (not built: the P2 kernel's bytes).
+- N13. **G4.5 Cd at the band** (P4b, A24): CdB - Cd_twin -1.10e-4 over the plan's [40, 80] (UNMET), -9.91e-5 over the
+  ring-cancelling [20, 80] fixed before the 30-cell run (inside 1e-4 by 9e-7, less than the twin's own unsettled drift
+  1.7e-5 between its [30, 40] and [60, 80] windows: not robust); CfBvac -6.9e-6 / -4.2e-5 passes. The flame half is
+  h-independent (CdB 0.998976 -> 0.998977 at 30 cells); the 30-cell twin was cut (~13 min GPU, viscous dt), so G4.5 at
+  30 is unevaluated. The viscous loss itself (twin - inviscid) is Cd -9.24e-4, CfVac -2.94e-3 at Re* 736.
+- N14. **The Total-fed choked chamber rings, h-independently**: u_u rms 1.0e-3 to 2.6e-3, p0b rms 2.8e-5, CdB per-row rms
+  2.1e-4, spectral peaks 20, 30, 15, 60 tau, IDENTICAL at 15 and 30 cells (P4b): a physical oscillation of the chamber
+  + nozzle, not a scheme ring; not growing over 80 tau; mode not identified (no p frame on one row). Window means of
+  40 tau carry its phase (+-1e-4 in Cd); 60-tau windows cancel its peaks. The CLI twin from rest rang +-1e-3 in Cd at
+  60-80 t* (A20); from the q1d IC it settles.
+- N15. **G4.6's mdot UNMET at 15 AND 30, does not fall** (P4b, A24): (mdotOut - rho_b x_f' A_c) vs rho_u S_c A_c -2.25e-4
+  / -2.23e-4 over [20, 80], -1.37e-4 / -1.41e-4 over [40, 80] (order ~0). The composition side closes (the ledger's burn
+  rate vs rho_u S_c A_c +7.5e-6); the gap is A19's drift storage model: the ledger's exact chamber mass change dM/dt
+  -0.0819 / -0.0845 vs (rho_u - rho_b) A_c x_f' -0.0870 / -0.0897 (6% over, 1.7e-4 of mdot), also with x_f' from the fuel
+  mass. Cause of the extra storage not identified (not the ring's phase: 60-tau windows).
+- N16. **Re-diagnosed (P4b, A23): the reacting G4.1 growth is the FP64 STATE's rounding, not the ledger.** The ledger is
+  now compensated (`fvLedgerAdd`, two-sum; `gpu_fv_nozzle_ledger` N16: 1e5 steps 3.9e-15 flat, the plain hi word
+  2.6e-13), and the reacting residual did not change (8.36e-14 / 8.38e-14 old / new at 31 639 steps): res_mass grows
+  +7.0e-15 per step at 15 cells and +7.2e-15 at 30, linear, one sign, independent of h and dt: each stage write rounds
+  the same way every step on a slowly drifting state. res/S' tends to that loss over |dI| per step (1/dt): 8.7e-13 at
+  15 (t 80), **3.51e-12 at 30: G4.1 UNMET at 30**. A fix needs a conservative FP64 state update (a compensated FP64
+  state, refused today): not built.
 - N17. **G4.7 partial**: the start perturbation is x_f + 2 delta_th (`--upstream 14`) only; "p0 IC + 1%" has no knob (none
   built for a test). The flame stays 3.20 delta_D downstream to the end; window mdot, CfBvac, S_c 4.4e-5, 2.2e-6, 3.8e-7.
 - N18. **The viscous one-row v is a field**, max |v|/c 6.9e-3 in the twin (P_my/P_mx 8.7e-4 in the flame run; the flame
   route outputs no v): the slip wall's least-squares gradient carries the normal stress into y. Quasi-1D only inviscid.
-- N19. **Cut** (masterplan_combnozzle section 6): the eps_c 13.2 row, the gamma 1.2 row (G4.9; its control "off >= 4%" was
-  eps_e 6.25's, 0.56% at eps_e 2), the reactingFoam `transonic` scout (G4.10), the 30-cell rung.
+- N19. **Cut** (masterplan_combnozzle section 6; P4b A25): the eps_c 13.2 row and the gamma 1.2 row (G4.9) by GPU budget;
+  G4.9's dead control ("off >= 4%": 0.56% at eps_e 2) replaced once by "CfBvac vs the gamma-1.4 closed oracle misses by
+  >= 1e-3" (expected 8.1e-3), not run. The reactingFoam `transonic yes` scout (G4.10) ran 5 CPU min and did NOT settle:
+  t 7.8 of 80 tau, mdotIn 31.13 vs mdotOut 30.64 (1.6% transient); stopped. The 30-cell rung ran (A24).
 
 ## Older open items (details in CLAUDE.md)
 

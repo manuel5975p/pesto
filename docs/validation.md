@@ -492,10 +492,11 @@ Device, FP64 unless named, gfx1100. `gpu_fv_nozzle_MODE`, `fvref_MODE`. Foam is 
 | G2.8 | `gpu_fv_nozzle_fixed` | T1 nozzle_QA (one row) 4.9e-14, mdot 3.1e-15 |
 | unlined | `fvshock_unlined` | 0 on every hex, snappy, prism75, tet75, tetdual; 1 of 1 on a regular tet (refused) |
 | react design | `fvref_react` | fvReactingNozzleDesign vs nozzle_react.py 0.0 (gamma 1.4, 1.2); T0b = T0u + 4 Tu 2.3e-16; IC isentropic 1e-15 |
-| G4.1 | `gpu_fv_nozzle_react` (tt 3), the 15-cell run (tt 80) | reacting ledger 1.5e-13 (tt 3), 8.7e-13 (842 393 steps) |
-| G4.4 | the 15-cell run, [40, 80] tau | T0b vs T0u + (sigma - 1) Tu -9.2e-7; fuelOut/burnIn 0.0 |
-| G4.5 | `gpu_fv_nozzle_reacttwin` | CdB - Cd_twin -1.10e-4 (UNMET, band 1e-4); CfBvac - CfVac_twin -4.2e-5; inviscid twin CfVac - 1.4576001 -5.1e-7 |
-| G4.6 | the 15-cell run | p0b/p0u - 1 -4.91166e-3 vs oracle -4.91536e-3; mdot (flame frame) -1.37e-4 (UNMET, band 1e-4) |
+| N16 | `gpu_fv_nozzle_ledger` (q1d 200, 1e5 steps) | compensated ledger 3.9e-15 flat; the plain hi word 2.6e-13 |
+| G4.1 | `gpu_fv_nozzle_react` (tt 3), the 15- / 30-cell runs (tt 80) | reacting ledger 1.5e-13 (tt 3), 8.7e-13 (842 393 steps), 3.51e-12 at 30 (UNMET: FP64 state rounding, issues N16) |
+| G4.4 | the 15- / 30-cell runs, [20, 80] tau | T0b vs T0u + (sigma - 1) Tu -1.46e-6 / -1.68e-6; fuelOut/burnIn 0.0 |
+| G4.5 | `gpu_fv_nozzle_reacttwin` | CdB - Cd_twin -1.10e-4 [40, 80] (UNMET), -9.91e-5 [20, 80] (marginal); CfBvac - CfVac_twin -4.2e-5 / -6.9e-6; inviscid twin CfVac - 1.4576001 -5.1e-7; 30-cell twin cut |
+| G4.6 | the 15- / 30-cell runs, [20, 80] | p0b/p0u - 1 vs oracle +2.9e-7 / -1.2e-7; mdot (flame frame) -2.25e-4 / -2.23e-4 (UNMET, band 1e-4, does not fall) |
 
 ### 0D reactor (`fvref_reactor`, `gpu_fv_flame_reactor`; docs/chem.md "P0: the 0D reactor")
 

@@ -1662,6 +1662,58 @@ void ledgerGate()
     }
 }
 
+// N16 (masterplan_combnozzle A23): the compensated ledger's residual does not grow with the step count. One-row
+// parabola, q1d IC, total + riemann p_b 0.1, FP64, hll, 100 000 steps at the IC's 0.95 stableDt; checks at 1e3, 1e4,
+// 1e5 steps. The plain sum (the hi word alone: the pre-N16 ledger bit for bit) is the control.
+//   gate     compensated max_k |res_k| / S_k <= 1e-14 at every check, last / first <= 4
+//   control  plain at 1e5 >= 10 x compensated at 1e5 (the uncompensated growth)
+void ledgerLong()
+{
+    std::printf("N16 the compensated ledger: q1d 200 parabola, 100000 steps, FP64, hll\n");
+    const Gen g = gen("llong", 200, 1, "--contour parabola --mode planar --exit riemann --pb 0.1");
+    const Rows rows{.pb = 0.1 * kP0, .exit = FvExit::Riemann};
+    FvCompConfig cfg = cfgOf(g.fm, rows, Run{});
+    auto d = orDie(DeviceFvComp::make(g.fm, cfg), "llong");
+    orDie(d.upload(q1dIc(g, kGam)), "llong");
+    orDie(d.setLedger(true), "ledger");
+    const std::vector<FvRole> roles = fvRoles(cfg.bc, g.fm);
+    FvState s0;
+    orDie(d.download(s0), "s0");
+    const FvRow6 P0 = fvTotals6(g.fm, s0, -1);
+    const double dt = 0.95 * orDie(d.stableDt({.cfl = 0.4}), "dt");
+    const auto worst = [&](const FvLedger& l, const FvState& s) {
+        const FvRoleSums r = fvRoleSums(l, roles, -1);
+        const FvRow6 P = fvTotals6(g.fm, s, -1);
+        double w = 0;
+        for (int v = 0; v < 5; ++v) {
+            double res = P[std::size_t(v)] - P0[std::size_t(v)];
+            for (const FvRow6& o : r.I) res += o[std::size_t(v)];
+            const double S = bandScale(g.fm, s, r, v);
+            if (S > 0.0) w = std::max(w, std::abs(res) / S);
+        }
+        return w;
+    };
+    std::vector<double> comp, plain;
+    long n = 0;
+    for (const long target : {1000L, 10000L, 100000L}) {
+        for (; n < target; ++n) d.step(dt);
+        FvState s;
+        orDie(d.download(s), "s");
+        FvLedger l = orDie(d.ledger(), "ledger");
+        comp.push_back(worst(l, s));
+        std::ranges::fill(l.lo, 0.0);
+        l.omegaLo = 0.0;
+        plain.push_back(worst(l, s));
+        std::printf("  %6ld steps: max |res_k| / S_k compensated %.2e, plain (hi only) %.2e\n", n, comp.back(), plain.back());
+    }
+    const double cmax = *std::ranges::max_element(comp);
+    check(cmax <= 1e-14, std::format("N16: compensated ledger identity {:.2e} <= 1e-14 at every check", cmax));
+    check(comp.back() <= 4.0 * std::max(comp.front(), 1e-17),
+          std::format("N16: compensated flat, 1e5 / 1e3 steps {:.2e} / {:.2e} <= 4", comp.back(), comp.front()));
+    check(plain.back() >= 10.0 * comp.back(),
+          std::format("N16 control: the plain sum grows ({:.2e} >= 10 x {:.2e})", plain.back(), comp.back()));
+}
+
 // G2.10 and the CLI's file rules: nozzle_A 80x16 through dns flow with [thrust].
 void thrustCli()
 {
@@ -1825,6 +1877,23 @@ void reactTwin()
     check(std::abs(cdU - v.Cd) >= 0.1, "G4.5 control: Cd on T0u misses by >= 0.1");
 }
 
+// The viscous twin of any rung (masterplan_combnozzle A23; no gate, the numbers for nozzle_react.py report):
+// reacttwin NX EPS_C RE_STAR PA T_STAR. The 15-cell twin is NX 4680 EPS_C 6.172901800721939 RE_STAR 736.2624872413062
+// PA 0.010037095719382376; the window is q1dRun's last quarter of T_STAR.
+void reactTwinAt(int nx, double epsC, double reStar, double pa, double tStar)
+{
+    std::printf("twin: react lc 0, eps_c %.16g, eps_e 2, %d cells, Re* %.16g, pa %.16g, q1d IC, FP64, hll, tt %g t*\n", epsC, nx, reStar, pa, tStar);
+    const Gen g = gen("rtw" + std::to_string(nx), nx, 1,
+                      std::format("--contour react --lc 0 --lcon 6 --ldiv 4 --eps-c {} --eps-e 2 --scale 1 --mode planar --exit riemann --pb {}",
+                                  epsC, pa));
+    const Rows rows{.pb = pa * kP0, .exit = FvExit::Riemann};
+    const double rho0 = kP0 / (287.1 * kT0), mu = rho0 * kC0 * 1.0 / reStar;
+    const Q1d v = q1dRun(g, rows, Run{.mu = mu}, tStar, true);
+    std::printf("  viscous: %ld steps %s; Cd %.10f CfVac %.10f; max |v|/c %.2e; window [%g, %g] t*\n", v.steps, v.err.c_str(), v.Cd, v.CfVac,
+                v.vMax, 0.75 * tStar, tStar);
+    check(v.err.empty() && v.steps > 2000, "twin live");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1857,9 +1926,12 @@ int main(int argc, char** argv)
     else if (m == "ambient") ambient();
     else if (m == "twin") twin();
     else if (m == "react") reactRun();
+    else if (m == "reacttwin" && argc == 7)
+        reactTwinAt(std::atoi(argv[2]), std::atof(argv[3]), std::atof(argv[4]), std::atof(argv[5]), std::atof(argv[6]));
     else if (m == "reacttwin") reactTwin();
     else if (m == "ledger") {
         ledgerGate();
+        ledgerLong();
         thrustCli();
     } else {
         std::printf("unknown mode\n");
