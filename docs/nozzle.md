@@ -301,9 +301,16 @@ the last bit on the rig, `fvref_react` R1):
 `q` is the SOLVER's `cp (sigma - 1) Tu` on the box's static `Tu`, so `T0b = T0u + (sigma - 1) Tu` exactly, never
 `sigma T0u` (2.8e-4 off at M_u 0.042). Inputs: the Total row, `[nozzle] astar`, `eps_c = A_ref/astar` off the chamber probe,
 `eps_e = sum_exit S.a/astar`, gamma, cp. Errors (exit 3): no throat (`eps_c <= 1`), no choke root, a thermally choked
-chamber. The IC (`fvReactingNozzleIC`): the chamber slabs fresh -> burnt along `premixedPoint` at the design's `m` with the
-flame at `--upstream` from the inlet; every later slab burnt and isentropic at `(p0b, T0b)`, subsonic to the least-area
-slab, supersonic past it (`fvref_react` R4: T0 and entropy per cell to 1e-15). `--inflow-speed` with `[nozzle]`: exit 2
+chamber. The IC (`fvReactingNozzleIC`, masterplan_combclose 2.1): the chamber slabs fresh -> burnt on the **Rayleigh line**
+of the design's `(m, P, H)`: `p + m u` and `cp T + u^2/2 + q (1 - Y)` conserved (`fvRayleighBurnt` at `q (1 - Y)`), Y =
+`(sigma - t)/(sigma - 1)` of the oracle profile with the flame at `--upstream` from the inlet; Y 0 is the design's burnt
+state bit for bit (`FvReactingDesign` echoes g, R, cp, q). Every later slab burnt and isentropic at `(p0b, T0b)`,
+subsonic to the least-area slab (`fvThroatBin`), supersonic past it (`fvref_react` R4: T0 and entropy per cell to 1e-15;
+R5: every chamber cell on the line to 4e-16, T0 continuous into the contraction). Not `premixedPoint` (low-Mach in
+energy, T = sigma Tu): its burnt chamber sat +1.7094e-3 over T0b, an entropy slug that crossed the throat at t_e ~ 40 tau
+inside every gate window (issues.md N13, N15). The oracle table ends at Y 1e-9 (sigma - 4e-9), so the burnt chamber
+carries Y 1e-9 (T0 8.0e-10 under T0b, cp T0 + q Y continuous to 2e-16); G4.12a reads the station's first row 2.7e-10 off
+T0b (`gpu_fv_nozzle_react`). `--inflow-speed` with `[nozzle]`: exit 2
 (`--inflow-speed: the throat sets the fresh velocity on a [nozzle] run`). The probe reads A_ref and the chamber bins
 (docs/fvcomp.md "Stats"); `_thrust.csv` appends the burnt station's `p0b T0b CdB CfBvac CfB` ("Thrust").
 

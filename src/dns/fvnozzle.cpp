@@ -1,7 +1,5 @@
 #include "dns/fvnozzle.hpp"
 
-#include "dns/flame1d.hpp"
-
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -318,6 +316,10 @@ std::expected<FvReactingDesign, std::string> fvReactingNozzleDesign(double gamma
     if (!(epsE >= 1.0)) return std::unexpected(std::format("reacting nozzle: exit area ratio {} < 1", epsE));
     if (!(epsC > 1.0)) return std::unexpected(std::format("reacting nozzle: chamber area / A* = {:.6g}: no throat", epsC));
     FvReactingDesign d;
+    d.g = g;
+    d.R = R;
+    d.cp = cp;
+    d.q = q;
     d.Gamma = std::sqrt(g) * std::pow(2 / (g + 1), (g + 1) / (2 * (g - 1)));
     const auto at = [&](double Mu) {
         FvReactingDesign o = d;
@@ -356,26 +358,25 @@ FvState fvReactingNozzleIC(const FaceMesh& fm, const FvFlameProbe& probe, const 
 {
     const FvFlameSpec& sp = probe.spec();
     assert(sp.chamber && astar > 0.0);
-    const int nB = probe.bins(), nCh = probe.chamberBins();
-    const double h = probe.slab(), g = sp.gamma, R = sp.Rgas;
-    std::vector<double> A(std::size_t(nB), 0.0);
-    for (int c = 0; c < fm.nC; ++c) A[std::size_t(probe.binOf(c))] += fm.V[std::size_t(c)] / h;
-    // The throat: the least-area non-empty slab past the chamber.
-    int throat = nCh;
-    for (int b = nCh; b < nB; ++b)
-        if (A[std::size_t(b)] > 0.0 && (A[std::size_t(throat)] <= 0.0 || A[std::size_t(b)] < A[std::size_t(throat)])) throat = b;
+    const int nCh = probe.chamberBins();
+    const double g = sp.gamma, R = sp.Rgas;
+    const std::vector<double> A = fvBinAreas(fm, probe);
+    const int throat = fvThroatBin(A, nCh);
     FvState q = FvState::zeros(fm.nC, kFvMeanVars + 1);
     for (int c = 0; c < fm.nC; ++c) {
         const std::size_t i = std::size_t(c);
         const int b = probe.binOf(c);
         double rho = 0, u = 0, E = 0, Y = 0;
         if (b < nCh) {
+            // The Rayleigh line of the design's (m, P, H) at the profile's Y (masterplan_combclose 2.1): never
+            // premixedPoint's low-Mach T = sigma Tu (+1.71e-3 in T0, an entropy slug through the throat).
             const double s = fm.C[0][i] * sp.dir[0] + fm.C[1][i] * sp.dir[1] + fm.C[2][i] * sp.dir[2] - probe.lo();
-            const PremixedPoint p = premixedPoint(g, sp.Tu, sp.sigma, d.m, t(s - xf));
-            rho = p.rho;
-            u = p.u;
-            E = p.E;
-            Y = p.Y;
+            const double tt = t(s - xf);
+            Y = (sp.sigma - tt) / (sp.sigma - 1);
+            const FvBurnt r = fvRayleighBurnt(d.g, d.R, d.cp, d.q * (1 - Y), d.Tu, d.pu, d.uu);
+            rho = r.pb / (R * r.Tb);
+            u = r.ub;
+            E = r.pb / (g - 1) + 0.5 * rho * u * u;
         } else {
             const double M = fvAreaMach(A[std::size_t(b)] / astar, g, b > throat);
             const double T = d.b.T0b / (1 + (g - 1) / 2 * M * M), p = d.b.p0b * std::pow(T / d.b.T0b, g / (g - 1));
@@ -389,6 +390,23 @@ FvState fvReactingNozzleIC(const FaceMesh& fm, const FvFlameProbe& probe, const 
         q.var(kFvMeanVars + sp.fuel)[i] = rho * Y;
     }
     return q;
+}
+
+std::vector<double> fvBinAreas(const FaceMesh& fm, const FvFlameProbe& probe)
+{
+    const double h = probe.slab();
+    std::vector<double> A(std::size_t(probe.bins()), 0.0);
+    for (int c = 0; c < fm.nC; ++c) A[std::size_t(probe.binOf(c))] += fm.V[std::size_t(c)] / h;
+    return A;
+}
+
+int fvThroatBin(std::span<const double> A, int nCh)
+{
+    assert(nCh >= 0 && std::size_t(nCh) < A.size());
+    int throat = nCh;
+    for (int b = nCh; b < int(A.size()); ++b)
+        if (A[std::size_t(b)] > 0.0 && (A[std::size_t(throat)] <= 0.0 || A[std::size_t(b)] < A[std::size_t(throat)])) throat = b;
+    return throat;
 }
 
 } // namespace dns

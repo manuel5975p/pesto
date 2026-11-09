@@ -2704,6 +2704,11 @@ G4.7, G4.8 PASS at 15 cells; at 30 cells G4.2-G4.4, G4.6 (p0b), G4.8 PASS, G4.1 
   rate vs rho_u S_c A_c +7.5e-6); the gap is A19's drift storage model: the ledger's exact chamber mass change dM/dt
   -0.0819 / -0.0845 vs (rho_u - rho_b) A_c x_f' -0.0870 / -0.0897 (6% over, 1.7e-4 of mdot), also with x_f' from the fuel
   mass. Cause of the extra storage not identified (not the ring's phase: 60-tau windows).
+  **Cause found (combclose):** the IC. `fvReactingNozzleIC` laid the chamber with `premixedPoint` (low-Mach in energy:
+  burnt T0 +1.7094e-3 over T0b); that entropy slug crosses the throat at t_e 40.2 tau, inside [20, 80] and [40, 80]
+  (mdotOut dip -7.0e-4, the ring re-excited), and its leaving density deficit is the "extra storage". Fixed in K2 (the
+  chamber on the Rayleigh line, `fvref_react` R5, G4.12a 2.7e-10 on the first row); the gated rerun is K5. Same cause
+  for N13's Cd.
 - N16. **Re-diagnosed (P4b, A23): the reacting G4.1 growth is the FP64 STATE's rounding, not the ledger.** The ledger is
   now compensated (`fvLedgerAdd`, two-sum; `gpu_fv_nozzle_ledger` N16: 1e5 steps 3.9e-15 flat, the plain hi word
   2.6e-13), and the reacting residual did not change (8.36e-14 / 8.38e-14 old / new at 31 639 steps): res_mass grows

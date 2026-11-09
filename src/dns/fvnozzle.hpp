@@ -138,7 +138,7 @@ FvStation fvStation(const FaceMesh& fm, const FvState& s, const std::array<doubl
 
 // The constant-area deflagration of a fresh state (Tu, pu, uu): complete burn of q, exact Rayleigh-Hugoniot
 // (p + m u, cp T + u^2/2 + q conserved), the subsonic root by bisection on u_b in [u_u, (P/m) gamma/(gamma+1)];
-// stagnation T0b, p0b of the burnt gas. Pre: all > 0.
+// stagnation T0b, p0b of the burnt gas. q: the heat released (q (1 - Y) for a partial burn). Pre: Tu, pu, uu > 0.
 struct FvBurnt
 {
     double ub = 0, pb = 0, Tb = 0, Mb = 0, T0b = 0, p0b = 0;
@@ -150,9 +150,10 @@ FvBurnt fvRayleighBurnt(double gamma, double Rgas, double cp, double q, double T
 // 0.3]) and expanded isentropically to eps_e (the supersonic root). q: the SOLVER's heat release, cp (sigma - 1)
 // Tu with Tu the box's static fresh T (never one normalised on T0u). CFvac on p0b, A*. sigma only feeds the
 // low-Mach estimate MuLowM = Gamma / (sqrt(gamma sigma) eps_c). Error: eps_c <= 1 (no throat), no choke root in the
-// bracket, a thermally choked chamber (M_b >= 1), eps_e < 1.
+// bracket, a thermally choked chamber (M_b >= 1), eps_e < 1. g, R, cp, q echo the inputs (the IC's Rayleigh line).
 struct FvReactingDesign
 {
+    double g = 0, R = 0, cp = 0, q = 0;
     double Gamma = 0, Mu = 0, Tu = 0, pu = 0, rhou = 0, uu = 0, m = 0;
     FvBurnt b{};
     double Me = 0, peOverP0b = 0, CFvac = 0, MuLowM = 0;
@@ -164,12 +165,20 @@ std::expected<FvReactingDesign, std::string> fvReactingNozzleDesign(double gamma
 // The supersonic (sup) or subsonic Mach number of area ratio ar >= 1 (bisection; ar <= 1 gives 1).
 double fvAreaMach(double ar, double gamma, bool sup);
 
-// The reacting nozzle's IC (masterplan_combnozzle P4): per slab of a chamber probe its area A = V_slab/h; the
-// chamber bins fresh -> burnt along premixedPoint(gamma, Tu, sigma, d.m, t(s - xf)) (t the flame's T/Tu profile,
-// s from the probe's low end); every later slab burnt and isentropic at (d.b.p0b, d.b.T0b), subsonic up to the
-// least-area slab, supersonic past it, M of A/astar. Y 0 there. Pre: probe.spec().chamber, d from
-// fvReactingNozzleDesign.
+// The reacting nozzle's IC (masterplan_combnozzle P4, masterplan_combclose 2.1): per slab of a chamber probe its
+// area A = V_slab/h; the chamber bins on the Rayleigh line of the design's (m, P, H): p + m u and cp T + u^2/2 +
+// q (1 - Y) conserved (fvRayleighBurnt at q (1 - Y)), Y = (sigma - t)/(sigma - 1) from the flame's T/Tu profile
+// t(s - xf) (s from the probe's low end); Y 0 is d.b. Every later slab burnt and isentropic at (d.b.p0b, d.b.T0b),
+// subsonic up to the least-area slab (fvThroatBin), supersonic past it, M of A/astar, Y 0. Pre: probe.spec().chamber,
+// d from fvReactingNozzleDesign.
 FvState fvReactingNozzleIC(const FaceMesh& fm, const FvFlameProbe& probe, const FvReactingDesign& d,
                            const std::function<double(double)>& t, double xf, double astar);
+
+// Per probe bin its area V_bin/h (cells summed in ascending order): the IC's slab areas.
+std::vector<double> fvBinAreas(const FaceMesh& fm, const FvFlameProbe& probe);
+
+// The throat bin: the least-area non-empty bin at or past nCh (the first on a tie); nCh if none is non-empty.
+// Pre: nCh < A.size().
+int fvThroatBin(std::span<const double> A, int nCh);
 
 } // namespace dns

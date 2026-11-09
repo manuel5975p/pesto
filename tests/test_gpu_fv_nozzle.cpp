@@ -1782,6 +1782,7 @@ void thrustCli()
 //   G4.1  every _thrust.csv row: |res_k| <= 1e-12 (|P_k| + sum |I_k| (+ q |Omega|, |Omega|)); control: Omega dropped
 //         from the rho Y row fails by >= 1e-6
 //   G4.8  shockCells 0 on every row
+//   G4.12a (masterplan_combclose) the first row's station T0b on the design's to 1e-6 (the Rayleigh-line chamber IC)
 //   route the station columns present and finite, exitSuper 1, the drift guard silent; S_L on A_ref within 1% of the
 //         1D S_L,num (the reduced tt reads the IC's start, not a gate); --inflow-speed exit 2
 void reactRun()
@@ -1834,6 +1835,11 @@ void reactRun()
     std::printf("  last row: CdB %.6f, T0b / Tu %.8f, S_L %.6f (1D 0.9945059), exitSuper %.3f\n", cdb.back(), T0b.back() / Tu, sl.back(),
                 sup.back());
     check(finite, "route: the station columns p0b T0b CdB CfBvac CfB on every row, finite");
+    // G4.12(a) (masterplan_combclose 2.5): the chamber IC on the Rayleigh line puts the station's first row at the
+    // design's T0b (fvref_react R1: 2024.7606632703096); premixedPoint's low-Mach IC read +1.709e-3 there.
+    const double t0bDesign = 2024.7606632703096, g412a = T0b.front() / t0bDesign - 1;
+    std::printf("  G4.12a first row (t %.4f): T0b / T0b_design - 1 %+.3e (old premixedPoint IC +1.709e-3)\n", t.front(), g412a);
+    check(std::abs(g412a) <= 1e-6, std::format("G4.12a: first-row T0b on the design's {:+.2e} <= 1e-6", g412a));
     check(std::ranges::all_of(sup, [](double x) { return x == 1.0; }), "route: exitSuper 1 on every row");
     check(std::abs(sl.back() / 0.9945059 - 1) <= 0.01, "route: S_L on A_ref within 1% of the 1D S_L,num (start, not a gate)");
     const int r2 = runDns(base + std::format(" --tt 3 --inflow-speed 0.98 --dry-run --out {}", o.string()), o.string() + "_is.log");
