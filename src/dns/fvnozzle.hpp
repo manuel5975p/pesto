@@ -4,11 +4,15 @@
 #pragma once
 
 #include "dns/facemesh.hpp"
+#include "dns/fvflame.hpp"
 #include "dns/fvflux.hpp"
 #include "dns/fvref.hpp"
 
 #include <array>
+#include <cmath>
 #include <cstdint>
+#include <expected>
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
@@ -71,11 +75,13 @@ FvRoleSums fvRoleSums(const FvLedger& l, std::span<const FvRole> roles, int fuel
 FvRow6 fvTotals6(const FaceMesh& fm, const FvState& s, int fuelRow);
 
 // The constants of a thrust row: axis a (unit), ambient pa, the Total row's p0, t0 (box units), the
-// throat area astar, the heat release q (0 inert), the gas, exitArea = sum_exit S.a.
+// throat area astar, the heat release q (0 inert), the gas, exitArea = sum_exit S.a. station: the
+// reacting nozzle's burnt stagnation plane along a (fvStation; NaN: no station columns).
 struct FvThrustCase
 {
     std::array<double, 3> axis{1, 0, 0};
     double pa = 0, p0 = 0, t0 = 0, astar = 0, q = 0, gamma = 1.4, Rgas = 1, exitArea = 0;
+    double station = NAN;
 };
 
 // sum_exit S.a over the active Outflow faces. Pre: roles = fvRoles of fm.
@@ -101,11 +107,15 @@ struct FvThrustWindow
 };
 FvThrustWindow fvThrustWindow(const FvRoleSums& a, double t1, const FvRoleSums& b, double t2, const FvThrustCase& k);
 
+struct FvStation;
+
 // _thrust.csv: the header and one row (R2's columns). res_k = P_k - P0_k + sum_roles I_k - q omega [E]
-// + omega [fuel]: 0 to rounding.
-std::vector<std::string> fvThrustColumns();
+// + omega [fuel]: 0 to rounding. station (the reacting nozzle's): p0b T0b CdB CfBvac CfB appended, Cd and
+// Cf on the burnt station's (p0b, T0b) with the window's mdotOut, Tvac. Pre: b non-null iff station.
+std::vector<std::string> fvThrustColumns(bool station = false);
 std::vector<double> fvThrustRow(double t, long step, double dt, const FvRow6& P, const FvRow6& P0, const FvRoleSums& now,
-                                const FvThrustWindow& w, const FvExitSample& x, const FvThrustCase& k);
+                                const FvThrustWindow& w, const FvExitSample& x, const FvThrustCase& k,
+                                const FvStation* b = nullptr);
 
 // The exit plane's Mach number from window-mean fluxes per area: f1 mass, f2 momentum + pressure along
 // the normal, f3 energy (the quasi-1D state the conserved fluxes carry). supersonic picks the root.
@@ -123,5 +133,43 @@ struct FvStation
 };
 FvStation fvStation(const FaceMesh& fm, const FvState& s, const std::array<double, 3>& axis, double station, double gamma,
                     double Rgas);
+
+// --- The reacting quasi-1D nozzle (docs/nozzle.md "Reacting", masterplan_combnozzle 2.1, R5) ---
+
+// The constant-area deflagration of a fresh state (Tu, pu, uu): complete burn of q, exact Rayleigh-Hugoniot
+// (p + m u, cp T + u^2/2 + q conserved), the subsonic root by bisection on u_b in [u_u, (P/m) gamma/(gamma+1)];
+// stagnation T0b, p0b of the burnt gas. Pre: all > 0.
+struct FvBurnt
+{
+    double ub = 0, pb = 0, Tb = 0, Mb = 0, T0b = 0, p0b = 0;
+};
+FvBurnt fvRayleighBurnt(double gamma, double Rgas, double cp, double q, double Tu, double pu, double uu);
+
+// The composition oracle (masterplan_combnozzle 2.1): Total (p0u, T0u) fresh gas, a planar flame in a chamber
+// of area eps_c A*, the burnt gas choked at A* (m eps_c = Gamma p0b / sqrt(R T0b), bisection on M_u in [1e-6,
+// 0.3]) and expanded isentropically to eps_e (the supersonic root). q: the SOLVER's heat release, cp (sigma - 1)
+// Tu with Tu the box's static fresh T (never one normalised on T0u). CFvac on p0b, A*. sigma only feeds the
+// low-Mach estimate MuLowM = Gamma / (sqrt(gamma sigma) eps_c). Error: eps_c <= 1 (no throat), no choke root in the
+// bracket, a thermally choked chamber (M_b >= 1), eps_e < 1.
+struct FvReactingDesign
+{
+    double Gamma = 0, Mu = 0, Tu = 0, pu = 0, rhou = 0, uu = 0, m = 0;
+    FvBurnt b{};
+    double Me = 0, peOverP0b = 0, CFvac = 0, MuLowM = 0;
+};
+std::expected<FvReactingDesign, std::string> fvReactingNozzleDesign(double gamma, double Rgas, double cp, double q,
+                                                                    double sigma, double epsC, double epsE, double p0u,
+                                                                    double T0u);
+
+// The supersonic (sup) or subsonic Mach number of area ratio ar >= 1 (bisection; ar <= 1 gives 1).
+double fvAreaMach(double ar, double gamma, bool sup);
+
+// The reacting nozzle's IC (masterplan_combnozzle P4): per slab of a chamber probe its area A = V_slab/h; the
+// chamber bins fresh -> burnt along premixedPoint(gamma, Tu, sigma, d.m, t(s - xf)) (t the flame's T/Tu profile,
+// s from the probe's low end); every later slab burnt and isentropic at (d.b.p0b, d.b.T0b), subsonic up to the
+// least-area slab, supersonic past it, M of A/astar. Y 0 there. Pre: probe.spec().chamber, d from
+// fvReactingNozzleDesign.
+FvState fvReactingNozzleIC(const FaceMesh& fm, const FvFlameProbe& probe, const FvReactingDesign& d,
+                           const std::function<double(double)>& t, double xf, double astar);
 
 } // namespace dns

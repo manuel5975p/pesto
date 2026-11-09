@@ -157,8 +157,8 @@ face passes. The nozzle itself, mostly cold, 0.142.
 
 ## Thrust
 
-`[thrust]` in `--bc` (`pa`, required, >= 0, a ratio as `[nozzle] p`; `station`: `dns flame` only, P4; needs
-`[nozzle]`) turns on the impulse ledger and writes `PREFIX_thrust.csv`, 17 digits, one row per stats row. Absent: no
+`[thrust]` in `--bc` (`pa`, required, >= 0, a ratio as `[nozzle] p`; `station`: `dns flame` only, required there,
+the burnt stagnation plane along the axis; needs `[nozzle]`) turns on the impulse ledger and writes `PREFIX_thrust.csv`, 17 digits, one row per stats row. Absent: no
 launch, no buffer, no file, `_stats.csv` byte for byte. `--checkpoint-dt`, `--restart`, `--wall-limit` with it: exit 2
 (the ledger is not checkpointed).
 
@@ -181,6 +181,12 @@ left side minus its right), then `Fmom Fpres Texit Twall exitSuper mdotIn mdotOu
     window  Tvac = Delta I_exit.a / Delta t         since the previous row: sample-free
     CfVac = Tvac/(p0 A*), Cf = (Tvac - pa sum_exit S.a)/(p0 A*), cstar = p0 A*/mdotOut, mdotIn/Out window means
     Fmom = sum_exit mdot_f (u_B.a), Fpres = sum_exit (p_B - pa) S.a; exitSuper = exit area fraction u_B.n >= c_B
+
+With `station` (the reacting nozzle, masterplan_combnozzle 2.3) the row appends `p0b T0b CdB CfBvac CfB`: over the
+internal faces whose owner and neighbour centroids straddle the station, the face state is the mean of the two cells'
+primitives, `T0 = T + |u|^2/(2 cp)`, `p0 = p (T0/T)^(gamma/(gamma - 1))`, both weighted by `|rho u.S|` (`fvStation`,
+host, off the row's state); `CdB = mdotOut / (Gamma p0b A*/sqrt(R T0b))`, `CfBvac = Tvac/(p0b A*)`, `CfB` at `pa`, with
+the window's `mdotOut`, `Tvac`.
 
 `Cf` at `pa` is ambient-valid only while `exitSuper == 1`; else it is ambient-dependent and needs the plume box (Z15).
 The CV is the whole mesh; the plume box's exit plane will be a faceZone (OpenFOAM `surfaceFieldValue` integrates the
@@ -252,7 +258,7 @@ live (`dns/fvmodules`). No kernel was edited to open it: `faces()` runs `kFvShoc
 reads the FINAL `F[0]`, so `F_Y = Y_f(sign of the final mdot) F_rho(final)` (KG + HLL + D3), never the structured `D
 Y_f(sign m_KG)`. Under `hll` the `--bc` file takes `type = "total"` with `y` (required: the fresh mass fractions),
 `[nozzle]` with `astar` (and `axis`; `p`, `t` exit 2: the flame starts from its composition IC), `[thrust]` with `pa`
-and `station` (required on the flame; the burnt-station columns are P4's). `wedge`: exit 2 (next cycle). The stats
+and `station` (required on the flame; its columns `p0b T0b CdB CfBvac CfB`, "Thrust"). `wedge`: exit 2 (next cycle). The stats
 append `shockCells byteMax` and, with `[nozzle]`, the nozzle columns; `[thrust]` writes `_thrust.csv` from the flame
 runner as from the flow's. `--shock-d4` on the flame: hll only, [0, 0.125]. C1, C2b, `--equivalence`, TFLES, LES,
 `--turb` with `--shock`: refused by name. Label:
@@ -276,12 +282,76 @@ runner as from the flow's. `--shock-d4` on the flame: hll only, [0, 0.125]. C1, 
 mass flux), below a third of the scheme's own S_L error at every rung, and leaves the Shvab-Zeldovich defect at or
 below the d4-0 value (ratio 0.82 to 1.00). `--shock hll` keeps eps 1/16 on the flame route.
 
+### The reacting quasi-1D nozzle (masterplan_combnozzle P4)
+
+A Total fresh inlet (`y = [1]`), a constant-area chamber holding a planar C0 flame, a choked cosine nozzle, a riemann
+exit, on ONE row (`nozzle_mesh.py` planar layout, so the scheme is quasi-1D). `[nozzle]` on `dns flame` starts the run from
+the **composition design** (`dns/fvnozzle` `fvReactingNozzleDesign`, Python twin `tools/fv/nozzle_react.py`, equal to
+the last bit on the rig, `fvref_react` R1):
+
+1. fresh: `T_u = T0u/(1 + (g-1)/2 M_u^2)`, `p_u = p0u (T_u/T0u)^(g/(g-1))`, `u_u = M_u c_u`, `m = rho_u u_u`;
+2. constant-area complete burn (Rayleigh-Hugoniot, `p + m u` and `cp T + u^2/2 + q` conserved), the subsonic root by
+   bisection on `u_b` in `[u_u, (P/m) g/(g+1)]`; `T0b`, `p0b` of the burnt gas;
+3. choke: `m eps_c = Gamma p0b/sqrt(R T0b)`, bisection on `M_u` in `[1e-6, 0.3]`; exit: the supersonic area-Mach root at
+   `eps_e`, `CFvac = Gamma sqrt(2g/(g-1)(1 - (p_e/p0b)^((g-1)/g))) + (p_e/p0b) eps_e`.
+
+`q` is the SOLVER's `cp (sigma - 1) Tu` on the box's static `Tu`, so `T0b = T0u + (sigma - 1) Tu` exactly, never
+`sigma T0u` (2.8e-4 off at M_u 0.042). Inputs: the Total row, `[nozzle] astar`, `eps_c = A_ref/astar` off the chamber probe,
+`eps_e = sum_exit S.a/astar`, gamma, cp. Errors (exit 3): no throat (`eps_c <= 1`), no choke root, a thermally choked
+chamber. The IC (`fvReactingNozzleIC`): the chamber slabs fresh -> burnt along `premixedPoint` at the design's `m` with the
+flame at `--upstream` from the inlet; every later slab burnt and isentropic at `(p0b, T0b)`, subsonic to the least-area
+slab, supersonic past it (`fvref_react` R4: T0 and entropy per cell to 1e-15). `--inflow-speed` with `[nozzle]`: exit 2
+(`--inflow-speed: the throat sets the fresh velocity on a [nozzle] run`). The probe reads A_ref and the chamber bins
+(docs/fvcomp.md "Stats"); `_thrust.csv` appends the burnt station's `p0b T0b CdB CfBvac CfB` ("Thrust").
+
+**The rig** (`nozzle_react.py design --cells 15 --mach 0.042 --sl 0.9945059`): y* 49.97 delta_D, chamber Lc 1 y* (50
+delta_D: the flame at 12 delta_th, 19 delta_th burnt after it), cosine contraction Lcon 6 y* (54 deg max), cosine
+divergent Ldiv 4 y* to eps_e 2, h = delta_th/15, 5148 cells (nx a multiple of 11: the twin is the same xi grid from
+the contraction start), A* = y* x depth, `pa` 0.01 Tu, station Lc - 2 delta_th, FP64, `--shock hll`, tt 80 tau,
+window [40, 80] off the ledger and the probe. eps_c 6.1729 solves `u_u = S_L,num` (P3's 1D 15-cell hll S_L 0.9945059).
+Not the plan's Lcon 4 y* (64 deg: R8 refuses 1400 cells, the one-row axis face then has no opposite), eps_e 6.25 (the
+exit density sets the viscous dt to 2.5e-5 tau in flame units: 3.1e6 steps), 0.98 S_L (below). 266 s per 80 tau
+(0.316 ms/step, 842 393 steps, dt 9.5e-5 viscous-bound).
+
+**The flame is neutral in position; the throat holds the BURNT volume flow.** Kinematically `x_f' = u_u - S_c`, but the
+flame jump `rho_b u_b = rho_u S_c + rho_b x_f'` with `rho_b u_b A_c` fixed by the throat gives `x_f' ~ sigma (u_d - S_c)`:
+five times the fresh mismatch. The open box's sliding 0.98 S_L drifted -0.1056 S_L (predicted -0.1070), 8.4 delta_D in
+80 tau, until its preheat reached the reference slab. At `u_d = S_L,num`: -0.0040. Started 2 delta_th further
+downstream, the flame stays 3.20 delta_D (2 delta_th) downstream to the end, and every window number agrees (G4.7).
+
+| gate | relation | measured (15 cells) | band |
+|---|---|---|---|
+| G4.1 | ledger res_k / (\|P_k\| + sum \|I_k\| (+ q\|Omega\|, \|Omega\|)), every row of 4212 | 8.7e-13 (grows with steps: 2.5e-13 at t 10; the start run 1.08e-12 at t 80) | 1e-12 |
+| G4.1 ctrl | Omega dropped from the rho Y row | 0.45 | fails |
+| G4.2 | S_c (A_ref) vs the 1D S_L,num 0.9945059; delta S_fresh -5.9e-5 <= band/4: raw | 0.9944148: -9.1e-5 | 5e-4 |
+| G4.3 | x_f' (regression) vs u_u - S_c | -0.0040060 vs -0.0036810: 3.3e-4 (the 0.98 run: -0.10557 vs -0.10466, 9.1e-4) | 2e-3 S_L |
+| G4.3 ctrl | S_c on vol/L (A_ref/(vol/L) 2.0154) | gap 1.01 | fails |
+| G4.4 | T0b vs T0u + (sigma - 1) Tu; fuelOut / burnIn (ledger) | -9.2e-7; 0.0 | 1e-4; 1e-8 |
+| G4.4 ctrl | sigma T0u | +2.8e-4 | fails |
+| G4.5 | CdB, CfBvac vs the viscous inert twin (Re* 736.26, Pr 0.72, same xi grid, q1d IC, `gpu_fv_nozzle_reacttwin`) | Cd 0.9989657 vs 0.9990755: **-1.10e-4 UNMET**; Cf 1.4546195 vs 1.4546618: -4.2e-5 | 1e-4 |
+| G4.5 ctrl | Cd on T0u | -0.552 | fails |
+| G4.6 | p0b/p0u - 1 vs the oracle at M_u = S_c/c_u (+ the drift's Galilean term -1.6e-8) | -4.91166e-3 vs -4.91536e-3: 3.7e-6 | 4.9e-4 |
+| G4.6 | mdot: (mdotOut - rho_b x_f' A_c) vs rho_u S_c A_c | **-1.37e-4 UNMET** (stationary form -9.4e-4) | 1e-4 |
+| G4.6 ctrl | no heat release (p0b = p0u) | 4.9e-3 | fails |
+| G4.7 | x_f + 2 delta_th start: window mdot, CfBvac, S_c | 4.4e-5, 2.2e-6, 3.8e-7 relative (bands: 2 x span 1.4e-2, 6.3e-4, 1.4e-4) | 2 x span |
+| G4.8 | shockCells | 0 on every row | 0 |
+
+The twin's own numbers: inviscid CfVac 1.4575996 vs the closed oracle 1.4576001 (-5.1e-7), Cd 0.9999996; the viscous loss
+at Re* 736: Cd -9.24e-4, CfVac -2.94e-3 (physics: the nozzle Re in flame units is ~ (A_c/A) L/delta_D, R5). The viscous
+one-row v is NOT a rounding field: max |v|/c 6.9e-3 in the twin (the slip wall's least-squares gradient carries the
+normal stress into y); P_my/P_mx 8.7e-4 in the flame run. The ring: a persistent thermo-acoustic oscillation of the
+Total-fed choked chamber, u_u rms 1.0e-3 to 2.6e-3 and p0b rms 2.3e-5 to 4.6e-5 per 20 tau window, not growing over 80
+tau (issues.md N14); the gates read ledger window means. Cut (masterplan_combnozzle section 6 order): the eps_c 13.2 row,
+the gamma 1.2 row (G4.9), the reactingFoam scout (G4.10), the 30-cell rung (G4.6's "falling": UNMET by cut).
+
 ## Not built, refused
 
 `--steady` (LTS on `Total` stalls on the host, Z7), LES, RANS, two-reactant species (C1, C2b), gravity, body force,
-`--turb`: refused by name (`dns/fvmodules`, axis `capture`). Plume box (P7), the reacting nozzle (P4): next. Structured
-D3: no. `[thrust]` with checkpoints: refused (the ledger is not checkpointed); `[thrust].station` on `dns flow`: refused
-(the reacting nozzle's burnt station, P4). The ledger refuses gravity, a body force, RANS and local time stepping (their
+`--turb`: refused by name (`dns/fvmodules`, axis `capture`). Plume box (P7), 2D / wedge reacting nozzles (P6), viscous
+walls (P7), Shock x C1 / C2b (P8), gamma(T) (P9): next cycle. Structured D3: no. `[thrust]` with checkpoints: refused
+(the ledger is not checkpointed); `[thrust].station` on `dns flow`: refused (the reacting nozzle's burnt station).
+`--inflow-speed` on a `[nozzle]` flame: exit 2 (the throat sets u_u). A `[nozzle]` flame whose mesh has no throat (eps_c
+<= 1), no choke root or a thermally choked chamber: exit 3 by name (`fvReactingNozzleDesign`). The ledger refuses gravity, a body force, RANS and local time stepping (their
 sources are no boundary flux).
 
 ## Bent invariants
@@ -318,6 +388,17 @@ CLAUDE.md is not edited. For the user:
   the axis's S_y differ by an ulp); area-Mach and the normal shock are its closed oracles.
 - **`--shock` is refused on meshes with unlined cells** (wedge axis prisms exempt); Kuhn tets and union-jack prisms
   are lined.
+- **Under `--shock` species ride the FINAL F[0]** (species faces after the shock face pass); never upwind on the KG
+  mass flux.
+- **A premixed flame in a constant-area chamber ahead of a choked throat is neutral in position**: M_u is set by eps_c;
+  the throat holds the burnt volume flow, so the drift is `sigma (u_d - S_c)` (kinematically `u_u - S_c`): a gate, not a
+  fault. Design `u_d = S_L,num`, never the open box's sliding 0.98.
+- **The composition oracle takes the solver's q = cp (sigma - 1) Tu**, not one normalised on T0u.
+- **A viscous quasi-1D nozzle in flame units has Re ~ (A_c/A) L/delta_D**: the nozzle half is compared against a matched
+  viscous inert twin, the ideal C_F only through the inviscid twin. Its viscous dt binds at the exit density: size eps_e
+  and tt before a band.
+- **On a `[nozzle]` flame the probe divides by A_ref = V_ref/h and searches the chamber bins only.**
+- **chemFoam takes janaf/sutherland thermo only**: constant cp is janaf with only the cp/R coefficient non-zero.
 - **Under `--shock` species ride the FINAL F[0]** (the species face pass after the shock face pass); never upwind on
   the KG mass flux (it breaks uniform Y), never `D Y_f(sign m_KG)` (unbounded: piston min Y -1.08e-2). D3 on a flame
   is order h^3 in S_L (G3.3).

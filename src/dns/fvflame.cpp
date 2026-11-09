@@ -75,6 +75,23 @@ std::expected<FvFlameProbe, std::string> FvFlameProbe::make(const FaceMesh& fm, 
         p.bin_[c] = std::clamp(int(std::floor((along(fm.C, c, spec.dir) - p.lo_) / p.h_)), 0, p.nBin_ - 1);
     }
     p.area_ = vol / L;
+    p.meanArea_ = p.area_;
+    p.nCh_ = p.nBin_;
+    if (!spec.chamber) return p;
+    // masterplan_combnozzle R9: A_ref = V_ref / h; the chamber bins run from the inlet bin while
+    // |V_slab / h - A_ref| <= 1e-9 A_ref.
+    std::vector<double> vs(std::size_t(p.nBin_), 0.0);
+    for (std::size_t c = 0; c < std::size_t(fm.nC); ++c) vs[std::size_t(p.bin_[c])] += fm.V[c];
+    const int ref = std::min(p.nBin_ - 1, int(std::lround(2.0 * spec.dth / p.h_)));
+    const double aRef = vs[std::size_t(ref)] / p.h_;
+    int nc = 0;
+    while (nc < p.nBin_ && std::abs(vs[std::size_t(nc)] / p.h_ - aRef) <= 1e-9 * aRef) ++nc;
+    if (nc <= ref)
+        return std::unexpected(std::format("flame probe: the reference slab {} lies past the {} constant-area chamber "
+                                           "slabs ([nozzle] run)",
+                                           ref, nc));
+    p.area_ = aRef;
+    p.nCh_ = nc;
     return p;
 }
 
@@ -148,12 +165,14 @@ FvFlameMeasure FvFlameProbe::measureLowMach(const FvFlameLowMachCells& q) const
 void FvFlameProbe::finish(FvFlameMeasure& o, std::vector<FvFlameSlab> b) const
 {
     const FvFlameSpec& sp = spec_;
+    // A chamber probe searches its chamber slabs only (the leading non-empty ones).
+    const int nCh = int(std::count_if(b.begin(), b.begin() + nCh_, [](const FvFlameSlab& k) { return k.vol != 0.0; }));
     std::erase_if(b, [](const FvFlameSlab& k) { return k.vol == 0.0; });
     for (FvFlameSlab& k : b) {
         for (double* f : {&k.s, &k.T, &k.rho, &k.u, &k.p, &k.ry, &k.omega}) *f /= k.vol;
         k.s -= lo_;
     }
-    const int n = int(b.size());
+    const int n = nCh;
     const auto at = [&](int i) -> const FvFlameSlab& { return b[std::size_t(i)]; };
     const double Tmid = 0.5 * (1.0 + sp.sigma) * sp.Tu, dT = (sp.sigma - 1.0) * sp.Tu;
     double wmax = 0, gmax = -1;

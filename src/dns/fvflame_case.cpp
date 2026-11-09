@@ -92,7 +92,8 @@ FvFlameSetup fvFlameSetup(const Case& c, FvBcSpec& spec)
     }
     s.fl = FvFlameSpec{.dir = dir, .Tu = Tu, .sigma = sig, .dth = c.flameEig.dthOverDD, .gamma = gam,
                        .Rgas = kRgasBox, .q = s.chem.q, .fuel = 0,
-                       .yBurnt = c.flamePremix2 && burn.phi > 1 ? burn.yFrem() : 0.0};
+                       .yBurnt = c.flamePremix2 && burn.phi > 1 ? burn.yFrem() : 0.0,
+                       .chamber = spec.nozzle.has_value()};
     return s;
 }
 
@@ -119,6 +120,22 @@ FvState fvFlameIC(const Case& c, const FaceMesh& fm, const FvBcSpec& spec, const
     if (c.flamePremix2) flameIC2(c, host, rhoY);
     else flameIC(c, host, rhoY[0]);
     return fvStateOf(fm, host, std::span<const std::vector<double>>(rhoY, std::size_t(nY)));
+}
+
+std::expected<FvNozzleStart, std::string> fvFlameNozzleStart(const Case& c, const FaceMesh& fm, const FvBcSpec& spec,
+                                                             const FvFlameSetup& s, const FvFlameProbe& probe,
+                                                             const std::vector<FvBc>& bc)
+{
+    const auto total = std::ranges::find(spec.patches, FvPatchKind::Total, &FvPatchSpec::kind);
+    if (total == spec.patches.end()) return std::unexpected("[nozzle] on dns flame: no total patch (the fresh inlet)");
+    const double astar = spec.nozzle->astar;
+    const double epsC = probe.area() / astar, epsE = fvExitArea(fm, fvRoles(bc, fm), spec.nozzle->axis) / astar;
+    auto d = fvReactingNozzleDesign(s.fs.gamma, kRgasBox, s.gas.cp(), s.chem.q, s.burnt.sigma, epsC, epsE,
+                                    total->p0 * s.fs.p, total->t0 * s.fs.T);
+    if (!d) return std::unexpected(d.error());
+    const FlameEigen& tab = c.flameEig.tab;
+    FvState ic = fvReactingNozzleIC(fm, probe, *d, [&](double x) { return flameProfile(tab, x); }, c.flameXf0, astar);
+    return FvNozzleStart{.design = *d, .ic = std::move(ic)};
 }
 
 FvJetSetup fvJetSetup(const Case& c, const FvBcSpec& spec, std::array<double, 3> origin)

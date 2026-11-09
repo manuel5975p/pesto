@@ -14,9 +14,11 @@
 //   E4  cell orders agree   E5  Dual / float instantiations of fvflux
 //   E6  u checkerboard on 100:1 cells, Pr 0.72/2/7: the momentum 4/3
 //   `test_fvref reactor`: the 0D reactor's quadrature and FvRef march (fvref_reactor.hpp)
+//   `test_fvref react`: the reacting nozzle's design, probe and IC (fvref_react.hpp)
 #include "dns/fvref.hpp"
 #include "fvref_ledger.hpp"
 #include "fvref_nozzle.hpp"
+#include "fvref_react.hpp"
 #include "fvref_reactor.hpp"
 #include "fvref_shockspecies.hpp"
 
@@ -1181,6 +1183,7 @@ int main(int argc, char** argv)
     if (argc > 1 && std::string(argv[1]) == "reactor") return reactorHost();
     if (argc > 1 && std::string(argv[1]) == "ledger") return dnstest::led::run();
     if (argc > 1 && std::string(argv[1]) == "shockspecies") return dnstest::shsp::run();
+    if (argc > 1 && std::string(argv[1]) == "react") return dnstest::react::run();
     g1();
     g2();
     g3();

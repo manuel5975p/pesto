@@ -233,7 +233,7 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
     if (r.nozzle) cols.insert(cols.end(), {"mdotIn", "mdotOut", "Fwall", "Fin", "Fexit", "Cd", "Cf"});
     if (auto e = out.declareSeries("stats", cols, r.label); !e) return fail(4, e.error());
     if (r.thrust)
-        if (auto e = out.declareSeries("thrust", fvThrustColumns(), r.label, 17); !e) return fail(4, e.error());
+        if (auto e = out.declareSeries("thrust", fvThrustColumns(std::isfinite(r.thrust->station)), r.label, 17); !e) return fail(4, e.error());
     if (r.flame) {
         const std::string pcols[] = {"t", "x", "T", "rho", "u", "p", "Y", "omega"};
         if (auto e = out.declareSeries("profiles", pcols); !e) return fail(4, e.error());
@@ -552,7 +552,10 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
         const FvRoleSums now = fvRoleSums(*led, roles, fuelRow);
         const FvExitSample x = fvExitSample(fm, roles, ev, rr, tk);
         const FvThrustWindow w = fvThrustWindow(ledPrev, tLedPrev, now, t, tk);
-        out.row("thrust", fvThrustRow(t, step, dt, fvTotals6(fm, s, fuelRow), P0, now, w, x, tk));
+        // The reacting nozzle's burnt station (masterplan_combnozzle 2.3): host, off the downloaded state.
+        const bool station = std::isfinite(tk.station);
+        const FvStation b = station ? fvStation(fm, s, tk.axis, tk.station, tk.gamma, tk.Rgas) : FvStation{};
+        out.row("thrust", fvThrustRow(t, step, dt, fvTotals6(fm, s, fuelRow), P0, now, w, x, tk, station ? &b : nullptr));
         ledPrev = now;
         tLedPrev = t;
         return {};

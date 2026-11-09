@@ -837,8 +837,7 @@ Csv readCsv(const std::string& path)
 // polyMesh (tools/chem/fv_flame_mesh.py: 197 x 4, y cyclic, z empty), M 0.042, FP64, tt 14:
 //   G3.4  --shock hll --shock-d4 0 == no --shock: every column of the plain run's stats, byte for byte
 //   G3.3  --shock hll: shockCells 0 on every row; |S(hll) - S(d4 0)| <= |S(d4 0) - S_ref| / 3 ([7, 14] means)
-//   route a total inlet with y, [nozzle] astar, [thrust] pa station: rc 0, the stats' nozzle columns,
-//         _thrust.csv rows with every res_k <= 1e-12 of P_k (the ledger on the flame route, FP64)
+//   (the route's [nozzle] / [thrust] smoke is gpu_fv_nozzle_react's since P4)
 int runFlameShock()
 {
 #if !defined(DNS_BIN) || !defined(DNS_SOURCE_DIR)
@@ -895,28 +894,9 @@ int runFlameShock()
                 sH - s0, band, sensed, hll.rows.size());
     check(!hll.rows.empty() && sensed == 0, "G3.3: the sensor stays silent on every row");
     check(std::abs(sH - s0) <= band, "G3.3 (7.5 cells): |S(hll) - S(d4 0)| <= |S(d4 0) - S_ref| / 3");
-    // The reacting nozzle's tables on the flame route (no nozzle contour: a constant-area smoke).
-    const double mu = 0.98 * 0.042, t0 = 1.0 + 0.2 * mu * mu, p0 = std::pow(t0, 3.5);
-    const std::string bcN = (dir / "bcN.toml").string();
-    {
-        std::ofstream f(bcN);
-        f << std::format("[reference]\ndirection = [1, 0, 0]\nlift = [0, 1, 0]\n[nozzle]\nastar = {:.17g}\n[thrust]\npa = 1\n"
-                         "station = 30\n[patch.xlo]\ntype = \"total\"\np0 = {:.17g}\nt0 = {:.17g}\ny = [1.0]\n[patch.xhi]\n"
-                         "type = \"outflow\"\nburnt = true\n",
-                         4 * h, p0, t0);
-    }
-    const std::string outN = run("nozzle", bcN, "--shock hll", 1);
-    const Csv st = readCsv(outN + "_stats.csv"), th = readCsv(outN + "_thrust.csv");
-    check(st.col("mdotIn") >= 0 && st.col("Cf") >= 0 && st.col("shockCells") >= 0, "route: the stats carry the shock and nozzle columns");
-    double res = th.rows.empty() ? HUGE_VAL : 0.0;
-    for (const auto& r : th.rows)
-        for (const char* k : {"mass", "mx", "E", "ry"}) {
-            const double P = std::abs(std::stod(r[std::size_t(th.col(std::string("P_") + k))]));
-            res = std::max(res, std::abs(std::stod(r[std::size_t(th.col(std::string("res_") + k))])) / P);
-        }
-    std::printf("  route (total + y, [nozzle], [thrust]): %zu stats rows, %zu thrust rows, max |res_k| / P_k %.2e\n", st.rows.size(),
-                th.rows.size(), res);
-    check(!th.rows.empty() && res <= 1e-12, "route: the impulse ledger closes on the flame route (res_k <= 1e-12 P_k)");
+    // The route's tables ([nozzle], [thrust] station, total + y) moved to gpu_fv_nozzle_react (masterplan_combnozzle
+    // P4): a [nozzle] flame now starts from the composition design, which needs a throat (P3's constant-area smoke
+    // is refused by name there, exit 3).
     fs::remove_all(dir);
     return dnstest::finish();
 #endif

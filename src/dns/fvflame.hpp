@@ -45,6 +45,9 @@ struct FvFlameSpec
     // The burnt side's Y of the fuel row (model C2: Y_F,rem): SL's reference is
     // rho (Y - yBurnt), the structured FlameRun::yFBurnt; 0 = the C0 expression.
     double yBurnt = 0;
+    // A [nozzle] run (masterplan_combnozzle R9): S_L on the reference slab's own area A_ref =
+    // V_ref/h, x_f, delta_th, Tmax, omegaEdge and the drift guard on the chamber bins only.
+    bool chamber = false;
 };
 
 // The low-Mach state's cell fields (gpu/fv_incomp DeviceFvLowMach::cells), [nC] but
@@ -59,7 +62,8 @@ class FvFlameProbe
 public:
     // Slab width: the mean |d . dir| over internal faces with |d . dir| >= |d|/2,
     // fitted to a whole number of slabs. Pre: fm outlives the probe. Errors: no
-    // such face, a mesh shorter than two slabs.
+    // such face, a mesh shorter than two slabs; a chamber probe whose reference slab
+    // lies past the constant-area bins.
     static std::expected<FvFlameProbe, std::string> make(const FaceMesh& fm, const FvFlameSpec& spec);
 
     // Pre: s has the mesh's cells and the mean + species rows; omega per cell.
@@ -69,10 +73,18 @@ public:
     // and the slabs' p the dynamic pressure. Pre: spec.gamma, Rgas give that cp.
     FvFlameMeasure measureLowMach(const FvFlameLowMachCells& q) const;
 
+    // S_L's area: vol/L, or A_ref on a chamber probe. meanArea: vol/L always.
     double area() const { return area_; }
-    double length() const { return hi_ - lo_; }
+    double meanArea() const { return meanArea_; }
+    // The guarded length: the mesh's, or the chamber bins' on a chamber probe.
+    double length() const { return nCh_ < nBin_ ? double(nCh_) * h_ : hi_ - lo_; }
     double slab() const { return h_; }
+    double lo() const { return lo_; } // the low end along spec().dir
     const FvFlameSpec& spec() const { return spec_; }
+    // Slab of cell c, the slab count, the chamber bins [0, chamberBins) (all bins off a chamber probe).
+    int binOf(int c) const { return bin_[std::size_t(c)]; }
+    int bins() const { return nBin_; }
+    int chamberBins() const { return nCh_; }
 
 private:
     // The slab means and the flame's numbers from the slab sums.
@@ -81,8 +93,8 @@ private:
     const FaceMesh* fm_ = nullptr;
     FvFlameSpec spec_;
     std::vector<int> bin_; // per cell
-    double lo_ = 0, hi_ = 0, h_ = 0, area_ = 0;
-    int nBin_ = 0;
+    double lo_ = 0, hi_ = 0, h_ = 0, area_ = 0, meanArea_ = 0;
+    int nBin_ = 0, nCh_ = 0;
 };
 
 // What the jet's rows, IC and probe read. dir: streamwise, lift: lateral, origin:

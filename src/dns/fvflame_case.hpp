@@ -13,6 +13,7 @@
 #include "dns/fvflame.hpp"
 #include "dns/fvflux.hpp"
 #include "dns/fvlowmach.hpp"
+#include "dns/fvnozzle.hpp"
 #include "dns/fvref.hpp"
 #include "dns/fvturb.hpp"
 #include "dns/tfles.hpp"
@@ -24,6 +25,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace dns {
 
@@ -67,6 +69,19 @@ FvFlameSetup fvFlameSetup(const Case& c, FvBcSpec& spec);
 // spec.origin (TFLES: thickened by F; C2: flameIC2's progress -> reactants rule); on the
 // box the structured flameIC / flameIC2 cell for cell. Pre: fm the route's mesh.
 FvState fvFlameIC(const Case& c, const FaceMesh& fm, const FvBcSpec& spec, const FvFlameSetup& s);
+
+// The reacting nozzle's design and IC (a [nozzle] run, docs/nozzle.md "Reacting"): the composition oracle on
+// the Total row's p0, t0 (box units), eps_c = A_ref / astar off the chamber probe, eps_e = sum_exit S.a / astar,
+// the flame's q, cp, gamma; the IC fvReactingNozzleIC with the flame at --upstream from the inlet.
+// Pre: spec.nozzle, probe a chamber probe of fm, bc fvBcsOf's table. Error: no Total patch, no choke (exit 3).
+struct FvNozzleStart
+{
+    FvReactingDesign design;
+    FvState ic;
+};
+std::expected<FvNozzleStart, std::string> fvFlameNozzleStart(const Case& c, const FaceMesh& fm, const FvBcSpec& spec,
+                                                             const FvFlameSetup& s, const FvFlameProbe& probe,
+                                                             const std::vector<FvBc>& bc);
 
 // The diffusion jet and the candle (two reactants, model D): gas, chemistry, freestream,
 // gravity along -spec.dir (candle) and the jet's spec at `origin`.

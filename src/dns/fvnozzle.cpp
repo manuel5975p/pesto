@@ -1,8 +1,11 @@
 #include "dns/fvnozzle.hpp"
 
+#include "dns/flame1d.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <format>
 
 namespace dns {
 
@@ -185,7 +188,7 @@ FvThrustWindow fvThrustWindow(const FvRoleSums& a, double t1, const FvRoleSums& 
     return w;
 }
 
-std::vector<std::string> fvThrustColumns()
+std::vector<std::string> fvThrustColumns(bool station)
 {
     static const char* const rows[6] = {"mass", "mx", "my", "mz", "E", "ry"};
     static const char* const roles[kFvRoles] = {"in", "exit", "wall", "side"};
@@ -197,11 +200,13 @@ std::vector<std::string> fvThrustColumns()
     for (const char* r : rows) c.push_back(std::string("res_") + r);
     for (const char* s : {"Fmom", "Fpres", "Texit", "Twall", "exitSuper", "mdotIn", "mdotOut", "CfVac", "Cf", "cstar"})
         c.emplace_back(s);
+    if (station)
+        for (const char* s : {"p0b", "T0b", "CdB", "CfBvac", "CfB"}) c.emplace_back(s);
     return c;
 }
 
 std::vector<double> fvThrustRow(double t, long step, double dt, const FvRow6& P, const FvRow6& P0, const FvRoleSums& now,
-                                const FvThrustWindow& w, const FvExitSample& x, const FvThrustCase& k)
+                                const FvThrustWindow& w, const FvExitSample& x, const FvThrustCase& k, const FvStation* b)
 {
     std::vector<double> v = {t, double(step), dt};
     v.insert(v.end(), P.begin(), P.end());
@@ -215,6 +220,10 @@ std::vector<double> fvThrustRow(double t, long step, double dt, const FvRow6& P,
         v.push_back(s);
     }
     v.insert(v.end(), {x.Fmom, x.Fpres, x.Texit, x.Twall, x.exitSuper, w.mdotIn, w.mdotOut, w.CfVac, w.Cf, w.cstar});
+    if (!b) return v;
+    const double ref = b->p0 * k.astar;
+    v.insert(v.end(), {b->p0, b->T0, w.mdotOut / fvIdealMassFlow(b->p0, b->T0, k.astar, k.gamma, k.Rgas), w.Tvac / ref,
+                       (w.Tvac - k.pa * k.exitArea) / ref});
     return v;
 }
 
@@ -262,6 +271,124 @@ FvStation fvStation(const FaceMesh& fm, const FvState& s, const std::array<doubl
     o.T0 = o.faces && w > 0.0 ? wt / w : NAN;
     o.p0 = o.faces && w > 0.0 ? wp / w : NAN;
     return o;
+}
+
+FvBurnt fvRayleighBurnt(double gamma, double Rgas, double cp, double q, double Tu, double pu, double uu)
+{
+    assert(Tu > 0.0 && pu > 0.0 && uu > 0.0);
+    const double g = gamma, R = Rgas;
+    const double rhou = pu / (R * Tu), m = rhou * uu, P = pu + m * uu, H = cp * Tu + uu * uu / 2 + q;
+    const auto f = [&](double ub) { return cp * (P - m * ub) * ub / (m * R) + ub * ub / 2 - H; };
+    double lo = uu, hi = (P / m) * g / (g + 1);
+    for (int i = 0; i < 200; ++i) {
+        const double mid = (lo + hi) / 2;
+        if (f(mid) < 0) lo = mid;
+        else hi = mid;
+    }
+    FvBurnt b;
+    b.ub = (lo + hi) / 2;
+    b.pb = P - m * b.ub;
+    b.Tb = b.pb * b.ub / (m * R);
+    b.Mb = b.ub / std::sqrt(g * R * b.Tb);
+    b.T0b = b.Tb * (1 + (g - 1) / 2 * b.Mb * b.Mb);
+    b.p0b = b.pb * std::pow(b.T0b / b.Tb, g / (g - 1));
+    return b;
+}
+
+double fvAreaMach(double ar, double gamma, bool sup)
+{
+    const double g = gamma;
+    const auto A = [&](double M) { return (1 / M) * std::pow((2 / (g + 1)) * (1 + (g - 1) / 2 * M * M), (g + 1) / (2 * (g - 1))); };
+    if (ar <= 1.0) return 1.0;
+    double lo = sup ? 1.0 : 1e-6, hi = sup ? 60.0 : 1.0;
+    for (int i = 0; i < 200; ++i) {
+        const double mid = (lo + hi) / 2;
+        // A(M) falls below M 1 and rises above it.
+        if ((A(mid) < ar) == sup) lo = mid;
+        else hi = mid;
+    }
+    return (lo + hi) / 2;
+}
+
+std::expected<FvReactingDesign, std::string> fvReactingNozzleDesign(double gamma, double Rgas, double cp, double q,
+                                                                    double sigma, double epsC, double epsE, double p0u,
+                                                                    double T0u)
+{
+    const double g = gamma, R = Rgas;
+    if (!(epsE >= 1.0)) return std::unexpected(std::format("reacting nozzle: exit area ratio {} < 1", epsE));
+    if (!(epsC > 1.0)) return std::unexpected(std::format("reacting nozzle: chamber area / A* = {:.6g}: no throat", epsC));
+    FvReactingDesign d;
+    d.Gamma = std::sqrt(g) * std::pow(2 / (g + 1), (g + 1) / (2 * (g - 1)));
+    const auto at = [&](double Mu) {
+        FvReactingDesign o = d;
+        o.Mu = Mu;
+        o.Tu = T0u / (1 + (g - 1) / 2 * Mu * Mu);
+        o.pu = p0u * std::pow(o.Tu / T0u, g / (g - 1));
+        o.rhou = o.pu / (R * o.Tu);
+        o.uu = Mu * std::sqrt(g * R * o.Tu);
+        o.m = o.rhou * o.uu;
+        o.b = fvRayleighBurnt(g, R, cp, q, o.Tu, o.pu, o.uu);
+        return o;
+    };
+    const auto excess = [&](const FvReactingDesign& o) { return o.m * epsC - d.Gamma * o.b.p0b / std::sqrt(R * o.b.T0b); };
+    double lo = 1e-6, hi = 0.3;
+    if (!(excess(at(lo)) < 0.0 && excess(at(hi)) >= 0.0))
+        return std::unexpected(std::format("reacting nozzle: the throat does not choke the chamber for M_u in [1e-6, 0.3] "
+                                           "(chamber area / A* = {:.6g})",
+                                           epsC));
+    for (int i = 0; i < 200; ++i) {
+        const double Mu = (lo + hi) / 2;
+        if (excess(at(Mu)) < 0.0) lo = Mu;
+        else hi = Mu;
+    }
+    d = at((lo + hi) / 2);
+    if (!(d.b.Mb < 1.0))
+        return std::unexpected(std::format("reacting nozzle: the flame chokes the chamber thermally (M_b {:.6g})", d.b.Mb));
+    d.Me = fvAreaMach(epsE, g, true);
+    d.peOverP0b = std::pow(1 + (g - 1) / 2 * d.Me * d.Me, -g / (g - 1));
+    d.CFvac = d.Gamma * std::sqrt(2 * g / (g - 1) * (1 - std::pow(d.peOverP0b, (g - 1) / g))) + d.peOverP0b * epsE;
+    d.MuLowM = d.Gamma / (std::sqrt(g * sigma) * epsC);
+    return d;
+}
+
+FvState fvReactingNozzleIC(const FaceMesh& fm, const FvFlameProbe& probe, const FvReactingDesign& d,
+                           const std::function<double(double)>& t, double xf, double astar)
+{
+    const FvFlameSpec& sp = probe.spec();
+    assert(sp.chamber && astar > 0.0);
+    const int nB = probe.bins(), nCh = probe.chamberBins();
+    const double h = probe.slab(), g = sp.gamma, R = sp.Rgas;
+    std::vector<double> A(std::size_t(nB), 0.0);
+    for (int c = 0; c < fm.nC; ++c) A[std::size_t(probe.binOf(c))] += fm.V[std::size_t(c)] / h;
+    // The throat: the least-area non-empty slab past the chamber.
+    int throat = nCh;
+    for (int b = nCh; b < nB; ++b)
+        if (A[std::size_t(b)] > 0.0 && (A[std::size_t(throat)] <= 0.0 || A[std::size_t(b)] < A[std::size_t(throat)])) throat = b;
+    FvState q = FvState::zeros(fm.nC, kFvMeanVars + 1);
+    for (int c = 0; c < fm.nC; ++c) {
+        const std::size_t i = std::size_t(c);
+        const int b = probe.binOf(c);
+        double rho = 0, u = 0, E = 0, Y = 0;
+        if (b < nCh) {
+            const double s = fm.C[0][i] * sp.dir[0] + fm.C[1][i] * sp.dir[1] + fm.C[2][i] * sp.dir[2] - probe.lo();
+            const PremixedPoint p = premixedPoint(g, sp.Tu, sp.sigma, d.m, t(s - xf));
+            rho = p.rho;
+            u = p.u;
+            E = p.E;
+            Y = p.Y;
+        } else {
+            const double M = fvAreaMach(A[std::size_t(b)] / astar, g, b > throat);
+            const double T = d.b.T0b / (1 + (g - 1) / 2 * M * M), p = d.b.p0b * std::pow(T / d.b.T0b, g / (g - 1));
+            rho = p / (R * T);
+            u = M * std::sqrt(g * R * T);
+            E = p / (g - 1) + 0.5 * rho * u * u;
+        }
+        q.var(0)[i] = rho;
+        for (int k = 0; k < 3; ++k) q.var(1 + k)[i] = rho * u * sp.dir[std::size_t(k)];
+        q.var(4)[i] = E;
+        q.var(kFvMeanVars + sp.fuel)[i] = rho * Y;
+    }
+    return q;
 }
 
 } // namespace dns

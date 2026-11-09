@@ -1368,9 +1368,11 @@ Measured gfx1100 via simjob, 2026-10-28, defaults (4 cells/δ_th) and the
   resolutions). The outflow's soft pressure anchor (σ 0.25) and the jet are
   the suspects; unmeasured. Chamber ratios are quoted against the MEASURED
   pAmb, never against p0.
+  Superseded for nozzle, choking and thrust by the FV reacting nozzle (docs/nozzle.md "Reacting", masterplan_combnozzle); not fixed. Thrust is never quoted from --mode chamber.
 - C4. **Nozzle total-pressure drop 1.45× the isentropic one** (Cd 0.83,
   1.448 → 1.470 from 4 to 6 cells), attributed to the viscous exit at
   u_e He/ν_b ~ 100; no Reynolds or resolution study beyond the two points.
+  Superseded for nozzle, choking and thrust by the FV reacting nozzle (docs/nozzle.md "Reacting", masterplan_combnozzle); not fixed. Thrust is never quoted from --mode chamber.
 - C5. **FP32 injector rounding**: the inert fuel residual grows steadily
   to 3.3e-5 of the inventory by t = 8, and ≤ 178 fresh cells per row read
   Y − 1 ≤ 4.3e-6 (yHits). Attributed to the absorption of the small
@@ -1385,6 +1387,7 @@ Measured gfx1100 via simjob, 2026-10-28, defaults (4 cells/δ_th) and the
   included; thrust is not separated. Exit-plane quantities are cell-centre
   sums over the last cavity column (x = xe − h/2), not face fluxes (ṁ
   closes to 0.1% regardless).
+  Superseded for nozzle, choking and thrust by the FV reacting nozzle (docs/nozzle.md "Reacting", masterplan_combnozzle); not fixed. Thrust is never quoted from --mode chamber.
 - C8. **6-cell energy-balance entry unverified** (docs/chem.md table).
   The 4-cell entry was quoted as 1.0011 but the labelled quantity
   q burn / (h0 − ṁ_in cp Tu), simple mean over t ∈ [40, 80], is 0.9989
@@ -2669,13 +2672,40 @@ needed. Open:
   (measured: bitwise). Replaced by "species on the KG mass flux" (the order-swap hazard): breaks. G3.2's structured
   `D Y_f(sign m_KG)` stays in [0, 1] on the Sod step (min Y 0.0: D and m_KG share their sign at the contact); live on
   the Mach 3 piston (-1.08e-2, a 8% margin over -1e-2), which carries the gate's control.
-- N9. **`[thrust].station` on the flame route is validated (required) but read by nothing until P4** (the burnt
-  station's columns p0b, T0b, CdB, CfB). The flame runner writes the nozzle columns and `_thrust.csv` (rows close to
-  1.6e-14 of P_k on a constant-area smoke, `gpu_fv_flame_shock`).
+- N9. **Closed (P4)**: `[thrust].station` feeds `_thrust.csv`'s `p0b T0b CdB CfBvac CfB` (`fvStation`). The route's
+  smoke moved from `gpu_fv_flame_shock` to `gpu_fv_nozzle_react` (a `[nozzle]` flame now needs a throat).
 - N10. **G3.3's control reads S_L on [2, 4], not [7, 14].** HLL on every face (force sigma 1) thickens the flame ~3x;
   past t ~ 4 its preheat reaches the probe's fresh reference slab (2 delta_th from the inflow), whose rho Y normalises
   S_L, and the probe reads ~2e8. Over [2, 4] the flame is inside the guard and S_L 1.631 vs 1.010 (shift 0.62 vs the
   needed 1.8e-2). The force runs' late S_L is a probe artefact, not a speed.
+
+P4, the reacting quasi-1D nozzle (docs/nozzle.md "Reacting"; amendments A17-A22). G4.1-G4.4, G4.6 (p0b), G4.7, G4.8 PASS
+at 15 cells; every control fails as required. Open:
+- N11. **Rig corrections forced by the plan's own rules and cost** (A17): Lcon 4 y* at eps_c 6.3 slopes to 64 deg and R8
+  refuses 1400 one-row cells (the axis face's partner, the wall, at cos -0.43); eps_e 6.25 puts the viscous dt at 2.5e-5
+  tau (rho_e 0.052 rho_0b): 3.1e6 steps per 80 tau, past the job cap. The rig is y* 50 delta_D, Lcon 6, Ldiv 4, eps_e 2.
+  An eps_e 6.25 reacting nozzle needs an implicit (or local) viscous term, or a coarser nozzle half.
+- N12. **The neutral flame drifts at sigma (u_d - S_c)** (A18): the throat holds the burnt volume flow. The plan's 0.98
+  S_L design drifted -0.1056 S_L (8.4 delta_D in 80 tau, preheat into the reference slab); u_d = S_L,num: -0.0040.
+  R5's "~0.02 S_L" sizing is wrong by sigma; the kinematic gate holds at both (G4.3).
+- N13. **G4.5 Cd UNMET**: CdB 0.9989657 vs the viscous twin 0.9990755, -1.10e-4 (band 1e-4); CfBvac -4.2e-5 passes.
+  Unseparated: the station's ring-weighted p0b (rms 2e-5 to 5e-5), the twin's Total face vs the flame's station, h (the
+  30-cell rung was cut). The viscous loss itself (twin - inviscid) is Cd -9.24e-4, CfVac -2.94e-3 at Re* 736.
+- N14. **The Total-fed choked chamber rings and does not settle**: u_u rms 1.0e-3 to 2.6e-3, p0b rms 2.3e-5 to 4.6e-5
+  per 20 tau window, alternating, not growing over 80 tau; mode not identified (no p frame on one row). The CLI twin
+  from rest rang +-1e-3 in Cd at 60-80 t* (A20); from the q1d IC it settles.
+- N15. **G4.6's mdot UNMET**: (mdotOut - rho_b x_f' A_c) vs rho_u S_c A_c -1.37e-4 (band 1e-4; the stationary form -9.4e-4).
+  The oracle was written for a stationary flame; the drift's regression slope and the window's chamber-mass change
+  carry 1e-4 here. "Falling with h" UNMET by cut (no 30-cell rung).
+- N16. **G4.1 grows with step count**: the uncompensated FP64 impulse I gives res/S 2.5e-13 at t 10, 8.7e-13 at t 80
+  (842 393 steps); the start run reaches 1.08e-12 over its last rows. A Kahan low word on I would hold 1e-12 at any
+  length (not built: the P2 kernel's bytes).
+- N17. **G4.7 partial**: the start perturbation is x_f + 2 delta_th (`--upstream 14`) only; "p0 IC + 1%" has no knob (none
+  built for a test). The flame stays 3.20 delta_D downstream to the end; window mdot, CfBvac, S_c 4.4e-5, 2.2e-6, 3.8e-7.
+- N18. **The viscous one-row v is a field**, max |v|/c 6.9e-3 in the twin (P_my/P_mx 8.7e-4 in the flame run; the flame
+  route outputs no v): the slip wall's least-squares gradient carries the normal stress into y. Quasi-1D only inviscid.
+- N19. **Cut** (masterplan_combnozzle section 6): the eps_c 13.2 row, the gamma 1.2 row (G4.9; its control "off >= 4%" was
+  eps_e 6.25's, 0.56% at eps_e 2), the reactingFoam `transonic` scout (G4.10), the 30-cell rung.
 
 ## Older open items (details in CLAUDE.md)
 

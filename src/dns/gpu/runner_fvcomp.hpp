@@ -71,7 +71,8 @@ struct FvCompRun
     std::optional<FvNozzleRun> nozzle{};
     // [thrust] (docs/nozzle.md "Thrust"): the device's impulse ledger from the run's start and
     // PREFIX_thrust.csv, one row per stats row, 17 digits (fvThrustColumns). axis, pa, p0, t0, astar,
-    // gamma, Rgas given; q and exitArea the runner's. Empty: no ledger launch, no file.
+    // gamma, Rgas given; q and exitArea the runner's. A finite station (dns flame): the burnt station's
+    // columns p0b T0b CdB CfBvac CfB (fvStation off the row's state). Empty: no ledger launch, no file.
     std::optional<FvThrustCase> thrust{};
     // --shock hll: the sticky dt cadence (internal::shockDtEvery), unless --dt-recompute.
     bool shockDtAuto = false;

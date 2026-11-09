@@ -689,6 +689,12 @@ width the mean `|d . dir|`, so on a Cartesian mesh a slab IS a structured column
 the x_f, delta_th (parabolic peak), S_L formulas are `runner_flame`'s. `energy` is
 `Sum V (E + q rho Y)`. `--profile-dt` writes slab means. Frames: `temp`, `fuel`,
 `omega`. Exit 8 when x_f comes within 2 delta_th of an end.
+On a `[nozzle]` run (masterplan_combnozzle R9, `FvFlameSpec::chamber`): S_L divides by the
+reference slab's own area `A_ref = V_ref/h` (not `vol/L`, which is the mean over the nozzle:
+A_ref/(vol/L) = 2.02 on the reacting rig), and x_f, delta_th, Tmax, omegaEdge and the drift
+guard read the CHAMBER bins only, contiguous from the inlet while `|V_slab/h - A_ref| <= 1e-9
+A_ref` (the nozzle's own T drop crosses T_mid). Off a `[nozzle]` run: `vol/L` and every bin, bit
+for bit (`fvref_react` R3).
 
 Rejected by name on this route: every `--nscbc-*`, `--turb`,
 `--hold-flame`, `--mode` other than premixed and diffusion (`--equivalence`: "Air-methane"); the mesh

@@ -3493,6 +3493,9 @@ outputs `runs/flames/real2/` (89 GB, 121 volume frames t 230–260).
 
 ## Chamber (`--mode chamber`)
 
+Frozen: superseded for nozzle, choking and thrust by the FV reacting nozzle (docs/nozzle.md "Reacting",
+masterplan_combnozzle R10); not fixed. Thrust is never quoted from `--mode chamber` (issues.md C3, C4, C7).
+
 A closed 2D combustion chamber, model C0 as above, at M_flame 0.02
 (inflated; the label says so). Files: `dns/chamber.{hpp,cpp}` (geometry,
 regions, IC, isentropic nozzle), `gpu/runner_chamber.{hpp,hip}`, the walled

@@ -172,6 +172,9 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
                 if (r.shock == ShockMode::Hll && f->physics == Physics::Compressible) {
                     // masterplan_combnozzle P3: the reacting nozzle's tables on the hll flame route.
                     if (auto e = fvFlameNozzleScope(f->fvBc)) return std::unexpected(*e);
+                    // masterplan_combnozzle P4: the throat (the composition design) sets u_u.
+                    if (f->fvBc.nozzle && r.given.contains("--inflow-speed"))
+                        return bad(2, "--inflow-speed", "the throat sets the fresh velocity on a [nozzle] run");
                 } else if (const std::string k = fvBcNozzleKey(f->fvBc); !k.empty()) {
                     return bad(2, "--bc", k + " belongs to the nozzle route (dns flow --shock hll --polymesh): the "
                                               "compressible flame's open faces are far/outflow");

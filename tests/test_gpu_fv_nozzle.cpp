@@ -13,6 +13,8 @@
 //   fp32     G25 compensated vs FP64, shock x, mdot; plain's gap
 //   gamma    G31 T1 at gamma 1.2
 //   sense    G27 sense == none bytes, sensed > 0 on B
+//   react    masterplan_combnozzle P4: the reacting one-row nozzle through dns flame (G4.1, G4.8, the route)
+//   reacttwin  G4.5: the reacting nozzle's inert twin, viscous at Re* and inviscid
 #include "fv_comp_test_util.hpp"
 #include "fvref_nozzle.hpp"
 
@@ -1722,6 +1724,107 @@ void thrustCli()
     check(!fs::exists(a.string() + "_thrust.csv") && fs::exists(b.string() + "_thrust.csv"), "_thrust.csv only with [thrust]");
 }
 
+// masterplan_combnozzle P4 (ctest gpu_fv_nozzle_react): the reacting one-row nozzle through dns flame at 15 cells /
+// delta_th, tools/fv/nozzle_react.py's rig (M 0.042, gamma 1.4, eps_e 2), tt 3 (the full-length gates are the runs of
+// docs/nozzle.md "Reacting"):
+//   G4.1  every _thrust.csv row: |res_k| <= 1e-12 (|P_k| + sum |I_k| (+ q |Omega|, |Omega|)); control: Omega dropped
+//         from the rho Y row fails by >= 1e-6
+//   G4.8  shockCells 0 on every row
+//   route the station columns present and finite, exitSuper 1, the drift guard silent; S_L on A_ref within 1% of the
+//         1D S_L,num (the reduced tt reads the IC's start, not a gate); --inflow-speed exit 2
+void reactRun()
+{
+    std::printf("P4 the reacting one-row nozzle through dns flame, 15 cells / delta_th, M 0.042, FP64, --shock hll, tt 3\n");
+    const fs::path dir = tmpDir() / "react15";
+    const fs::path tool = fs::path(DNS_MESH_DATA) / ".." / ".." / ".." / "tools/fv/nozzle_react.py";
+    const std::string gen = std::format("python3 {} design --cells 15 --mach 0.042 --sl 0.9945059 --out {} > /dev/null", tool.string(),
+                                        dir.string());
+    if (std::system(gen.c_str()) != 0) {
+        check(false, "nozzle_react.py design wrote the case");
+        return;
+    }
+    const std::string base = std::format("flame --mach 0.042 --expansion 5 --zeldovich 8 --prandtl 0.72 --polymesh {0} --bc {0}/bc.toml "
+                                         "--shock hll --fv-precision fp64 --upstream 12 --emit stats --quiet",
+                                         dir.string());
+    const fs::path o = tmpDir() / "react15_run";
+    const int rc = runDns(base + std::format(" --tt 3 --out {}", o.string()), o.string() + ".log");
+    const std::string th = o.string() + "_thrust.csv", st = o.string() + "_stats.csv";
+    const auto t = csvColumn(th, "t");
+    check(rc == 0 && t.size() > 5, std::format("dns flame [nozzle]: rc {}, {} thrust rows", rc, t.size()));
+    if (t.size() < 5) return;
+    const double Tu = 1.0 / (1.4 * 0.042 * 0.042), q = 3.5 * 4.0 * Tu;
+    const auto Om = csvColumn(th, "Omega");
+    double worst = 0, ctrl = 0;
+    for (const char* k : {"mass", "mx", "my", "mz", "E", "ry"}) {
+        const auto res = csvColumn(th, std::format("res_{}", k)), P = csvColumn(th, std::format("P_{}", k));
+        std::vector<std::vector<double>> I;
+        for (const char* r : {"in", "exit", "wall", "side"}) I.push_back(csvColumn(th, std::format("I_{}_{}", r, k)));
+        for (std::size_t i = 0; i < t.size(); ++i) {
+            double S = std::abs(P[i]);
+            for (const auto& c : I) S += std::abs(c[i]);
+            if (std::string(k) == "E") S += q * std::abs(Om[i]);
+            if (std::string(k) == "ry") S += std::abs(Om[i]);
+            if (S > 0) worst = std::max(worst, std::abs(res[i]) / S);
+            if (std::string(k) == "ry" && S > 0) ctrl = std::max(ctrl, std::abs(res[i] - Om[i]) / S);
+        }
+    }
+    std::printf("  %zu thrust rows: max |res_k| / S'_k %.2e; control (Omega dropped from rho Y) %.2e\n", t.size(), worst, ctrl);
+    check(worst <= 1e-12, std::format("G4.1 ledger identity on the reacting route {:.2e} <= 1e-12", worst));
+    check(ctrl >= 1e-6, std::format("G4.1 control: Omega dropped from the rho Y row fails ({:.2e} >= 1e-6)", ctrl));
+    const auto sensed = csvColumn(st, "shockCells");
+    check(!sensed.empty() && *std::ranges::max_element(sensed) == 0.0, "G4.8 shockCells 0 on every row");
+    bool finite = true;
+    for (const char* k : {"p0b", "T0b", "CdB", "CfBvac", "CfB"}) {
+        const auto v = csvColumn(th, k);
+        finite = finite && v.size() == t.size() && std::ranges::all_of(v, [](double x) { return std::isfinite(x); });
+    }
+    const auto sup = csvColumn(th, "exitSuper"), cdb = csvColumn(th, "CdB"), sl = csvColumn(st, "SL"), T0b = csvColumn(th, "T0b");
+    std::printf("  last row: CdB %.6f, T0b / Tu %.8f, S_L %.6f (1D 0.9945059), exitSuper %.3f\n", cdb.back(), T0b.back() / Tu, sl.back(),
+                sup.back());
+    check(finite, "route: the station columns p0b T0b CdB CfBvac CfB on every row, finite");
+    check(std::ranges::all_of(sup, [](double x) { return x == 1.0; }), "route: exitSuper 1 on every row");
+    check(std::abs(sl.back() / 0.9945059 - 1) <= 0.01, "route: S_L on A_ref within 1% of the 1D S_L,num (start, not a gate)");
+    const int r2 = runDns(base + std::format(" --tt 3 --inflow-speed 0.98 --dry-run --out {}", o.string()), o.string() + "_is.log");
+    check(r2 == 2, std::format("--inflow-speed with [nozzle]: exit 2 (rc {})", r2));
+}
+
+// masterplan_combnozzle G4.5 (ctest gpu_fv_nozzle_reacttwin): the reacting nozzle's half against its inert twin. The
+// twin is nozzle_react.py's rig from the contraction start (lc 0, y* 1, eps_c 6.172901800721939, Lcon 6, Ldiv 4, eps_e 2,
+// 4680 cells: the 15-cell flame's xi grid), SI at p0 1e5, T0 300, from the generator's isentropic q1d IC (A20: the CLI
+// twin from rest rang +-1e-3 in Cd at 60-80 t*). Viscous at the flame's Re* = rho0b c0b y*/mu 736.2624872413062 (flame
+// units, mu = Pr; the gated run's station p0b 403.42733, T0b 2024.75881), Pr 0.72; inviscid against the closed oracle.
+// tt 80 t*, window the last quarter (the ledger). The flame's window numbers (the gated 15-cell run, [40, 80] tau):
+// CdB 0.9989656977, CfBvac 1.4546195121.
+void reactTwin()
+{
+    std::printf("G4.5 the reacting nozzle's inert twin: react lc 0, eps_c 6.1729018, eps_e 2, 4680 cells, q1d IC, FP64, hll, tt 80 t*\n");
+    const double cdB = 0.9989656977, cfB = 1.4546195121, cfO = 1.457600096948547, reStar = 736.2624872413062;
+    const double pa = 0.010037095719382376; // the flame's pa over p0b (nozzle_react.py twin)
+    const Gen g = gen("rtw", 4680, 1,
+                      std::format("--contour react --lc 0 --lcon 6 --ldiv 4 --eps-c 6.172901800721939 --eps-e 2 --scale 1 --mode planar "
+                                  "--exit riemann --pb {}",
+                                  pa));
+    const Rows rows{.pb = pa * kP0, .exit = FvExit::Riemann};
+    const double rho0 = kP0 / (287.1 * kT0), mu = rho0 * kC0 * 1.0 / reStar;
+    const Q1d v = q1dRun(g, rows, Run{.mu = mu}, 80.0, true);
+    const Q1d i = q1dRun(g, rows, Run{}, 80.0, true);
+    std::printf("  viscous (mu %.6g SI, Re* %.4f): %ld steps %s; Cd %.10f CfVac %.10f (vs the flame's CdB %+.2e, CfBvac %+.2e); max |v|/c %.2e\n", mu,
+                reStar, v.steps, v.err.c_str(), v.Cd, v.CfVac, cdB - v.Cd, cfB - v.CfVac, v.vMax);
+    std::printf("  inviscid: %ld steps %s; Cd %.10f CfVac %.10f (closed oracle %.7f: %+.2e); the viscous loss: Cd %+.2e, CfVac %+.2e\n", i.steps,
+                i.err.c_str(), i.Cd, i.CfVac, cfO, i.CfVac - cfO, v.Cd - i.Cd, v.CfVac - i.CfVac);
+    check(v.err.empty() && i.err.empty() && v.steps > 2000 && i.steps > 2000, "twins live");
+    // UNMET as measured (masterplan_combnozzle A21: -1.10e-4): printed, not counted (P0's rule for a recorded UNMET).
+    std::printf("  %s G4.5 |CdB - Cd_twin| %.2e <= 1e-4\n", std::abs(cdB - v.Cd) <= 1e-4 ? "[PASS]" : "[UNMET (recorded, A21)]",
+                std::abs(cdB - v.Cd));
+    check(std::abs(cdB - v.Cd) <= 2e-4, std::format("G4.5 regression: |CdB - Cd_twin| {:.2e} stays <= 2e-4", std::abs(cdB - v.Cd)));
+    check(std::abs(i.CfVac - cfO) <= 1e-5, std::format("the inviscid twin vs the closed oracle {:.2e} <= 1e-5", std::abs(i.CfVac - cfO)));
+    check(std::abs(cfB - v.CfVac) <= 1e-4, std::format("G4.5 |CfBvac - CfVac_twin| {:.2e} <= 1e-4", std::abs(cfB - v.CfVac)));
+    // The control: Cd on T0u (A3's normalisation of the station: sqrt(T0u / T0b) ~ 1/sqrt(sigma)).
+    const double T0u = 1.0003489340123555 / (1.4 * 0.042 * 0.042), T0b = 2024.7588104045626, cdU = cdB * std::sqrt(T0u / T0b);
+    std::printf("  control: Cd on T0u %.6f, off the twin by %.3f\n", cdU, cdU - v.Cd);
+    check(std::abs(cdU - v.Cd) >= 0.1, "G4.5 control: Cd on T0u misses by >= 0.1");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1753,6 +1856,8 @@ int main(int argc, char** argv)
     } else if (m == "q1dshock") q1dShock();
     else if (m == "ambient") ambient();
     else if (m == "twin") twin();
+    else if (m == "react") reactRun();
+    else if (m == "reacttwin") reactTwin();
     else if (m == "ledger") {
         ledgerGate();
         thrustCli();

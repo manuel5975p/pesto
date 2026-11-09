@@ -133,12 +133,27 @@ int runFvFlame(const Case& c, const CheckpointContext& ckx)
         if (!t) return die(exitInput, t.error());
         tfles = *t;
     }
-    FvState ic = fvFlameIC(c, fm, spec, fs);
+    std::vector<FvBc> bcTable = fvBcsOf(fm, spec, fs.fs, 1.0);
+    // masterplan_combnozzle P4: a [nozzle] run starts from the composition design (docs/nozzle.md "Reacting").
+    FvState ic;
+    if (spec.nozzle) {
+        auto st = fvFlameNozzleStart(c, fm, spec, fs, *probe, bcTable);
+        if (!st) return die(exitInput, st.error());
+        const FvReactingDesign& d = st->design;
+        if (!c.quiet)
+            std::printf("# reacting nozzle design: eps_c %.10g, M_u %.10g, u_u %.10g, rho_u %.10g, T0b %.10g, p0b %.10g, "
+                        "p0b/p0u %.10g, M_b %.10g, M_e %.10g, CFvac %.10g, A_ref %.10g (vol/L %.10g), chamber %d of %d slabs\n",
+                        probe->area() / spec.nozzle->astar, d.Mu, d.uu, d.rhou, d.b.T0b, d.b.p0b,
+                        d.b.p0b / (d.pu * std::pow(1 + 0.5 * (fs.fs.gamma - 1) * d.Mu * d.Mu, fs.fs.gamma / (fs.fs.gamma - 1))),
+                        d.b.Mb, d.Me, d.CFvac, probe->area(), probe->meanArea(), probe->chamberBins(), probe->bins());
+        ic = std::move(st->ic);
+    } else {
+        ic = fvFlameIC(c, fm, spec, fs);
+    }
     // --turb (M5, docs/fvcomp.md "Turbulence"): the structured box's field at the
     // centroids (IC) and swept past the xlo faces (per-face Far rows after the patch rows).
     std::optional<FvTurb> turb;
     std::optional<TurbSweep> turbSweep;
-    std::vector<FvBc> bcTable = fvBcsOf(fm, spec, fs.fs, 1.0);
     std::vector<int> bcRow;
     const int turbFirst = int(bcTable.size());
     if (c.flameTurb > 0) {
@@ -193,8 +208,8 @@ int runFvFlame(const Case& c, const CheckpointContext& ckx)
     if (c.flamePremix2) rr.premix = c.premix;
     rr.shockDtAuto = c.shockDtAuto;
     // masterplan_combnozzle P3: [nozzle] and [thrust] on the hll flame route (validate: no rest
-    // state, total with y). The nozzle columns and the ledger as dns flow's; the burnt station's
-    // columns are P4's.
+    // state, total with y). The nozzle columns and the ledger as dns flow's; P4: the burnt station's
+    // columns (p0b T0b CdB CfBvac CfB).
     if (spec.nozzle) {
         const auto total = std::ranges::find(spec.patches, FvPatchKind::Total, &FvPatchSpec::kind);
         rr.nozzle = FvNozzleRun{.astar = spec.nozzle->astar,
@@ -209,7 +224,8 @@ int runFvFlame(const Case& c, const CheckpointContext& ckx)
                                      .t0 = rr.nozzle->t0,
                                      .astar = rr.nozzle->astar,
                                      .gamma = fs.fs.gamma,
-                                     .Rgas = kRgasBox};
+                                     .Rgas = kRgasBox,
+                                     .station = *spec.thrust->station};
     }
     if (turbSweep) {
         rr.turbSweep = &*turbSweep;
