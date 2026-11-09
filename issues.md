@@ -2564,19 +2564,32 @@ at sigma 1 to 3.4e-13 of scale on every cell, shock and wedge included.
   supersonic cone foam's p0 error is -1.6e-3, -9.7e-4 at 160, 320 (order 0.74) and its T0 error -3.4e-4,
   -2.4e-4; dns -3.4e-4, -6.9e-5 (order 2.3), T0 5.5e-6, 1.7e-6. So the flat +2e-3 wall offset past x 1.5
   is mostly foam's. Its cause inside foam (Euler in time on a low-dissipation flux?) is not proved.
+  **One row reproduces it** (masterplan_combnozzle R12, A12): nc A, 1 x nx, rhoCentralFoam Kurganov vanLeer to t 2.4 s:
+  cone p0 error -1.71e-3 / -1.39e-3 (t 2.1 / 2.4) at 200, -1.21e-3 / -9.0e-4 at 400 (order ~0.6); T0 -3.8e-4 / -2.9e-4,
+  -2.8e-4 / -2.0e-4 (2D: -3.4e-4, -2.4e-4 at 160, 320); not settled (p moves 1.2e-3, 2.0e-3 of p0 between t 2.1 and 2.4,
+  growing with nx). Upwind (sigma 1) on the same row: steady to 6e-15, T0 exact, p0 -1.3e-2. dns on the row: CfVac
+  order 2.0 to 2.1e-6 (G2.5). So Z4 is foam's own 1D behaviour at vanLeer: no axis focus, no 2D. The 800 rung and B (x_s)
+  were cut (CPU budget).
 - Z5. Axis focus: a pointwise axis M is no parity number. B exit axis M gap 9.6e-3, 1.40e-2 at 160, 320: it
   grows; vanLeer vs Minmod 1.2e-2, 4.0e-3. Cause open.
 - Z6. Post-shock wall p0 3.0% gap [A1]: unexplained, not re-read by a gate.
 - Z7. LTS on `Total`: stall [R] vs A2's 2.3e-12 on Riemann: open, `--steady` refused meanwhile.
 - Z8. Structured steady odd-even: gate 34's order 1.23 may be the same mode: unproven. No structured D3.
-- Z9. Foam's one-row L1 p 2e-3 vs dns 4e-5 [A2 E11]: unexplained, not dns's.
+- Z9. Foam's one-row L1 p 2e-3 vs dns 4e-5 [A2 E11]: unexplained, not dns's. Same item as Z4 (R12): foam vanLeer on
+  one row does not settle, its p moves 1.2e-3 of p0 over t 2.1 to 2.4 s at 200 cells (2.0e-3 at 400).
 - Z10. Line sensor on a flame unbracketed: `Shock + C0` refused.
-- Z11. Line sensor on tets, snappy cells: no opposite means no line; unmeasured.
+- Z11. Line sensor on tets, snappy cells. **Measured, refusal built** (masterplan_combnozzle R8, A11, docs/nozzle.md
+  "Sensor"): unlined cells (an active face with no opposite at cos <= -0.5; wedge axis prisms exempt) are 0 on every hex
+  mesh, cyl2d_snappy, and A1's prism75, tet75, tetdual (1.99, 1.99, 7.40 lines per cell): Kuhn tets and union-jack prisms
+  have a <= 60 deg opposite on every face, so the sensor reads zigzag lines there and D3 acts along them. A regular tet
+  is unlined: `--shock` refuses it by count (exit 3). Open: D3 / the sensor along 60 deg zigzag lines is ungated (P5).
 - Z12. Total inlet under sonic backflow diverged once [A3]; no guard built, exit 7 by `stableDt`.
 - Z13. Hoop term: one-column model, u_r only, Pr 2; G24 is the proof: 0.37 uniform, 0.58 tanh of the bound, on
   w = 0 only. `d_z` in the formula, not `|d|`: amendment A5.
 - Z14. `FvRaster` on a wedge: built, PNG frames of `nozzle_W` show the z = 0 plane, read by eye once; no gate.
-- Z15. Plume box: next cycle. Needs `Far` p, t, u; S1 contact; foam domain ladder; RANS for real separation.
+- Z15. Plume box: next cycle, placed in masterplan_combnozzle P7 (after viscous walls). Needs `Far` p, t, u; S1 contact;
+  foam domain ladder; RANS for real separation. Until then a supersonic exit is ambient-proof by construction (G2.7: state
+  and row bytes equal across p_a, `exitSuper` 1); `_thrust.csv` flags `exitSuper < 1`.
 - Z16. FP32 D3 and FMA: G25 reads compensated -1.6e-8 mdot, 0.000 cells x_s vs FP64, plain -2.0e-5, on the
   planar B at t* 150; FMA itself not separated.
 - Z17. **The chamber rings past t* 1800 on the `nc` wedge**: out/in - 1 reads +-3e-3 at single samples, a mean of
@@ -2599,6 +2612,11 @@ at sigma 1 to 3.4e-13 of scale on every cell, shock and wedge included.
   the length grows 13%); exit axis M gap A 7.5e-4, 1.6e-3, B 9.6e-3, 1.4e-2, both rising. Only volume, wall, mdot and
   A's Cf fall (B's Cf rises 3.6e-5, 2.6e-4). dns x_s 3.0716, 3.0696, 3.074: not monotone; foam 3.0825, 3.0820 at 160,
   320. A flat gap is a bug or a stated model gap: unattributed. Needs foam at 640 (cut).
+  **One row** (masterplan_combnozzle R12, G2.6, A10): dns x_s 3.08025, 3.08188, 3.08240 at 200, 400, 800 vs the quasi-1D
+  3.08380 (-0.07 h, -0.08 h, -0.12 h, settled from t* 50; order 0.88, 0.46: UNMET on order), Fexit -1.3e-5, -3.2e-6,
+  -5.9e-7 (order 2.0, 2.4). The 2D dns x_s sits ~1e-2 upstream (3.0716, 3.0696 at 160, 320): ten times the one-row
+  error at a like h, so the 2D offset is not the row algebra; it is 2D (the shock foot, a curved shock) or the 2D
+  scheme. Foam's one-row B was cut (CPU budget).
 
 ### Reacting nozzle (`docs/nozzle.md` "Reacting", `plans/masterplan_combnozzle.md`)
 
@@ -2629,6 +2647,17 @@ fails as required. Open:
 - N5. **dns − foam on one mesh does not shrink at a clean order** (+1.38e-3, +4.6e-4, +2.3e-4: ratios 3.0, 2.0).
   Inside G1.2's band at every rung (4× below the smaller own error at 30 cells); the 30-cell gap is of the size
   of foam's missing viscous work (G1 reading) and of dns' O(M²) Richardson spread. No 60-cell rung (budget).
+
+P2, the minimal CD nozzle and the thrust ledger (docs/nozzle.md "Thrust", "Quasi-1D"; amendments A8-A13):
+- N6. **G2.3 UNMET as specified (v == 0.0 bitwise on one row)**: the wall face's S_y and the axis face's differ by an ulp
+  per cell (2.2e-19 to 8.7e-19 absolute, ~2e-16 relative; OpenFOAM's face fan on the slanted quad), so v is a rounding
+  field: max |v|/c 1.4e-17, 7.2e-18, 7.1e-17 (parabola 200, 400, 800), <= 1.9e-16 on nc A, B and the twin (G2.3b,
+  band 1e-12, counted). The x faces' S_y is exactly 0.0. A 1e-9 x-jitter of one axis node gives 6.7e-12 (the control).
+  No fix: the geometry is OpenFOAM's by invariant.
+- N7. **G2.6 UNMET on order**: one-row x_s within 0.12 h of the quasi-1D shock at every rung, settled, but the (p1 +
+  p2)/2 crossing's sub-cell offset (-0.07 h, -0.08 h, -0.12 h) is not monotone in h: orders 0.88, 0.46 vs >= 0.9.
+  The post-shock integrals converge at order 2 (Fexit, wall). Stop rule: recorded, P4 proceeds (its nozzle is smooth).
+  `--shock-d4 0` (reported): x_s 3.08016, 3.08190, 3.08241, Fexit 1.5740346, 1.5740521, 1.5740563: D3 moves x_s <= 1e-4.
 
 ## Older open items (details in CLAUDE.md)
 

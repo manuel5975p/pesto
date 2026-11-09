@@ -4,6 +4,7 @@ the job spec for `simjob submit --spec ROOT/NAME.json --inherit-env --wait`. Sou
 
   A, B, W      tests/data/fv/nozzle_{A,B,W}: 80x16, upwind (T1): supersonic exit, normal shock, 20 deg y = r wedge
   G            tests/data/fv/nozzle_G: B at gamma 1.2
+  QA, QV, RT   tests/data/fv/nozzle_{QA,QV,RT}: one row (nc 200 upwind, nc 200 vanLeer, react twin 400 upwind)
 """
 import json
 import os
@@ -28,6 +29,11 @@ CASES = {
     "B": (dict(nx=80, ny=16, end=2.4, write=0.3, co=0.2, exit="fixed", pb=0.6), 280, 1),
     "W": (dict(nx=80, ny=16, mode="wedge", dphi=20.0, end=2.4, write=0.3, co=0.8, exit="extrapolate"), 280, 1),
     "G": (dict(nx=80, ny=16, end=2.4, write=0.3, co=0.2, exit="fixed", pb=0.6, gamma=1.2), 280, 1),
+    # masterplan_combnozzle P2: one row (the quasi-1D FV scheme). QA: nc, G2.8's T1; QV: QA at vanLeer (recorded);
+    # RT: the react contour's inert twin (lc 0, eps_c = eps_e = 6.25), G2.9's T1.
+    "QA": (dict(nx=200, ny=1, end=2.4, write=0.3, co=0.2, exit="extrapolate"), 280, 1),
+    "QV": (dict(nx=200, ny=1, end=2.4, write=0.3, co=0.2, exit="extrapolate", recon="vanLeer"), 280, 1),
+    "RT": (dict(contour="react", lc=0.0, nx=400, ny=1, end=2.4, write=0.3, co=0.2, exit="extrapolate"), 280, 1),
 }
 
 

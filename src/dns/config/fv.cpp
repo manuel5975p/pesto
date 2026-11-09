@@ -182,6 +182,7 @@ std::optional<ConfigError> fvNozzleScope(const RawConfig& r)
                 return ConfigError{2, "--bc", std::format("patch `{}`: --inviscid: a no-slip wall needs viscosity, use type = \"slip\"", p.name)};
     }
     if (bc.nozzle && !hll) return ConfigError{2, "--bc", "[nozzle] needs --shock hll"};
+    if (bc.thrust && bc.thrust->station) return ConfigError{2, "--bc", "[thrust].station is the reacting nozzle's (dns flame)"};
     if (hasTotal && !bc.nozzle) return ConfigError{2, "--bc", "a total patch needs [nozzle] (the rest state)"};
     if (r.given.contains("--foam-write") && !(r.foamWrite > 0.0 && std::isfinite(r.foamWrite)))
         return ConfigError{2, "--foam-write", "must be finite and > 0"};

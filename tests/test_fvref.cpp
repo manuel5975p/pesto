@@ -15,6 +15,7 @@
 //   E6  u checkerboard on 100:1 cells, Pr 0.72/2/7: the momentum 4/3
 //   `test_fvref reactor`: the 0D reactor's quadrature and FvRef march (fvref_reactor.hpp)
 #include "dns/fvref.hpp"
+#include "fvref_ledger.hpp"
 #include "fvref_nozzle.hpp"
 #include "fvref_reactor.hpp"
 
@@ -1177,6 +1178,7 @@ int main(int argc, char** argv)
     if (argc > 1 && std::string(argv[1]) == "t1r") return dnstest::noz::t1r();
     if (argc > 1 && std::string(argv[1]) == "hoop") return dnstest::noz::hoop();
     if (argc > 1 && std::string(argv[1]) == "reactor") return reactorHost();
+    if (argc > 1 && std::string(argv[1]) == "ledger") return dnstest::led::run();
     g1();
     g2();
     g3();

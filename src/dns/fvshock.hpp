@@ -8,7 +8,9 @@
 #include "dns/fvgrad.hpp"
 
 #include <cstdint>
+#include <expected>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace dns {
@@ -25,6 +27,15 @@ struct FvShockLines
 // under every CellOrder. Pre: geom = fvFaceGeom of fm. Post: a uniform periodic box gives
 // one line per axis per cell; an axis prism has no radial line.
 FvShockLines fvShockLines(const FaceMesh& fm, const FvFaceGeom& geom);
+
+// Cells with an active CSR entry that has no opposite (fvShockLines' rule: no active entry with cos
+// <= -0.5): tets, triangles, prisms off the axis. On a wedge FaceMesh (wedgeHalf > 0) the 5-face axis
+// prisms are exempt: their radial line stops by design (docs/nozzle.md "Sensor"). A hex mesh gives 0.
+long fvUnlinedCells(const FaceMesh& fm, const FvFaceGeom& geom);
+
+// --shock's mesh rule (masterplan_combnozzle R8, issues.md Z11): every cell lined, else the refusal
+// text by count (the driver's exit 3). Errors also: fvFaceGeom's.
+std::expected<void, std::string> fvShockMeshCheck(const FaceMesh& fm);
 
 // Sensor bytes of p: shockByte of max over the cell's lines of shockJump (a NaN sticks);
 // 0 on a cell with no whole line. Pre: p, b sized nC.

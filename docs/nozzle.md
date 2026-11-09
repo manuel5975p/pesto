@@ -23,7 +23,7 @@ itself). `slip` walls need `force = true` for `Fwall`. Stats append `shockCells 
 `[nozzle]`, `mdotIn mdotOut Fwall Fin Fexit Cd Cf`: `Cd = mdotOut / ideal(p0, T0, A*)`, `Cf = Fexit /
 (p0 A*)`, `Fexit`, `Fin` outward patch fluxes at pRef 0, `Fwall` gauge at the rest p. A wedge's numbers
 are per wedge, not 2 pi. `--foam-write DT`: `PREFIX_foam/<t>/{p,T,U,rho}`, box units, polyMesh cell order,
-17 digits, patches from B.
+17 digits, patches from B. `[thrust]` (`pa`): the impulse ledger and `PREFIX_thrust.csv` ("Thrust").
 
 ## Scheme
 
@@ -43,6 +43,26 @@ Label: `Euler` or `laminar`, never DNS: D3 is numerical dissipation everywhere, 
 The opposite of a CSR entry is the most antiparallel outward normal, cos <= -0.5, ties to the lowest
 `srcFace`. A line counts only if its 5 cells exist: an axis prism has no radial line, rows 0, 1 read their
 x line. The structured rule (a blocked read is the centre) reads a first difference at a wall.
+
+**Mesh rule** (`fvUnlinedCells`, `fvShockMeshCheck`; masterplan_combnozzle R8). A cell is unlined when an active face
+has no opposite (no other face's outward normal at cos <= -0.5); on a wedge FaceMesh the 5-face axis prisms are exempt.
+`--shock hll|sense` on a polyMesh (`dns flow`, `dns flame`) refuses any unlined cell at Acquire, exit 3, before the GPU:
+`mesh: --shock needs a mesh line through every face: N of M cells have a face with no opposite (tets, triangles; ...)`.
+The library (FvRef, DeviceFvComp) stays capable. Counts (`fvshock_unlined`; analyst scratch meshes by argv):
+
+| mesh | cells | unlined | note |
+|---|---|---|---|
+| nozzle_A, nozzle_B, nozzle_QA | 1280, 1280, 200 | 0 | hex |
+| nozzle_W | 1280 | 0 | 80 axis prisms exempt (80 without the exemption) |
+| box_cyclic, box_refined | 24, 276 | 0 | |
+| cyl2d_snappy | 1084 | 0 | 8 five-face cells, all lined |
+| tet_small (Kuhn tets) | 48 | 0 | 1.67 lines per cell |
+| prism75, tet75, tetdual (A1) | 6304, 18912, 5346 | 0, 0, 0 | 1.99, 1.99, 7.40 lines per cell |
+| tet_regular (one regular tet) | 1 | 1 | refused: cos -1/3 between every face pair |
+
+So the analysts' premise "a tet has no opposite face, sigma 0, bare KG" is false for the Kuhn split, the union-jack
+prisms and their polyDual: every face there has a <= 60 deg opposite and the sensor reads lines (issues.md Z11). The
+rule refuses near-regular tets (a Delaunay mesher's), not these.
 
 **D3.** Steady KG has an odd-even mode: bare, source flow L1 p 1.255e-3 at 256, order 1.00, sawtooth 1.11e-3.
 The ruled term: 3.25e-5, order 1.98, sawtooth 7.2e-6. lambda is |u.S|: 0 on a wall-normal face.
@@ -135,10 +155,103 @@ Cost. Dispatches per step, `tools/fv/shock_cost.sh`: none 18.4, sense 20.4, hll 
 20480 cells, FP32, a hot start: none 0.126, sense 0.131, hll 0.210 ms/step (+67%). Launch-bound: the dt every step and three
 face passes. The nozzle itself, mostly cold, 0.142.
 
+## Thrust
+
+`[thrust]` in `--bc` (`pa`, required, >= 0, a ratio as `[nozzle] p`; `station`: `dns flame` only, P4; needs
+`[nozzle]`) turns on the impulse ledger and writes `PREFIX_thrust.csv`, 17 digits, one row per stats row. Absent: no
+launch, no buffer, no file, `_stats.csv` byte for byte. `--checkpoint-dt`, `--restart`, `--wall-limit` with it: exit 2
+(the ledger is not checkpointed).
+
+**Ledger** (`DeviceFvComp::setLedger`, `FvLedger`, FvRef's twin `march(..., &ledger)`). Per stage, after the fluxes,
+per patch and state row: `S_k = sum_f F_f` over the patch's materialized boundary faces (FP64, one block per patch,
+thread partials in ascending face order, a shared-memory tree; no atomics), and `sum_c V omega`. At the step's end,
+one thread: `I += (w0 S_0 + w1 S_1) + w2 S_2` with the weights the stage writes used (`fv_comp.hip` `step`):
+`w0 = w1 = cb2 (cb1 dtR)`, `w2 = R(cb2 dtR)`, `cb1 = 1/4`, `cb2 = R(2/3)`, `ca + cb = 1` exactly. So per row k
+
+    P_k(t) - P_k(0) + sum_roles I_k = q Omega [E] - Omega [fuel]      to rounding, on any mesh
+
+`P_k = sum_c V q_k` (hi + lo, Neumaier). Roles by BC kind: in (total, inflow, far), exit (outflow), side (`wedge`
+rows, a slip on a `symmetryPlane`/`symmetry` patch: the planar axis), wall (every other wall, slip).
+
+**Columns.** `t step dt`, `P_{mass,mx,my,mz,E,ry}`, `I_{in,exit,wall,side}_{...}`, `Omega`, `res_{...}` (the identity's
+left side minus its right), then `Fmom Fpres Texit Twall exitSuper mdotIn mdotOut CfVac Cf cstar`:
+
+    Texit = sum_exit (F - pa S).a                   sampled, the current state
+    Twall = -sum_{in, wall, side} (F - pa S).a - (sum_c V dq/dt).a      the same number by the gather's telescoping
+    window  Tvac = Delta I_exit.a / Delta t         since the previous row: sample-free
+    CfVac = Tvac/(p0 A*), Cf = (Tvac - pa sum_exit S.a)/(p0 A*), cstar = p0 A*/mdotOut, mdotIn/Out window means
+    Fmom = sum_exit mdot_f (u_B.a), Fpres = sum_exit (p_B - pa) S.a; exitSuper = exit area fraction u_B.n >= c_B
+
+`Cf` at `pa` is ambient-valid only while `exitSuper == 1`; else it is ambient-dependent and needs the plume box (Z15).
+The CV is the whole mesh; the plume box's exit plane will be a faceZone (OpenFOAM `surfaceFieldValue` integrates the
+same faces), never a cell-centre sum. Any window is `Delta I / Delta t` of two rows.
+
+| gate | rig | measured | band |
+|---|---|---|---|
+| G2.1 | FvRef, random states, `sum_c V R + sum_bnd F - src` / `sum |F|`, every row | box_cyclic 2.4e-17, box_refined 5.6e-18, cyl2d_snappy 2.9e-18, nozzle_A 1.9e-17, nozzle_W 7.3e-16, q1d 2.3e-16, q1d + C0 1.2e-16 | 1e-14 |
+| G2.2 | device FP64, rest + ramp 40, 1000 steps through it: max res_k / S_k | nozzle_A 3.8e-15, nozzle_W 3.7e-15, q1d 4.6e-15; Texit - Twall 1.0e-14, 5.1e-15, 3.3e-14 | 1e-12 |
+| G2.2 ctrl | weights 1/3 each | 1.1e-5, 1.3e-5, 2.4e-5 | >= 1e-6 |
+| G2.2 | FvRef ledger vs device, 200 steps | 1.2e-16, 2.1e-16, 9.3e-17 | 1e-13 |
+| G2.10 | nozzle_A 80x16 through the CLI, every `_thrust.csv` row; window [140, 240] Cf | res 6.5e-15, Texit - Twall 1.8e-16; Cf 1.439005 | [1.43700, 1.44315] |
+| L1 | FvRef march 400 steps, inert (hll) and C0 (KG), res / S | 6.7e-16, 5.2e-16 | 1e-12 |
+
+## Quasi-1D
+
+`nozzle_mesh.py --ny 1` (planar): one row of cells, i lines vertical, `wall` on top, `axis` (symmetryPlane) below. It
+IS the quasi-1D FV scheme: the wall's `p_P S` is `p dA`, the x faces' S_y is exactly 0.0, and the wall's S_y and the
+axis's cancel per cell to an ulp (not bitwise: OpenFOAM's fan on the slanted quad, 2e-19 of 4e-3). So from v = 0 the
+march keeps |v|/c at rounding, 1e-17 to 2e-16 (G2.3b; a 1e-9 axis node shift gives 6.7e-12). Closed oracles: area-Mach,
+the quasi-1D normal shock (`p_b` sets A_s), `C_F,vac = Gamma sqrt(2g/(g-1)(1 - (p_e/p0)^((g-1)/g))) + (p_e/p0) eps_e`.
+Rig (`gpu_fv_nozzle_q1d`, `_q1dshock`, `_ambient`, `_twin`): the generator's q1d IC with v 0, total + riemann, FP64,
+hll eps 1/16, every number a window mean from the ledger over the last quarter of tt; A* the contour's (y* 1 x depth),
+M_e and p_e from the exit fluxes (`fvExitMach`).
+
+| gate | case | 200 | 400 | 800 | order | band |
+|---|---|---|---|---|---|---|
+| G2.4 | parabola R 20, eps 1.4: \|Cd - 1\| | 3.82e-6 | 9.80e-7 | 2.48e-7 | 1.96, 1.98 | >= 1.8 |
+| | \|CfVac - 1.3794635\| | 5.40e-6 | 1.36e-6 | 3.27e-7 | 1.99, 2.05 | >= 1.8; 1e-5 at 400 |
+| | \|M_e - 1.7632052\| | 7.54e-7 | 1.39e-7 | 2.16e-8 | 2.44, 2.69 | >= 1.8 |
+| ctrl | `force` sigma 1 CfVac | 1.90e-3 | 9.53e-4 | 4.78e-4 | 0.99, 1.00 | fails: >= 1e-4, <= 1.2 |
+| G2.5 | nc A, eps 2: CfVac - 1.457600 | -3.42e-5 | -8.68e-6 | -2.12e-6 | 1.98, 2.03 | 2e-4 at 400, >= 1.5 |
+| | Fin + 2.595093 | +3.70e-6 | +1.01e-6 | +3.15e-7 | | reported |
+| | wall - 1.137493 | +3.05e-5 | +7.67e-6 | +1.81e-6 | | reported |
+| | p_e/p0 - 0.093933 | +5.3e-7 | -1.6e-7 | -3.1e-7 | | reported |
+| G2.6 | nc B, p_b 0.6: x_s - 3.08380 | -3.55e-3 (0.07 h) | -1.92e-3 (0.08 h) | -1.40e-3 (0.12 h) | 0.88, 0.46 | <= 1 h; **>= 0.9 UNMET** |
+| | Fexit - 1.574057 | -1.32e-5 | -3.19e-6 | -5.88e-7 | 2.05, 2.44 | 5e-4 at 400 |
+| | wall - 1.021036 | +9.47e-6 | +2.17e-6 | +2.73e-7 | | reported |
+| d4 0 | x_s; Fexit (R6 fallback evidence) | 3.08016; 1.5740346 | 3.08190; 1.5740521 | 3.08241; 1.5740563 | | reported |
+| ctrl | p_b 0.606 at 800: x_s moves | | | 6.06e-2 (43x the error) | | fails |
+
+x_s is the linear crossing of (p1 + p2)/2 (the oracle's M1 2.04716), settled from t* 50 at every rung; its sub-cell
+offset is not monotone in h, the post-shock integrals converge at order 2 (issues.md N7). G2.7 (nc A 200, 20000
+steps at a fixed dt, riemann at p_a/p0 0.01, 0.093933, 0.45): state bytes and every row column but the p_a ones
+equal; Cf - (CfVac - (p_a/p0) eps_e) 2.2e-16, 1.1e-16; exitSuper 1 at every sample; `exit = "fixed"` at 0.45 diverges
+(the bytes break).
+
+**The react twin** (G2.9; `--contour react --lc 0`, eps_c = eps_e 6.25, P4's nozzle half in nozzle units): CfVac vs the
+oracle 1.608145 (gamma 1.4), 1.678517 (gamma 1.2), FP64, riemann p_b 0.005, tt 160:
+
+| gamma | 400 | 800 | 1600 | 3200 | orders |
+|---|---|---|---|---|---|
+| 1.4 | -4.26e-4 | -1.33e-4 | -4.32e-5 | -1.45e-5 | 1.68, 1.63, 1.57 |
+| 1.2 | -4.25e-4 | -1.34e-4 | -4.36e-5 | -1.45e-5 | 1.66, 1.62, 1.59 |
+
+The band (1e-4 at the coarse rung, falling) holds from 1600 (h 0.01; P4's xi grid is h ~ 1.1e-3); 400 and 800 miss it
+(recorded). The error is Cd's (2.8e-4 at 400): the cosine throat's curvature radius is 0.62 y* upstream, 5.6 down (C1).
+Control: the gamma 1.2 oracle against the 1.4 run, 4.22%.
+
+**T1 on one row** (G2.8, G2.9): `force` sigma 1 from the q1d IC to t 2.4 s vs rhoCentralFoam upwind on the same
+directory, every cell p, T, u (v on the speed scale: both are rounding fields): `nozzle_QA` (nc 200) 4.9e-14, mdot vs
+foam 3.1e-15, 104442 steps; `nozzle_RT` (twin 400) 2.4e-14, 1.8e-14, 132768 steps. Controls: the route's own flux (KG +
+D3) 8.97e-3 (the plan's >= 1e-2 UNMET by threshold, replaced by >= 1e-3), gas R + 1e-6 1.0e-6.
+
 ## Not built, refused
 
 `--steady` (LTS on `Total` stalls on the host, Z7), LES, RANS, species, gravity, body force, `--turb`: refused by name
-(`dns/fvmodules`, axis `capture`). Plume box, chamber, flame: next cycle. Structured D3: no.
+(`dns/fvmodules`, axis `capture`). Plume box (P7), the reacting chamber (masterplan_combnozzle P3, P4): next. Structured
+D3: no. `[thrust]` with checkpoints: refused (the ledger is not checkpointed); `[thrust].station` on `dns flow`: refused
+(the reacting nozzle's burnt station, P4). The ledger refuses gravity, a body force, RANS and local time stepping (their
+sources are no boundary flux).
 
 ## Bent invariants
 
@@ -167,5 +280,12 @@ CLAUDE.md is not edited. For the user:
 - **Compressible walls carry no D.**
 - **`--gamma` on FV polyMesh routes is one constant gamma for fresh and burnt gas**; Lambda is gamma-free; the burnt
   T offset -(sigma^2 - 1)(gamma - 1) M^2/(2 sigma) is its gate (P1 G1.7: D +4.81e-5 / +4.75e-5 vs 4.8e-5).
+- **Thrust is the impulse ledger**: FP64 sums of the materialized boundary F per stage, weights `cb2 (cb1 dtR), cb2
+  (cb1 dtR), R(cb2 dtR)` read from the stage coefficients. The exit form equals the wall form by the identity; window
+  thrust = Delta I / Delta t. Never a cell-centre sum, never a sampled mean.
+- **A one-row planar FaceMesh is the quasi-1D FV scheme**: v a rounding field (|v|/c <= 1e-12; not 0.0: the wall's and
+  the axis's S_y differ by an ulp); area-Mach and the normal shock are its closed oracles.
+- **`--shock` is refused on meshes with unlined cells** (wedge axis prisms exempt); Kuhn tets and union-jack prisms
+  are lined.
 - **A foam parity gap is a two-sided number.** In the supersonic cone foam at vanLeer holds p0 to -9.7e-4 at 320 x 64
   and dns to -6.9e-5: the gap is mostly foam's.

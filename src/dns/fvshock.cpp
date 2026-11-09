@@ -2,7 +2,10 @@
 
 #include "dns/shockflux.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <format>
+#include <ranges>
 
 namespace dns {
 namespace {
@@ -98,6 +101,32 @@ FvShockLines fvShockLines(const FaceMesh& m, const FvFaceGeom& geom)
         if (en >= 0) l.faceLine[2 * f + 1] = across(m, nei, en);
     }
     return l;
+}
+
+long fvUnlinedCells(const FaceMesh& m, const FvFaceGeom& geom)
+{
+    const std::vector<int> opp = oppositeEntries(m, geom);
+    long n = 0;
+    for (std::size_t c = 0; c < std::size_t(m.nC); ++c) {
+        const int first = m.cellStart[c], last = m.cellStart[c + 1];
+        if (m.wedgeHalf > 0.0 && last - first == 5) continue; // an axis prism
+        const bool unlined = std::ranges::any_of(std::views::iota(first, last), [&](int e) {
+            return geom.active[std::size_t(m.cellFace[std::size_t(e)])] && opp[std::size_t(e)] < 0;
+        });
+        n += unlined ? 1 : 0;
+    }
+    return n;
+}
+
+std::expected<void, std::string> fvShockMeshCheck(const FaceMesh& fm)
+{
+    auto g = fvFaceGeom(fm, FvFaceGradRule::AlongD, 1.0);
+    if (!g) return std::unexpected(g.error());
+    const long n = fvUnlinedCells(fm, *g);
+    if (n == 0) return {};
+    return std::unexpected(std::format("mesh: --shock needs a mesh line through every face: {} of {} cells have a face with no "
+                                       "opposite (tets, triangles; docs/nozzle.md \"Sensor\", issues.md Z11)",
+                                       n, fm.nC));
 }
 
 void fvShockSense(const FvShockLines& l, std::span<const double> p, std::span<std::uint8_t> b)

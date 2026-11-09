@@ -105,10 +105,11 @@ public:
     // <prefix>_stats.csv); cols is the header line, written verbatim. Fails
     // when the file cannot be created (the caller exits 4); a no-op success
     // when stats are not emitted. A non-empty `comment` (the run label) goes
-    // first as "# <comment>"; empty writes the file exactly as before.
+    // first as "# <comment>"; empty writes the file exactly as before. digits > 0:
+    // the rows' significant digits (_thrust.csv's 17); 0 the stream default (6).
     [[nodiscard]] std::expected<void, std::string>
     declareSeries(std::string_view name, std::span<const std::string> cols,
-                  std::string_view comment = {});
+                  std::string_view comment = {}, int digits = 0);
     // Appends one row; false when the write failed. The failure is RECORDED
     // and finish() reports it, so a caller in a time loop may ignore this.
     bool row(std::string_view series, std::span<const double>);

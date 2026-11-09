@@ -1,0 +1,28 @@
+# tools/fv/nozzle_mesh.py: p, t ratios to the --mach 1 reference (the stagnation state)
+[reference]
+length = 1
+area = 0.10000000000000001
+direction = [1, 0, 0]
+lift = [0, 1, 0]
+
+[nozzle]
+p = 0.10000000000000001
+t = 1
+astar = 0.10000000000000001
+
+[patch.inlet]
+type = "total"
+p0 = 1
+t0 = 1
+
+[patch.outlet]
+type = "outflow"
+exit = "extrapolate"
+
+[patch.wall]
+type = "slip"
+force = true
+
+[patch.axis]
+type = "slip"
+

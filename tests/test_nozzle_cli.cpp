@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
 #include <string>
 
 using dnstest::check;
@@ -92,7 +93,7 @@ int main()
     refuses(run + bc("t3", "[patch.o]\ntype = \"outflow\"\nexit = \"extrapolate\"\np = 1\n"), 3, "patch.o: exit = \"extrapolate\" reads no p, tback: give neither");
     refuses(run + bc("t4", "[patch.o]\ntype = \"outflow\"\nexit = \"riemann\"\np = 1\n"), 3, "patch.o: exit = \"riemann\" needs p and tback");
     refuses(run + bc("t5", "[nozzle]\nq = 1\n[patch.o]\ntype = \"far\"\n"), 3, "[nozzle]: unknown key 'q' (p, t, astar, axis)");
-    refuses(run + bc("t6", "[nope]\n[patch.o]\ntype = \"far\"\n"), 3, "unknown top-level key 'nope' (reference, patch, nozzle)");
+    refuses(run + bc("t6", "[nope]\n[patch.o]\ntype = \"far\"\n"), 3, "unknown top-level key 'nope' (reference, patch, nozzle, thrust)");
     refuses(run + bc("t7", "[patch.o]\ntype = \"wobble\"\n"), 3, "one of: wall, slip, inflow, outflow, far, empty, open, total, wedge");
     refuses(run + bc("t8", "[patch.o]\n"), 3, "needs type = \"wall|slip|inflow|outflow|far|empty|open|total|wedge\"");
 
@@ -168,6 +169,33 @@ int main()
     refuses(fl + " --gamma 1.2 --equivalence 1.3", 2, "--gamma: with --equivalence: not built");
     refuses("flame --mode diffusion --polymesh " + dataA + " --bc " + flBc + " --gamma 1.2" + o, 2,
             "--gamma: with --mode other than premixed: not built");
+    // [thrust] (masterplan_combnozzle R2): keys, texts, the dry-run line; --shock's mesh rule (R8).
+    std::string bcText;
+    {
+        std::ifstream in(bcA);
+        bcText.assign(std::istreambuf_iterator<char>(in), {});
+    }
+    const std::string thr = "flow --physics compressible --polymesh " + dataA + " --shock hll --mach 1 --tt 1 --inviscid" + o + " --bc ";
+    Out t = dns(thr + bc("th0", bcText + "\n[thrust]\npa = 0.05\n"));
+    check(t.rc == 0 && t.text.find("thrust     pa 0.05 (a ratio, as [nozzle] p): the impulse ledger, PREFIX_thrust.csv") != std::string::npos,
+          "[thrust] passes the dry-run and names the ledger");
+    check(dns(hll + " --inviscid").text.find("thrust ") == std::string::npos, "no [thrust]: no thrust line");
+    refuses(thr + bc("th1", bcText + "\n[thrust]\npa = 0\nq = 1\n"), 3, "[thrust]: unknown key 'q' (pa, station)");
+    refuses(thr + bc("th2", "[thrust]\npa = 0\n[patch.o]\ntype = \"far\"\n"), 3, "[thrust] needs [nozzle]");
+    refuses(thr + bc("th3", bcText + "\n[thrust]\npa = -0.1\n"), 3, "[thrust].pa: must be >= 0");
+    refuses(thr + bc("th4", bcText + "\n[thrust]\nstation = 1\n"), 3, "[thrust]: needs pa");
+    refuses(thr + bc("th5", bcText + "\n[thrust]\npa = 0\nstation = 1\n"), 2, "--bc: [thrust].station is the reacting nozzle's (dns flame)");
+    refuses("flame --polymesh " + dataA + " --bc " + bc("th6", bcText + "\n[thrust]\npa = 0\n") + " --checkpoint-dt 1" + o, 2,
+            "--checkpoint-dt: is not built with [thrust] (the impulse ledger is not checkpointed)");
+    refuses("flame --polymesh " + dataA + " --bc " + bc("th7", bcText + "\n[thrust]\npa = 0\n") + o, 2,
+            "[nozzle] belongs to the nozzle route (dns flow --shock hll --polymesh)");
+    // A regular tetrahedron has no face with an opposite: refused by count, before any GPU or output.
+    const std::string tet = std::string(DNS_MESH_DATA) + "/tet_regular";
+    refuses("flow --physics compressible --polymesh " + tet + " --bc " + tet + "/bc.toml --shock hll --inviscid --mach 1 --tt 1 --out " +
+                (tmp() / "tet").string(),
+            3, "mesh: --shock needs a mesh line through every face: 1 of 1 cells have a face with no opposite (tets, triangles; "
+               "docs/nozzle.md \"Sensor\", issues.md Z11)");
+
     std::error_code ec;
     fs::remove_all(tmp(), ec);
     return dnstest::finish();

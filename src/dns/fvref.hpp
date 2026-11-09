@@ -105,6 +105,23 @@ struct FvShock
     bool force = false;
 };
 
+// The impulse ledger (docs/nozzle.md "Thrust", masterplan_combnozzle R2): per FaceMesh patch and
+// state row (the mean flow and species, RANS scalars excluded), the time integral of the
+// materialized outward boundary flux, sum_f F_f in FP64, accumulated per step with the weights
+// the RK3 stage writes used: w0 = w1 = cb2 (cb1 dt), w2 = R(cb2 dt) (exact Shu-Osher 1/6, 1/6,
+// 2/3 in exact arithmetic). omega: the same integral of sum_c V omega (the fuel's sink).
+// Identity per row k: sum_c V q_k(t) - sum_c V q_k(0) + sum_p I[p][k] = q omega [E] - omega [fuel],
+// to rounding, on any mesh.
+struct FvLedger
+{
+    int nV = 0, nP = 0;
+    std::vector<double> I; // [patch][nV], outward
+    double omega = 0;
+
+    static FvLedger zeros(int nP, int nV) { return {nV, nP, std::vector<double>(std::size_t(nP) * std::size_t(nV), 0.0), 0.0}; }
+    double at(int p, int v) const { return I[std::size_t(p) * std::size_t(nV) + std::size_t(v)]; }
+};
+
 // A boundary table: rows (a row per patch first), and per boundary face its row.
 struct FvBcTable
 {
@@ -260,7 +277,11 @@ public:
 
     // `steps` SSP-RK3 steps of global dt on persistent workers (one spawn per
     // call); out = ca a + cb b + cr R with ca = 1 - cb. dt within stableDt.
-    void march(FvState& s, double dt, int steps, const FvState* src = nullptr) const;
+    // ledger (the device's twin, DeviceFvComp::setLedger): each stage's per-patch
+    // boundary sums in ascending face order and sum V omega in cell order, added with
+    // the stage weights. Pre: ledger sized FvLedger::zeros(patches, 5 + nY); no RANS,
+    // gravity, bodyForce or src (their sources are not boundary fluxes).
+    void march(FvState& s, double dt, int steps, const FvState* src = nullptr, FvLedger* ledger = nullptr) const;
     void step(FvState& s, double dt, const FvState* src = nullptr) const { march(s, dt, 1, src); }
 
 private:

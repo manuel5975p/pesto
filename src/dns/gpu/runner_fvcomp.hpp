@@ -69,6 +69,10 @@ struct FvCompRun
     // A nozzle on a Total inlet (docs/nozzle.md): the ramp raises the Total row's p0, no
     // boost; the stats append mdotIn mdotOut Fwall Fin Fexit Cd Cf. Empty: off.
     std::optional<FvNozzleRun> nozzle{};
+    // [thrust] (docs/nozzle.md "Thrust"): the device's impulse ledger from the run's start and
+    // PREFIX_thrust.csv, one row per stats row, 17 digits (fvThrustColumns). axis, pa, p0, t0, astar,
+    // gamma, Rgas given; q and exitArea the runner's. Empty: no ledger launch, no file.
+    std::optional<FvThrustCase> thrust{};
     // --shock hll: the sticky dt cadence (internal::shockDtEvery), unless --dt-recompute.
     bool shockDtAuto = false;
     // > 0: --foam-write, PREFIX_foam/<t>/{p,T,U,rho} every foamWrite, source cell order.

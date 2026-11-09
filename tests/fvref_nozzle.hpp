@@ -592,6 +592,68 @@ inline int t1r()
     return dnstest::finish();
 }
 
+// --- The one-row planar half nozzle (masterplan_combnozzle R1): the quasi-1D FV scheme ---------
+
+// nozzle_mesh.py's planar layout at ny 1, bit for bit the generator's point and face order: nodes
+// (x_i, 0) and (x_i, y(x_i)) at z 0 and depth, i lines vertical; patches inlet, outlet, wall (wall),
+// axis (symmetryPlane), back, front (empty). x_i = x0 + i (x2 - x0)/nx as numpy's linspace.
+template <class Y>
+inline PolyMesh q1dPoly(int nx, Y&& y, double x0, double x2, double depth = 0.1)
+{
+    const int nxp = nx + 1, N = 2 * nxp;
+    PolyMesh pm;
+    std::vector<double> xs(static_cast<std::size_t>(nxp));
+    const double step = (x2 - x0) / nx;
+    for (int i = 0; i < nxp; ++i) xs[std::size_t(i)] = i == nx ? x2 : x0 + i * step;
+    for (int k = 0; k < 2; ++k)
+        for (int j = 0; j < 2; ++j)
+            for (int i = 0; i < nxp; ++i) {
+                pm.px.push_back(xs[std::size_t(i)]);
+                pm.py.push_back(j == 0 ? 0.0 : y(xs[std::size_t(i)]));
+                pm.pz.push_back(k * depth);
+            }
+    auto nid = [&](int i, int j, int k) { return i + nxp * j + k * N; };
+    pm.faceStart.push_back(0);
+    auto add = [&](std::initializer_list<int> f, int o, int n = -1) {
+        pm.faceNodes.insert(pm.faceNodes.end(), f.begin(), f.end());
+        pm.faceStart.push_back(std::int32_t(pm.faceNodes.size()));
+        pm.owner.push_back(o);
+        if (n >= 0) pm.neighbour.push_back(n);
+    };
+    for (int i = 0; i < nx - 1; ++i) add({nid(i + 1, 0, 0), nid(i + 1, 1, 0), nid(i + 1, 1, 1), nid(i + 1, 0, 1)}, i, i + 1);
+    const int nI = int(pm.neighbour.size());
+    auto patch = [&](const char* name, FoamPatchType ty, auto gen) {
+        const int st = int(pm.owner.size());
+        gen();
+        pm.man.patches.push_back({name, ty, std::int64_t(pm.owner.size()) - st, st, "", std::nullopt});
+    };
+    patch("inlet", FoamPatchType::Patch, [&] { add({nid(0, 0, 0), nid(0, 0, 1), nid(0, 1, 1), nid(0, 1, 0)}, 0); });
+    patch("outlet", FoamPatchType::Patch, [&] { add({nid(nx, 0, 0), nid(nx, 1, 0), nid(nx, 1, 1), nid(nx, 0, 1)}, nx - 1); });
+    patch("wall", FoamPatchType::Wall, [&] {
+        for (int i = 0; i < nx; ++i) add({nid(i, 1, 0), nid(i, 1, 1), nid(i + 1, 1, 1), nid(i + 1, 1, 0)}, i);
+    });
+    patch("axis", FoamPatchType::SymmetryPlane, [&] {
+        for (int i = 0; i < nx; ++i) add({nid(i, 0, 0), nid(i + 1, 0, 0), nid(i + 1, 0, 1), nid(i, 0, 1)}, i);
+    });
+    patch("back", FoamPatchType::Empty, [&] {
+        for (int i = 0; i < nx; ++i) add({nid(i, 0, 0), nid(i, 1, 0), nid(i + 1, 1, 0), nid(i + 1, 0, 0)}, i);
+    });
+    patch("front", FoamPatchType::Empty, [&] {
+        for (int i = 0; i < nx; ++i) add({nid(i, 0, 1), nid(i + 1, 0, 1), nid(i + 1, 1, 1), nid(i, 1, 1)}, i);
+    });
+    pm.man.nPoints = std::int64_t(pm.px.size());
+    pm.man.nCells = nx;
+    pm.man.nFaces = std::int64_t(pm.owner.size());
+    pm.man.nInternalFaces = nI;
+    return pm;
+}
+
+// The parabola contour y = 1 + x^2/(2 R), x in [-0.2 R, 0.2 R] (nozzle_mesh.py --contour parabola).
+inline PolyMesh q1dParabola(int nx, double R = 20.0)
+{
+    return q1dPoly(nx, [R](double x) { return 1.0 + x * x / (2.0 * R); }, -0.2 * R, 0.2 * R);
+}
+
 // --- G24, the hoop bound -------------------------------------------------------------
 
 // A flat wedge column: nx slabs of nr cells, radii r[0] = 0 .. r[nr], half angle h, patches

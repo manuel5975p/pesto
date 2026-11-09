@@ -9,6 +9,7 @@
 #include "dns/output.hpp"
 #include "dns/fvincomp.hpp"
 #include "dns/fvnozzle.hpp"
+#include "dns/fvshock.hpp"
 #include "dns/fvsimple.hpp"
 #include "dns/fvstructured.hpp"
 #include "dns/remap.hpp"
@@ -120,6 +121,14 @@ int runFvCompOn(const Case& c, const FaceMesh& fm, const FvBcSpec& spec, const F
                                 .pRef = rr.solver.pRef,
                                 .p0 = total == spec.patches.end() ? 0.0 : total->p0 * fs.p,
                                 .t0 = total == spec.patches.end() ? 0.0 : total->t0 * fs.T};
+        if (spec.thrust)
+            rr.thrust = FvThrustCase{.axis = rr.nozzle->axis,
+                                     .pa = spec.thrust->pa * fs.p,
+                                     .p0 = rr.nozzle->p0,
+                                     .t0 = rr.nozzle->t0,
+                                     .astar = rr.nozzle->astar,
+                                     .gamma = fs.gamma,
+                                     .Rgas = kRgasBox};
     }
     rr.shockDtAuto = c.shockDtAuto;
     rr.foamWrite = c.foamWrite;
@@ -227,6 +236,9 @@ int runFvCompPoly(const Case& c)
     if (!pm) return die(exitInput, pm.error());
     auto fm = FaceMesh::fromPolyMesh(*pm, CellOrder::Morton, 0, {.wedge = c.shock != ShockMode::None});
     if (!fm) return die(exitInput, fm.error());
+    // --shock reads mesh lines: a cell with a face and no opposite is refused (masterplan_combnozzle R8).
+    if (c.shock != ShockMode::None)
+        if (auto ok = fvShockMeshCheck(*fm); !ok) return die(exitInput, c.fvMeshDir + ": " + ok.error());
     if (!haveGpu(c)) return die(exitNoGpu, "no GPU device (dns flow is GPU-only)");
 #if DNS_WITH_GPU
     FvFreestream fs = fvFreestreamOf(c.mach, c.fvGamma, kRgasBox, c.fvBc.dir);

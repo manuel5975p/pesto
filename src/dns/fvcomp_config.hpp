@@ -59,6 +59,15 @@ struct FvNozzleSpec
     std::array<double, 3> axis{1, 0, 0};
 };
 
+// [thrust] of a --bc file (docs/nozzle.md "Thrust", masterplan_combnozzle R2): the impulse ledger and
+// _thrust.csv. pa: the ambient pressure (a ratio, as [nozzle] p), >= 0; station: the reacting nozzle's burnt
+// stagnation plane along [nozzle] axis (dns flame only). Needs [nozzle].
+struct FvThrustSpec
+{
+    double pa = 0;
+    std::optional<double> station{};
+};
+
 // The whole --bc file. length: L in Re = rho U L / mu. area: force reference
 // area, 0 = L x depth on a 2D mesh, required for a tally on a 3D mesh.
 // dir: unit freestream direction, lift: unit lift direction, normal to dir.
@@ -71,6 +80,7 @@ struct FvBcSpec
     std::array<double, 3> dir{1, 0, 0}, lift{0, 1, 0}, origin{0, 0, 0};
     bool hasOrigin = false;
     std::optional<FvNozzleSpec> nozzle{};
+    std::optional<FvThrustSpec> thrust{};
 
     // The resolved table, one line per patch (--dry-run).
     std::string describe() const;
@@ -93,7 +103,7 @@ struct FvMeshPatch
 std::expected<void, std::string> checkFvBc(const FvBcSpec& spec, std::span<const FvMeshPatch> mesh, bool wedgeOk = false);
 
 // The first thing in this file only the nozzle route reads ("" if none): `total`,
-// `wedge`, exit, [nozzle]. Every other route refuses it by name.
+// `wedge`, exit, [nozzle], [thrust]. Every other route refuses it by name.
 std::string fvBcNozzleKey(const FvBcSpec& spec);
 
 // The first key of this file that only `dns flame` reads, "" if none.

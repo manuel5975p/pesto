@@ -196,6 +196,15 @@ public:
     // after it the next step is the checkpointed run's bit for bit. Errors: a record
     // missing or mis-sized exit 3, an upload exit 6.
     std::expected<void, RunError> load(const Checkpoint& ck);
+    // [thrust]'s impulse ledger (FvLedger, docs/nozzle.md "Thrust"): on zeroes it, and every later
+    // step() adds per stage a fixed-order FP64 sum of each patch's materialized boundary F (one
+    // block per patch, ascending partials, no atomics) and of V omega, with the weights of that
+    // step's stage writes. Off (the default): no launch, the buffers freed. equalWeights (TEST
+    // ONLY): dt/3 per stage, G2.2's control. Errors: gravity, body force, RANS (sources that are
+    // no boundary flux), local time stepping (no one dt), an allocation.
+    std::expected<void, std::string> setLedger(bool on, bool equalWeights = false);
+    // The ledger since setLedger(true). Errors: off, a download.
+    std::expected<FvLedger, std::string> ledger() const;
     // Replace rows first .. first + rows.size() of the FvBc table in one upload (M5: the
     // turbulent inflow's per-face rows, rewritten between steps). Pre: the range is in
     // the table, every kind unchanged (else an error by name, nothing written).

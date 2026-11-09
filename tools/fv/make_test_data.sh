@@ -5,8 +5,9 @@
 # and ref/<last> (U, p, phi) and ref/residuals.csv (initial residuals per
 # iteration from log.simpleFoam). Host only, no OpenFOAM needed.
 #   tools/fv/make_test_data.sh runs/fv/if [CASE...]
-# nozzle_A nozzle_B nozzle_W nozzle_G (tools/fv/nozzle_cases.py ROOT A B W G, rhoCentralFoam, 80x16): the
-# mesh, 0/, bc.toml, ref/<last>/{p,T,U,rho}.
+# nozzle_A nozzle_B nozzle_W nozzle_G (tools/fv/nozzle_cases.py ROOT A B W G, rhoCentralFoam, 80x16), nozzle_QA
+# nozzle_RT (ROOT QA RT: one row, nc 200 and the react twin 400, masterplan_combnozzle P2): the mesh, 0/, bc.toml,
+# ref/<last>/{p,T,U,rho}.
 set -euo pipefail
 root=$1
 shift

@@ -1,0 +1,6 @@
+# One regular tetrahedron (masterplan_combnozzle G2.11): cos -1/3 between every pair of face normals, so no
+# face has an opposite: --shock refuses it by count (test_nozzle_cli).
+[reference]
+area = 1.0
+[patch.walls]
+type = "slip"

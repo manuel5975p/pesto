@@ -481,6 +481,16 @@ Device, FP64 unless named, gfx1100. `gpu_fv_nozzle_MODE`, `fvref_MODE`. Foam is 
 | Cd ladder | `gpu_fv_nozzle_cdladder` | Richardson 0.02426, -3.0% of (g + 1)/96; budget 4e-6, mdot 9e-6 |
 | FP32 | `gpu_fv_nozzle_fp32` | compensated x_s 0.000 cells, mdot 1e-8; plain 2.0e-5 |
 | matrix | `gpu_fv_comp`, `gpu_fv_cross` X6, `gpu_fv_matrix` | FV64 vs FvRef 3e-15; FV32 vs structured 1.85e-6 (own 1.64e-6), bytes 0 off |
+| ledger G2.1 | `fvref_ledger` | sum V R + sum F - src, every row, random states, 6 meshes + C0: <= 7.3e-16 of sum \|F\| |
+| ledger G2.2 | `gpu_fv_nozzle_ledger` | res_k / S_k over a ramp: A 3.8e-15, W 3.7e-15, q1d 4.6e-15; FvRef vs device 2.1e-16; 1/3 weights 1.1e-5 |
+| G2.10 | `gpu_fv_nozzle_ledger` (CLI) | nozzle_A 80x16 `_thrust.csv`: res 6.5e-15; window [140, 240] Cf 1.439005 in [1.43700, 1.44315] |
+| q1d G2.4 | `gpu_fv_nozzle_q1d` | parabola R 20, 200/400/800: CfVac - 1.3794635 5.40e-6, 1.36e-6, 3.27e-7; Cd - 1 3.8e-6, 9.8e-7, 2.5e-7; M_e 7.5e-7, 1.4e-7, 2.2e-8 |
+| q1d G2.5 | `gpu_fv_nozzle_q1d` | nc A: CfVac - 1.457600 -3.42e-5, -8.68e-6, -2.12e-6 (order 1.98, 2.03) |
+| q1d G2.6 | `gpu_fv_nozzle_q1dshock` | nc B p_b 0.6: x_s - 3.08380 -3.55e-3, -1.92e-3, -1.40e-3 (<= 0.12 h; order 0.88, 0.46 UNMET); Fexit -1.3e-5, -3.2e-6, -5.9e-7 |
+| G2.7 | `gpu_fv_nozzle_ambient` | p_a 0.01 / 0.0939 / 0.45: state bytes equal, Cf arithmetic 2.2e-16 |
+| G2.9 | `gpu_fv_nozzle_twin` | twin eps 6.25: CfVac -4.32e-5, -1.45e-5 at 1600, 3200 (gamma 1.4 and 1.2 alike); T1 nozzle_RT 2.4e-14 |
+| G2.8 | `gpu_fv_nozzle_fixed` | T1 nozzle_QA (one row) 4.9e-14, mdot 3.1e-15 |
+| unlined | `fvshock_unlined` | 0 on every hex, snappy, prism75, tet75, tetdual; 1 of 1 on a regular tet (refused) |
 
 ### 0D reactor (`fvref_reactor`, `gpu_fv_flame_reactor`; docs/chem.md "P0: the 0D reactor")
 

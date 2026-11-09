@@ -171,6 +171,23 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
     };
     if (r.ramp > 0)
         if (auto e = retarget(0.0); !e) return std::unexpected(e.error());
+    // [thrust]: the ledger from the IC on; P0 the IC's sums.
+    std::vector<FvRole> roles;
+    FvThrustCase tk{};
+    FvRoleSums ledPrev{};
+    FvRow6 P0{};
+    double tLedPrev = 0.0;
+    const int fuelRow = r.solver.chem.nY > 0 ? kFvMeanVars + r.solver.chem.fuel : -1;
+    if (r.thrust) {
+        roles = fvRoles(r.solver.bc, fm);
+        tk = *r.thrust;
+        tk.q = r.solver.chem.nY > 0 ? r.solver.chem.q : 0.0;
+        tk.exitArea = fvExitArea(fm, roles, tk.axis);
+        if (auto e = dev.setLedger(true); !e) return fail(e.error().starts_with("FV device") ? 6 : 3, e.error());
+        dns::FvState s0;
+        if (auto e = dev.download(s0); !e) return fail(6, e.error());
+        P0 = fvTotals6(fm, s0, fuelRow);
+    }
     if (!r.quiet) {
         std::printf("# %s\n# FV path: %d cells, %d internal faces, %d boundary faces, %.1f MB on the device\n",
                     r.label.c_str(), fm.nC, fm.nI, fm.nB, double(dev.deviceBytes()) / 1048576.0);
@@ -215,6 +232,8 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
     if (shockCols) cols.insert(cols.end(), {"shockCells", "byteMax"});
     if (r.nozzle) cols.insert(cols.end(), {"mdotIn", "mdotOut", "Fwall", "Fin", "Fexit", "Cd", "Cf"});
     if (auto e = out.declareSeries("stats", cols, r.label); !e) return fail(4, e.error());
+    if (r.thrust)
+        if (auto e = out.declareSeries("thrust", fvThrustColumns(), r.label, 17); !e) return fail(4, e.error());
     if (r.flame) {
         const std::string pcols[] = {"t", "x", "T", "rho", "u", "p", "Y", "omega"};
         if (auto e = out.declareSeries("profiles", pcols); !e) return fail(4, e.error());
@@ -509,6 +528,23 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
         return {};
     };
 
+    // [thrust]: one _thrust.csv row, the ledger window since the previous row.
+    auto thrustRow = [&](double dt) -> std::expected<void, RunError> {
+        FvEval ev;
+        dns::FvState rr, s;
+        if (auto e = dev.evaluate(ev, rr); !e) return fail(6, e.error());
+        if (auto e = dev.download(s); !e) return fail(6, e.error());
+        auto led = dev.ledger();
+        if (!led) return fail(6, led.error());
+        const FvRoleSums now = fvRoleSums(*led, roles, fuelRow);
+        const FvExitSample x = fvExitSample(fm, roles, ev, rr, tk);
+        const FvThrustWindow w = fvThrustWindow(ledPrev, tLedPrev, now, t, tk);
+        out.row("thrust", fvThrustRow(t, step, dt, fvTotals6(fm, s, fuelRow), P0, now, w, x, tk));
+        ledPrev = now;
+        tLedPrev = t;
+        return {};
+    };
+
     // The pseudo-time march: one row per stats cadence, the floored stop.
     if (r.steadyTol > 0) {
         const int nT = ransScalars(r.solver.rans.model);
@@ -642,6 +678,8 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
                 if (auto e = jetRow(dt); !e) return std::unexpected(e.error());
         } else if (cad.due(step, t, r.tEnd)) {
             if (auto e = statsRow(dt); !e) return std::unexpected(e.error());
+            if (r.thrust)
+                if (auto e = thrustRow(dt); !e) return std::unexpected(e.error());
             cad.logged(step);
         }
         if (out.wantsAnyFrame(t))

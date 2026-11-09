@@ -7,6 +7,7 @@
 #include "dns/flame1d.hpp"
 #include "dns/facemesh.hpp"
 #include "dns/fvlowmach.hpp"
+#include "dns/fvshock.hpp"
 #include "dns/fvturb.hpp"
 #include "dns/lowmach.hpp"
 #include "dns/output.hpp"
@@ -110,6 +111,9 @@ int runFvFlame(const Case& c, const CheckpointContext& ckx)
     }
     if (!mesh) return die(exitInput, "FaceMesh: " + mesh.error());
     const FaceMesh& fm = *mesh;
+    // --shock reads mesh lines: a cell with a face and no opposite is refused (masterplan_combnozzle R8).
+    if (poly && c.shock != ShockMode::None)
+        if (auto ok = fvShockMeshCheck(fm); !ok) return die(exitInput, c.fvMeshDir + ": " + ok.error());
     if (!haveGpu(c)) return die(exitNoGpu, "no GPU device (dns flame is GPU-only)");
     if (c.flameDiffusion)
         return runFvJet(c, fm, spec, poly ? spec.origin : std::array<double, 3>{0, c.bunsen.yc, 0}, ckx);

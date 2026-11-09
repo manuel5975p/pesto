@@ -1,0 +1,10 @@
+# A Kuhn-tet box (4 x 2 x 1, 48 tets, y and z cyclic), written by the combnozzle analyst's unstruct_mesh.py
+# (masterplan_combnozzle R8): --shock's unlined-cell refusal, verbatim through the CLI (test_nozzle_cli).
+[reference]
+direction = [1.0, 0.0, 0.0]
+lift = [0.0, 1.0, 0.0]
+area = 2.0
+[patch.xlo]
+type = "far"
+[patch.xhi]
+type = "outflow"

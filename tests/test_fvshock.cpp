@@ -18,6 +18,7 @@
 #include <format>
 #include <numbers>
 #include <set>
+#include <string_view>
 #include <vector>
 
 using namespace dns;
@@ -219,10 +220,69 @@ void orders(const fs::path& poly, FaceMeshOptions opt, const char* tag, const fs
     std::printf("  %d internal faces\n", nI);
 }
 
+// masterplan_combnozzle R8, G2.11: unlined cells per mesh (a cell with an active face that has no
+// opposite). Hex meshes 0; the wedge's axis prisms exempt; a tet mesh refused by count. Extra
+// directories (the analysts' prism / tet / polyDual scratch) by argv: counted and printed, not gated.
+void unlined(int argc, char** argv)
+{
+    std::printf("unlined cells (--shock's mesh rule)\n");
+    const fs::path fv = fs::path(DNS_MESH_DATA) / ".." / "fv", mesh = fs::path(DNS_MESH_DATA);
+    struct M
+    {
+        fs::path dir;
+        bool wedge;
+        long expect; // -1: printed only
+    };
+    const M ms[] = {{fv / "nozzle_A", false, 0},          {fv / "nozzle_B", false, 0},     {fv / "nozzle_W", true, 0},
+                    {fv / "nozzle_QA", false, 0},         {mesh / "box_cyclic", false, 0}, {mesh / "box_refined", false, 0},
+                    {mesh / "cyl2d_snappy", false, 0},    {mesh / "tet_small", false, 0},
+                    {mesh / "tet_regular", false, 1}};
+    long tet = -1;
+    for (const M& m : ms) {
+        const PolyMesh pm = must(readPolyMesh(m.dir / "constant/polyMesh"), m.dir.string());
+        const FaceMesh fm = must(FaceMesh::fromPolyMesh(pm, CellOrder::Morton, 0, {.wedge = m.wedge}), m.dir.string());
+        const long n = fvUnlinedCells(fm, must(fvFaceGeom(fm, FvFaceGradRule::AlongD, 1.0), "geom"));
+        long prisms = 0;
+        for (int c = 0; c < fm.nC; ++c) prisms += fm.cellStart[std::size_t(c) + 1] - fm.cellStart[std::size_t(c)] == 5;
+        std::printf("  %-14s %7d cells, %6ld unlined (%ld five-face cells%s)\n", m.dir.filename().c_str(), fm.nC, n, prisms,
+                    m.wedge ? ", exempt on the wedge" : "");
+        if (m.expect >= 0) check(n == m.expect, std::format("{}: {} unlined == {}", m.dir.filename().string(), n, m.expect));
+        if (m.dir.filename() == "tet_regular") tet = n;
+        if (m.dir.filename() == "tet_small")
+            std::printf("  tet_small: %.3f lines per cell (Kuhn tets: every face has a <= 60 deg opposite)\n",
+                        double(linesOf(fm).line.size() / 2) / fm.nC);
+        const auto ok = fvShockMeshCheck(fm);
+        check(ok.has_value() == (n == 0), std::format("{}: the refusal iff unlined > 0", m.dir.filename().string()));
+    }
+    check(tet == 1, std::format("tet_regular: the regular tet is unlined ({} cell)", tet));
+    // The wedge without its exemption: the axis prisms count (the control that the rule sees them).
+    {
+        const PolyMesh pm = must(readPolyMesh(fv / "nozzle_W" / "constant/polyMesh"), "W");
+        FaceMesh fm = must(FaceMesh::fromPolyMesh(pm, CellOrder::Morton, 0, {.wedge = true}), "W");
+        const FvFaceGeom g = must(fvFaceGeom(fm, FvFaceGradRule::AlongD, 1.0), "geom");
+        fm.wedgeHalf = 0.0;
+        const long n = fvUnlinedCells(fm, g);
+        std::printf("  nozzle_W with the prism exemption off: %ld unlined\n", n);
+        check(n == 80, "control: the 80 axis prisms are unlined without the exemption");
+    }
+    for (int i = 2; i < argc; ++i) {
+        const fs::path d = argv[i];
+        const PolyMesh pm = must(readPolyMesh(d / "constant/polyMesh"), d.string());
+        const FaceMesh fm = must(FaceMesh::fromPolyMesh(pm, CellOrder::Morton), d.string());
+        std::printf("  %-14s %7d cells, %6ld unlined, %.3f lines per cell (not gated)\n", d.filename().c_str(), fm.nC,
+                    fvUnlinedCells(fm, must(fvFaceGeom(fm, FvFaceGradRule::AlongD, 1.0), "geom")),
+                    double(linesOf(fm).line.size() / 2) / fm.nC);
+    }
+}
+
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    if (argc > 1 && std::string_view(argv[1]) == "unlined") {
+        unlined(argc, argv);
+        return dnstest::finish();
+    }
     periodic();
     prisms();
     rotated();

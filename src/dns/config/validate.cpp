@@ -155,6 +155,11 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
                 if (!r.fvBc) return bad(2, "--bc", "--polymesh needs --bc FILE.toml");
                 f->fvMeshDir = r.polymesh;
                 f->fvBc = *r.fvBc;
+                // masterplan_combnozzle R2: the ledger is carried state no checkpoint holds.
+                if (f->fvBc.thrust)
+                    for (const char* k : {"--checkpoint-dt", "--restart", "--wall-limit"})
+                        if (r.given.contains(k))
+                            return bad(2, k, "is not built with [thrust] (the impulse ledger is not checkpointed)");
                 if (const std::string k = fvBcNozzleKey(f->fvBc); !k.empty())
                     return bad(2, "--bc", k + " belongs to the nozzle route (dns flow --shock hll --polymesh): the "
                                               "compressible flame's open faces are far/outflow");

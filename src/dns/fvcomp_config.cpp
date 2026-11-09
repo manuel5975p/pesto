@@ -197,6 +197,22 @@ std::expected<FvNozzleSpec, std::string> parseNozzle(const toml::table& t)
     return n;
 }
 
+// [thrust]: pa required (>= 0), station optional (the flame route's).
+std::expected<FvThrustSpec, std::string> parseThrust(const toml::table& t)
+{
+    FvThrustSpec s;
+    for (const auto& [k, v] : t) {
+        const std::string key(k.str());
+        if (key != "pa" && key != "station") return Err("[thrust]: unknown key '" + key + "' (pa, station)");
+        double x = 0;
+        if (!number(v, x)) return Err("[thrust]." + key + ": must be a finite number");
+        if (key == "pa" && !(x >= 0.0)) return Err("[thrust].pa: must be >= 0");
+        (key == "pa" ? s.pa : s.station.emplace()) = x;
+    }
+    if (!t.contains("pa")) return Err("[thrust]: needs pa");
+    return s;
+}
+
 } // namespace
 
 std::expected<FvBcSpec, std::string> parseFvBc(std::string_view text)
@@ -251,10 +267,17 @@ std::expected<FvBcSpec, std::string> parseFvBc(std::string_view text)
             auto n = parseNozzle(*t);
             if (!n) return Err(n.error());
             sp.nozzle = *n;
+        } else if (key == "thrust") {
+            const toml::table* t = v.as_table();
+            if (!t) return Err("[thrust] must be a table");
+            auto s = parseThrust(*t);
+            if (!s) return Err(s.error());
+            sp.thrust = *s;
         } else
-            return Err("unknown top-level key '" + key + "' (reference, patch, nozzle)");
+            return Err("unknown top-level key '" + key + "' (reference, patch, nozzle, thrust)");
     }
     if (sp.patches.empty()) return Err("no [patch.NAME] table");
+    if (sp.thrust && !sp.nozzle) return Err("[thrust] needs [nozzle]");
     const double dl = sp.dir[0] * sp.lift[0] + sp.dir[1] * sp.lift[1] + sp.dir[2] * sp.lift[2];
     if (std::abs(dl) > 1e-12) return Err("reference.lift must be normal to reference.direction");
     return sp;
@@ -272,6 +295,8 @@ std::string FvBcSpec::describe() const
         if (p.tallied) s += ", in the force tally";
         s += "\n";
     }
+    if (thrust)
+        s += std::format("  thrust     pa {:g} (a ratio, as [nozzle] p): the impulse ledger, PREFIX_thrust.csv (docs/nozzle.md \"Thrust\")\n", thrust->pa);
     return s;
 }
 
@@ -330,6 +355,7 @@ std::string fvBcFlameKey(const FvBcSpec& spec)
 std::string fvBcNozzleKey(const FvBcSpec& spec)
 {
     if (spec.nozzle) return "[nozzle]";
+    if (spec.thrust) return "[thrust]";
     for (const FvPatchSpec& p : spec.patches) {
         if (p.kind == FvPatchKind::Total) return "patch." + p.name + ".type = \"total\"";
         if (p.kind == FvPatchKind::Wedge) return "patch." + p.name + ".type = \"wedge\"";

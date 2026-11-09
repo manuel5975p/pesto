@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Converging-diverging nozzle: one polyMesh + one case directory for dns and rhoCentralFoam (docs/nozzle.md).
 
-  nozzle_mesh.py --contour nc|nc-smooth|a1-smooth|parabola|cone6|rocket --nx N --ny N [--beta B]
-                 --mode planar|wedge [--dphi DEG] [--pb P] [--exit extrapolate|fixed|riemann] --out DIR
+  nozzle_mesh.py --contour nc|nc-smooth|a1-smooth|parabola|cone6|rocket|react --nx N --ny N [--beta B]
+                 --mode planar|wedge [--dphi DEG] [--pb P] [--exit extrapolate|fixed|riemann] [--pa PA] --out DIR
+  react: --eps-c E --eps-e E --lc L --lcon L --ldiv L --scale S (masterplan_combnozzle 2.2). --ny 1: the one-row
+  planar half nozzle, the quasi-1D FV scheme (docs/nozzle.md "Quasi-1D").
 
 Writes DIR/constant/polyMesh (the `note` line, else dns refuses the owner file), DIR/bc.toml (astar from the
 generator's own throat column), and rhoCentralFoam's 0/, constant/, system/. Wedge: the y = r form, points
@@ -90,7 +92,32 @@ def contour(a):
         R = Rt or 20.0
         xm = 0.2 * R  # |slope| <= 0.2
         return (lambda x: 1 + np.asarray(x, float) ** 2 / (2 * R)), -xm, xm
+    if a.contour == "react":
+        return reactContour(a.eps_c, a.eps_e, a.lc, a.lcon, a.ldiv, a.scale)
     raise SystemExit("unknown contour " + a.contour)
+
+
+def reactContour(ec, ee, lc, lcon, ldiv, s=1.0):
+    """masterplan_combnozzle 2.2, planar, y* = 1 before the scale s: chamber y = ec on [0, lc], contraction
+    1 + (ec - 1)(1 + cos pi xi)/2 over lcon, divergent 1 + (ee - 1)(1 - cos pi xi)/2 over ldiv. C1, exit parallel.
+    (y, x0, x2); the throat sits at x = s (lc + lcon) (throatOf)."""
+    assert ec >= 1 and ee >= 1 and lc >= 0 and lcon > 0 and ldiv > 0 and s > 0
+
+    def y(x):
+        u = np.asarray(x, float) / s
+        o = np.full_like(u, ec)
+        m = (u > lc) & (u <= lc + lcon)
+        o[m] = 1 + (ec - 1) * (1 + np.cos(np.pi * (u[m] - lc) / lcon)) / 2
+        m = u > lc + lcon
+        o[m] = 1 + (ee - 1) * (1 - np.cos(np.pi * np.minimum(u[m] - lc - lcon, ldiv) / ldiv)) / 2
+        return s * o
+
+    return y, 0.0, s * (lc + lcon + ldiv)
+
+
+def throatOf(a):
+    """x of the throat: 0 for every contour but react's."""
+    return a.scale * (a.lc + a.lcon) if a.contour == "react" else 0.0
 
 
 def quadMesh(nx, ny, y, x0, x2, beta=0.0):
@@ -196,8 +223,9 @@ def writePolyMesh(case, X, Y, dphi=0.0, depth=0.1):
     return float(area[i]), i
 
 
-def writeBc(case, astar, wedge, pb, exitKind, wall, twall, area, u_force=True):
-    """DIR/bc.toml. pb: the back pressure over p0 (also the rest state of [nozzle]); exitKind: extrapolate writes no p."""
+def writeBc(case, astar, wedge, pb, exitKind, wall, twall, area, u_force=True, pa=None):
+    """DIR/bc.toml. pb: the back pressure over p0 (also the rest state of [nozzle]); exitKind: extrapolate writes no p.
+    pa: [thrust] pa (the ambient over p0, docs/nozzle.md "Thrust"), None: no [thrust] table."""
     side = '[patch.back]\ntype = "wedge"\n\n[patch.front]\ntype = "wedge"\n\n' if wedge else ""
     axis = "" if wedge else '[patch.axis]\ntype = "slip"\n\n'
     if wall == "slip":
@@ -215,6 +243,8 @@ def writeBc(case, astar, wedge, pb, exitKind, wall, twall, area, u_force=True):
         f.write(f"[reference]\nlength = 1\narea = {area:.17g}\ndirection = [1, 0, 0]\nlift = [0, 1, 0]\n\n")
         f.write(f"[nozzle]\np = {pb:.17g}\nt = 1\nastar = {astar:.17g}\n\n")
         f.write(f'[patch.inlet]\ntype = "total"\np0 = 1\nt0 = 1\n\n{o}\n{w}\n{axis}{side}')
+        if pa is not None:
+            f.write(f"\n[thrust]\npa = {pa:.17g}\n")
 
 
 FH = "FoamFile {{ version 2.0; format ascii; class {cls}; location \"{loc}\"; object {obj}; }}\n"
@@ -299,14 +329,15 @@ def areaMach(ar, sup=True, g=GAMMA):
     return 0.5 * (lo + hi)
 
 
-def quasi1dIc(X, Y, delta, pback=None, p0=P0, T0_=T0, R=RGAS, g=GAMMA):
-    """Cell-order isentropic state, supersonic past the throat; pback [Pa]: the normal-shock branch. delta 1: axisymmetric."""
+def quasi1dIc(X, Y, delta, pback=None, p0=P0, T0_=T0, R=RGAS, g=GAMMA, xt=0.0):
+    """Cell-order isentropic state, supersonic past the throat at x = xt; pback [Pa]: the normal-shock branch. delta 1:
+    axisymmetric."""
     nx, ny = X.shape[0] - 1, X.shape[1] - 1
     xm = 0.5 * (X[:-1, 0] + X[1:, 0])
     ym = 0.5 * (Y[:-1, -1] + Y[1:, -1])
     yc = 0.25 * (Y[:-1, :-1] + Y[1:, :-1] + Y[:-1, 1:] + Y[1:, 1:])
     ar = (ym / Y[:, -1].min()) ** (1 + delta)
-    M = np.array([areaMach(max(a, 1 + 1e-9), xx > 0.0, g) for a, xx in zip(ar, xm)])
+    M = np.array([areaMach(max(a, 1 + 1e-9), xx > xt, g) for a, xx in zip(ar, xm)])
     pr = (1 + (g - 1) / 2 * M * M) ** (-g / (g - 1))
     Tr = 1 / (1 + (g - 1) / 2 * M * M)
     if pback is not None:
@@ -327,7 +358,7 @@ def quasi1dIc(X, Y, delta, pback=None, p0=P0, T0_=T0, R=RGAS, g=GAMMA):
                 hi = m
         As = 0.5 * (lo + hi)
         p02 = peOf(As)[2]
-        xs = next(i for i in range(nx) if xm[i] > 0 and ar[i] >= As)
+        xs = next(i for i in range(nx) if xm[i] > xt and ar[i] >= As)
         for i in range(xs, nx):
             Mi = areaMach(max(ar[i] * p02, 1 + 1e-9), False, g)
             M[i], pr[i], Tr[i] = Mi, p02 * (1 + (g - 1) / 2 * Mi * Mi) ** (-g / (g - 1)), 1 / (1 + (g - 1) / 2 * Mi * Mi)
@@ -349,8 +380,8 @@ def generate(a):
     astar, col = writePolyMesh(a.out, X, Y, a.dphi if wedge else 0.0)
     pb = a.pb if a.pb > 0 else 0.0
     exitKind = a.exit
-    writeBc(a.out, astar, wedge, pb if pb > 0 else 0.1, exitKind, a.wall, a.twall, astar)
-    ic = quasi1dIc(X, Y, 1 if wedge else 0, pb * P0 if (pb > 0 and exitKind == "fixed") else None, g=a.gamma)
+    writeBc(a.out, astar, wedge, pb if pb > 0 else 0.1, exitKind, a.wall, a.twall, astar, pa=a.pa)
+    ic = quasi1dIc(X, Y, 1 if wedge else 0, pb * P0 if (pb > 0 and exitKind == "fixed") else None, g=a.gamma, xt=throatOf(a))
     Tw = a.twall * T0 if a.twall is not None else None
     writeFoamCase(a.out, ic, pback=pb * P0 if exitKind == "fixed" else None, recon=a.recon, endTime=a.end, maxCo=a.co, wedge=wedge,
                   mu=a.mu, Pr=a.Pr, wall=a.wall, Twall=Tw, write=a.write)
@@ -378,6 +409,14 @@ def parser():
     p.add_argument("--write", type=float, default=None)
     p.add_argument("--co", type=float, default=0.2, help="foam maxCo")
     p.add_argument("--gamma", type=float, default=1.4)
+    p.add_argument("--pa", type=float, default=None, help="[thrust] pa / p0 (absent: no [thrust] table)")
+    # --contour react (masterplan_combnozzle 2.2): chamber, cosine contraction, cosine divergent.
+    p.add_argument("--eps-c", type=float, default=6.25, help="react: chamber area / A*")
+    p.add_argument("--eps-e", type=float, default=6.25, help="react: exit area / A*")
+    p.add_argument("--lc", type=float, default=0.5, help="react: chamber length / y*")
+    p.add_argument("--lcon", type=float, default=4.0, help="react: contraction length / y*")
+    p.add_argument("--ldiv", type=float, default=12.0, help="react: divergent length / y*")
+    p.add_argument("--scale", type=float, default=1.0, help="react: y* (the mesh's length unit)")
     p.add_argument("--out", required=True)
     return p
 
@@ -386,7 +425,7 @@ def main():
     a = parser().parse_args()
     astar, col, X, Y = generate(a)
     print(f"{a.contour} {a.mode}: {a.nx}x{a.ny}, x in [{X[0, 0]:.5f}, {X[-1, 0]:.5f}], A* {astar:.12g} at column {col}, A_e/A* "
-          f"{(Y[-1, -1] / Y[:, -1].min()) ** (2 if a.mode == 'wedge' else 1):.5f} -> {a.out}")
+          f"{(Y[-1, -1] / Y[:, -1].min()) ** (2 if a.mode == 'wedge' else 1):.5f}, throat x {throatOf(a):.6g} -> {a.out}")
 
 
 if __name__ == "__main__":

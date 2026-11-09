@@ -1090,10 +1090,43 @@ void FvRef::rhs(const FvState& s, FvState& out, const FvState* src) const
     evaluate(s, ev, out, src);
 }
 
-void FvRef::march(FvState& s, double dt, int steps, const FvState* src) const
+void FvRef::march(FvState& s, double dt, int steps, const FvState* src, FvLedger* ledger) const
 {
     const FaceMesh& m = *fm_;
     assert(s.nV == nV_ && s.nC == m.nC && (!src || (src->nV == s.nV && src->nC == s.nC)));
+    const int nVl = kFvMeanVars + cfg_.chem.nY, nP = int(m.patches.size());
+    assert(!ledger || (ledger->nV == nVl && ledger->nP == nP && !src && cfg_.rans.model == RansModel::None &&
+                       std::ranges::all_of(cfg_.gravity, [](double g) { return g == 0.0; }) &&
+                       std::ranges::all_of(cfg_.bodyForce, [](double g) { return g == 0.0; })));
+    // The ledger's stage sums: [stage][patch][row], sum V omega per stage.
+    std::vector<double> ledS(ledger ? 3 * std::size_t(nP) * std::size_t(nVl) : 0);
+    double ledOm[3] = {0, 0, 0};
+    const auto ledgerStage = [&](const FvEval& ev, int k) {
+        double* S = ledS.data() + std::size_t(k) * std::size_t(nP) * std::size_t(nVl);
+        for (int p = 0; p < nP; ++p) {
+            const MeshPatch& mp = m.patches[std::size_t(p)];
+            for (int v = 0; v < nVl; ++v) {
+                const std::vector<double>& F = v < kFvMeanVars ? ev.F[std::size_t(v)] : ev.Fy[std::size_t(v - kFvMeanVars)];
+                double a = 0.0;
+                for (int b = mp.first; b < mp.first + mp.count; ++b) {
+                    const std::size_t f = std::size_t(m.nI + b);
+                    if (geom_.active[f]) a += F[f];
+                }
+                S[std::size_t(p) * std::size_t(nVl) + std::size_t(v)] = a;
+            }
+        }
+        double o = 0.0;
+        if (cfg_.chem.nY > 0)
+            for (std::size_t c = 0; c < std::size_t(m.nC); ++c) o += m.V[c] * ev.omega[c];
+        ledOm[k] = o;
+    };
+    // The R2 weights: the cr each stage write used (ca + cb = 1 exactly).
+    const double w01 = (2.0 / 3.0) * (0.25 * dt), w2 = (2.0 / 3.0) * dt;
+    const auto ledgerStep = [&] {
+        const std::size_t n = std::size_t(nP) * std::size_t(nVl);
+        for (std::size_t i = 0; i < n; ++i) ledger->I[i] += (w01 * ledS[i] + w01 * ledS[n + i]) + w2 * ledS[2 * n + i];
+        ledger->omega += (w01 * ledOm[0] + w01 * ledOm[1]) + w2 * ledOm[2];
+    };
     const std::size_t nC = std::size_t(m.nC), nB = std::size_t(m.nB), nF = std::size_t(m.nI) + nB;
     FvEval ev;
     sizeEval(ev);
@@ -1157,6 +1190,12 @@ void FvRef::march(FvState& s, double dt, int steps, const FvState* src) const
                 if (species) {
                     speciesFaces(ev, f0, f1);
                     sync();
+                }
+                // The ledger reads F and omega only (the gather writes the state): worker 0, before
+                // its gather; the next stage's faces come after the gather's sync.
+                if (ledger && w == 0) {
+                    ledgerStage(ev, k);
+                    if (k == 2) ledgerStep();
                 }
                 Stage st;
                 st.a = s.q.data();

@@ -540,7 +540,7 @@ RunOutput::writeSurface(std::string_view comment,
 
 std::expected<void, std::string>
 RunOutput::declareSeries(std::string_view name, std::span<const std::string> cols,
-                         std::string_view comment)
+                         std::string_view comment, int digits)
 {
     if (!has(p_->cfg.kinds, Emit::Stats)) return {};
     const std::string key(name);
@@ -551,6 +551,7 @@ RunOutput::declareSeries(std::string_view name, std::span<const std::string> col
     // set failbit and silently swallow every subsequent row.
     if (f.is_open()) f.close();
     f.clear();
+    if (digits > 0) f.precision(digits);
     // --restart: the truncated file keeps its header and rows; append.
     if (p_->resumed.contains(suffix)) {
         f.open(path, std::ios::app);

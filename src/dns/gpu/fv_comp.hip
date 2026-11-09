@@ -1194,6 +1194,63 @@ struct MinCell
     __device__ double operator()(int c) const { return double(d[c]); }
 };
 
+// --- The impulse ledger ([thrust], FvLedger; docs/nozzle.md "Thrust"). ---
+
+// A block's fixed-order FP64 sum: the shared-memory tree, no shuffles (wave32 = wave64). Every thread
+// calls it; thread 0 gets the sum.
+__device__ inline double blockSum(double v, double* sh)
+{
+    sh[threadIdx.x] = v;
+    __syncthreads();
+    for (int s = kT / 2; s > 0; s >>= 1) {
+        if (int(threadIdx.x) < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    const double o = sh[0];
+    __syncthreads();
+    return o;
+}
+
+// One block per patch: S[p][v] = sum of F row v over the patch's compact boundary faces seg[p] .. seg[p
+// + 1], thread t summing faces t, t + kT, ... in ascending order, then the tree.
+template <class R>
+__global__ void __launch_bounds__(kT) kFvLedger(int nI, int nV, const int* seg, const R* F, double* S)
+{
+    __shared__ double sh[kT];
+    const int p = int(blockIdx.x);
+    for (int v = 0; v < nV; ++v) {
+        double a = 0.0;
+        for (int b = seg[p] + int(threadIdx.x); b < seg[p + 1]; b += kT)
+            a += double(F[std::size_t(nV) * (std::size_t(nI) + std::size_t(b)) + std::size_t(v)]);
+        const double s = blockSum(a, sh);
+        if (threadIdx.x == 0) S[std::size_t(p) * std::size_t(nV) + std::size_t(v)] = s;
+    }
+}
+
+// Block partials of sum_c V omega, cells in ascending blocks.
+template <class R>
+__global__ void __launch_bounds__(kT) kFvLedgerOmega(int nC, const R* V, const R* om, double* part)
+{
+    __shared__ double sh[kT];
+    const int c = int(blockIdx.x) * kT + int(threadIdx.x);
+    const double s = blockSum(c < nC ? double(V[c]) * double(om[c]) : 0.0, sh);
+    if (threadIdx.x == 0) part[blockIdx.x] = s;
+}
+
+// The step: I += (w0 S0 + w1 S1) + w2 S2 per patch and row; omega likewise from the partials summed in
+// ascending block order per stage. One thread.
+__global__ void kFvLedgerStep(int n, int nOm, const double* S, const double* part, double w0, double w1, double w2, double* I,
+                              double* om)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    for (int i = 0; i < n; ++i) I[i] += (w0 * S[i] + w1 * S[n + i]) + w2 * S[2 * n + i];
+    if (nOm == 0) return;
+    double o[3] = {0.0, 0.0, 0.0};
+    for (int k = 0; k < 3; ++k)
+        for (int b = 0; b < nOm; ++b) o[k] += part[k * nOm + b];
+    om[0] += (w0 * o[0] + w1 * o[1]) + w2 * o[2];
+}
+
 std::string hipErr(const char* what, hipError_t e)
 {
     return std::format("FV device: {}: {}", what, hipGetErrorString(e));
@@ -1227,6 +1284,8 @@ struct DeviceFvComp::Impl
     virtual std::expected<void, RunError> save(Checkpoint&) const = 0;
     virtual std::expected<void, RunError> load(const Checkpoint&) = 0;
     virtual std::expected<void, std::string> setBcRows(int, std::span<const FvBc>) = 0;
+    virtual std::expected<void, std::string> setLedger(bool, bool) = 0;
+    virtual std::expected<FvLedger, std::string> ledger() const = 0;
     virtual std::size_t bytes() const = 0;
     int nC = 0;
     FvPrecision precision{};
@@ -1242,6 +1301,16 @@ std::expected<DeviceBuffer<T>, std::string> sized(std::size_t n, const char* wha
     auto b = DeviceBuffer<T>::make(std::max<std::size_t>(n, 1));
     if (!b) return std::unexpected(hipErr(what, b.error()));
     return std::move(*b);
+}
+
+template <class T>
+std::expected<DeviceBuffer<T>, std::string> uploaded(const std::vector<T>& h, const char* what)
+{
+    auto b = sized<T>(h.size(), what);
+    if (!b) return b;
+    if (!h.empty())
+        if (const hipError_t e = b->upload(h.data()); e != hipSuccess) return std::unexpected(hipErr(what, e));
+    return b;
 }
 
 template <class R>
@@ -1293,6 +1362,12 @@ struct FvCompImpl final : DeviceFvComp::Impl
     DeviceBuffer<int> lineStart, line, fLine;
     mutable ReduceScratch red;
     Gas<R> gas{};
+    // [thrust]: the impulse ledger. seg: per patch its compact boundary range; S [3][nP][nV] the
+    // stage sums, part [3][nOm] the stage's V omega partials, I [nP][nV], om the integral.
+    bool ledgerOn = false, ledgerEq = false;
+    int nOm = 0;
+    DeviceBuffer<int> ledSeg;
+    DeviceBuffer<double> ledS, ledPart, ledI, ledOm;
 
     View<R> view() const
     {
@@ -1517,6 +1592,24 @@ struct FvCompImpl final : DeviceFvComp::Impl
         }
     }
 
+    // The ledger's sums of stage k: F of the stage (the gather left it), omega of the stage.
+    void ledgerStage(int k)
+    {
+        const std::size_t nP = ledSeg.size() - 1, n = nP * std::size_t(nV);
+        if (nP) kFvLedger<R><<<unsigned(nP), kT>>>(nI, nV, ledSeg.data(), F.data(), ledS.data() + std::size_t(k) * n);
+        if (nOm)
+            kFvLedgerOmega<R><<<unsigned(nOm), kT>>>(nC, Vd.data(), om.data(), ledPart.data() + std::size_t(k) * std::size_t(nOm));
+    }
+
+    // R2's weights: w0 = w1 = cb2 (cb1 dtR), w2 = R(cb2 dtR), the cr each stage write used (ca + cb = 1).
+    void ledgerStep(R cb1, R cb2, R dtR)
+    {
+        const double w01 = ledgerEq ? double(dtR) / 3.0 : double(cb2) * double(cb1 * dtR);
+        const double w2 = ledgerEq ? double(dtR) / 3.0 : double(R(cb2 * dtR));
+        const int n = int((ledSeg.size() - 1) * std::size_t(nV));
+        kFvLedgerStep<<<1, 1>>>(n, nOm, ledS.data(), ledPart.data(), w01, w01, w2, ledI.data(), ledOm.data());
+    }
+
     void step(double dt) override
     {
         const R cb1 = R(0.25), cb2 = R(2.0 / 3.0);
@@ -1525,17 +1618,81 @@ struct FvCompImpl final : DeviceFvComp::Impl
         if (shockOn) shockUpdate(q.data()); // the sensor of the step's input state
         if (compensated) {
             stagePair(q.data(), l.data(), q.data(), l.data(), q1.data(), l1.data(), R(0.0), dtR);
+            if (ledgerOn) ledgerStage(0);
             stagePair(q.data(), l.data(), q1.data(), l1.data(), q2.data(), l2.data(), cb1, cb1 * dtR);
+            if (ledgerOn) ledgerStage(1);
             stagePair(q.data(), l.data(), q2.data(), l2.data(), q1.data(), l1.data(), cb2, cb2 * dtR);
+            if (ledgerOn) {
+                ledgerStage(2);
+                ledgerStep(cb1, cb2, dtR);
+            }
             std::swap(q, q1);
             std::swap(l, l1);
             return;
         }
         stage(q.data(), q.data(), q1.data(), R(1.0) - R(0.0), R(0.0), dtR);
+        if (ledgerOn) ledgerStage(0);
         stage(q.data(), q1.data(), q2.data(), R(1.0) - cb1, cb1, cb1 * dtR);
+        if (ledgerOn) ledgerStage(1);
         // q1 is dead here: stage 3 writes it and swaps, so the output never aliases a.
         stage(q.data(), q2.data(), q1.data(), R(1.0) - cb2, cb2, cb2 * dtR);
+        if (ledgerOn) {
+            ledgerStage(2);
+            ledgerStep(cb1, cb2, dtR);
+        }
         std::swap(q, q1);
+    }
+
+    std::expected<void, std::string> setLedger(bool on, bool equalWeights) override
+    {
+        (void)hipDeviceSynchronize();
+        ledgerOn = false;
+        ledSeg = DeviceBuffer<int>();
+        ledS = DeviceBuffer<double>();
+        ledPart = DeviceBuffer<double>();
+        ledI = DeviceBuffer<double>();
+        ledOm = DeviceBuffer<double>();
+        nOm = 0;
+        if (!on) return {};
+        if (hasG || force || rans) return std::unexpected("FV ledger: gravity, a body force or RANS adds sources that are no boundary flux");
+        if (useLts) return std::unexpected("FV ledger: local time stepping has no one dt");
+        // Per patch its compact boundary range: compact faces keep FaceMesh's patch-major order.
+        const std::size_t nP = patchFirst.size();
+        std::vector<int> seg(nP + 1, 0);
+        for (std::size_t p = 0; p < nP; ++p) {
+            if (patchActive[p] > 0 && patchFirst[p] != seg[p]) return std::unexpected("FV ledger: boundary faces not patch-major");
+            seg[p + 1] = seg[p] + patchActive[p];
+        }
+        nOm = sp.nY ? int(blocksOf(std::size_t(nC))) : 0;
+        const std::size_t n = nP * std::size_t(nV);
+        std::optional<std::string> err;
+        auto take = [&](auto& dst, auto&& made) {
+            if (!made) {
+                if (!err) err = std::move(made.error());
+                return;
+            }
+            dst = std::move(*made);
+        };
+        take(ledSeg, uploaded(seg, "ledger"));
+        take(ledS, sized<double>(3 * n, "ledger"));
+        take(ledPart, sized<double>(3 * std::size_t(std::max(nOm, 1)), "ledger"));
+        take(ledI, uploaded(std::vector<double>(std::max<std::size_t>(n, 1), 0.0), "ledger"));
+        take(ledOm, uploaded(std::vector<double>{0.0}, "ledger"));
+        if (err) return std::unexpected(std::move(*err));
+        ledgerEq = equalWeights;
+        ledgerOn = true;
+        return {};
+    }
+
+    std::expected<FvLedger, std::string> ledger() const override
+    {
+        if (!ledgerOn) return std::unexpected("FV ledger: off ([thrust] absent)");
+        (void)hipDeviceSynchronize();
+        FvLedger o = FvLedger::zeros(int(ledSeg.size() - 1), nV);
+        if (!o.I.empty())
+            if (const hipError_t e = ledI.download(o.I.data()); e != hipSuccess) return std::unexpected(hipErr("ledger", e));
+        if (const hipError_t e = ledOm.download(&o.omega); e != hipSuccess) return std::unexpected(hipErr("ledger", e));
+        return o;
     }
 
     std::expected<void, std::string> check(const char* what) const
@@ -2000,17 +2157,8 @@ struct FvCompImpl final : DeviceFvComp::Impl
 
     std::size_t bndFull = 0;
     double tallyArea = 0;
+    std::vector<int> patchFirst, patchActive; // per FaceMesh patch: first compact boundary face, count
 };
-
-template <class T>
-std::expected<DeviceBuffer<T>, std::string> uploaded(const std::vector<T>& h, const char* what)
-{
-    auto b = sized<T>(h.size(), what);
-    if (!b) return b;
-    if (!h.empty())
-        if (const hipError_t e = b->upload(h.data()); e != hipSuccess) return std::unexpected(hipErr(what, e));
-    return b;
-}
 
 template <class R>
 std::expected<std::unique_ptr<DeviceFvComp::Impl>, std::string> makeImpl(const FaceMesh& fm, const FvCompConfig& cfg,
@@ -2128,6 +2276,15 @@ std::expected<std::unique_ptr<DeviceFvComp::Impl>, std::string> makeImpl(const F
         }
     I.nB = int(I.bndFace.size());
     I.nF = I.nI + I.nB;
+    // The ledger's per-patch ranges: each patch's active boundary faces, contiguous in compact order.
+    I.patchActive.assign(fm.patches.size(), 0);
+    I.patchFirst.assign(fm.patches.size(), -1);
+    for (std::size_t p = 0; p < fm.patches.size(); ++p)
+        for (int b = fm.patches[p].first; b < fm.patches[p].first + fm.patches[p].count; ++b) {
+            if (compact[std::size_t(b)] < 0) continue;
+            if (I.patchFirst[p] < 0) I.patchFirst[p] = compact[std::size_t(b)];
+            ++I.patchActive[p];
+        }
 
     std::vector<FaceRow<R>> rows(nIs);
     for (std::size_t f = 0; f < nIs; ++f) {
@@ -2354,6 +2511,8 @@ std::expected<void, std::string> DeviceFvComp::setBcRows(int first, std::span<co
 {
     return p_->setBcRows(first, rows);
 }
+std::expected<void, std::string> DeviceFvComp::setLedger(bool on, bool equalWeights) { return p_->setLedger(on, equalWeights); }
+std::expected<FvLedger, std::string> DeviceFvComp::ledger() const { return p_->ledger(); }
 int DeviceFvComp::cells() const { return p_->nC; }
 FvPrecision DeviceFvComp::precision() const { return p_->precision; }
 std::size_t DeviceFvComp::deviceBytes() const { return p_->bytes(); }
