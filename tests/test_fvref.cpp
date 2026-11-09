@@ -18,6 +18,7 @@
 #include "fvref_ledger.hpp"
 #include "fvref_nozzle.hpp"
 #include "fvref_reactor.hpp"
+#include "fvref_shockspecies.hpp"
 
 #include "dns/comp.hpp"
 #include "dns/curvmesh.hpp"
@@ -1179,6 +1180,7 @@ int main(int argc, char** argv)
     if (argc > 1 && std::string(argv[1]) == "hoop") return dnstest::noz::hoop();
     if (argc > 1 && std::string(argv[1]) == "reactor") return reactorHost();
     if (argc > 1 && std::string(argv[1]) == "ledger") return dnstest::led::run();
+    if (argc > 1 && std::string(argv[1]) == "shockspecies") return dnstest::shsp::run();
     g1();
     g2();
     g3();

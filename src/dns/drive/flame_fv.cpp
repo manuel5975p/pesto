@@ -176,9 +176,10 @@ int runFvFlame(const Case& c, const CheckpointContext& ckx)
                                  .compensated = c.compensated,
                                  .chem = fs.chem,
                                  .tfles = tfles,
-                                 .tallied = std::vector<std::uint8_t>(fm.patches.size(), 0),
+                                 .tallied = spec.nozzle ? fvTallyOf(fm, spec) : std::vector<std::uint8_t>(fm.patches.size(), 0),
                                  .pRef = fs.fs.p,
-                                 .turb = turb.has_value()},
+                                 .turb = turb.has_value(),
+                                 .shock = {.mode = c.shock, .eps4 = c.shockEps4}},
                       .spec = spec,
                       .fs = fs.fs,
                       .refArea = probe->area(),
@@ -190,6 +191,26 @@ int runFvFlame(const Case& c, const CheckpointContext& ckx)
                       .profileDt = c.profileDt,
                       .ckpt = flamePolicy(c, ckx, *restart)};
     if (c.flamePremix2) rr.premix = c.premix;
+    rr.shockDtAuto = c.shockDtAuto;
+    // masterplan_combnozzle P3: [nozzle] and [thrust] on the hll flame route (validate: no rest
+    // state, total with y). The nozzle columns and the ledger as dns flow's; the burnt station's
+    // columns are P4's.
+    if (spec.nozzle) {
+        const auto total = std::ranges::find(spec.patches, FvPatchKind::Total, &FvPatchSpec::kind);
+        rr.nozzle = FvNozzleRun{.astar = spec.nozzle->astar,
+                                .axis = spec.nozzle->axis,
+                                .pRef = rr.solver.pRef,
+                                .p0 = total == spec.patches.end() ? 0.0 : total->p0 * fs.fs.p,
+                                .t0 = total == spec.patches.end() ? 0.0 : total->t0 * fs.fs.T};
+        if (spec.thrust)
+            rr.thrust = FvThrustCase{.axis = rr.nozzle->axis,
+                                     .pa = spec.thrust->pa * fs.fs.p,
+                                     .p0 = rr.nozzle->p0,
+                                     .t0 = rr.nozzle->t0,
+                                     .astar = rr.nozzle->astar,
+                                     .gamma = fs.fs.gamma,
+                                     .Rgas = kRgasBox};
+    }
     if (turbSweep) {
         rr.turbSweep = &*turbSweep;
         rr.turbPatch = &spec.patches[0];

@@ -52,11 +52,13 @@ struct FvPatchSpec
 };
 
 // [nozzle] of a --bc file (docs/nozzle.md): the rest state p, t (ratios), the throat area
-// astar the mesh generator measured, the thrust axis (unit).
+// astar the mesh generator measured, the thrust axis (unit). hasRest: p and t given (dns flow
+// requires them, dns flame refuses them: the flame starts from its composition IC).
 struct FvNozzleSpec
 {
     double p = 1, t = 1, astar = 0;
     std::array<double, 3> axis{1, 0, 0};
+    bool hasP = false, hasT = false;
 };
 
 // [thrust] of a --bc file (docs/nozzle.md "Thrust", masterplan_combnozzle R2): the impulse ledger and

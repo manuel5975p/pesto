@@ -804,6 +804,124 @@ int runFlame1d()
 #endif
 }
 
+// A CSV series: header and rows of text fields (comment lines skipped).
+struct Csv
+{
+    std::vector<std::string> head;
+    std::vector<std::vector<std::string>> rows;
+    int col(const std::string& n) const
+    {
+        const auto it = std::ranges::find(head, n);
+        return it == head.end() ? -1 : int(it - head.begin());
+    }
+};
+
+Csv readCsv(const std::string& path)
+{
+    Csv c;
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::stringstream s(line);
+        std::string f;
+        std::vector<std::string> row;
+        while (std::getline(s, f, ',')) row.push_back(f);
+        if (c.head.empty()) c.head = std::move(row);
+        else c.rows.push_back(std::move(row));
+    }
+    return c;
+}
+
+// Shock x C0 through the binary (masterplan_combnozzle P3; ctest gpu_fv_flame_shock): fv1d's 7.5-cell
+// polyMesh (tools/chem/fv_flame_mesh.py: 197 x 4, y cyclic, z empty), M 0.042, FP64, tt 14:
+//   G3.4  --shock hll --shock-d4 0 == no --shock: every column of the plain run's stats, byte for byte
+//   G3.3  --shock hll: shockCells 0 on every row; |S(hll) - S(d4 0)| <= |S(d4 0) - S_ref| / 3 ([7, 14] means)
+//   route a total inlet with y, [nozzle] astar, [thrust] pa station: rc 0, the stats' nozzle columns,
+//         _thrust.csv rows with every res_k <= 1e-12 of P_k (the ledger on the flame route, FP64)
+int runFlameShock()
+{
+#if !defined(DNS_BIN) || !defined(DNS_SOURCE_DIR)
+    dnstest::skip("no dns binary");
+#else
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / std::format("dns_fvflameshock_{}", ::getpid());
+    fs::create_directories(dir);
+    const double h = 1.601651 / 7.5;
+    const std::string mesh = (dir / "mesh").string();
+    const std::string gen = std::format("python3 {}/tools/chem/fv_flame_mesh.py --nx 197 --ny 4 --lx {:.17g} --ly {:.17g} "
+                                        "--depth 1 --out {} > /dev/null",
+                                        DNS_SOURCE_DIR, 197 * h, 4 * h, mesh);
+    if (std::system(gen.c_str()) != 0) {
+        check(false, "fv_flame_mesh.py wrote the 7.5-cell mesh");
+        return dnstest::finish();
+    }
+    auto run = [&](const std::string& tag, const std::string& bc, const std::string& extra, double tt) {
+        const std::string out = (dir / tag).string();
+        const std::string cmd = std::format("{} flame --mach 0.042 --expansion 5 --zeldovich 8 --prandtl 0.72 --polymesh {} --bc {} "
+                                            "--upstream 14.133333333333333 --inflow-speed 0.98 --tt {:g} --fv-precision fp64 "
+                                            "--emit stats --quiet --out {} {} > /dev/null",
+                                            DNS_BIN, mesh, bc, tt, out, extra);
+        const int rc = std::system(cmd.c_str());
+        check(rc == 0, std::format("dns flame {}: rc 0", tag));
+        return out;
+    };
+    const std::string bc = mesh + "/bc.toml";
+    const Csv none = readCsv(run("none", bc, "", 14) + "_stats.csv");
+    const Csv d40 = readCsv(run("d40", bc, "--shock hll --shock-d4 0", 14) + "_stats.csv");
+    const Csv hll = readCsv(run("hll", bc, "--shock hll", 14) + "_stats.csv");
+    bool same = !none.rows.empty() && none.rows.size() == d40.rows.size();
+    for (std::size_t r = 0; same && r < none.rows.size(); ++r)
+        for (std::size_t k = 0; same && k < none.head.size(); ++k) {
+            const int j = d40.col(none.head[k]);
+            same = j >= 0 && d40.rows[r][std::size_t(j)] == none.rows[r][k];
+        }
+    check(same, std::format("G3.4 (7.5 cells): --shock hll --shock-d4 0 == no --shock, {} rows byte for byte", none.rows.size()));
+    auto window = [](const Csv& c) {
+        const int t = c.col("t"), s = c.col("SL");
+        double sum = 0;
+        int n = 0;
+        for (const auto& r : c.rows)
+            if (std::stod(r[std::size_t(t)]) >= 7.0) {
+                sum += std::stod(r[std::size_t(s)]);
+                ++n;
+            }
+        return n ? sum / n : NAN;
+    };
+    double sensed = 0;
+    for (const auto& r : hll.rows) sensed = std::max(sensed, std::stod(r[std::size_t(hll.col("shockCells"))]));
+    const double sH = window(hll), s0 = window(d40), sref = 1.0 - 1.4 * 0.042 * 0.042 * 4.0, band = std::abs(s0 - sref) / 3.0;
+    std::printf("  7.5 cells M 0.042: S_L hll %.7f, d4 0 %.7f, Delta %+.3e, band %.3e; shockCells max %g over %zu rows\n", sH, s0,
+                sH - s0, band, sensed, hll.rows.size());
+    check(!hll.rows.empty() && sensed == 0, "G3.3: the sensor stays silent on every row");
+    check(std::abs(sH - s0) <= band, "G3.3 (7.5 cells): |S(hll) - S(d4 0)| <= |S(d4 0) - S_ref| / 3");
+    // The reacting nozzle's tables on the flame route (no nozzle contour: a constant-area smoke).
+    const double mu = 0.98 * 0.042, t0 = 1.0 + 0.2 * mu * mu, p0 = std::pow(t0, 3.5);
+    const std::string bcN = (dir / "bcN.toml").string();
+    {
+        std::ofstream f(bcN);
+        f << std::format("[reference]\ndirection = [1, 0, 0]\nlift = [0, 1, 0]\n[nozzle]\nastar = {:.17g}\n[thrust]\npa = 1\n"
+                         "station = 30\n[patch.xlo]\ntype = \"total\"\np0 = {:.17g}\nt0 = {:.17g}\ny = [1.0]\n[patch.xhi]\n"
+                         "type = \"outflow\"\nburnt = true\n",
+                         4 * h, p0, t0);
+    }
+    const std::string outN = run("nozzle", bcN, "--shock hll", 1);
+    const Csv st = readCsv(outN + "_stats.csv"), th = readCsv(outN + "_thrust.csv");
+    check(st.col("mdotIn") >= 0 && st.col("Cf") >= 0 && st.col("shockCells") >= 0, "route: the stats carry the shock and nozzle columns");
+    double res = th.rows.empty() ? HUGE_VAL : 0.0;
+    for (const auto& r : th.rows)
+        for (const char* k : {"mass", "mx", "E", "ry"}) {
+            const double P = std::abs(std::stod(r[std::size_t(th.col(std::string("P_") + k))]));
+            res = std::max(res, std::abs(std::stod(r[std::size_t(th.col(std::string("res_") + k))])) / P);
+        }
+    std::printf("  route (total + y, [nozzle], [thrust]): %zu stats rows, %zu thrust rows, max |res_k| / P_k %.2e\n", st.rows.size(),
+                th.rows.size(), res);
+    check(!th.rows.empty() && res <= 1e-12, "route: the impulse ledger closes on the flame route (res_k <= 1e-12 P_k)");
+    fs::remove_all(dir);
+    return dnstest::finish();
+#endif
+}
+
 // The 0D constant-volume reactor (masterplan_combnozzle P0, docs/chem.md "P0: the 0D reactor"): the
 // uniform periodic 4 x 4 x 1 box at rest, C0 sigma 5 beta 8 at M 0.01 units, Y 1, T0 2.5 Tu,
 // against the closed quadrature of fvref_reactor.hpp.
@@ -972,6 +1090,7 @@ int main(int argc, char** argv)
     test::requireDeviceOrSkip();
     if (argc > 1 && std::string(argv[1]) == "reactor") return runReactor();
     if (argc > 1 && std::string(argv[1]) == "flame1d") return runFlame1d();
+    if (argc > 1 && std::string(argv[1]) == "shock") return runFlameShock();
     if (argc > 1 && std::string(argv[1]) == "jet") return runJet();
     if (argc > 1 && std::string(argv[1]) == "mix") {
         gateMix();

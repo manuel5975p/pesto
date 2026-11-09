@@ -674,7 +674,8 @@ void inventoryGate()
     // G9: Shock's rows, every text verbatim; a pair left out would read Live.
     using M = FvModule;
     const std::pair<std::vector<M>, std::string_view> shockRows[] = {
-        {{M::ChemC0, M::ChemC1, M::ChemC2b}, "FV --shock with species: not built (the chamber is the next cycle)"},
+        {{M::ChemC1}, "FV --shock with two reactants: not built (no gate; docs/nozzle.md \"Reacting\")"},
+        {{M::ChemC2b}, "FV --shock with --equivalence (C2b): not built (no gate; docs/nozzle.md \"Reacting\")"},
         {{M::LesSmag, M::LesSigma}, "FV --shock with LES: not built (no gate)"},
         {{M::TflesUniform, M::TflesDynamic, M::TflesEfficiency}, "FV --shock with TFLES: not built (no gate)"},
         {{M::RansSa, M::RansSst}, "FV --shock with RANS: not built (no gate; the scalars ride F[0])"},
@@ -692,6 +693,9 @@ void inventoryGate()
     check(fvPair(M::Shock, M::Fp64).decision == FvPairDecision::Live && fvPair(M::Shock, M::Compensated).decision == FvPairDecision::Live &&
               fvPair(M::Shock, M::Fp64).gate == "gpu_fv_nozzle",
           "G9: Fp64, Compensated live on gpu_fv_nozzle");
+    check(fvPair(M::Shock, M::ChemC0).decision == FvPairDecision::Live &&
+              fvPair(M::Shock, M::ChemC0).gate.find("fvref_shockspecies") != std::string_view::npos,
+          "G9: Shock x C0 live (masterplan_combnozzle P3)");
     check(fvCombinationsMarkdown().find("capture") != std::string::npos, "G9: the generated table carries the capture axis");
 
     const Grid g = Grid::make(6, 5, 1, 1.2, 1.0, 0.1);

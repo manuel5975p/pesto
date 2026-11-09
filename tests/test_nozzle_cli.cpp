@@ -136,7 +136,8 @@ int main()
 
     // the other routes refuse as before
     refuses("flow --physics compressible --solver fv --body none --shock hll" + o, 2, "--shock: is not built on --solver fv");
-    refuses("flame --polymesh " + dataA + " --bc " + bcA + " --shock hll" + o, 2, "--polymesh is not built with --shock");
+    // masterplan_combnozzle P3: the flame polyMesh route takes --shock hll (Shock x C0) and the nozzle's tables.
+    refuses("flame --polymesh " + dataA + " --bc " + bcA + " --shock hll" + o, 2, "--bc: patch.inlet: total needs y on a flame (the fresh mass fractions)");
     refuses("flame --polymesh " + dataA + " --bc " + bcA + o, 2, "belongs to the nozzle route (dns flow --shock hll --polymesh)");
     refuses("flame --physics lowmach --polymesh " + dataA + " --bc " + bcA + o, 3, "[nozzle]: the compressible nozzle route's table");
     refuses("flame --physics lowmach --polymesh " + dataA + " --bc " + bc("lm", "[patch.inlet]\ntype = \"total\"\np0 = 1\nt0 = 1\n") + o, 3,
@@ -189,6 +190,40 @@ int main()
             "--checkpoint-dt: is not built with [thrust] (the impulse ledger is not checkpointed)");
     refuses("flame --polymesh " + dataA + " --bc " + bc("th7", bcText + "\n[thrust]\npa = 0\n") + o, 2,
             "[nozzle] belongs to the nozzle route (dns flow --shock hll --polymesh)");
+    // Shock x C0 on the flame route (masterplan_combnozzle P3): acceptance, label, every text verbatim.
+    {
+        Out s = dns(fl + " --shock hll");
+        check(s.rc == 0 && s.text.find("laminar reacting [premixed single-step C0, calorically perfect gamma 1.4, Le 1, M_flame 0.01 "
+                                       "(inflated)]") != std::string::npos &&
+                  s.text.find("background D4 eps 0.0625 |u.S|: NUMERICAL dissipation everywhere, not DNS") != std::string::npos &&
+                  s.text.find("label      DNS") == std::string::npos,
+              "flame --polymesh --shock hll: passes, labelled laminar reacting + the FV shock suffix, never DNS");
+        check(dns(fl + " --shock hll --gamma 1.2").text.find("calorically perfect gamma 1.2") != std::string::npos, "the label's gamma");
+        check(dns(fl + " --shock hll --shock-d4 0").text.find("D4 eps 0 |u.S|") != std::string::npos, "--shock-d4 0 on the flame");
+        refuses(fl + " --shock-d4 0", 2, "--shock-d4: needs --shock hll");
+        refuses(fl + " --shock hll --shock-d4 0.2", 2, "--shock-d4: must be in [0, 0.125]");
+        refuses("flame --shock hll --shock-d4 0" + o, 2, "--shock-d4: is the FV polyMesh route's (the structured solvers carry no background term)");
+        refuses("flame --solver fv --shock hll" + o, 2, "--shock: is not built on --solver fv");
+        refuses("flame --physics lowmach --shock hll" + o, 2, "--shock: is compressible only");
+        check(dns(fl + " --shock hll --cfl 0.9").rc == 0, "--cfl 0.9 passes on the FV flame (the Sigma form, not the structured 0.6)");
+        refuses(fl + " --shock hll --equivalence 1.3", 2, "--shock: is not built with --equivalence (two reactants)");
+        refuses("flame --mode diffusion --polymesh " + dataA + " --bc " + flBc + " --shock hll" + o, 2,
+                "--shock: is not built for --mode diffusion: premixed and chamber");
+        refuses(fl + " --shock hll --mach 0.06", 2, "--mach: must be in (0, 0.05]");
+        const std::string inlet = "[patch.outlet]\ntype = \"outflow\"\nexit = \"riemann\"\np = 0.5\ntback = 1\n[patch.wall]\ntype = "
+                                  "\"slip\"\n[patch.axis]\ntype = \"slip\"\n[patch.inlet]\ntype = \"total\"\np0 = 1.01\nt0 = 1.003\n";
+        const std::string fh = "flame --polymesh " + dataA + " --upstream 7 --tt 1 --shock hll" + o + " --bc ";
+        Out n = dns(fh + bc("sx0", inlet + "y = [1.0]\n[nozzle]\nastar = 0.1\n[thrust]\npa = 0.01\nstation = 1\n"));
+        check(n.rc == 0 && n.text.find("thrust     pa 0.01") != std::string::npos, "total + y, [nozzle] astar, [thrust] station: the dry-run passes");
+        refuses(fh + bc("sx1", inlet + "y = [1.0]\n[nozzle]\np = 0.1\nastar = 0.1\n"), 2,
+                "--bc: [nozzle].p, t: the flame route starts from the composition IC (docs/nozzle.md \"Reacting\")");
+        refuses(fh + bc("sx2", inlet + "y = [1.0]\n[nozzle]\nastar = 0.1\n[thrust]\npa = 0.01\n"), 2,
+                "--bc: [thrust]: needs station on dns flame (the burnt stagnation plane, masterplan_combnozzle R2)");
+        refuses(fh + bc("sx3", inlet + "y = [1.0]\n[patch.side]\ntype = \"wedge\"\n"), 2, "--bc: patch `side`: a wedge on the flame route: not built (next cycle)");
+        refuses(thr + bc("sx5", "[nozzle]\np = 1\nastar = 1\n[patch.o]\ntype = \"far\"\n"), 3, "[nozzle]: needs t");
+        refuses(thr + bc("sx6", "[nozzle]\np = 1\nt = 1\nastar = 1\n[patch.inlet]\ntype = \"total\"\np0 = 1\nt0 = 1\ny = [1.0]\n"), 2,
+                "patch.inlet.y belongs to a dns flame file");
+    }
     // A regular tetrahedron has no face with an opposite: refused by count, before any GPU or output.
     const std::string tet = std::string(DNS_MESH_DATA) + "/tet_regular";
     refuses("flow --physics compressible --polymesh " + tet + " --bc " + tet + "/bc.toml --shock hll --inviscid --mach 1 --tt 1 --out " +

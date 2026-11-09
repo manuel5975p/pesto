@@ -348,6 +348,33 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
         return {};
     };
     bool stopped = false; // a checkpoint stop: the run is incomplete
+    long lastCells = 0;
+    // The trailing columns of every stats row: shockCells byteMax (--shock), the nozzle's (F: the
+    // tallied wall force). dns flow and dns flame alike.
+    auto shockNozzleCols = [&](std::vector<double>& row, const std::array<double, 3>& F) -> std::expected<void, RunError> {
+        if (shockCols) {
+            auto n = dev.shockCells();
+            if (!n) return fail(6, n.error());
+            auto m = dev.shockByteMax();
+            if (!m) return fail(6, m.error());
+            lastCells = *n;
+            row.push_back(double(*n));
+            row.push_back(double(*m));
+        }
+        if (r.nozzle) {
+            auto mass = dev.patchFlux(0);
+            if (!mass) return fail(6, mass.error());
+            std::array<std::vector<double>, 3> mom;
+            for (int k = 0; k < 3; ++k) {
+                auto v = dev.patchFlux(1 + k);
+                if (!v) return fail(6, v.error());
+                mom[std::size_t(k)] = std::move(*v);
+            }
+            const FvNozzleRow z = fvNozzleRow(r.solver.bc, *mass, mom, F, *r.nozzle, r.solver.tr.gamma, r.solver.tr.Rgas);
+            row.insert(row.end(), {z.mdotIn, z.mdotOut, z.Fwall, z.Fin, z.Fexit, z.Cd, z.Cf});
+        }
+        return {};
+    };
     // One flame measure: the stats row and/or the profile, the drift guard.
     auto flameRow = [&](double dt, bool row, bool profile) -> std::expected<void, RunError> {
         if (auto c = dev.speciesFields(flameState, flameOmega); !c) return fail(6, c.error());
@@ -391,6 +418,13 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
                 const double area = a / (r.flame->area() * dY);
                 v.insert(v.end(), {area, m.SL / area});
             }
+            std::array<double, 3> F{};
+            if (r.nozzle) {
+                auto s = dev.surface();
+                if (!s) return fail(7, s.error());
+                F = {s->fp[0] + s->fv[0], s->fp[1] + s->fv[1], s->fp[2] + s->fv[2]};
+            }
+            if (auto e = shockNozzleCols(v, F); !e) return e;
             out.row("stats", v);
             xfPrev = m.xf;
             tPrev = t;
@@ -480,7 +514,6 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
         return {};
     };
 
-    long lastCells = 0;
     auto statsRow = [&](double dt) -> std::expected<void, RunError> {
         auto s = dev.surface();
         if (!s) return fail(7, s.error());
@@ -503,27 +536,7 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
                 row.push_back(double(*h));
             }
         }
-        if (shockCols) {
-            auto n = dev.shockCells();
-            if (!n) return fail(6, n.error());
-            auto m = dev.shockByteMax();
-            if (!m) return fail(6, m.error());
-            lastCells = *n;
-            row.push_back(double(*n));
-            row.push_back(double(*m));
-        }
-        if (r.nozzle) {
-            auto mass = dev.patchFlux(0);
-            if (!mass) return fail(6, mass.error());
-            std::array<std::vector<double>, 3> mom;
-            for (int k = 0; k < 3; ++k) {
-                auto v = dev.patchFlux(1 + k);
-                if (!v) return fail(6, v.error());
-                mom[std::size_t(k)] = std::move(*v);
-            }
-            const FvNozzleRow z = fvNozzleRow(r.solver.bc, *mass, mom, F, *r.nozzle, r.solver.tr.gamma, r.solver.tr.Rgas);
-            row.insert(row.end(), {z.mdotIn, z.mdotOut, z.Fwall, z.Fin, z.Fexit, z.Cd, z.Cf});
-        }
+        if (auto e = shockNozzleCols(row, F); !e) return e;
         out.row("stats", row);
         return {};
     };
@@ -673,6 +686,8 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
             const bool row = cad.due(step, t, r.tEnd), profile = prof.due(t, r.tEnd);
             if (row || profile)
                 if (auto e = flameRow(dt, row, profile); !e) return std::unexpected(e.error());
+            if (row && r.thrust)
+                if (auto e = thrustRow(dt); !e) return std::unexpected(e.error());
         } else if (r.jet) {
             if (cad.due(step, t, r.tEnd))
                 if (auto e = jetRow(dt); !e) return std::unexpected(e.error());

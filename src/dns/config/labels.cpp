@@ -100,6 +100,14 @@ std::string fvFlameLabel(const Case& c)
                            mesh, c.fvPrecision == FvPrecision::Fp32 ? "fp32, rho and rho Y compensated" : "fp64") +
                fvTurbText(c) + (bar == std::string::npos ? std::string() : base.substr(bar));
     }
+    // --shock hll (masterplan_combnozzle P3, Shock x C0): numerical dissipation everywhere, never DNS.
+    if (c.shock == ShockMode::Hll)
+        return std::format("laminar reacting [premixed single-step C0, calorically perfect gamma {:g}, Le 1, M_flame {:g} "
+                           "(inflated)] species: MC-limited MUSCL on the FINAL face mass flux (KG + HLL + D3) | FV path, "
+                           "{}, {}{}: Kennedy-Gruber face flux, least-squares gradients, SSP-RK3; open faces are FV "
+                           "boundary fluxes, no NSCBC, no sink",
+                           c.fvGamma, c.mach, mesh, fvPrecisionName(c.fvPrecision), c.compensated ? " compensated" : "") +
+               std::vformat(kFvShockSuffix, std::make_format_args(c.shockEps4));
     return flameRunLabel(c) +
            std::format(" | FV path, {}, {}{}: Kennedy-Gruber face flux, least-squares gradients, SSP-RK3; species "
                        "virtual-upwind MC {}on the face mass flux; open faces are FV boundary fluxes, no NSCBC, no sink{}",

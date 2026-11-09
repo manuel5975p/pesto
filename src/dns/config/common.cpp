@@ -140,8 +140,10 @@ std::optional<ConfigError> checkMach(double mach, bool shock)
 std::optional<ConfigError> shockRouteScope(const RawConfig& r)
 {
     if (r.shock == ShockMode::None) return std::nullopt;
-    // dns flow --physics compressible --polymesh: the FV route (docs/nozzle.md).
-    const bool fvPoly = r.sub == Subcommand::Flow && r.physics == Physics::Compressible && r.given.contains("--polymesh");
+    // dns flow | flame --physics compressible --polymesh: the FV route (docs/nozzle.md; the flame's since
+    // masterplan_combnozzle P3, Shock x C0).
+    const bool fvPoly = (r.sub == Subcommand::Flow || r.sub == Subcommand::Flame) && r.physics == Physics::Compressible &&
+                        r.given.contains("--polymesh");
     const std::initializer_list<const char*> always = {"--ogrid", "--stretch", "--focal", "--rans", "--steady",
                                                        "--precond", "--rotor-mach", "--rotor-frame", "--thin-seal", "--penalize",
                                                        "--nscbc-strip", "--pot"};
@@ -189,6 +191,9 @@ std::optional<ConfigError> shockFlagScope(const RawConfig& r, const Case& c)
                                    kShockMachMax));
     }
     if (c.sub == Subcommand::Bench) return std::nullopt; // a fixed dt, no --cfl
+    // The FV flame (polyMesh): the Sigma form is the axis sum, cap kShockCflAxisSum 1.2 (the nozzle
+    // route's); the flame's own (0, 1] is inside it, not the structured per-axis 0.6.
+    if (c.sub == Subcommand::Flame && r.given.contains("--polymesh")) return std::nullopt;
     const double cap = kShockCflAxisSum / (c.grid.nz > 1 ? 3 : 2);
     if (c.cfl > cap + 1e-12)
         return err(2, "--cfl",

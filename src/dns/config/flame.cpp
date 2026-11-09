@@ -43,7 +43,9 @@ std::optional<ConfigError> checkFvFlame(const RawConfig& r)
         // M5: runFvComp's and runFvLowMach's checkpoints (gpu_restart_fv: every route).
         "--checkpoint-dt", "--wall-limit", "--restart",
         // gammaScope below keeps it to the compressible premixed C0 polyMesh flame.
-        "--gamma"};
+        "--gamma",
+        // masterplan_combnozzle P3 (Shock x C0): shockRouteScope keeps them to the compressible polyMesh flame.
+        "--shock", "--shock-d4"};
     static const char* const allowedJet[] = {"--stoich", "--fuel-y", "--ox-y", "--damkohler", "--cells-per-unit",
                                              "--slot-width", "--slot-edge", "--coflow-speed", "--coflow-width",
                                              "--pilot-width", "--pilot-speed", "--length", "--ignition"};
@@ -160,6 +162,22 @@ std::optional<ConfigError> gammaScope(const RawConfig& r)
 }
 
 } // namespace
+
+std::optional<ConfigError> fvFlameNozzleScope(const FvBcSpec& bc)
+{
+    for (const FvPatchSpec& p : bc.patches) {
+        if (p.kind == FvPatchKind::Wedge)
+            return ConfigError{2, "--bc", std::format("patch `{}`: a wedge on the flame route: not built (next cycle)", p.name)};
+        if (p.kind == FvPatchKind::Total && !p.hasY)
+            return ConfigError{2, "--bc", std::format("patch.{}: total needs y on a flame (the fresh mass fractions)", p.name)};
+    }
+    if (bc.nozzle && (bc.nozzle->hasP || bc.nozzle->hasT))
+        return ConfigError{2, "--bc", "[nozzle].p, t: the flame route starts from the composition IC (docs/nozzle.md \"Reacting\")"};
+    if (bc.thrust && !bc.thrust->station)
+        return ConfigError{2, "--bc", "[thrust]: needs station on dns flame (the burnt stagnation plane, masterplan_combnozzle R2)"};
+    return std::nullopt;
+}
+
 } // namespace dns::cfg
 
 namespace dns::cfg {

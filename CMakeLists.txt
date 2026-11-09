@@ -570,6 +570,9 @@ if(BUILD_TESTING)
     # The thrust ledger (masterplan_combnozzle P2, docs/nozzle.md "Thrust"): G2.1, FvRef's ledger identity.
     add_test(NAME fvref_ledger COMMAND test_fvref ledger)
     set_tests_properties(fvref_ledger PROPERTIES TIMEOUT 120 LABELS "nozzle;fast")
+    # Shock x C0 (masterplan_combnozzle P3, docs/nozzle.md "Reacting"): G3.2, G3.1's control.
+    add_test(NAME fvref_shockspecies COMMAND test_fvref shockspecies)
+    set_tests_properties(fvref_shockspecies PROPERTIES TIMEOUT 120 LABELS "nozzle;fast")
     add_executable(test_fvshock tests/test_fvshock.cpp)
     target_link_libraries(test_fvshock PRIVATE dns_core)
     target_compile_definitions(test_fvshock PRIVATE DNS_MESH_DATA="${DNS_MESH_DATA}")
@@ -855,13 +858,16 @@ if(BUILD_TESTING)
         add_executable(test_gpu_fv_flame tests/test_gpu_fv_flame.cpp)
         target_link_libraries(test_gpu_fv_flame PRIVATE dns_gpu)
         target_compile_definitions(test_gpu_fv_flame PRIVATE DNS_BIN="$<TARGET_FILE:dns>"
-                                   DNS_MESH_DATA="${DNS_MESH_DATA}")
+                                   DNS_MESH_DATA="${DNS_MESH_DATA}" DNS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
         add_dependencies(test_gpu_fv_flame dns)
         add_test(NAME gpu_fv_flame COMMAND test_gpu_fv_flame)
         add_test(NAME gpu_fv_flame1d COMMAND test_gpu_fv_flame flame1d)
         set_tests_properties(gpu_fv_flame gpu_fv_flame1d PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
         add_test(NAME gpu_fv_flame_reactor COMMAND test_gpu_fv_flame reactor)
         set_tests_properties(gpu_fv_flame_reactor PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300 LABELS "flame")
+        # Shock x C0 through the binary (masterplan_combnozzle P3: G3.3 / G3.4 at 7.5 cells, the route's tables).
+        add_test(NAME gpu_fv_flame_shock COMMAND test_gpu_fv_flame shock)
+        set_tests_properties(gpu_fv_flame_shock PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300 LABELS "flame;nozzle")
         # Species LES and the thickened flame on the FV family (docs/fvcomp.md "Species LES and TFLES").
         add_executable(test_gpu_fv_flame_les tests/test_gpu_fv_flame_les.cpp)
         target_link_libraries(test_gpu_fv_flame_les PRIVATE dns_gpu)

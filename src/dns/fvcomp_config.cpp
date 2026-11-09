@@ -67,7 +67,7 @@ std::vector<std::string_view> keysOf(FvPatchKind k)
     case FvPatchKind::Far: return {"type", "y"};
     case FvPatchKind::Empty: return {"type"};
     case FvPatchKind::Open: return {"type", "t", "y"};
-    case FvPatchKind::Total: return {"type", "p0", "t0"};
+    case FvPatchKind::Total: return {"type", "p0", "t0", "y"};
     case FvPatchKind::Wedge: return {"type"};
     }
     return {"type"};
@@ -192,8 +192,10 @@ std::expected<FvNozzleSpec, std::string> parseNozzle(const toml::table& t)
         if (!number(v, x) || !(x > 0)) return Err("nozzle." + key + ": must be a finite number > 0");
         (key == "p" ? n.p : key == "t" ? n.t : n.astar) = x;
     }
-    for (const char* k : {"p", "t", "astar"})
-        if (!t.contains(k)) return Err(std::format("[nozzle]: needs {}", k));
+    // p, t: the route decides (fvNozzleRestCheck); astar: both.
+    n.hasP = t.contains("p");
+    n.hasT = t.contains("t");
+    if (!t.contains("astar")) return Err("[nozzle]: needs astar");
     return n;
 }
 

@@ -33,6 +33,10 @@ std::expected<void, int> readFvBcFile(RawConfig& raw)
     const std::string text{std::istreambuf_iterator<char>(f), {}};
     auto b = parseFvBc(text);
     if (!b) return std::unexpected(die(exitInput, "--bc " + raw.bc + ": " + b.error()));
+    // [nozzle] p, t: the flow route's rest state (the flame refuses them in validate, exit 2).
+    if (b->nozzle && raw.sub != Subcommand::Flame)
+        for (const auto& [has, k] : {std::pair{b->nozzle->hasP, "p"}, std::pair{b->nozzle->hasT, "t"}})
+            if (!has) return std::unexpected(die(exitInput, std::format("--bc {}: [nozzle]: needs {}", raw.bc, k)));
     if (raw.physics == Physics::LowMach)
         if (auto l = fvLowMachBcs(*b, 1.0, 1.0); !l) return std::unexpected(die(exitInput, raw.bc + ": " + l.error()));
     raw.fvBc = std::move(*b);

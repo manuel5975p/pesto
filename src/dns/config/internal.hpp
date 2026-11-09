@@ -84,6 +84,10 @@ std::optional<ConfigError> shockFlagScope(const RawConfig& r, const Case& c);
 // given N > 1 warns. Pre: c.dtRecompute resolved.
 void shockCadence(const RawConfig& r, Case& c);
 
+// The reacting nozzle's --bc tables on the compressible flame polyMesh route under --shock hll
+// (masterplan_combnozzle P3): total needs y, no wedge, no [nozzle] p / t, [thrust] needs station.
+std::optional<ConfigError> fvFlameNozzleScope(const FvBcSpec& bc);
+
 // The z cell count: 1 is the exact 2D restriction, otherwise >= 4.
 // `belowOne` is the subcommand's own wording for nz < 1.
 std::optional<ConfigError> checkNz(int nz, const char* belowOne);

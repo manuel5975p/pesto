@@ -21,6 +21,12 @@
 #include "fv_comp_test_util.hpp"
 #include "fv_matrix_util.hpp"
 
+#include "dns/cli.hpp"
+#include "dns/config.hpp"
+#include "dns/fvcomp_case.hpp"
+#include "dns/fvflame.hpp"
+#include "dns/fvflame_case.hpp"
+#include "dns/gpu/chem.hpp"
 #include "dns/gpu/hip_runtime.hpp"
 #include "gpu_test_util.hpp"
 
@@ -502,8 +508,10 @@ Row runCell(const FvModuleSet& cell, const std::vector<MeshCase>& ms)
             const FvState sp = cellState(cp, fm, nV);
             FvState sw = FvState::zeros(nC, nV - cp.chem.nY);
             std::copy_n(sp.q.begin(), std::size_t(kFvMeanVars) * std::size_t(nC), sw.q.begin());
-            const Run a = march(fm, devOf(cp, FvPrecision::Fp32), sp, dt, 10, lts);
-            const Run b = march(fm, devOf(cw, FvPrecision::Fp32), sw, dt, 10, lts);
+            // Shock x C0 (masterplan_combnozzle G3.1): 40 steps, the sensor and D3 live on the mean rows.
+            const int n = has(cell, FvModule::Shock) ? 40 : 10;
+            const Run a = march(fm, devOf(cp, FvPrecision::Fp32), sp, dt, n, lts);
+            const Run b = march(fm, devOf(cw, FvPrecision::Fp32), sw, dt, n, lts);
             const bool ok = a.ok && b.ok && sameBytes(mean5(a.s), mean5(b.s));
             inertOk = inertOk && ok;
             if (std::ranges::find(inert, "passive species") == inert.end()) inert.push_back("passive species");
@@ -959,6 +967,91 @@ void mixing()
     check(les.var < dnsR.var, "the eddy species flux mixes: LES Z variance below DNS's");
 }
 
+// Shock x C0 (masterplan_combnozzle G3.3 at 7.5 cells, docs/nozzle.md "Reacting"): the FV box flame of
+// `dns flame --solver fv --cells-per-delta 7.5 --mach 0.042` (the library's case assembly, dns/fvflame_case),
+// FP64, tt 14, S_L = the window [7, 14] mean of the probe. Variants: no --shock, hll at eps 0 (== none
+// bitwise), hll (eps 1/16, silent: shockCells 0), and `force` sigma 1 (the control: HLL on every face).
+// Gate: |S(hll) - S(d4 0)| <= |S(d4 0) - S_ref| / 3; the control shifts S_L by >= 3 x that band.
+void shockFlame()
+{
+    std::printf("== Shock x C0: the 1D flame at 7.5 cells / delta_th, M 0.042, FP64 (G3.3's rung)\n");
+    const char* argv[] = {"dns", "flame", "--solver", "fv", "--fv-precision", "fp64", "--cells-per-delta", "7.5", "--mach", "0.042",
+                          "--inflow-speed", "0.98", "--tt", "14", "--out", "/tmp/dns_shockflame"};
+    auto raw = dns::cli::parse(int(std::size(argv)), const_cast<char**>(argv));
+    if (!raw) {
+        check(false, "parse");
+        return;
+    }
+    auto c = dns::validate(*raw);
+    if (!c) {
+        check(false, "validate: " + c.error().message);
+        return;
+    }
+    FvFlameBox box = fvFlameBox(*c);
+    const FaceMesh fm = orDie(FaceMesh::fromCurvMesh(CurvMesh::uniform(c->grid), box.ss, CellOrder::Morton), "box");
+    FvBcSpec spec = box.spec;
+    const FvFlameSetup fs = fvFlameSetup(*c, spec);
+    const FvFlameProbe probe = orDie(FvFlameProbe::make(fm, fs.fl), "probe");
+    const FvState ic = fvFlameIC(*c, fm, spec, fs);
+    const std::vector<FvBc> bc = fvBcsOf(fm, spec, fs.fs, 1.0);
+    struct Out
+    {
+        double S = 0, early = 0, xfLo = HUGE_VAL, xfHi = -HUGE_VAL; // S: [7, 14] mean; early: [2, 4] mean, xf range over it
+        long sensed = 0, steps = 0;
+        FvState end;
+    };
+    auto run = [&](FvShock sh) {
+        FvCompConfig cfg{.tr = fs.gas, .bc = bc, .precision = FvPrecision::Fp64, .chem = fs.chem, .shock = sh};
+        auto d = orDie(DeviceFvComp::make(fm, cfg), "flame");
+        orDie(d.upload(ic), "upload");
+        Out o;
+        double t = 0.0, sum = 0.0, sumE = 0.0, next = 2.0;
+        int n = 0, nE = 0;
+        FvState s;
+        std::vector<double> om;
+        while (t < c->tEnd - 1e-12) {
+            const double dt = std::min({0.95 * orDie(d.stableDt({.cfl = c->cfl}), "dt"), orDie(d.chemDt(gpu::kChemDt), "chem"),
+                                        c->tEnd - t});
+            d.step(dt);
+            t += dt;
+            ++o.steps;
+            if (t < next) continue;
+            next += 0.1;
+            orDie(d.speciesFields(s, om), "fields");
+            const FvFlameMeasure m = probe.measure(s, om);
+            if (t <= 4.0) {
+                sumE += m.SL;
+                ++nE;
+                o.xfLo = std::min(o.xfLo, m.xf);
+                o.xfHi = std::max(o.xfHi, m.xf);
+            }
+            if (t >= 7.0) {
+                sum += m.SL;
+                ++n;
+            }
+            if (sh.mode != ShockMode::None) o.sensed = std::max(o.sensed, orDie(d.shockCells(), "cells"));
+        }
+        o.S = sum / n;
+        o.early = sumE / nE;
+        orDie(d.download(o.end), "end");
+        return o;
+    };
+    const Out none = run({}), d40 = run({.mode = ShockMode::Hll, .eps4 = 0.0}), hll = run({.mode = ShockMode::Hll, .eps4 = kFvShockEps4});
+    // The control on [2, 4]: HLL on every face thickens the flame ~3x and it outruns the 0.98 S_L inflow; past
+    // t ~ 4 its preheat reaches the probe's fresh reference slab (2 delta_th from the inflow), whose rho Y
+    // normalises S_L (S_L then reads ~1e8: a probe failure, not a speed). The flame stays inside the guard there.
+    const Out force = run({.mode = ShockMode::Hll, .eps4 = kFvShockEps4, .force = true});
+    const double sref = 1.0 - kGamma * 0.042 * 0.042 * 4.0, band = std::abs(d40.S - sref) / 3.0, delta = hll.S - d40.S;
+    const double guard = 2.0 * probe.spec().dth, shift = force.early - d40.early;
+    std::printf("  S_L [7, 14]: none %.7f, hll d4 0 %.7f, hll %.7f (Delta %+.3e, band %.3e, sensed max %ld, %ld steps)\n", none.S,
+                d40.S, hll.S, delta, band, hll.sensed, hll.steps);
+    std::printf("  control, S_L [2, 4]: force sigma 1 %.5f vs d4 0 %.5f (shift %+.3e, 3 x band %.3e); force x_f in [%.3f, %.3f], "
+                "guard [%.3f, %.3f]\n",
+                force.early, d40.early, shift, 3 * band, force.xfLo, force.xfHi, guard, probe.length() - guard);
+    check(force.xfLo > guard && force.xfHi < probe.length() - guard, "G3.3 control: the force flame inside the guard over [2, 4]");
+    check(std::abs(shift) >= 3 * band, "G3.3 control: force sigma 1 shifts S_L by >= 3 x the band (the gate sees dissipation)");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -969,6 +1062,7 @@ int main(int argc, char** argv)
         pocket();
         poiseuille();
         mixing();
+        shockFlame();
         return dnstest::finish();
     }
     std::printf("== MC generic gate matrix (docs/fvcomp.md \"Combinations\")\n");

@@ -96,7 +96,7 @@ origin = [0, 0, 0]
 force = true               # wall default true, slip default false
 # inflow: u (default the freestream), t (T / T_inf)
 # outflow: p (p / p_inf), tback (T / T_inf at backflow), exit = fixed | extrapolate | riemann
-# total: p0, t0 (ratios), --shock hll + [nozzle] only (docs/nozzle.md)
+# total: p0, t0 (ratios), --shock hll only (docs/nozzle.md); dns flow needs [nozzle], dns flame needs y
 ```
 
 Bound against the patch list: an unbound patch, a binding with no patch, a bound
@@ -321,7 +321,7 @@ Pair matrix: L live, R refused, x one axis (exclusive).
 | Charlette | L | L | L | L | . | R | R | L | R | R | L | L | L | R | L | L | R |
 | RANS SA | x | x | R | R | R | . | x | R | R | R | R | L | R | L | L | L | R |
 | RANS SST | x | x | R | R | R | x | . | R | R | R | R | L | R | L | L | L | R |
-| C0 | L | L | L | L | L | R | R | . | x | x | L | L | L | R | L | L | R |
+| C0 | L | L | L | L | L | R | R | . | x | x | L | L | L | R | L | L | L |
 | C1 | L | L | R | R | R | R | R | x | . | x | L | L | R | R | L | L | R |
 | C2b | L | L | R | R | R | R | R | x | x | . | L | L | L | R | L | L | R |
 | gravity | L | L | L | L | L | R | R | L | L | L | . | L | R | R | L | L | R |
@@ -330,7 +330,7 @@ Pair matrix: L live, R refused, x one axis (exclusive).
 | steady LTS | R | R | R | R | R | L | L | R | R | R | R | L | R | . | L | L | R |
 | compensated | L | L | L | L | L | L | L | L | L | L | L | L | L | L | . | x | L |
 | FP64 | L | L | L | L | L | L | L | L | L | L | L | L | L | L | x | . | L |
-| shock | R | R | R | R | R | R | R | R | R | R | R | R | R | R | L | L | . |
+| shock | R | R | R | R | R | R | R | L | R | R | R | R | R | R | L | L | . |
 
 | Pair | Decision | Error text | Why |
 |---|---|---|---|
@@ -347,19 +347,19 @@ Pair matrix: L live, R refused, x one axis (exclusive).
 | TFLES uniform + C1 | refused | `FV TFLES: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening and its sensor are the premixed step's (kChemCellPass<true>) |
 | TFLES uniform + C2b | refused | `FV TFLES with --equivalence: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening, its sensor (the one-step rate at Ta/2) and Charlette's E are the premixed step's; a two-reactant TFLES would thicken the partially premixed jet's outer diffusion sheet too, which no model here defines (the structured --equivalence refuses --tfles alike) |
 | TFLES uniform + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
-| TFLES uniform + shock | refused | `FV --shock with TFLES: not built (no gate)` | TFLES is a premixed flame's; species with --shock are refused |
+| TFLES uniform + shock | refused | `FV --shock with TFLES: not built (no gate)` | no gate thickens a flame under the hybrid flux (Shock x C0 is gated on the laminar flame) |
 | TFLES dynamic + RANS SA | refused | `FV TFLES with RANS: the thickened flame is a resolved (DNS / LES) flame` | TFLES thickens a flame the grid carries; a RANS mean flame has none |
 | TFLES dynamic + RANS SST | refused | `FV TFLES with RANS: the thickened flame is a resolved (DNS / LES) flame` | TFLES thickens a flame the grid carries; a RANS mean flame has none |
 | TFLES dynamic + C1 | refused | `FV TFLES: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening and its sensor are the premixed step's (kChemCellPass<true>) |
 | TFLES dynamic + C2b | refused | `FV TFLES with --equivalence: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening, its sensor (the one-step rate at Ta/2) and Charlette's E are the premixed step's; a two-reactant TFLES would thicken the partially premixed jet's outer diffusion sheet too, which no model here defines (the structured --equivalence refuses --tfles alike) |
 | TFLES dynamic + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
-| TFLES dynamic + shock | refused | `FV --shock with TFLES: not built (no gate)` | TFLES is a premixed flame's; species with --shock are refused |
+| TFLES dynamic + shock | refused | `FV --shock with TFLES: not built (no gate)` | no gate thickens a flame under the hybrid flux (Shock x C0 is gated on the laminar flame) |
 | Charlette + RANS SA | refused | `FV TFLES efficiency (Charlette) with RANS: it reads an LES sub-grid velocity` | Charlette's u' is the filtered field's (Colin's operator), RANS has none |
 | Charlette + RANS SST | refused | `FV TFLES efficiency (Charlette) with RANS: it reads an LES sub-grid velocity` | Charlette's u' is the filtered field's (Colin's operator), RANS has none |
 | Charlette + C1 | refused | `FV TFLES: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening and its sensor are the premixed step's (kChemCellPass<true>) |
 | Charlette + C2b | refused | `FV TFLES with --equivalence: the thickened flame is premixed species only (FvChem ox < 0)` | the thickening, its sensor (the one-step rate at Ta/2) and Charlette's E are the premixed step's; a two-reactant TFLES would thicken the partially premixed jet's outer diffusion sheet too, which no model here defines (the structured --equivalence refuses --tfles alike) |
 | Charlette + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
-| Charlette + shock | refused | `FV --shock with TFLES: not built (no gate)` | TFLES is a premixed flame's; species with --shock are refused |
+| Charlette + shock | refused | `FV --shock with TFLES: not built (no gate)` | no gate thickens a flame under the hybrid flux (Shock x C0 is gated on the laminar flame) |
 | RANS SA + C0 | refused | `FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)` | a RANS flame needs a mean reaction-rate closure (Arrhenius of the mean state is not the mean rate) and a turbulent scalar flux; neither is built |
 | RANS SA + C1 | refused | `FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)` | a RANS flame needs a mean reaction-rate closure (Arrhenius of the mean state is not the mean rate) and a turbulent scalar flux; neither is built |
 | RANS SA + C2b | refused | `FV species with RANS: not built (no turbulent scalar flux, two users of rows 5..)` | a RANS flame needs a mean reaction-rate closure (Arrhenius of the mean state is not the mean rate) and a turbulent scalar flux; neither is built |
@@ -373,19 +373,18 @@ Pair matrix: L live, R refused, x one axis (exclusive).
 | RANS SST + turb | refused | `FV --turb with RANS: synthetic fluctuations on an ensemble mean` | a RANS field is the ensemble mean: resolved fluctuations at its inflow are no RANS input (that is k and omega / nu~ at the patch), and the RANS flame is refused anyway |
 | RANS SST + shock | refused | `FV --shock with RANS: not built (no gate; the scalars ride F[0])` | F[0] would carry the hybrid mass flux under the scalars: ungated |
 | C0 + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
-| C0 + shock | refused | `FV --shock with species: not built (the chamber is the next cycle)` | no FV injector or holder, the line sensor is unbracketed on a flame (issues.md Z10) |
 | C1 + turb | refused | `FV --turb with model C1 / C2 (--mode diffusion, --sl-law onestep): not built (the turbulent box is measured on C0 and C2b)` | the slot jet takes no --turb on any solver; the one-step C2 premix is C1's stage and has no turbulent number |
 | C1 + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
-| C1 + shock | refused | `FV --shock with species: not built (the chamber is the next cycle)` | no FV injector or holder, the line sensor is unbracketed on a flame (issues.md Z10) |
+| C1 + shock | refused | `FV --shock with two reactants: not built (no gate; docs/nozzle.md "Reacting")` | Shock x C0 is gated (masterplan_combnozzle G3.1-G3.3); the two-reactant step's shared limiter under the hybrid mass flux is not (P8) |
 | C2b + steady LTS | refused | `FV local time stepping with species: not built` | kFvChem takes the bare cr: under LTS the fixed point would move with lts |
-| C2b + shock | refused | `FV --shock with species: not built (the chamber is the next cycle)` | no FV injector or holder, the line sensor is unbracketed on a flame (issues.md Z10) |
+| C2b + shock | refused | `FV --shock with --equivalence (C2b): not built (no gate; docs/nozzle.md "Reacting")` | Shock x C0 is gated (masterplan_combnozzle G3.1-G3.3); the two-reactant step's shared limiter under the hybrid mass flux is not (P8) |
 | gravity + turb | refused | `FV --turb with gravity: not built (the box's inflow is an open patch)` | gravity needs a closed domain (no hydrostatic ambient on open patches); --turb needs an open inflow |
 | gravity + steady LTS | refused | `FV local time stepping with gravity: not built` | kFvGravity takes the bare cr: under LTS the fixed point would move with lts |
 | gravity + shock | refused | `FV --shock with gravity: not built (no consumer)` | no rung has both; the hydrostatic balance is unproven under D3 |
 | bodyForce + turb | refused | `FV --turb with a body force: not built (the drive's channel has no inflow)` | the box is swept through an inflow patch; the driven channel is closed |
 | bodyForce + shock | refused | `FV --shock with a body force: not built (no consumer)` | the driven channel is subsonic: nothing to capture |
 | turb + steady LTS | refused | `FV --turb with local time stepping: the swept inflow is time-accurate` | the rows follow X = sum U dt; pseudo-time has no physical sweep |
-| turb + shock | refused | `FV --shock with --turb: not built (no consumer)` | --turb is the premixed flame box's; species with --shock are refused |
+| turb + shock | refused | `FV --shock with --turb: not built (no consumer)` | --turb is the flags' flame box's (--solver fv); --shock is the polyMesh route's |
 | steady LTS + shock | refused | `FV --shock with local time stepping: not built (the sensor flickers; the structured steady march refuses it too)` | a frozen or live sensor both left the host LTS residual flat at 3.7e-3 on a Total inlet (issues.md Z7); the time march is the route |
 | compensated + FP64 | exclusive | `--compensated is the FP32 state's low word: FP64 has no update floor to lift` | the two-word state lifts FP32's update floor; FP64 has none |
 | turb without C0 or C2b | requirement | `FV --turb: the premixed flame box (C0, C2b; dns flame --mode premixed --solver fv)` | |
@@ -429,6 +428,7 @@ Pair matrix: L live, R refused, x one axis (exclusive).
 | C0 + turb | gpu_fv_turb (IC, rows, trajectory X), tools/chem/turb_fv.sh comp, pairs (S_c, area vs structured) |
 | C0 + compensated | gpu_fv_flame S3, S4 |
 | C0 + FP64 | gpu_fv_flame S3, S4 |
+| C0 + shock | gpu_fv_matrix, gpu_fv_matrix_phys (G3.3), fvref_shockspecies (G3.2), gpu_fv_flame_shock |
 | C1 + gravity | gpu_fv_candle_rest, _g0, _height (the candle vs structured) |
 | C1 + compensated | gpu_fv_flame_jet |
 | C1 + FP64 | gpu_fv_flame_jet |
@@ -444,7 +444,7 @@ Pair matrix: L live, R refused, x one axis (exclusive).
 | FP64 + shock | gpu_fv_nozzle |
 
 <!-- generated: test_gpu_fv_matrix markdown (tests/test_gpu_fv_matrix.cpp) -->
-Harness rows (`gpu_fv_matrix`, 56 live cells on the meshes box 8x6x5 periodic, box_cyclic, box_refined, cyl2d_snappy; gravity on the open set through the hydrostatic ambient's rows). oracle: double vs FvRef, max relative over every pass, 3 steps; orders: Source / Morton / ColourMajor, 3 FP64 steps; rest: |rhs - source| / (p sum|S| / V), FP64 / FP32 on the closed set, open rest on the open set at rest (gravity, cyl2d_snappy: Far, Outflow, Inflow faces); mass, energy: 10 FP64 steps; Z: max|Z(Y) - tracer|, FP64 / FP32, 20 steps. Steady LTS cells: the oracle is the rhs and stableDt (FvRef has no LTS), mass n/a (LTS drifts it). Energy n/a with the drive (its work).
+Harness rows (`gpu_fv_matrix`, 57 live cells on the meshes box 8x6x5 periodic, box_cyclic, box_refined, cyl2d_snappy; gravity on the open set through the hydrostatic ambient's rows). oracle: double vs FvRef, max relative over every pass, 3 steps; orders: Source / Morton / ColourMajor, 3 FP64 steps; rest: |rhs - source| / (p sum|S| / V), FP64 / FP32 on the closed set, open rest on the open set at rest (gravity, cyl2d_snappy: Far, Outflow, Inflow faces); mass, energy: 10 FP64 steps; Z: max|Z(Y) - tracer|, FP64 / FP32, 20 steps. Steady LTS cells: the oracle is the rhs and stableDt (FvRef has no LTS), mass n/a (LTS drifts it). Energy n/a with the drive (its work).
 
 | Cell | oracle | f32 vs f64 | orders | rest FP64 / FP32 | open rest | mass | energy | pow2 Y | Z == tracer | inert | rerun |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -504,6 +504,7 @@ Harness rows (`gpu_fv_matrix`, 56 live cells on the meshes box 8x6x5 periodic, b
 | RANS SST + steady LTS | 3.3e-15 | 4.7e-06 | 5.0e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical |
 | bodyForce + steady LTS | 4.7e-15 | 4.3e-06 | 8.6e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical |
 | shock | 3.0e-15 | 2.8e-06 | 4.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.3e-15 | 1.7e-15 | n/a | n/a | n/a | byte-identical |
+| C0 + shock | 4.5e-15 | 3.3e-06 | 3.5e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.2e-16 | 6.7e-16 | exact | n/a | passive species: bitwise | byte-identical |
 
 Regenerate: `test_gpu_fv_matrix markdown` (via simjob) prints everything from the first
 `<!-- generated` marker to here.
@@ -720,6 +721,8 @@ oracle's 1.60165 at sigma 5, beta 8, Pr 0.72, M 0.01 unless stated, u_in 0.98.
 | FV(FP64) vs reactingFoam (G1.2, masterplan_combnozzle P1) | the SAME poly1d files, foam mclin (docs/chem.md "P1") | S_L | converged limit: gap below both oracle errors, falling | +1.384e-3, +4.592e-4, +2.341e-4 (own errors 1.74e-2, 4.03e-3, 9.97e-4); fresh-state term 1.7e-5 |
 | FV(FP64) at M 0.042 (G1.5) | poly1d, 7.5 / 15 / 30 | S_L self-convergence | order 2 | 1.007853, 0.994837, 0.991887: order 2.141, Richardson 0.991021 (+9.0e-4 off the O(M^2) formula, reported) |
 | FV(FP64) gamma 1.2 vs 1.4 (G1.6, G1.7) | poly1d, 15 / 30 | T_b/(sigma Tu) - 1 difference over [x_f + 3, x_f + 5] delta_th | +4.8e-5 [D] +- 1.2e-5 | +4.809e-5, +4.751e-5; S_L order 2.074, 1.865 about 1 - 1.2 M^2 (sigma - 1) |
+| `--shock hll` vs `--shock-d4 0` (G3.3, masterplan_combnozzle P3) | poly1d, 7.5 / 15 / 30, M 0.01 and 0.042 | Delta = S(hll) - S(d4 0) | <= \|S(d4 0) - S_ref\|/3, order >= 1.8; SZ defect <= 4/3 x d4 0; sensed 0 | M 0.01 -2.982e-3, -3.491e-4, -4.204e-5 (order 3.09, 3.05); M 0.042 -2.809e-3, -3.314e-4, -4.084e-5 (3.08, 3.02); bands 5.8e-3 .. 3.3e-4; SZ ratio 0.82 .. 1.00; shockCells 0 on every row |
+| `--shock hll --shock-d4 0` vs no `--shock` (G3.4) | poly1d 15 (both Machs), the box and poly1d at 7.5 | stats columns, profiles, state | bytes | identical (781 / 229 rows; gpu_fv_matrix_phys state bytes; gpu_fv_flame_shock) |
 | rotated 30 deg vs planar | 7.5 / 15 / 30, ny 16 / 32 / 64, FP64 | S_L; delta_th | rounding of the geometry | -5.1e-8, 0, -1.3e-8; +1.2e-5, -1.8e-6, +1.7e-7 |
 | sheared 30 deg (every face non-orthogonal) vs planar | same | S_L | order 2 | -3.50e-3, -9.40e-4, -2.38e-4 (1.89, 1.98) |
 | same | same | delta_th | order 2 | -2.12e-2, -5.38e-3, -1.25e-3 (1.98, 2.11) |

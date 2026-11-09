@@ -86,12 +86,16 @@ constexpr std::string_view kTurbLtsWhy = "the rows follow X = sum U dt; pseudo-t
 constexpr std::string_view kCompFp64 = "--compensated is the FP32 state's low word: FP64 has no update floor to lift";
 constexpr std::string_view kCompFp64Why = "the two-word state lifts FP32's update floor; FP64 has none";
 
-constexpr std::string_view kShSpecies = "FV --shock with species: not built (the chamber is the next cycle)";
-constexpr std::string_view kShSpeciesWhy = "no FV injector or holder, the line sensor is unbracketed on a flame (issues.md Z10)";
+constexpr std::string_view kShC1 = "FV --shock with two reactants: not built (no gate; docs/nozzle.md \"Reacting\")";
+constexpr std::string_view kShC2b = "FV --shock with --equivalence (C2b): not built (no gate; docs/nozzle.md \"Reacting\")";
+constexpr std::string_view kShTwoWhy =
+    "Shock x C0 is gated (masterplan_combnozzle G3.1-G3.3); the two-reactant step's shared limiter under the hybrid "
+    "mass flux is not (P8)";
+constexpr std::string_view kShC0 = "gpu_fv_matrix, gpu_fv_matrix_phys (G3.3), fvref_shockspecies (G3.2), gpu_fv_flame_shock";
 constexpr std::string_view kShLes = "FV --shock with LES: not built (no gate)";
 constexpr std::string_view kShLesWhy = "no nozzle rung runs LES; the background term has no filter width";
 constexpr std::string_view kShTfles = "FV --shock with TFLES: not built (no gate)";
-constexpr std::string_view kShTflesWhy = "TFLES is a premixed flame's; species with --shock are refused";
+constexpr std::string_view kShTflesWhy = "no gate thickens a flame under the hybrid flux (Shock x C0 is gated on the laminar flame)";
 constexpr std::string_view kShRans = "FV --shock with RANS: not built (no gate; the scalars ride F[0])";
 constexpr std::string_view kShRansWhy = "F[0] would carry the hybrid mass flux under the scalars: ungated";
 constexpr std::string_view kShGrav = "FV --shock with gravity: not built (no consumer)";
@@ -99,7 +103,7 @@ constexpr std::string_view kShGravWhy = "no rung has both; the hydrostatic balan
 constexpr std::string_view kShDrive = "FV --shock with a body force: not built (no consumer)";
 constexpr std::string_view kShDriveWhy = "the driven channel is subsonic: nothing to capture";
 constexpr std::string_view kShTurb = "FV --shock with --turb: not built (no consumer)";
-constexpr std::string_view kShTurbWhy = "--turb is the premixed flame box's; species with --shock are refused";
+constexpr std::string_view kShTurbWhy = "--turb is the flags' flame box's (--solver fv); --shock is the polyMesh route's";
 constexpr std::string_view kShLts = "FV --shock with local time stepping: not built (the sensor flickers; the structured steady march refuses it too)";
 constexpr std::string_view kShLtsWhy =
     "a frozen or live sensor both left the host LTS residual flat at 3.7e-3 on a Total inlet (issues.md Z7); the time march is the route";
@@ -213,9 +217,9 @@ constexpr std::array kRules{
     // shock capture: every refusal written (the default of a cross-axis pair is live)
     Rule{M::Shock, M::Fp64, live(kShNozzle)},
     Rule{M::Shock, M::Compensated, live(kShNozzle)},
-    Rule{M::Shock, M::ChemC0, refused(kShSpecies, kShSpeciesWhy)},
-    Rule{M::Shock, M::ChemC1, refused(kShSpecies, kShSpeciesWhy)},
-    Rule{M::Shock, M::ChemC2b, refused(kShSpecies, kShSpeciesWhy)},
+    Rule{M::Shock, M::ChemC0, live(kShC0)},
+    Rule{M::Shock, M::ChemC1, refused(kShC1, kShTwoWhy)},
+    Rule{M::Shock, M::ChemC2b, refused(kShC2b, kShTwoWhy)},
     Rule{M::Shock, M::LesSmag, refused(kShLes, kShLesWhy)},
     Rule{M::Shock, M::LesSigma, refused(kShLes, kShLesWhy)},
     Rule{M::Shock, M::TflesUniform, refused(kShTfles, kShTflesWhy)},

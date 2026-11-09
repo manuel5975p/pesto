@@ -245,10 +245,41 @@ directory, every cell p, T, u (v on the speed scale: both are rounding fields): 
 foam 3.1e-15, 104442 steps; `nozzle_RT` (twin 400) 2.4e-14, 1.8e-14, 132768 steps. Controls: the route's own flux (KG +
 D3) 8.97e-3 (the plan's >= 1e-2 UNMET by threshold, replaced by >= 1e-3), gas R + 1e-6 1.0e-6.
 
+## Reacting
+
+`dns flame --polymesh DIR --bc FILE --shock hll` (compressible, premixed C0; masterplan_combnozzle P3): Shock x C0 is
+live (`dns/fvmodules`). No kernel was edited to open it: `faces()` runs `kFvShockFace` after the KG faces, `speciesFaces()`
+reads the FINAL `F[0]`, so `F_Y = Y_f(sign of the final mdot) F_rho(final)` (KG + HLL + D3), never the structured `D
+Y_f(sign m_KG)`. Under `hll` the `--bc` file takes `type = "total"` with `y` (required: the fresh mass fractions),
+`[nozzle]` with `astar` (and `axis`; `p`, `t` exit 2: the flame starts from its composition IC), `[thrust]` with `pa`
+and `station` (required on the flame; the burnt-station columns are P4's). `wedge`: exit 2 (next cycle). The stats
+append `shockCells byteMax` and, with `[nozzle]`, the nozzle columns; `[thrust]` writes `_thrust.csv` from the flame
+runner as from the flow's. `--shock-d4` on the flame: hll only, [0, 0.125]. C1, C2b, `--equivalence`, TFLES, LES,
+`--turb` with `--shock`: refused by name. Label:
+
+    laminar reacting [premixed single-step C0, calorically perfect gamma G, Le 1, M_flame M (inflated)] species:
+    MC-limited MUSCL on the FINAL face mass flux (KG + HLL + D3) | FV path, ... [shock capturing: ... background D4
+    eps E |u.S|: NUMERICAL dissipation everywhere, not DNS; ...]
+
+| gate | rig | measured | band |
+|---|---|---|---|
+| G3.1 | `gpu_fv_matrix` cell C0 + shock, 4 meshes | FvRef 4.5e-15, f32 3.3e-6, numbering 3.5e-16, mass 2.2e-16, E + q rho Y 6.7e-16, pow2 Y exact, passive species 40 steps bitwise, rerun identical | matrix rules |
+| G3.1 ctrl | host: one forward-Euler update of uniform Y 1/4 from mutated face fluxes (`fvref_shockspecies`) | "D3 on rho Y itself" bitwise (DEAD: d(rho Y) = d(rho)/4 exactly); replaced once by "species on the KG mass flux": broken | must break |
+| G3.2 | `fvref_shockspecies`: 200 cells, 200 steps, cfl 0.8, force sigma 1 / hll | Sod Y in [-2.0e-17, 1 + 2.2e-16], contact 1.69 / 0.94 cells; Mach 3 piston Y in [-2.9e-19, 1 + 4.4e-16] | [-1e-14, 1 + 1e-14]; 2 cells |
+| G3.2 ctrl | `D Y_f(sign m_KG)`, sigma 1, same ICs (`shock_ref.hpp` Reuse) | piston min Y -1.08e-2; Sod 0.0 (reported) | < -1e-2 |
+| G3.3 | poly1d hll vs d4 0, [7, 14] | see docs/fvcomp.md "Species cross-verification": Delta order 3.1, 3.0 at both Machs, SZ defect hll <= d4 0, shockCells 0 | 1/3 of the d4-0 error, order 1.8 |
+| G3.3 ctrl | box 7.5 cells M 0.042, force sigma 1, [2, 4] | S_L 1.631 vs 1.010 (shift 0.62) | >= 3 x band (1.8e-2) |
+| G3.4 | hll d4 0 vs none | bytes (15 cells both Machs; 7.5 box state; 7.5 poly1d through the binary) | bytes |
+| G3.5 | gamma 1.2, M 0.042, 15 cells, hll | S_L 0.9982783 (P4's design input) | reported |
+
+**R6's fallback did not fire**: D3 moves S_L by 3e-3 at 7.5 cells and at order 3 (h^3: a fourth difference on the
+mass flux), below a third of the scheme's own S_L error at every rung, and leaves the Shvab-Zeldovich defect at or
+below the d4-0 value (ratio 0.82 to 1.00). `--shock hll` keeps eps 1/16 on the flame route.
+
 ## Not built, refused
 
-`--steady` (LTS on `Total` stalls on the host, Z7), LES, RANS, species, gravity, body force, `--turb`: refused by name
-(`dns/fvmodules`, axis `capture`). Plume box (P7), the reacting chamber (masterplan_combnozzle P3, P4): next. Structured
+`--steady` (LTS on `Total` stalls on the host, Z7), LES, RANS, two-reactant species (C1, C2b), gravity, body force,
+`--turb`: refused by name (`dns/fvmodules`, axis `capture`). Plume box (P7), the reacting nozzle (P4): next. Structured
 D3: no. `[thrust]` with checkpoints: refused (the ledger is not checkpointed); `[thrust].station` on `dns flow`: refused
 (the reacting nozzle's burnt station, P4). The ledger refuses gravity, a body force, RANS and local time stepping (their
 sources are no boundary flux).
@@ -287,5 +318,8 @@ CLAUDE.md is not edited. For the user:
   the axis's S_y differ by an ulp); area-Mach and the normal shock are its closed oracles.
 - **`--shock` is refused on meshes with unlined cells** (wedge axis prisms exempt); Kuhn tets and union-jack prisms
   are lined.
+- **Under `--shock` species ride the FINAL F[0]** (the species face pass after the shock face pass); never upwind on
+  the KG mass flux (it breaks uniform Y), never `D Y_f(sign m_KG)` (unbounded: piston min Y -1.08e-2). D3 on a flame
+  is order h^3 in S_L (G3.3).
 - **A foam parity gap is a two-sided number.** In the supersonic cone foam at vanLeer holds p0 to -9.7e-4 at 320 x 64
   and dns to -6.9e-5: the gap is mostly foam's.

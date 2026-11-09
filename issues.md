@@ -2577,7 +2577,10 @@ at sigma 1 to 3.4e-13 of scale on every cell, shock and wedge included.
 - Z8. Structured steady odd-even: gate 34's order 1.23 may be the same mode: unproven. No structured D3.
 - Z9. Foam's one-row L1 p 2e-3 vs dns 4e-5 [A2 E11]: unexplained, not dns's. Same item as Z4 (R12): foam vanLeer on
   one row does not settle, its p moves 1.2e-3 of p0 over t 2.1 to 2.4 s at 200 cells (2.0e-3 at 400).
-- Z10. Line sensor on a flame unbracketed: `Shock + C0` refused.
+- Z10. **Closed by G3.3** (masterplan_combnozzle P3, A14-A16): on the poly1d flame at M 0.01 and 0.042, 7.5 / 15 / 30
+  cells, the line sensor reads 0 cells on every stats row, and D3 moves S_L by -3.0e-3, -3.4e-4, -4.2e-5 (order 3.1,
+  3.0), below a third of the d4-0 error at every rung; the Shvab-Zeldovich defect is at or below the d4-0 one. Shock
+  x C0 is live; C1, C2b stay refused (no gate, P8).
 - Z11. Line sensor on tets, snappy cells. **Measured, refusal built** (masterplan_combnozzle R8, A11, docs/nozzle.md
   "Sensor"): unlined cells (an active face with no opposite at cos <= -0.5; wedge axis prisms exempt) are 0 on every hex
   mesh, cyl2d_snappy, and A1's prism75, tet75, tetdual (1.99, 1.99, 7.40 lines per cell): Kuhn tets and union-jack prisms
@@ -2658,6 +2661,21 @@ P2, the minimal CD nozzle and the thrust ledger (docs/nozzle.md "Thrust", "Quasi
   p2)/2 crossing's sub-cell offset (-0.07 h, -0.08 h, -0.12 h) is not monotone in h: orders 0.88, 0.46 vs >= 0.9.
   The post-shock integrals converge at order 2 (Fexit, wall). Stop rule: recorded, P4 proceeds (its nozzle is smooth).
   `--shock-d4 0` (reported): x_s 3.08016, 3.08190, 3.08241, Fexit 1.5740346, 1.5740521, 1.5740563: D3 moves x_s <= 1e-4.
+
+P3, Shock x C0 (docs/nozzle.md "Reacting"; amendments A14-A16): G3.1-G3.4 PASS, G3.5 reported; R6's fallback not
+needed. Open:
+- N8. **Two plan controls were dead and are replaced once (A14).** G3.1's "D3 applied to rho Y itself" cannot break a
+  power-of-two uniform Y: d(rho Y) = d(rho)/4 exactly, so `Y_f F_KG + l d(rho Y)` IS `Y_f F_final` bit for bit
+  (measured: bitwise). Replaced by "species on the KG mass flux" (the order-swap hazard): breaks. G3.2's structured
+  `D Y_f(sign m_KG)` stays in [0, 1] on the Sod step (min Y 0.0: D and m_KG share their sign at the contact); live on
+  the Mach 3 piston (-1.08e-2, a 8% margin over -1e-2), which carries the gate's control.
+- N9. **`[thrust].station` on the flame route is validated (required) but read by nothing until P4** (the burnt
+  station's columns p0b, T0b, CdB, CfB). The flame runner writes the nozzle columns and `_thrust.csv` (rows close to
+  1.6e-14 of P_k on a constant-area smoke, `gpu_fv_flame_shock`).
+- N10. **G3.3's control reads S_L on [2, 4], not [7, 14].** HLL on every face (force sigma 1) thickens the flame ~3x;
+  past t ~ 4 its preheat reaches the probe's fresh reference slab (2 delta_th from the inflow), whose rho Y normalises
+  S_L, and the probe reads ~2e8. Over [2, 4] the flame is inside the guard and S_L 1.631 vs 1.010 (shift 0.62 vs the
+  needed 1.8e-2). The force runs' late S_L is a probe artefact, not a speed.
 
 ## Older open items (details in CLAUDE.md)
 

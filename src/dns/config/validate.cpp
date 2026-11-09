@@ -1,6 +1,7 @@
 // validate(): the shared prologue and the per-subcommand dispatch.
 #include "dns/config.hpp"
 #include "dns/config/internal.hpp"
+#include "dns/shockflux.hpp"
 
 
 
@@ -48,6 +49,12 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
                                    "lowmach (the compressible dt is acoustic)");
 
     if (auto e = shockRouteScope(r)) return std::unexpected(*e);
+    if (r.sub == Subcommand::Flame && r.given.contains("--shock-d4")) {
+        if (!r.given.contains("--polymesh"))
+            return bad(2, "--shock-d4", "is the FV polyMesh route's (the structured solvers carry no background term)");
+        if (r.shock != ShockMode::Hll) return bad(2, "--shock-d4", "needs --shock hll");
+        if (!(r.shockD4 >= 0.0 && r.shockD4 <= kFvShockEps4Max)) return bad(2, "--shock-d4", "must be in [0, 0.125]");
+    }
     if (r.sub == Subcommand::Flow && !r.given.contains("--polymesh")) {
         if (r.given.contains("--shock-d4"))
             return bad(2, "--shock-d4", "is the FV polyMesh route's (the structured solvers carry no background term)");
@@ -145,6 +152,8 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
             if (auto e = shockFlagScope(r, *f); e) return std::unexpected(*e);
         if (f && r.shock != ShockMode::None) f->meta.shock = name(r.shock);
         if (f && r.shock == ShockMode::Hll) shockCadence(r, *f);
+        // The FV flame's background term (masterplan_combnozzle P3); the structured flame has none.
+        if (f && r.shock == ShockMode::Hll && r.given.contains("--polymesh")) f->shockEps4 = r.shockD4;
         if (f)
             if (auto e = resolveFrameStart(r, *f); e) return std::unexpected(*e);
         if (f)
@@ -160,9 +169,13 @@ std::expected<Case, ConfigError> validate(const RawConfig& r)
                     for (const char* k : {"--checkpoint-dt", "--restart", "--wall-limit"})
                         if (r.given.contains(k))
                             return bad(2, k, "is not built with [thrust] (the impulse ledger is not checkpointed)");
-                if (const std::string k = fvBcNozzleKey(f->fvBc); !k.empty())
+                if (r.shock == ShockMode::Hll && f->physics == Physics::Compressible) {
+                    // masterplan_combnozzle P3: the reacting nozzle's tables on the hll flame route.
+                    if (auto e = fvFlameNozzleScope(f->fvBc)) return std::unexpected(*e);
+                } else if (const std::string k = fvBcNozzleKey(f->fvBc); !k.empty()) {
                     return bad(2, "--bc", k + " belongs to the nozzle route (dns flow --shock hll --polymesh): the "
                                               "compressible flame's open faces are far/outflow");
+                }
                 if (f->physics != Physics::LowMach)
                     for (const FvPatchSpec& p : f->fvBc.patches)
                         if (p.kind == FvPatchKind::Open)

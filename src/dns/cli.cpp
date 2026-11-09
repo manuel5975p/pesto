@@ -310,7 +310,7 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--chem-dt", &c.chemDt}, {"--rim", &c.rim},
              {"--tube-length", &c.tubeLength}, {"--rim-temp", &c.rimTemp},
              {"--si-delta-d", &c.siDeltaD}, {"--si-sl", &c.siSL},
-             {"--gamma", &c.gamma}});
+             {"--gamma", &c.gamma}, {"--shock-d4", &c.shockD4}});
     if (c.sub == Subcommand::Flame) // --mode chamber (validator scopes them)
         add({{"--inject-speed", &c.chamber.injectSpeed},
              {"--coflow", &c.chamber.coflow},
@@ -1954,7 +1954,11 @@ and --mode diffusion, model C1).
                        hll adds NUMERICAL dissipation in sensed cells; sense runs
                        the sensor alone, the central solver bit for bit. Appends
                        stats columns. --mach <= 0.05, --cfl <= 0.6 at nz 1, 0.4
-                       at nz > 1.                                    [none]
+                       at nz > 1. On --polymesh (compressible, premixed C0;
+                       docs/nozzle.md "Reacting"): the FV pass + D3, --cfl <= 1.2;
+                       --bc takes total (with y), [nozzle] astar, [thrust]. [none]
+  --shock-d4 EPS       FV --polymesh --shock hll: the background D3,
+                       eps (1 - sigma) |u.S|, in [0, 0.125]          [0.0625]
   --tt T               run length in flame times delta_D/S_L        [10]
   --cfl C              acoustic CFL                                [0.4]
   --dt-recompute N     steps between dt recomputations             [16]

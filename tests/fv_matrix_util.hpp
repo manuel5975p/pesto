@@ -219,6 +219,11 @@ inline std::vector<FvModuleSet> matrixCells(bool live)
     FvModuleSet shock; // past the precision axis in the enum, a model module
     shock.set(std::size_t(FvModule::Shock));
     add(shock);
+    for (std::size_t a = 0; a < nModel; ++a) { // its pairs (live: C0, masterplan_combnozzle P3)
+        FvModuleSet two = shock;
+        two.set(a);
+        add(two);
+    }
     std::ranges::sort(v, {}, [](const FvModuleSet& s) { return s.to_ullong(); });
     return v;
 }
