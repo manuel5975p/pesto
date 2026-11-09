@@ -108,8 +108,6 @@ std::optional<ConfigError> fvCompCommon(const RawConfig& r, Case& c)
     c.fvFrameN = r.frameN;
     c.fvPrecision = FvPrecision(r.fvPrecision);
     // The inventory's pairs a flag pair spells (dns/fvmodules, docs/fvcomp.md "Combinations").
-    if (r.compensated && c.fvPrecision == FvPrecision::Fp64)
-        return ConfigError{2, "--compensated", std::string(fvPair(FvModule::Compensated, FvModule::Fp64).message)};
     if (r.les > 0.0 && r.given.contains("--steady"))
         return ConfigError{2, "--steady", std::string(fvPair(FvModule::LesSmag, FvModule::Steady).message)};
     c.compensated = r.compensated;

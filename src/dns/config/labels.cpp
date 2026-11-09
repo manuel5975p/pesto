@@ -52,7 +52,8 @@ std::string fvCompLabel(const Case& c, bool twoD)
     if (c.rans != RansModel::None) // a mean-model label: no DNS/LES text, no 2D caveat
         return std::format("[FV path, {}, {}{}] compressible {} [exact wall distance, scalars first-order upwind]: "
                            "Kennedy-Gruber face flux, least-squares gradients, SSP-RK3",
-                           mesh, fvPrecisionName(c.fvPrecision), c.compensated || c.compSteady ? " compensated" : "",
+                           mesh, fvPrecisionName(c.fvPrecision),
+                           c.compensated ? fvCompensatedSuffix(c.fvPrecision, true) : c.compSteady ? " compensated" : "",
                            ransRunLabel(c.rans, c.compSteady ? RansMode::SteadyExplicit : RansMode::Urans));
     const std::string model =
         c.compSteady ? ransRunLabel(RansModel::None, RansMode::SteadyExplicit)
@@ -64,7 +65,7 @@ std::string fvCompLabel(const Case& c, bool twoD)
     const std::string gam = c.fvGamma != kGammaAir ? std::format(" gamma {:g}", c.fvGamma) : "";
     return std::format("[FV path, {}, {}{}] compressible{} {}: Kennedy-Gruber face flux, least-squares gradients, "
                        "SSP-RK3{}{}",
-                       mesh, fvPrecisionName(c.fvPrecision), c.compensated ? " compensated" : "", gam, model, sense, hll);
+                       mesh, fvPrecisionName(c.fvPrecision), fvCompensatedSuffix(c.fvPrecision, c.compensated), gam, model, sense, hll);
 }
 
 } // namespace dns
@@ -106,12 +107,12 @@ std::string fvFlameLabel(const Case& c)
                            "(inflated)] species: MC-limited MUSCL on the FINAL face mass flux (KG + HLL + D3) | FV path, "
                            "{}, {}{}: Kennedy-Gruber face flux, least-squares gradients, SSP-RK3; open faces are FV "
                            "boundary fluxes, no NSCBC, no sink",
-                           c.fvGamma, c.mach, mesh, fvPrecisionName(c.fvPrecision), c.compensated ? " compensated" : "") +
+                           c.fvGamma, c.mach, mesh, fvPrecisionName(c.fvPrecision), fvCompensatedSuffix(c.fvPrecision, c.compensated)) +
                std::vformat(kFvShockSuffix, std::make_format_args(c.shockEps4));
     return flameRunLabel(c) +
            std::format(" | FV path, {}, {}{}: Kennedy-Gruber face flux, least-squares gradients, SSP-RK3; species "
                        "virtual-upwind MC {}on the face mass flux; open faces are FV boundary fluxes, no NSCBC, no sink{}",
-                       mesh, fvPrecisionName(c.fvPrecision), c.compensated ? " compensated" : "",
+                       mesh, fvPrecisionName(c.fvPrecision), fvCompensatedSuffix(c.fvPrecision, c.compensated),
                        c.flameDiffusion || c.flamePremix2 ? "shared by the species " : "",
                        c.flameCandle && c.flameGravity > 0
                            ? "; gravity the well-balanced face form, open faces on the hydrostatic ambient's rows "
@@ -811,7 +812,7 @@ std::string fvConvLabel(const Case& c, bool twoD)
                                c.sgsModel == SgsModel::Sigma ? "Csigma" : "Cs", c.cs, kLesPrt)
                  : std::string("DNS");
     return std::format("{}{} [FV path, {}, {}{}] Rayleigh-Benard {}", what, twoD ? " (2D: qualitative only)" : "", mesh,
-                       fvPrecisionName(c.fvPrecision), c.compensated ? " compensated" : "", model);
+                       fvPrecisionName(c.fvPrecision), fvCompensatedSuffix(c.fvPrecision, c.compensated), model);
 }
 
 } // namespace dns

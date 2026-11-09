@@ -13,6 +13,7 @@
 #include "dns/gpu/index.hpp"
 #include "dns/gpu/reductions.hpp"
 #include "dns/gpu/shock.hpp"
+#include "dns/gpu/word2d.hpp"
 
 #include <cstdint>
 #include <expected>
@@ -205,6 +206,12 @@ __host__ __device__ inline Word2 addWord2(Real hi, Real lo, Real d)
     const Word2 s = twoSum(hi, d);
     return twoSum(s.hi, s.lo + lo);
 }
+
+// The FP32 state's words (dns/gpu/word2d.hpp: WordOf<double> = Word2d).
+template <> struct WordOf<Real>
+{
+    using type = Word2;
+};
 
 // Exact uniform Galilean x-boost by du: mx += rho du, E += mx_old du +
 // rho du^2/2. A frame change -- no divergence, vorticity or acoustics;

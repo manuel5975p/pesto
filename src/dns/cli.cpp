@@ -791,8 +791,10 @@ COMPRESSIBLE FV PATH (docs/fvcomp.md)
   --fv-precision P   fp32 | fp64 also selects this solver's arithmetic. [fp32]
   --compensated      the two-word FP32 state: a plain FP32 state drops updates
                      below ulp(q)/2, so a settled flow's cd wanders (0.5% on a
-                     Re 40 cylinder, docs/fvcomp.md). Rejected with fp64. On the
-                     FV family this path alone: rejected by the other two.
+                     Re 40 cylinder, docs/fvcomp.md). With fp64: the
+                     double-double state (the plain FP64 stage-3 write is
+                     biased +0.11 ulp, a ledger residual linear in steps). On
+                     the FV family this path alone: rejected by the other two.
   --frame-box a,b,c,d  window of the frames in the plane's two axes (default
                      the mesh bbox). Frames on any FV mesh are this uniform
                      plane, the containing cell's value per pixel; 3D meshes:
@@ -1850,7 +1852,8 @@ and --mode diffusion, model C1).
                        the slot's centre, lift its lateral axis.
   --fv-precision P     fp32 | fp64 (fv path).                          [fp32]
   --compensated        the FP32 two-word state (fv path). Plain FP32 reads S_L
-                       5e-4 low at M 0.01; --compensated matches FP64.
+                       5e-4 low at M 0.01; --compensated matches FP64. With
+                       fp64: the double-double state (unbiased ledger).
   --gamma G            premixed C0 with --polymesh only: one constant gamma for
                        fresh AND burnt gas (calorically perfect, frozen);
                        Tu = 1/(G M^2), q = cp(G) (sigma - 1) Tu.          [1.4]

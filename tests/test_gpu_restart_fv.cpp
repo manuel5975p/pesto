@@ -17,6 +17,10 @@
 //   fp64    C0 at --fv-precision fp64 (F64 words), profiles; junk appended to
 //           every output between jobs 2 and 3 (a job killed after its
 //           checkpoint): the restart truncates it
+//   fp64c   C0 at --fv-precision fp64 --compensated (masterplan_combclose R6): F64 q and
+//           lo words; teeth on state.fv.lo (the final state words move: the printed
+//           outputs do not resolve an FP64 low word over 1 tau); a restart without
+//           --compensated is exit 3
 //   jet     --mode diffusion (the jet's per-face rows, characteristic outflow)
 //   turb    --turb 4 (3D box 24^2): the inflow rows of the box swept to X = sum U dt,
 //           X carried in the loop record "sweep" (restarting at X 0 replays the
@@ -37,7 +41,7 @@
 //   poly    --polymesh: the sheared box at --fv-precision fp64 (F64 words)
 //   reject  the polyMesh content changed (exit 3)
 //
-// Usage: test_gpu_restart_fv comp|lm. No HIP device -> skip (77).
+// Usage: test_gpu_restart_fv comp|lm|fp64c. No HIP device -> skip (77).
 #include "dns/checkpoint.hpp"
 #include "dns/gpu/device_util.hpp"
 #include "gpu_test_util.hpp"
@@ -226,6 +230,41 @@ void teeth(const std::string& name, const std::string& args, double every, const
           name + ": zeroing " + rec + " in the checkpoint changes the outputs (carried state, seen by the byte gate)");
 }
 
+// teeth on an F64 record (the FP64 words): the whole record zeroed, resumed to the end; the
+// final checkpoint's state.fv.q must differ from the straight run's.
+void teeth64(const std::string& name, const std::string& args, double every, const std::string& rec)
+{
+    const std::string d = kRoot + "/" + name + "_teeth_" + rec;
+    fs::create_directories(d);
+    const std::string out = " --quiet --out " + d + "/r";
+    const std::string ck = std::format(" --checkpoint-dt {}", every);
+    int rc = runDns(args + ck + " --wall-limit 0" + out, d + "/job0.log");
+    auto c = dns::Checkpoint::read(d + "/r_ckpt.bin");
+    const bool ok = rc == 0 && c.has_value();
+    check(ok, name + " teeth: first job and its checkpoint");
+    if (!ok) return;
+    const auto was = c->f64(rec);
+    const bool nonzero = was && std::ranges::any_of(*was, [](double v) { return v != 0.0; });
+    if (was) c->putF64(rec, std::vector<double>(was->size(), 0.0));
+    const bool wrote = c->write(d + "/r_ckpt.bin").has_value();
+    rc = runDns(args + ck + " --restart " + d + "/r" + out, d + "/job1.log");
+    std::printf("    %s teeth: %s %s\n", name.c_str(), rec.c_str(), nonzero ? "was nonzero" : "was ALL ZERO");
+    // An FP64 low word is <= ulp(hi)/2: the printed outputs (stats, profiles, FP32 frames) do not
+    // resolve it over a short run. The carried state does: the final checkpoint's q words.
+    auto mine = dns::Checkpoint::read(d + "/r_ckpt.bin"), ref = dns::Checkpoint::read(kRoot + "/" + name + "/ck/r_ckpt.bin");
+    std::vector<double> qa, qb;
+    if (mine)
+        if (auto v = mine->f64("state.fv.q")) qa = std::move(*v);
+    if (ref)
+        if (auto v = ref->f64("state.fv.q")) qb = std::move(*v);
+    std::size_t moved = 0;
+    if (!qa.empty() && qa.size() == qb.size())
+        for (std::size_t i = 0; i < qa.size(); ++i) moved += qa[i] != qb[i];
+    std::printf("    %s teeth: %zu of %zu final state.fv.q words moved\n", name.c_str(), moved, qa.size());
+    check(was.has_value() && wrote && rc == 0 && nonzero && moved > 0,
+          name + ": zeroing " + rec + " in the checkpoint moves the final state words (carried state)");
+}
+
 // Rejections on the one-job checkpoint of `args` (prefix d/r): each a
 // (modification, restart args, exit code, text) row; the outputs stay as they were.
 struct Reject
@@ -274,6 +313,22 @@ void touch(const std::string& path, bool on, std::string& keep, const char* comm
     }
 }
 
+// masterplan_combclose R6: the compensated FP64 state (F64 q and lo words); its checkpoint
+// carries state.fv.lo, zeroed it changes the outputs; a restart without --compensated is
+// exit 3 by name. Also alone: `test_gpu_restart_fv fp64c`.
+void compFp64()
+{
+    const std::string fp64c = "flame --solver fv --fv-precision fp64 --compensated --cells-per-delta 8 --tt 1 --profile-dt 0.5 "
+                              "--emit stats --emit bin --fdt 0.25";
+    fvCase("fp64c", fp64c, 0.25, 4);
+    teeth64("fp64c", fp64c, 0.25, "state.fv.lo");
+    rejects(kRoot + "/reject_fp64c", fp64c, 0.25,
+            {{"a compensated FP64 checkpoint into a plain FP64 run",
+              "flame --solver fv --fv-precision fp64 --cells-per-delta 8 --tt 1 --profile-dt 0.5 --emit stats --emit bin --fdt 0.25", 3,
+              "--compensated"}},
+            [](int, bool) {});
+}
+
 void comp()
 {
     fvCase("les3d",
@@ -291,6 +346,7 @@ void comp()
            0.25, 4, [](int job) {
                if (job == 2) appendJunk(kRoot + "/fp64/chain");
            });
+    compFp64();
     fvCase("jet", "flame --mode diffusion --solver fv --tt 1 --emit stats --emit bin --fdt 0.25", 0.25, 4);
     fvCase("turb",
            "flame --solver fv --turb 4 --turb-length 1 --cells-per-delta 4 --ny 24 --nz 24 --upstream 6 "
@@ -361,8 +417,8 @@ void lowMach()
 int main(int argc, char** argv)
 {
     const std::string_view group = argc > 1 ? argv[1] : "";
-    if (group != "comp" && group != "lm") {
-        std::fprintf(stderr, "usage: test_gpu_restart_fv comp|lm\n");
+    if (group != "comp" && group != "lm" && group != "fp64c") {
+        std::fprintf(stderr, "usage: test_gpu_restart_fv comp|lm|fp64c\n");
         return 1;
     }
     dns::test::requireDeviceOrSkip();
@@ -371,6 +427,7 @@ int main(int argc, char** argv)
     fs::remove_all(kRoot, ec);
     fs::create_directories(kRoot);
     if (group == "comp") comp();
+    else if (group == "fp64c") compFp64();
     else lowMach();
     return dnstest::finish();
 }

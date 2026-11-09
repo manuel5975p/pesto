@@ -500,7 +500,7 @@ if(BUILD_TESTING)
         rotor focal cli_defaults comp_axis_permute rans rans_channel1d
         steady_stop blockband channel_line pseudo_time flow_rans_config precond
         host_threads flame1d flame_config lowmach_config fv_lowmach restart_config bunsen diffusion candle wick chamber_config
-        polymesh facemesh fvref fv_comp la amg fvcase fvwalldist fvstructured tfles poisson_sep fvincomp)
+        polymesh facemesh fvref fv_comp la amg fvcase fvwalldist fvstructured tfles poisson_sep fvincomp stage_bias)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini turb_ic)
     endif()
@@ -511,6 +511,9 @@ if(BUILD_TESTING)
         set_tests_properties(${t} PROPERTIES TIMEOUT 120)
     endforeach()
     target_link_libraries(test_fieldpng PRIVATE ZLIB::ZLIB) # decodes IDAT
+    # N16 (masterplan_combclose K4): std::fma emulates the GPU's stage-3 order; no host contraction.
+    target_compile_options(test_stage_bias PRIVATE -ffp-contract=off)
+    set_tests_properties(stage_bias PROPERTIES LABELS "nozzle;fast")
     target_compile_definitions(test_host_threads PRIVATE
         DNS_ROTOR2_STL="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/rotor2.stl")
     # The Cantera reference of the chemistry oracle (tools/chem/cantera_flame.py).

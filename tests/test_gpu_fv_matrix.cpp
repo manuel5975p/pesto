@@ -8,19 +8,24 @@
 //       (their off IS absence: tools/fv/comp_bit_identity.sh against the base binary)
 //   (b) invariants on the closed boundary set: the rest (hydrostatic with gravity)
 //       state's rhs is the analytic source (drive) to rounding of its pressure fluxes;
-//       uniform power-of-two Y exact over 10 steps (FP32, compensated, FP64); mass and
-//       E + q rho Y_F + rho Phi telescope (FP64, 10 steps; energy not with the drive);
-//       Z(Y_F, Y_O) == the carried tracer (two reactants, FP64 and FP32 walk)
+//       uniform power-of-two Y exact over 10 steps (FP32, compensated, FP64, compensated
+//       FP64); mass and E + q rho Y_F + rho Phi telescope (FP64 plain and compensated, 10
+//       steps; energy not with the drive); Z(Y_F, Y_O) == the carried tracer (two
+//       reactants, FP64 and FP32 walk)
 //   (c) double instantiation vs FvRef <= 1e-13: rhs, mean and species fluxes, omega,
-//       mu_t, the TFLES coefficients, RANS fields, stableDt, 3 steps; float vs double
-//   (d) Source / Morton / ColourMajor numbering: 3 FP64 steps, to summation order (the
-//       CSR order changes with the numbering; test_fvref E4), bitwise stated if so
-//   (e) rerun byte-identical, FP32 plain and compensated, 10 steps
+//       mu_t, the TFLES coefficients, RANS fields, stableDt, 3 steps (plain and compensated
+//       FP64, masterplan_combclose R6); float vs double; the silent-float guard: one step,
+//       compensated FP64 vs FP64 <= 1e-14 (control: compensated FP32 >= 1e-9)
+//   (d) Source / Morton / ColourMajor numbering: 3 FP64 steps (plain and compensated), to
+//       summation order (the CSR order changes with the numbering; test_fvref E4), bitwise
+//       stated if so
+//   (e) rerun byte-identical, FP32 plain and compensated, compensated FP64, 10 steps
 // One row per cell. `test_gpu_fv_matrix markdown` prints docs/fvcomp.md's generated
 // "Combinations" section (the inventory + this matrix' rows).
 #include "fv_comp_test_util.hpp"
 #include "fv_matrix_util.hpp"
 
+#include "dns/checkpoint.hpp"
 #include "dns/cli.hpp"
 #include "dns/config.hpp"
 #include "dns/fvcomp_case.hpp"
@@ -271,6 +276,7 @@ struct Row
     int meshes = 0;
     double oracle = 0.0, f32 = 0.0, orders = 0.0, rest64 = 0.0, rest32 = 0.0, open64 = -1.0, open32 = -1.0, mass = -1.0, energy = -1.0, ztr64 = -1.0,
            ztr32 = -1.0;
+    double guard = 0.0, guardCtl = HUGE_VAL; // compensated FP64 vs FP64, compensated FP32 vs FP64: one step
     bool ordersBitwise = true, pow2 = true, pow2Run = false, rerun = true;
     std::string inert = "n/a";
     bool pass = true;
@@ -361,18 +367,42 @@ Row runCell(const FvModuleSet& cell, const std::vector<MeshCase>& ms)
                 e = std::max(e, relDiff(qD.q, q.q, nV, nC));
                 f = std::max(f, relDiff(qF.q, qD.q, nV, nC));
             }
+            // Compensated FP64 (masterplan_combclose R6): the double-double state vs FvRef, 3 steps.
+            if (!lts) {
+                auto dc = orDie(DeviceFvComp::make(fm, devOf(cfg, FvPrecision::Fp64, true)), "dev comp");
+                orDie(dc.upload(s0), "upload");
+                for (int n = 0; n < 3; ++n) dc.step(dt);
+                FvState q = s0, qC;
+                ref.march(q, dt, 3);
+                orDie(dc.download(qC), "download");
+                const double ec = relDiff(qC.q, q.q, nV, nC);
+                if (ec > 1e-13) std::printf("    %s: compensated FP64 vs FvRef %.2e\n", m.name.c_str(), ec);
+                e = std::max(e, ec);
+            }
             row.oracle = std::max(row.oracle, e);
             if (f > 2e-5 || e > 1e-13) std::printf("    %s: oracle %.2e, f32 %.2e\n", m.name.c_str(), e, f);
             row.f32 = std::max(row.f32, f);
         }
 
-        // (d) numberings, FP64, 3 steps, compared in source numbering.
+        // Silent-float guard (masterplan_combclose 8): one step from s0, compensated FP64 vs plain
+        // FP64 <= 1e-14 relative (a double kernel narrowed to float lands ~1e-7 off); control:
+        // compensated FP32 vs plain FP64 >= 1e-9.
         {
+            const Run p = march(fm, devOf(cfg, FvPrecision::Fp64), s0, dt, 1, lts);
+            const Run c = march(fm, devOf(cfg, FvPrecision::Fp64, true), s0, dt, 1, lts);
+            const Run f = march(fm, devOf(cfg, FvPrecision::Fp32, true), s0, dt, 1, lts);
+            const bool ok = p.ok && c.ok && f.ok;
+            row.guard = std::max(row.guard, ok ? relDiff(c.s.q, p.s.q, nV, nC) : HUGE_VAL);
+            row.guardCtl = std::min(row.guardCtl, ok ? relDiff(f.s.q, p.s.q, nV, nC) : 0.0);
+        }
+
+        // (d) numberings, FP64 plain and compensated, 3 steps, compared in source numbering.
+        for (const bool comp : {false, true}) {
             std::vector<double> base;
             for (std::size_t o = 0; o < kOrders.size(); ++o) {
                 const FaceMesh& fo = m.fm[o];
                 const FvConfig co = fvm::matrixConfig(cell, fo, m.open[o], m.tr);
-                const Run r = march(fo, devOf(co, FvPrecision::Fp64), cellState(co, fo, nV), dt, 3, lts);
+                const Run r = march(fo, devOf(co, FvPrecision::Fp64, comp), cellState(co, fo, nV), dt, 3, lts);
                 if (!r.ok) {
                     row.pass = false;
                     continue;
@@ -386,16 +416,17 @@ Row runCell(const FvModuleSet& cell, const std::vector<MeshCase>& ms)
                     continue;
                 }
                 const double eo = relDiff(bySrc, base, nV, nC);
-                if (eo > 1e-13) std::printf("    %s, numbering %zu: %.2e\n", m.name.c_str(), o, eo);
+                if (eo > 1e-13) std::printf("    %s, numbering %zu%s: %.2e\n", m.name.c_str(), o, comp ? " (compensated)" : "", eo);
                 row.orders = std::max(row.orders, eo);
                 row.ordersBitwise = row.ordersBitwise && sameBytes(bySrc, base);
             }
         }
 
-        // (e) rerun, FP32 plain and compensated.
-        for (const bool comp : {false, true}) {
-            const Run a = march(fm, devOf(cfg, FvPrecision::Fp32, comp), s0, dt, 10, lts);
-            const Run b = march(fm, devOf(cfg, FvPrecision::Fp32, comp), s0, dt, 10, lts);
+        // (e) rerun, FP32 plain and compensated, compensated FP64.
+        for (const auto& [pr, comp] : {std::pair{FvPrecision::Fp32, false}, std::pair{FvPrecision::Fp32, true},
+                                       std::pair{FvPrecision::Fp64, true}}) {
+            const Run a = march(fm, devOf(cfg, pr, comp), s0, dt, 10, lts);
+            const Run b = march(fm, devOf(cfg, pr, comp), s0, dt, 10, lts);
             row.rerun = row.rerun && a.ok && b.ok && sameBytes(a.s.q, b.s.q);
         }
 
@@ -438,7 +469,8 @@ Row runCell(const FvModuleSet& cell, const std::vector<MeshCase>& ms)
                 FvPrecision pr;
                 bool comp;
             };
-            for (const Mode md : {Mode{FvPrecision::Fp32, false}, Mode{FvPrecision::Fp32, true}, Mode{FvPrecision::Fp64, false}}) {
+            for (const Mode md : {Mode{FvPrecision::Fp32, false}, Mode{FvPrecision::Fp32, true}, Mode{FvPrecision::Fp64, false},
+                                  Mode{FvPrecision::Fp64, true}}) {
                 const Run r = march(fm, devOf(cc, md.pr, md.comp), u, dt, 10, false);
                 bool ok = r.ok;
                 for (int k = 0; ok && k < cc.chem.nY; ++k) {
@@ -471,12 +503,15 @@ Row runCell(const FvModuleSet& cell, const std::vector<MeshCase>& ms)
                 }
                 return mass;
             };
-            double e0, e1;
-            const double m0 = totals(s, e0), m1 = totals(r.s, e1);
-            row.mass = std::max(row.mass, std::abs(m1 / m0 - 1.0));
+            // ... and compensated FP64, the same 10 steps.
+            const Run rc = march(fm, devOf(cb, FvPrecision::Fp64, true), s, dt, 10, false);
+            double e0, e1, e2 = HUGE_VAL;
+            const double m0 = totals(s, e0), m1 = totals(r.s, e1), m2 = rc.ok ? totals(rc.s, e2) : HUGE_VAL;
+            row.mass = std::max({row.mass, std::abs(m1 / m0 - 1.0), std::abs(m2 / m0 - 1.0)});
             // Energy: no work term (drive), and the potential -g.x must be single-valued
             // (no cyclic pair along g).
-            if (!drive && (!grav || m.hydro)) row.energy = std::max(row.energy, std::abs(e1 / e0 - 1.0));
+            if (!drive && (!grav || m.hydro))
+                row.energy = std::max({row.energy, std::abs(e1 / e0 - 1.0), std::abs(e2 / e0 - 1.0)});
             if (c1) {
                 // Z == tracer: FP64 and the FP32 walk, 20 steps.
                 for (const FvPrecision pr : {FvPrecision::Fp64, FvPrecision::Fp32}) {
@@ -594,7 +629,8 @@ Row runCell(const FvModuleSet& cell, const std::vector<MeshCase>& ms)
     }
     const bool zok = !c1 || (row.ztr64 <= 1e-13 && row.ztr32 <= 4 * std::ldexp(1.0, -23) * std::sqrt(3.0 * 20));
     row.pass = row.pass && inertOk && row.oracle <= 1e-13 && row.f32 <= 2e-5 && row.orders <= 1e-13 && row.rest64 <= 1e-13 &&
-               row.rest32 <= 1e-5 && row.open64 <= 1e-13 && row.open32 <= 1e-5 && row.mass <= 1e-13 && row.energy <= 1e-13 && row.pow2 && row.rerun && zok;
+               row.rest32 <= 1e-5 && row.open64 <= 1e-13 && row.open32 <= 1e-5 && row.mass <= 1e-13 && row.energy <= 1e-13 && row.pow2 && row.rerun && zok &&
+               row.guard <= 1e-14 && row.guardCtl >= 1e-9;
     return row;
 }
 
@@ -657,7 +693,7 @@ void shockInert(const std::vector<MeshCase>& ms)
         flow.var(4)[c] = 3.0 + 0.5 * (0.295 * 0.295 + 0.149 * 0.149 + 0.168 * 0.168);
     }
     for (const auto& [pr, comp, tag] : {std::tuple{FvPrecision::Fp32, false, "FP32"}, std::tuple{FvPrecision::Fp32, true, "compensated"},
-                                        std::tuple{FvPrecision::Fp64, false, "FP64"}}) {
+                                        std::tuple{FvPrecision::Fp64, false, "FP64"}, std::tuple{FvPrecision::Fp64, true, "compensated FP64"}}) {
         for (const FvState* s0 : std::array<const FvState*, 2>{&rest, &flow}) {
             FvConfig on = fvm::matrixConfig(fvModuleSet({FvModule::Shock}), fm, m.closed[1], m.tr), off = on;
             off.shock = {};
@@ -676,6 +712,65 @@ void shockInert(const std::vector<MeshCase>& ms)
     }
 }
 
+// masterplan_combclose K4: rest and a uniform flow under compensated FP64, 10 steps, on a
+// periodic box of DYADIC spacings (0.25, 0.5, 0.125: every S, V exact, a y or z face's S_x
+// exactly 0). Rest: the momentum gather is +p S_x - p S_x, every rhs byte 0, so every
+// increment is 0 -- the low words stay exactly 0 (the checkpoint's state.fv.lo) and the state
+// is the IC and plain FP64's, byte for byte. A uniform flow's mass/energy gather sums three
+// face values in CSR order (not exact: measured 1.8e-15): gated bitwise if its rhs is 0, else
+// compensated vs plain <= 10 eps after 10 steps (measured 9.9e-16 = 4.5 eps).
+// (On the matrix box, spacings 0.3 0.45 0.2, rest's rhs is 1.0e-15: the rounding of Sum S,
+// which the compensated state then correctly accumulates.)
+void compUniform(const std::vector<MeshCase>& ms)
+{
+    std::printf("Compensated FP64: rest and a uniform flow on a dyadic periodic box, 10 steps\n");
+    const MeshCase& m = ms.front();
+    const Grid g = Grid::make(8, 8, 4, 8 * 0.25, 8 * 0.5, 4 * 0.125);
+    const FaceMesh fm = orDie(FaceMesh::fromCurvMesh(CurvMesh::uniform(g), periodicSpec(g), CellOrder::Morton), "dyadic box");
+    const std::vector<FvBc> closed = bcFor(fm, [](const MeshPatch&) { return wall(); });
+    FvState rest = FvState::zeros(fm.nC), flow = rest;
+    for (int c = 0; c < fm.nC; ++c) {
+        rest.var(0)[c] = flow.var(0)[c] = 1.0;
+        rest.var(4)[c] = 3.0;
+        flow.var(1)[c] = 0.295;
+        flow.var(2)[c] = -0.149;
+        flow.var(3)[c] = 0.168;
+        flow.var(4)[c] = 3.0 + 0.5 * (0.295 * 0.295 + 0.149 * 0.149 + 0.168 * 0.168);
+    }
+    const FvConfig cfg = fvm::matrixConfig(fvModuleSet({}), fm, closed, m.tr);
+    for (const FvState* s0 : {&rest, &flow}) {
+        const char* tag = s0 == &rest ? "rest" : "uniform flow";
+        auto p = orDie(DeviceFvComp::make(fm, devOf(cfg, FvPrecision::Fp64)), "plain");
+        auto c = orDie(DeviceFvComp::make(fm, devOf(cfg, FvPrecision::Fp64, true)), "compensated");
+        orDie(p.upload(*s0), "upload");
+        orDie(c.upload(*s0), "upload");
+        FvState r;
+        orDie(p.rhs(r), "rhs");
+        const double rmax = std::ranges::max(r.q, {}, [](double v) { return std::abs(v); });
+        for (int n = 0; n < 10; ++n) {
+            p.step(0.01);
+            c.step(0.01);
+        }
+        FvState qp, qc;
+        orDie(p.download(qp), "download");
+        orDie(c.download(qc), "download");
+        Checkpoint ck;
+        const bool saved = c.save(ck).has_value();
+        const auto lo = ck.f64("state.fv.lo");
+        const bool loZero = saved && lo && lo->size() == qc.q.size() && std::ranges::all_of(*lo, [](double v) { return v == 0.0; });
+        const double dq = relDiff(qc.q, qp.q, kFvMeanVars, fm.nC);
+        std::printf("  %s: max |rhs| %.2e, lo %s, compensated vs plain %.2e\n", tag, std::abs(rmax), loZero ? "all 0" : "nonzero", dq);
+        if (s0 == &rest)
+            check(rmax == 0.0, "compensated FP64 rest: the dyadic box's rhs is 0, every byte (the gate's premise)");
+        if (rmax == 0.0)
+            check(loZero && sameBytes(qc.q, qp.q) && sameBytes(qc.q, s0->q),
+                  std::format("compensated FP64 {}: lo stays 0, the state is the IC and plain FP64's, byte for byte", tag));
+        else
+            check(dq <= 10 * 0x1p-52, std::format("compensated FP64 {}: rhs not 0 ({:.1e}), compensated vs plain {:.1e} <= 10 eps "
+                                                  "(one rounding of the plain write per step)", tag, rmax, dq));
+    }
+}
+
 void matrix(bool markdown)
 {
     const auto t0 = std::chrono::steady_clock::now();
@@ -685,11 +780,11 @@ void matrix(bool markdown)
         Row r = runCell(cell, ms);
         if (!markdown)
             std::printf("  %-44s %d meshes | oracle %s f32 %s | orders %s%s | rest %s/%s open %s/%s | mass %s energy %s | pow2 %s | "
-                        "Z %s/%s | inert %s | rerun %s\n",
+                        "Z %s/%s | inert %s | rerun %s | c64 guard %s ctl %s\n",
                         r.cell.c_str(), r.meshes, sci(r.oracle).c_str(), sci(r.f32).c_str(), sci(r.orders).c_str(),
                         r.ordersBitwise ? " (bitwise)" : "", sci(r.rest64).c_str(), sci(r.rest32).c_str(),
                         sci(r.open64).c_str(), sci(r.open32).c_str(), sci(r.mass).c_str(), sci(r.energy).c_str(), !r.pow2Run ? "n/a" : r.pow2 ? "exact" : "BROKEN", sci(r.ztr64).c_str(),
-                        sci(r.ztr32).c_str(), r.inert.c_str(), r.rerun ? "identical" : "DIFFERS");
+                        sci(r.ztr32).c_str(), r.inert.c_str(), r.rerun ? "identical" : "DIFFERS", sci(r.guard).c_str(), sci(r.guardCtl).c_str());
         check(r.pass, std::format("cell {}: every generic gate", r.cell));
         rows.push_back(std::move(r));
     }
@@ -697,25 +792,26 @@ void matrix(bool markdown)
     std::printf("  %zu live cells, %.1f s\n", rows.size(), sec);
     tiedSensor(ms);
     shockInert(ms);
+    compUniform(ms);
     if (!markdown) return;
     std::printf("%s", fvCombinationsMarkdown().c_str());
     std::printf("\n<!-- generated: test_gpu_fv_matrix markdown (tests/test_gpu_fv_matrix.cpp) -->\n");
     std::printf("Harness rows (`gpu_fv_matrix`, %zu live cells on the meshes box 8x6x5 periodic, box_cyclic, box_refined, "
                 "cyl2d_snappy; gravity on the open set through the hydrostatic ambient's rows). oracle: double vs FvRef, max relative over every "
-                "pass, 3 steps; orders: Source / Morton / ColourMajor, 3 FP64 steps; rest: |rhs - source| / (p sum|S| / V), "
-                "FP64 / FP32 on the closed set, open rest on the open set at rest (gravity, cyl2d_snappy: Far, Outflow, Inflow faces); mass, energy: 10 FP64 steps; Z: max|Z(Y) - tracer|, FP64 / FP32, 20 steps. Steady LTS "
+                "pass, 3 steps (plain and compensated FP64); orders: Source / Morton / ColourMajor, 3 FP64 steps (plain and compensated); rest: |rhs - source| / (p sum|S| / V), "
+                "FP64 / FP32 on the closed set, open rest on the open set at rest (gravity, cyl2d_snappy: Far, Outflow, Inflow faces); mass, energy: 10 FP64 steps (plain and compensated); pow2 Y: FP32, compensated FP32, FP64, compensated FP64; Z: max|Z(Y) - tracer|, FP64 / FP32, 20 steps; rerun: FP32, compensated FP32, compensated FP64; c64 guard: one step, compensated FP64 vs FP64 (<= 1e-14; control compensated FP32 vs FP64 >= 1e-9). Steady LTS "
                 "cells: the oracle is the rhs and stableDt (FvRef has no LTS), mass n/a (LTS drifts it). Energy n/a with "
                 "the drive (its work).\n\n",
                 rows.size());
-    std::printf("| Cell | oracle | f32 vs f64 | orders | rest FP64 / FP32 | open rest | mass | energy | pow2 Y | Z == tracer | inert | rerun |\n");
-    std::printf("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    std::printf("| Cell | oracle | f32 vs f64 | orders | rest FP64 / FP32 | open rest | mass | energy | pow2 Y | Z == tracer | inert | rerun | c64 guard / ctl |\n");
+    std::printf("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     for (const Row& r : rows)
-        std::printf("| %s | %s | %s | %s%s | %s / %s | %s | %s | %s | %s | %s | %s | %s |\n", r.cell.c_str(), sci(r.oracle).c_str(),
+        std::printf("| %s | %s | %s | %s%s | %s / %s | %s | %s | %s | %s | %s | %s | %s | %s / %s |\n", r.cell.c_str(), sci(r.oracle).c_str(),
                     sci(r.f32).c_str(), sci(r.orders).c_str(), r.ordersBitwise ? " bitwise" : "", sci(r.rest64).c_str(),
                     sci(r.rest32).c_str(), r.open64 < 0 ? "n/a" : std::format("{:.1e} / {:.1e}", r.open64, r.open32).c_str(),
                     sci(r.mass).c_str(), sci(r.energy).c_str(), !r.pow2Run ? "n/a" : r.pow2 ? "exact" : "BROKEN",
                     r.ztr64 < 0 ? "n/a" : std::format("{:.1e} / {:.1e}", r.ztr64, r.ztr32).c_str(), r.inert.c_str(),
-                    r.rerun ? "byte-identical" : "DIFFERS");
+                    r.rerun ? "byte-identical" : "DIFFERS", sci(r.guard).c_str(), sci(r.guardCtl).c_str());
 }
 
 // --- physics (`test_gpu_fv_matrix physics`): one sanity number per pair turned on in MC.

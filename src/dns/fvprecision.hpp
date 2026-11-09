@@ -45,4 +45,12 @@ constexpr FvNumerics fvNumerics(FvPrecision p)
 
 inline const char* fvPrecisionName(FvPrecision p) { return p == FvPrecision::Fp32 ? "FP32" : "FP64"; }
 
+// The compensated state's label suffix: FP32 " compensated" (the pre-K4 text), FP64 the
+// double-double state (masterplan_combclose R6); "" when off.
+inline const char* fvCompensatedSuffix(FvPrecision p, bool compensated)
+{
+    if (!compensated) return "";
+    return p == FvPrecision::Fp32 ? " compensated" : " compensated (double-double state)";
+}
+
 } // namespace dns

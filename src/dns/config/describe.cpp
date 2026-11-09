@@ -510,7 +510,7 @@ std::string Case::describeCase() const
                            "from the origin, u_in {}\n  output     {}\n{}",
                            fvMeshDir, flameModel.sigma, flameModel.beta, prandtl, mach, gam, flameEig.Lambda,
                            flameEig.dthOverDD, premixText, tEnd, cfl, fvPrecisionName(fvPrecision),
-                           compensated ? " compensated" : "", flameXf0,
+                           fvCompensatedSuffix(fvPrecision, compensated), flameXf0,
                            // masterplan_combnozzle P4: the throat sets u_u (the composition design, at the run).
                            fvBc.nozzle ? std::string("set by the throat ([nozzle]: the composition design)")
                                        : std::format("{:g}", flameUIn),

@@ -27,7 +27,7 @@ constexpr std::array<FvModuleInfo, kFvModuleCount> kModules{{
     {M::BodyForce, FvAxis::Drive, "bodyForce", "the channel's drive (FvConfig::bodyForce)"},
     {M::Turb, FvAxis::Inflow, "turb", "dns flame --turb U --solver fv (FvConfig::turb)"},
     {M::Steady, FvAxis::Time, "steady LTS", "--steady TOL (DeviceFvComp::localDt)"},
-    {M::Compensated, FvAxis::Precision, "compensated", "--compensated"},
+    {M::Compensated, FvAxis::State, "compensated", "--compensated"},
     {M::Fp64, FvAxis::Precision, "FP64", "--fv-precision fp64"},
     {M::Shock, FvAxis::Capture, "shock", "--shock hll|sense --polymesh"},
 }};
@@ -83,8 +83,11 @@ constexpr std::string_view kTurbDrive = "FV --turb with a body force: not built 
 constexpr std::string_view kTurbDriveWhy = "the box is swept through an inflow patch; the driven channel is closed";
 constexpr std::string_view kTurbLts = "FV --turb with local time stepping: the swept inflow is time-accurate";
 constexpr std::string_view kTurbLtsWhy = "the rows follow X = sum U dt; pseudo-time has no physical sweep";
-constexpr std::string_view kCompFp64 = "--compensated is the FP32 state's low word: FP64 has no update floor to lift";
-constexpr std::string_view kCompFp64Why = "the two-word state lifts FP32's update floor; FP64 has none";
+// masterplan_combclose R6 (N16): the plain FP64 stage-3 write ca a + RN(cb b) rounds on a
+// lattice (+0.11 ulp per write on mantissas [1, 1.5)); the double-double state is its fix.
+constexpr std::string_view kCompFp64 =
+    "gpu_fv_matrix (compensated FP64: FvRef 1e-13, numbering, rerun, pow2 Y, mass/energy, the silent-float guard), "
+    "gpu_fv_nozzle_react N16b, gpu_restart_fv fp64c";
 
 constexpr std::string_view kShC1 = "FV --shock with two reactants: not built (no gate; docs/nozzle.md \"Reacting\")";
 constexpr std::string_view kShC2b = "FV --shock with --equivalence (C2b): not built (no gate; docs/nozzle.md \"Reacting\")";
@@ -213,7 +216,7 @@ constexpr std::array kRules{
     Rule{M::Turb, M::TflesEfficiency, live(kTurbGate)},
     Rule{M::Turb, M::Compensated, live(kTurbGate)},
     Rule{M::Turb, M::Fp64, live(kTurbGate)},
-    Rule{M::Compensated, M::Fp64, {.decision = D::Exclusive, .message = kCompFp64, .why = kCompFp64Why}},
+    Rule{M::Compensated, M::Fp64, live(kCompFp64)},
     // shock capture: every refusal written (the default of a cross-axis pair is live)
     Rule{M::Shock, M::Fp64, live(kShNozzle)},
     Rule{M::Shock, M::Compensated, live(kShNozzle)},
@@ -333,8 +336,8 @@ std::string fvCombinationsMarkdown()
 {
     std::string o = "<!-- generated: dns::fvCombinationsMarkdown (src/dns/fvmodules.cpp); test_gpu_fv_matrix markdown -->\n";
     o += "| Module | Axis | Spelling |\n|---|---|---|\n";
-    static constexpr std::string_view axes[] = {"turbulence", "flame",  "efficiency", "chemistry", "gravity",
-                                                "drive",      "inflow", "time",       "precision", "capture"};
+    static constexpr std::string_view axes[] = {"turbulence", "flame", "efficiency", "chemistry", "gravity", "drive",
+                                                "inflow",     "time",  "precision",  "capture",   "state"};
     for (const FvModuleInfo& m : kModules)
         o += std::format("| {} | {} | `{}` |\n", m.name, axes[std::size_t(m.axis)], m.spelling);
     o += "\nPair matrix: L live, R refused, x one axis (exclusive).\n\n|   |";

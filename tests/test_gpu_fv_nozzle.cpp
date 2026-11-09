@@ -1783,6 +1783,8 @@ void thrustCli()
 //         from the rho Y row fails by >= 1e-6
 //   G4.8  shockCells 0 on every row
 //   G4.12a (masterplan_combclose) the first row's station T0b on the design's to 1e-6 (the Rayleigh-line chamber IC)
+//   N16b  (masterplan_combclose K4) the same run with --compensated (FP64 double-double): max r <= 1e-14, flat (last 10%
+//         of rows <= 4 x rows 10-20%); control: the plain run's max r >= 4e-14 (lattice bias, test_stage_bias)
 //   route the station columns present and finite, exitSuper 1, the drift guard silent; S_L on A_ref within 1% of the
 //         1D S_L,num (the reduced tt reads the IC's start, not a gate); --inflow-speed exit 2
 void reactRun()
@@ -1806,24 +1808,59 @@ void reactRun()
     check(rc == 0 && t.size() > 5, std::format("dns flame [nozzle]: rc {}, {} thrust rows", rc, t.size()));
     if (t.size() < 5) return;
     const double Tu = 1.0 / (1.4 * 0.042 * 0.042), q = 3.5 * 4.0 * Tu;
-    const auto Om = csvColumn(th, "Omega");
-    double worst = 0, ctrl = 0;
-    for (const char* k : {"mass", "mx", "my", "mz", "E", "ry"}) {
-        const auto res = csvColumn(th, std::format("res_{}", k)), P = csvColumn(th, std::format("P_{}", k));
-        std::vector<std::vector<double>> I;
-        for (const char* r : {"in", "exit", "wall", "side"}) I.push_back(csvColumn(th, std::format("I_{}_{}", r, k)));
-        for (std::size_t i = 0; i < t.size(); ++i) {
-            double S = std::abs(P[i]);
-            for (const auto& c : I) S += std::abs(c[i]);
-            if (std::string(k) == "E") S += q * std::abs(Om[i]);
-            if (std::string(k) == "ry") S += std::abs(Om[i]);
-            if (S > 0) worst = std::max(worst, std::abs(res[i]) / S);
-            if (std::string(k) == "ry" && S > 0) ctrl = std::max(ctrl, std::abs(res[i] - Om[i]) / S);
+    // Per row r_i = max_k |res_k| / S'_k; ctrl: the rho Y row with Omega dropped.
+    auto ledgerR = [&](const std::string& csv, double* ctrlOut) {
+        const auto tt = csvColumn(csv, "t"), Om = csvColumn(csv, "Omega");
+        std::vector<double> r(tt.size(), 0.0);
+        double ctrl = 0;
+        for (const char* k : {"mass", "mx", "my", "mz", "E", "ry"}) {
+            const auto res = csvColumn(csv, std::format("res_{}", k)), P = csvColumn(csv, std::format("P_{}", k));
+            std::vector<std::vector<double>> I;
+            for (const char* rr : {"in", "exit", "wall", "side"}) I.push_back(csvColumn(csv, std::format("I_{}_{}", rr, k)));
+            for (std::size_t i = 0; i < tt.size(); ++i) {
+                double S = std::abs(P[i]);
+                for (const auto& c : I) S += std::abs(c[i]);
+                if (std::string(k) == "E") S += q * std::abs(Om[i]);
+                if (std::string(k) == "ry") S += std::abs(Om[i]);
+                if (S > 0) r[i] = std::max(r[i], std::abs(res[i]) / S);
+                if (std::string(k) == "ry" && S > 0) ctrl = std::max(ctrl, std::abs(res[i] - Om[i]) / S);
+            }
         }
-    }
+        if (ctrlOut) *ctrlOut = ctrl;
+        return r;
+    };
+    double ctrl = 0;
+    const std::vector<double> rPlain = ledgerR(th, &ctrl);
+    const double worst = *std::ranges::max_element(rPlain);
     std::printf("  %zu thrust rows: max |res_k| / S'_k %.2e; control (Omega dropped from rho Y) %.2e\n", t.size(), worst, ctrl);
     check(worst <= 1e-12, std::format("G4.1 ledger identity on the reacting route {:.2e} <= 1e-12", worst));
     check(ctrl >= 1e-6, std::format("G4.1 control: Omega dropped from the rho Y row fails ({:.2e} >= 1e-6)", ctrl));
+    // N16b (masterplan_combclose K4): the same run on the compensated FP64 state (double-double:
+    // the increment form + a low word) holds the ledger at its own rounding, flat; the plain FP64
+    // stage-3 write's lattice bias (+0.11 ulp per write, test_stage_bias) grows it linearly.
+    {
+        const fs::path oc = tmpDir() / "react15_comp";
+        const int rcc = runDns(base + std::format(" --compensated --tt 3 --out {}", oc.string()), oc.string() + ".log");
+        const std::string thc = oc.string() + "_thrust.csv";
+        const std::vector<double> rc = rcc == 0 ? ledgerR(thc, nullptr) : std::vector<double>{};
+        check(rcc == 0 && rc.size() >= 20, std::format("N16b: the compensated FP64 run, rc {}, {} thrust rows", rcc, rc.size()));
+        if (rc.size() >= 20) {
+            const std::size_t n = rc.size();
+            const double cmax = *std::ranges::max_element(rc);
+            const double early = *std::max_element(rc.begin() + std::ptrdiff_t(n / 10), rc.begin() + std::ptrdiff_t(n / 5));
+            const double late = *std::max_element(rc.begin() + std::ptrdiff_t(n - n / 10), rc.end());
+            std::printf("  N16b compensated FP64: %zu rows, max r %.2e, last 10%% %.2e vs rows 10-20%% %.2e; plain max r %.2e\n", n, cmax,
+                        late, early, worst);
+            check(cmax <= 1e-14, std::format("N16b: compensated FP64 max r {:.2e} <= 1e-14", cmax));
+            check(late <= 4 * early, std::format("N16b: compensated FP64 flat, last 10% {:.2e} <= 4 x rows 10-20% {:.2e}", late, early));
+            check(worst >= 4e-14, std::format("N16b control: the plain FP64 run at the same tt fails ({:.2e} >= 4e-14)", worst));
+        }
+        std::ifstream lf(thc);
+        std::string label;
+        std::getline(lf, label);
+        check(label.find("FP64 compensated (double-double state)") != std::string::npos,
+              "N16b: the _thrust.csv label names the double-double state");
+    }
     const auto sensed = csvColumn(st, "shockCells");
     check(!sensed.empty() && *std::ranges::max_element(sensed) == 0.0, "G4.8 shockCells 0 on every row");
     bool finite = true;

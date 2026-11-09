@@ -45,7 +45,9 @@ of the same templates, the same pass order:
   operand (`other` cell or `~b`) and weights.
 - **`--compensated`** (FP32): the structured two-word state, hi + lo per state
   word, `internal::combineWord2`, a compile-time kernel instantiation. See
-  "FP32 on a steady flow". FP64 rejects it (exit 2).
+  "FP32 on a steady flow". Under `--fv-precision fp64` (masterplan_combclose R6): the
+  double-double state (`gpu/word2d.hpp`, the same kernels' R = double instantiation), the
+  fix of the plain FP64 stage-3 lattice bias: "Precision: the plain FP64 write is biased".
 
 **Quiet start.** `--ramp`: the IC at rest, the freestream raised by exact
 Galilean boosts over `[0, ramp]` with the Far/Inflow rows of the table following,
@@ -235,7 +237,7 @@ stepping, precision) is a set of ADDITIVE face / cell terms or a stage-writer sw
 each module as data, ONE decision per pair (live | refused + error text + reason), the
 requirements (TFLES needs C0, Charlette needs LES and TFLES). `FvRef::make` (`fvModulesOf`),
 `DeviceFvComp::make` (the precision axis), `DeviceFvComp::localDt` (the time axis) and the CLI's
-flag pairs (`fvCompCommon`: `--compensated` + `fp64`, `--les` + `--steady`; `fvRansCheck`:
+flag pairs (`fvCompCommon`: `--les` + `--steady`; `fvRansCheck`:
 `--rans` + `--les`) read it; nothing restates a pair. A pair goes live when the generic gate
 matrix passes its cell, in the same commit as its physics number.
 
@@ -249,11 +251,15 @@ matrix passes its cell, in the same commit as its physics number.
   same set at rest: "Hydrostatic ambient").
   (a) inert = without, bitwise: passive species, TFLES F 1 (no LES: with it Omega still switches
   the SGS scalar flux off), RANS scalars 0; (b) rest (hydrostatic) rhs = the drive to rounding,
-  uniform power-of-two Y exact (FP32, compensated, FP64), mass and E + q rho Y_F + rho Phi
-  telescope, Z == tracer, C2b with C(xi) == 1 = C1 byte for byte; (c) FP64 vs FvRef 1e-13 every pass and 3 steps, FP32 vs FP64; (d)
-  Source / Morton / ColourMajor, 3 FP64 steps, to summation order (test_fvref E4: the CSR order
-  moves with the numbering); (e) rerun byte-identical, plain and compensated. 48 cells, 4
-  meshes, ~15 s.
+  uniform power-of-two Y exact (FP32, compensated, FP64, compensated FP64), mass and E + q rho
+  Y_F + rho Phi telescope (FP64 plain and compensated), Z == tracer, C2b with C(xi) == 1 = C1
+  byte for byte; (c) FP64 and compensated FP64 vs FvRef 1e-13 every pass and 3 steps, FP32 vs
+  FP64, the silent-float guard (one step, compensated FP64 vs FP64 <= 1e-14; control
+  compensated FP32 >= 1e-9); (d) Source / Morton / ColourMajor, 3 FP64 steps plain and
+  compensated, to summation order (test_fvref E4: the CSR order moves with the numbering); (e)
+  rerun byte-identical, FP32 plain and compensated, compensated FP64. Beside the cells:
+  compensated FP64 rest on a dyadic periodic box (rhs 0 every byte) keeps lo exactly 0 and
+  the IC's bytes over 10 steps (`compUniform`). 57 cells, 4 meshes, ~20 s.
 - **Matrix states are UNTIED** (1e-3 hashed noise on E). The TFLES dynamic sensor's T-gate is a
   switch, and mirror-symmetric fields on a uniform patch tie neighbouring T exactly. Measured on
   the TIED state (`tiedSensor`, TFLES dynamic + C0, 3 steps): numberings at rounding on every
@@ -306,7 +312,7 @@ is the candle's (M5a, "Hydrostatic ambient"): gravity x open patches and gravity
 | bodyForce | drive | `the channel's drive (FvConfig::bodyForce)` |
 | turb | inflow | `dns flame --turb U --solver fv (FvConfig::turb)` |
 | steady LTS | time | `--steady TOL (DeviceFvComp::localDt)` |
-| compensated | precision | `--compensated` |
+| compensated | state | `--compensated` |
 | FP64 | precision | `--fv-precision fp64` |
 | shock | capture | `--shock hll|sense --polymesh` |
 
@@ -328,8 +334,8 @@ Pair matrix: L live, R refused, x one axis (exclusive).
 | bodyForce | L | L | L | L | L | L | L | L | L | L | L | . | R | L | L | L | R |
 | turb | L | L | L | L | L | R | R | L | R | L | R | R | . | R | L | L | R |
 | steady LTS | R | R | R | R | R | L | L | R | R | R | R | L | R | . | L | L | R |
-| compensated | L | L | L | L | L | L | L | L | L | L | L | L | L | L | . | x | L |
-| FP64 | L | L | L | L | L | L | L | L | L | L | L | L | L | L | x | . | L |
+| compensated | L | L | L | L | L | L | L | L | L | L | L | L | L | L | . | L | L |
+| FP64 | L | L | L | L | L | L | L | L | L | L | L | L | L | L | L | . | L |
 | shock | R | R | R | R | R | R | R | L | R | R | R | R | R | R | L | L | . |
 
 | Pair | Decision | Error text | Why |
@@ -386,7 +392,6 @@ Pair matrix: L live, R refused, x one axis (exclusive).
 | turb + steady LTS | refused | `FV --turb with local time stepping: the swept inflow is time-accurate` | the rows follow X = sum U dt; pseudo-time has no physical sweep |
 | turb + shock | refused | `FV --shock with --turb: not built (no consumer)` | --turb is the flags' flame box's (--solver fv); --shock is the polyMesh route's |
 | steady LTS + shock | refused | `FV --shock with local time stepping: not built (the sensor flickers; the structured steady march refuses it too)` | a frozen or live sensor both left the host LTS residual flat at 3.7e-3 on a Total inlet (issues.md Z7); the time march is the route |
-| compensated + FP64 | exclusive | `--compensated is the FP32 state's low word: FP64 has no update floor to lift` | the two-word state lifts FP32's update floor; FP64 has none |
 | turb without C0 or C2b | requirement | `FV --turb: the premixed flame box (C0, C2b; dns flame --mode premixed --solver fv)` | |
 | TFLES uniform without C0 | requirement | `FV TFLES: the thickened flame is premixed species only (FvChem ox < 0)` | |
 | TFLES dynamic without C0 | requirement | `FV TFLES: the thickened flame is premixed species only (FvChem ox < 0)` | |
@@ -440,71 +445,72 @@ Pair matrix: L live, R refused, x one axis (exclusive).
 | bodyForce + steady LTS | gpu_fv_rans |
 | turb + compensated | gpu_fv_turb (IC, rows, trajectory X), tools/chem/turb_fv.sh comp, pairs (S_c, area vs structured) |
 | turb + FP64 | gpu_fv_turb (IC, rows, trajectory X), tools/chem/turb_fv.sh comp, pairs (S_c, area vs structured) |
+| compensated + FP64 | gpu_fv_matrix (compensated FP64: FvRef 1e-13, numbering, rerun, pow2 Y, mass/energy, the silent-float guard), gpu_fv_nozzle_react N16b, gpu_restart_fv fp64c |
 | compensated + shock | gpu_fv_nozzle |
 | FP64 + shock | gpu_fv_nozzle |
 
 <!-- generated: test_gpu_fv_matrix markdown (tests/test_gpu_fv_matrix.cpp) -->
-Harness rows (`gpu_fv_matrix`, 57 live cells on the meshes box 8x6x5 periodic, box_cyclic, box_refined, cyl2d_snappy; gravity on the open set through the hydrostatic ambient's rows). oracle: double vs FvRef, max relative over every pass, 3 steps; orders: Source / Morton / ColourMajor, 3 FP64 steps; rest: |rhs - source| / (p sum|S| / V), FP64 / FP32 on the closed set, open rest on the open set at rest (gravity, cyl2d_snappy: Far, Outflow, Inflow faces); mass, energy: 10 FP64 steps; Z: max|Z(Y) - tracer|, FP64 / FP32, 20 steps. Steady LTS cells: the oracle is the rhs and stableDt (FvRef has no LTS), mass n/a (LTS drifts it). Energy n/a with the drive (its work).
+Harness rows (`gpu_fv_matrix`, 57 live cells on the meshes box 8x6x5 periodic, box_cyclic, box_refined, cyl2d_snappy; gravity on the open set through the hydrostatic ambient's rows). oracle: double vs FvRef, max relative over every pass, 3 steps (plain and compensated FP64); orders: Source / Morton / ColourMajor, 3 FP64 steps (plain and compensated); rest: |rhs - source| / (p sum|S| / V), FP64 / FP32 on the closed set, open rest on the open set at rest (gravity, cyl2d_snappy: Far, Outflow, Inflow faces); mass, energy: 10 FP64 steps (plain and compensated); pow2 Y: FP32, compensated FP32, FP64, compensated FP64; Z: max|Z(Y) - tracer|, FP64 / FP32, 20 steps; rerun: FP32, compensated FP32, compensated FP64; c64 guard: one step, compensated FP64 vs FP64 (<= 1e-14; control compensated FP32 vs FP64 >= 1e-9). Steady LTS cells: the oracle is the rhs and stableDt (FvRef has no LTS), mass n/a (LTS drifts it). Energy n/a with the drive (its work).
 
-| Cell | oracle | f32 vs f64 | orders | rest FP64 / FP32 | open rest | mass | energy | pow2 Y | Z == tracer | inert | rerun |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| laminar | 4.7e-15 | 4.3e-06 | 4.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.6e-15 | 1.3e-15 | n/a | n/a | n/a | byte-identical |
-| LES smag | 4.4e-15 | 4.3e-06 | 4.7e-16 | 6.7e-17 / 3.3e-08 | n/a | 7.8e-16 | 6.7e-16 | n/a | n/a | n/a | byte-identical |
-| LES sigma | 1.3e-14 | 5.3e-06 | 6.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 8.9e-16 | 1.1e-15 | n/a | n/a | n/a | byte-identical |
-| RANS SA | 3.8e-15 | 3.6e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.4e-15 | 4.4e-16 | n/a | n/a | RANS scalars 0: bitwise | byte-identical |
-| RANS SST | 3.3e-15 | 4.7e-06 | 4.7e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.6e-15 | 6.7e-16 | n/a | n/a | RANS scalars 0: bitwise | byte-identical |
-| C0 | 4.8e-15 | 2.7e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | 7.8e-16 | exact | n/a | passive species: bitwise | byte-identical |
-| LES smag + C0 | 4.7e-15 | 3.2e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 7.8e-16 | exact | n/a | passive species: bitwise | byte-identical |
-| LES sigma + C0 | 1.3e-14 | 2.7e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | 8.9e-16 | exact | n/a | passive species: bitwise | byte-identical |
-| TFLES uniform + C0 | 4.8e-15 | 2.7e-06 | 3.0e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.0e-15 | 8.9e-16 | exact | n/a | TFLES F 1: bitwise | byte-identical |
-| LES smag + TFLES uniform + C0 | 4.7e-15 | 3.2e-06 | 3.4e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 4.4e-16 | exact | n/a | n/a | byte-identical |
-| LES sigma + TFLES uniform + C0 | 1.3e-14 | 2.7e-06 | 4.6e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.0e-15 | 8.9e-16 | exact | n/a | n/a | byte-identical |
-| TFLES dynamic + C0 | 4.8e-15 | 2.7e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | 8.9e-16 | exact | n/a | TFLES F 1: bitwise | byte-identical |
-| LES smag + TFLES dynamic + C0 | 4.7e-15 | 3.2e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | 1.7e-15 | exact | n/a | n/a | byte-identical |
-| LES sigma + TFLES dynamic + C0 | 1.3e-14 | 2.7e-06 | 4.6e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | 1.0e-15 | exact | n/a | n/a | byte-identical |
-| LES smag + TFLES uniform + Charlette + C0 | 4.7e-15 | 3.2e-06 | 3.4e-16 | 6.7e-17 / 3.3e-08 | n/a | 8.9e-16 | 1.3e-15 | exact | n/a | n/a | byte-identical |
-| LES sigma + TFLES uniform + Charlette + C0 | 1.3e-14 | 2.7e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.0e-15 | 1.6e-15 | exact | n/a | n/a | byte-identical |
-| LES smag + TFLES dynamic + Charlette + C0 | 4.7e-15 | 3.2e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 1.7e-15 | exact | n/a | n/a | byte-identical |
-| C1 | 4.8e-15 | 2.7e-06 | 4.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 1.8e-15 | exact | 1.4e-15 / 6.9e-07 | passive species: bitwise | byte-identical |
-| LES smag + C1 | 4.7e-15 | 3.2e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 3.1e-15 | 2.2e-15 | exact | 1.3e-15 / 7.0e-07 | passive species: bitwise | byte-identical |
-| LES sigma + C1 | 1.3e-14 | 2.7e-06 | 4.5e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | 1.8e-15 | exact | 1.4e-15 / 6.9e-07 | passive species: bitwise | byte-identical |
-| C2b | 4.8e-15 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.2e-16 | 8.9e-16 | exact | 1.4e-15 / 7.4e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
-| LES smag + C2b | 4.7e-15 | 3.2e-06 | 4.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.0e-15 | 1.3e-15 | exact | 1.1e-15 / 8.4e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
-| LES sigma + C2b | 1.3e-14 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 8.9e-16 | exact | 1.4e-15 / 7.4e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
-| gravity | 4.7e-15 | 4.3e-06 | 3.2e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 1.4e-15 | 4.4e-16 | n/a | n/a | n/a | byte-identical |
-| LES smag + gravity | 4.4e-15 | 4.3e-06 | 3.2e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 8.9e-16 | 1.1e-15 | n/a | n/a | n/a | byte-identical |
-| LES sigma + gravity | 1.3e-14 | 5.3e-06 | 3.7e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 1.4e-15 | 4.4e-16 | n/a | n/a | n/a | byte-identical |
-| C0 + gravity | 4.8e-15 | 2.4e-06 | 4.0e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 1.1e-15 | 4.4e-16 | exact | n/a | passive species: bitwise | byte-identical |
-| TFLES uniform + C0 + gravity | 4.8e-15 | 2.4e-06 | 3.3e-16 | 1.0e-15 / 4.5e-07 | 1.0e-15 / 4.5e-07 | 4.4e-16 | 8.9e-16 | exact | n/a | TFLES F 1: bitwise | byte-identical |
-| TFLES dynamic + C0 + gravity | 4.8e-15 | 2.4e-06 | 3.2e-16 | 5.4e-16 / 2.4e-07 | 5.4e-16 / 2.4e-07 | 1.7e-15 | 2.0e-15 | exact | n/a | TFLES F 1: bitwise | byte-identical |
-| LES smag + TFLES uniform + Charlette + C0 + gravity | 4.4e-15 | 2.8e-06 | 3.1e-16 | 1.0e-15 / 4.5e-07 | 1.0e-15 / 4.5e-07 | 8.9e-16 | 4.4e-16 | exact | n/a | n/a | byte-identical |
-| C1 + gravity | 4.8e-15 | 2.4e-06 | 4.5e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 4.4e-16 | 8.9e-16 | exact | 1.7e-15 / 6.9e-07 | passive species: bitwise | byte-identical |
-| C2b + gravity | 4.8e-15 | 2.4e-06 | 4.5e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 8.9e-16 | 2.4e-15 | exact | 1.2e-15 / 8.0e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
-| bodyForce | 4.7e-15 | 4.3e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.3e-15 | n/a | n/a | n/a | n/a | byte-identical |
-| LES smag + bodyForce | 4.4e-15 | 4.3e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | n/a | n/a | n/a | byte-identical |
-| LES sigma + bodyForce | 1.3e-14 | 5.3e-06 | 4.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.3e-15 | n/a | n/a | n/a | n/a | byte-identical |
-| RANS SA + bodyForce | 3.8e-15 | 3.6e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | n/a | n/a | n/a | RANS scalars 0: bitwise | byte-identical |
-| RANS SST + bodyForce | 3.5e-15 | 4.7e-06 | 4.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | n/a | n/a | RANS scalars 0: bitwise | byte-identical |
-| C0 + bodyForce | 4.8e-15 | 2.7e-06 | 3.4e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | n/a | exact | n/a | passive species: bitwise | byte-identical |
-| TFLES uniform + C0 + bodyForce | 4.8e-15 | 2.7e-06 | 3.0e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | exact | n/a | TFLES F 1: bitwise | byte-identical |
-| TFLES dynamic + C0 + bodyForce | 4.8e-15 | 2.7e-06 | 4.6e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | n/a | exact | n/a | TFLES F 1: bitwise | byte-identical |
-| LES smag + TFLES uniform + Charlette + C0 + bodyForce | 4.7e-15 | 3.2e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | exact | n/a | n/a | byte-identical |
-| C1 + bodyForce | 4.8e-15 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | exact | 1.4e-15 / 5.8e-07 | passive species: bitwise | byte-identical |
-| C2b + bodyForce | 4.8e-15 | 2.7e-06 | 3.8e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.3e-15 | n/a | exact | 1.6e-15 / 7.5e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical |
-| gravity + bodyForce | 4.7e-15 | 4.3e-06 | 3.4e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 4.4e-16 | n/a | n/a | n/a | n/a | byte-identical |
-| C0 + turb | 4.8e-15 | 2.7e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | 7.8e-16 | exact | n/a | passive species, turb u' 0: bitwise | byte-identical |
-| LES smag + C0 + turb | 4.7e-15 | 3.2e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 7.8e-16 | exact | n/a | passive species, turb u' 0: bitwise | byte-identical |
-| LES sigma + C0 + turb | 1.3e-14 | 2.7e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | 8.9e-16 | exact | n/a | passive species, turb u' 0: bitwise | byte-identical |
-| TFLES uniform + C0 + turb | 4.8e-15 | 2.7e-06 | 3.0e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.0e-15 | 8.9e-16 | exact | n/a | TFLES F 1, turb u' 0: bitwise | byte-identical |
-| TFLES dynamic + C0 + turb | 4.8e-15 | 2.7e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | 8.9e-16 | exact | n/a | TFLES F 1, turb u' 0: bitwise | byte-identical |
-| LES smag + TFLES uniform + Charlette + C0 + turb | 4.7e-15 | 3.2e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 8.9e-16 | 1.3e-15 | exact | n/a | turb u' 0: bitwise | byte-identical |
-| C2b + turb | 4.8e-15 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.2e-16 | 8.9e-16 | exact | 1.4e-15 / 7.4e-07 | passive species, C(xi) 1 = C1, turb u' 0: bitwise | byte-identical |
-| steady LTS | 4.7e-15 | 4.3e-06 | 5.2e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical |
-| RANS SA + steady LTS | 3.8e-15 | 3.6e-06 | 5.4e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical |
-| RANS SST + steady LTS | 3.3e-15 | 4.7e-06 | 5.0e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical |
-| bodyForce + steady LTS | 4.7e-15 | 4.3e-06 | 8.6e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical |
-| shock | 3.0e-15 | 2.8e-06 | 4.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.3e-15 | 1.7e-15 | n/a | n/a | n/a | byte-identical |
-| C0 + shock | 4.5e-15 | 3.3e-06 | 3.5e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.2e-16 | 6.7e-16 | exact | n/a | passive species: bitwise | byte-identical |
+| Cell | oracle | f32 vs f64 | orders | rest FP64 / FP32 | open rest | mass | energy | pow2 Y | Z == tracer | inert | rerun | c64 guard / ctl |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| laminar | 4.7e-15 | 4.3e-06 | 4.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.6e-15 | 1.3e-15 | n/a | n/a | n/a | byte-identical | 3.8e-16 / 5.0e-08 |
+| LES smag | 4.4e-15 | 4.3e-06 | 4.7e-16 | 6.7e-17 / 3.3e-08 | n/a | 7.8e-16 | 1.3e-15 | n/a | n/a | n/a | byte-identical | 3.8e-16 / 5.0e-08 |
+| LES sigma | 1.3e-14 | 5.3e-06 | 6.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 8.9e-16 | 1.1e-15 | n/a | n/a | n/a | byte-identical | 3.8e-16 / 5.0e-08 |
+| RANS SA | 3.8e-15 | 3.6e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.7e-15 | 4.4e-16 | n/a | n/a | RANS scalars 0: bitwise | byte-identical | 3.8e-16 / 5.5e-08 |
+| RANS SST | 3.3e-15 | 4.7e-06 | 4.7e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.6e-15 | 6.7e-16 | n/a | n/a | RANS scalars 0: bitwise | byte-identical | 3.8e-16 / 5.0e-08 |
+| C0 | 4.8e-15 | 2.7e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | 1.0e-15 | exact | n/a | passive species: bitwise | byte-identical | 3.8e-16 / 5.3e-08 |
+| LES smag + C0 | 4.7e-15 | 3.2e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 1.0e-15 | exact | n/a | passive species: bitwise | byte-identical | 3.8e-16 / 5.3e-08 |
+| LES sigma + C0 | 1.3e-14 | 2.7e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | 1.0e-15 | exact | n/a | passive species: bitwise | byte-identical | 3.8e-16 / 5.3e-08 |
+| TFLES uniform + C0 | 4.8e-15 | 2.7e-06 | 3.0e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.0e-15 | 8.9e-16 | exact | n/a | TFLES F 1: bitwise | byte-identical | 3.8e-16 / 5.2e-08 |
+| LES smag + TFLES uniform + C0 | 4.7e-15 | 3.2e-06 | 3.4e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 4.4e-16 | exact | n/a | n/a | byte-identical | 3.8e-16 / 5.3e-08 |
+| LES sigma + TFLES uniform + C0 | 1.3e-14 | 2.7e-06 | 4.6e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.0e-15 | 8.9e-16 | exact | n/a | n/a | byte-identical | 3.8e-16 / 5.1e-08 |
+| TFLES dynamic + C0 | 4.8e-15 | 2.7e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | 8.9e-16 | exact | n/a | TFLES F 1: bitwise | byte-identical | 3.8e-16 / 5.1e-08 |
+| LES smag + TFLES dynamic + C0 | 4.7e-15 | 3.2e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | 1.7e-15 | exact | n/a | n/a | byte-identical | 3.8e-16 / 5.0e-08 |
+| LES sigma + TFLES dynamic + C0 | 1.3e-14 | 2.7e-06 | 4.6e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | 1.1e-15 | exact | n/a | n/a | byte-identical | 3.9e-16 / 5.1e-08 |
+| LES smag + TFLES uniform + Charlette + C0 | 4.7e-15 | 3.2e-06 | 3.4e-16 | 6.7e-17 / 3.3e-08 | n/a | 8.9e-16 | 1.3e-15 | exact | n/a | n/a | byte-identical | 3.8e-16 / 5.3e-08 |
+| LES sigma + TFLES uniform + Charlette + C0 | 1.3e-14 | 2.7e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.0e-15 | 1.6e-15 | exact | n/a | n/a | byte-identical | 3.8e-16 / 5.2e-08 |
+| LES smag + TFLES dynamic + Charlette + C0 | 4.7e-15 | 3.2e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 1.8e-15 | exact | n/a | n/a | byte-identical | 3.8e-16 / 5.0e-08 |
+| C1 | 4.8e-15 | 2.7e-06 | 4.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 1.8e-15 | exact | 1.4e-15 / 6.9e-07 | passive species: bitwise | byte-identical | 4.0e-16 / 5.0e-08 |
+| LES smag + C1 | 4.7e-15 | 3.2e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 3.1e-15 | 2.2e-15 | exact | 1.3e-15 / 7.0e-07 | passive species: bitwise | byte-identical | 4.0e-16 / 5.0e-08 |
+| LES sigma + C1 | 1.3e-14 | 2.7e-06 | 4.5e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 1.8e-15 | exact | 1.4e-15 / 6.9e-07 | passive species: bitwise | byte-identical | 4.0e-16 / 5.0e-08 |
+| C2b | 4.8e-15 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.2e-16 | 1.1e-15 | exact | 1.4e-15 / 7.4e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical | 4.0e-16 / 5.0e-08 |
+| LES smag + C2b | 4.7e-15 | 3.2e-06 | 4.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.0e-15 | 1.4e-15 | exact | 1.1e-15 / 8.4e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical | 4.0e-16 / 5.0e-08 |
+| LES sigma + C2b | 1.3e-14 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 1.1e-15 | exact | 1.4e-15 / 7.4e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical | 4.0e-16 / 5.0e-08 |
+| gravity | 4.7e-15 | 4.3e-06 | 3.2e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 1.8e-15 | 4.4e-16 | n/a | n/a | n/a | byte-identical | 3.8e-16 / 5.1e-08 |
+| LES smag + gravity | 4.4e-15 | 4.3e-06 | 3.2e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 8.9e-16 | 1.1e-15 | n/a | n/a | n/a | byte-identical | 3.8e-16 / 5.1e-08 |
+| LES sigma + gravity | 1.3e-14 | 5.3e-06 | 3.7e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 1.8e-15 | 4.4e-16 | n/a | n/a | n/a | byte-identical | 4.1e-16 / 5.5e-08 |
+| C0 + gravity | 4.8e-15 | 2.4e-06 | 4.0e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 1.1e-15 | 4.4e-16 | exact | n/a | passive species: bitwise | byte-identical | 3.8e-16 / 5.2e-08 |
+| TFLES uniform + C0 + gravity | 4.8e-15 | 2.4e-06 | 3.3e-16 | 1.0e-15 / 4.5e-07 | 1.0e-15 / 4.5e-07 | 7.8e-16 | 8.9e-16 | exact | n/a | TFLES F 1: bitwise | byte-identical | 3.8e-16 / 5.3e-08 |
+| TFLES dynamic + C0 + gravity | 4.8e-15 | 2.4e-06 | 3.2e-16 | 5.4e-16 / 2.4e-07 | 5.4e-16 / 2.4e-07 | 1.7e-15 | 2.0e-15 | exact | n/a | TFLES F 1: bitwise | byte-identical | 4.3e-16 / 5.3e-08 |
+| LES smag + TFLES uniform + Charlette + C0 + gravity | 4.4e-15 | 2.8e-06 | 3.1e-16 | 1.0e-15 / 4.5e-07 | 1.0e-15 / 4.5e-07 | 1.0e-15 | 4.4e-16 | exact | n/a | n/a | byte-identical | 3.8e-16 / 5.0e-08 |
+| C1 + gravity | 4.8e-15 | 2.4e-06 | 4.5e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 4.4e-16 | 8.9e-16 | exact | 1.7e-15 / 6.9e-07 | passive species: bitwise | byte-identical | 4.0e-16 / 5.0e-08 |
+| C2b + gravity | 4.8e-15 | 2.4e-06 | 4.5e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 8.9e-16 | 2.4e-15 | exact | 1.2e-15 / 8.0e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical | 4.0e-16 / 5.0e-08 |
+| bodyForce | 4.7e-15 | 4.3e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.3e-15 | n/a | n/a | n/a | n/a | byte-identical | 3.8e-16 / 5.9e-08 |
+| LES smag + bodyForce | 4.4e-15 | 4.3e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | n/a | n/a | n/a | byte-identical | 3.7e-16 / 5.0e-08 |
+| LES sigma + bodyForce | 1.3e-14 | 5.3e-06 | 4.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.3e-15 | n/a | n/a | n/a | n/a | byte-identical | 3.8e-16 / 5.9e-08 |
+| RANS SA + bodyForce | 3.8e-15 | 3.6e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | n/a | n/a | n/a | RANS scalars 0: bitwise | byte-identical | 3.8e-16 / 5.7e-08 |
+| RANS SST + bodyForce | 3.5e-15 | 4.7e-06 | 4.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | n/a | n/a | RANS scalars 0: bitwise | byte-identical | 3.9e-16 / 5.8e-08 |
+| C0 + bodyForce | 4.8e-15 | 2.7e-06 | 3.4e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | n/a | exact | n/a | passive species: bitwise | byte-identical | 3.8e-16 / 5.3e-08 |
+| TFLES uniform + C0 + bodyForce | 4.8e-15 | 2.7e-06 | 3.0e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | exact | n/a | TFLES F 1: bitwise | byte-identical | 3.8e-16 / 5.1e-08 |
+| TFLES dynamic + C0 + bodyForce | 4.8e-15 | 2.7e-06 | 4.6e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | n/a | exact | n/a | TFLES F 1: bitwise | byte-identical | 3.8e-16 / 5.0e-08 |
+| LES smag + TFLES uniform + Charlette + C0 + bodyForce | 4.7e-15 | 3.2e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | exact | n/a | n/a | byte-identical | 3.8e-16 / 5.3e-08 |
+| C1 + bodyForce | 4.8e-15 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | n/a | exact | 1.4e-15 / 5.8e-07 | passive species: bitwise | byte-identical | 5.6e-16 / 5.1e-08 |
+| C2b + bodyForce | 4.8e-15 | 2.7e-06 | 3.8e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.3e-15 | n/a | exact | 1.6e-15 / 7.5e-07 | passive species, C(xi) 1 = C1: bitwise | byte-identical | 4.0e-16 / 5.1e-08 |
+| gravity + bodyForce | 4.7e-15 | 4.3e-06 | 3.4e-16 | 3.4e-16 / 1.5e-07 | 3.4e-16 / 1.5e-07 | 4.4e-16 | n/a | n/a | n/a | n/a | byte-identical | 3.8e-16 / 5.0e-08 |
+| C0 + turb | 4.8e-15 | 2.7e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | 1.0e-15 | exact | n/a | passive species, turb u' 0: bitwise | byte-identical | 3.8e-16 / 5.3e-08 |
+| LES smag + C0 + turb | 4.7e-15 | 3.2e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 6.7e-16 | 1.0e-15 | exact | n/a | passive species, turb u' 0: bitwise | byte-identical | 3.8e-16 / 5.3e-08 |
+| LES sigma + C0 + turb | 1.3e-14 | 2.7e-06 | 4.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.1e-15 | 1.0e-15 | exact | n/a | passive species, turb u' 0: bitwise | byte-identical | 3.8e-16 / 5.3e-08 |
+| TFLES uniform + C0 + turb | 4.8e-15 | 2.7e-06 | 3.0e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.0e-15 | 8.9e-16 | exact | n/a | TFLES F 1, turb u' 0: bitwise | byte-identical | 3.8e-16 / 5.2e-08 |
+| TFLES dynamic + C0 + turb | 4.8e-15 | 2.7e-06 | 3.3e-16 | 6.7e-17 / 3.3e-08 | n/a | 4.4e-16 | 8.9e-16 | exact | n/a | TFLES F 1, turb u' 0: bitwise | byte-identical | 3.8e-16 / 5.1e-08 |
+| LES smag + TFLES uniform + Charlette + C0 + turb | 4.7e-15 | 3.2e-06 | 3.1e-16 | 6.7e-17 / 3.3e-08 | n/a | 8.9e-16 | 1.3e-15 | exact | n/a | turb u' 0: bitwise | byte-identical | 3.8e-16 / 5.3e-08 |
+| C2b + turb | 4.8e-15 | 2.7e-06 | 3.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.2e-16 | 1.1e-15 | exact | 1.4e-15 / 7.4e-07 | passive species, C(xi) 1 = C1, turb u' 0: bitwise | byte-identical | 4.0e-16 / 5.0e-08 |
+| steady LTS | 4.7e-15 | 4.3e-06 | 5.2e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical | 5.4e-16 / 5.8e-08 |
+| RANS SA + steady LTS | 3.8e-15 | 3.6e-06 | 5.4e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical | 6.4e-16 / 1.1e-07 |
+| RANS SST + steady LTS | 3.3e-15 | 4.7e-06 | 5.4e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical | 4.4e-16 / 1.3e-07 |
+| bodyForce + steady LTS | 4.7e-15 | 4.3e-06 | 8.6e-16 | 6.7e-17 / 3.3e-08 | n/a | n/a | n/a | n/a | n/a | n/a | byte-identical | 3.7e-16 / 7.1e-08 |
+| shock | 3.0e-15 | 2.8e-06 | 4.2e-16 | 6.7e-17 / 3.3e-08 | n/a | 1.3e-15 | 1.8e-15 | n/a | n/a | n/a | byte-identical | 3.8e-16 / 5.4e-08 |
+| C0 + shock | 4.5e-15 | 3.3e-06 | 3.5e-16 | 6.7e-17 / 3.3e-08 | n/a | 2.2e-16 | 6.7e-16 | exact | n/a | passive species: bitwise | byte-identical | 3.8e-16 / 5.3e-08 |
 
 Regenerate: `test_gpu_fv_matrix markdown` (via simjob) prints everything from the first
 `<!-- generated` marker to here.
@@ -623,6 +629,59 @@ that is not a floor but a slow limit cycle:
 A number off a settled FV flow in plain FP32 is not a number. Use `--compensated`
 (gate O11: at dt 2% of stable, 4000 steps, 8.2e-7 vs FP64 where plain sits at
 1.8e-4) or `--fv-precision fp64`.
+
+### Precision: the plain FP64 write is biased (masterplan_combclose R6, N16)
+
+The plain stage write `ca a + cb b + cr r` compiles (gfx1100, `kFvGather<double, false>`) to
+`t = RN(cb b); x = fma(ca, a, t); out = fma(cr, r, x)`. At stage 3, `cb = R(2/3)` and
+`ca = 1 - cb` (exact): `a` and `b` are state words on one ulp grid, so the exact `ca a + t`
+sits on a lattice of spacing ulp/3 (ulp/6 when `cb b` drops a binade) offset by
+`(ca - 1/3) a`, and `x` rounds it BEFORE the increment is added. Round-to-nearest on a
+non-uniform lattice has a mean: it depends only on where q sits in its binade, so it is
+coherent over steps and cells, one sign for every positive conserved row, independent of dt
+and h, and absent on a frozen state (b == a). Stages 1 and 2 (cb 0, 1/4) are unbiased.
+
+| `test_stage_bias` (host, std::fma = the GPU order, binary128 exact, 4e5 samples) | [1, 1.5) | [1.5, 2) |
+|---|---|---|
+| plain compiled order (the control, >= +0.05) | +0.1112 ulp | -0.0000 ulp |
+| increment form `a + (cb (b - a) + cr r)`, unfused / fma (<= 0.01) | +0.0003 / +0.0003 | -0.0003 / -0.0003 |
+| compensated FP64 (`word2d.hpp` combineWord2): accumulation (<= 4 u^2 \|a\|), mean error | 1.00 u^2\|a\|, +4e-15 ulp | 0.67 u^2\|a\|, -6e-14 ulp |
+
+On the reacting nozzle (docs/nozzle.md "Reacting") it is a ledger residual LINEAR in steps:
+res_mass +7.0e-15 per step at 15 cells, +7.2e-15 at 30 (same at 4x smaller dt), predicted
+from the state within 1.6x on every row (analysis_combclose_2 A3); G4.1 reached 8.7e-13 (15,
+t 80) and 3.51e-12 (30): UNMET at 30. Physically negligible (~1e-11 after 1e7 steps), but a
+real conservation defect of every plain FP64 run: +0.03-0.09 u|q| per step in every row
+(issues.md N20). The plain FP32 write has the same form (`R(2/3)` rounds up in float, so the
+sign likely flips): unmeasured, N20.
+
+**Fix: `--compensated` under FP64** = the double-double state: `Word2d`, `twoSum`,
+`addWord2`, `combineWord2` overloads in `gpu/word2d.hpp` (DNS_HD, host-tested), the same
+`Comp` kernels' R = double instantiation (`kFvGather`, `kFvGravity`, `kFvForce`,
+`kFvRansGather`, `kFvChem`, `kFvBoostPair`), the increment form plus a low word.
+Kernels declare their words as `Word2Of<R>`, so a missing double overload is a compile error,
+never a silent float narrowing (verified: no f32/f64 conversion in any R = double `Comp`
+kernel; every float kernel's gfx1100 code identical to the pre-K4 object). Off = bytes (the
+float functions are verbatim; `comp_bit_identity.sh` subset, the plain `[thrust]` rig).
+Download folds `hi + lo` to one double (rounds back to hi: the lost `Sum V lo <= (u/2) Sum
+V|q|`, ~5.5e-17 of S', not accumulating). The checkpoint carries `state.fv.lo` (F64)
+(`gpu_restart_fv` fp64c). Label: `FP64 compensated (double-double state)`. The inventory moves
+`compensated` to its own axis (`state`): it composes with either precision, so the pair
+compensated + FP64 is live, and the CLI's explicit refusal is gone.
+
+| gate | relation | measured | band |
+|---|---|---|---|
+| N16b (`gpu_fv_nozzle_react`) | 15-cell reacting nozzle, tt 3 (31 639 steps), max_i max_k \|res_k\|/S'_k | compensated FP64 2.07e-16; last 10% of rows 1.57e-16 vs rows 10-20% 1.82e-16 | <= 1e-14, ratio <= 4 |
+| N16b control | the plain FP64 run, same tt | 1.48e-13 | >= 4e-14 (fails) |
+| matrix (`gpu_fv_matrix`) | every live cell: compensated FP64 vs FvRef 3 steps, numberings, rerun, pow2 Y, mass/energy | inside each cell's FP64 numbers (oracle <= 1.3e-14) | as FP64 |
+| silent-float guard | one step, compensated FP64 vs FP64 (control compensated FP32 vs FP64) | <= 6.4e-16 (control >= 5.0e-8) | <= 1e-14 (control >= 1e-9) |
+| cost | 15-cell reacting rig, tt 3, `--bench`, ms/step plain / compensated | 0.3076 / 0.3170 (+3.1%) | |
+
+**Proposed CLAUDE.md wording** (masterplan_combclose 7 item 1; CLAUDE.md is not edited): in "A plain FP32
+state wanders...", replace "FP64 rejects it." with: "FP64 takes it (masterplan_combclose): the plain FP64
+stage-3 write `ca a + cb b + cr r` (cb = R(2/3)) rounds `ca a + RN(cb b)` on a non-uniform lattice, +0.11 ulp
+per write on mantissas [1, 1.5): a ledger residual linear in steps (+7e-15 res_mass per step, G4.1 3.51e-12 at
+30 cells). Compensated FP64 = the increment form + a double low word; off = bytes."
 
 ## Species
 

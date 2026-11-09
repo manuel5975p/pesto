@@ -56,7 +56,8 @@ enum class FvAxis : std::uint8_t
     Inflow, // the turbulent inflow: IC and per-face rows, no stage term
     Time,
     Precision,
-    Capture // shock capture: the sensor, the HLL face term, the background term
+    Capture, // shock capture: the sensor, the HLL face term, the background term
+    State    // the compensated two-word state, under either precision (masterplan_combclose R6)
 };
 
 struct FvModuleInfo

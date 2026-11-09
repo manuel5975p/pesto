@@ -274,7 +274,8 @@ __global__ void __launch_bounds__(kT) kFvBndFace(View<R> m, Gas<R> gas, const R*
 }
 
 // The gather fused with the stage: ascending CSR faces, own index only. Comp:
-// the compensated two-word state (R = float), hi + lo accumulates what the plain
+// the compensated two-word state (R = float: comp.hpp's Word2; R = double: the
+// double-double Word2d of gpu/word2d.hpp), hi + lo accumulates what the plain
 // expression rounds away (gpu/internal/stage_write.hpp, a compile-time choice).
 // Rows First .. First + Count: the mean rows, or the species rows through this same
 // source (one block of stage writes: another shape fuses cb X + cr R into other
@@ -308,7 +309,7 @@ __global__ void __launch_bounds__(kT) kFvGather(View<R> m, const R* F, const R* 
         const std::size_t i = std::size_t(v + First) * nC + cc;
         const R rr = -acc[v] / Vc;
         if constexpr (Comp) {
-            const Word2 w2 = internal::combineWord2(cb, a[i], al[i], b[i], bl[i], cr * rr);
+            const Word2Of<R> w2 = internal::combineWord2(cb, a[i], al[i], b[i], bl[i], cr * rr);
             out[i] = w2.hi;
             ol[i] = w2.lo;
         } else {
@@ -351,7 +352,7 @@ __global__ void __launch_bounds__(kT) kFvGravity(View<R> m, R cr, const R* Gf, R
         const std::size_t i = std::size_t(k + 1) * n + cc;
         const R inc = cr * (acc[k] / Vc);
         if constexpr (Comp) {
-            const Word2 w = addWord2(out[i], ol[i], inc);
+            const Word2Of<R> w = addWord2(out[i], ol[i], inc);
             out[i] = w.hi;
             ol[i] = w.lo;
         } else {
@@ -688,7 +689,7 @@ __global__ void __launch_bounds__(kT) kFvRansGather(View<R> m, const R* Ft, cons
         const R comb = ca * a[i] + cb * b[i];
         R hi, lo = R(0.0);
         if constexpr (Comp) {
-            const Word2 w2 = internal::combineWord2(cb, a[i], al[i], b[i], bl[i],
+            const Word2Of<R> w2 = internal::combineWord2(cb, a[i], al[i], b[i], bl[i],
                                                     pointImplicitDelta(comb, cr, rr, sr[2 + e], b[i]));
             hi = w2.hi;
             lo = w2.lo;
@@ -726,7 +727,7 @@ __global__ void kFvForce(View<R> m, R fx, R fy, R fz, R cr0, const R* P, R* out,
         const std::size_t i = std::size_t(v) * nC + cc;
         const R x = cr * (v < 4 ? f[v - 1] : pw);
         if constexpr (Comp) {
-            const Word2 w = addWord2(out[i], ol[i], x);
+            const Word2Of<R> w = addWord2(out[i], ol[i], x);
             out[i] = w.hi;
             ol[i] = w.lo;
         } else {
@@ -969,8 +970,8 @@ __global__ void kFvChem(View<R> m, SpView<R> sp, const R* om, R* out, R* ol, R c
     const std::size_t nC = std::size_t(m.nC), cc = std::size_t(c);
     const std::size_t iF = std::size_t(sp.iY + sp.fuel) * nC + cc, iE = 4 * nC + cc;
     if constexpr (Comp) {
-        const Word2 f = addWord2(out[iF], ol[iF], -(cr * om[c]));
-        const Word2 e = addWord2(out[iE], ol[iE], cr * (sp.q * om[c]));
+        const Word2Of<R> f = addWord2(out[iF], ol[iF], -(cr * om[c]));
+        const Word2Of<R> e = addWord2(out[iE], ol[iE], cr * (sp.q * om[c]));
         out[iF] = f.hi;
         ol[iF] = f.lo;
         out[iE] = e.hi;
@@ -982,7 +983,7 @@ __global__ void kFvChem(View<R> m, SpView<R> sp, const R* om, R* out, R* ol, R c
     if constexpr (Two) {
         const std::size_t iO = std::size_t(sp.iY + sp.ox) * nC + cc;
         if constexpr (Comp) {
-            const Word2 o = addWord2(out[iO], ol[iO], -(cr * (sp.stoich * om[c])));
+            const Word2Of<R> o = addWord2(out[iO], ol[iO], -(cr * (sp.stoich * om[c])));
             out[iO] = o.hi;
             ol[iO] = o.lo;
         } else {
@@ -1166,23 +1167,24 @@ __global__ void kFvBoost(int nC, R ux, R uy, R uz, R* q)
 }
 
 // The boost on the two-word state: the increments land in the low words' pair.
-__global__ void kFvBoostPair(int nC, Real ux, Real uy, Real uz, Real* q, Real* l)
+template <class R>
+__global__ void kFvBoostPair(int nC, R ux, R uy, R uz, R* q, R* l)
 {
     const int c = int(blockIdx.x) * kT + int(threadIdx.x);
     if (c >= nC) return;
     const std::size_t n = std::size_t(nC), cc = std::size_t(c);
-    const Real rho = q[cc];
-    const Real mx = q[n + cc], my = q[2 * n + cc], mz = q[3 * n + cc];
-    const Real du[3] = {ux, uy, uz};
+    const R rho = q[cc];
+    const R mx = q[n + cc], my = q[2 * n + cc], mz = q[3 * n + cc];
+    const R du[3] = {ux, uy, uz};
 #pragma unroll
     for (int k = 0; k < 3; ++k) {
         const std::size_t i = std::size_t(k + 1) * n + cc;
-        const Word2 w = addWord2(q[i], l[i], rho * du[k]);
+        const Word2Of<R> w = addWord2(q[i], l[i], rho * du[k]);
         q[i] = w.hi;
         l[i] = w.lo;
     }
     const std::size_t e = 4 * n + cc;
-    const Word2 w = addWord2(q[e], l[e], mx * ux + my * uy + mz * uz + Real(0.5) * rho * (ux * ux + uy * uy + uz * uz));
+    const Word2Of<R> w = addWord2(q[e], l[e], mx * ux + my * uy + mz * uz + R(0.5) * rho * (ux * ux + uy * uy + uz * uz));
     q[e] = w.hi;
     l[e] = w.lo;
 }
@@ -1584,14 +1586,12 @@ struct FvCompImpl final : DeviceFvComp::Impl
         else gatherStage<false, false>(a, nullptr, b, nullptr, out, nullptr, ca, cb, cr, residual);
     }
 
-    // Stage on the two-word state; ca is implied (1 - cb exactly).
+    // Stage on the two-word state (FP32 hi + lo, or FP64 double-double); ca is implied (1 - cb exactly).
     void stagePair(const R* a, const R* al, const R* b, const R* bl, R* out, R* ol, R cb, R cr)
     {
         rhsPasses(b);
-        if constexpr (std::is_same_v<R, Real>) {
-            if (useLts) gatherStage<true, true>(a, al, b, bl, out, ol, R(1.0) - cb, cb, cr, false);
-            else gatherStage<true, false>(a, al, b, bl, out, ol, R(1.0) - cb, cb, cr, false);
-        }
+        if (useLts) gatherStage<true, true>(a, al, b, bl, out, ol, R(1.0) - cb, cb, cr, false);
+        else gatherStage<true, false>(a, al, b, bl, out, ol, R(1.0) - cb, cb, cr, false);
     }
 
     // The ledger's sums of stage k: F of the stage (the gather left it), omega of the stage.
@@ -2117,11 +2117,10 @@ struct FvCompImpl final : DeviceFvComp::Impl
 
     void boost(const std::array<double, 3>& du) override
     {
-        if constexpr (std::is_same_v<R, Real>)
-            if (compensated) {
-                kFvBoostPair<<<blocksOf(std::size_t(nC)), kT>>>(nC, R(du[0]), R(du[1]), R(du[2]), q.data(), l.data());
-                return;
-            }
+        if (compensated) {
+            kFvBoostPair<R><<<blocksOf(std::size_t(nC)), kT>>>(nC, R(du[0]), R(du[1]), R(du[2]), q.data(), l.data());
+            return;
+        }
         kFvBoost<R><<<blocksOf(std::size_t(nC)), kT>>>(nC, R(du[0]), R(du[1]), R(du[2]), q.data());
     }
 

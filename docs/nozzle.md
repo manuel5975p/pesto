@@ -349,7 +349,7 @@ downstream, the flame stays 3.20 delta_D (2 delta_th) downstream to the end, and
 
 | gate | relation | measured (15 cells) | band |
 |---|---|---|---|
-| G4.1 | ledger res_k / (\|P_k\| + sum \|I_k\| (+ q\|Omega\|, \|Omega\|)), every row of 4212 | 8.7e-13 (grows with steps: 2.5e-13 at t 10; the start run 1.08e-12 at t 80); 30 cells **3.51e-12 UNMET**: the FP64 state's rounding (+7e-15 res_mass per step at both h), not the ledger (compensated, P4b) | 1e-12 |
+| G4.1 | ledger res_k / (\|P_k\| + sum \|I_k\| (+ q\|Omega\|, \|Omega\|)), every row of 4212 | 8.7e-13 (grows with steps: 2.5e-13 at t 10; the start run 1.08e-12 at t 80); 30 cells **3.51e-12 UNMET**: the FP64 state's rounding (+7e-15 res_mass per step at both h), not the ledger (compensated, P4b). Cause: the plain stage-3 write's lattice bias (N16); `--compensated` FP64 (combclose K4, N16b, tt 3): 2.07e-16 flat vs plain 1.48e-13 | 1e-12 |
 | G4.1 ctrl | Omega dropped from the rho Y row | 0.45 | fails |
 | G4.2 | S_c (A_ref) vs the 1D S_L,num 0.9945059; delta S_fresh -5.9e-5 <= band/4: raw | 0.9944148: -9.1e-5 | 5e-4 |
 | G4.3 | x_f' (regression) vs u_u - S_c | -0.0040060 vs -0.0036810: 3.3e-4 (the 0.98 run: -0.10557 vs -0.10466, 9.1e-4) | 2e-3 S_L |
@@ -414,6 +414,10 @@ CLAUDE.md is not edited. For the user:
   also on `dns flame --polymesh` (compressible premixed C0 only): one gamma for fresh AND burnt gas, frozen; Tu =
   1/(gamma M^2), q = cp(gamma) (sigma - 1) Tu; Lambda gamma-free. Gate: the burnt T offset (docs/chem.md "P1").
 - "Bit-identical silent `hll` == `none`" is the structured rule; on FV it holds at `--shock-d4 0` only.
+- "A plain FP32 state wanders ... FP64 rejects it [`--compensated`]": bent by masterplan_combclose K4 (R6). FP64 takes it:
+  the plain FP64 stage-3 write is biased (+0.11 ulp per write on mantissas [1, 1.5), issues.md N16, N20), a ledger
+  residual linear in steps; `--compensated --fv-precision fp64` is the double-double state (docs/fvcomp.md "Precision:
+  the plain FP64 write is biased"), off = bytes. Proposed wording there.
 
 ## Proposed CLAUDE.md invariants
 

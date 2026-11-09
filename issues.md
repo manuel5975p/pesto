@@ -2723,6 +2723,15 @@ G4.7, G4.8 PASS at 15 cells; at 30 cells G4.2-G4.4, G4.6 (p0b), G4.8 PASS, G4.1 
   the same way every step on a slowly drifting state. res/S' tends to that loss over |dI| per step (1/dt): 8.7e-13 at
   15 (t 80), **3.51e-12 at 30: G4.1 UNMET at 30**. A fix needs a conservative FP64 state update (a compensated FP64
   state, refused today): not built.
+  **CLOSED (combclose K4): compensated FP64.** Cause pinned (analysis_combclose_2 A2): the plain stage-3 write
+  `ca a + cb b + cr r` (cb = R(2/3)) compiles to `fma(cr, r, fma(ca, a, RN(cb b)))`, which rounds `ca a + RN(cb b)` on a
+  lattice of spacing ulp/3 before the increment: `test_stage_bias` (host, std::fma, binary128) +0.1112 ulp per write on
+  mantissas [1, 1.5), -0.0000 on [1.5, 2); the increment form +0.0003. `--compensated` under `--fv-precision fp64` = the
+  double-double state (`gpu/word2d.hpp`, the `Comp` kernels' R = double instantiation; docs/fvcomp.md "Precision: the
+  plain FP64 write is biased"). N16b (`gpu_fv_nozzle_react`, 15 cells, tt 3, 31 639 steps): max r 2.07e-16, flat (last
+  10% of rows 1.57e-16 vs rows 10-20% 1.82e-16); plain control 1.48e-13. Off = bytes (bit subset vs dns.BASE, the plain
+  `[thrust]` rig vs dns.K3). Cost +3.1% per step (0.3076 vs 0.3170 ms/step, 15-cell reacting rig, `--bench`). The
+  full-length gated runs (K5/K6) run compensated.
 - N17. **G4.7 partial**: the start perturbation is x_f + 2 delta_th (`--upstream 14`) only; "p0 IC + 1%" has no knob (none
   built for a test). The flame stays 3.20 delta_D downstream to the end; window mdot, CfBvac, S_c 4.4e-5, 2.2e-6, 3.8e-7.
 - N18. **The viscous one-row v is a field**, max |v|/c 6.9e-3 in the twin (P_my/P_mx 8.7e-4 in the flame run; the flame
@@ -2733,6 +2742,14 @@ G4.7, G4.8 PASS at 15 cells; at 30 cells G4.2-G4.4, G4.6 (p0b), G4.8 PASS, G4.1 
   t 7.8 of 80 tau, mdotIn 31.13 vs mdotOut 30.64 (1.6% transient); stopped. The 30-cell rung ran (A24).
 
 combclose (`plans/masterplan_combclose.md`, amendments B1-):
+- N20. **Every plain stage write `ca a + cb b + cr r` with cb = R(2/3) is biased** (masterplan_combclose R12, N16's
+  mechanism): it rounds `ca a + RN(cb b)` on a non-uniform lattice before the increment. FP64 measured: +0.11 ulp per
+  write on mantissas [1, 1.5) (`test_stage_bias`), +0.03-0.09 u|q| per step in every conserved row on the reacting nozzle
+  (res_mass +7e-15 per step). FP32 (`kFvGather<float, false>`, the structured `stagePut` plain path): the same form,
+  `R(2/3)` rounds UP in float, so the sign likely flips; ~0.1 ulp_f32 per step, the order of the known plain-FP32
+  wander: UNMEASURED (a closed-box plain vs compensated mass-drift probe would settle it). Not fixed: the plain writes
+  are the bit-identity invariants of every shipped row; `--compensated` (FP32 and, since K4, FP64) is the fix where a
+  ledger or a settled number needs it.
 - N21. **CLOSED (B4): the converged dns − reactingFoam O(M²) gap is stock reactingFoam's missing viscous work** (K1,
   docs/chem.md "P1" "At the nozzle's Mach"). v2606 `reactingFoam/EEqn.H` (h + K, −dpdt, laplacian(alphaEff, he),
   Qdot) has no div(τ·u); dns' E flux carries u_f·(τ_f·S) (`fvMeanFlux`). Every other term matches here (stress,
