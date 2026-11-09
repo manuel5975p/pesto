@@ -656,8 +656,32 @@ res_mass +7.0e-15 per step at 15 cells, +7.2e-15 at 30 (same at 4x smaller dt), 
 from the state within 1.6x on every row (analysis_combclose_2 A3); G4.1 reached 8.7e-13 (15,
 t 80) and 3.51e-12 (30): UNMET at 30. Physically negligible (~1e-11 after 1e7 steps), but a
 real conservation defect of every plain FP64 run: +0.03-0.09 u|q| per step in every row
-(issues.md N20). The plain FP32 write has the same form (`R(2/3)` rounds up in float, so the
-sign likely flips): unmeasured, N20.
+(issues.md N20). The plain FP32 write has the same form; `R_f32(2/3)` rounds UP (the double's
+rounds down), so the sign flips (combscale S3, measured below).
+
+**FP32 (combscale S3, measured, nothing fixed).** `test_stage_bias` (4): the plain FP32 write
+(`kFvGather<float, false>`'s order, cb = R_f32(2/3), b = a + k ulp_f32, |k| <= 2^8) is
+-0.1116 ulp_f32 on mantissas [1, 1.5), -0.0013 on [1.5, 2); the increment form +0.0006 /
++0.0003. The 15-cell `[thrust]` rig, tt 3, same argv at four states (`nozzle_react.py drift
+PREFIX`: slope_k = LSQ d res_k / d step, beta_k = slope_k / (u_R |P_k|), u_R 2^-24 / 2^-53):
+
+| run (steps) | res_mass /step | beta mass / mx / E / ry | G4.1 r_max | r last 10% / rows 10-20% |
+|---|---|---|---|---|
+| plain FP32 (31 629) | -2.386e-6 | -0.021 / +0.210 / -0.067 / +0.075 | 1.29e-4 | 8.33e-5 / 1.07e-5 (7.8) |
+| compensated FP32 (31 639) | -9.9e-14 | 0.0000 on every row (\|beta\| < 1e-5) | 1.69e-9 | 1.69e-9 / 3.70e-10 (4.6) |
+| plain FP64 (31 639) | +5.699e-15 | +0.027 / +0.096 / +0.007 / +0.057 | 1.48e-13 | 1.48e-13 / 3.49e-14 (4.2) |
+| compensated FP64 (31 639) | -1.5e-19 | 0.0000 | 2.07e-16 | 1.57e-16 / 1.82e-16 (0.87) |
+
+The FP32 mass row drifts NEGATIVE (the mirror of FP64's +), 0.78x the FP64 slope scaled by
+2^29 at the same tt; the momentum row carries the largest beta at both precisions (+0.21 /
++0.10). Compensated FP32 removes the bias (beta 0) but its r still grows (ratio 4.6: the FP32
+state's flux and ledger arithmetic, not the write; floor 1.7e-9 at 3e4 steps, far below the
+~1e-7 guessed). Plain FP32 moves the flame itself: S_L 0.994132 vs 0.995070 (compensated FP32
+= both FP64 to 6 digits), Cd 0.444774 vs 0.444501. Body-free periodic FV box (64^2, Re 100,
+M 0.2, `--ramp 0.5 --kick 0.5`, ft 20, ~5900 steps): plain FP32 total mass -1.40e-3 of 39.48
+(-2.2e-8 per step, -5.6e-10 relative per step), compensated exactly 0. The pre-registered
+magnitudes missed (masterplan_combscale B2): the reacting rig's slopes at tt 3 are below the
+tt-80 fit the plan scaled from (FP64 +5.70e-15 here vs +7.0e-15 there).
 
 **Fix: `--compensated` under FP64** = the double-double state: `Word2d`, `twoSum`,
 `addWord2`, `combineWord2` overloads in `gpu/word2d.hpp` (DNS_HD, host-tested), the same

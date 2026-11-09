@@ -2775,10 +2775,16 @@ combclose (`plans/masterplan_combclose.md`, amendments B1-):
   mechanism): it rounds `ca a + RN(cb b)` on a non-uniform lattice before the increment. FP64 measured: +0.11 ulp per
   write on mantissas [1, 1.5) (`test_stage_bias`), +0.03-0.09 u|q| per step in every conserved row on the reacting nozzle
   (res_mass +7e-15 per step). FP32 (`kFvGather<float, false>`, the structured `stagePut` plain path): the same form,
-  `R(2/3)` rounds UP in float, so the sign likely flips; ~0.1 ulp_f32 per step, the order of the known plain-FP32
-  wander: UNMEASURED (a closed-box plain vs compensated mass-drift probe would settle it). Not fixed: the plain writes
-  are the bit-identity invariants of every shipped row; `--compensated` (FP32 and, since K4, FP64) is the fix where a
-  ledger or a settled number needs it.
+  `R(2/3)` rounds UP in float, and the sign FLIPS — MEASURED (combscale S3, docs/fvcomp.md "Precision"): host
+  -0.1116 ulp_f32 per write on [1, 1.5) (-0.0013 on [1.5, 2); increment form +0.0006); 15-cell `[thrust]` rig, tt 3,
+  plain FP32 res_mass -2.386e-6 per step, beta (slope / (u_R |P|)) mass -0.021, mx +0.210, E -0.067, ry +0.075, G4.1
+  1.29e-4; compensated FP32 beta 0 on every row, r 1.69e-9 but still growing (last/early 4.6); plain FP64 +5.70e-15 per
+  step (beta +0.027 / +0.096 / +0.007 / +0.057), r 1.48e-13; compensated FP64 2.07e-16 flat. plain - compensated FP32:
+  S_L -9.4e-4, Cd +2.7e-4, res_mass -0.108 at t 3. Body-free periodic box (64^2): plain FP32 mass -2.2e-8 per step
+  (-5.6e-10 relative), compensated 0. The FP32 magnitude is 0.78x FP64's x 2^29 at the same tt; the plan's
+  pre-registered |p32| [2.7e-6, 4.9e-6] and p64 +7e-15 +-10% are UNMET (both scaled from the tt-80 fit; at tt 3 the
+  slopes are lower; masterplan_combscale B2). Not fixed: the plain writes are the bit-identity invariants of every
+  shipped row; `--compensated` (FP32 and, since K4, FP64) is the fix where a ledger or a settled number needs it.
 - N21. **CLOSED (B4): the converged dns − reactingFoam O(M²) gap is stock reactingFoam's missing viscous work** (K1,
   docs/chem.md "P1" "At the nozzle's Mach"). v2606 `reactingFoam/EEqn.H` (h + K, −dpdt, laplacian(alphaEff, he),
   Qdot) has no div(τ·u); dns' E flux carries u_f·(τ_f·S) (`fvMeanFlux`). Every other term matches here (stress,

@@ -32,6 +32,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 
 import numpy as np
@@ -773,6 +774,33 @@ def cmdReport(a):
         open(a.json, "w").write(txt)
 
 
+def cmdDrift(a):
+    """combscale S3 (issues.md N20): the ledger residual's drift per step, from PREFIX_thrust.csv. Per row k: slope_k =
+    LSQ d res_k / d step, beta_k = slope_k / (u_R |P_k|) (writes' mean rounding bias per step in units of the state's
+    unit roundoff, u_R = 2^-24 FP32 / 2^-53 FP64, read off the label), and r_max as G4.1 (first / last 10% printed)."""
+    path = a.prefix + "_thrust.csv"
+    th, lab = readCsv(path), labelOf(path)
+    st = re.search(r", FP(32|64)( compensated)?", lab)
+    fp32 = bool(st) and st.group(1) == "32"
+    uR = 2.0 ** -24 if fp32 else 2.0 ** -53
+    n = len(th["t"])
+    o = dict(prefix=a.prefix, precision="FP32" if fp32 else "FP64", compensated=bool(st and st.group(2)), rows=n,
+             steps=th["step"][-1], rows_out={})
+    for k in ("mass", "mx", "E", "ry"):
+        s = slope(th["step"], th["res_" + k])
+        P = mean([abs(v) for v in th["P_" + k]])
+        o["rows_out"][k] = dict(slope=s, P=P, beta=s / (uR * P) if P > 0 else math.nan, res_last=th["res_" + k][-1])
+    q = flameUnits(a.gamma, a.mach, a.sigma)["q"]
+    r = g41(th, q, False)["G4.1"]["res"]
+    o["r_max"] = r
+    print(f"{a.prefix}: {o['precision']}{' compensated' if o['compensated'] else ''}, {n} rows, {o['steps']:.0f} steps")
+    for k, v in o["rows_out"].items():
+        print(f"  {k:5s} slope {v['slope']:+.4e} /step  |P| {v['P']:.6e}  beta {v['beta']:+.4f}  res_last {v['res_last']:+.4e}")
+    print(f"  G4.1 r_max {r:.3e} (q {q:.6g})")
+    if a.json:
+        open(a.json, "w").write(json.dumps(o, indent=1, default=float))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     s = p.add_subparsers(dest="cmd", required=True)
@@ -826,10 +854,17 @@ def main():
     r.add_argument("--start", default=None, help="G4.7b: another start's PREFIX, on this run's W")
     r.add_argument("--compensated", action="store_true", help="evaluate G4.1f (else read off the label)")
     r.add_argument("--json", default=None)
+    dr = s.add_parser("drift")
+    dr.add_argument("prefix")
+    dr.add_argument("--gamma", type=float, default=1.4)
+    dr.add_argument("--mach", type=float, default=0.042)
+    dr.add_argument("--sigma", type=float, default=SIGMA)
+    dr.add_argument("--json", default=None)
     a = p.parse_args()
     if a.cmd == "report" and (a.twin_cd is None) != (a.twin_cf is None):
         p.error("--twin-cd and --twin-cf go together")
-    {"oracle": cmdOracle, "design": cmdDesign, "argv": cmdArgv, "modes": cmdModes, "twin": cmdTwin, "report": cmdReport}[a.cmd](a)
+    {"oracle": cmdOracle, "design": cmdDesign, "argv": cmdArgv, "modes": cmdModes, "twin": cmdTwin, "report": cmdReport,
+     "drift": cmdDrift}[a.cmd](a)
 
 
 if __name__ == "__main__":
