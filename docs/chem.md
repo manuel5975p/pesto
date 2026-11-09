@@ -1209,22 +1209,47 @@ Readings:
   204 s CPU job.
 
 **At the nozzle's Mach (masterplan_combclose K1, G1.8).** Cases `fv1d_mn` (fv1d at M 0.042, γ 1.4,
-dns `--shock hll`, dns 7.5 / 15 / 30, foam 15 / 30) and `fv1d_mn_stockle` (the control, foam 15):
-`foam_flame.py setup|run|compare fv1d_mn`, `foam_flame.py gates-mn` (`p1gates.evaluate_mn`,
+dns `--shock hll`, dns 7.5 / 15 / 30, foam 15 / 30), `fv1d_mn_vw` (foam 15 / 30 + the viscous
+work, below) and `fv1d_mn_stockle` (the control, foam 15): `foam_flame.py setup|run|compare
+fv1d_mn|fv1d_mn_vw`, `foam_flame.py gates-mn` (`p1gates.evaluate_mn`,
 `runs/flames/foam/fv1d_mn/gates.txt`). Same meshes, IC, BCs, schemes and window as P1.
+
+**Stock reactingFoam carries no viscous work** (issues.md N21). v2606 `reactingFoam/EEqn.H`:
+`fvm::ddt(rho, he) + mvConvection->fvmDiv(phi, he) + fvc::ddt(rho, K) + fvc::div(phi, K) − dpdt
+(he = h) − fvm::laplacian(turbulence->alphaEff(), he) == Qdot + fvOptions(rho, he)`: no
+div(τ·u). dns' E flux (`dns/fvflux.hpp` `fvMeanFlux`) carries `um[c] * ts[c]` (u_f·(τ_f·S)). Every
+other term is the same model here: momentum stress (`divDevRhoReff` = μ(∇U + ∇Uᵀ − ⅔ div U I),
+dns `fvTraction`), h = cp T sensible (hConst, equal Cp: laplacian(α, h) = κ∇T, no species-enthalpy
+flux), Le 1 (unityLewis fvOption), K = ½|U|² both, dpdt on (`thermo.dpdt()` default), constant
+μ. In the flame u_x ∝ T_x, so the missing flux (4/3)μ u u_x is extra conduction of relative size
+(4/3) Pr (γ−1) M² T/T_u (6.8e-4 T/T_u at M 0.042) that the species do not get: an effective Le
+above 1 by up to 3.4e-3 at the reaction zone, so the flame without it is SLOWER. The writer adds
+it as a `scalarCodedSource` on h (`writer.VISCW`, `visc_work`): τ_f from the face gradient (the
+interpolated cell gradient with its normal part replaced by snGrad: dns' AlongD face gradient on
+this orthogonal mesh), dotted with the mean face U, `fvc::surfaceIntegrate`, explicit on the RHS.
+
+Finite-Mach oracle (`tools/chem/mach_flame_oracle.py`, 3 s): the steady compressible NS ODE of
+the C0 flame (momentum with (4/3)μu', total energy with or without (4/3)μ u u', Le 1), solve_bvp
+two-segment, fresh state (T_u, p0) exactly: S 0.9908841 with the work, 0.9882683 without (M 0.042;
+n 4001 = 16001 to 1e-9, L 25 = 35); difference 2.616e-3 = 0.265 γM²(σ−1); M 0.01: 0.9994723 /
+0.9993221, 1.50e-4 = 0.268. On the measured fresh states (a_T, a_p): 0.9909379 (dns' state) vs
+dns S∞ 0.9909473; 0.9883637 (stock foam's state, without) vs stock foam's Richardson 0.9883743.
 
 | gate | relation | measured | |
 |---|---|---|---|
 | G1.8a | dns ladder reproduces the archived M_n S_L (G1.5/G3.3) within the span | 1.0050441, 0.9945059, 0.9918457 (+4.8e-8, 0.0); order 1.986, S∞ 0.9909473 (1 − γM²(σ−1) + 8.3e-4) | PASS |
-| G1.8 | \|S_dns − S_foam\| ≤ max(\|S_dns − S∞\|, \|S_foam − S∞\|) at 15 and 30, \|gap 30\| < \|gap 15\| | +2.620e-3 / +2.593e-3 vs 3.559e-3 / 1.695e-3; foam 0.9918861, 0.9892522; δS_fresh +6.5e-5, −8.7e-5 (raw) | **UNMET at 30** |
+| G1.8 | foam + viscous work: \|S_dns − S_foam\| ≤ max(\|S_dns − S∞\|, \|S_foam − S∞\|) at 15 and 30, \|gap 30\| < \|gap 15\| | +2.099e-5 / +1.379e-5 vs 3.559e-3 / 8.983e-4; foam 0.9944850, 0.9918319, Richardson (p 2) 0.9909475 (S∞ + 1.9e-7); δS_fresh +1.04e-4, −4.5e-5 (raw) | PASS |
+| G1.8 stock (not gated) | stock reactingFoam, the same relation | +2.620e-3 / +2.593e-3 vs 3.559e-3 / 1.695e-3; foam 0.9918861, 0.9892522, Richardson 0.9883743 (S∞ − 2.57e-3) | the stated model gap |
 | G1.8 control | foam stock Le 1.39 at 15: gap ≥ 0.1 | +0.1257 | fails as required |
 
-Reading: the dns − foam gap does NOT fall with h (2.620e-3 → 2.593e-3); foam's own Richardson
-limit (p 2) is 0.988374, 2.57e-3 under dns' S∞. That is 0.26 γM²(σ−1); P1's converged gap at
-M 0.01 (foam 0.99939, dns Richardson 0.99955) is 1.6e-4 = 0.29 γM²(σ−1): one O(M²) model
-difference, not h, window or fresh state (term budget: δS_fresh ≤ 8.7e-5, window spans ≤ 1.8e-4,
-the outlet acts through the fresh state only). issues.md N21. dns 60.6 s GPU (one job), foam
-83 / 166 s exec (one 174 s CPU job with the stockle run).
+Reading: with the viscous work the gap falls 125× (15) and 188× (30) and foam's Richardson limit
+equals dns' S∞ to 1.9e-7; the oracle puts both within 1e-5 of its own value with and without the
+term. Stock reactingFoam's converged S_L is 0.265 γM²(σ−1) below dns' by its energy equation
+alone: a MODEL gap of stock reactingFoam (no viscous heating), not dns'. P1's M 0.01 converged gap
+(foam 0.99939, dns 0.99955: 0.29 γM²(σ−1)) is the same term: `fv1d_vw` (foam + the work, 15 / 30)
+moves foam by +1.49e-4 / +1.48e-4 (oracle 1.50e-4); dns − foam +3.098e-4 / +8.60e-5 (stock
++4.592e-4 / +2.341e-4), falling 3.6× per halving. dns 60.6 s GPU (one job); foam 83 / 166 s exec
+stock, 97 / 185 s with the work (+17% / +11%, one 234 s CPU job with the two M 0.01 runs).
 
 ## 2D slot-jet diffusion flame (`--mode diffusion`)
 

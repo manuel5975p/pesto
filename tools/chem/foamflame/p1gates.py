@@ -170,12 +170,15 @@ MN_ARCHIVED = {15: 0.9945059, 30: 0.9918456870897155}
 
 
 def evaluate_mn(root, oracle, si):
-    """masterplan_combclose G1.8 off fv1d_mn / fv1d_mn_stockle's compare.json: the nozzle's flame (M 0.042,
-    gamma 1.4, --shock hll) vs reactingFoam at 15 and 30 cells. S_inf = S30 + (S30 - S15)/(2^p - 1), p from
-    the dns ladder; |S_dns - S_foam| <= max(|S_dns - S_inf|, |S_foam - S_inf|) at 15 and 30, |gap 30| < |gap 15|;
-    the fresh correction in G1.4's form; 1 - gamma M^2 (sigma - 1) printed beside."""
-    fv, st = _load(root, "fv1d_mn"), _load(root, "fv1d_mn_stockle")
-    R = fv["runs"]
+    """masterplan_combclose G1.8 off fv1d_mn / fv1d_mn_vw / fv1d_mn_stockle's compare.json: the nozzle's flame
+    (M 0.042, gamma 1.4, --shock hll) vs reactingFoam + the viscous work div(tau . u) (fv1d_mn_vw; stock
+    reactingFoam's EEqn.H has none, issues.md N21) at 15 and 30 cells. S_inf = S30 + (S30 - S15)/(2^p - 1),
+    p from the dns ladder; |S_dns - S_foam| <= max(|S_dns - S_inf|, |S_foam - S_inf|) at 15 and 30, |gap 30| <
+    |gap 15|; the fresh correction in G1.4's form; 1 - gamma M^2 (sigma - 1) printed beside. Stock foam's
+    gap (the stated model gap) and the finite-Mach oracle (tools/chem/mach_flame_oracle.py) are printed
+    beside, not gated."""
+    fv, st, vw = _load(root, "fv1d_mn"), _load(root, "fv1d_mn_stockle"), _load(root, "fv1d_mn_vw")
+    R = {**fv["runs"], **{f"vw_{k}": v for k, v in vw["runs"].items()}}
     sig, M, g = 5.0, 0.042, 1.4
     out, L = {}, []
 
@@ -195,21 +198,41 @@ def evaluate_mn(root, oracle, si):
          + " ".join(f"{N:g}: {rep[N]:+.1e} (span {spans[N]:.1e})" for N in rep))
     aT, ap = sens(root, oracle)
     Tu = pu = 1.0 / (g * M * M)
-    fresh, band, raw = {}, {}, {}
-    for N in (15, 30):
-        dn, fn = R[f"dns_c{N:g}"], R[f"foam_mclin_c{N:g}"]
-        fresh[N] = aT * (dn["TRef_series"]["mean"] - fn["TRef_series"]["mean"]) / Tu \
-            + ap * (dn["pRef_series"]["mean"] - fn["pRef_series"]["mean"]) / pu
-        band[N] = max(abs(sd[N] - sinf), abs(_sl(fn) - sinf))
-        raw[N] = sd[N] - _sl(fn)
-    corr = any(abs(fresh[N]) > band[N] / 4 for N in fresh)
-    gap = {N: raw[N] - (fresh[N] if corr else 0.0) for N in raw}
-    ok = all(abs(gap[N]) <= band[N] for N in gap) and abs(gap[30]) < abs(gap[15])
-    line("G1.8", ok,
-         "dns - foam " + " ".join(f"{N:g}: {gap[N]:+.3e}" for N in gap) + " vs max own error vs S_inf "
-         + " ".join(f"{band[N]:.3e}" for N in band) + f"; |gap 30| < |gap 15|: {abs(gap[30]) < abs(gap[15])}; foam S_L "
-         + " ".join(f"{_sl(R[f'foam_mclin_c{N:g}']):.7f}" for N in gap) + "; dS_fresh "
-         + " ".join(f"{fresh[N]:+.2e}" for N in fresh) + (" (corrected)" if corr else " (raw S_L compared, <= band/4)"))
+    def gaps(pre):
+        fresh, band, raw = {}, {}, {}
+        for N in (15, 30):
+            dn, fn = R[f"dns_c{N:g}"], R[f"{pre}foam_mclin_c{N:g}"]
+            fresh[N] = aT * (dn["TRef_series"]["mean"] - fn["TRef_series"]["mean"]) / Tu \
+                + ap * (dn["pRef_series"]["mean"] - fn["pRef_series"]["mean"]) / pu
+            band[N] = max(abs(sd[N] - sinf), abs(_sl(fn) - sinf))
+            raw[N] = sd[N] - _sl(fn)
+        corr = any(abs(fresh[N]) > band[N] / 4 for N in fresh)
+        gap = {N: raw[N] - (fresh[N] if corr else 0.0) for N in raw}
+        sf = [_sl(R[f"{pre}foam_mclin_c{N:g}"]) for N in (15, 30)]
+        rich = sf[1] + (sf[1] - sf[0]) / 3.0
+        txt = ("dns - foam " + " ".join(f"{N:g}: {gap[N]:+.3e}" for N in gap) + " vs max own error vs S_inf "
+               + " ".join(f"{band[N]:.3e}" for N in band) + f"; |gap 30| < |gap 15|: {abs(gap[30]) < abs(gap[15])}; "
+               f"foam S_L {sf[0]:.7f} {sf[1]:.7f}, Richardson (p 2) {rich:.7f} (- S_inf {rich - sinf:+.2e}); dS_fresh "
+               + " ".join(f"{fresh[N]:+.2e}" for N in fresh) + (" (corrected)" if corr else " (raw S_L compared, <= band/4)"))
+        ok = all(abs(gap[N]) <= band[N] for N in gap) and abs(gap[30]) < abs(gap[15])
+        return ok, txt, gap
+
+    ok, txt, gap = gaps("vw_")
+    line("G1.8", ok, "foam + viscous work: " + txt)
+    oks, txts, gaps_stock = gaps("")
+    out["G1.8 stock"] = {"pass": bool(oks), "gap": gaps_stock, "gated": False}
+    L.append(f"       stock reactingFoam (no viscous work, stated model gap, not gated): {txts}")
+    try:        # the finite-Mach oracle at the exact fresh state (Tu, p0), ~3 s
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+        from mach_flame_oracle import solve as _mach
+        o1, o0 = _mach(M, 1)[0], _mach(M, 0)[0]
+        out["G1.8 oracle"] = {"S_work": o1, "S_none": o0}
+        L.append(f"       finite-Mach oracle (Tu, p0): S {o1:.7f} with viscous work (S_inf - it {sinf - o1:+.2e}), "
+                 f"{o0:.7f} without; difference {o1 - o0:+.3e} = {(o1 - o0) / (g * M * M * (sig - 1)):.3f} "
+                 f"gamma M^2 (sigma - 1)")
+    except (ImportError, SystemExit) as e:
+        L.append(f"       finite-Mach oracle: not evaluated ({e})")
     sc = _sl(st["runs"]["foam_mclin_c15"]) - sd[15]
     out["G1.8 control"] = {"fails": abs(sc) >= G12_CONTROL, "value": sc}
     L.append(f"       control (stock Le 1.39, foam 15): gap {sc:+.4f} "

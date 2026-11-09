@@ -264,9 +264,60 @@ BUOY = r"""buoyancyWork
 """
 
 
-def fv_options(case, solved, le1=True, buoyancy_work=False):
+# The viscous work div(tau . u) on the sensible enthalpy (issues.md N21): reactingFoam's
+# EEqn.H (h + K, -dpdt, laplacian(alphaEff, he), Qdot) carries none; dns' total energy
+# flux carries u_f . (tau_f . S) (dns/fvflux.hpp fvMeanFlux). The same face expression:
+# tau_f = muEff_f (g + g^T - 2/3 tr(g) I), g = the interpolated cell gradient with its
+# normal component replaced by snGrad (dns' AlongD face gradient on an orthogonal
+# mesh), dotted with the mean face U; summed over faces / V. Explicit, RHS.
+VISCW = r"""viscousWork
+{
+    type            scalarCodedSource;
+    selectionMode   all;
+    fields          (h);
+    name            viscousWork;
+    codeInclude
+    #{
+        #include "turbulentFluidThermoModel.H"
+        #include "fvc.H"
+    #};
+    codeOptions
+    #{
+        -I$(LIB_SRC)/finiteVolume/lnInclude \
+        -I$(LIB_SRC)/meshTools/lnInclude \
+        -I$(LIB_SRC)/TurbulenceModels/turbulenceModels/lnInclude \
+        -I$(LIB_SRC)/TurbulenceModels/compressible/lnInclude \
+        -I$(LIB_SRC)/thermophysicalModels/basic/lnInclude \
+        -I$(LIB_SRC)/transportModels/compressible/lnInclude
+    #};
+    codeLibs
+    #{
+        -lfiniteVolume -lmeshTools -lturbulenceModels -lcompressibleTurbulenceModels -lfluidThermophysicalModels
+    #};
+    codeAddSup
+    #{
+        FatalErrorInFunction << "viscousWork: rho form only" << exit(FatalError);
+    #};
+    codeAddSupRho
+    #{
+        const auto& turb = mesh_.lookupObject<compressible::turbulenceModel>(turbulenceModel::propertiesName);
+        const auto& U = mesh_.lookupObject<volVectorField>("U");
+        const surfaceVectorField n(mesh_.Sf()/mesh_.magSf());
+        surfaceTensorField g(fvc::interpolate(fvc::grad(U)));
+        g += n*(fvc::snGrad(U) - (n & g));
+        const surfaceSymmTensorField tau(fvc::interpolate(turb.muEff())*(twoSymm(g) - (2.0/3.0)*I*tr(g)));
+        const surfaceScalarField w((tau & mesh_.Sf()) & fvc::interpolate(U));
+        eqn += fvc::surfaceIntegrate(w);
+    #};
+    codeCorrect #{ #};
+    codeConstrain #{ #};
+}
+"""
+
+
+def fv_options(case, solved, le1=True, buoyancy_work=False, visc_work=False):
     body = (LE1 % {"fields": " ".join(solved)} if le1 else "") + \
-        (BUOY if buoyancy_work else "")
+        (BUOY if buoyancy_work else "") + (VISCW if visc_work else "")
     if body:
         put(case, "system/fvOptions", body)
 

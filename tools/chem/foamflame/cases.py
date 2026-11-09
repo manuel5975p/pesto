@@ -257,6 +257,55 @@ CASES = {
         },
         "si": {"Tu": 300.0, "p0": 101325.0, "W": 28.014, "dD": 1e-4},
     },
+    # issues.md N21: fv1d_mn's foam rungs with the viscous work div(tau . u) added to the
+    # enthalpy equation (writer.VISCW; stock reactingFoam's EEqn.H has none, dns' E carries it)
+    "fv1d_mn_vw": {
+        "title": "fv1d_mn, reactingFoam + viscous work div(tau . u) (N21, G1.8)",
+        "geometry": "poly1d",
+        "model": {"sigma": 5.0, "beta": 8.0, "Pr": 0.72, "mach": 0.042},
+        "species": ["F", "P"],
+        "reactions": ["F = P"],
+        "box": {"upstream": 12, "downstream": 10, "sink": 16},
+        "ny": 4,
+        "mesh_root": "poly1d_mesh",
+        "inflow": 0.98,
+        "tt": 14.0,
+        "window": (7.0, 14.0),
+        "ladder": [15, 30],
+        "dns_ladder": [],
+        "profile_dt": 0.1,
+        "foam_write_dt": 0.5,
+        "dns": ["--fv-precision", "fp64", "--shock", "hll"],
+        "foam": {
+            "dt": 1e-3, "n_outer": 3, "n_corr": 2,
+            "variants": {"mclin": {"yscheme": "MUSCL", "hscheme": "linear", "visc_work": True}},
+        },
+        "si": {"Tu": 300.0, "p0": 101325.0, "W": 28.014, "dD": 1e-4},
+    },
+    # the same at P1's M 0.01 (fv1d's dns ladder)
+    "fv1d_vw": {
+        "title": "fv1d, reactingFoam + viscous work div(tau . u) (N21, P1's M 0.01)",
+        "geometry": "poly1d",
+        "model": {"sigma": 5.0, "beta": 8.0, "Pr": 0.72, "mach": 0.01},
+        "species": ["F", "P"],
+        "reactions": ["F = P"],
+        "box": {"upstream": 12, "downstream": 10, "sink": 16},
+        "ny": 4,
+        "mesh_root": "poly1d_mesh",
+        "inflow": 0.98,
+        "tt": 14.0,
+        "window": (7.0, 14.0),
+        "ladder": [15, 30],
+        "dns_ladder": [],
+        "profile_dt": 0.1,
+        "foam_write_dt": 0.5,
+        "dns": ["--fv-precision", "fp64"],
+        "foam": {
+            "dt": 1e-3, "n_outer": 3, "n_corr": 2,
+            "variants": {"mclin": {"yscheme": "MUSCL", "hscheme": "linear", "visc_work": True}},
+        },
+        "si": {"Tu": 300.0, "p0": 101325.0, "W": 28.014, "dD": 1e-4},
+    },
     "G2a": {
         "title": "2D slot Bunsen, burnt coflow (docs/chem.md 2D slot Bunsen)",
         "geometry": "bunsen2d",
@@ -1327,7 +1376,8 @@ def write_foam_poly1d(spec, N, st, oracle, si, case):
     writer.thermo_files(case, si, sp, {sp[0]: si["q"]})
     writer.reactions_file(case, sp, [(eq, si["A"], si["Ta"]) for eq in spec["reactions"]])
     writer.chemistry_files(case, integrate=st.get("integrate", False))
-    writer.fv_options(case, sp[:-1], le1=st.get("le1", True))
+    writer.fv_options(case, sp[:-1], le1=st.get("le1", True),
+                      visc_work=st.get("visc_work", False))
     writer.schemes(case, st["yscheme"], st["hscheme"], sp)
     writer.solution(case, st["n_outer"], st["n_corr"])
     tau = si["tau"]
