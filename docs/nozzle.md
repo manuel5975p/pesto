@@ -362,6 +362,21 @@ the twin at that Re* read 0.9990733, dCd with it +3.1e-7.
 trend to read. G4.6 mdot at 30 (+2.1e-5, k 1) is its storage term over ONE period: the k-1 window's ring residual
 (contraction storage -1.7e-5), 5x under the band. The 30-cell rung closes N13 (G4.5 at 30 evaluated) and N16 (G4.1).
 
+**The gamma 1.2 row (G4.9 = G4.1-G4.6 at gamma 1.2, K7)**: 1D 15-cell hll at gamma 1.2, M 0.042 (the poly1d c15 mesh,
+[7, 14]): S_L 0.9982783 (G3.5 reproduced), fresh p 472.595, T 472.442; `design --gamma 1.2 --cells 15 --sl 0.9982783`
+(eps_c 6.294448557148318); `modes`: P 22.802 / e-fold 35.73, t_e 39.973. Flame tt 140 compensated (429 s); fit P 22.438 /
+e-fold 33.71, k 4, W [50.255, 140]. Twin `reacttwin 4680 6.294448557148318 736.6472072284014 0.010032027478420226 80 1.2`
+(140 s): Cd 0.9992640439, CfVac 1.4631090715 (the gamma-1.2 closed oracle 1.4657471: viscous loss -2.6e-3).
+
+| gate | gamma 1.2, 15 cells, W | band |
+|---|---|---|
+| G4.1 / G4.1f | 1.54e-16; 0.97 | 1e-12 / 1e-13, 4 |
+| G4.2 / G4.3 / G4.4 | +2.08e-5 / -7.32e-6 / -9.21e-7, fuel 0.0 | 5e-4 / 2e-3 S_L / 1e-4, 1e-8 |
+| G4.5 dCd (throat flux) / dCf | +8.31e-7 (exit -1.42e-7) / +8.54e-7 | 1e-4 |
+| G4.6 p0b / mdot | +8.07e-7 / -1.276e-6 = burn -3.57e-7 + storage -9.19e-7 | 4.9e-4 / 1e-4 |
+| G4.8 / G4.11 / G4.12 a, b | 0 on 6786 rows / P -1.6%, e-fold -5.7% / +1.28e-10, -8.38e-5 | 0 / 3%, 15% / 1e-6, 3e-4 |
+| control (A25): CfBvac 1.4631099 vs the gamma-1.4 oracle 1.4576001 | +5.51e-3 (fails as required; the plan's 8.1e-3 is the inviscid oracles' difference, the run carries the viscous loss) | >= 1e-3 |
+
 Controls, the old-IC q15 (plain FP64) through the same report, fail where stated: G4.1f 9.79e-13 (> 1e-13), legacy
 mdot -2.20e-4 / -2.10e-4, G4.12 a +1.709e-3, b -7.08e-4. On the legacy windows the fixed IC leaves only the ring's phase
 (contraction storage +5.7e-5 / +3.6e-5, its 10-tau bins +-5e-4 at t 10-20 decaying to +7e-6 at 130-140): a window of

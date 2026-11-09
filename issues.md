@@ -2754,6 +2754,13 @@ G4.7, G4.8 PASS at 15 cells; at 30 cells G4.2-G4.4, G4.6 (p0b), G4.8 PASS, G4.1 
   G4.9's dead control ("off >= 4%": 0.56% at eps_e 2) replaced once by "CfBvac vs the gamma-1.4 closed oracle misses by
   >= 1e-3" (expected 8.1e-3), not run. The reactingFoam `transonic yes` scout (G4.10) ran 5 CPU min and did NOT settle:
   t 7.8 of 80 tau, mdotIn 31.13 vs mdotOut 30.64 (1.6% transient); stopped. The 30-cell rung ran (A24).
+  **combclose:** the gamma 1.2 row RAN (K7, 15 cells, compensated, tt 140, W [50.255, 140] k 4): G4.1-G4.6 pass (dCd
+  +8.3e-7, dCf +8.5e-7, mdot -1.3e-6, p0b +8.1e-7, G4.2 +2.1e-5), G4.11/G4.12 pass; control CfBvac vs the gamma-1.4 oracle
+  +5.51e-3 >= 1e-3 fails as required (docs/nozzle.md "The gamma 1.2 row"). eps_c 13.2 CUT BY DECISION (R9): the M^2
+  scaling of the Rayleigh loss is the oracle's closed form and G4.6 p0b holds to 7.5e-4 of it; entry for a later cycle
+  = a 1D hll ladder plus a foam rung at M 0.02. G4.10 is DECOMPOSED (R10): the flame vs reactingFoam (G1.2; G1.8 at M
+  0.042 hll, on foam + viscous work, N21), nozzle + Total + riemann vs rhoCentralFoam (T1), the coupling vs the closed
+  oracle + the inert twin (G4.5/G4.6); an end-to-end foam run is not run (~60-90 CPU min for a ~1e-3 converged number).
 
 combclose (`plans/masterplan_combclose.md`, amendments B1-):
 - N20. **Every plain stage write `ca a + cb b + cr r` with cb = R(2/3) is biased** (masterplan_combclose R12, N16's
