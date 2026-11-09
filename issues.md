@@ -2620,6 +2620,16 @@ P0, the 0D reactor (docs/chem.md "P0: the 0D reactor"; amendments A1–A3):
   is zero. With RKDP45 the constant-pressure reactor matches the cp quadrature to 3.3e-10 (G0.5b):
   the janaf-constant map is exact; a constant-volume foam reference needs another solver.
 
+P1, the 1D flame on one polyMesh (docs/chem.md "P1"; amendments A5–A7): G1.0–G1.7 PASS, every control
+fails as required. Open:
+- N4. **The oracle's fresh-state sensitivity and the measured one disagree.** `Oracle.sens()` (A, Ta, q, cp,
+  lambda fixed) gives dln S/dln T_u = 2.335, dln S/dln p_u = −0.5; docs/fvcomp.md's structured NSCBC pair read
+  ~1.0 per unit ln T at M 0.05 (rho held: 2.335 − 0.5 = 1.84 would be the oracle's). Not resolved; G1.4 passes
+  at either value (δS_fresh ≤ 2.8e-5 vs band/4 ≥ 2.5e-4).
+- N5. **dns − foam on one mesh does not shrink at a clean order** (+1.38e-3, +4.6e-4, +2.3e-4: ratios 3.0, 2.0).
+  Inside G1.2's band at every rung (4× below the smaller own error at 30 cells); the 30-cell gap is of the size
+  of foam's missing viscous work (G1 reading) and of dns' O(M²) Richardson spread. No 60-cell rung (budget).
+
 ## Older open items (details in CLAUDE.md)
 
 - No anchor for the Re800 compressible cases or `sphere_re300_n160_cd`

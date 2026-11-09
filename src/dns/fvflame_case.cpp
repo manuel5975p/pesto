@@ -61,11 +61,13 @@ FvFlameSetup fvFlameSetup(const Case& c, FvBcSpec& spec)
     const PartialPremixModel& burn = burnt.burn;
     const double Tu = c.flameTu, m = c.flameUIn, sig = burnt.sigma;
     const std::array<double, 3> dir = poly ? c.fvBc.dir : std::array<double, 3>{1, 0, 0};
-    // mu = Pr at Tref = Tu: lambda_u = mu cp / Pr = cp (delta_D = 1).
+    // mu = Pr at Tref = Tu: lambda_u = mu cp / Pr = cp (delta_D = 1). --gamma (polyMesh
+    // C0 only, else kGammaAir): one gamma for fresh and burnt gas, q = cp(gamma) (sigma - 1) Tu.
+    const double gam = c.fvGamma;
     FvFlameSetup s{.burnt = burnt,
-                   .gas = Transport::air(c.prandtl, Tu, c.tinfK, c.prandtl, kGammaAir, kRgasBox, c.sutherland),
+                   .gas = Transport::air(c.prandtl, Tu, c.tinfK, c.prandtl, gam, kRgasBox, c.sutherland),
                    .chem = {},
-                   .fs = {.rho = 1.0, .U = m, .p = Tu, .T = Tu, .gamma = kGammaAir, .dir = dir,
+                   .fs = {.rho = 1.0, .U = m, .p = Tu, .T = Tu, .gamma = gam, .dir = dir,
                           .pBurnt = Tu - m * m * (sig - 1), .tBurnt = sig * Tu},
                    .fl = {}};
     s.chem = FvChem{.nY = 1,
@@ -88,7 +90,7 @@ FvFlameSetup fvFlameSetup(const Case& c, FvBcSpec& spec)
             if (p.kind == FvPatchKind::Outflow) p.y = {rich ? burn.yFrem() : 0.0, rich ? 0.0 : burn.yOrem(), 0, 0};
         }
     }
-    s.fl = FvFlameSpec{.dir = dir, .Tu = Tu, .sigma = sig, .dth = c.flameEig.dthOverDD, .gamma = kGammaAir,
+    s.fl = FvFlameSpec{.dir = dir, .Tu = Tu, .sigma = sig, .dth = c.flameEig.dthOverDD, .gamma = gam,
                        .Rgas = kRgasBox, .q = s.chem.q, .fuel = 0,
                        .yBurnt = c.flamePremix2 && burn.phi > 1 ? burn.yFrem() : 0.0};
     return s;

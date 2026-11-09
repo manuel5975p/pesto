@@ -309,7 +309,8 @@ std::expected<RawConfig, CliError> parse(int argc, char** argv)
              {"--wall-limit", &c.wallLimit}, {"--restart", &c.restart},
              {"--chem-dt", &c.chemDt}, {"--rim", &c.rim},
              {"--tube-length", &c.tubeLength}, {"--rim-temp", &c.rimTemp},
-             {"--si-delta-d", &c.siDeltaD}, {"--si-sl", &c.siSL}});
+             {"--si-delta-d", &c.siDeltaD}, {"--si-sl", &c.siSL},
+             {"--gamma", &c.gamma}});
     if (c.sub == Subcommand::Flame) // --mode chamber (validator scopes them)
         add({{"--inject-speed", &c.chamber.injectSpeed},
              {"--coflow", &c.chamber.coflow},
@@ -1850,6 +1851,9 @@ and --mode diffusion, model C1).
   --fv-precision P     fp32 | fp64 (fv path).                          [fp32]
   --compensated        the FP32 two-word state (fv path). Plain FP32 reads S_L
                        5e-4 low at M 0.01; --compensated matches FP64.
+  --gamma G            premixed C0 with --polymesh only: one constant gamma for
+                       fresh AND burnt gas (calorically perfect, frozen);
+                       Tu = 1/(G M^2), q = cp(G) (sigma - 1) Tu.          [1.4]
   --frame-box, --frame-n  the frame plane (fv path; docs/fvcomp.md).
   Every other flag of the structured flame is rejected by name there.
   --physics lowmach --solver fv | --polymesh DIR --bc FILE: the planar flame on the

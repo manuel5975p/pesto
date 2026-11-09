@@ -499,10 +499,16 @@ std::string Case::describeCase() const
                                      premixLaw.n > 0 ? "C2b" : "C2", premix.s, premix.phi, b.phi, b.yF1(), b.yO1(),
                                      b.phi > 1 ? b.yFrem() : 0.0, b.phi > 1 ? 0.0 : b.yOrem(), premix.sigmaAt(b.phi));
         }
-        return std::format("dns flame: premixed, FV path, polyMesh {}\n  flame      sigma {:g} beta {:g} Pr {:g} M {:g}, "
+        // --gamma: named only off 1.4 (Lambda is gamma-free; Tu and q carry it).
+        const std::string gam =
+            fvGamma != kGammaAir
+                ? std::format(" gamma {:g} (fresh AND burnt gas, frozen; Tu {:.10g}, q/(cp Tu) {:g})", fvGamma,
+                              flameTu, flameModel.sigma - 1)
+                : std::string();
+        return std::format("dns flame: premixed, FV path, polyMesh {}\n  flame      sigma {:g} beta {:g} Pr {:g} M {:g}{}, "
                            "Lambda {:.10g}, delta_th/delta_D {:.6g}\n{}  run        tt {:g}, cfl {:g}, {}{}, x_f at s = {:g} "
                            "from the origin, u_in {:g}\n  output     {}\n{}",
-                           fvMeshDir, flameModel.sigma, flameModel.beta, prandtl, mach, flameEig.Lambda,
+                           fvMeshDir, flameModel.sigma, flameModel.beta, prandtl, mach, gam, flameEig.Lambda,
                            flameEig.dthOverDD, premixText, tEnd, cfl, fvPrecisionName(fvPrecision),
                            compensated ? " compensated" : "", flameXf0, flameUIn, outPrefix, fvBc.describe());
     }

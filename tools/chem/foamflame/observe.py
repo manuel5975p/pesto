@@ -35,13 +35,14 @@ from . import cases, writer
 PROFILE_HALF = 5.0      # delta_th, the L-infinity window
 BURNT = (2.5, 3.5)      # delta_th behind x_f: the burnt state the flame makes
 BURNT_FAR = (8.0, 9.0)  # ... and 6 delta_th further (dns heats there, below)
+BURNT_G17 = (3.0, 5.0)  # masterplan_combnozzle G1.7: the burnt T offset's window
 
 
 # --- loading ------------------------------------------------------------------
 
 def _csv(path):
     with open(path) as f:
-        r = csv.reader(f)
+        r = csv.reader(l for l in f if not l.startswith("#"))   # the FV label line
         head = next(r)
         rows = np.array([[float(v) for v in row] for row in r])
     return {h: rows[:, k] for k, h in enumerate(head)}
@@ -55,11 +56,78 @@ def load_dns(rundir):
         k = pr["t"] == t
         dumps.append((t, {q: pr[q][k] for q in ("x", "T", "rho", "u", "p", "Y",
                                                 "omega")}))
-    return {"series": {"t": st["t"], "SL": st["SL"]}, "dumps": dumps,
-            "stats": st}
+    ser = {"t": st["t"], "SL": st["SL"]}
+    for q, col in (("TRef", "TFresh"), ("pRef", "pFresh")):   # the FV runner's reference slab
+        if col in st:
+            ser[q] = st[col]
+    return {"series": ser, "dumps": dumps, "stats": st}
+
+
+def _probe(rundir, f):
+    """OpenFOAM probes file: (time, values (n_t, n_probes))."""
+    a = np.atleast_2d(np.loadtxt(os.path.join(rundir, "postProcessing/ref/0", f)))
+    return a[:, 0], a[:, 1:]
+
+
+def load_foam_poly(rundir, si, m, species):
+    """poly1d: FvFlameProbe's slabs restated (dns/fvflame.cpp): a cell's slab
+    = floor(C.dir / h) from the low end (0/C of writeCellCentres), slab means
+    of equal-volume cells: T, rho = p/(R T), u, p, omega; Y = mean(rho Y) /
+    mean(rho). S_L = burn / (A rho Y_ref), A = ly x depth, rho Y_ref the
+    reference slab's mean over its ny probes (probes 0..ny-1); SL_g1 the same
+    over G1's column (probes ny..2ny-1, G1.0). TRef, pRef: the slab's T, p."""
+    tau, dD, ny = si["tau"], si["dD"], m["ny"]
+    C = writer.read_vector(os.path.join(rundir, "0", "C"))
+    xs = C[:, 0] / dD
+    k = np.clip(np.floor(xs / m["h"]).astype(int), 0, m["nx"] - 1)
+    cnt = np.bincount(k, minlength=m["nx"]).astype(float)
+    mean = lambda f: np.bincount(k, weights=f, minlength=m["nx"]) / cnt
+    dumps = []
+    for d in glob.glob(os.path.join(rundir, "[0-9]*")):
+        t = float(os.path.basename(d))
+        if t <= 0 or not os.path.exists(os.path.join(d, "Qdot")):
+            continue
+        T = writer.read_scalar_field(os.path.join(d, "T"))
+        p = writer.read_scalar_field(os.path.join(d, "p"))
+        u = writer.read_vector_x(os.path.join(d, "U"))
+        Y = writer.read_scalar_field(os.path.join(d, species[0]))
+        Q = writer.read_scalar_field(os.path.join(d, "Qdot"))
+        rho = p / (si["R"] * T)            # hePsiThermo: rho = psi p
+        rs = mean(rho)
+        dumps.append((t / tau, {
+            "x": mean(xs), "T": mean(T) / si["TUnit"], "rho": rs / si["rho_u"],
+            "u": mean(u) / si["SL"], "p": mean(p) / si["pUnit"], "Y": mean(rho * Y) / rs,
+            "omega": mean(Q) / si["q"] / si["omegaUnit"]}))
+    dumps.sort(key=lambda d: d[0])
+    b = np.loadtxt(os.path.join(rundir, "postProcessing/burn/0/volFieldValue.dat"))
+    _, rho = _probe(rundir, "rho")
+    _, F = _probe(rundir, "F")
+    _, Tp = _probe(rundir, "T")
+    _, pp = _probe(rundir, "p")
+    n = min(len(b), len(rho), len(F))
+    area = m["ly"] * m["depth"] * dD * dD
+    ry = (rho[:n] * F[:n])
+    SL = b[:n, 1] / si["q"] / area / ry[:, :ny].mean(axis=1) / si["SL"]
+    SLg1 = b[:n, 1] / si["q"] / area / ry[:, ny:2 * ny].mean(axis=1) / si["SL"]
+    wall = None
+    wf = os.path.join(rundir, "wall.txt")
+    if os.path.exists(wf):
+        wall = float(open(wf).read().split()[0])
+    clock = None
+    log = os.path.join(rundir, "log.reactingFoam")
+    if os.path.exists(log):
+        for line in open(log):
+            if line.startswith("ExecutionTime"):
+                clock = (float(line.split()[2]), float(line.split()[6]))
+    return {"series": {"t": b[:n, 0] / tau, "SL": SL, "SL_g1": SLg1,
+                       "TRef": Tp[:n, :ny].mean(axis=1) / si["TUnit"],
+                       "pRef": pp[:n, :ny].mean(axis=1) / si["pUnit"]},
+            "dumps": dumps, "wall": wall, "exec_clock": clock}
 
 
 def load_foam(rundir, si, m, species):
+    if "ly" in m:                          # poly1d (mesh_poly1d)
+        return load_foam_poly(rundir, si, m, species)
     tau, dD = si["tau"], si["dD"]
     dumps = []
     for d in glob.glob(os.path.join(rundir, "[0-9]*")):
@@ -103,9 +171,13 @@ def load_foam(rundir, si, m, species):
 
 # --- per-profile measures (gpu/runner_flame.hip measure()) ---------------------
 
+def gamma_of(spec):
+    return spec["model"].get("gamma", 1.4)
+
+
 def measure(prof, spec, o, m):
     sigma = o.sigma
-    Tu = 1.0 / (1.4 * spec["model"]["mach"] ** 2)
+    Tu = 1.0 / (gamma_of(spec) * spec["model"]["mach"] ** 2)
     Tmid = 0.5 * (Tu + sigma * Tu)
     dTf = (sigma - 1) * Tu
     T, h = prof["T"], m["h"]
@@ -124,6 +196,7 @@ def measure(prof, spec, o, m):
     xi = (prof["x"] - xf) / o.dth
     bw = (xi >= BURNT[0]) & (xi <= BURNT[1])
     fw = (xi >= BURNT_FAR[0]) & (xi <= BURNT_FAR[1])
+    w35 = (xi >= BURNT_G17[0]) & (xi <= BURNT_G17[1])
     pb, rb = prof["p"][bw].mean(), prof["rho"][bw].mean()
     SLp = prof["omega"].sum() * h / ry
     dp = prof["p"][i] - pb
@@ -132,6 +205,7 @@ def measure(prof, spec, o, m):
     return {"xf": xf, "dth": dTf / peak, "SL": SLp,
             "Tb": prof["T"][bw].mean() / (sigma * Tu),
             "Tb_far": prof["T"][fw].mean() / (sigma * Tu),
+            "Tb35": prof["T"][w35].mean() / (sigma * Tu),
             "Tmax": T.max() / (sigma * Tu),
             "dp_lowMach": dp / (sigma - 1), "dp_RH": dp / rh,
             "uRef": prof["u"][i],
@@ -141,12 +215,12 @@ def measure(prof, spec, o, m):
             "_far": tuple(prof[q][fw].mean() for q in ("T", "u", "Y"))}
 
 
-def enthalpy_defect(mm, uf, sigma, Tu, key="_b"):
+def enthalpy_defect(mm, uf, sigma, Tu, key="_b", gamma=1.4):
     """(H_b - H_u)/q in the frame of the flame (lab speed uf), H = cp T +
-    u_rel^2/2 + q Y, cp = 3.5: exactly 0 between plateaus for a conservative
-    scheme on a steadily moving flame (heat, viscous and diffusive fluxes
-    vanish there; viscous work drops out too)."""
-    cp = 3.5
+    u_rel^2/2 + q Y, cp = gamma/(gamma - 1) (3.5 at 1.4): exactly 0 between
+    plateaus for a conservative scheme on a steadily moving flame (heat,
+    viscous and diffusive fluxes vanish there; viscous work drops out too)."""
+    cp = gamma / (gamma - 1)
     q = cp * (sigma - 1) * Tu
     (Tu_, uu, Yu), (Tb, ub, Yb) = mm["_ref"], mm[key]
     Hu = cp * Tu_ + 0.5 * (uu - uf) ** 2 + q * Yu
@@ -161,7 +235,7 @@ def _oracle_cols(o, xi_dD, uin):
 
 
 def _solver_cols(prof, o, spec, uin):
-    Tu = 1.0 / (1.4 * spec["model"]["mach"] ** 2)
+    Tu = 1.0 / (gamma_of(spec) * spec["model"]["mach"] ** 2)
     th = (prof["T"] - Tu) / ((o.sigma - 1) * Tu)
     return {"theta": th, "Y": prof["Y"], "u": (prof["u"] - uin) / (o.sigma - 1),
             "omega": prof["omega"]}
@@ -209,14 +283,15 @@ def linf_pair(pa, xa, pb, xb, o, spec):
 
 # --- per run ------------------------------------------------------------------
 
-def _window(ser, win):
-    t, v = ser["t"], ser["SL"]
+def _window(ser, win, key="SL"):
+    t, v = ser["t"], ser[key]
     a, b = win
     mid = 0.5 * (a + b)
     k = (t >= a) & (t <= b)
     return {"mean": float(v[k].mean()),
             "half1": float(v[(t >= a) & (t <= mid)].mean()),
-            "half2": float(v[(t > mid) & (t <= b)].mean()), "n": int(k.sum())}
+            "half2": float(v[(t > mid) & (t <= b)].mean()), "n": int(k.sum()),
+            "span": float(v[k].max() - v[k].min())}
 
 
 def summarize(run, spec, o, m):
@@ -225,6 +300,9 @@ def summarize(run, spec, o, m):
     ms = [measure(p, spec, o, m) for _, p in ds]
     li = [linf_oracle(p, mm["xf"], o, spec) for (_, p), mm in zip(ds, ms)]
     out = {"SL_series": _window(run["series"], win), "ndumps": len(ds)}
+    for key in ("SL_g1", "TRef", "pRef"):      # poly1d: G1.0, the fresh state (G1.4)
+        if key in run["series"]:
+            out[key + "_series"] = _window(run["series"], win, key)
     for key in ms[0]:
         if not key.startswith("_"):
             out[key] = float(np.mean([mm[key] for mm in ms]))
@@ -234,12 +312,13 @@ def summarize(run, spec, o, m):
     out["linf_oracle_max"] = {q: float(np.max([l[q] for l in li])) for q in li[0]}
     uf = (ms[-1]["xf"] - ms[0]["xf"]) / (ds[-1][0] - ds[0][0])
     out["xf_drift"] = float(uf)
-    Tu = 1.0 / (1.4 * spec["model"]["mach"] ** 2)
-    hd = [enthalpy_defect(mm, uf, o.sigma, Tu) for mm in ms]
+    g = gamma_of(spec)
+    Tu = 1.0 / (g * spec["model"]["mach"] ** 2)
+    hd = [enthalpy_defect(mm, uf, o.sigma, Tu, gamma=g) for mm in ms]
     out["H_defect"] = float(np.mean(hd))
     out["H_defect_std"] = float(np.std(hd))
     out["H_defect_far"] = float(np.mean(
-        [enthalpy_defect(mm, uf, o.sigma, Tu, "_far") for mm in ms]))
+        [enthalpy_defect(mm, uf, o.sigma, Tu, "_far", gamma=g) for mm in ms]))
     return out, ds, ms
 
 
@@ -252,20 +331,33 @@ def order(q):
     return {"p": p, "rich": c + (c - b) / (2 ** p - 1), "rich2": c + (c - b) / 3}
 
 
-def compare(spec, o, si, root, dns_names, foam_runs):
+def model_of(argv):
+    """The model flags a dns argv overrides (a twin's --mach, --gamma)."""
+    ov = {}
+    for flag, key in (("--mach", "mach"), ("--gamma", "gamma")):
+        if flag in argv:
+            ov[key] = float(argv[argv.index(flag) + 1])
+    return ov
+
+
+def compare(spec, o, si, root, dns_runs, foam_runs):
+    """dns_runs: (name, N, argv) -- a twin is measured at its own --mach,
+    --gamma (the nominal oracle otherwise: the flag-form mutation of G1.7)."""
     res = {"case": spec["title"], "Lambda": o.Lambda, "dth_oracle": o.dth,
            "si": si, "runs": {}, "pairs": {}}
     raw = {}
     geo = cases.GEOMETRY[spec["geometry"]][0]
-    for name, N in zip(dns_names, spec["ladder"]):
+    for name, N, argv in dns_runs:
         d = os.path.join(root, name)
         if not os.path.exists(os.path.join(d, "flame_stats.csv")):
             continue
         m = geo(spec, N, o.dth)
         run = load_dns(d)
-        s, ds, ms = summarize(run, spec, o, m)
+        ov = model_of(argv)
+        s, ds, ms = summarize(run, {**spec, "model": {**spec["model"], **ov}}, o, m)
         s["N"] = N
         s["solver"] = "dns"
+        s["model"] = ov
         s["dth_stats"] = float(np.mean(run["stats"]["dth"][
             (run["stats"]["t"] >= spec["window"][0])]))
         js = os.path.join(d, "flame.json")
@@ -291,7 +383,14 @@ def compare(spec, o, si, root, dns_names, foam_runs):
         run = load_foam(d, si, m, spec["species"])
         if not run["dumps"]:
             continue
-        s, ds, ms = summarize(run, spec, o, m)
+        try:
+            s, ds, ms = summarize(run, spec, o, m)
+        except IndexError:     # no planar flame in a dump (G1.0's scrambled-IC control): series only
+            res["unmeasured"] = res.get("unmeasured", []) + [name]
+            res["series_only"] = {**res.get("series_only", {}), name: {
+                k + "_series": _window(run["series"], spec["window"], k)
+                for k in run["series"] if k != "t"}}
+            continue
         s.update({"N": N, "solver": "foam", "variant": st["variant"],
                   "dt": st["dt"], "n_outer": st["n_outer"],
                   "scheme": f"Y {st['yscheme']}, h {st['hscheme']}, U linear",
@@ -317,11 +416,14 @@ def compare(spec, o, si, root, dns_names, foam_runs):
                     "n": len(li)}
     # ladders
     lad = {}
-    groups = {"dns": [f"dns_c{N:g}" for N in spec["ladder"]]}
+    dl = spec.get("dns_ladder", spec["ladder"])
+    groups = {"dns": [f"dns_c{N:g}" for N in dl]}
+    for tw in spec.get("twins", []):
+        groups["dns" + tw[1]] = [f"dns_c{N:g}{tw[1]}" for N in dl]
     for v in spec["foam"]["variants"]:
-        groups[f"foam_{v}"] = [f"foam_{v}_c{N:g}" for N in spec["ladder"]]
+        groups[f"foam_{v}"] = [f"foam_{v}_c{N:g}" for N in spec.get("foam_ladder", spec["ladder"])]
     for gname, names in groups.items():
-        if all(n in res["runs"] for n in names):
+        if len(names) == 3 and all(n in res["runs"] for n in names):
             r = [res["runs"][n] for n in names]
             lad[gname] = {
                 "SL": order([x["SL_series"]["mean"] for x in r]),

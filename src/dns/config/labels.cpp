@@ -425,9 +425,13 @@ std::string flameRunLabel(const Case& c)
         model += std::format(", sigma={:g}", c.flameModel.sigma);
     if (c.flameModel.beta != defModel.beta)
         model += std::format(", Zeldovich beta={:g}", c.flameModel.beta);
+    // --gamma (FV polyMesh C0 only): named only off 1.4, so every other label reads as before.
+    const std::string gam = c.fvGamma != kGammaAir
+                                ? std::format(", gamma {:g} for fresh AND burnt gas, frozen", c.fvGamma)
+                                : std::string();
     return std::format(
-        "{} [premixed single-step, calorically perfect, Le=1{}, {}{}] {}{}",
-        kind, model, machText, dim,
+        "{} [premixed single-step, calorically perfect{}, Le=1{}, {}{}] {}{}",
+        kind, gam, model, machText, dim,
         lm ? schemeText
            : std::string("species: MC-limited MUSCL on the central mass flux "
                          "(bounded scalar transport; mean flow central)"),

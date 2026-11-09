@@ -149,7 +149,9 @@ CLAUDE.md is not edited. For the user:
 - "No NSCBC, no sink on a FaceMesh" stands for the flame box. D3 is a mean-flow numerical term on the nozzle route, on by
   default under `hll`; it uses no freestream reference, so it does not justify a sponge.
 - "Mean flow gets NO added dissipation" is RANS's. RANS with `--shock` is refused.
-- "gamma = 1.4 FIXED": `--gamma` on the polyMesh route only, constant, default 1.4.
+- "gamma = 1.4 FIXED": `--gamma` on the polyMesh route only, constant, default 1.4. Since masterplan_combnozzle P1
+  also on `dns flame --polymesh` (compressible premixed C0 only): one gamma for fresh AND burnt gas, frozen; Tu =
+  1/(gamma M^2), q = cp(gamma) (sigma - 1) Tu; Lambda gamma-free. Gate: the burnt T offset (docs/chem.md "P1").
 - "Bit-identical silent `hll` == `none`" is the structured rule; on FV it holds at `--shock-d4 0` only.
 
 ## Proposed CLAUDE.md invariants
@@ -163,5 +165,7 @@ CLAUDE.md is not edited. For the user:
 - **A `wedge` is y = r, sides bit mirrored, w exactly 0**: its side mode is outside the dt.
 - **A nozzle's exit is the half-Riemann row.** `Far` at a subsonic duct exit is a radiating far field (M_e 0.4: p_b/p_a 1.79).
 - **Compressible walls carry no D.**
+- **`--gamma` on FV polyMesh routes is one constant gamma for fresh and burnt gas**; Lambda is gamma-free; the burnt
+  T offset -(sigma^2 - 1)(gamma - 1) M^2/(2 sigma) is its gate (P1 G1.7: D +4.81e-5 / +4.75e-5 vs 4.8e-5).
 - **A foam parity gap is a two-sided number.** In the supersonic cone foam at vanLeer holds p0 to -9.7e-4 at 320 x 64
   and dns to -6.9e-5: the gap is mostly foam's.

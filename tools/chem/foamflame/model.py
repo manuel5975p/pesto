@@ -115,9 +115,11 @@ class Oracle:
     Sutherland). Lambda, dth (delta_th/delta_D) and the profile table in box
     units (x in delta_D, T in Tu, x = 0 at the mid temperature)."""
 
-    def __init__(self, sigma=5.0, beta=8.0, n=20000):
+    def __init__(self, sigma=5.0, beta=8.0, n=20000, theta=None):
+        """theta (Ta/Tu) given: the eigenvalue at that activation, beta ignored
+        (sens() moves Tu with Ta fixed)."""
         self.sigma, self.beta = sigma, beta
-        self.theta = beta * sigma * sigma / (sigma - 1.0)
+        self.theta = beta * sigma * sigma / (sigma - 1.0) if theta is None else theta
         # dns/chem.cpp's bracket: one slow -> fast transition over 2^-60 ..
         # 2^20, then the shipped [lo, 1] / [1, hi] (issues.md 72).
         ks = np.arange(_SCAN[0], _SCAN[1] + 1)
@@ -162,6 +164,20 @@ class Oracle:
         self.G = G / m1
         self.T = T
         self.dth = (sigma - 1) / self.G.max()
+
+    def sens(self, eps=1e-4):
+        """(a_T, a_p) = dln S_L/dln T_u, dln S_L/dln p_u at fixed A, Ta, q, cp,
+        lambda (masterplan_combnozzle R3): central differences +-eps of
+        S^2 = lambda A/(cp rho_u Lambda(Ta/T_u, 1 + q/(cp T_u))), rho_u =
+        p_u/(R T_u). Two eigenvalue solves (~16 s)."""
+        def s(eT, ep):
+            th = self.theta / (1.0 + eT)
+            sg = 1.0 + (self.sigma - 1.0) / (1.0 + eT)
+            lam = self.Lambda if eT == 0.0 else Oracle(sg, self.beta, theta=th).Lambda
+            return math.sqrt(self.Lambda / lam * (1.0 + eT) / (1.0 + ep))
+        aT = (s(eps, 0.0) - s(-eps, 0.0)) / (2 * eps)
+        ap = (s(0.0, eps) - s(0.0, -eps)) / (2 * eps)
+        return aT, ap
 
     def profile(self, xi, Tu=1.0):
         """T(x)/Tu * Tu at x (delta_D, mid temperature at 0); isobaric
@@ -210,25 +226,27 @@ def si_map_diff(md, T0=300.0, p0=101325.0, W=28.014, l=1e-3, gravity=0.0):
 
 
 def si_map(mach, sigma, beta, Pr, Lambda, Tu=300.0, p0=101325.0, W=28.014,
-           dD=1e-4):
+           dD=1e-4, gamma=GAMMA):
     """Box units -> SI, the ONE mapping of the OpenFOAM cases.
     Inputs: flame Mach M = S_L/c_u, sigma, beta, Pr, the oracle Lambda, the
     fresh state (Tu [K], p0 [Pa]), the common molecular weight W [kg/kmol]
-    and the Damkoehler-free length delta_D [m] (sets mu).
+    and the Damkoehler-free length delta_D [m] (sets mu); gamma one constant
+    for fresh and burnt gas (dns flame --gamma: Tu_box = 1/(gamma M^2), cp =
+    gamma R/(gamma - 1); Lambda is gamma-free).
     Box quantity * unit = SI: lengths * dD, times * tau, velocities * SL,
     densities * rho_u, pressures * (p0/p0_box), temperatures * (Tu/Tu_box),
     omega * rho_u/tau, Qdot * rho_u q_SI/tau."""
     R = RR / W
-    cp = GAMMA / (GAMMA - 1) * R
-    cu = math.sqrt(GAMMA * R * Tu)
+    cp = gamma / (gamma - 1) * R
+    cu = math.sqrt(gamma * R * Tu)
     SL = mach * cu
     rho_u = p0 / (R * Tu)
     lam = rho_u * cp * SL * dD
     mu = Pr * lam / cp
     tau = dD / SL
     theta = beta * sigma * sigma / (sigma - 1)
-    TuBox = 1.0 / (GAMMA * mach * mach)
-    return {
+    TuBox = 1.0 / (gamma * mach * mach)
+    si = {
         "W": W, "R": R, "cp": cp, "Tu": Tu, "p0": p0, "rho_u": rho_u,
         "c_u": cu, "SL": SL, "dD": dD, "tau": tau, "mu": mu, "kappa": lam,
         "Pr": Pr, "A": Lambda / tau, "Ta": theta * Tu, "q": cp * (sigma - 1) * Tu,
@@ -237,3 +255,6 @@ def si_map(mach, sigma, beta, Pr, Lambda, Tu=300.0, p0=101325.0, W=28.014,
         "TuBox": TuBox, "pUnit": p0 / TuBox, "TUnit": Tu / TuBox,
         "omegaUnit": rho_u / tau,
     }
+    if gamma != GAMMA:      # the 1.4 maps (G1's si.json) byte for byte
+        si["gamma"] = gamma
+    return si

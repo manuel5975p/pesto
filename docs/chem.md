@@ -1162,6 +1162,52 @@ chemFoam rig (`tools/chem/chemfoam_reactor.py setup|run|compare [--ode S]`, case
   step. The gated runs use RKDP45 (explicit, absTol 1e-14, relTol 1e-10): the reaction is not
   stiff here (J ≤ 7624/τ).
 
+### P1: the 1D flame on ONE polyMesh, dns FV (FP64) and reactingFoam (masterplan_combnozzle, 2026-11-09)
+
+G1's box (12 + 10 δ_th + 2 × 16 cells, h = δ_th/N, u_in 0.98, σ 5, β 8, Pr 0.72, M 0.01) as ONE
+`tools/chem/fv_flame_mesh.py` polyMesh per rung (ny 4, y cyclic, z empty, depth 1 δ_D:
+`runs/flames/foam/poly1d_mesh/c{7.5,15,30}`). dns reads it (`--polymesh --bc`, `--fv-precision
+fp64`, `--upstream 12 + 16/N`); reactingFoam reads the same faces/owner/neighbour, points and
+cyclic separation × δ_D (checkMesh OK, no blockMesh), IC = the oracle at foam's own
+`writeCellCentres`, BCs `foam_bcs_1d` unchanged (fixedValue U, T, Y in; waveTransmissive p out),
+G1's `mclin` schemes, dt 1e-3 τ, 3 × 2 correctors. Window [7, 14] τ for both. Probes = the dns
+`FvFlameProbe` restated (`observe.load_foam_poly`): slab = floor(C.x/h), reference slab
+round(2 δ_th/h) from the low end, S_L = Σ V ω/(A ρY_ref), A = ly × depth. Tooling:
+`foam_flame.py setup|run|compare fv1d|fv1d_stockle|fv1d_g12` (`run fv1d --foam --also
+fv1d_stockle fv1d_g12`: the six foam runs in one CPU job), `foam_flame.py gates`
+(`foamflame/p1gates.py`, `runs/flames/foam/fv1d/gates.txt`). Fresh-state sensitivity
+`Oracle.sens()` (A, Ta, q, cp, λ fixed, ±1e-4 central): a_T = dln S/dln T_u = 2.33532, a_p =
+−0.50000.
+
+| gate | relation | measured | |
+|---|---|---|---|
+| G1.0 | foam on poly1d vs foam G1 blockMesh, 15 cells, G1's column, [7, 14] ≤ 2e-5 | 1.00301311 vs 1.00301311: −1.4e-9 | PASS |
+| G1.0 control | G1's IC laid j fastest on the poly cells must miss | −1.003 (no planar flame) | fails as required |
+| G1.1 | dns S_L − (1 − γM²(σ−1)) order ≥ 1.8; docs/fvcomp.md's box rows within the spans | +1.743e-2, +4.032e-3, +9.966e-4 (2.112, 2.017); vs the box +1.0e-8, +4.3e-7, −4.1e-7 | PASS |
+| G1.2 | \|S_dns − S_foam\| ≤ max(own error vs S_ref) each rung, falling | +1.384e-3, +4.592e-4, +2.341e-4 vs 1.743e-2, 4.032e-3, 9.966e-4 | PASS |
+| G1.2 control | foam stock Le 1.39 (ρD = μ) gap ≥ 0.1 | +0.1342 | fails as required |
+| G1.3 | L∞ θ, Y at x_f, dns vs foam ≤ max own oracle L∞ | θ 1.79e-3 / 3.21e-4 / 1.10e-4 vs 1.04e-2 / 2.15e-3 / 3.63e-4; Y 1.95e-3 / 3.77e-4 / 1.35e-4 vs 5.71e-3 / 1.16e-3 / 2.66e-4 | PASS |
+| G1.4 | δS_fresh = a_T δT_u/T_u + a_p δp_u/p_u ≤ band/4 | +2.8e-5, +1.7e-5, +1.7e-5 vs 4.4e-3, 1.0e-3, 2.5e-4: raw S_L compared | PASS |
+| G1.5 | dns at M_n 0.042: self-convergence order ≥ 1.8 | 1.007853, 0.994837, 0.991887: ratio 4.41, order 2.141; Richardson 0.991021, +9.0e-4 off 1 − γM²(σ−1) (reported) | PASS |
+| G1.6 | γ 1.2: order ≥ 1.8 about 1 − 1.2 M²(σ−1); dns − foam at 15 ≤ max own error | +1.708e-2, +4.057e-3, +1.114e-3 (2.074, 1.865); +2.53e-4 vs 4.06e-3 | PASS |
+| G1.7 | D = [T_b/(σT_u) − 1]_1.2 − [·]_1.4, T_b over [x_f + 3, x_f + 5] δ_th: 4.8e-5 ± 1.2e-5 | +4.809e-5 (15), +4.751e-5 (30) | PASS |
+| G1.7 control | q on cp(1.4) at γ 1.2 (flag form: σ' = 1 + 3.5·4/6, the same q/cp) | D −0.3333 | fails as required |
+
+Readings:
+- **Same mesh, both readers**: foam's 4-row cyclic poly1d run IS its 1-row blockMesh run (1.4e-9
+  in the window mean), so every dns − foam number below is the solvers', not the meshes'.
+- **dns − foam shrinks** (1.38e-3, 4.6e-4, 2.3e-4: ratios 3.0, 2.0, no order claimed) and sits 13×, 9×, 4× below the
+  oracle error; the fresh states differ by 1.7e-5 in S_L (Far vs fixedValue: T_u 7142.91 vs
+  7142.856, p_u equal to 2e-6). foam's converged S_L (G1) 0.99939, dns' Richardson 0.99955.
+- **γ enters only Tu, q, the O(M²) offset and the burnt T offset**: γ 1.2 S_L errors equal γ 1.4's
+  to 2% at 15 cells; the burnt T offset halves (−3.9e-5 / −4.5e-5 vs −8.7e-5 / −9.3e-5).
+- **M_n 0.042 (P4's flame)**: S_L 0.994837 at 15 cells; the Richardson value sits 9.0e-4 above
+  the O(M²) formula (formula error ~1e-3 at M 0.05, docs/fvcomp.md). T_b/(σTu) − 1 −1.67e-3 vs
+  −1.69e-3 [D].
+- Cost: dns 0.211 ms/step (FP64, 1448–5792 cells), 16.6 / 33.2 / 66.1 s at M 0.01, 4.3 / 9.8 /
+  38.7 s at M_n; foam 55 / 104 / 196 s exec (1 core, 14 000 steps), the six side by side in a
+  204 s CPU job.
+
 ## 2D slot-jet diffusion flame (`--mode diffusion`)
 
 `dns/diffusion.{hpp,cpp}` (core: model, Burke–Schumann state, inflow,
@@ -3583,6 +3629,13 @@ virtual upwind difference, identical on a uniform mesh. No NSCBC, no sink: fresh
 burnt `Outflow`. Rotated 30 deg: S_L 5e-8 off planar; sheared 30 deg: order 2.
 Plain FP32 at M 0.01 scatters S_L ~1e-3 on BOTH solvers: quote FV in FP64 or
 `--compensated`.
+
+`--gamma G` (`--polymesh` premixed C0 only; masterplan_combnozzle R7): one constant γ for fresh
+AND burnt gas, calorically perfect, frozen; Tu = 1/(γM²), q = cp(γ)(σ − 1)Tu, Λ γ-free (the
+oracle has no γ). Label `calorically perfect, gamma G for fresh AND burnt gas, frozen`; `.json`
+`"gamma"`; absent or 1.4 = the 1.4 bytes. Refused by name: structured and low-Mach flames (`is
+the compressible FV polyMesh routes'`), `--solver fv` (`needs --polymesh`), `--equivalence`,
+`--les`, `--tfles`, `--mode` other than premixed. Gated in "P1" above (G1.6, G1.7).
 
 LES species and TFLES (`--les --sgs`, `--tfles`, `--tfles-sensor`, `--efficiency`; this
 section's "LES species and the thickened flame") on either route, premixed C0:

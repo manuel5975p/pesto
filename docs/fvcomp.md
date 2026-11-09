@@ -693,7 +693,8 @@ Rejected by name on this route: every `--nscbc-*`, `--turb`,
 `--hold-flame`, `--mode` other than premixed and diffusion (`--equivalence`: "Air-methane"); the mesh
 flags with `--polymesh`. `--les`, `--sgs`, `--tfles`, `--tfles-sensor`, `--efficiency`:
 "Species LES and TFLES" below (premixed only). `--physics lowmach` on this route is `docs/fvincomp.md`
-"Low-Mach". Off it: `--bc`, `--fv-precision`,
+"Low-Mach". `--gamma G` on `--polymesh` (premixed C0 only): one gamma for fresh and burnt gas
+(docs/chem.md "FV path"). Off it: `--bc`, `--fv-precision`,
 `--compensated`, `--frame-*`.
 
 ### Species cross-verification
@@ -715,6 +716,10 @@ oracle's 1.60165 at sigma 5, beta 8, Pr 0.72, M 0.01 unless stated, u_in 0.98.
 | same | same | delta_th | same | 1.55325 vs 1.55488, 1.59115 vs 1.59111, 1.59986 vs 1.59982: -1.6e-3, +3.6e-5, +3.9e-5 |
 | FV `--compensated` vs FV(FP64) | 15 cells | S_L, delta_th, 20 flame times | rounding | 1.003447, 1.003447; 1.59072, 1.59073 |
 | polyMesh reader vs fromCurvMesh | same box through `tools/chem/fv_flame_mesh.py`, FP64 | S_L, delta_th, x_f | bitwise to the printed digits | 1.003447, 1.59073, 20.4096, equal |
+| FV(FP64) polyMesh vs the box row above (G1.1) | poly1d (`fv_flame_mesh.py` ny 4), 7.5 / 15 / 30, [7, 14] | S_L - (1 - gamma M^2 (sigma - 1)) | order 2; the box within its spans | +1.743e-2, +4.032e-3, +9.966e-4 (2.112, 2.017); vs the box +1.0e-8, +4.3e-7, -4.1e-7 |
+| FV(FP64) vs reactingFoam (G1.2, masterplan_combnozzle P1) | the SAME poly1d files, foam mclin (docs/chem.md "P1") | S_L | converged limit: gap below both oracle errors, falling | +1.384e-3, +4.592e-4, +2.341e-4 (own errors 1.74e-2, 4.03e-3, 9.97e-4); fresh-state term 1.7e-5 |
+| FV(FP64) at M 0.042 (G1.5) | poly1d, 7.5 / 15 / 30 | S_L self-convergence | order 2 | 1.007853, 0.994837, 0.991887: order 2.141, Richardson 0.991021 (+9.0e-4 off the O(M^2) formula, reported) |
+| FV(FP64) gamma 1.2 vs 1.4 (G1.6, G1.7) | poly1d, 15 / 30 | T_b/(sigma Tu) - 1 difference over [x_f + 3, x_f + 5] delta_th | +4.8e-5 [D] +- 1.2e-5 | +4.809e-5, +4.751e-5; S_L order 2.074, 1.865 about 1 - 1.2 M^2 (sigma - 1) |
 | rotated 30 deg vs planar | 7.5 / 15 / 30, ny 16 / 32 / 64, FP64 | S_L; delta_th | rounding of the geometry | -5.1e-8, 0, -1.3e-8; +1.2e-5, -1.8e-6, +1.7e-7 |
 | sheared 30 deg (every face non-orthogonal) vs planar | same | S_L | order 2 | -3.50e-3, -9.40e-4, -2.38e-4 (1.89, 1.98) |
 | same | same | delta_th | order 2 | -2.12e-2, -5.38e-3, -1.25e-3 (1.98, 2.11) |

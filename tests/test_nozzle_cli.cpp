@@ -141,6 +141,33 @@ int main()
     refuses("flame --physics lowmach --polymesh " + dataA + " --bc " + bc("lm", "[patch.inlet]\ntype = \"total\"\np0 = 1\nt0 = 1\n") + o, 3,
             "patch.inlet: type = \"total\": a low-Mach inlet has no stagnation state");
     refuses("conv --solver fv --polymesh " + dataA + " --bc " + bcA + " --ny 16 --rayleigh 2e4 --tt 1" + o, 2, "belongs to the nozzle route");
+
+    // --gamma on the flame (masterplan_combnozzle R7): the premixed C0 polyMesh flame only.
+    const std::string flBc = bc("fl", "[patch.inlet]\ntype = \"far\"\ny = [1.0]\n[patch.outlet]\ntype = \"outflow\"\nburnt = "
+                                      "true\n[patch.wall]\ntype = \"slip\"\n[patch.axis]\ntype = \"slip\"\n");
+    const std::string fl = "flame --polymesh " + dataA + " --bc " + flBc + " --upstream 7 --tt 1" + o;
+    Out g = dns(fl + " --gamma 1.2");
+    check(g.rc == 0, "--gamma 1.2 passes on the premixed polyMesh flame");
+    check(g.text.find("calorically perfect, gamma 1.2 for fresh AND burnt gas, frozen, Le=1") != std::string::npos,
+          "the label names gamma 1.2 for fresh and burnt gas");
+    check(g.text.find("M 0.01 gamma 1.2 (fresh AND burnt gas, frozen; Tu 8333.333333, q/(cp Tu) 4)") != std::string::npos,
+          "the dry-run's flame line: Tu = 1/(gamma M^2)");
+    g = dns(fl);
+    check(g.rc == 0 && g.text.find("gamma") == std::string::npos, "no --gamma: no gamma text (the 1.4 bytes)");
+    g = dns(fl + " --gamma 1.4");
+    check(g.rc == 0 && g.text.find("gamma") == std::string::npos, "--gamma 1.4 is the default, bytes and all");
+    refuses("flame --gamma 1.2" + o, 2,
+            "--gamma: is the compressible FV polyMesh routes' (structured and low-Mach flames are gamma 1.4)");
+    refuses("flame --physics lowmach --gamma 1.2" + o, 2,
+            "--gamma: is the compressible FV polyMesh routes' (structured and low-Mach flames are gamma 1.4)");
+    refuses("flame --solver fv --gamma 1.2" + o, 2, "--gamma: needs --polymesh");
+    refuses(fl + " --gamma 1.7", 2, "--gamma: must be in (1, 1.67]");
+    refuses(fl + " --gamma 1", 2, "--gamma: must be in (1, 1.67]");
+    refuses(fl + " --gamma 1.2 --les 0.1", 2, "--gamma: with --les: not built");
+    refuses(fl + " --gamma 1.2 --tfles 2", 2, "--gamma: with --tfles: not built");
+    refuses(fl + " --gamma 1.2 --equivalence 1.3", 2, "--gamma: with --equivalence: not built");
+    refuses("flame --mode diffusion --polymesh " + dataA + " --bc " + flBc + " --gamma 1.2" + o, 2,
+            "--gamma: with --mode other than premixed: not built");
     std::error_code ec;
     fs::remove_all(tmp(), ec);
     return dnstest::finish();

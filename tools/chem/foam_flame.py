@@ -9,6 +9,8 @@ simjob job specs, and the comparison table.
   foam_flame.py run CASE [--dns] [--foam] [--np K] [--only RUN ...]
                                         dns --dry-run, then simjob (GPU / CPU)
   foam_flame.py compare CASE            table + runs/flames/foam/CASE/compare.json
+  foam_flame.py gates                   masterplan_combnozzle P1 (fv1d, fv1d_stockle,
+                                        fv1d_g12 compared first): G1.0-G1.7, controls
 
 Every run goes through the job server (docs/jobs.md): dns as one GPU job
 (one step per rung), OpenFOAM as one CPU job (blockMesh per case, then the
@@ -27,7 +29,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from foamflame import cases, observe  # noqa: E402
-from foamflame.model import Oracle, si_map, si_map_diff  # noqa: E402
+from foamflame.model import GAMMA, Oracle, si_map, si_map_diff  # noqa: E402
 
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 DNS = os.path.join(REPO, "build", "dns")
@@ -63,9 +65,11 @@ def context(name):
         si = si_map_diff(md, gravity=spec["burner"].get("gravity", 0.0),
                          **spec["si"])
         return spec, None, si, os.path.join(ROOT, name)
+    if "mesh_root" in spec:                      # poly1d: the shared mesh dirs
+        spec = {**spec, "_mesh_root": os.path.join(ROOT, spec["mesh_root"])}
     o = oracle_for(md)
     si = si_map(md["mach"], md["sigma"], md["beta"], md["Pr"], o.Lambda,
-                **spec["si"])
+                gamma=md.get("gamma", GAMMA), **spec["si"])
     return spec, o, si, os.path.join(ROOT, name)
 
 
@@ -86,13 +90,14 @@ def dns_runs(spec, root):
     """(run dir, N, argv): the ladder, then the dns twins -- bunsen `twins`
     (label, dir suffix, flags[, flags dropped from the case's argv]) per
     rung, two-reactant `extra_dns` (label, dir, flags) on the first rung."""
+    ladder = spec.get("dns_ladder", spec["ladder"])
     runs = [(f"dns_c{N:g}", N, cases.dns_argv(
         spec, N, os.path.join(root, f"dns_c{N:g}", "flame")))
-        for N in spec["ladder"]]
+        for N in ladder]
     for tw in spec.get("twins", []):
         _, suf, flags = tw[:3]
         drop = tw[3] if len(tw) > 3 else ()
-        for N in spec["ladder"]:
+        for N in ladder:
             d = f"dns_c{N:g}{suf}"
             argv = drop_flags(cases.dns_argv(spec, N, os.path.join(root, d, "flame")),
                               drop)
@@ -102,6 +107,10 @@ def dns_runs(spec, root):
         for _, d, flags in spec.get("extra_dns", []):
             runs.append((d, N, cases.dns_argv(spec, N, os.path.join(root, d, "flame"))
                          + flags.split()))
+    if spec["geometry"] == "poly1d":     # (label, dir, N, flags, flags dropped)
+        for _, d, N, flags, drop in spec.get("extra_dns", []):
+            runs.append((d, N, drop_flags(cases.dns_argv(spec, N, os.path.join(root, d, "flame")),
+                                          drop) + flags.split()))
     return runs
 
 
@@ -110,12 +119,31 @@ def cmd_setup(name):
     os.makedirs(root, exist_ok=True)
     with open(os.path.join(root, "si.json"), "w") as f:
         json.dump(si, f, indent=1)
+    poly = spec["geometry"] == "poly1d"
+    if poly:        # the shared dns mesh dirs (box units), once per rung
+        for N in sorted({r[1] for r in dns_runs(spec, root)} |
+                        {r[1] for r in cases.foam_runs(spec)}):
+            print(f"mesh {cases.write_poly_mesh(spec, N, o.dth)['dir']}")
     for run, N, st in cases.foam_runs(spec):
         case = os.path.join(root, run)
         cases.write_foam(spec, N, st, o, si, case)
         with open(os.path.join(case, "settings.json"), "w") as f:
             json.dump({"N": N, **st}, f, indent=1)
         print(f"foam case {case}")
+    if poly and cases.foam_runs(spec):  # the IC at OpenFOAM's own cell centres
+        steps = []
+        for run, _, _ in cases.foam_runs(spec):
+            case = os.path.join(root, run)
+            os.makedirs(os.path.join(case, "0"), exist_ok=True)
+            steps.append({"exe": os.path.join(FOAM_BIN, "checkMesh"), "args": ["-case", case]})
+            steps.append({"exe": os.path.join(FOAM_BIN, "postProcess"),
+                          "args": ["-case", case, "-func", "writeCellCentres", "-time", "0"]})
+        job = {"label": f"foamflame {name} writeCellCentres", "resource": "cpu",
+               "max_runtime_s": 300, "max_mem_mb": 2048, "cwd": root, "steps": steps}
+        if submit_spec(job, os.path.join(root, "job_centres.json"), True):
+            sys.exit("writeCellCentres failed (job_centres.log)")
+        for run, N, st in cases.foam_runs(spec):
+            cases.write_fields_poly1d(spec, N, st, o, si, os.path.join(root, run))
     for run, N, argv in dns_runs(spec, root):
         os.makedirs(os.path.join(root, run), exist_ok=True)
         with open(os.path.join(root, run, "argv.txt"), "w") as f:
@@ -154,7 +182,9 @@ def submit_spec(job, path, foam_env):
     return p.returncode
 
 
-def cmd_run(name, do_dns, do_foam, np_, only):
+def cmd_run(name, do_dns, do_foam, np_, only, also=()):
+    """also: further poly1d cases whose foam runs join this case's CPU job
+    (one job, every run side by side)."""
     spec, o, si, root = context(name)
     rc = 0
     # a partial run keeps its own job files (the full ladder's stay)
@@ -178,6 +208,10 @@ def cmd_run(name, do_dns, do_foam, np_, only):
         runs = [r for r in cases.foam_runs(spec) if not only or r[0] in only]
         if runs:
             dirs = [os.path.join(root, r[0]) for r in runs]
+            for other in also:
+                if cases.CASES[other]["geometry"] != "poly1d" or spec["geometry"] != "poly1d":
+                    sys.exit("--also joins poly1d cases only")
+                dirs += [os.path.join(ROOT, other, r[0]) for r in cases.foam_runs(cases.CASES[other])]
             solver = ("rhoReactingBuoyantFoam" if spec["geometry"] == "candle2d"
                       else "reactingFoam")
             for r in runs:          # a restarted check starts from its base's field
@@ -187,7 +221,7 @@ def cmd_run(name, do_dns, do_foam, np_, only):
             if spec["geometry"] in cases.DIFF_GEOMS:    # one script per job
                 script = os.path.join(root, f"run_foam{tag}.sh")
             with open(script, "w") as f:
-                if spec["geometry"] == "1d":
+                if spec["geometry"] in ("1d", "poly1d"):
                     f.write(FOAM_SCRIPT.format(np=np_, dirs="\n".join(dirs)))
                 elif spec["geometry"] in cases.DIFF_GEOMS:
                     f.write(FOAM_PAR_SCRIPT_DIFF.format(
@@ -196,8 +230,9 @@ def cmd_run(name, do_dns, do_foam, np_, only):
                 else:
                     f.write(FOAM_PAR_SCRIPT.format(
                         np=spec["foam"].get("np", np_), dirs="\n".join(dirs)))
-            steps = [{"exe": os.path.join(FOAM_BIN, "blockMesh"),
-                      "args": ["-case", d]} for d in dirs]
+            # poly1d: the mesh is the dns polyMesh (copied at setup), no blockMesh
+            steps = [] if spec["geometry"] == "poly1d" else [
+                {"exe": os.path.join(FOAM_BIN, "blockMesh"), "args": ["-case", d]} for d in dirs]
             steps.append({"exe": "/bin/bash", "args": [script],
                           "verify": [{"path": os.path.join(FOAM_BIN, solver)}]})
             job = {"label": f"foamflame {name} foam", "resource": "cpu",
@@ -314,7 +349,7 @@ def cmd_compare(name):
             json.dump(res, f, indent=1)
         print(observejet.table(res))
         return
-    if spec["geometry"] != "1d":
+    if spec["geometry"] not in ("1d", "poly1d"):
         from foamflame import observe2d
         if spec["geometry"] == "bunsen2d":
             tw = spec.get("twins")
@@ -331,27 +366,43 @@ def cmd_compare(name):
             json.dump(res, f, indent=1)
         print(txt)
         return
-    res = observe.compare(spec, o, si, root,
-                          [r[0] for r in dns_runs(spec, root)],
+    res = observe.compare(spec, o, si, root, dns_runs(spec, root),
                           cases.foam_runs(spec))
     with open(os.path.join(root, "compare.json"), "w") as f:
         json.dump(res, f, indent=1)
     print(observe.table(res))
 
 
+def cmd_gates():
+    """masterplan_combnozzle P1: G1.0-G1.7 off the poly1d cases' compare.json."""
+    from foamflame import p1gates
+    _, o, si, root = context("fv1d")
+    res, txt = p1gates.evaluate(ROOT, o, si)
+    with open(os.path.join(root, "gates.json"), "w") as f:
+        json.dump(res, f, indent=1)
+    with open(os.path.join(root, "gates.txt"), "w") as f:
+        f.write(txt + "\n")
+    print(txt)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["list", "setup", "run", "compare"])
+    ap.add_argument("cmd", choices=["list", "setup", "run", "compare", "gates"])
     ap.add_argument("case", nargs="?")
     ap.add_argument("--dns", action="store_true")
     ap.add_argument("--foam", action="store_true")
     ap.add_argument("--np", type=int, default=12)
     ap.add_argument("--only", nargs="*", default=[])
+    ap.add_argument("--also", nargs="*", default=[],
+                    help="run: other poly1d cases' foam runs in the same CPU job")
     a = ap.parse_args()
     if a.cmd == "list":
         for k, v in cases.CASES.items():
             print(f"{k}: {v['title']}")
+        return
+    if a.cmd == "gates":
+        cmd_gates()
         return
     if a.case not in cases.CASES:
         sys.exit(f"unknown case {a.case!r} (foam_flame.py list)")
@@ -359,7 +410,7 @@ def main():
         cmd_setup(a.case)
     elif a.cmd == "run":
         both = not (a.dns or a.foam)
-        cmd_run(a.case, a.dns or both, a.foam or both, a.np, set(a.only))
+        cmd_run(a.case, a.dns or both, a.foam or both, a.np, set(a.only), a.also)
     else:
         cmd_compare(a.case)
 

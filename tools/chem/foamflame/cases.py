@@ -20,6 +20,11 @@ points (`probes_1d`). Add a case = add a dict; a new geometry = those five
 (observe.py's measure() is the 1D measure; a 2D case adds its own).
 """
 import math
+import os
+import re
+import shutil
+import subprocess
+import sys
 
 import numpy as np
 
@@ -63,6 +68,94 @@ CASES = {
                 # Le = 1/Pr = 1.39): what the unityLewis fvOption buys
                 "mclin_sc1": {"base": "mclin", "N": 15, "le1": False},
             },
+        },
+        "si": {"Tu": 300.0, "p0": 101325.0, "W": 28.014, "dD": 1e-4},
+    },
+    # masterplan_combnozzle P1: ONE polyMesh (tools/chem/fv_flame_mesh.py, ny 4,
+    # y cyclic, z empty; G1's box: 12 + 10 delta_th + 2 x 16 cells) read by both
+    # solvers: dns flame --polymesh (FV, FP64) and reactingFoam (the mesh scaled
+    # to SI, no blockMesh). Window [7, 14] tau for both (docs/fvcomp.md's FV rows).
+    "fv1d": {
+        "title": "1D premixed flame on one polyMesh, dns FV FP64 vs reactingFoam "
+                 "(masterplan_combnozzle P1)",
+        "geometry": "poly1d",
+        "model": {"sigma": 5.0, "beta": 8.0, "Pr": 0.72, "mach": 0.01},
+        "species": ["F", "P"],
+        "reactions": ["F = P"],
+        "box": {"upstream": 12, "downstream": 10, "sink": 16},
+        "ny": 4,
+        "mesh_root": "poly1d_mesh",
+        "inflow": 0.98,
+        "tt": 14.0,
+        "window": (7.0, 14.0),
+        "ladder": [7.5, 15, 30],
+        "profile_dt": 0.1,
+        "foam_write_dt": 0.5,
+        "dns": ["--fv-precision", "fp64"],
+        # G1.5: the nozzle's flame Mach (P4's design ladder), dns only
+        "twins": [("dns M_n 0.042", "_mn", "--mach 0.042", ("--mach",))],
+        "foam": {
+            "dt": 1e-3, "n_outer": 3, "n_corr": 2,
+            "variants": {"mclin": {"yscheme": "MUSCL", "hscheme": "linear"}},
+            "checks": {
+                # G1.0's control: G1's blockMesh IC (nx values) laid on the poly
+                # mesh's cells in the wrong order (j fastest)
+                "mclin_icwrong": {"base": "mclin", "N": 15, "ic_order": "repeat"},
+            },
+        },
+        "si": {"Tu": 300.0, "p0": 101325.0, "W": 28.014, "dD": 1e-4},
+    },
+    # G1.2's control: stock reactingFoam species diffusion (rho D = mu, Le 1.39)
+    "fv1d_stockle": {
+        "title": "fv1d, stock reactingFoam Le 1.39 (G1.2's control)",
+        "geometry": "poly1d",
+        "model": {"sigma": 5.0, "beta": 8.0, "Pr": 0.72, "mach": 0.01},
+        "species": ["F", "P"],
+        "reactions": ["F = P"],
+        "box": {"upstream": 12, "downstream": 10, "sink": 16},
+        "ny": 4,
+        "mesh_root": "poly1d_mesh",
+        "inflow": 0.98,
+        "tt": 14.0,
+        "window": (7.0, 14.0),
+        "ladder": [15],
+        "dns_ladder": [],
+        "profile_dt": 0.1,
+        "foam_write_dt": 0.5,
+        "dns": ["--fv-precision", "fp64"],
+        "foam": {
+            "dt": 1e-3, "n_outer": 3, "n_corr": 2,
+            "variants": {"mclin": {"yscheme": "MUSCL", "hscheme": "linear", "le1": False}},
+        },
+        "si": {"Tu": 300.0, "p0": 101325.0, "W": 28.014, "dD": 1e-4},
+    },
+    # G1.6 / G1.7: gamma 1.2 for fresh and burnt gas (dns flame --gamma 1.2;
+    # foam hConst Cp = gamma R/(gamma - 1), waveTransmissive gamma 1.2)
+    "fv1d_g12": {
+        "title": "fv1d at gamma 1.2 (masterplan_combnozzle P1, G1.6 / G1.7)",
+        "geometry": "poly1d",
+        "model": {"sigma": 5.0, "beta": 8.0, "Pr": 0.72, "mach": 0.01, "gamma": 1.2},
+        "species": ["F", "P"],
+        "reactions": ["F = P"],
+        "box": {"upstream": 12, "downstream": 10, "sink": 16},
+        "ny": 4,
+        "mesh_root": "poly1d_mesh",
+        "inflow": 0.98,
+        "tt": 14.0,
+        "window": (7.0, 14.0),
+        "ladder": [7.5, 15, 30],
+        "foam_ladder": [15],
+        "profile_dt": 0.1,
+        "foam_write_dt": 0.5,
+        "dns": ["--fv-precision", "fp64"],
+        # G1.7's control, the mutation "q on cp(1.4) at gamma 1.2" in flag form:
+        # sigma' = 1 + 3.5 (sigma - 1)/6 puts q = cp(1.2)(sigma' - 1) Tu = cp(1.4)
+        # (sigma - 1) Tu exactly (the burnt plateau reads q/cp only); 15 cells
+        "extra_dns": [("dns q on cp(1.4)", "dns_c15_qcp14", 15,
+                       f"--expansion {1 + 3.5 * 4 / 6:.17g}", ("--expansion",))],
+        "foam": {
+            "dt": 1e-3, "n_outer": 3, "n_corr": 2,
+            "variants": {"mclin": {"yscheme": "MUSCL", "hscheme": "linear"}},
         },
         "si": {"Tu": 300.0, "p0": 101325.0, "W": 28.014, "dD": 1e-4},
     },
@@ -490,7 +583,7 @@ def foam_bcs_1d(spec, oracle, si, m):
              "p": zg, sp[0]: writer.bc("fixedValue", 1.0),
              sp[1]: writer.bc("fixedValue", 0.0)}
     outlet = {"U": zg, "T": zg, sp[0]: zg, sp[1]: zg,
-              "p": writer.bc("waveTransmissive", gamma=GAMMA, pInf=pB, lInf=L)}
+              "p": writer.bc("waveTransmissive", gamma=si.get("gamma", GAMMA), pInf=pB, lInf=L)}
     return {"inlet": inlet, "outlet": outlet}
 
 
@@ -657,6 +750,102 @@ def foam_bcs_wrinkle2d(spec, oracle, si, m):
     cyc = {q: cy for q in ("U", "T", "p", sp[0], sp[1])}
     d.update({"lower": cyc, "upper": cyc})
     return d
+
+
+# --- geometry: poly1d (one fv_flame_mesh.py polyMesh, both solvers) ------------
+
+FV_FLAME_MESH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "fv_flame_mesh.py")
+
+
+def mesh_poly1d(spec, N, dth):
+    """G1's box (mesh_1d) as the ny-row polyMesh of tools/chem/fv_flame_mesh.py
+    (y cyclic, z empty, depth 1 delta_D; cell c = i + nx j). iRef =
+    FvFlameProbe's reference slab round(2 delta_th/h) from the low end (no sink
+    band on a mesh: dns/fvflame.cpp finish()); iRefG1 = G1's column (sink +
+    round(2 delta_th/h)), probed for G1.0. dir: the dns mesh directory."""
+    m = mesh_1d(spec, N, dth)
+    ny = spec["ny"]
+    m.update({"ny": ny, "ly": ny * m["h"], "depth": 1.0, "iRefG1": m["iRef"],
+              "iRef": min(m["nx"] - 1, int(round(2 * dth / m["h"]))),
+              "dir": os.path.join(spec["_mesh_root"], f"c{N:g}")})
+    return m
+
+
+def write_poly_mesh(spec, N, dth):
+    """The dns mesh directory (box units) of rung N, written once."""
+    m = mesh_poly1d(spec, N, dth)
+    if not os.path.exists(os.path.join(m["dir"], "bc.toml")):
+        subprocess.run([sys.executable, FV_FLAME_MESH, "--nx", str(m["nx"]), "--ny", str(m["ny"]),
+                        "--lx", f"{m['nx'] * m['h']:.17g}", "--ly", f"{m['ly']:.17g}",
+                        "--depth", f"{m['depth']:.17g}", "--out", m["dir"]],
+                       check=True, capture_output=True)
+    return m
+
+
+_VEC = re.compile(r"\(\s*(\S+)\s+(\S+)\s+(\S+)\s*\)")
+
+
+def copy_poly_mesh(case, m, si):
+    """The dns polyMesh into the foam case, every length (points, cyclic
+    separation vectors) times delta_D [m]; faces, owner, neighbour verbatim."""
+    src = os.path.join(m["dir"], "constant", "polyMesh")
+    dst = os.path.join(case, "constant", "polyMesh")
+    os.makedirs(dst, exist_ok=True)
+    for f in ("faces", "owner", "neighbour"):
+        shutil.copyfile(os.path.join(src, f), os.path.join(dst, f))
+    s = si["dD"]
+    scale = lambda mt: "(" + " ".join(f"{float(v) * s:.17g}" for v in mt.groups()) + ")"
+    with open(os.path.join(src, "points")) as f:
+        lines = f.read().split("\n")
+    out = [_VEC.sub(scale, l) if _VEC.fullmatch(l.strip()) else l for l in lines]
+    with open(os.path.join(dst, "points"), "w") as f:
+        f.write("\n".join(out))
+    with open(os.path.join(src, "boundary")) as f:
+        txt = f.read()
+    txt = re.sub(r"separationVector " + _VEC.pattern,
+                 lambda mt: "separationVector " + scale(mt), txt)
+    with open(os.path.join(dst, "boundary"), "w") as f:
+        f.write(txt)
+
+
+def ic_poly1d(spec, N, oracle, si, cx, order="centres"):
+    """ic_1d (dns premixedState of the oracle at x - x_f0) at the foam cell
+    centres cx [m] (writeCellCentres, along reference.direction = +x). order
+    "repeat": G1.0's control -- the blockMesh row's nx values laid on the
+    poly cells j fastest (np.repeat), the wrong order."""
+    m = mesh_poly1d(spec, N, oracle.dth)
+    if order == "repeat":
+        one = ic_1d(spec, N, oracle, si)
+        return {k: np.repeat(v, m["ny"], axis=0) for k, v in one.items()}
+    t = oracle.profile(np.asarray(cx) / si["dD"] - m["xf0"])["T"]
+    Tu = si["TuBox"]
+    mf = spec["inflow"]
+    p = Tu - mf * mf * (t - 1.0)
+    rho = p / (t * Tu)
+    Y = (oracle.sigma - t) / (oracle.sigma - 1)
+    U = np.zeros((t.size, 3))
+    U[:, 0] = mf / rho * si["SL"]
+    sp = spec["species"]
+    return {"T": t * si["Tu"], "p": p * si["pUnit"], "U": U, sp[0]: Y, sp[1]: 1.0 - Y}
+
+
+def foam_bcs_poly1d(spec, oracle, si, m):
+    """foam_bcs_1d unchanged on the mesh's patches (xlo fresh fixedValue, xhi
+    waveTransmissive) + the cyclic ylo / yhi pair."""
+    d = foam_bcs_1d(spec, oracle, si, m)
+    cy = writer.bc("cyclic")
+    sp = spec["species"]
+    cyc = {q: cy for q in ("U", "T", "p", sp[0], sp[1])}
+    return {"xlo": d["inlet"], "xhi": d["outlet"], "ylo": cyc, "yhi": cyc}
+
+
+def probes_poly1d(m, si):
+    """FvFlameProbe's reference slab (iRef, every row), then G1's column
+    (iRefG1, every row) [m]."""
+    s = si["dD"]
+    return [((i + 0.5) * m["h"] * s, (j + 0.5) * m["h"] * s, 0.5 * m["depth"] * s)
+            for i in (m["iRef"], m["iRefG1"]) for j in range(m["ny"])]
 
 
 # --- geometry: diffusion2d / candle2d (dns flame --mode diffusion | candle) -----
@@ -882,7 +1071,9 @@ GEOMETRY = {"1d": (mesh_1d, ic_1d, foam_bcs_1d, block_1d, probes_1d),
             "diffusion2d": (mesh_diffusion2d, ic_diffusion2d,
                             foam_bcs_diffusion2d, block_diff, no_probes),
             "candle2d": (mesh_diffusion2d, ic_candle2d, foam_bcs_candle2d,
-                         block_diff, no_probes)}
+                         block_diff, no_probes),
+            # IC at the foam cell centres (write_fields_poly1d), mesh copied
+            "poly1d": (mesh_poly1d, None, foam_bcs_poly1d, None, probes_poly1d)}
 
 
 # --- dns ----------------------------------------------------------------------
@@ -915,10 +1106,30 @@ def dns_argv_diff(spec, N, out):
     return a + list(spec["dns"])
 
 
+def dns_argv_poly1d(spec, N, out):
+    """dns flame --polymesh on the rung's mesh directory: --upstream = x_f0 /
+    delta_th = upstream + sink/N (FvFlameProbe from the mesh's low end)."""
+    md, b = spec["model"], spec["box"]
+    d = os.path.join(spec["_mesh_root"], f"c{N:g}")
+    a = ["flame", "--mach", f"{md['mach']:g}", "--expansion", f"{md['sigma']:g}",
+         "--zeldovich", f"{md['beta']:g}", "--prandtl", f"{md['Pr']:g}",
+         "--polymesh", d, "--bc", os.path.join(d, "bc.toml"),
+         "--upstream", f"{b['upstream'] + b['sink'] / N:.17g}",
+         "--inflow-speed", f"{spec['inflow']:g}", "--tt", f"{spec['tt']:g}",
+         "--out", out]
+    if md.get("gamma", GAMMA) != GAMMA:
+        a += ["--gamma", f"{md['gamma']:g}"]
+    if spec.get("profile_dt"):
+        a += ["--profile-dt", f"{spec['profile_dt']:g}"]
+    return a + list(spec["dns"])
+
+
 def dns_argv(spec, N, out):
     md = spec["model"]
     if spec["geometry"] in DIFF_GEOMS:
         return dns_argv_diff(spec, N, out)
+    if spec["geometry"] == "poly1d":
+        return dns_argv_poly1d(spec, N, out)
     a = ["flame", "--mach", f"{md['mach']:g}", "--expansion", f"{md['sigma']:g}",
          "--zeldovich", f"{md['beta']:g}", "--prandtl", f"{md['Pr']:g}",
          "--cells-per-delta", f"{N:g}", "--tt", f"{spec['tt']:g}",
@@ -953,7 +1164,7 @@ def foam_runs(spec):
         base["np"] = f["np"]
     runs = []
     for v, o in f["variants"].items():
-        for N in spec["ladder"]:
+        for N in spec.get("foam_ladder", spec["ladder"]):
             runs.append((f"foam_{v}_c{N:g}", N, {**base, **o, "variant": v}))
     for name, o in f.get("checks", {}).items():
         b = f["variants"][o["base"]]
@@ -1009,9 +1220,42 @@ def write_foam_diff(spec, N, st, si, case):
     return m
 
 
+def write_foam_poly1d(spec, N, st, oracle, si, case):
+    """write_foam on the copied polyMesh, without 0/: the IC needs the cell
+    centres (writeCellCentres, then write_fields_poly1d)."""
+    m = mesh_poly1d(spec, N, oracle.dth)
+    sp = spec["species"]
+    copy_poly_mesh(case, m, si)
+    writer.thermo_files(case, si, sp, {sp[0]: si["q"]})
+    writer.reactions_file(case, sp, [(eq, si["A"], si["Ta"]) for eq in spec["reactions"]])
+    writer.chemistry_files(case, integrate=st.get("integrate", False))
+    writer.fv_options(case, sp[:-1], le1=st.get("le1", True))
+    writer.schemes(case, st["yscheme"], st["hscheme"], sp)
+    writer.solution(case, st["n_outer"], st["n_corr"])
+    tau = si["tau"]
+    writer.control(case, st["dt"] * tau, st.get("tt", spec["tt"]) * tau,
+                   spec["foam_write_dt"] * tau, probes_poly1d(m, si),
+                   precision=spec.get("write_precision", 14))
+    return m
+
+
+def write_fields_poly1d(spec, N, st, oracle, si, case):
+    """0/ from the oracle at the case's 0/C (writeCellCentres)."""
+    m = mesh_poly1d(spec, N, oracle.dth)
+    C = writer.read_vector(os.path.join(case, "0", "C"))
+    if len(C) != m["nx"] * m["ny"]:
+        raise ValueError(f"{case}: 0/C has {len(C)} cells, the mesh {m['nx'] * m['ny']}")
+    ic = ic_poly1d(spec, N, oracle, si, C[:, 0], st.get("ic_order", "centres"))
+    writer.fields_0(case, ic, si, foam_bcs_poly1d(spec, oracle, si, m), spec["species"][:-1],
+                    spec["species"])
+    return m
+
+
 def write_foam(spec, N, st, oracle, si, case):
     if spec["geometry"] in DIFF_GEOMS:
         return write_foam_diff(spec, N, st, si, case)
+    if spec["geometry"] == "poly1d":
+        return write_foam_poly1d(spec, N, st, oracle, si, case)
     mesh_f, ic_f, bcs_f, block_f, probes_f = GEOMETRY[spec["geometry"]]
     m = mesh_f(spec, N, oracle.dth)
     sp = spec["species"]

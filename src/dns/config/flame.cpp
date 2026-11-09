@@ -41,7 +41,9 @@ std::optional<ConfigError> checkFvFlame(const RawConfig& r)
         "--pdt", "--wdt", "--png-down", "--frame-box", "--frame-n", "--frame-start", "--backend", "--quiet", "--dry-run",
         "--fv-precision", "--compensated",
         // M5: runFvComp's and runFvLowMach's checkpoints (gpu_restart_fv: every route).
-        "--checkpoint-dt", "--wall-limit", "--restart"};
+        "--checkpoint-dt", "--wall-limit", "--restart",
+        // gammaScope below keeps it to the compressible premixed C0 polyMesh flame.
+        "--gamma"};
     static const char* const allowedJet[] = {"--stoich", "--fuel-y", "--ox-y", "--damkohler", "--cells-per-unit",
                                              "--slot-width", "--slot-edge", "--coflow-speed", "--coflow-width",
                                              "--pilot-width", "--pilot-speed", "--length", "--ignition"};
@@ -135,6 +137,28 @@ std::optional<ConfigError> checkFvFlame(const RawConfig& r)
     return std::nullopt;
 }
 
+// --gamma (masterplan_combnozzle R7): one constant gamma for fresh AND burnt gas, built
+// on the compressible premixed C0 flame on a polyMesh only; everything else by name.
+std::optional<ConfigError> gammaScope(const RawConfig& r)
+{
+    if (!r.given.contains("--gamma")) return std::nullopt;
+    const bool poly = r.given.contains("--polymesh");
+    if (r.physics == Physics::LowMach || (!poly && r.solver != int(SolverKind::Fv)))
+        return ConfigError{2, "--gamma",
+                           "is the compressible FV polyMesh routes' (structured and low-Mach flames are gamma 1.4)"};
+    if (!poly) return ConfigError{2, "--gamma", "needs --polymesh"};
+    for (const char* f : {"--equivalence", "--les", "--tfles"})
+        if (r.given.contains(f))
+            return ConfigError{2, "--gamma", std::format("with {}: not built (the premixed C0 flame's; "
+                                                         "masterplan_combnozzle R7)",
+                                                         f)};
+    if (r.flameMode != 0)
+        return ConfigError{2, "--gamma", "with --mode other than premixed: not built (the premixed C0 flame's; "
+                                         "masterplan_combnozzle R7)"};
+    if (!(r.gamma > 1.0 && r.gamma <= 1.67)) return ConfigError{2, "--gamma", "must be in (1, 1.67]"};
+    return std::nullopt;
+}
+
 } // namespace
 } // namespace dns::cfg
 
@@ -142,6 +166,7 @@ namespace dns::cfg {
 
 std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
 {
+    if (auto e = gammaScope(r)) return std::unexpected(*e);
     if (auto e = checkFvFlame(r)) return std::unexpected(*e);
     // --equivalence: the rich two-reactant premixed jet (model C2): the
     // premixed 1D/3D flame (both solvers) and the low-Mach bunsen (masterplan
@@ -528,8 +553,10 @@ std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
     c.flameUIn = r.inflowSpeed;
     c.flameWrinkle = r.wrinkle;
     c.flameWrinkleModes = r.wrinkleModes;
-    // Low-Mach box units: Tu = P0 = R = rho_u = 1 (no acoustic scale).
-    c.flameTu = lm ? 1.0 : 1.0 / (kGammaAir * c.mach * c.mach);
+    // Low-Mach box units: Tu = P0 = R = rho_u = 1 (no acoustic scale). gammaScope
+    // left r.gamma at kGammaAir everywhere but the premixed polyMesh flame.
+    c.fvGamma = r.gamma;
+    c.flameTu = lm ? 1.0 : 1.0 / (c.fvGamma * c.mach * c.mach);
 
     const double dth = c.flameEig.dthOverDD;
     if (bunsen && !r.given.contains("--cells-per-delta"))
@@ -677,7 +704,7 @@ std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
             "--mach {:.4g} is above the measured ladder top 0.02: the "
             "compressible flame speed carries an O(M^2) offset "
             "(gamma M^2 (sigma - 1) = {:.3g})",
-            c.mach, kGammaAir * c.mach * c.mach * (md.sigma - 1)));
+            c.mach, c.fvGamma * c.mach * c.mach * (md.sigma - 1)));
     if (nb == 0 && !lm)
         c.warnings.push_back("--nscbc-sink 0: the bare characteristic "
                              "boundary (nothing drains mesh-scale content)");

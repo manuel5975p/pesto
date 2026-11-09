@@ -159,6 +159,7 @@ int runFvFlame(const Case& c, const CheckpointContext& ckx)
     if (c.flamePremix2)
         json += std::format(",\"model\":\"{}\",\"phi\":{},\"zst\":{}", c.premixLaw.n > 0 ? "C2b" : "C2", c.premix.phi,
                             c.premix.zst());
+    if (c.fvGamma != kGammaAir) json += std::format(",\"gamma\":{}", c.fvGamma);
     auto out = RunOutput::make(outputConfig(c, json), meta, raster->grid(), std::move(fgeo));
     if (!out) return die(exitOutput, out.error());
     gpu::FvCompRun rr{.label = fvFlameLabel(c),
