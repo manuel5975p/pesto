@@ -21,6 +21,7 @@
 #include "fvref_react.hpp"
 #include "fvref_reactor.hpp"
 #include "fvref_shockspecies.hpp"
+#include "fvref_wedgeflame.hpp"
 
 #include "dns/comp.hpp"
 #include "dns/curvmesh.hpp"
@@ -1184,6 +1185,7 @@ int main(int argc, char** argv)
     if (argc > 1 && std::string(argv[1]) == "ledger") return dnstest::led::run();
     if (argc > 1 && std::string(argv[1]) == "shockspecies") return dnstest::shsp::run();
     if (argc > 1 && std::string(argv[1]) == "react") return dnstest::react::run();
+    if (argc > 1 && std::string(argv[1]) == "wedgeflame") return dnstest::wfl::run();
     g1();
     g2();
     g3();

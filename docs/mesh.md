@@ -99,7 +99,7 @@ plane k = 1, sides `symmetry`.
   `fromCurvMesh`: `srcCell` = `Grid::idx`, `srcFace` = the `polyOf` face).
 - **Validation** (exit 3, named): open cell (`|Σ S| > 1e-9 Σ|S|`), `V ≤ 0`,
   `d·S ≤ 0`, cells with < 4 faces, unmatched cyclics, bad `empty`, `wedge`
-  patches (the axisymmetric FaceMesh is P8; `FaceMeshOptions::wedge` opens it on one route:
+  patches (the axisymmetric FaceMesh is P8; `FaceMeshOptions::wedge` opens it on two routes, `dns flow --shock` and the compressible `dns flame --shock hll`:
   exactly two planar sides mirrored about z = 0, axis x, y = r form. Every C_z and non-side
   S_z, Cf_z, d_z exactly 0, the second side the first's bit mirror, `wedgeHalf` set, `dim`
   stays 3. docs/nozzle.md).

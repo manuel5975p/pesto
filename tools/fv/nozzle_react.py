@@ -20,6 +20,9 @@ constant-area chamber holding a planar C0 flame, a choked cosine nozzle, a riema
   nozzle_react.py front PREFIX --fit A B [--band LO HI] [--dl HC]   the slope of ln|xIa1|, ln|xIa2| (C6)
   nozzle_react.py pair --r2d JSON --i2d CD CF --r1d JSON --i1d CD CF   G6.2: (reacting - inert) 2D vs 1D off two
       report --json files (W and the G6.5b shift) and the twins' Cd (exit ledger flux), CfVac
+  nozzle_react.py strip --cells C --radius R --ny N [--dphi D] --like POLY1D --out DIR
+      combscale S6a (W5): POLY1D's x nodes as a D-degree wedge strip of N rows to r = R (xlo far, xhi outflow burnt,
+      the wall slip, wedge sides, POLY1D's [reference]): the planar 1D flame's argv runs on it
   nozzle_react.py modes DIR
       the chamber's linear acoustic modes (masterplan_combclose 2.4 step 6): P1, e-fold1, P2, e-fold2, the entropy transit
       t_e (x_f0 -> throat), t_flush (-> exit), and the controls (p-node inlet; compact nozzle at the chamber's end);
@@ -233,6 +236,29 @@ def cmdArgv(a):
     if a.wrinkle is not None:
         argv += ["--wrinkle", repr(a.wrinkle)]
     print(" ".join(argv))
+
+
+def cmdStrip(a):
+    """combscale S6a (W5): the planar 1D flame's mesh as a wedge strip. The x nodes of POLY1D verbatim, ny uniform
+    rows to r = R, the y = r wedge of nozzle_mesh.writePolyMesh; xlo far (fresh), xhi outflow burnt, the wall slip."""
+    pts = open(os.path.join(a.like, "constant/polyMesh/points")).read()
+    xs = sorted({float(t.split()[0]) for t in re.findall(r"^\(([^()]+)\)$", pts, re.M)})
+    h = DTH / a.cells
+    if abs((xs[-1] - xs[0]) / (len(xs) - 1) / h - 1) > 1e-6:
+        raise SystemExit(f"--like: its x spacing is not delta_th / {a.cells:g}")
+    X = np.repeat(np.array(xs)[:, None], a.ny + 1, 1)
+    Y = np.repeat((a.radius * np.arange(a.ny + 1) / a.ny)[None, :], len(xs), 0)
+    os.makedirs(a.out, exist_ok=True)
+    nozzle_mesh.writePolyMesh(a.out, X, Y, a.dphi)
+    b = os.path.join(a.out, "constant/polyMesh/boundary")
+    txt = open(b).read().replace("\ninlet\n", "\nxlo\n").replace("\noutlet\n", "\nxhi\n")
+    open(b, "w").write(txt)
+    ref = re.search(r"\[reference\]\n(?:[^\[\n][^\n]*\n)*", open(os.path.join(a.like, "bc.toml")).read()).group(0)
+    with open(os.path.join(a.out, "bc.toml"), "w") as f:
+        f.write(f"# tools/fv/nozzle_react.py strip --cells {a.cells:g} --radius {a.radius!r} --ny {a.ny} --dphi {a.dphi!r}\n")
+        f.write(ref + '[patch.xlo]\ntype = "far"\ny = [1.0]\n[patch.xhi]\ntype = "outflow"\nburnt = true\n'
+                '[patch.wall]\ntype = "slip"\n[patch.back]\ntype = "wedge"\n[patch.front]\ntype = "wedge"\n')
+    print(json.dumps(dict(cells=a.cells, nx=len(xs) - 1, ny=a.ny, radius=a.radius, dphi=a.dphi, h=h, x0=xs[0], x1=xs[-1])))
 
 
 def cmdTwin(a):
@@ -1044,11 +1070,18 @@ def main():
     pr.add_argument("--r1d", required=True, help="report --json of the 1D reacting run")
     pr.add_argument("--i1d", type=float, nargs=2, required=True, metavar=("CD", "CF"))
     pr.add_argument("--json", default=None)
+    sp = s.add_parser("strip")
+    sp.add_argument("--cells", type=float, required=True, help="cells per delta_th of --like (checked)")
+    sp.add_argument("--radius", type=float, required=True, help="the strip's radius, delta_D")
+    sp.add_argument("--ny", type=int, required=True, help="radial rows")
+    sp.add_argument("--dphi", type=float, default=5.0, help="the wedge's full angle, degrees")
+    sp.add_argument("--like", required=True, help="the planar 1D flame's mesh directory (its x nodes, its [reference])")
+    sp.add_argument("--out", required=True)
     a = p.parse_args()
     if a.cmd == "report" and (a.twin_cd is None) != (a.twin_cf is None):
         p.error("--twin-cd and --twin-cf go together")
     {"oracle": cmdOracle, "design": cmdDesign, "argv": cmdArgv, "modes": cmdModes, "twin": cmdTwin, "report": cmdReport,
-     "drift": cmdDrift, "front": cmdFront, "pair": cmdPair}[a.cmd](a)
+     "drift": cmdDrift, "front": cmdFront, "pair": cmdPair, "strip": cmdStrip}[a.cmd](a)
 
 
 if __name__ == "__main__":

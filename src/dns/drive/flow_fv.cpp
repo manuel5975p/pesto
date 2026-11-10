@@ -216,9 +216,17 @@ std::expected<bool, std::pair<int, std::string>> fvPolyCheck(const Case& c)
     if (!man) return Err({exitInput, man.error()});
     std::vector<FvMeshPatch> mp;
     for (const FoamPatch& p : man->patches) mp.push_back({p.name, foamPatchTypeName(p.type)});
-    const bool wedgeOk = c.sub == Subcommand::Flow && c.shock != ShockMode::None;
-    if (auto r = checkFvBc(c.fvBc, mp, wedgeOk); !r) return Err({exitInput, c.fvMeshDir + ": " + r.error()});
+    // The wedge opens on two routes (combscale S6a): the nozzle's (dns flow --shock) and the compressible hll flame's.
+    const bool wedgeOk = (c.sub == Subcommand::Flow && c.shock != ShockMode::None) ||
+                         (c.sub == Subcommand::Flame && c.shock == ShockMode::Hll && c.physics == Physics::Compressible);
     const bool wedge = std::ranges::any_of(mp, [](const FvMeshPatch& m) { return m.type == "wedge"; });
+    if (c.sub == Subcommand::Flame && wedge && !wedgeOk)
+        return Err({2, "a `wedge` mesh on dns flame needs --shock hll (compressible)"});
+    if (c.sub == Subcommand::Flame && wedge)
+        for (const auto& [e, name] : {std::pair{Emit::Png, "png"}, {Emit::Bin, "bin"}, {Emit::Shm, "shm"}, {Emit::Web, "web"},
+                                      {Emit::Vtk, "vtk"}})
+            if (c.emit.contains(e)) return Err({2, std::format("--emit {}: frames on a wedge flame mesh: not built", name)});
+    if (auto r = checkFvBc(c.fvBc, mp, wedgeOk); !r) return Err({exitInput, c.fvMeshDir + ": " + r.error()});
     // combscale S5: --wrinkle seeds a planar chamber's cos(pi r/H_c); a wedge's lowest mode is radial (m = 0).
     if (c.sub == Subcommand::Flame && wedge && c.flameWrinkle > 0)
         return Err({2, "--wrinkle: not built on a wedge (m = 0 radial mode)"});

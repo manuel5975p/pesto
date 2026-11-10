@@ -17,9 +17,13 @@
 //   reacttwin  G4.5: the reacting nozzle's inert twin, viscous at Re* and inviscid
 //   reacttwinrow  combscale S5: the twin of the multi-row rig (any rows, a stub chamber), no gate but its settle test
 //   react2d  combscale S5: the multi-row reacting nozzle through dns flame (xIa columns, seed, label, ledger, scope)
+//   wedgeflame  combscale S6a: the wedge under C0 + hll (W2 device, W3)
+//   wedgestrip  combscale S6a: W5, the 1D flame on a wedge strip vs the planar mesh, through dns flame
 #include "fv_comp_test_util.hpp"
 #include "fvref_nozzle.hpp"
+#include "fvref_wedgeflame.hpp"
 
+#include "dns/checkpoint.hpp"
 #include "dns/fvnozzle.hpp"
 #include "dns/gpu/hip_runtime.hpp"
 #include "gpu_test_util.hpp"
@@ -2192,6 +2196,273 @@ void react2dRun()
     }
 }
 
+// masterplan_combscale S6a (ctest gpu_fv_nozzle_wedgeflame): the wedge under C0 + hll on the device, the rig of
+// tests/fvref_wedgeflame.hpp (nozzle_W, viscous, SI one-step chemistry).
+//   W2  passive Y = 1/4, 40 steps, FP64 plain and compensated: rho Y == rho/4 in every cell, every wedge side's
+//       F_Y == 0.0, bitwise. Control: Y = 0.3 is off somewhere.
+//   W3  reacting, a Y ramp, 3 steps: device FP64 vs FvRef max rel diff per row <= 1e-13 on Source, Morton and
+//       ColourMajor; the three numberings agree <= 1e-13; a rerun is the bytes.
+void wedgeFlame()
+{
+    namespace wf = dnstest::wfl;
+    std::printf("W2 device: a passive Y = 1/4 through the wedge, 40 steps, FP64\n");
+    const Ref w = loadRef("nozzle_W", CellOrder::Morton);
+    const auto devCfg = [&](const FaceMesh& fm, bool react, double yIn, bool comp) {
+        const FvConfig h = wf::cfgW(fm, w.Rgas, react, yIn);
+        FvCompConfig c;
+        c.tr = h.tr;
+        c.bc = h.bc;
+        c.precision = FvPrecision::Fp64;
+        c.compensated = comp;
+        c.chem = h.chem;
+        c.shock = h.shock;
+        c.tallied.assign(fm.patches.size(), 0);
+        return c;
+    };
+    const auto passive = [&](double y, bool comp, double& fy, double& moved) {
+        auto d = orDie(DeviceFvComp::make(w.fm, devCfg(w.fm, false, y, comp)), "W2");
+        const FvState ic = wf::icW(w, w.fm, [y](double) { return y; });
+        orDie(d.upload(ic), "W2");
+        const double dt = 0.95 * orDie(d.stableDt({.cfl = 0.4}), "dt");
+        for (int n = 0; n < 40; ++n) d.step(dt);
+        FvState s, rr;
+        FvEval ev;
+        orDie(d.download(s), "W2");
+        orDie(d.evaluate(ev, rr), "W2");
+        fy = wf::sideFy(w.fm, ev);
+        moved = 0;
+        for (int c = 0; c < s.nC; ++c) moved = std::max(moved, std::abs(s.var(0)[c] / ic.var(0)[c] - 1.0));
+        return wf::offCells(s, y);
+    };
+    for (const bool comp : {false, true}) {
+        double fy = 0, moved = 0;
+        const long off = passive(0.25, comp, fy, moved);
+        std::printf("  FP64%s: %ld cells off rho/4, max side |F_Y| %.3e, rho moved %.2e\n", comp ? " compensated" : "", off, fy, moved);
+        check(moved >= 1e-4, "W2: the march moved rho");
+        check(off == 0, std::format("W2 FP64{}: rho Y == rho/4 bitwise in every cell", comp ? " compensated" : ""));
+        check(fy == 0.0, std::format("W2 FP64{}: the wedge sides' species flux == 0.0", comp ? " compensated" : ""));
+    }
+    {
+        double fy = 0, moved = 0;
+        const long off = passive(0.3, false, fy, moved);
+        std::printf("  control Y 0.3: %ld cells off\n", off);
+        check(off >= 1, "W2 control: Y = 0.3 is off by >= 1 ulp somewhere");
+    }
+    std::printf("W3 device FP64 vs FvRef: reacting, a Y ramp, 3 steps, three numberings\n");
+    // Per source cell and row, after 3 steps at one dt (the host's bound on the Source mesh).
+    using Rows6 = std::array<std::vector<double>, 6>;
+    const auto bySource = [](const FaceMesh& fm, const FvState& s) {
+        Rows6 r;
+        for (int v = 0; v < 6; ++v) {
+            r[std::size_t(v)].resize(std::size_t(fm.nC));
+            for (std::size_t c = 0; c < std::size_t(fm.nC); ++c) r[std::size_t(v)][std::size_t(fm.srcCell[c])] = s.var(v)[c];
+        }
+        return r;
+    };
+    // max over rows of max_c |a - b| / max_c |b|; a row that is 0.0 in both (w) reads 0.
+    const auto rowGap = [](const Rows6& a, const Rows6& b) {
+        double g = 0;
+        for (std::size_t v = 0; v < 6; ++v) g = std::max(g, relMax(a[v], b[v]));
+        return g;
+    };
+    double dt = 0;
+    {
+        const FaceMesh fm = orDie(FaceMesh::fromPolyMesh(w.pm, CellOrder::Source, 0, {.wedge = true}), "source");
+        const FvRef ref = orDie(FvRef::make(fm, wf::cfgW(fm, w.Rgas, true, 1.0)), "FvRef");
+        const FvState s = wf::icW(w, fm, wf::rampOf(fm));
+        dt = std::min(0.5 * orDie(ref.stableDt(s), "dt"), ref.chemDt(s, 0.5));
+    }
+    Rows6 first;
+    const char* names[] = {"Source", "Morton", "ColourMajor"};
+    const CellOrder orders[] = {CellOrder::Source, CellOrder::Morton, CellOrder::ColourMajor};
+    for (int k = 0; k < 3; ++k) {
+        const FaceMesh fm = orDie(FaceMesh::fromPolyMesh(w.pm, orders[k], 0, {.wedge = true}), names[k]);
+        const FvRef ref = orDie(FvRef::make(fm, wf::cfgW(fm, w.Rgas, true, 1.0)), "FvRef");
+        const FvState ic = wf::icW(w, fm, wf::rampOf(fm));
+        FvState h = ic, s, s2;
+        ref.march(h, dt, 3);
+        const auto dev = [&](FvState& out) {
+            auto d = orDie(DeviceFvComp::make(fm, devCfg(fm, true, 1.0, false)), names[k]);
+            orDie(d.upload(ic), names[k]);
+            for (int n = 0; n < 3; ++n) d.step(dt);
+            orDie(d.download(out), names[k]);
+        };
+        dev(s);
+        dev(s2);
+        const Rows6 rd = bySource(fm, s), rh = bySource(fm, h);
+        const double gap = rowGap(rd, rh), moved = relMax(bySource(fm, ic)[5], rh[5]);
+        if (k == 0) first = rd;
+        const double num = rowGap(rd, first);
+        std::printf("  %-11s: device vs FvRef %.2e, vs the Source numbering %.2e, max |rho w| %.1e (rho Y moved %.2e)\n", names[k], gap, num,
+                    wMax(s), moved);
+        check(moved >= 1e-6, std::format("W3 {}: the reacting march moved rho Y", names[k]));
+        check(gap <= 1e-13, std::format("W3 {}: device FP64 vs FvRef {:.2e} <= 1e-13 per row", names[k], gap));
+        check(num <= 1e-13, std::format("W3 {}: vs the Source numbering {:.2e} <= 1e-13", names[k], num));
+        check(wMax(s) == 0.0, std::format("W3 {}: w == 0.0", names[k]));
+        check(s.q.size() == s2.q.size() && std::memcmp(s.q.data(), s2.q.data(), s.q.size() * sizeof(double)) == 0,
+              std::format("W3 {}: a rerun is the bytes", names[k]));
+    }
+}
+
+// masterplan_combscale S6a, W5 (ctest gpu_fv_nozzle_wedgestrip): the planar 1D flame of G1.8 (fv1d_mn's dns argv, the
+// poly1d c7.5 mesh: 197 x 4, y cyclic) against the same x nodes as a 5 deg wedge strip, R 1.5 delta_D, 6 rows
+// (nozzle_react.py strip), through dns flame, FP64, --shock hll, tt 14, window [7, 14], --checkpoint-dt 7.
+// An identity gate: same h AND same dt. The window numbers are row means of _stats.csv (a row per 200 steps, 6
+// digits) of a signal that drifts and saws as the front crosses cells, so two runs at different dt average different
+// sample times: the planar run at half its dt reproduces its own rows to the print while its row mean moves 4e-6.
+// The strip's dt is 0.805 of the planar run's (the axis prisms' Sigma bound), so the reference runs at --cfl 0.4 x
+// (strip dt / planar dt, window mean): its rows sit on the strip's times.
+//   W5   strip vs the planar run at the strip's dt: |dS_L| <= 1e-6, |d delta_th| / delta_th <= 1e-4; the strip's last
+//        checkpoint (t >= 7): max |v| / c <= 1e-11, rho w == 0.0
+//   same argv (the plan's protocol): both printed, [UNMET] recorded, not gated
+//   t = tt, the one time every run shares: S_L, delta_th equal to the print
+//   control (no run): the strip's S_L vs the archived 15-cell 0.9945059 differs >= 1e-3
+void wedgeStrip()
+{
+    std::printf("W5 the 1D flame on a 5 deg wedge strip vs the planar poly1d mesh, 7.5 cells / delta_th, FP64, hll, tt 14\n");
+    const fs::path root = fs::path(DNS_MESH_DATA) / ".." / ".." / "..";
+    const fs::path planar = tmpDir() / "p1d", strip = tmpDir() / "strip";
+    const std::string g1 = std::format("python3 {} --nx 197 --ny 4 --lx 42.07003070110829 --ly 0.85421382134230028 --depth 1 --out {} > /dev/null",
+                                       (root / "tools/chem/fv_flame_mesh.py").string(), planar.string());
+    const std::string g2 = std::format("python3 {} strip --cells 7.5 --radius 1.5 --ny 6 --dphi 5 --like {} --out {} > /dev/null",
+                                       (root / "tools/fv/nozzle_react.py").string(), planar.string(), strip.string());
+    if (std::system(g1.c_str()) != 0 || std::system(g2.c_str()) != 0) {
+        check(false, "fv_flame_mesh.py and nozzle_react.py strip wrote the meshes");
+        return;
+    }
+    struct Win
+    {
+        int rc = 0;
+        std::vector<double> t, dt, sl, dth;
+        double slMean = 0, dthMean = 0, dtMean = 0;
+        long rows = 0;
+    };
+    const auto run = [&](const char* name, const fs::path& mesh, const std::string& extra) {
+        const fs::path o = tmpDir() / name;
+        Win r;
+        r.rc = runDns(std::format("flame --mach 0.042 --expansion 5 --zeldovich 8 --prandtl 0.72 --polymesh {0} --bc {0}/bc.toml --upstream "
+                                  "14.133333333333333 --inflow-speed 0.98 --tt 14 --profile-dt 0.1 --fv-precision fp64 --shock hll "
+                                  "--checkpoint-dt 7 --quiet --out {1}{2}",
+                                  mesh.string(), o.string(), extra),
+                      o.string() + ".log");
+        const std::string st = o.string() + "_stats.csv";
+        r.t = csvColumn(st, "t");
+        r.dt = csvColumn(st, "dt");
+        r.sl = csvColumn(st, "SL");
+        r.dth = csvColumn(st, "dth");
+        long nd = 0;
+        for (std::size_t i = 0; i < r.t.size(); ++i) {
+            if (r.t[i] < 7.0 || r.t[i] > 14.0) continue;
+            r.slMean += r.sl[i];
+            r.dthMean += r.dth[i];
+            ++r.rows;
+            if (i + 1 < r.t.size()) { // the last row's dt is the clamp onto tt
+                r.dtMean += r.dt[i];
+                ++nd;
+            }
+        }
+        if (r.rows > 0) r.slMean /= double(r.rows), r.dthMean /= double(r.rows);
+        if (nd > 0) r.dtMean /= double(nd);
+        std::printf("  %-7s rc %d, %zu rows (%ld in [7, 14]), dt %.6e: S_L %.8f, delta_th %.8f\n", name, r.rc, r.t.size(), r.rows, r.dtMean, r.slMean,
+                    r.dthMean);
+        return r;
+    };
+    const Win w = run("strip", strip, ""), p = run("planar", planar, "");
+    check(w.rc == 0 && p.rc == 0 && w.rows >= 20 && p.rows >= 20, "route: the strip and the planar run ran");
+    if (w.rc != 0 || p.rc != 0 || w.rows < 20 || p.rows < 20) return;
+    {
+        std::ifstream f(tmpDir() / "strip_stats.csv");
+        std::string label;
+        std::getline(f, label);
+        check(label.find(" [axisymmetric wedge 5 deg: m = 0 modes only, no swirl]") != std::string::npos, "route: the label states the wedge");
+        const auto sc = csvColumn(tmpDir() / "strip_stats.csv", "shockCells");
+        check(!sc.empty() && *std::ranges::max_element(sc) == 0.0, "route: shockCells 0 on every row");
+    }
+    const double ratio = w.dtMean / p.dtMean;
+    const Win m = run("matched", planar, std::format(" --cfl {:.17g}", 0.4 * ratio));
+    const Win h = run("half", planar, " --cfl 0.2");
+    check(m.rc == 0 && h.rc == 0 && m.rows == w.rows, "the planar runs at the strip's dt and at half dt ran; the matched rows pair the strip's");
+    if (m.rc != 0 || h.rc != 0 || m.rows != w.rows) return;
+    // The plan's protocol (same argv): recorded, not gated.
+    const double dS0 = w.slMean - p.slMean, dD0 = (w.dthMean - p.dthMean) / p.dthMean;
+    std::printf("  dt strip / planar %.5f (pre-registered ~1/2.7)\n", ratio);
+    std::printf("  same argv: dS_L %+.2e, d delta_th / delta_th %+.2e\n", dS0, dD0);
+    std::printf("  %s W5 as specified (same argv): |dS_L| <= 1e-6, |d delta_th| / delta_th <= 1e-4\n",
+                std::abs(dS0) <= 1e-6 && std::abs(dD0) <= 1e-4 ? "[PASS]" : "[UNMET (recorded, B7: row means at different sample times)]");
+    // The cause: the planar run at half dt on the cfl-0.4 run's row times (linear between its own rows).
+    const auto at = [](const Win& r, const std::vector<double>& v, double t) {
+        std::size_t i = 1;
+        while (i + 1 < r.t.size() && r.t[i] < t) ++i;
+        const double x = (t - r.t[i - 1]) / (r.t[i] - r.t[i - 1]);
+        return v[i - 1] + x * (v[i] - v[i - 1]);
+    };
+    double ptS = 0, ptD = 0, rowT = 0;
+    for (std::size_t i = 0; i < p.t.size(); ++i)
+        if (p.t[i] >= 7.0) {
+            ptS = std::max(ptS, std::abs(at(h, h.sl, p.t[i]) - p.sl[i]));
+            ptD = std::max(ptD, std::abs(at(h, h.dth, p.t[i]) - p.dth[i]) / p.dth[i]);
+        }
+    for (std::size_t i = 0; i < w.t.size() && i < m.t.size(); ++i) rowT = std::max(rowT, std::abs(w.t[i] - m.t[i]));
+    std::printf("  planar at half dt, on the planar rows' times: max |dS_L| %.2e, max |d delta_th| / delta_th %.2e; its row mean moves S_L %+.2e, "
+                "delta_th %+.2e\n",
+                ptS, ptD, h.slMean - p.slMean, (h.dthMean - p.dthMean) / p.dthMean);
+    check(ptS <= 1e-5 && ptD <= 1e-5, std::format("cause: half dt reproduces the planar rows to the print (S_L {:.1e}, delta_th {:.1e} <= 1e-5)", ptS, ptD));
+    check(std::abs(h.slMean - p.slMean) >= 1e-6,
+          std::format("cause: the row mean of the same solution moves with the sample times ({:+.2e} >= 1e-6)", h.slMean - p.slMean));
+    // t = tt: the one time every run shares.
+    const double eS = std::abs(w.sl.back() - p.sl.back()), eD = std::abs(w.dth.back() - p.dth.back()) / p.dth.back();
+    std::printf("  t = 14, strip vs planar (same argv): |dS_L| %.1e, |d delta_th| / delta_th %.1e\n", eS, eD);
+    check(w.t.back() == 14.0 && p.t.back() == 14.0 && eS <= 1e-5 && eD <= 1e-5, "t = tt: the strip's S_L and delta_th equal the planar run's to the print");
+    {
+        // The slab profiles' last dump (t = tt in both): every slab, every column.
+        const fs::path fw = tmpDir() / "strip_profiles.csv", fp = tmpDir() / "planar_profiles.csv";
+        const auto tw = csvColumn(fw, "t"), tp = csvColumn(fp, "t");
+        double worst = 0;
+        long slabs = 0;
+        for (const char* k : {"T", "rho", "u", "p", "Y", "omega"}) {
+            const auto a = csvColumn(fw, k), b = csvColumn(fp, k);
+            double e = 0, s = 0;
+            slabs = 0;
+            for (std::size_t i = tw.size(), j = tp.size(); i > 0 && j > 0 && tw[i - 1] == 14.0 && tp[j - 1] == 14.0; --i, --j, ++slabs) {
+                e = std::max(e, std::abs(a[i - 1] - b[j - 1]));
+                s = std::max(s, std::abs(b[j - 1]));
+            }
+            worst = std::max(worst, s > 0 ? e / s : e);
+        }
+        std::printf("  t = 14 profiles, %ld slabs, T rho u p Y omega: max |strip - planar| / max %.1e\n", slabs, worst);
+        check(slabs == 197 && worst <= 1e-5, std::format("t = tt: the strip's slab profiles equal the planar run's to the print ({:.1e})", worst));
+    }
+    // W5: the identity at the same h and dt.
+    const double dS = w.slMean - m.slMean, dD = (w.dthMean - m.dthMean) / m.dthMean;
+    std::printf("  matched dt (planar --cfl %.6f, dt ratio %.6f, row times within %.1e): dS_L %+.2e, d delta_th / delta_th %+.2e\n", 0.4 * ratio,
+                w.dtMean / m.dtMean, rowT, dS, dD);
+    check(std::abs(w.dtMean / m.dtMean - 1) <= 1e-3, "W5: the reference runs at the strip's dt (1e-3)");
+    check(std::abs(dS) <= 1e-6, std::format("W5: |dS_L| {:.2e} <= 1e-6 at the same h and dt", std::abs(dS)));
+    check(std::abs(dD) <= 1e-4, std::format("W5: |d delta_th| / delta_th {:.2e} <= 1e-4 at the same h and dt", std::abs(dD)));
+    // v, w off the strip's last checkpoint.
+    const auto ck = dns::Checkpoint::read(dns::checkpointPath((tmpDir() / "strip").string()));
+    const auto q = ck ? ck->f64("state.fv.q") : std::unexpected(ck.error());
+    const auto tc = ck ? ck->f64Scalar("t") : std::unexpected(ck.error());
+    check(q.has_value() && tc.has_value() && q->size() % 6 == 0, "the strip's checkpoint holds state.fv.q (6 rows, FP64)");
+    if (q && tc && q->size() % 6 == 0) {
+        const std::size_t nC = q->size() / 6;
+        double vc = 0, wm = 0;
+        for (std::size_t c = 0; c < nC; ++c) {
+            const double rho = (*q)[c], mx = (*q)[nC + c], my = (*q)[2 * nC + c], mz = (*q)[3 * nC + c], E = (*q)[4 * nC + c];
+            const double pr = 0.4 * (E - 0.5 * (mx * mx + my * my + mz * mz) / rho);
+            vc = std::max(vc, std::abs(my / rho) / std::sqrt(1.4 * pr / rho));
+            wm = std::max(wm, std::abs(mz));
+        }
+        std::printf("  the strip's checkpoint at t %.4f, %zu cells: max |v| / c %.3e, max |rho w| %.1e\n", *tc, nC, vc, wm);
+        check(*tc >= 7.0, "W5: the checkpoint is at t >= 7");
+        check(vc <= 1e-11, std::format("W5: max |v| / c {:.2e} <= 1e-11", vc));
+        check(wm == 0.0, "W5: rho w == 0.0");
+    }
+    const double ctrl = std::abs(w.slMean - 0.9945059);
+    std::printf("  control: |S_L(strip, 7.5 cells) - 0.9945059 (15 cells)| %.3e\n", ctrl);
+    check(ctrl >= 1e-3, "W5 control: the strip's S_L differs from the 15-cell value by >= 1e-3");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -2235,6 +2506,8 @@ int main(int argc, char** argv)
         reactTwinRow(std::atoi(argv[2]), std::atoi(argv[3]), std::atof(argv[4]), std::atof(argv[5]), std::atof(argv[6]), std::atof(argv[7]),
                      std::atof(argv[8]));
     else if (m == "react2d") react2dRun();
+    else if (m == "wedgeflame") wedgeFlame();
+    else if (m == "wedgestrip") wedgeStrip();
     else if (m == "ledger") {
         ledgerGate();
         ledgerLong();

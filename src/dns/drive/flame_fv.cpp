@@ -102,7 +102,9 @@ int runFvFlame(const Case& c, const CheckpointContext& ckx)
         if (auto two = fvPolyCheck(c); !two) return die(two.error().first, two.error().second);
         auto pm = readPolyMesh(fvPolyDir(c.fvMeshDir));
         if (!pm) return die(exitInput, pm.error());
-        mesh = FaceMesh::fromPolyMesh(*pm, CellOrder::Morton);
+        // combscale S6a: the wedge opens on the compressible hll flame (fvPolyCheck refused every other route).
+        mesh = FaceMesh::fromPolyMesh(*pm, CellOrder::Morton, 0,
+                                      {.wedge = c.shock == ShockMode::Hll && c.physics == Physics::Compressible});
         spec = c.fvBc;
     } else {
         FvFlameBox box = fvFlameBox(c);
@@ -240,6 +242,9 @@ int runFvFlame(const Case& c, const CheckpointContext& ckx)
         });
         if (half) rr.label += " [half-domain: transverse modes even about the symmetry plane only]";
     }
+    // combscale S6a (R3): a wedge carries the axisymmetric family only.
+    if (fm.wedgeHalf > 0)
+        rr.label += std::format(" [axisymmetric wedge {:.6g} deg: m = 0 modes only, no swirl]", 2.0 * fm.wedgeHalf * 180.0 / pi);
     if (turbSweep) {
         rr.turbSweep = &*turbSweep;
         rr.turbPatch = &spec.patches[0];

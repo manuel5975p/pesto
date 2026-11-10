@@ -82,8 +82,8 @@ transonic, supersonic, backflow at `tback`). `riemann` is the production row: pe
 under a core takes its own branch. On cone6: rest, p_b 0.01: exit M 3.334 at t* 16, `characteristic` hangs at
 0.797. Supersonic IC, p_b 0.5: p_e/p0 0.5001, `extrapolate` stays at 0.0162.
 
-**`wedge`**: one case directory in both solvers, the word `wedge` opt-in (`FaceMeshOptions::wedge`) on this route
-only. y = r form: (x, r, +-r tan(h)). A z scale is an exact gauge: 5 vs 20 deg 7.0e-15. The cos form is not
+**`wedge`**: one case directory in both solvers, the word `wedge` opt-in (`FaceMeshOptions::wedge`) on two routes
+only: this one and the compressible `dns flame --shock hll` (combscale S6a, "Wedge flame" below). y = r form: (x, r, +-r tan(h)). A z scale is an exact gauge: 5 vs 20 deg 7.0e-15. The cos form is not
 (1.3e-2). Sides are a Slip row the tables know: out of the convective dt (`entS` 0, dt x 12 at 5 deg), hoop term
 `V sin^2(h)/d_z^2` in the diffusive one. w exactly 0.0 is load-bearing: the dt excludes its side mode. S_z, Cf_z, d_z,
 C_z pinned, the second side the first's bit mirror; `w == 0.0` after 1000 viscous steps in FP32 and FP64.
@@ -276,7 +276,7 @@ live (`dns/fvmodules`). No kernel was edited to open it: `faces()` runs `kFvShoc
 reads the FINAL `F[0]`, so `F_Y = Y_f(sign of the final mdot) F_rho(final)` (KG + HLL + D3), never the structured `D
 Y_f(sign m_KG)`. Under `hll` the `--bc` file takes `type = "total"` with `y` (required: the fresh mass fractions),
 `[nozzle]` with `astar` (and `axis`; `p`, `t` exit 2: the flame starts from its composition IC), `[thrust]` with `pa`
-and `station` (required on the flame; its columns `p0b T0b CdB CfBvac CfB`, "Thrust"). `wedge`: exit 2 (next cycle). The stats
+and `station` (required on the flame; its columns `p0b T0b CdB CfBvac CfB`, "Thrust"). `wedge`: built on this route (combscale S6a, "Wedge flame" below). The stats
 append `shockCells byteMax` and, with `[nozzle]`, the nozzle columns; `[thrust]` writes `_thrust.csv` from the flame
 runner as from the flow's. `--shock-d4` on the flame: hll only, [0, 0.125]. C1, C2b, `--equivalence`, TFLES, LES,
 `--turb` with `--shock`: refused by name. Label:
@@ -487,7 +487,7 @@ H < lambda_c/4. The run label says so: ` [half-domain: transverse modes even abo
   `v = u r dA_b/A_b` (np.gradient over the bin centres; 2.95e-12 of max |v| off the generator's formula).
   `--wrinkle` on a `[nozzle]` flame polyMesh (compressible, `--shock hll`): lowest mode only;
   `--wrinkle-modes`: exit 2 `--wrinkle-modes: a [nozzle] chamber seeds its lowest transverse mode only`; a one-row
-  chamber: exit 3 `--wrinkle: the [nozzle] chamber has one row: no transverse mode`; a wedge (S6a): exit 2.
+  chamber: exit 3 `--wrinkle: the [nozzle] chamber has one row: no transverse mode`; a wedge: exit 2 `--wrinkle: not built on a wedge (m = 0 radial mode)`.
 - `xIa1 xIa2`, last in `_stats.csv` on a multi-row chamber: `xIa_n = 2 sum_chamber V rhoY cos(n pi r/H_c) / (rhoY_ref
   A_ref)` (`fvFrontAmplitudes`, Neumaier, FP64): a cos front of amplitude A reads A to 1e-14, a planar front 6e-15
   (host and device).
@@ -549,11 +549,60 @@ bounds as required: G6.4a over [2, t_s 18.68] +0.150/tau (> -0.03), G6.4b max_W 
 own G4 is not gated. (A first C6 job was killed at t 15.5 by the 18:16 amdgpu reset, rc 135, discarded; the rerun
 reproduced its 1058 rows byte for byte.)
 
+### Wedge flame (the P6b route, combscale S6a)
+
+`dns flame --polymesh DIR --bc FILE --shock hll` (compressible) reads a `wedge` mesh: `FaceMesh::fromPolyMesh(...,
+{.wedge = true})` on this route, the sides the Slip rows the tables know (`fvBcsOf`, bound in the file or left out), no
+kernel and no flux template edited. Label suffix ` [axisymmetric wedge D deg: m = 0 modes only, no swirl]` (R3; run
+label, the `--dry-run` reads no cells). Refused by name: a wedge mesh on any other flame route (no `--shock hll`,
+`--physics lowmach`): exit 2 `a \`wedge\` mesh on dns flame needs --shock hll (compressible)` (a low-Mach file that
+names the sides: exit 3, `dns/fvlowmach`); frames: exit 2 `--emit <png|bin|shm|web|vtk>: frames on a wedge flame mesh:
+not built` (FvRaster is unverified there; `--emit stats` and the default pass); `--wrinkle`: exit 2. A multi-row
+`[nozzle]` wedge chamber starts planar with v = 0 (R5; the IC's 2D v is the planar rig's).
+
+| gate | rig | measured | band |
+|---|---|---|---|
+| W1 | host FvRef, nozzle_W (20 deg), C0 (SI: A exp(-600/T), ~50 /s) + hll + mu 1e-3, no-slip wall, Y ramp 1 -> 0 in x, 1000 FP64 steps (65% of the fuel burnt) | max \|rho w\| 0.0 | == 0.0 |
+| W1 ctrl | one side face's S one ulp off the mirror | 3.0e-13 | != 0 |
+| W2 | passive Y = 1/4, 40 steps: host FvRef, device FP64, device FP64 compensated | 0 cells off rho/4; every side F_Y 0.0 (all three) | bitwise |
+| W2 ctrl | Y = 0.3 | 1130 (host) / 1134 (device) cells off | >= 1 |
+| W3 | device FP64 vs FvRef, reacting, Y ramp, 3 steps, per row | 5.84e-16 on Source, Morton, ColourMajor; numberings 2.4e-16, 3.7e-16; rerun bytes; w 0.0 | 1e-13 |
+| W4 | FvRef ledger, 400 reacting steps (30% burnt), all 6 rows | 1.72e-16 (the z row exactly 0.0) | 1e-12 |
+| W4 ctrl | Omega dropped from the rho Y row | 0.370 | >= 0.1 |
+| W5 | strip vs planar at the SAME h and dt (below): dS_L; d delta_th / delta_th | +1.64e-7; +1.02e-5 | 1e-6; 1e-4 |
+| | the strip's checkpoint (t 7.0006, 1182 cells): max \|v\|/c; rho w | 4.31e-16; 0.0 | 1e-11; == 0.0 |
+| W5 ctrl | strip S_L 1.0050495 vs the 15-cell 0.9945059 | 1.054e-2 | >= 1e-3 |
+
+`fvref_wedgeflame` (W1, W2, W4), `gpu_fv_nozzle_wedgeflame` (W2 device, W3), `gpu_fv_nozzle_wedgestrip` (W5).
+
+**W5, the protocol.** The strip: `nozzle_react.py strip --cells 7.5 --radius 1.5 --ny 6 --dphi 5 --like
+poly1d_mesh/c7.5`: the planar 1D flame's 198 x nodes verbatim (the test regenerates that mesh with `fv_flame_mesh.py`:
+bytes equal to the archived one), 6 uniform rows to R 1.5 delta_D, 1182 cells with 197 axis prisms; `xlo` far (y [1]),
+`xhi` outflow burnt, the wall slip. Both runs: G1.8's `fv1d_mn` argv (M 0.042, FP64, hll, `--inflow-speed 0.98`, tt
+14, window [7, 14]) + `--checkpoint-dt 7`. The plan's protocol (the SAME ARGV) is **UNMET, recorded**: dS_L +5.43e-6,
+d delta_th/delta_th +1.36e-4. Decomposed: v, w pass (4.3e-16, 0.0), so not a wedge code path; the two runs' dt differ
+(strip/planar 0.80542: the axis prisms' Sigma bound; the plan's pre-registered ~2.7x smaller is unmet, it is 1.24x)
+and the gate's estimator is a ROW mean of `_stats.csv` (a row per 200 steps, 6 digits) of a signal that drifts (S_L
+1.00527 -> 1.00491 over W) and saws (delta_th 1.568-1.602 as the front crosses a cell): two dt average different
+sample times. It is not time-integration error either: the planar run at half its dt (`--cfl 0.2`) reproduces the
+planar rows to every printed digit (max |dS_L| 0, |d delta_th| 0 on the planar rows' times) while ITS row mean moves
++4.06e-6 in S_L and +8.6e-5 in delta_th, the size of the gap. At t = tt = 14, the one time every run shares, strip and
+planar (same argv, different dt) agree to every printed digit: S_L, delta_th, and the 197 slab profiles of T, rho, u,
+p, Y, omega. So W5 is evaluated as the identity it is, same h AND same dt: the planar reference at `--cfl 0.4 x (strip
+dt / planar dt, window mean)` = 0.322168 (dt ratio 1.000001, row times within 3.1e-3 tau): **dS_L +1.64e-7, d
+delta_th/delta_th +1.02e-5: met**. The bands are the plan's, untouched.
+
+**Not built: the wedge reacting nozzle rig (P6b / S6b).** The route is open; the rig is next cycle's. Sizing ruled
+(masterplan_combscale R3, R4): R_c = 6.0 delta_D (<= 0.29 x the measured lambda_c 21: the m = 1 Bessel bound, so the
+wedge's m = 0 computation is a full-cylinder statement), 15 cells/delta_th (a 7.5 rung only after a q1d G4 pass at
+7.5), ~130 GPU min, chained; `nozzle_react.py --mode wedge` design / twin deferred with it.
+
 ## Not built, refused
 
 `--steady` (LTS on `Total` stalls on the host, Z7), LES, RANS, two-reactant species (C1, C2b), gravity, body force,
-`--turb`: refused by name (`dns/fvmodules`, axis `capture`). Plume box (P7), the wedge reacting nozzle (P6b; the 2D
-planar half-nozzle is built, P6a above), viscous
+`--turb`: refused by name (`dns/fvmodules`, axis `capture`). Plume box (P7), the wedge reacting nozzle RIG (P6b: the
+flame route reads a wedge since combscale S6a, "Wedge flame" above; the 2D planar half-nozzle is built, P6a above),
+frames on a wedge flame mesh, viscous
 walls (P7), Shock x C1 / C2b (P8), gamma(T) (P9): next cycle. Structured D3: no. `[thrust]` with checkpoints: built
 (combscale S1, "Thrust" above); `[thrust].station` on `dns flow`: refused (the reacting nozzle's burnt station).
 `--inflow-speed` on a `[nozzle]` flame: exit 2 (the throat sets u_u). A `[nozzle]` flame whose mesh has no throat (eps_c
@@ -565,7 +614,8 @@ sources are no boundary flux).
 CLAUDE.md carries masterplan_combclose 7 (combscale S4). The rest, for the user:
 
 - "The reader accepts exactly what the OpenFOAM mesh tools write; everything else REJECTED BY NAME": `wedge` opens on
-  one route by opt-in; every other route keeps the text.
+  two routes by opt-in (`dns flow --shock`; since combscale S6a the compressible `dns flame --shock hll`, gates W1-W5);
+  every other route keeps a refusal by name.
 - "No NSCBC, no sink on a FaceMesh" stands for the flame box. D3 is a mean-flow numerical term on the nozzle route, on by
   default under `hll`; it uses no freestream reference, so it does not justify a sponge.
 - "Mean flow gets NO added dissipation" is RANS's. RANS with `--shock` is refused.
@@ -616,5 +666,12 @@ CLAUDE.md carries masterplan_combclose 7 (combscale S4). The rest, for the user:
   label says `[half-domain ...]`; a full channel's antisymmetric mode is twice as long. `[nozzle] cd` makes the design
   effective (`A_ref/(cd A*)`); cd absent is the shipped design bit for bit; a multi-row chamber's IC carries the
   generator's 2D v in the nozzle half and seeds only cos(pi r/H_c).
+- **A `wedge` mesh opens on two routes: `dns flow --shock` and the compressible `dns flame --shock hll`** (combscale
+  S6a; W1-W5: w == 0.0 under C0, a pow2 Y bitwise, the sides' F_Y == 0.0, FvRef 1e-13, the ledger). Frames and
+  `--wrinkle` there, and a wedge on every other route: refused by name. Label ` [axisymmetric wedge D deg: m = 0 modes
+  only, no swirl]`.
+- **A window mean off `_stats.csv` rows is comparable only at the same dt** (rows per 200 steps): a planar flame at
+  half its dt reproduces its rows to the print while its row mean moves 4e-6 in S_L. An identity gate between two
+  meshes runs the reference at the other's dt (`--cfl` scaled by the measured dt ratio), or reads t = tt.
 - **A foam parity gap is a two-sided number.** In the supersonic cone foam at vanLeer holds p0 to -9.7e-4 at 320 x 64
   and dns to -6.9e-5: the gap is mostly foam's.

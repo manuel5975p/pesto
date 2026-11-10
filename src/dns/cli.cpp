@@ -1959,7 +1959,9 @@ and --mode diffusion, model C1).
                        stats columns. --mach <= 0.05, --cfl <= 0.6 at nz 1, 0.4
                        at nz > 1. On --polymesh (compressible, premixed C0;
                        docs/nozzle.md "Reacting"): the FV pass + D3, --cfl <= 1.2;
-                       --bc takes total (with y), [nozzle] astar, [thrust]. [none]
+                       --bc takes total (with y), [nozzle] astar, [thrust]; hll
+                       reads a `wedge` mesh (axisymmetric, m = 0; no frame
+                       --emit, no --wrinkle there).                 [none]
   --shock-d4 EPS       FV --polymesh --shock hll: the background D3,
                        eps (1 - sigma) |u.S|, in [0, 0.125]          [0.0625]
   --tt T               run length in flame times delta_D/S_L        [10]

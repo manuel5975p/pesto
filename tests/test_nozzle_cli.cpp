@@ -221,7 +221,32 @@ int main()
                 "--bc: [nozzle].p, t: the flame route starts from the composition IC (docs/nozzle.md \"Reacting\")");
         refuses(fh + bc("sx2", inlet + "y = [1.0]\n[nozzle]\nastar = 0.1\n[thrust]\npa = 0.01\n"), 2,
                 "--bc: [thrust]: needs station on dns flame (the burnt stagnation plane, masterplan_combnozzle R2)");
-        refuses(fh + bc("sx3", inlet + "y = [1.0]\n[patch.side]\ntype = \"wedge\"\n"), 2, "--bc: patch `side`: a wedge on the flame route: not built (next cycle)");
+        // combscale S6a: the wedge on the compressible hll flame (W1-W5, docs/nozzle.md "Wedge flame"); every other
+        // flame route, frames and --wrinkle keep a refusal by name.
+        {
+            const std::string wIn = "[patch.outlet]\ntype = \"outflow\"\nexit = \"riemann\"\np = 0.5\ntback = 1\n[patch.wall]\ntype = \"slip\"\n"
+                                    "[patch.inlet]\ntype = \"total\"\np0 = 1.01\nt0 = 1.003\ny = [1.0]\n";
+            const std::string sides = "[patch.back]\ntype = \"wedge\"\n[patch.front]\ntype = \"wedge\"\n";
+            const std::string open = "[patch.inlet]\ntype = \"far\"\ny = [1.0]\n[patch.outlet]\ntype = \"outflow\"\nburnt = true\n[patch.wall]\ntype = "
+                                     "\"slip\"\n";
+            const std::string lm = "[patch.inlet]\ntype = \"inflow\"\ny = [1.0]\n[patch.outlet]\ntype = \"outflow\"\n[patch.wall]\ntype = \"slip\"\n";
+            const std::string fw = "flame --polymesh " + dataW + " --upstream 7 --tt 1" + o + " --bc ";
+            n = dns(fw + bc("sx3", wIn + sides) + " --shock hll");
+            if (n.rc != 0) std::printf("    rc %d: %s", n.rc, n.text.c_str());
+            check(n.rc == 0 && n.text.find("  patch      back: wedge") != std::string::npos && n.text.find("  patch      front: wedge") != std::string::npos,
+                  "a wedge mesh on dns flame --shock hll: the dry-run passes");
+            check(dns(fw + bc("sx3b", open) + " --shock hll").rc == 0, "the wedge sides left out of the file: the dry-run passes");
+            check(dns(fw + bc("sx3", wIn + sides) + " --shock hll --emit stats").rc == 0, "--emit stats on the wedge flame passes");
+            refuses(fw + bc("sx3b", open), 2, "a `wedge` mesh on dns flame needs --shock hll (compressible)");
+            refuses(fw + bc("sx3c", lm) + " --physics lowmach", 2, "a `wedge` mesh on dns flame needs --shock hll (compressible)");
+            refuses(fw + bc("sx3d", lm + sides) + " --physics lowmach", 3, "patch.back: type = \"wedge\": the wedge is the compressible nozzle route's");
+            refuses(fw + bc("sx3e", open + sides), 2, "--bc: patch.back.type = \"wedge\" belongs to the nozzle route");
+            for (const char* e : {"png", "bin", "shm", "web"})
+                refuses(fw + bc("sx3", wIn + sides) + " --shock hll --emit stats --emit " + e, 2,
+                        std::format("--emit {}: frames on a wedge flame mesh: not built", e));
+            refuses(fw + bc("sx3f", wIn + sides + "[nozzle]\nastar = 0.1\n") + " --shock hll --wrinkle 0.005", 2,
+                    "--wrinkle: not built on a wedge (m = 0 radial mode)");
+        }
         // combscale S5: [nozzle] cd (the flame's design; dns flow refuses it), --wrinkle on a [nozzle] chamber.
         const std::string noz = inlet + "y = [1.0]\n[nozzle]\nastar = 0.1\n";
         n = dns(fh + bc("cd0", noz + "cd = 0.95\n"));

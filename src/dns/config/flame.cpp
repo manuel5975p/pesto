@@ -180,12 +180,10 @@ std::optional<ConfigError> gammaScope(const RawConfig& r)
 
 std::optional<ConfigError> fvFlameNozzleScope(const FvBcSpec& bc)
 {
-    for (const FvPatchSpec& p : bc.patches) {
-        if (p.kind == FvPatchKind::Wedge)
-            return ConfigError{2, "--bc", std::format("patch `{}`: a wedge on the flame route: not built (next cycle)", p.name)};
+    // A `wedge` patch passes (combscale S6a, gates W1-W5 of docs/nozzle.md "Wedge flame"): fvPolyCheck owns the mesh rule.
+    for (const FvPatchSpec& p : bc.patches)
         if (p.kind == FvPatchKind::Total && !p.hasY)
             return ConfigError{2, "--bc", std::format("patch.{}: total needs y on a flame (the fresh mass fractions)", p.name)};
-    }
     if (bc.nozzle && (bc.nozzle->hasP || bc.nozzle->hasT))
         return ConfigError{2, "--bc", "[nozzle].p, t: the flame route starts from the composition IC (docs/nozzle.md \"Reacting\")"};
     if (bc.thrust && !bc.thrust->station)

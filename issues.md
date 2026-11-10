@@ -2842,6 +2842,23 @@ G6.1, G6.2, G6.3, G6.4a/b, G6.5a/b and C6 MET; G6.0 carries two UNMETs. Open:
   (|out/in - 1| 8.5e-5 at 600 t*, the plan's tt; 5.8e-8 at 1200); the inviscid 2D twin did not settle (|out/in - 1|
   ~1e-3 at 1200 t*, an unsteady 2D supersonic field, max |v|/c 0.73): reported, no number used.
 
+combscale S6a: the wedge on the flame route (docs/nozzle.md "Wedge flame", masterplan_combscale B7). W1-W4 MET; W5 MET
+at the same h and dt, UNMET under the plan's same-argv protocol; the refusal is lifted. Open:
+- N29. **W5 as specified (same argv) is UNMET: dS_L +5.43e-6 (band 1e-6), d delta_th/delta_th +1.36e-4 (1e-4)**, strip
+  (5 deg, R 1.5 delta_D, 6 rows) vs planar poly1d c7.5. Not the wedge: max |v|/c 4.3e-16, rho w 0.0, and at t = 14
+  S_L, delta_th and all 197 slab profiles equal the planar run's to the print. Not time error: the planar run at half
+  dt reproduces its rows to the print while its row mean moves +4.06e-6 / +8.6e-5. Cause: the estimator, a row mean of
+  `_stats.csv` (a row per 200 steps) of a drifting, sawing signal, sampled at dt-dependent times; the strip's dt is
+  0.80542 of the planar run's (the plan's ~1/2.7 unmet). The gate runs the reference at the strip's dt (`--cfl
+  0.322168`): +1.64e-7 / +1.02e-5, met. Open: `_stats.csv` prints 6 digits, so S_L on a window is resolved to ~4e-7 at
+  best (61 rows); a sharper identity needs a time-integrated S_L (the fuel ledger) in the output.
+- N30. **The wedge reacting nozzle rig (P6b / S6b) is not built**: route open, rig deferred. Sizing ruled (R3, R4):
+  R_c 6.0 delta_D (<= 0.29 measured lambda_c: m = 1 Bessel bound), 15 cells/delta_th, ~130 GPU min chained; the wedge
+  design / twin modes of `nozzle_react.py` with it. A multi-row wedge `[nozzle]` chamber's IC is planar with v = 0 in
+  the nozzle half (the planar rig's 2D v is not carried): its start transient is S6b's question.
+- N31. **Frames on a wedge flame mesh are refused** (`--emit png|bin|shm|web|vtk`: exit 2): FvRaster's uniform plane is
+  unverified on the y = r wedge (which plane, the axis prisms). `dns flow --shock` on a wedge keeps its frames.
+
 ## Older open items (details in CLAUDE.md)
 
 - No anchor for the Re800 compressible cases or `sphere_re300_n160_cd`

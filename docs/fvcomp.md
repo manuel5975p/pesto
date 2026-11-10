@@ -106,7 +106,8 @@ force = true               # wall default true, slip default false
 ```
 
 Bound against the patch list: an unbound patch, a binding with no patch, a bound
-cyclic (an internal face), `wedge` off the `--shock` route: exit 3 by name.
+cyclic (an internal face), `wedge` off the `--shock` route: exit 3 by name (a wedge mesh on
+`dns flame` without `--shock hll`: exit 2, docs/nozzle.md "Wedge flame").
 `examples/fvcomp_cyl2d_snappy.toml`. `[nozzle]` (`p`, `t`, `astar`, `axis`), `total`,
 `wedge` and `exit` are the nozzle route's, `docs/nozzle.md`.
 
