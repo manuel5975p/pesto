@@ -15,6 +15,8 @@
 //   sense    G27 sense == none bytes, sensed > 0 on B
 //   react    masterplan_combnozzle P4: the reacting one-row nozzle through dns flame (G4.1, G4.8, the route)
 //   reacttwin  G4.5: the reacting nozzle's inert twin, viscous at Re* and inviscid
+//   reacttwinrow  combscale S5: the twin of the multi-row rig (any rows, a stub chamber), no gate but its settle test
+//   react2d  combscale S5: the multi-row reacting nozzle through dns flame (xIa columns, seed, label, ledger, scope)
 #include "fv_comp_test_util.hpp"
 #include "fvref_nozzle.hpp"
 
@@ -2032,6 +2034,164 @@ void reactTwinSeq(int nxC, int nxF, double epsC, double reStar, double pa, doubl
     check(outIn <= 1e-5, std::format("twin seq settled: |out/in - 1| {:.2e} <= 1e-5 per 5 t* over the last 15 t*", outIn));
 }
 
+// combscale S5 (masterplan_combscale R-g, G6.2): the inert twin of the multi-row rig, any rows:
+// reacttwinrow NX NY LC EPS_C RE_STAR PA T_STAR. The react contour at y* 1 (lc LC y* stub, Lcon 6, Ldiv 4, eps_e 2),
+// planar, NY rows; NY 1: the q1d IC (v 0), NY >= 2: the generator's 2D IC (v = u y_w' y/y_w). RE_STAR <= 0: inviscid.
+// Windows of 5 t* (ledger); settled iff |mdotOut/mdotIn - 1| <= 1e-5 in every window of the last 15 t*; Cd (exit
+// flux), Cd on the inflow and CfVac over the last 100 t* (T_STAR / 4 if shorter), the ledger's endpoints. gamma 1.4.
+void reactTwinRow(int nx, int ny, double lc, double epsC, double reStar, double pa, double tStar)
+{
+    std::printf("twin row: react lc %.6g, eps_c %.16g, eps_e 2, %d x %d cells, Re* %.16g, pa %.16g, tt %g t*, %s IC\n", lc, epsC, nx, ny,
+                reStar, pa, tStar, ny == 1 ? "q1d" : "2D generator");
+    const std::string args = std::format(
+        "--contour react --lc {} --lcon 6 --ldiv 4 --eps-c {} --eps-e 2 --scale 1 --mode planar --exit riemann --pb {}", lc, epsC, pa);
+    const Gen g = gen(std::format("rtr{}x{}", nx, ny), nx, ny, args);
+    const Rows rows{.pb = pa * kP0, .exit = FvExit::Riemann};
+    const double rho0 = kP0 / (287.1 * kT0), mu = reStar > 0 ? rho0 * kC0 * 1.0 / reStar : 0.0;
+    const Run r{.mu = mu};
+    const double ideal = fvIdealMassFlow(kP0, kT0, kAstar, r.gamma, 287.1);
+    FvCompConfig cfg = cfgOf(g.fm, rows, r);
+    auto d = orDie(DeviceFvComp::make(g.fm, cfg), "twin row");
+    orDie(d.upload(ny == 1 ? q1dIc(g, r.gamma) : icOfGas(g, r.gamma)), "twin row");
+    orDie(d.setLedger(true), "ledger");
+    const std::vector<FvRole> roles = fvRoles(cfg.bc, g.fm);
+    const FvThrustCase k{.axis = {1, 0, 0}, .pa = rows.pb, .p0 = kP0, .t0 = kT0, .astar = kAstar, .gamma = r.gamma, .Rgas = 287.1,
+                         .exitArea = fvExitArea(g.fm, roles, {1, 0, 0})};
+    const int n = std::max(1, int(std::lround(tStar / 5.0)));
+    std::vector<FvRoleSums> sums{fvRoleSums(orDie(d.ledger(), "ledger"), roles, -1)};
+    std::vector<double> outIn;
+    double t = 0;
+    long steps = 0;
+    for (int i = 1; i <= n; ++i) {
+        const double tn = tStar / kC0 * i / n;
+        const Marched m = marchTo(d, tn - t, 0.4, 4, 40000000);
+        steps += m.steps;
+        if (!m.err.empty()) {
+            std::printf("  %s\n", m.err.c_str());
+            check(false, "twin row marched");
+            return;
+        }
+        sums.push_back(fvRoleSums(orDie(d.ledger(), "ledger"), roles, -1));
+        const FvThrustWindow w = fvThrustWindow(sums[sums.size() - 2], t, sums.back(), tn, k);
+        outIn.push_back(w.mdotOut / w.mdotIn - 1);
+        if (i % std::max(1, n / 12) == 0 || i == n)
+            std::printf("  t* [%7.2f, %7.2f] steps %9ld Cd %.10f out/in-1 %+.2e CfVac %.10f\n", t * kC0, tn * kC0, steps, w.mdotOut / ideal,
+                        outIn.back(), w.CfVac);
+        t = tn;
+    }
+    const int last = std::min(n, std::max(1, int(std::lround(15.0 / (tStar / n)))));
+    double settle = 0;
+    for (int i = n - last; i < n; ++i) settle = std::max(settle, std::abs(outIn[std::size_t(i)]));
+    const double win = tStar >= 400.0 ? 100.0 : tStar / 4;
+    const int iw = n - std::min(n, std::max(1, int(std::lround(win / (tStar / n)))));
+    const double t1 = tStar / kC0 * iw / n, t2 = tStar / kC0;
+    const FvThrustWindow w = fvThrustWindow(sums[std::size_t(iw)], t1, sums.back(), t2, k);
+    FvState s;
+    orDie(d.download(s), "twin row");
+    std::printf("  window [%g, %g] t*: Cd %.10f Cd_in %.10f CfVac %.10f; max |out/in - 1| over the last 15 t* %.2e (settled <= 1e-5: %s); "
+                "%ld steps, max |v|/c %.3e\n",
+                t1 * kC0, t2 * kC0, w.mdotOut / ideal, w.mdotIn / ideal, w.CfVac, settle, settle <= 1e-5 ? "yes" : "NO", steps,
+                vOverC(s, r.gamma));
+    check(settle <= 1e-5, std::format("twin row settled: |out/in - 1| {:.2e} <= 1e-5 per 5 t* over the last 15 t*", settle));
+}
+
+// combscale S5 (ctest gpu_fv_nozzle_react2d): the multi-row reacting nozzle through dns flame, a smoke on 588 x 4 at
+// the S5 rig's columns (y* 12 h, Lc 468 columns, 15 cells / delta_th), FP64 compensated, --shock hll:
+//   route  rc 0; xIa1 xIa2 last in _stats.csv, finite; the label's half-domain suffix; shockCells 0
+//   seed   --wrinkle 0.005: the first row's xIa1 within 2% of 0.005 delta_th; a planar run |xIa| <= 1e-6 delta_D
+//   G4.1f  the ledger at <= 1e-13 on every row
+//   scope  --wrinkle on the one-row chamber: exit 3 by name; one row: no xIa columns, no suffix
+void react2dRun()
+{
+    std::printf("combscale S5: the multi-row reacting nozzle through dns flame, 588 x 4, FP64 compensated, --shock hll\n");
+    const fs::path tool = fs::path(DNS_MESH_DATA) / ".." / ".." / ".." / "tools/fv/nozzle_react.py";
+    const fs::path dir = tmpDir() / "react2d", one = tmpDir() / "react1d";
+    const auto design = [&](const fs::path& d, int ny) {
+        return std::system(std::format("python3 {} design --cells 15 --ny {} --ystar-cells 12 --lc-cells 468 --mach 0.042 --sl 0.9945059 "
+                                       "--out {} > /dev/null",
+                                       tool.string(), ny, d.string())
+                               .c_str()) == 0;
+    };
+    if (!design(dir, 4) || !design(one, 1)) {
+        check(false, "nozzle_react.py design wrote the cases");
+        return;
+    }
+    const auto base = [](const fs::path& d) {
+        return std::format("flame --mach 0.042 --expansion 5 --zeldovich 8 --prandtl 0.72 --polymesh {0} --bc {0}/bc.toml --shock hll "
+                           "--fv-precision fp64 --compensated --upstream 12 --emit stats --quiet",
+                           d.string());
+    };
+    const double dth = 1.601651;
+    const fs::path o = tmpDir() / "r2d", op = tmpDir() / "r2dp", o1 = tmpDir() / "r1d";
+    const int rc = runDns(base(dir) + std::format(" --wrinkle 0.005 --tt 0.5 --out {}", o.string()), o.string() + ".log");
+    const std::string st = o.string() + "_stats.csv", th = o.string() + "_thrust.csv";
+    const auto t = csvColumn(st, "t"), a1 = csvColumn(st, "xIa1"), a2 = csvColumn(st, "xIa2"), sens = csvColumn(st, "shockCells");
+    check(rc == 0 && t.size() > 5 && a1.size() == t.size() && a2.size() == t.size(),
+          std::format("route: rc {}, {} rows, xIa1 xIa2 present", rc, t.size()));
+    if (t.size() < 5 || a1.size() != t.size()) return;
+    std::string header, label;
+    {
+        std::ifstream f(st);
+        std::getline(f, label);
+        std::getline(f, header);
+    }
+    check(header.ends_with("xIa1,xIa2"), "route: xIa1 xIa2 are the last columns");
+    check(label.find("[half-domain: transverse modes even about the symmetry plane only]") != std::string::npos,
+          "route: the label states the half-domain");
+    check(std::ranges::all_of(a1, [](double x) { return std::isfinite(x); }) && std::ranges::all_of(a2, [](double x) { return std::isfinite(x); }),
+          "route: xIa finite");
+    check(!sens.empty() && *std::ranges::max_element(sens) == 0.0, "G4.8: shockCells 0 on every row");
+    const double seed = 0.005 * dth;
+    std::printf("  seeded: first row t %.4f xIa1 %.6e (seed %.6e, %.4f), xIa2 %.2e; last t %.3f xIa1 %.6e xIa2 %.2e\n", t.front(), a1.front(), seed,
+                a1.front() / seed, a2.front(), t.back(), a1.back(), a2.back());
+    check(std::abs(a1.front() / seed - 1) <= 0.02, "seed: the first row's xIa1 within 2% of 0.005 delta_th");
+    // G4.1f on every row (the reacting route's ledger, as gpu_fv_nozzle_react).
+    {
+        const double Tu = 1.0 / (1.4 * 0.042 * 0.042), q = 3.5 * 4.0 * Tu;
+        const auto Om = csvColumn(th, "Omega");
+        double worst = 0;
+        for (const char* kk : {"mass", "mx", "my", "mz", "E", "ry"}) {
+            const auto res = csvColumn(th, std::format("res_{}", kk)), P = csvColumn(th, std::format("P_{}", kk));
+            std::vector<std::vector<double>> I;
+            for (const char* rr : {"in", "exit", "wall", "side"}) I.push_back(csvColumn(th, std::format("I_{}_{}", rr, kk)));
+            for (std::size_t i = 0; i < res.size(); ++i) {
+                double S = std::abs(P[i]);
+                for (const auto& c : I) S += std::abs(c[i]);
+                if (std::string(kk) == "E") S += q * std::abs(Om[i]);
+                if (std::string(kk) == "ry") S += std::abs(Om[i]);
+                if (S > 0) worst = std::max(worst, std::abs(res[i]) / S);
+            }
+        }
+        std::printf("  G4.1f: max r %.2e over %zu rows\n", worst, Om.size());
+        check(!Om.empty() && worst <= 1e-13, std::format("G4.1f: the 2D ledger {:.2e} <= 1e-13", worst));
+    }
+    const int rp = runDns(base(dir) + std::format(" --tt 0.2 --out {}", op.string()), op.string() + ".log");
+    const auto p1 = csvColumn(op.string() + "_stats.csv", "xIa1"), p2 = csvColumn(op.string() + "_stats.csv", "xIa2");
+    double pm = 0;
+    for (std::size_t i = 0; i < p1.size() && i < p2.size(); ++i) pm = std::max({pm, std::abs(p1[i]), std::abs(p2[i])});
+    std::printf("  planar (no --wrinkle): rc %d, max |xIa| %.3e over %zu rows\n", rp, pm, p1.size());
+    check(rp == 0 && !p1.empty() && pm <= 1e-6, std::format("seed: a planar run reads max |xIa| {:.2e} <= 1e-6 delta_D", pm));
+    // The one-row chamber: --wrinkle refused (exit 3) by name; without it no xIa columns, no suffix.
+    const int r1 = runDns(base(one) + std::format(" --wrinkle 0.005 --tt 0.1 --out {}", o1.string()), o1.string() + ".log");
+    std::string log;
+    {
+        std::ifstream f(o1.string() + ".log");
+        log.assign(std::istreambuf_iterator<char>(f), {});
+    }
+    check(r1 == 3 && log.find("--wrinkle: the [nozzle] chamber has one row: no transverse mode") != std::string::npos,
+          std::format("scope: --wrinkle on a one-row chamber: exit 3 by name (rc {})", r1));
+    const int r0 = runDns(base(one) + std::format(" --tt 0.05 --out {}", o1.string()), o1.string() + "_0.log");
+    std::string l0;
+    {
+        std::ifstream f(o1.string() + "_stats.csv");
+        std::getline(f, l0);
+        std::string h;
+        std::getline(f, h);
+        check(r0 == 0 && !h.empty() && h.find("xIa") == std::string::npos && l0.find("half-domain") == std::string::npos,
+              "scope: one row: no xIa columns, no half-domain suffix");
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -2071,6 +2231,10 @@ int main(int argc, char** argv)
         reactTwinSeq(std::atoi(argv[2]), std::atoi(argv[3]), std::atof(argv[4]), std::atof(argv[5]), std::atof(argv[6]), std::atof(argv[7]),
                      std::atof(argv[8]));
     else if (m == "reacttwin") reactTwin();
+    else if (m == "reacttwinrow" && argc == 9)
+        reactTwinRow(std::atoi(argv[2]), std::atoi(argv[3]), std::atof(argv[4]), std::atof(argv[5]), std::atof(argv[6]), std::atof(argv[7]),
+                     std::atof(argv[8]));
+    else if (m == "react2d") react2dRun();
     else if (m == "ledger") {
         ledgerGate();
         ledgerLong();

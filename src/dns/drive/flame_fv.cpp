@@ -136,6 +136,7 @@ int runFvFlame(const Case& c, const CheckpointContext& ckx)
     std::vector<FvBc> bcTable = fvBcsOf(fm, spec, fs.fs, 1.0);
     // masterplan_combnozzle P4: a [nozzle] run starts from the composition design (docs/nozzle.md "Reacting").
     FvState ic;
+    std::optional<FvNozzleShape> shape;
     if (spec.nozzle) {
         auto st = fvFlameNozzleStart(c, fm, spec, fs, *probe, bcTable);
         if (!st) return die(exitInput, st.error());
@@ -146,7 +147,11 @@ int runFvFlame(const Case& c, const CheckpointContext& ckx)
                         probe->area() / spec.nozzle->astar, d.Mu, d.uu, d.rhou, d.b.T0b, d.b.p0b,
                         d.b.p0b / (d.pu * std::pow(1 + 0.5 * (fs.fs.gamma - 1) * d.Mu * d.Mu, fs.fs.gamma / (fs.fs.gamma - 1))),
                         d.b.Mb, d.Me, d.CFvac, probe->area(), probe->meanArea(), probe->chamberBins(), probe->bins());
+        if (!c.quiet && st->shape)
+            std::printf("# multi-row chamber: H_c %.10g, seed %.6g (cd %.10g)\n", st->shape->Hc, st->shape->seed,
+                        spec.nozzle->cd);
         ic = std::move(st->ic);
+        shape = st->shape;
     } else {
         ic = fvFlameIC(c, fm, spec, fs);
     }
@@ -226,6 +231,14 @@ int runFvFlame(const Case& c, const CheckpointContext& ckx)
                                      .gamma = fs.fs.gamma,
                                      .Rgas = kRgasBox,
                                      .station = *spec.thrust->station};
+    }
+    // combscale S5 (R3): a multi-row chamber's front columns; on a symmetry axis the label states the half-domain.
+    if (shape) {
+        rr.shape = &*shape;
+        const bool half = std::ranges::any_of(fm.patches, [](const MeshPatch& m) {
+            return m.type == FoamPatchType::SymmetryPlane || m.type == FoamPatchType::Symmetry;
+        });
+        if (half) rr.label += " [half-domain: transverse modes even about the symmetry plane only]";
     }
     if (turbSweep) {
         rr.turbSweep = &*turbSweep;

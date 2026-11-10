@@ -71,13 +71,16 @@ FvFlameSetup fvFlameSetup(const Case& c, FvBcSpec& spec);
 FvState fvFlameIC(const Case& c, const FaceMesh& fm, const FvBcSpec& spec, const FvFlameSetup& s);
 
 // The reacting nozzle's design and IC (a [nozzle] run, docs/nozzle.md "Reacting"): the composition oracle on
-// the Total row's p0, t0 (box units), eps_c = A_ref / astar off the chamber probe, eps_e = sum_exit S.a / astar,
+// the Total row's p0, t0 (box units), eps_c = A_ref / (cd astar) off the chamber probe, eps_e = sum_exit S.a / astar,
 // the flame's q, cp, gamma; the IC fvReactingNozzleIC with the flame at --upstream from the inlet.
-// Pre: spec.nozzle, probe a chamber probe of fm, bc fvBcsOf's table. Error: no Total patch, no choke (exit 3).
+// shape (combscale S5): a multi-row chamber's (fvNozzleShapeOf; --wrinkle A delta_th its seed), nullopt on one row.
+// Pre: spec.nozzle, probe a chamber probe of fm, bc fvBcsOf's table. Error: no Total patch, no choke, --wrinkle on a
+// one-row chamber (exit 3).
 struct FvNozzleStart
 {
     FvReactingDesign design;
     FvState ic;
+    std::optional<FvNozzleShape> shape{};
 };
 std::expected<FvNozzleStart, std::string> fvFlameNozzleStart(const Case& c, const FaceMesh& fm, const FvBcSpec& spec,
                                                              const FvFlameSetup& s, const FvFlameProbe& probe,

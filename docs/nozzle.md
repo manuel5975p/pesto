@@ -461,10 +461,99 @@ the Rayleigh-line IC). The eps_c 13.2 row is cut by decision (masterplan_combclo
 above). The reactingFoam `transonic yes` scout (G4.10) did not settle in 5 CPU min (7.8 of 80 tau, mdotIn/Out 1.6%
 apart): stopped; G4.10 is decomposed (masterplan_combclose R10: G1.2 + G1.8, T1, the oracle + twin).
 
+### 2D reacting (P6a, combscale S5)
+
+**Rig A** (`plans/masterplan_combscale.md` S5, analysis_combscale_2): the planar half-nozzle, 588 x 16 cells, h =
+delta_th/15 (the S_L,num 0.9945059 rung), y* = 12 h = 1.28132 delta_D, the chamber 468 columns (49.97 delta_D), Lcon 6 y*,
+Ldiv 4 y*, eps_e 2, Re* = rho0b c0b y*/mu 18.878 (flame units, mu = Pr). The chamber H_c = 7.558 delta_D. `nozzle_react.py
+design --cells 15 --ny 16 --ystar-cells 12 --lc-cells 468 --cd CD --cd-geom G`; compensated FP64, `--shock hll`,
+`--upstream 12`, `--wrinkle 0.005`, tt 50.
+
+**The claim is a half-domain claim** (R3). The axis is a `symmetryPlane`: the lowest transverse mode the domain carries
+is cos(pi r/H_c), lambda_1 = 2 H_c = 15.12 delta_D = 0.65 lambda_c (MM 23.11; 0.72 of the measured ~21): DL-stable
+(s_MM -0.258/tau). The antisymmetric family (lambda 4 H_c = 30.2 delta_D, s_MM +0.057) is excluded by the domain: this
+rig does NOT show that a full 2 H_c channel holds a planar front (it is DL-unstable); a 3D-valid planar statement needs
+H < lambda_c/4. The run label says so: ` [half-domain: transverse modes even about the symmetry plane only]` (multi-row
+`[nozzle]` mesh with a `symmetryPlane`/`symmetry` patch; run label only, the `--dry-run` reads no cells).
+
+**What was built** (byte-neutral off: one-row rows and `dns flow` unchanged, bit subset vs dns.BASE):
+- `[nozzle] cd` (dns flame only; `dns flow`: exit 2 `--bc: [nozzle].cd is the reacting nozzle's design (dns flame)`;
+  outside (0, 1]: exit 3 `[nozzle].cd: must be in (0, 1]`): the throat passes cd x the ideal choked flux, so the design
+  runs on the EFFECTIVE ratio `A_ref / astar / cd` (cd 1 divides by 1.0: bytes). The dry-run prints `nozzle     cd X`
+  only when given; `bc.sections` carries ` cd X` (a restart with a changed cd is exit 3 naming `[nozzle]`).
+- The multi-row chamber (`fvNozzleShapeOf`: some chamber bin holds >= 2 cells; H_c the highest Wall-role face of a
+  chamber cell along lift): the chamber profile at `t(s - xf - seed cos(pi r/H_c))`, seed = `--wrinkle A` x delta_th
+  (seed 0 = the one-row body bit for bit, `fvref_react` S5d); the nozzle half carries the generator's 2D
+  `v = u r dA_b/A_b` (np.gradient over the bin centres; 2.95e-12 of max |v| off the generator's formula).
+  `--wrinkle` on a `[nozzle]` flame polyMesh (compressible, `--shock hll`): lowest mode only;
+  `--wrinkle-modes`: exit 2 `--wrinkle-modes: a [nozzle] chamber seeds its lowest transverse mode only`; a one-row
+  chamber: exit 3 `--wrinkle: the [nozzle] chamber has one row: no transverse mode`; a wedge (S6a): exit 2.
+- `xIa1 xIa2`, last in `_stats.csv` on a multi-row chamber: `xIa_n = 2 sum_chamber V rhoY cos(n pi r/H_c) / (rhoY_ref
+  A_ref)` (`fvFrontAmplitudes`, Neumaier, FP64): a cos front of amplitude A reads A to 1e-14, a planar front 6e-15
+  (host and device).
+- Tools: `nozzle_react.py design --ny --ystar-cells --lc-cells --cd --cd-geom`, `report` (G6.4, G6.5 on a multi-row
+  run), `front` (C6), `pair` (G6.2); `test_gpu_fv_nozzle reacttwinrow NX NY LC EPS_C RE PA T` (the twin of any rows:
+  2D from the generator's 2D IC with a 1.5 H_c stub, LC 9.25 y*; 1D lc 0, the q1d IC) and `react2d` (the smoke).
+
+**The cd fixed point** (R-c): twins at eps_c0 (I2D0: Cd 0.95560 over [500, 600] t*, not yet settled; I1D0 0.968945,
+|ratio - 1| 1.4% < 2%: the 1D rig shares the 2D chamber); the chamber sized on 0.9556011729 (eps_c 5.898832200966407,
+H_c 7.558); final twins at it, Re* 18.878428964101555, pa 0.010037142353160357: **I2D** (231 x 16, tt 1200 t*: the 2D
+twin's stub fills on ~130 t*, 600 t* left |out/in - 1| 8.5e-5) Cd 0.9574411023, CfVac 1.3428190014 over [1100, 1200] t*
+(|out/in - 1| 5.8e-8); **I1D** (120 x 1, tt 600) Cd 0.9695943560, CfVac 1.3645127976; I2D inviscid (reported) did
+NOT settle (|out/in - 1| ~1e-3 at 1200 t*, an unsteady 2D supersonic field): Cd ~0.9937, CfVac ~1.426. The viscous
+loss at Re* 19: Cd -4.3% (2D), -3.0% (1D). R2D runs cd 0.9574411023 (u_d 0.99643: the residual drift sigma(u_d - S_c)
+~0.01/tau), R1D cd 0.9695943560 on the same chamber (u_d 1.00907: the 1D flame drifts downstream at 0.075/tau, 3.7
+delta_D in 50 tau; u_u 1.07 in the chamber, N12's rule).
+
+**Measured** (R2D 775 548 steps, 0.475 ms/step, dt 6.45e-5 tau, 368 s; R1D 506 210 steps, 0.272 ms/step, 138 s; rule
+window from `modes`: t_e 6.994, P_model 7.785, e-fold 21.54; the u_u fit refused (resid/amp 0.739, amplitude 2.1e-3):
+P_model, k 4, W [18.860, 50]):
+
+| gate | R2D (588 x 16) | R1D (588 x 1, reported) | band |
+|---|---|---|---|
+| G6.1 = G4.1f | 1.86e-16, last 10% / rows 10-20% 0.81; control (Omega dropped) 0.42 | 1.45e-16, 0.90 | 1e-13, 4; ctrl >= 1e-6 |
+| G4.2 S_c - S_L,num | -8.66e-5 | -9.74e-6 | 5e-4 |
+| G4.3 endpoint x_f' vs u_u - S_c | +2.88e-5 (x_f' +0.0101) | -1.27e-4 | 2e-3 S_L |
+| G4.4 T0b; fuel | +2.07e-5; 0.0 | +6.09e-5; 0.0 | 1e-4; 1e-8 |
+| G4.5 dCd (throat) / dCf vs its twin | +5.93e-6 (exit +5.73e-6) / -1.19e-6 | -4.57e-6 / -8.25e-6 | 1e-4 |
+| G6.3 = G4.6 p0b; mdot = burn + storage | -1.22e-7; +1.171e-5 = -6.8e-8 + 1.18e-5 (ident -1.2e-16) | +2.73e-5; +4.34e-5 | 4.9e-4; 1e-4; 1e-9 |
+| G6.3 control: p0b/p0u - 1 with no heat release | 4.916e-3 | 4.895e-3 | >= 4.9e-3 |
+| G4.8 shockCells | **1 on every row (byte 13): UNMET** | 0 | 0 |
+| G4.11 ring fit | refused (resid/amp 0.739): not evaluable | refused (0.165) | 3% / 15% |
+| G4.12 a / b | +1.82e-10 / -1.65e-4 at [4.5, 8.5] | -1.10e-10 / **-1.11e-3** | 1e-6 / 3e-4 |
+| G6.4a slope ln\|xIa1\| over [2.00, 16.99] | -0.1066/tau (s_MM(2 H_c) -0.258, measured-lambda_c estimate -0.190) | - | <= -0.03 |
+| G6.4b max_W max(\|xIa1\|, \|xIa2\|) | 7.98e-4 (t_s value 9.61e-4; band 1.06e-3) | - | max(1.1 t_s, 1e-4) |
+| G6.5a P_T1 = 2 H_c/c_u | 0.635 tau (burnt 0.284) vs \|W\|/20 1.557 | - | <= \|W\|/20 |
+| G6.5b W - P_T1/2: dCd, dCf, mdot, p0b moves | -2.7e-7, +1.9e-7, -2.6e-6, -4.2e-8 | - | band/10 |
+
+G6.2 (`pair`): Delta_2D (Cd, Cf, mdot) = (+5.93e-6, -1.19e-6, +5.73e-6), Delta_1D = (-4.57e-6, -8.25e-6, -3.33e-6):
+|Delta_2D - Delta_1D| = **1.05e-5, 7.06e-6, 9.06e-6** (band 1e-4: met); K5's Delta_1D +1.05e-6 beside; control
+|Cd_R2D - Cd_I1D| 1.22e-2 >= 1e-3 (live); the W shift moves them <= 2.7e-7. The front: xIa1 8.0e-3 (the seed, 0.005
+delta_th) -> 9.6e-4 at t_s -> 4.9e-5 at 50; xIa2 <= 1.7e-6. The decay is half MM's rate (-0.107 vs -0.258/tau;
+pre-registered ~-0.2): the measured-lambda_c law reads -0.19; the 4.6:1 chamber cells (dy 0.47, dx 0.107 delta_D)
+are the stated suspect (risk 8), not resolved here.
+
+**G4.8 decomposed**: the one sensed cell is the EXIT column's row 13 of 16 (C (62.73, 2.16), byte 13 of 255, p 50.8;
+`test_fvshock sensed` on a t-1 checkpoint): the cosine divergent ends concave (y'' = -(eps_e - 1) pi^2/(2 Ldiv^2) at
+the exit), its turning-back compression along the wall reads a stride-2 jump on the radial line at the exit plane.
+Supersonic: it cannot reach the throat or the chamber; its HLL share sits in one exit cell's face fluxes, so it enters
+the vacuum thrust through `I_exit` only, and the 2D twin carries the same contour. The one-row rig senses 0 (no radial
+line); a 4-row smoke senses 0.
+
+**C6, the control** (H_c = lambda_c = 23.07 delta_D: y* 35 h, 818 x 32, `--wrinkle 0.02`, cd 1, tt 30, no twin; 408 634
+steps, 0.596 ms/step, 244 s): lambda_1 = 2 H_c = 46.14 = 2 lambda_c, MM's fastest mode (s_MM +0.0798, measured-lambda_c
+law +0.0871, G2b 0.0884). The slope of ln xIa1 over [8, 30] is **+0.1110/tau** (band [0.040, 0.120]: met; pre-registered
++0.08-0.09: high by 25-40%); xIa1 0.032 -> 1.77 delta_D, xIa2 grows at +0.22 (the harmonic). It breaks both G6.4
+bounds as required: G6.4a over [2, t_s 18.68] +0.150/tau (> -0.03), G6.4b max_W 1.77 vs 0.63. Cd 1 on a Re* 55 throat
+(Cd ~0.98) drifts the flame upstream (x_f 19.2 -> 15.4) and rings u_u +-0.1: the growth rides that; the control's
+own G4 is not gated. (A first C6 job was killed at t 15.5 by the 18:16 amdgpu reset, rc 135, discarded; the rerun
+reproduced its 1058 rows byte for byte.)
+
 ## Not built, refused
 
 `--steady` (LTS on `Total` stalls on the host, Z7), LES, RANS, two-reactant species (C1, C2b), gravity, body force,
-`--turb`: refused by name (`dns/fvmodules`, axis `capture`). Plume box (P7), 2D / wedge reacting nozzles (P6), viscous
+`--turb`: refused by name (`dns/fvmodules`, axis `capture`). Plume box (P7), the wedge reacting nozzle (P6b; the 2D
+planar half-nozzle is built, P6a above), viscous
 walls (P7), Shock x C1 / C2b (P8), gamma(T) (P9): next cycle. Structured D3: no. `[thrust]` with checkpoints: built
 (combscale S1, "Thrust" above); `[thrust].station` on `dns flow`: refused (the reacting nozzle's burnt station).
 `--inflow-speed` on a `[nozzle]` flame: exit 2 (the throat sets u_u). A `[nozzle]` flame whose mesh has no throat (eps_c
@@ -523,5 +612,9 @@ CLAUDE.md carries masterplan_combclose 7 (combscale S4). The rest, for the user:
 - **Under `--shock` species ride the FINAL F[0]** (the species face pass after the shock face pass); never upwind on
   the KG mass flux (it breaks uniform Y), never `D Y_f(sign m_KG)` (unbounded: piston min Y -1.08e-2). D3 on a flame
   is order h^3 in S_L (G3.3).
+- **A planar `[nozzle]` half-nozzle claims only the transverse modes even about its axis** (combscale S5, R3): its run
+  label says `[half-domain ...]`; a full channel's antisymmetric mode is twice as long. `[nozzle] cd` makes the design
+  effective (`A_ref/(cd A*)`); cd absent is the shipped design bit for bit; a multi-row chamber's IC carries the
+  generator's 2D v in the nozzle half and seeds only cos(pi r/H_c).
 - **A foam parity gap is a two-sided number.** In the supersonic cone foam at vanLeer holds p0 to -9.7e-4 at 320 x 64
   and dns to -6.9e-5: the gap is mostly foam's.

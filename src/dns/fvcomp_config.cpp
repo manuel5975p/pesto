@@ -187,7 +187,14 @@ std::expected<FvNozzleSpec, std::string> parseNozzle(const toml::table& t)
             for (std::size_t i = 0; i < 3; ++i) n.axis[i] = (*a)[i] / m;
             continue;
         }
-        if (key != "p" && key != "t" && key != "astar") return Err("[nozzle]: unknown key '" + key + "' (p, t, astar, axis)");
+        if (key == "cd") {
+            double x = 0;
+            if (!number(v, x) || !(x > 0.0 && x <= 1.0)) return Err("[nozzle].cd: must be in (0, 1]");
+            n.cd = x;
+            n.hasCd = true;
+            continue;
+        }
+        if (key != "p" && key != "t" && key != "astar") return Err("[nozzle]: unknown key '" + key + "' (p, t, astar, axis, cd)");
         double x = 0;
         if (!number(v, x) || !(x > 0)) return Err("nozzle." + key + ": must be a finite number > 0");
         (key == "p" ? n.p : key == "t" ? n.t : n.astar) = x;
@@ -297,6 +304,8 @@ std::string FvBcSpec::describe() const
         if (p.tallied) s += ", in the force tally";
         s += "\n";
     }
+    if (nozzle && nozzle->hasCd)
+        s += std::format("  nozzle     cd {:.10g}: the throat's discharge coefficient (the design on A_ref / (cd A*))\n", nozzle->cd);
     if (thrust)
         s += std::format("  thrust     pa {:g} (a ratio, as [nozzle] p): the impulse ledger, PREFIX_thrust.csv (docs/nozzle.md \"Thrust\")\n", thrust->pa);
     return s;
@@ -306,7 +315,8 @@ std::string fvBcCheckpointSections(const FvBcSpec& spec)
 {
     std::string s;
     if (const auto& z = spec.nozzle)
-        s += std::format("[nozzle] astar {} axis {} {} {}\n", z->astar, z->axis[0], z->axis[1], z->axis[2]);
+        s += std::format("[nozzle] astar {} axis {} {} {}{}\n", z->astar, z->axis[0], z->axis[1], z->axis[2],
+                         z->hasCd ? std::format(" cd {}", z->cd) : std::string());
     if (const auto& t = spec.thrust)
         s += std::format("[thrust] pa {}{}\n", t->pa, t->station ? std::format(" station {}", *t->station) : std::string());
     return s;

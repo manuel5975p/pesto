@@ -19,6 +19,14 @@
 namespace dns::cfg {
 namespace {
 
+// combscale S5: --wrinkle reaches a [nozzle] flame polyMesh (compressible, --shock hll), its chamber's lowest
+// transverse mode; everywhere else on --polymesh it is refused as before.
+bool nozzleWrinkle(const RawConfig& r)
+{
+    return r.given.contains("--polymesh") && r.physics != Physics::LowMach && r.shock == ShockMode::Hll && r.fvBc &&
+           r.fvBc->nozzle.has_value();
+}
+
 // The 1D freely propagating premixed flame (docs/chem.md): model C0, the
 // oracle eigenvalue resolved HERE (pure FP64, ~0.1 s) so the grid is counted
 // in the oracle's own thermal thickness and --dry-run prints Lambda.
@@ -130,6 +138,13 @@ std::optional<ConfigError> checkFvFlame(const RawConfig& r)
                                  "an isothermal wall patch)"))
             return e;
         return rejectGiven(r, {"--downstream", "--ny", "--nz", "--wrinkle", "--wrinkle-modes"},
+                           "does not apply with --polymesh: the mesh is the case");
+    }
+    // combscale S5: --wrinkle A seeds a multi-row [nozzle] chamber's lowest transverse mode (the hll route's).
+    if (poly && nozzleWrinkle(r)) {
+        if (r.given.contains("--wrinkle-modes"))
+            return ConfigError{2, "--wrinkle-modes", "a [nozzle] chamber seeds its lowest transverse mode only"};
+        return rejectGiven(r, {"--cells-per-delta", "--downstream", "--ny", "--nz", "--cells-per-unit", "--length"},
                            "does not apply with --polymesh: the mesh is the case");
     }
     if (poly)
@@ -476,10 +491,12 @@ std::expected<Case, ConfigError> validateFlame(const RawConfig& r, Case c)
         return bad(2, "--wrinkle", "must be finite and >= 0 (thermal thicknesses)");
     if (r.given.contains("--wrinkle-modes") && !r.given.contains("--wrinkle"))
         return bad(2, "--wrinkle-modes", "needs --wrinkle");
-    if (r.wrinkle > 0 && (r.wrinkleModes < 1 || 8 * r.wrinkleModes > r.ny))
+    // combscale S5: a [nozzle] chamber's seed is one mode on the mesh's rows (the run checks it has two).
+    const bool oneMode = nozzleWrinkle(r);
+    if (!oneMode && r.wrinkle > 0 && (r.wrinkleModes < 1 || 8 * r.wrinkleModes > r.ny))
         return bad(2, "--wrinkle-modes", "must be in [1, ny/8] (8 cells per "
                                          "shortest seeded wavelength)");
-    if (r.wrinkle > 0 && r.wrinkle * std::sqrt(double(r.wrinkleModes)) >
+    if (r.wrinkle > 0 && r.wrinkle * std::sqrt(double(oneMode ? 1 : r.wrinkleModes)) >
                              std::min(r.upstream, r.downstream) / 2)
         return bad(2, "--wrinkle", "peak displacement A sqrt(N) must stay "
                                    "within half of --upstream and --downstream");

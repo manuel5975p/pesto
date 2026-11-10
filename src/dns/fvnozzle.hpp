@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -175,14 +176,38 @@ std::expected<FvReactingDesign, std::string> fvReactingNozzleDesign(double gamma
 // The supersonic (sup) or subsonic Mach number of area ratio ar >= 1 (bisection; ar <= 1 gives 1).
 double fvAreaMach(double ar, double gamma, bool sup);
 
+// A multi-row planar [nozzle] chamber (combscale S5): r = (C - origin).lift; Hc = max over Wall-role faces owned by
+// chamber cells of (Cf - origin).lift; seed = --wrinkle A times delta_th (0: planar).
+struct FvNozzleShape
+{
+    std::array<double, 3> origin{}, lift{0, 1, 0};
+    double Hc = 0, seed = 0;
+};
+
+// The shape of a [nozzle] flame mesh: nullopt on a one-row chamber (no chamber bin holds two cells).
+// Pre: probe.spec().chamber, roles = fvRoles of fm. Post: Hc > 0 when set.
+std::optional<FvNozzleShape> fvNozzleShapeOf(const FaceMesh& fm, const FvFlameProbe& probe, std::span<const FvRole> roles,
+                                             const std::array<double, 3>& origin, const std::array<double, 3>& lift);
+
+// The front's transverse amplitudes on the chamber (combscale S5, G6.4): xIa_n = 2 sum_chamber V rhoY cos(n pi r/Hc) /
+// (rhoY_ref A_ref), n = 1, 2, in length units; rhoY_ref, A_ref the probe's S_L normalisation (its reference slab's mean
+// rho Y - yBurnt rho, probe.area()). Neumaier sums in ascending cell order, FP64. A planar front reads ~1e-16 x_I; a
+// front displaced by a cos(pi r/Hc) reads xIa1 = a. Pre: s holds the fuel row.
+std::array<double, 2> fvFrontAmplitudes(const FaceMesh& fm, const FvFlameProbe& probe, const FvNozzleShape& shape,
+                                        const FvState& s);
+
 // The reacting nozzle's IC (masterplan_combnozzle P4, masterplan_combclose 2.1): per slab of a chamber probe its
 // area A = V_slab/h; the chamber bins on the Rayleigh line of the design's (m, P, H): p + m u and cp T + u^2/2 +
 // q (1 - Y) conserved (fvRayleighBurnt at q (1 - Y)), Y = (sigma - t)/(sigma - 1) from the flame's T/Tu profile
 // t(s - xf) (s from the probe's low end); Y 0 is d.b. Every later slab burnt and isentropic at (d.b.p0b, d.b.T0b),
 // subsonic up to the least-area slab (fvThroatBin), supersonic past it, M of A/astar, Y 0. Pre: probe.spec().chamber,
 // d from fvReactingNozzleDesign.
+// shape (combscale S5, a multi-row planar chamber): the chamber's profile at t(s - xf - seed cos(pi r/Hc)); the
+// nozzle half carries v = u r dA_b/A_b along lift (dA_b central over the bin centres, one-sided at the ends: the
+// generator's u y_w' r/y_w), E += rho v^2/2. nullptr: the one-row body verbatim (v 0).
 FvState fvReactingNozzleIC(const FaceMesh& fm, const FvFlameProbe& probe, const FvReactingDesign& d,
-                           const std::function<double(double)>& t, double xf, double astar);
+                           const std::function<double(double)>& t, double xf, double astar,
+                           const FvNozzleShape* shape = nullptr);
 
 // Per probe bin its area V_bin/h (cells summed in ascending order): the IC's slab areas.
 std::vector<double> fvBinAreas(const FaceMesh& fm, const FvFlameProbe& probe);

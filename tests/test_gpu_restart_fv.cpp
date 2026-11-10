@@ -52,8 +52,8 @@
 //           zeroed (each non-zero before) moves _thrust.csv
 //   reject  on a one-job thrust64 checkpoint (exit 3, outputs untouched): [thrust] pa changed,
 //           [thrust] removed, [nozzle] astar one ulp off (each named by its section, before the
-//           --bc sha), a comment line appended (the mesh identity); a thrust64c checkpoint into
-//           thrust64 (--compensated by name)
+//           --bc sha), a comment line appended (the mesh identity), [nozzle] cd = 1 added
+//           (combscale S5: named by [nozzle]); a thrust64c checkpoint into thrust64 (--compensated by name)
 //   loop.shockHot (--shock hll's sticky dt cadence) has no CLI-reachable teeth: the nozzle's
 //   sensor marks 0 cells over these runs, so it stays false; carried all the same.
 //
@@ -519,15 +519,19 @@ void thrust()
         return s;
     };
     const std::string thrustBlock = "[thrust]\npa = 0.01\nstation = 46.768209200000001\n";
+    // combscale S5: [nozzle] cd joins the section line (a cd added is named by [nozzle]).
     const std::string variants[] = {edited("pa = 0.01", "pa = 0.02"), edited(thrustBlock, ""),
                                     edited("astar = 4.9971511200000007", "astar = 4.9971511200000016"),
-                                    orig + "# a comment\n"};
+                                    orig + "# a comment\n",
+                                    edited("astar = 4.9971511200000007\n", "astar = 4.9971511200000007\ncd = 1\n")};
     rejects(kRoot + "/reject_thrust", t64, 0.25,
             {{"[thrust] pa 0.01 -> 0.02", t64, 3,
               "the --bc file's [thrust] differs from the checkpoint's: pa 0.01 station 46.7682092 vs pa 0.02 station 46.7682092"},
              {"[thrust] removed", t64, 3, "the --bc file's [thrust] differs from the checkpoint's: pa 0.01 station 46.7682092 vs (absent)"},
              {"[nozzle] astar one ulp off (its 17th digit)", t64, 3, "the --bc file's [nozzle] differs from the checkpoint's: astar 4.997151120000001"},
-             {"a comment line appended to the --bc file", t64, 3, "the mesh differs from the checkpoint's"}},
+             {"a comment line appended to the --bc file", t64, 3, "the mesh differs from the checkpoint's"},
+             {"[nozzle] cd = 1 added", t64, 3,
+              "the --bc file's [nozzle] differs from the checkpoint's: astar 4.997151120000001 axis 1 0 0 vs astar 4.997151120000001 axis 1 0 0 cd 1"}},
             [&](int i, bool on) { std::ofstream(bcFile, std::ios::trunc) << (on ? variants[i] : orig); });
     rejects(kRoot + "/reject_thrust_c", t64c, 0.25,
             {{"a compensated FP64 [thrust] checkpoint into a plain FP64 run", t64, 3, "--compensated"}}, [](int, bool) {});

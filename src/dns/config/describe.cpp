@@ -512,7 +512,13 @@ std::string Case::describeCase() const
                            flameEig.dthOverDD, premixText, tEnd, cfl, fvPrecisionName(fvPrecision),
                            fvCompensatedSuffix(fvPrecision, compensated), flameXf0,
                            // masterplan_combnozzle P4: the throat sets u_u (the composition design, at the run).
-                           fvBc.nozzle ? std::string("set by the throat ([nozzle]: the composition design)")
+                           fvBc.nozzle ? std::string("set by the throat ([nozzle]: the composition design)") +
+                                             // combscale S5: the multi-row chamber's seed (the run checks the rows).
+                                             (flameWrinkle > 0
+                                                  ? std::format("; --wrinkle {:g} delta_th: the chamber front at "
+                                                                "x_f + A cos(pi r/H_c), its lowest transverse mode",
+                                                                flameWrinkle)
+                                                  : std::string())
                                        : std::format("{:g}", flameUIn),
                            outPrefix, fvBc.describe());
     }

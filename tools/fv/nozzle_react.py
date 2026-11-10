@@ -13,7 +13,13 @@ constant-area chamber holding a planar C0 flame, a choked cosine nozzle, a riema
       reference (p0, t0 ratios 1), rest at it (no ramp); prints Re* = rho0b c0b y*/mu (flame units, mu = Pr) for --re:
       dns flow --physics compressible --polymesh TDIR --bc TDIR/bc.toml --shock hll --mach 1 --re RE --prandtl 0.72
       --fv-precision fp64 --tt T (the inviscid twin: --inviscid for --re)
-  nozzle_react.py argv DIR [--tt T] [--compensated]   the dns flame argv of a design (for simjob)
+      combscale S5 (P6a): --ny N --ystar-cells K --lc-cells L: the multi-row planar rig (y* = K h, Lc = L h, nx = L +
+      10 K, N rows, the axis a symmetryPlane); --cd X [--cd-geom G]: [nozzle] cd = X, the chamber cd x eps_c0 (or G x
+      eps_c0); design.json gains lc, ny, cd (absent in old dirs: 1, 1, 1 -- their reports are byte-equal)
+  nozzle_react.py argv DIR [--tt T] [--compensated] [--wrinkle A]   the dns flame argv of a design (for simjob)
+  nozzle_react.py front PREFIX --fit A B [--band LO HI] [--dl HC]   the slope of ln|xIa1|, ln|xIa2| (C6)
+  nozzle_react.py pair --r2d JSON --i2d CD CF --r1d JSON --i1d CD CF   G6.2: (reacting - inert) 2D vs 1D off two
+      report --json files (W and the G6.5b shift) and the twins' Cd (exit ledger flux), CfVac
   nozzle_react.py modes DIR
       the chamber's linear acoustic modes (masterplan_combclose 2.4 step 6): P1, e-fold1, P2, e-fold2, the entropy transit
       t_e (x_f0 -> throat), t_flush (-> exit), and the controls (p-node inlet; compact nozzle at the chamber's end);
@@ -24,6 +30,8 @@ constant-area chamber holding a planar C0 flame, a choked cosine nozzle, a riema
       rule window W = [tt - k P, tt] (2.4: t_s = t_e + 10, P the ring fitted on uFresh over [t_s, tt] or the model's, k =
       floor((tt - t_s)/P) >= 1, else exit 1); every rate an endpoint ledger difference; [20, 80], [40, 80] beside as
       legacy. The 1D reference: S_L,num and its fresh state (window means of the 1D --shock hll run at the same M, gamma, h)
+      A multi-row run (xIa1 xIa2 in _stats.csv, combscale S5) adds G6.4a (ln|xIa1| slope over [2, t_s]), G6.4b (max on W),
+      the DL numbers (H_c/lambda_c, s_MM(2 H_c)), G6.5a (P_T1 = 2 H_c/c_u vs |W|/20) and G6.5b (W - P_T1/2 moves)
 
 q is the SOLVER's heat release cp (sigma - 1) Tu (masterplan_combnozzle R5): T0b = T0u + (sigma - 1) Tu, never sigma T0u.
 Python twin of dns/fvnozzle fvReactingNozzleDesign (test_fvref react pins the two to 1e-12).
@@ -171,25 +179,43 @@ def meshNx(cells):
 
 
 def cmdDesign(a):
-    nx, h, S = meshNx(a.cells)
-    epsC, Mu, p0, t0 = inverse(a.gamma, a.mach, a.target * a.sl)
-    y, x0, x2 = nozzle_mesh.reactContour(epsC, a.eps_e, LC, LCON, LDIV, S)
-    X, Y = nozzle_mesh.quadMesh(nx, 1, y, x0, x2)
+    lc = LC
+    if a.ystar_cells is None:
+        if a.lc_cells is not None:
+            raise SystemExit("--lc-cells needs --ystar-cells")
+        nx, h, S = meshNx(a.cells)
+    else:
+        # combscale S5: y* = K h, Lc = L h (columns), nx = L + K (Lcon + Ldiv); the chamber ends on a node.
+        if a.lc_cells is None:
+            raise SystemExit("--ystar-cells needs --lc-cells")
+        h = DTH / a.cells
+        S = a.ystar_cells * h
+        lc = a.lc_cells / a.ystar_cells
+        nx = a.lc_cells + round(a.ystar_cells * (LCON + LDIV))
+    epsC0, Mu, p0, t0 = inverse(a.gamma, a.mach, a.target * a.sl)
+    # [nozzle] cd (combscale S5): the chamber is cd x eps_c0 (A_c/A* = cd eps_c0 at fixed u_u); dns divides by cd.
+    # --cd-geom G: the chamber sized on G (the fixed point's first twin), cd the final twin's.
+    if a.cd_geom is not None and a.cd is None:
+        raise SystemExit("--cd-geom needs --cd")
+    epsC = epsC0 if a.cd is None else (a.cd if a.cd_geom is None else a.cd_geom) * epsC0
+    y, x0, x2 = nozzle_mesh.reactContour(epsC, a.eps_e, lc, LCON, LDIV, S)
+    X, Y = nozzle_mesh.quadMesh(nx, a.ny, y, x0, x2)
     os.makedirs(a.out, exist_ok=True)
     nozzle_mesh.writePolyMesh(a.out, X, Y)
     astar = S * DEPTH
-    station = S * LC - 2 * DTH
+    station = S * lc - 2 * DTH
     with open(os.path.join(a.out, "bc.toml"), "w") as f:
         f.write(f"# tools/fv/nozzle_react.py design --cells {a.cells} --mach {a.mach} --gamma {a.gamma} --sl {a.sl!r} --target {a.target!r}: "
                 f"eps_c {epsC!r}, M_u {Mu!r}\n")
         f.write("[reference]\ndirection = [1, 0, 0]\nlift = [0, 1, 0]\n\n")
-        f.write(f"[nozzle]\nastar = {astar:.17g}\n\n")
+        f.write(f"[nozzle]\nastar = {astar:.17g}\n" + ("" if a.cd is None else f"cd = {a.cd:.17g}\n") + "\n")
         f.write(f"[thrust]\npa = {a.pa:.17g}\nstation = {station:.17g}\n\n")
         f.write(f'[patch.inlet]\ntype = "total"\np0 = {p0:.17g}\nt0 = {t0:.17g}\ny = [1.0]\n\n')
         f.write(f'[patch.outlet]\ntype = "outflow"\nexit = "riemann"\np = {a.pa:.17g}\ntback = 1\ny = [0.0]\n\n')
         f.write('[patch.wall]\ntype = "slip"\n\n[patch.axis]\ntype = "slip"\n')
     meta = dict(cells=a.cells, mach=a.mach, gamma=a.gamma, sl=a.sl, target=a.target, nx=nx, h=h, scale=S, epsC=epsC, epsE=a.eps_e, Mu=Mu,
-                p0=p0, t0=t0, astar=astar, station=station, pa=a.pa, upstream=a.upstream)
+                p0=p0, t0=t0, astar=astar, station=station, pa=a.pa, upstream=a.upstream, lc=lc, ny=a.ny,
+                cd=1.0 if a.cd is None else a.cd)
     with open(os.path.join(a.out, "design.json"), "w") as f:
         json.dump(meta, f, indent=1)
     print(json.dumps(meta))
@@ -204,6 +230,8 @@ def cmdArgv(a):
         argv += ["--gamma", repr(m["gamma"])]
     if a.compensated:
         argv += ["--compensated"]
+    if a.wrinkle is not None:
+        argv += ["--wrinkle", repr(a.wrinkle)]
     print(" ".join(argv))
 
 
@@ -271,7 +299,11 @@ class Rig:
         self.g, self.cp, self.q = g, u["cp"], u["q"]
         Tu = u["Tu"]
         self.T0u, self.p0u = m["t0"] * Tu, m["p0"] * Tu
-        d = design(g, 1.0, self.cp, self.q, SIGMA, m["epsC"], m["epsE"], self.p0u, self.T0u)
+        # combscale S5: [nozzle] cd -- the model nozzle is the EFFECTIVE one, eps_c / cd (the solver's design ratio; the
+        # viscous throat as an area loss); cd absent: 1, eps_c / 1.0 (the old reports' bytes).
+        self.cdN = m.get("cd", 1.0)
+        epsEff = m["epsC"] / self.cdN
+        d = design(g, 1.0, self.cp, self.q, SIGMA, epsEff, m["epsE"], self.p0u, self.T0u)
         self.d = d
         self.Tu, self.pu, self.rhou, self.uu = d["Tu"], d["pu"], d["rhou"], d["uu"]
         self.cu = math.sqrt(g * self.Tu)
@@ -279,8 +311,10 @@ class Rig:
         self.ub, self.pb, self.Tb, self.T0b, self.p0b = b["ub"], b["pb"], b["Tb"], b["T0b"], b["p0b"]
         self.rhob, self.cb = self.pb / self.Tb, math.sqrt(g * self.Tb)
         S = m["scale"]
-        self.Lc, self.Lcon, self.Ldiv = LC * S, LCON * S, LDIV * S
-        self.epsc, self.epse = m["epsC"], m["epsE"]
+        self.Lc, self.Lcon, self.Ldiv = m.get("lc", LC) * S, LCON * S, LDIV * S
+        self.epsc, self.epse = epsEff, m["epsE"]
+        # The chamber half-height (planar: A_c = H_c x depth) and the rows (combscale S5).
+        self.Hc, self.ny = m["epsC"] * S, m.get("ny", 1)
         self.xf = m["upstream"] * DTH
         self.xth, self.xexit = self.Lc + self.Lcon, self.Lc + self.Lcon + self.Ldiv
 
@@ -715,6 +749,8 @@ def gates(a):
         o["G4.11"].update(ok=None, note=f"ring below the fit floor (amplitude {fit.get('amp', math.nan):.3e}): {fit.get('why', '')}")
     mW = o["W"]["G4.5"]["mdotOut"]
     o["G4.12"] = g412(th, rig, te, mW)
+    if "xIa1" in st:
+        o.update(frontGates(m, rig, st, th, W, ts, a, twin))
     if a.start:
         s = readCsv(a.start + "_stats.csv"), readCsv(a.start + "_thrust.csv")
         sw = windowGates(m, rig, s[0], s[1], W[0], W[1], a.sl1d, a.p1d, a.t1d, None)
@@ -727,6 +763,122 @@ def gates(a):
         res["window"] = sw["window"]
         o["G4.7b"] = res
     return o
+
+
+# --- combscale S5 (P6a): the multi-row chamber's front (G6.4), the window's transverse check (G6.5), the pairing (G6.2) ----
+
+DL_A, DL_B = 1.173599, 4.316885  # the chamber DL dispersion s = A k - B k^2 per tau (docs/chem.md; lambda_c 23.1116)
+LAMBDA_C_MEAS = 21.0             # the measured lambda_c (docs/chem.md)
+K5_D1D = 1.05e-6                 # K5's Delta_1D (masterplan_combscale G6.2)
+
+
+def sDL(lam, lamC=None):
+    """The DL growth rate at wavelength lam: MM's, or the same law with B rescaled to the cut-off lamC."""
+    k = 2 * math.pi / lam
+    B = DL_B if lamC is None else DL_A * lamC / (2 * math.pi)
+    return DL_A * k - B * k * k
+
+
+def logSlope(t, x, a, b, floor=1e-12):
+    """LSQ slope of ln|x| over a <= t <= b, the rows up to the first |x| < floor; (slope, rows, t range)."""
+    tt, ll = [], []
+    for ti, xi in zip(t, x):
+        if ti < a - 1e-12 or ti > b + 1e-12:
+            continue
+        if abs(xi) < floor:
+            break
+        tt.append(ti)
+        ll.append(math.log(abs(xi)))
+    if len(tt) < 3:
+        return math.nan, len(tt), [math.nan, math.nan]
+    return slope(tt, ll), len(tt), [tt[0], tt[-1]]
+
+
+def dlPrint(rig):
+    """The R3 numbers: H_c/lambda_c (theory, measured), lambda_1 = 2 H_c, s_MM(lambda_1), the full-domain bound."""
+    Hc = rig.Hc
+    return dict(Hc=Hc, Hc_over_lc_MM=Hc / (2 * math.pi * DL_B / DL_A), Hc_over_lc_meas=Hc / LAMBDA_C_MEAS, lambda1=2 * Hc,
+                s_MM_lambda1=sDL(2 * Hc), s_meas_lambda1=sDL(2 * Hc, LAMBDA_C_MEAS), lambda_antisym=4 * Hc,
+                s_MM_antisym=sDL(4 * Hc), full_domain_note="a full 2 H_c channel carries lambda = 4 H_c (antisymmetric), "
+                                                            "excluded here; a 3D-valid planar statement needs H < lambda_c / 4")
+
+
+def frontGates(m, rig, st, th, W, ts, a, twin):
+    """G6.4a/b and G6.5 on a multi-row run (masterplan_combscale 2.12)."""
+    t, x1, x2 = st["t"], st["xIa1"], st["xIa2"]
+    o = {}
+    s1, n1, rng = logSlope(t, x1, 2.0, ts)
+    o["G6.4a"] = dict(slope=s1, rows=n1, range=rng, band=-0.03, ok=s1 <= -0.03, dl=dlPrint(rig))
+    i0 = snap(t, ts)
+    ref = max(abs(x1[i0]), abs(x2[i0]))
+    w = [max(abs(p), abs(q)) for ti, p, q in zip(t, x1, x2) if W[0] - 1e-12 <= ti <= W[1] + 1e-12]
+    bnd = max(1.1 * ref, 1e-4)
+    o["G6.4b"] = dict(max_W=max(w), at_ts=ref, band=bnd, ok=max(w) <= bnd)
+    # G6.5a: the transverse acoustic period 2 H_c / c_u against |W| / 20.
+    PT1 = 2 * rig.Hc / rig.cu
+    o["G6.5a"] = dict(P_T1=PT1, P_T1_burnt=2 * rig.Hc / rig.cb, W=W[1] - W[0], band=(W[1] - W[0]) / 20,
+                      ok=PT1 <= (W[1] - W[0]) / 20)
+    # G6.5b: W shifted by -P_T1/2; every gated rate moves by <= its band / 10.
+    sw = windowGates(m, rig, st, th, W[0] - PT1 / 2, W[1] - PT1 / 2, a.sl1d, a.p1d, a.t1d, twin)
+    pw = windowGates(m, rig, st, th, W[0], W[1], a.sl1d, a.p1d, a.t1d, twin)
+    mv = dict(p0b=(sw["G4.6"]["gap_p0b"] - pw["G4.6"]["gap_p0b"], pw["G4.6"]["band_p0b"] / 10),
+              mdot=(sw["G4.6"]["mdot"] - pw["G4.6"]["mdot"], 1e-5),
+              CdB=(sw["G4.5"]["CdB"] - pw["G4.5"]["CdB"], 1e-5), CfBvac=(sw["G4.5"]["CfBvac"] - pw["G4.5"]["CfBvac"], 1e-5),
+              CdB_exit=(sw["G4.5"]["CdB_exit"] - pw["G4.5"]["CdB_exit"], 1e-5))
+    o["G6.5b"] = dict(window=sw["window"], moves={k: dict(d=v[0], band=v[1], ok=abs(v[0]) <= v[1]) for k, v in mv.items()},
+                      ok=all(abs(v[0]) <= v[1] for v in mv.values()), shifted=dict(CdB=sw["G4.5"]["CdB"], CfBvac=sw["G4.5"]["CfBvac"],
+                                                                                  CdB_exit=sw["G4.5"]["CdB_exit"]))
+    return o
+
+
+def cmdFront(a):
+    """front PREFIX --fit A B: the LSQ growth of ln|xIa1|, ln|xIa2| over [A, B] (C6) and their max there."""
+    st = readCsv(a.prefix + "_stats.csv")
+    t = st["t"]
+    o = dict(prefix=a.prefix, fit=a.fit)
+    for k in ("xIa1", "xIa2"):
+        s, n, rng = logSlope(t, st[k], a.fit[0], a.fit[1])
+        w = [abs(v) for ti, v in zip(t, st[k]) if a.fit[0] - 1e-12 <= ti <= a.fit[1] + 1e-12]
+        o[k] = dict(slope=s, rows=n, range=rng, max=max(w), first=st[k][0], last=st[k][-1])
+        print(f"{k}: slope of ln|.| over [{rng[0]:.3f}, {rng[1]:.3f}] ({n} rows) {s:+.5f}/tau; max {max(w):.3e}; first {st[k][0]:.3e} "
+              f"last {st[k][-1]:.3e}")
+    if a.band:
+        lo, hi = a.band
+        s = o["xIa1"]["slope"]
+        o["band"] = dict(lo=lo, hi=hi, ok=lo <= s <= hi)
+        print(f"xIa1 slope {s:+.5f} in [{lo}, {hi}]: {'MET' if lo <= s <= hi else 'UNMET'}")
+    if a.dl is not None:
+        Hc = a.dl
+        print(f"s_MM(2 H_c = {2 * Hc:.4f}) {sDL(2 * Hc):+.5f}/tau; measured-lambda_c (21) estimate {sDL(2 * Hc, LAMBDA_C_MEAS):+.5f}; "
+              f"G2b's 0.0884 beside")
+    if a.json:
+        open(a.json, "w").write(json.dumps(o, indent=1, default=float))
+
+
+def cmdPair(a):
+    """pair --r2d JSON --i2d CD CF --r1d JSON --i1d CD CF: G6.2, (reacting - inert) 2D vs 1D on the reports' W."""
+    r2, r1 = json.load(open(a.r2d)), json.load(open(a.r1d))
+
+    def deltas(r, cd, cf, key="W"):
+        g = r[key]["G4.5"] if key == "W" else r["G6.5b"]["shifted"]
+        return dict(Cd=g["CdB"] - cd, Cf=g["CfBvac"] - cf, mdot=g["CdB_exit"] - cd)
+
+    d2, d1 = deltas(r2, *a.i2d), deltas(r1, *a.i1d)
+    o = dict(d2D=d2, d1D=d1, K5_d1D=K5_D1D, rows={})
+    for k in ("Cd", "Cf", "mdot"):
+        o["rows"][k] = dict(diff=d2[k] - d1[k], band=1e-4, ok=abs(d2[k] - d1[k]) <= 1e-4)
+    ctrl = r2["W"]["G4.5"]["CdB"] - a.i1d[0]
+    o["control"] = dict(Cd_R2D_minus_Cd_I1D=ctrl, band=1e-3, live=abs(ctrl) >= 1e-3)
+    if "G6.5b" in r2:
+        s2 = deltas(r2, *a.i2d, key="shift")
+        o["G6.5b_G6.2"] = {k: dict(d=s2[k] - d2[k], band=1e-5, ok=abs(s2[k] - d2[k]) <= 1e-5) for k in d2}
+    for k, v in o["rows"].items():
+        print(f"G6.2 {k}: Delta_2D {d2[k]:+.4e} Delta_1D {d1[k]:+.4e} diff {v['diff']:+.3e} (band 1e-4: {'MET' if v['ok'] else 'UNMET'})")
+    print(f"K5's Delta_1D {K5_D1D:+.2e}; control |Cd_R2D - Cd_I1D| {abs(ctrl):.3e} >= 1e-3: {'live' if o['control']['live'] else 'control dead'}")
+    if "G6.5b_G6.2" in o:
+        print("G6.5b on G6.2: " + "; ".join(f"{k} {v['d']:+.2e} (ok {v['ok']})" for k, v in o["G6.5b_G6.2"].items()))
+    if a.json:
+        open(a.json, "w").write(json.dumps(o, indent=1, default=float))
 
 
 def summary(o):
@@ -763,6 +915,19 @@ def summary(o):
     if "G4.7b" in o:
         L.append("G4.7b " + "; ".join(f"{k} {v['diff']:+.2e} (band {v['band']:.1e}, ok {v['ok']})" for k, v in o["G4.7b"].items()
                                       if k != "window"))
+    if "G6.4a" in o:
+        g, d = o["G6.4a"], o["G6.4a"]["dl"]
+        L.append(f"G6.4a slope ln|xIa1| over [{g['range'][0]:.3f}, {g['range'][1]:.3f}] ({g['rows']} rows) {g['slope']:+.4f}/tau "
+                 f"(<= -0.03: {g['ok']}); s_MM(lambda_1 {d['lambda1']:.3f}) {d['s_MM_lambda1']:+.4f}, measured-lambda_c estimate "
+                 f"{d['s_meas_lambda1']:+.4f}; H_c/lambda_c {d['Hc_over_lc_MM']:.3f} (MM) {d['Hc_over_lc_meas']:.3f} (21); "
+                 f"antisymmetric lambda 4 H_c {d['lambda_antisym']:.2f} s_MM {d['s_MM_antisym']:+.4f} (excluded)")
+        g = o["G6.4b"]
+        L.append(f"G6.4b max_W max(|xIa1|, |xIa2|) {g['max_W']:.3e} vs band {g['band']:.3e} (t_s value {g['at_ts']:.3e}): {g['ok']}")
+        g = o["G6.5a"]
+        L.append(f"G6.5a P_T1 {g['P_T1']:.4f} (burnt {g['P_T1_burnt']:.4f}) vs |W|/20 {g['band']:.4f}: {g['ok']}")
+        g = o["G6.5b"]
+        L.append(f"G6.5b W - P_T1/2 [{g['window'][0]:.3f}, {g['window'][1]:.3f}]: " +
+                 "; ".join(f"{k} {v['d']:+.2e} (band {v['band']:.1e}, ok {v['ok']})" for k, v in g["moves"].items()))
     return "\n".join(L)
 
 
@@ -823,12 +988,19 @@ def main():
     d.add_argument("--target", type=float, default=1.0, help="the design's u_u / S_L,num")
     d.add_argument("--pa", type=float, default=0.01, help="riemann p and [thrust] pa, ratio to Tu")
     d.add_argument("--upstream", type=float, default=12.0)
+    # combscale S5 (P6a): the multi-row planar rig. Absent: the one-row rig (y* ~ 50, Lc 1 y*), byte for byte.
+    d.add_argument("--ny", type=int, default=1, help="rows (>= 2: the planar half-nozzle, axis a symmetryPlane)")
+    d.add_argument("--ystar-cells", type=int, default=None, help="y* in cells of h = delta_th / cells")
+    d.add_argument("--lc-cells", type=int, default=None, help="the chamber's columns (with --ystar-cells)")
+    d.add_argument("--cd", type=float, default=None, help="[nozzle] cd: the chamber is cd x eps_c0")
+    d.add_argument("--cd-geom", type=float, default=None, help="size the chamber on this cd instead (cd stays --cd's)")
     d.add_argument("--out", required=True)
     v = s.add_parser("argv")
     v.add_argument("dir")
     v.add_argument("--tt", type=float, default=80.0)
     v.add_argument("--upstream", type=float, default=None)
     v.add_argument("--compensated", action="store_true", help="the compensated state (masterplan_combclose R6)")
+    v.add_argument("--wrinkle", type=float, default=None, help="combscale S5: the multi-row chamber's seed, delta_th")
     md = s.add_parser("modes")
     md.add_argument("dir")
     t = s.add_parser("twin")
@@ -860,11 +1032,23 @@ def main():
     dr.add_argument("--mach", type=float, default=0.042)
     dr.add_argument("--sigma", type=float, default=SIGMA)
     dr.add_argument("--json", default=None)
+    fr = s.add_parser("front")
+    fr.add_argument("prefix")
+    fr.add_argument("--fit", type=float, nargs=2, required=True, metavar=("A", "B"))
+    fr.add_argument("--band", type=float, nargs=2, default=None, metavar=("LO", "HI"), help="the xIa1 slope's band (C6)")
+    fr.add_argument("--dl", type=float, default=None, metavar="HC", help="print s_MM(2 H_c)")
+    fr.add_argument("--json", default=None)
+    pr = s.add_parser("pair")
+    pr.add_argument("--r2d", required=True, help="report --json of the 2D reacting run")
+    pr.add_argument("--i2d", type=float, nargs=2, required=True, metavar=("CD", "CF"))
+    pr.add_argument("--r1d", required=True, help="report --json of the 1D reacting run")
+    pr.add_argument("--i1d", type=float, nargs=2, required=True, metavar=("CD", "CF"))
+    pr.add_argument("--json", default=None)
     a = p.parse_args()
     if a.cmd == "report" and (a.twin_cd is None) != (a.twin_cf is None):
         p.error("--twin-cd and --twin-cf go together")
     {"oracle": cmdOracle, "design": cmdDesign, "argv": cmdArgv, "modes": cmdModes, "twin": cmdTwin, "report": cmdReport,
-     "drift": cmdDrift}[a.cmd](a)
+     "drift": cmdDrift, "front": cmdFront, "pair": cmdPair}[a.cmd](a)
 
 
 if __name__ == "__main__":

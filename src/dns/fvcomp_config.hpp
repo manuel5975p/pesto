@@ -54,11 +54,15 @@ struct FvPatchSpec
 // [nozzle] of a --bc file (docs/nozzle.md): the rest state p, t (ratios), the throat area
 // astar the mesh generator measured, the thrust axis (unit). hasRest: p and t given (dns flow
 // requires them, dns flame refuses them: the flame starts from its composition IC).
+// cd (combscale S5, dns flame only): the throat's discharge coefficient in (0, 1]; the reacting
+// design runs on the effective chamber ratio A_ref / (cd A*). Absent: 1 (A_ref / A* / 1.0, the bytes).
 struct FvNozzleSpec
 {
     double p = 1, t = 1, astar = 0;
     std::array<double, 3> axis{1, 0, 0};
     bool hasP = false, hasT = false;
+    double cd = 1;
+    bool hasCd = false;
 };
 
 // [thrust] of a --bc file (docs/nozzle.md "Thrust", masterplan_combnozzle R2): the impulse ledger and

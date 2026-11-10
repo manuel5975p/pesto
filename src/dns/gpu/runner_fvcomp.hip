@@ -263,6 +263,9 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
     const bool shockCols = r.solver.shock.mode != ShockMode::None;
     if (shockCols) cols.insert(cols.end(), {"shockCells", "byteMax"});
     if (r.nozzle) cols.insert(cols.end(), {"mdotIn", "mdotOut", "Fwall", "Fin", "Fexit", "Cd", "Cf"});
+    // combscale S5: a multi-row chamber's front amplitudes, last.
+    assert(!r.shape || (r.flame && r.flame->spec().chamber));
+    if (r.shape) cols.insert(cols.end(), {"xIa1", "xIa2"});
     if (auto e = out.declareSeries("stats", cols, r.label); !e) return fail(4, e.error());
     if (r.thrust)
         if (auto e = out.declareSeries("thrust", fvThrustColumns(std::isfinite(r.thrust->station)), r.label, 17); !e) return fail(4, e.error());
@@ -455,6 +458,10 @@ std::expected<RunStats, RunError> runFvComp(const FaceMesh& fm, const dns::FvSta
                 F = {s->fp[0] + s->fv[0], s->fp[1] + s->fv[1], s->fp[2] + s->fv[2]};
             }
             if (auto e = shockNozzleCols(v, F); !e) return e;
+            if (r.shape) {
+                const std::array<double, 2> a = fvFrontAmplitudes(fm, *r.flame, *r.shape, flameState);
+                v.insert(v.end(), {a[0], a[1]});
+            }
             out.row("stats", v);
             xfPrev = m.xf;
             tPrev = t;

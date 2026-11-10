@@ -2818,6 +2818,30 @@ combclose (`plans/masterplan_combclose.md`, amendments B1-):
   device `load` moved after `setLedger(true)` (it re-zeroed the words), the `bc.sections` record names a changed
   `[nozzle]`/`[thrust]`; `gpu_restart_fv_thrust` (docs/nozzle.md "Thrust").
 
+combscale S5, P6a: the 2D planar reacting nozzle (docs/nozzle.md "2D reacting (P6a)", masterplan_combscale B4, B5).
+G6.1, G6.2, G6.3, G6.4a/b, G6.5a/b and C6 MET; G6.0 carries two UNMETs. Open:
+- N24. **The planar rig is a HALF-domain statement** (R3): the `symmetryPlane` axis excludes the antisymmetric DL family
+  (lambda 4 H_c = 30.2 delta_D, s_MM +0.057: unstable). A full 2 H_c channel is DL-unstable; a 3D-valid planar statement
+  needs H < lambda_c/4. Stated in the run label (`[half-domain ...]`), not in the `--dry-run` label (no cells read).
+  The wedge (S6b, R_c 6.0 delta_D) is the next cycle's full-cylinder statement.
+- N25. **G4.8 UNMET on R2D (G6.0): one sensed cell on every row** (byte 13 of 255): the exit column, row 13 of 16, at the
+  concave end of the cosine divergent (its wall turns back to parallel: a compression on the radial line at the exit
+  plane; `test_fvshock sensed`). Supersonic, downstream of the throat: it reaches `I_exit` only, and the 2D twin has the
+  same contour. One row (R1D) and the 4-row smoke sense 0. Not fixed: a contour with a zero-curvature end (or a
+  straight exit section) is the change, not a sensor tune.
+- N26. **G4.11 not evaluable on the Re* 19 rig** (R2D fit refused, resid/amp 0.739 at amplitude 2.1e-3 in u_u; R1D 0.165
+  at 3.1e-2): the window used P_model 7.785 (rule 2.4's fallback); the G6.5b shift moves every rate <= 2.7e-6. R1D also
+  fails G4.12b (-1.11e-3 vs 3e-4): its chamber is sized on the 2D twin's Cd (rule R-h, |Cd_I1D/Cd_I2D - 1| 1.4% < 2%),
+  so u_d 1.009 and the flame drifts 0.075/tau from an IC laid stationary: a large start ring. R1D is the G6.2 reference
+  only, its own G4 is reported, not gated.
+- N27. **The 2D front decays at HALF MM's rate**: G6.4a -0.107/tau over [2, 17] vs s_MM(2 H_c) -0.258 (pre-registered
+  ~-0.2; the measured-lambda_c law -0.190). The control C6 grows at +0.111 vs s_MM +0.080 (+39%). Both bias toward
+  growth by ~0.03-0.15/tau; suspects: the 4.6:1 (R2D) and 6.7:1 (C6) chamber cells, the Re* drift and u_u ring of the
+  controls. Gates hold (G6.4a band -0.03, C6 band [0.04, 0.12]); the DL rate on anisotropic cells is unmeasured.
+- N28. **The 2D inert twin needs a long settle and its inviscid version none**: I2D's stub chamber fills on ~130 t*
+  (|out/in - 1| 8.5e-5 at 600 t*, the plan's tt; 5.8e-8 at 1200); the inviscid 2D twin did not settle (|out/in - 1|
+  ~1e-3 at 1200 t*, an unsteady 2D supersonic field, max |v|/c 0.73): reported, no number used.
+
 ## Older open items (details in CLAUDE.md)
 
 - No anchor for the Re800 compressible cases or `sphere_re300_n160_cd`

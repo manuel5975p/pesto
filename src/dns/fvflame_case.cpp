@@ -129,13 +129,21 @@ std::expected<FvNozzleStart, std::string> fvFlameNozzleStart(const Case& c, cons
     const auto total = std::ranges::find(spec.patches, FvPatchKind::Total, &FvPatchSpec::kind);
     if (total == spec.patches.end()) return std::unexpected("[nozzle] on dns flame: no total patch (the fresh inlet)");
     const double astar = spec.nozzle->astar;
-    const double epsC = probe.area() / astar, epsE = fvExitArea(fm, fvRoles(bc, fm), spec.nozzle->axis) / astar;
+    const std::vector<FvRole> roles = fvRoles(bc, fm);
+    // [nozzle] cd (combscale S5): the throat passes cd x the ideal choked flux, so the design's area ratio is the
+    // effective one; cd 1 divides by 1.0 (exact: bytes).
+    const double epsC = probe.area() / astar / spec.nozzle->cd, epsE = fvExitArea(fm, roles, spec.nozzle->axis) / astar;
     auto d = fvReactingNozzleDesign(s.fs.gamma, kRgasBox, s.gas.cp(), s.chem.q, s.burnt.sigma, epsC, epsE,
                                     total->p0 * s.fs.p, total->t0 * s.fs.T);
     if (!d) return std::unexpected(d.error());
+    // combscale S5: a multi-row chamber's shape (--wrinkle seeds its lowest transverse mode); one row: none.
+    std::optional<FvNozzleShape> shape = fvNozzleShapeOf(fm, probe, roles, spec.origin, spec.lift);
+    if (!shape && c.flameWrinkle > 0) return std::unexpected("--wrinkle: the [nozzle] chamber has one row: no transverse mode");
+    if (shape) shape->seed = c.flameWrinkle * c.flameEig.dthOverDD;
     const FlameEigen& tab = c.flameEig.tab;
-    FvState ic = fvReactingNozzleIC(fm, probe, *d, [&](double x) { return flameProfile(tab, x); }, c.flameXf0, astar);
-    return FvNozzleStart{.design = *d, .ic = std::move(ic)};
+    FvState ic = fvReactingNozzleIC(fm, probe, *d, [&](double x) { return flameProfile(tab, x); }, c.flameXf0, astar,
+                                    shape ? &*shape : nullptr);
+    return FvNozzleStart{.design = *d, .ic = std::move(ic), .shape = shape};
 }
 
 FvJetSetup fvJetSetup(const Case& c, const FvBcSpec& spec, std::array<double, 3> origin)

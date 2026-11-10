@@ -74,6 +74,9 @@ struct FvCompRun
     // gamma, Rgas given; q and exitArea the runner's. A finite station (dns flame): the burnt station's
     // columns p0b T0b CdB CfBvac CfB (fvStation off the row's state). Empty: no ledger launch, no file.
     std::optional<FvThrustCase> thrust{};
+    // combscale S5: a multi-row [nozzle] chamber's shape (dns flame): the stats append xIa1 xIa2
+    // (fvFrontAmplitudes, last). nullptr: off.
+    const FvNozzleShape* shape = nullptr;
     // --shock hll: the sticky dt cadence (internal::shockDtEvery), unless --dt-recompute.
     bool shockDtAuto = false;
     // > 0: --foam-write, PREFIX_foam/<t>/{p,T,U,rho} every foamWrite, source cell order.

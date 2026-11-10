@@ -92,7 +92,7 @@ int main()
     refuses(run + bc("t2", "[patch.o]\ntype = \"outflow\"\nexit = \"wide\"\n"), 3, "patch.o.exit: must be \"fixed\", \"extrapolate\" or \"riemann\"");
     refuses(run + bc("t3", "[patch.o]\ntype = \"outflow\"\nexit = \"extrapolate\"\np = 1\n"), 3, "patch.o: exit = \"extrapolate\" reads no p, tback: give neither");
     refuses(run + bc("t4", "[patch.o]\ntype = \"outflow\"\nexit = \"riemann\"\np = 1\n"), 3, "patch.o: exit = \"riemann\" needs p and tback");
-    refuses(run + bc("t5", "[nozzle]\nq = 1\n[patch.o]\ntype = \"far\"\n"), 3, "[nozzle]: unknown key 'q' (p, t, astar, axis)");
+    refuses(run + bc("t5", "[nozzle]\nq = 1\n[patch.o]\ntype = \"far\"\n"), 3, "[nozzle]: unknown key 'q' (p, t, astar, axis, cd)");
     refuses(run + bc("t6", "[nope]\n[patch.o]\ntype = \"far\"\n"), 3, "unknown top-level key 'nope' (reference, patch, nozzle, thrust)");
     refuses(run + bc("t7", "[patch.o]\ntype = \"wobble\"\n"), 3, "one of: wall, slip, inflow, outflow, far, empty, open, total, wedge");
     refuses(run + bc("t8", "[patch.o]\n"), 3, "needs type = \"wall|slip|inflow|outflow|far|empty|open|total|wedge\"");
@@ -222,6 +222,30 @@ int main()
         refuses(fh + bc("sx2", inlet + "y = [1.0]\n[nozzle]\nastar = 0.1\n[thrust]\npa = 0.01\n"), 2,
                 "--bc: [thrust]: needs station on dns flame (the burnt stagnation plane, masterplan_combnozzle R2)");
         refuses(fh + bc("sx3", inlet + "y = [1.0]\n[patch.side]\ntype = \"wedge\"\n"), 2, "--bc: patch `side`: a wedge on the flame route: not built (next cycle)");
+        // combscale S5: [nozzle] cd (the flame's design; dns flow refuses it), --wrinkle on a [nozzle] chamber.
+        const std::string noz = inlet + "y = [1.0]\n[nozzle]\nastar = 0.1\n";
+        n = dns(fh + bc("cd0", noz + "cd = 0.95\n"));
+        check(n.rc == 0 && n.text.find("  nozzle     cd 0.95: the throat's discharge coefficient (the design on A_ref / (cd A*))") !=
+                               std::string::npos,
+              "[nozzle] cd: the flame dry-run passes and names it");
+        check(dns(fh + bc("cd1", noz)).text.find("nozzle     cd") == std::string::npos, "no cd: no dry-run line");
+        refuses(fh + bc("cd2", noz + "cd = 1.2\n"), 3, "[nozzle].cd: must be in (0, 1]");
+        refuses(fh + bc("cd3", noz + "cd = 0\n"), 3, "[nozzle].cd: must be in (0, 1]");
+        {
+            std::string cdText = bcText;
+            cdText.replace(cdText.find("[nozzle]\n"), 9, "[nozzle]\ncd = 0.9\n");
+            refuses(thr + bc("cd4", cdText), 2, "--bc: [nozzle].cd is the reacting nozzle's design (dns flame)");
+        }
+        n = dns(fh + bc("wr0", noz) + " --wrinkle 0.005");
+        check(n.rc == 0 && n.text.find("; --wrinkle 0.005 delta_th: the chamber front at x_f + A cos(pi r/H_c), its lowest transverse mode") !=
+                               std::string::npos,
+              "--wrinkle on a [nozzle] flame polyMesh: the dry-run passes and names the mode");
+        refuses(fh + bc("wr1", noz) + " --wrinkle 0.005 --wrinkle-modes 2", 2,
+                "--wrinkle-modes: a [nozzle] chamber seeds its lowest transverse mode only");
+        refuses(fh + bc("wr2", noz) + " --wrinkle-modes 2", 2, "--wrinkle-modes: a [nozzle] chamber seeds its lowest transverse mode only");
+        refuses(fl + " --shock hll --wrinkle 0.005", 2, "--wrinkle: --wrinkle does not apply with --polymesh: the mesh is the case");
+        refuses(fl + " --wrinkle 0.005", 2, "--wrinkle: --wrinkle does not apply with --polymesh: the mesh is the case");
+        refuses(fh + bc("wr3", noz) + " --wrinkle -1", 2, "--wrinkle: must be finite and >= 0 (thermal thicknesses)");
         refuses(thr + bc("sx5", "[nozzle]\np = 1\nastar = 1\n[patch.o]\ntype = \"far\"\n"), 3, "[nozzle]: needs t");
         refuses(thr + bc("sx6", "[nozzle]\np = 1\nt = 1\nastar = 1\n[patch.inlet]\ntype = \"total\"\np0 = 1\nt0 = 1\ny = [1.0]\n"), 2,
                 "patch.inlet.y belongs to a dns flame file");

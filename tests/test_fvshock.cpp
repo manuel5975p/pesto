@@ -2,6 +2,7 @@
 // stride-2 sensor's bytes; prisms carry no radial line; a mesh rotated 45 deg keeps two
 // distinct lines per cell where the structured +-e_a walk picks one; bitwise the same lines
 // under every CellOrder, ties (a snappy mesh) included.
+#include "dns/checkpoint.hpp"
 #include "dns/curvmesh.hpp"
 #include "dns/facemesh.hpp"
 #include "dns/foamio.hpp"
@@ -275,6 +276,37 @@ void unlined(int argc, char** argv)
     }
 }
 
+// combscale S5 (diagnostic, not gated): where the sensor fires on a run's state. sensed MESHDIR CKPT GAMMA: the
+// polyMesh (Morton, the flame route's order), the checkpoint's state.fv.q (+ state.fv.lo), p of it, fvShockSense;
+// every cell with a nonzero byte printed with its centroid.
+int sensed(const fs::path& dir, const std::string& ckpt, double gamma)
+{
+    const PolyMesh pm = must(readPolyMesh(dir / "constant/polyMesh"), dir.string());
+    const FaceMesh fm = must(FaceMesh::fromPolyMesh(pm, CellOrder::Morton), dir.string());
+    const Checkpoint ck = must(Checkpoint::read(ckpt), ckpt);
+    std::vector<double> q = must(ck.f64("state.fv.q"), "state.fv.q");
+    if (auto lo = ck.f64("state.fv.lo"))
+        for (std::size_t i = 0; i < q.size() && i < lo->size(); ++i) q[i] += (*lo)[i];
+    const std::size_t n = std::size_t(fm.nC);
+    std::vector<double> p(n);
+    for (std::size_t c = 0; c < n; ++c) {
+        const double rho = q[c], m2 = q[n + c] * q[n + c] + q[2 * n + c] * q[2 * n + c] + q[3 * n + c] * q[3 * n + c];
+        p[c] = (gamma - 1.0) * (q[4 * n + c] - 0.5 * m2 / rho);
+    }
+    const FvShockLines l = fvShockLines(fm, must(fvFaceGeom(fm, FvFaceGradRule::AlongD, 1.0), "geom"));
+    std::vector<std::uint8_t> b(n, 0);
+    fvShockSense(l, p, b);
+    long k = 0;
+    for (std::size_t c = 0; c < n; ++c)
+        if (b[c]) {
+            ++k;
+            std::printf("  sensed cell %zu (source %lld): C (%.6g, %.6g), byte %d, p %.8g\n", c, (long long)fm.srcCell[c], fm.C[0][c],
+                        fm.C[1][c], int(b[c]), p[c]);
+        }
+    std::printf("%ld sensed cells of %d\n", k, fm.nC);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -283,6 +315,7 @@ int main(int argc, char** argv)
         unlined(argc, argv);
         return dnstest::finish();
     }
+    if (argc == 5 && std::string_view(argv[1]) == "sensed") return sensed(argv[2], argv[3], std::atof(argv[4]));
     periodic();
     prisms();
     rotated();

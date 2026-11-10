@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cmath>
 #include <format>
+#include <numbers>
 
 namespace dns {
 
@@ -370,24 +371,40 @@ std::expected<FvReactingDesign, std::string> fvReactingNozzleDesign(double gamma
 }
 
 FvState fvReactingNozzleIC(const FaceMesh& fm, const FvFlameProbe& probe, const FvReactingDesign& d,
-                           const std::function<double(double)>& t, double xf, double astar)
+                           const std::function<double(double)>& t, double xf, double astar, const FvNozzleShape* shape)
 {
     const FvFlameSpec& sp = probe.spec();
     assert(sp.chamber && astar > 0.0);
+    assert(!shape || shape->Hc > 0.0);
     const int nCh = probe.chamberBins();
     const double g = sp.gamma, R = sp.Rgas;
     const std::vector<double> A = fvBinAreas(fm, probe);
     const int throat = fvThroatBin(A, nCh);
+    // combscale S5: dA_b/dx at the bin centres (np.gradient over uniform bins: central inside, one-sided at the ends).
+    std::vector<double> dA;
+    if (shape) {
+        const std::size_t n = A.size();
+        const double h = probe.slab();
+        dA.assign(n, 0.0);
+        for (std::size_t b = 0; b < n && n >= 2; ++b)
+            dA[b] = b == 0 ? (A[1] - A[0]) / h : b + 1 == n ? (A[n - 1] - A[n - 2]) / h : (A[b + 1] - A[b - 1]) / (2.0 * h);
+    }
+    // r = (C - origin).lift of cell i (shape only).
+    const auto rOf = [&](std::size_t i) {
+        return (fm.C[0][i] - shape->origin[0]) * shape->lift[0] + (fm.C[1][i] - shape->origin[1]) * shape->lift[1] +
+               (fm.C[2][i] - shape->origin[2]) * shape->lift[2];
+    };
     FvState q = FvState::zeros(fm.nC, kFvMeanVars + 1);
     for (int c = 0; c < fm.nC; ++c) {
         const std::size_t i = std::size_t(c);
         const int b = probe.binOf(c);
-        double rho = 0, u = 0, E = 0, Y = 0;
+        double rho = 0, u = 0, E = 0, Y = 0, v = 0;
         if (b < nCh) {
             // The Rayleigh line of the design's (m, P, H) at the profile's Y (masterplan_combclose 2.1): never
             // premixedPoint's low-Mach T = sigma Tu (+1.71e-3 in T0, an entropy slug through the throat).
             const double s = fm.C[0][i] * sp.dir[0] + fm.C[1][i] * sp.dir[1] + fm.C[2][i] * sp.dir[2] - probe.lo();
-            const double tt = t(s - xf);
+            // combscale S5: the seeded front's lowest transverse mode (seed 0: s - xf - 0, the planar front's bits).
+            const double tt = shape ? t(s - xf - shape->seed * std::cos(std::numbers::pi * rOf(i) / shape->Hc)) : t(s - xf);
             Y = (sp.sigma - tt) / (sp.sigma - 1);
             const FvBurnt r = fvRayleighBurnt(d.g, d.R, d.cp, d.q * (1 - Y), d.Tu, d.pu, d.uu);
             rho = r.pb / (R * r.Tb);
@@ -399,13 +416,76 @@ FvState fvReactingNozzleIC(const FaceMesh& fm, const FvFlameProbe& probe, const 
             rho = p / (R * T);
             u = M * std::sqrt(g * R * T);
             E = p / (g - 1) + 0.5 * rho * u * u;
+            // combscale S5: the generator's 2D v = u y_w' r / y_w (planar A proportional to y_w).
+            if (shape) {
+                v = u * rOf(i) * dA[std::size_t(b)] / A[std::size_t(b)];
+                E += 0.5 * rho * v * v;
+            }
         }
         q.var(0)[i] = rho;
-        for (int k = 0; k < 3; ++k) q.var(1 + k)[i] = rho * u * sp.dir[std::size_t(k)];
+        if (shape)
+            for (int k = 0; k < 3; ++k)
+                q.var(1 + k)[i] = rho * (u * sp.dir[std::size_t(k)] + v * shape->lift[std::size_t(k)]);
+        else
+            for (int k = 0; k < 3; ++k) q.var(1 + k)[i] = rho * u * sp.dir[std::size_t(k)];
         q.var(4)[i] = E;
         q.var(kFvMeanVars + sp.fuel)[i] = rho * Y;
     }
     return q;
+}
+
+std::optional<FvNozzleShape> fvNozzleShapeOf(const FaceMesh& fm, const FvFlameProbe& probe, std::span<const FvRole> roles,
+                                             const std::array<double, 3>& origin, const std::array<double, 3>& lift)
+{
+    assert(probe.spec().chamber && roles.size() == fm.patches.size());
+    const int nCh = probe.chamberBins();
+    std::vector<int> per(std::size_t(nCh), 0);
+    for (int c = 0; c < fm.nC; ++c)
+        if (const int b = probe.binOf(c); b < nCh) ++per[std::size_t(b)];
+    if (std::ranges::none_of(per, [](int n) { return n >= 2; })) return std::nullopt;
+    FvNozzleShape s{.origin = origin, .lift = lift};
+    for (std::size_t p = 0; p < fm.patches.size(); ++p) {
+        if (roles[p] != FvRole::Wall) continue;
+        const MeshPatch& m = fm.patches[p];
+        for (int q = m.first; q < m.first + m.count; ++q) {
+            const std::size_t f = std::size_t(fm.nI + q);
+            if (probe.binOf(fm.own[f]) >= nCh) continue;
+            const double r = (fm.Cf[0][f] - origin[0]) * lift[0] + (fm.Cf[1][f] - origin[1]) * lift[1] +
+                             (fm.Cf[2][f] - origin[2]) * lift[2];
+            s.Hc = std::max(s.Hc, r);
+        }
+    }
+    if (!(s.Hc > 0.0)) return std::nullopt;
+    return s;
+}
+
+std::array<double, 2> fvFrontAmplitudes(const FaceMesh& fm, const FvFlameProbe& probe, const FvNozzleShape& shape,
+                                        const FvState& s)
+{
+    assert(shape.Hc > 0.0 && probe.spec().chamber);
+    const FvFlameSpec& sp = probe.spec();
+    const int nCh = probe.chamberBins();
+    const double* rho = s.var(0);
+    const double* ry = s.var(kFvMeanVars + sp.fuel);
+    // The probe's reference slab (FvFlameProbe::finish: 2 delta_th inside the low end, within the chamber).
+    const int ref = std::min(nCh - 1, int(std::lround(2.0 * sp.dth / probe.slab())));
+    double vr = 0, vrLo = 0, vol = 0, volLo = 0;
+    double a[2] = {0, 0}, lo[2] = {0, 0};
+    for (int c = 0; c < fm.nC; ++c) {
+        const std::size_t i = std::size_t(c);
+        const int b = probe.binOf(c);
+        if (b >= nCh) continue;
+        const double V = fm.V[i], ryc = ry[i];
+        if (b == ref) {
+            neumaier(vr, vrLo, V * (ryc - sp.yBurnt * rho[i]));
+            neumaier(vol, volLo, V);
+        }
+        const double r = (fm.C[0][i] - shape.origin[0]) * shape.lift[0] + (fm.C[1][i] - shape.origin[1]) * shape.lift[1] +
+                         (fm.C[2][i] - shape.origin[2]) * shape.lift[2];
+        for (int n = 0; n < 2; ++n) neumaier(a[n], lo[n], V * ryc * std::cos(double(n + 1) * std::numbers::pi * r / shape.Hc));
+    }
+    const double ryRef = (vr + vrLo) / (vol + volLo), den = ryRef * probe.area();
+    return {2.0 * (a[0] + lo[0]) / den, 2.0 * (a[1] + lo[1]) / den};
 }
 
 std::vector<double> fvBinAreas(const FaceMesh& fm, const FvFlameProbe& probe)

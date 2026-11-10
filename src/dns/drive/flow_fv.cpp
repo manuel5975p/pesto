@@ -219,6 +219,9 @@ std::expected<bool, std::pair<int, std::string>> fvPolyCheck(const Case& c)
     const bool wedgeOk = c.sub == Subcommand::Flow && c.shock != ShockMode::None;
     if (auto r = checkFvBc(c.fvBc, mp, wedgeOk); !r) return Err({exitInput, c.fvMeshDir + ": " + r.error()});
     const bool wedge = std::ranges::any_of(mp, [](const FvMeshPatch& m) { return m.type == "wedge"; });
+    // combscale S5: --wrinkle seeds a planar chamber's cos(pi r/H_c); a wedge's lowest mode is radial (m = 0).
+    if (c.sub == Subcommand::Flame && wedge && c.flameWrinkle > 0)
+        return Err({2, "--wrinkle: not built on a wedge (m = 0 radial mode)"});
     if (wedgeOk && wedge && (c.lesLabel || c.rans != RansModel::None))
         return Err({2, "a `wedge` mesh takes no --les, --rans (an axisymmetric mean flow)"});
     if (wedgeOk && c.lesLabel) return Err({2, std::string(fvPair(FvModule::Shock, FvModule::LesSmag).message)});
