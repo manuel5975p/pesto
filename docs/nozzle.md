@@ -374,6 +374,31 @@ the twin at that Re* read 0.9990733, dCd with it +3.1e-7.
 trend to read. G4.6 mdot at 30 (+2.1e-5, k 1) is its storage term over ONE period: the k-1 window's ring residual
 (contraction storage -1.7e-5), 5x under the band. The 30-cell rung closes N13 (G4.5 at 30 evaluated) and N16 (G4.1).
 
+**The 30-cell rung, later ends (combscale S2, S2b)**: the SAME run continued through the `[thrust]` ledger's
+checkpoints (`tools/chem/chain.sh`, `--checkpoint-dt 5`, compensated FP64): tt 103 in 2 links (1813.8 s, 4 337 569
+steps), then `--resume` to tt 140 (1 link, 671.5 s; 5 895 603 steps, 0.398 ms/step). Every K6 row (t < 80) and every
+tt-103 row is reproduced byte for byte by the longer chain: the restart is in production. Twin as K6's (Cd
+0.9990744066, CfVac 1.4546626487).
+
+| gate | tt 80 (K6), k 1, W [57.6, 80] | tt 103, k 2, W [58.260, 103] | tt 140, k 4, W [50.556, 140] | band |
+|---|---|---|---|---|
+| fit P / e-fold (G4.11 vs 22.700 / 34.00) | 22.384 / 33.63 | 22.371 / 32.93 (-1.45%, -3.1%) | 22.362 / 32.95 (-1.49%, -3.1%) | 3% / 15% |
+| G4.1f | 1.65e-16; 0.76 | 1.65e-16; 1.02 | 1.65e-16; 1.01 | 1e-13, 4 |
+| G4.2 S_c - S_L,num | -7.49e-5 | -7.48e-5 | -7.33e-5 | 5e-4 |
+| G4.3 | +6.88e-6 | +8.7e-6 | +2.30e-6 | 2e-3 S_L |
+| G4.4 T0b; fuel | -3.00e-6; 0.0 | -2.89e-6; 0.0 | -2.07e-6; 0.0 | 1e-4; 1e-8 |
+| G4.5 dCd / dCf | -8.01e-7 / +2.08e-6 | -6.54e-7 / +9.5e-7 | +1.99e-6 / +1.61e-6 | 1e-4 |
+| G4.6 p0b | -9.58e-7 | -9.27e-7 | +1.00e-6 | 4.9e-4 |
+| G4.6 mdot = burn + storage | +2.126e-5 = -5.11e-7 + 2.18e-5 | +1.385e-5 = -5.18e-7 + 1.437e-5 | **+2.52e-7 = -3.69e-7 + 6.21e-7** (ident 2.6e-16) | 1e-4 |
+| contraction storage | -1.67e-5 | -1.08e-5 | -1.57e-6 | reported |
+| G4.8 shockCells | 0 | 0 | 0 on 29 479 rows | 0 |
+| G4.12 a / b | -1.96e-10 / -9.85e-5 | -1.96e-10 / -9.79e-5 | -1.96e-10 / -9.96e-5 | 1e-6 / 3e-4 |
+
+The pre-registered expectation E-S2 (|mdot| <= 1.0e-5): UNMET at tt 103 as predicted (+1.385e-5 vs predicted
++1.35e-5), MET at tt 140 (+2.5e-7; predicted ~+1.5e-6, storage ~+2e-6: measured 6.2e-7). G4.6 mdot falls 84x from tt
+80 to tt 140 while burn stays -4e-7 to -5e-7: the residual is the damped ring's endpoint storage, removed by a later
+END (e-fold 33), not by h and not by k alone. At tt 140 the 30-cell rung reads the 15-cell rung's numbers (K5: +1.5e-6).
+
 **The gamma 1.2 row (G4.9 = G4.1-G4.6 at gamma 1.2, K7)**: 1D 15-cell hll at gamma 1.2, M 0.042 (the poly1d c15 mesh,
 [7, 14]): S_L 0.9982783 (G3.5 reproduced), fresh p 472.595, T 472.442; `design --gamma 1.2 --cells 15 --sl 0.9982783`
 (eps_c 6.294448557148318); `modes`: P 22.802 / e-fold 35.73, t_e 39.973. Flame tt 140 compensated (429 s); fit P 22.438 /
@@ -591,6 +616,17 @@ planar (same argv, different dt) agree to every printed digit: S_L, delta_th, an
 p, Y, omega. So W5 is evaluated as the identity it is, same h AND same dt: the planar reference at `--cfl 0.4 x (strip
 dt / planar dt, window mean)` = 0.322168 (dt ratio 1.000001, row times within 3.1e-3 tau): **dS_L +1.64e-7, d
 delta_th/delta_th +1.02e-5: met**. The bands are the plan's, untouched.
+
+**The identity at full precision (S7, closes N29).** The 6-digit rows resolve S_L on W to ~4e-7 only, so the same test
+reads the two runs' last checkpoints (`state.fv.q`, FP64, each its run's first step past t 7) onto their meshes and
+compares every strip cell with the planar cell of its x column (x equal to 2.1e-14). The strip is radially uniform to
+1.5e-14. `dns flame` has no fixed dt, so the checkpoints sit one step apart (5.07e-4 tau) and the raw difference is the
+front's travel: rho 4.5e-6, rho Y 5.6e-6 of max. ONE number removes it, a translation fitted on rho Y (1.800e-5
+delta_D): what is left is rho 9.6e-8, rho u 1.41e-7, E 3.9e-8, rho Y 1.23e-7. The method's floor is the same
+decomposition on two PLANAR runs (`--cfl 0.4` vs the strip's dt, checkpoints 2.05e-4 apart): 3.9e-8, 5.7e-8, 1.6e-8,
+5.0e-8. Per unit time the two agree **row by row to 2.9e-4, the front speed (-0.0355 in the grid frame) to 1.0e-5**:
+strip minus planar is the solution's own evolution over the offset, nothing on top of it (a wedge term at 1e-10 of
+max would show). Gates: radial 1e-12, residual 1e-6, per-unit-time rows 1e-2, front speed 1e-3.
 
 **Not built: the wedge reacting nozzle rig (P6b / S6b).** The route is open; the rig is next cycle's. Sizing ruled
 (masterplan_combscale R3, R4): R_c = 6.0 delta_D (<= 0.29 x the measured lambda_c 21: the m = 1 Bessel bound, so the

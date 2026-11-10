@@ -2714,6 +2714,12 @@ G4.7, G4.8 PASS at 15 cells; at 30 cells G4.2-G4.4, G4.6 (p0b), G4.8 PASS, G4.1 
   34.00), K7 gamma 1.2 22.438 / 33.71 (model 22.802 / 35.73); u_u amplitude 1.7e-3 vs 3.4e-3 old IC. Not a defect: a
   damped start transient the window rule cancels. Open only as a cost: a 1-period window (30 cells, tt 80) leaves
   ~2e-5 of storage in G4.6 mdot.
+  **Mechanism measured (combscale S2, S2b): the END time, not h, not k alone.** The same 30-cell run chained through
+  the ledger checkpoints: G4.6 mdot +2.126e-5 (tt 80, k 1) -> +1.385e-5 (tt 103, k 2; storage +1.437e-5, pre-registered
+  +1.35e-5 / +1.4e-5, E-S2 <= 1.0e-5 UNMET as predicted) -> **+2.52e-7 (tt 140, k 4; storage +6.21e-7, E-S2 MET)**; burn
+  -5.1e-7 / -5.2e-7 / -3.7e-7 throughout. Fit P 22.362, e-fold 32.95 at tt 140. Cost of the settled 30-cell number:
+  5 895 603 steps, 41.4 GPU min in 3 links (docs/nozzle.md "The 30-cell rung, later ends"). CLOSED as a defect; the
+  cost stands.
 - N15. **G4.6's mdot UNMET at 15 AND 30, does not fall** (P4b, A24): (mdotOut - rho_b x_f' A_c) vs rho_u S_c A_c -2.25e-4
   / -2.23e-4 over [20, 80], -1.37e-4 / -1.41e-4 over [40, 80] (order ~0). The composition side closes (the ledger's burn
   rate vs rho_u S_c A_c +7.5e-6); the gap is A19's drift storage model: the ledger's exact chamber mass change dM/dt
@@ -2850,8 +2856,13 @@ at the same h and dt, UNMET under the plan's same-argv protocol; the refusal is 
   dt reproduces its rows to the print while its row mean moves +4.06e-6 / +8.6e-5. Cause: the estimator, a row mean of
   `_stats.csv` (a row per 200 steps) of a drifting, sawing signal, sampled at dt-dependent times; the strip's dt is
   0.80542 of the planar run's (the plan's ~1/2.7 unmet). The gate runs the reference at the strip's dt (`--cfl
-  0.322168`): +1.64e-7 / +1.02e-5, met. Open: `_stats.csv` prints 6 digits, so S_L on a window is resolved to ~4e-7 at
-  best (61 rows); a sharper identity needs a time-integrated S_L (the fuel ledger) in the output.
+  0.322168`): +1.64e-7 / +1.02e-5, met. `_stats.csv` prints 6 digits, so S_L on a window is resolved to ~4e-7 at
+  best (61 rows).
+  **CLOSED (S7): the identity at full precision.** `gpu_fv_nozzle_wedgestrip` compares the two checkpoints' FP64
+  states cell by cell: the strip radially uniform to 1.5e-14; strip minus planar, one fitted translation removed (the
+  checkpoints are a step apart, no fixed dt on `dns flame`), <= 1.41e-7 of max, and per unit time equal to the same
+  decomposition of two PLANAR runs row by row to 2.9e-4, the front speed to 1.0e-5 (docs/nozzle.md "Wedge flame").
+  The same-argv row-mean number stays UNMET as recorded: it is the estimator's.
 - N30. **The wedge reacting nozzle rig (P6b / S6b) is not built**: route open, rig deferred. Sizing ruled (R3, R4):
   R_c 6.0 delta_D (<= 0.29 measured lambda_c: m = 1 Bessel bound), 15 cells/delta_th, ~130 GPU min chained; the wedge
   design / twin modes of `nozzle_react.py` with it. A multi-row wedge `[nozzle]` chamber's IC is planar with v = 0 in

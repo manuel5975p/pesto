@@ -2314,6 +2314,8 @@ void wedgeFlame()
 // (strip dt / planar dt, window mean): its rows sit on the strip's times.
 //   W5   strip vs the planar run at the strip's dt: |dS_L| <= 1e-6, |d delta_th| / delta_th <= 1e-4; the strip's last
 //        checkpoint (t >= 7): max |v| / c <= 1e-11, rho w == 0.0
+//   N29  the two checkpoints' FP64 states cell by cell: the strip radially uniform (1e-12); strip minus planar, one
+//        translation removed, <= 1e-6 of max and per unit time the planar pair's own (rows 1e-2, front speed 1e-3)
 //   same argv (the plan's protocol): both printed, [UNMET] recorded, not gated
 //   t = tt, the one time every run shares: S_L, delta_th equal to the print
 //   control (no run): the strip's S_L vs the archived 15-cell 0.9945059 differs >= 1e-3
@@ -2457,6 +2459,118 @@ void wedgeStrip()
         check(*tc >= 7.0, "W5: the checkpoint is at t >= 7");
         check(vc <= 1e-11, std::format("W5: max |v| / c {:.2e} <= 1e-11", vc));
         check(wm == 0.0, "W5: rho w == 0.0");
+    }
+    // N29: the identity at full precision. The strip's and the matched planar run's last checkpoints (the first step
+    // past t 7 in both), state.fv.q FP64, cell by cell: every strip cell against the planar cell of its x column.
+    {
+        struct Snap
+        {
+            FaceMesh fm;
+            std::vector<double> q;
+            double t = 0;
+        };
+        const auto snap = [&](const fs::path& mesh, const char* name, bool wedge) -> std::optional<Snap> {
+            auto pm = readPolyMesh(mesh / "constant/polyMesh");
+            if (!pm) return std::nullopt;
+            auto fm = FaceMesh::fromPolyMesh(*pm, CellOrder::Morton, 0, {.wedge = wedge});
+            const auto c = dns::Checkpoint::read(dns::checkpointPath((tmpDir() / name).string()));
+            if (!fm || !c) return std::nullopt;
+            auto s = c->f64("state.fv.q");
+            const auto t = c->f64Scalar("t");
+            if (!s || !t || s->size() != 6 * fm->C[0].size()) return std::nullopt;
+            return Snap{std::move(*fm), std::move(*s), *t};
+        };
+        struct Cmp
+        {
+            double dt = 0, xOff = 1, col = 0, rad = 0, sh = 0, raw[4] = {}, res[4] = {}, rawMax = 0, resMax = 0;
+        };
+        static constexpr int rows[] = {0, 1, 4, 5};
+        static constexpr const char* names[] = {"rho", "rho u", "E", "rho Y"};
+        // a against b (b planar: the reference columns). The two checkpoints are a step apart in time (each is its
+        // run's first step past 7): the raw difference carries the front's travel over that time. ONE number removes
+        // it: the translation sh (least squares on rho Y, b's own central d/dx).
+        const auto compare = [&](const Snap& a, const Snap& b) {
+            Cmp o;
+            o.dt = a.t - b.t;
+            const std::size_t nA = a.fm.C[0].size(), nB = b.fm.C[0].size();
+            std::vector<std::pair<double, std::size_t>> xs, cols; // b: one cell per x column, ascending
+            for (std::size_t c = 0; c < nB; ++c) xs.emplace_back(b.fm.C[0][c], c);
+            std::ranges::sort(xs);
+            for (const auto& xc : xs)
+                if (cols.empty() || xc.first - cols.back().first > 1e-9) cols.push_back(xc);
+            const auto colOf = [&](double x) {
+                const auto it = std::ranges::lower_bound(cols, std::pair{x - 1e-9, std::size_t(0)});
+                return std::size_t(it - cols.begin());
+            };
+            const auto ddx = [&](int row, std::size_t i) {
+                const std::size_t lo = i > 0 ? i - 1 : i, hi = i + 1 < cols.size() ? i + 1 : i;
+                return (b.q[row * nB + cols[hi].second] - b.q[row * nB + cols[lo].second]) / (cols[hi].first - cols[lo].first);
+            };
+            double s[4] = {};
+            for (std::size_t c = 0; c < nB; ++c) { // b is 1D: its rows within a column
+                const std::size_t i = colOf(b.fm.C[0][c]);
+                for (int k = 0; k < 4; ++k) {
+                    o.col = std::max(o.col, std::abs(b.q[rows[k] * nB + c] - b.q[rows[k] * nB + cols[i].second]));
+                    s[k] = std::max(s[k], std::abs(b.q[rows[k] * nB + c]));
+                }
+            }
+            o.xOff = 0;
+            for (std::size_t c = 0; c < nA; ++c) {
+                const std::size_t i = colOf(a.fm.C[0][c]);
+                o.xOff = std::max(o.xOff, i < cols.size() ? std::abs(cols[i].first - a.fm.C[0][c]) : 1.0);
+            }
+            if (o.xOff > 1e-9) return o;
+            double num = 0, den = 0;
+            std::vector<double> first(cols.size() * 4, std::numeric_limits<double>::quiet_NaN());
+            for (std::size_t c = 0; c < nA; ++c) {
+                const std::size_t i = colOf(a.fm.C[0][c]);
+                const double g = ddx(5, i);
+                num += (a.q[5 * nA + c] - b.q[5 * nB + cols[i].second]) * g;
+                den += g * g;
+                for (int k = 0; k < 4; ++k) { // a's own rows within a column
+                    double& f = first[4 * i + k];
+                    if (std::isnan(f)) f = a.q[rows[k] * nA + c];
+                    o.rad = std::max(o.rad, std::abs(a.q[rows[k] * nA + c] - f) / s[k]);
+                }
+            }
+            o.sh = den > 0 ? num / den : 0;
+            for (std::size_t c = 0; c < nA; ++c) {
+                const std::size_t i = colOf(a.fm.C[0][c]);
+                for (int k = 0; k < 4; ++k) {
+                    const double d = a.q[rows[k] * nA + c] - b.q[rows[k] * nB + cols[i].second];
+                    o.raw[k] = std::max(o.raw[k], std::abs(d) / s[k]);
+                    o.res[k] = std::max(o.res[k], std::abs(d - o.sh * ddx(rows[k], i)) / s[k]);
+                }
+            }
+            for (int k = 0; k < 4; ++k) o.rawMax = std::max(o.rawMax, o.raw[k]), o.resMax = std::max(o.resMax, o.res[k]);
+            return o;
+        };
+        const auto show = [&](const char* what, const Cmp& o) {
+            std::printf("  N29 %s: checkpoints %.3e apart in t, x within %.1e, reference rows within %.1e, own rows within %.1e, translation "
+                        "%.4e delta_D (front speed %.4f in the grid frame)\n",
+                        what, o.dt, o.xOff, o.col, o.rad, o.sh, o.dt != 0 ? -o.sh / o.dt : 0.0);
+            for (int k = 0; k < 4; ++k) std::printf("    %-6s max |a - b| / max: raw %.3e, translation removed %.3e\n", names[k], o.raw[k], o.res[k]);
+        };
+        const auto a = snap(strip, "strip", true), b = snap(planar, "matched", false), p0 = snap(planar, "planar", false);
+        check(a.has_value() && b.has_value() && p0.has_value(), "N29: the checkpoints read onto their meshes (Morton, 6 rows)");
+        if (a && b && p0) {
+            // The method's floor: the same decomposition on two PLANAR runs (--cfl 0.4 vs the strip's dt), no wedge in it.
+            const Cmp w5 = compare(*a, *b), fl = compare(*p0, *b);
+            show("strip vs planar at the strip's dt", w5);
+            show("floor: planar --cfl 0.4 vs planar at the strip's dt", fl);
+            check(w5.xOff <= 1e-9 && fl.xOff <= 1e-9, "N29: every cell has its planar column");
+            check(w5.rad <= 1e-12, std::format("N29: the strip's state is radially uniform, FP64 ({:.2e} <= 1e-12)", w5.rad));
+            check(w5.resMax <= 1e-6, std::format("N29: the strip's state equals the planar run's up to one translation, FP64 ({:.2e} <= 1e-6)", w5.resMax));
+            // What is left is the solution's own evolution over the offset: per unit time it is the planar pair's, row
+            // by row, and so is the front speed. A wedge term would sit on top of it.
+            double rate = 0;
+            for (int k = 0; k < 4; ++k) rate = std::max(rate, std::abs(w5.res[k] / std::abs(w5.dt) / (fl.res[k] / std::abs(fl.dt)) - 1));
+            const double speed = std::abs(w5.sh / w5.dt / (fl.sh / fl.dt) - 1);
+            std::printf("    per unit time vs the planar pair: residual rows within %.2e, front speed within %.2e\n", rate, speed);
+            check(std::abs(w5.dt) >= 1e-5 && std::abs(fl.dt) >= 1e-5, "N29: both pairs are offset in time (else the raw difference is the gate)");
+            check(rate <= 1e-2 && speed <= 1e-3,
+                  std::format("N29: strip minus planar per unit time IS the planar pair's (rows {:.1e} <= 1e-2, front speed {:.1e} <= 1e-3)", rate, speed));
+        }
     }
     const double ctrl = std::abs(w.slMean - 0.9945059);
     std::printf("  control: |S_L(strip, 7.5 cells) - 0.9945059 (15 cells)| %.3e\n", ctrl);
