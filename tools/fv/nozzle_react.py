@@ -16,6 +16,8 @@ constant-area chamber holding a planar C0 flame, a choked cosine nozzle, a riema
       combscale S5 (P6a): --ny N --ystar-cells K --lc-cells L: the multi-row planar rig (y* = K h, Lc = L h, nx = L +
       10 K, N rows, the axis a symmetryPlane); --cd X [--cd-geom G]: [nozzle] cd = X, the chamber cd x eps_c0 (or G x
       eps_c0); design.json gains lc, ny, cd (absent in old dirs: 1, 1, 1 -- their reports are byte-equal)
+      combscale N25: --div cos|cone|flat, the divergent (nozzle_mesh.reactDiv; cone: convex into a straight end, no
+      recompression at the exit); design.json gains div only when not cos (absent: cos, the bytes)
   nozzle_react.py argv DIR [--tt T] [--compensated] [--wrinkle A]   the dns flame argv of a design (for simjob)
   nozzle_react.py front PREFIX --fit A B [--band LO HI] [--dl HC]   the slope of ln|xIa1|, ln|xIa2| (C6)
   nozzle_react.py pair --r2d JSON --i2d CD CF --r1d JSON --i1d CD CF   G6.2: (reacting - inert) 2D vs 1D off two
@@ -201,7 +203,7 @@ def cmdDesign(a):
     if a.cd_geom is not None and a.cd is None:
         raise SystemExit("--cd-geom needs --cd")
     epsC = epsC0 if a.cd is None else (a.cd if a.cd_geom is None else a.cd_geom) * epsC0
-    y, x0, x2 = nozzle_mesh.reactContour(epsC, a.eps_e, lc, LCON, LDIV, S)
+    y, x0, x2 = nozzle_mesh.reactContour(epsC, a.eps_e, lc, LCON, LDIV, S, a.div)
     X, Y = nozzle_mesh.quadMesh(nx, a.ny, y, x0, x2)
     os.makedirs(a.out, exist_ok=True)
     nozzle_mesh.writePolyMesh(a.out, X, Y)
@@ -209,7 +211,7 @@ def cmdDesign(a):
     station = S * lc - 2 * DTH
     with open(os.path.join(a.out, "bc.toml"), "w") as f:
         f.write(f"# tools/fv/nozzle_react.py design --cells {a.cells} --mach {a.mach} --gamma {a.gamma} --sl {a.sl!r} --target {a.target!r}: "
-                f"eps_c {epsC!r}, M_u {Mu!r}\n")
+                f"eps_c {epsC!r}, M_u {Mu!r}" + ("" if a.div == "cos" else f", div {a.div}") + "\n")
         f.write("[reference]\ndirection = [1, 0, 0]\nlift = [0, 1, 0]\n\n")
         f.write(f"[nozzle]\nastar = {astar:.17g}\n" + ("" if a.cd is None else f"cd = {a.cd:.17g}\n") + "\n")
         f.write(f"[thrust]\npa = {a.pa:.17g}\nstation = {station:.17g}\n\n")
@@ -219,6 +221,8 @@ def cmdDesign(a):
     meta = dict(cells=a.cells, mach=a.mach, gamma=a.gamma, sl=a.sl, target=a.target, nx=nx, h=h, scale=S, epsC=epsC, epsE=a.eps_e, Mu=Mu,
                 p0=p0, t0=t0, astar=astar, station=station, pa=a.pa, upstream=a.upstream, lc=lc, ny=a.ny,
                 cd=1.0 if a.cd is None else a.cd)
+    if a.div != "cos":  # combscale N25: the divergent's shape (absent: cos, the old directories' bytes)
+        meta["div"] = a.div
     with open(os.path.join(a.out, "design.json"), "w") as f:
         json.dump(meta, f, indent=1)
     print(json.dumps(meta))
@@ -265,7 +269,7 @@ def cmdTwin(a):
     m = json.load(open(os.path.join(a.dir, "design.json")))
     g = m["gamma"]
     nxT = m["nx"] - m["nx"] // round((LC + LCON + LDIV) / LC)
-    y, x0, x2 = nozzle_mesh.reactContour(m["epsC"], m["epsE"], 0.0, LCON, LDIV, 1.0)
+    y, x0, x2 = nozzle_mesh.reactContour(m["epsC"], m["epsE"], 0.0, LCON, LDIV, 1.0, m.get("div", "cos"))
     X, Y = nozzle_mesh.quadMesh(nxT, 1, y, x0, x2)
     os.makedirs(a.out, exist_ok=True)
     nozzle_mesh.writePolyMesh(a.out, X, Y)
@@ -343,6 +347,7 @@ class Rig:
         self.Hc, self.ny = m["epsC"] * S, m.get("ny", 1)
         self.xf = m["upstream"] * DTH
         self.xth, self.xexit = self.Lc + self.Lcon, self.Lc + self.Lcon + self.Ldiv
+        self.div = m.get("div", "cos")  # combscale N25: the divergent's shape
 
     def area(self, x):
         """A/A* of the contour (nozzle_mesh.reactContour)."""
@@ -350,6 +355,8 @@ class Rig:
             return self.epsc
         if x <= self.xth:
             return 1 + (self.epsc - 1) * (1 + math.cos(math.pi * (x - self.Lc) / self.Lcon)) / 2
+        if self.div != "cos":
+            return 1 + (self.epse - 1) * float(nozzle_mesh.reactDiv(min(x - self.xth, self.Ldiv) / self.Ldiv, self.div))
         return 1 + (self.epse - 1) * (1 - math.cos(math.pi * min(x - self.xth, self.Ldiv) / self.Ldiv)) / 2
 
     def dlnA(self, x):
@@ -1020,6 +1027,7 @@ def main():
     d.add_argument("--lc-cells", type=int, default=None, help="the chamber's columns (with --ystar-cells)")
     d.add_argument("--cd", type=float, default=None, help="[nozzle] cd: the chamber is cd x eps_c0")
     d.add_argument("--cd-geom", type=float, default=None, help="size the chamber on this cd instead (cd stays --cd's)")
+    d.add_argument("--div", default="cos", choices=list(nozzle_mesh.REACT_DIVS), help="the divergent's shape (N25)")
     d.add_argument("--out", required=True)
     v = s.add_parser("argv")
     v.add_argument("dir")

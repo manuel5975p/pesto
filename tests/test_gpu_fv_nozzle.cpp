@@ -2039,17 +2039,21 @@ void reactTwinSeq(int nxC, int nxF, double epsC, double reStar, double pa, doubl
 }
 
 // combscale S5 (masterplan_combscale R-g, G6.2): the inert twin of the multi-row rig, any rows:
-// reacttwinrow NX NY LC EPS_C RE_STAR PA T_STAR. The react contour at y* 1 (lc LC y* stub, Lcon 6, Ldiv 4, eps_e 2),
+// reacttwinrow NX NY LC EPS_C RE_STAR PA T_STAR [DIV]. The react contour at y* 1 (lc LC y* stub, Lcon 6, Ldiv 4, eps_e 2),
 // planar, NY rows; NY 1: the q1d IC (v 0), NY >= 2: the generator's 2D IC (v = u y_w' y/y_w). RE_STAR <= 0: inviscid.
 // Windows of 5 t* (ledger); settled iff |mdotOut/mdotIn - 1| <= 1e-5 in every window of the last 15 t*; Cd (exit
 // flux), Cd on the inflow and CfVac over the last 100 t* (T_STAR / 4 if shorter), the ledger's endpoints. gamma 1.4.
-void reactTwinRow(int nx, int ny, double lc, double epsC, double reStar, double pa, double tStar)
+// [DIV] (combscale N25): the divergent, cos (absent: the old argv, mesh and print) | cone (nozzle_mesh.py --div).
+void reactTwinRow(int nx, int ny, double lc, double epsC, double reStar, double pa, double tStar, const std::string& div)
 {
-    std::printf("twin row: react lc %.6g, eps_c %.16g, eps_e 2, %d x %d cells, Re* %.16g, pa %.16g, tt %g t*, %s IC\n", lc, epsC, nx, ny,
-                reStar, pa, tStar, ny == 1 ? "q1d" : "2D generator");
-    const std::string args = std::format(
-        "--contour react --lc {} --lcon 6 --ldiv 4 --eps-c {} --eps-e 2 --scale 1 --mode planar --exit riemann --pb {}", lc, epsC, pa);
-    const Gen g = gen(std::format("rtr{}x{}", nx, ny), nx, ny, args);
+    const bool cos = div == "cos";
+    std::printf("twin row: react lc %.6g, eps_c %.16g, eps_e 2, %d x %d cells, Re* %.16g, pa %.16g, tt %g t*, %s IC%s\n", lc, epsC, nx, ny,
+                reStar, pa, tStar, ny == 1 ? "q1d" : "2D generator", cos ? "" : (", div " + div).c_str());
+    const std::string args =
+        std::format("--contour react --lc {} --lcon 6 --ldiv 4 --eps-c {} --eps-e 2 --scale 1 --mode planar --exit riemann --pb {}", lc,
+                    epsC, pa) +
+        (cos ? "" : " --div " + div);
+    const Gen g = gen(std::format("rtr{}x{}{}", nx, ny, cos ? "" : div), nx, ny, args);
     const Rows rows{.pb = pa * kP0, .exit = FvExit::Riemann};
     const double rho0 = kP0 / (287.1 * kT0), mu = reStar > 0 ? rho0 * kC0 * 1.0 / reStar : 0.0;
     const Run r{.mu = mu};
@@ -2616,9 +2620,9 @@ int main(int argc, char** argv)
         reactTwinSeq(std::atoi(argv[2]), std::atoi(argv[3]), std::atof(argv[4]), std::atof(argv[5]), std::atof(argv[6]), std::atof(argv[7]),
                      std::atof(argv[8]));
     else if (m == "reacttwin") reactTwin();
-    else if (m == "reacttwinrow" && argc == 9)
+    else if (m == "reacttwinrow" && (argc == 9 || (argc == 10 && (std::string(argv[9]) == "cos" || std::string(argv[9]) == "cone"))))
         reactTwinRow(std::atoi(argv[2]), std::atoi(argv[3]), std::atof(argv[4]), std::atof(argv[5]), std::atof(argv[6]), std::atof(argv[7]),
-                     std::atof(argv[8]));
+                     std::atof(argv[8]), argc == 10 ? argv[9] : "cos");
     else if (m == "react2d") react2dRun();
     else if (m == "wedgeflame") wedgeFlame();
     else if (m == "wedgestrip") wedgeStrip();

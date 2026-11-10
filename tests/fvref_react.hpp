@@ -90,14 +90,23 @@ inline void designGates()
     check(!bad, "R1: eps_c 1 (no throat) is an error: " + (bad ? std::string("none") : bad.error()));
 }
 
-// The react contour (nozzle_mesh.py reactContour) at scale s.
-inline double reactY(double x, double ec, double ee, double s)
+// The react divergent (nozzle_mesh.py reactContour's div; combscale N25). Cone: nozzle_mesh.py reactDiv "cone".
+enum class Div { Cos, Cone };
+
+// The react contour (nozzle_mesh.py reactContour) at scale s, the chamber lc y* long: the ONE host copy.
+inline double reactY2(double x, double ec, double ee, double s, double lc, Div div = Div::Cos)
 {
     const double u = x / s, pi = std::numbers::pi;
-    if (u <= kLc) return s * ec;
-    if (u <= kLc + kLcon) return s * (1 + (ec - 1) * (1 + std::cos(pi * (u - kLc) / kLcon)) / 2);
-    return s * (1 + (ee - 1) * (1 - std::cos(pi * std::min(u - kLc - kLcon, kLdiv) / kLdiv)) / 2);
+    if (u <= lc) return s * ec;
+    if (u <= lc + kLcon) return s * (1 + (ec - 1) * (1 + std::cos(pi * (u - lc) / kLcon)) / 2);
+    if (div == Div::Cos) return s * (1 + (ee - 1) * (1 - std::cos(pi * std::min(u - lc - kLcon, kLdiv) / kLdiv)) / 2);
+    // Convex, never concave: the cosine's throat parabola to xi_b = 1 - sqrt(1 - 4/pi^2), then its tangent.
+    const double xi = std::min(u - lc - kLcon, kLdiv) / kLdiv, xb = 1 - std::sqrt(1 - 4 / (pi * pi)), k = pi * pi / 4;
+    return s * (1 + (ee - 1) * (xi <= xb ? k * xi * xi : k * xb * (2 * xi - xb)));
 }
+
+// The one-row rig's (Lc 1 y*).
+inline double reactY(double x, double ec, double ee, double s) { return reactY2(x, ec, ee, s, kLc); }
 
 // The chamber's errors against the design's Rayleigh line, per cell (rho, u, E of the cell): mass rho u vs d.m,
 // momentum p + rho u^2 vs d.pu + d.m d.uu, energy cp T + u^2/2 + q Y vs cp d.Tu + d.uu^2/2 + d.q; on the burnt cells
@@ -258,15 +267,6 @@ inline void meshGates()
 
 // --- combscale S5 (masterplan_combscale 2.6-2.8): cd, the multi-row chamber's shape, seed, v, xIa ----------------
 
-// The S5 rig's planar contour (nozzle_react.py design --ystar-cells 12 --lc-cells 468): y* = 12 h, Lc 39 y*.
-inline double reactY2(double x, double ec, double ee, double s, double lc)
-{
-    const double u = x / s, pi = std::numbers::pi;
-    if (u <= lc) return s * ec;
-    if (u <= lc + kLcon) return s * (1 + (ec - 1) * (1 + std::cos(pi * (u - lc) / kLcon)) / 2);
-    return s * (1 + (ee - 1) * (1 - std::cos(pi * std::min(u - lc - kLcon, kLdiv) / kLdiv)) / 2);
-}
-
 // The planar nozzle's rows: inlet Total, outlet Outflow, wall Slip (Wall role), axis Slip on a symmetryPlane (Side).
 inline std::vector<FvBc> rigBc()
 {
@@ -309,9 +309,28 @@ inline void s5Gates()
         auto u = parseFvBc(base + "q = 1\n");
         check(!u && u.error() == "[nozzle]: unknown key 'q' (p, t, astar, axis, cd)", "S5a: the unknown-key list names cd");
     }
+}
+
+// The S5 rig (nozzle_react.py design --ystar-cells 12 --lc-cells 468: y* = 12 h, Lc 39 y*) on one divergent: S5b the
+// shape, S5c --shock's mesh rule, S5d the IC; on the cosine also C6's mesh and S5e (xIa: the chamber's, any divergent).
+inline void s5Rig(Div div)
+{
+    const char* tag = div == Div::Cos ? "" : " [div cone]";
+    const PyRow& r = kPy[0];
+    const double Tu = 1.0 / (r.g * kMach * kMach), cp = r.g / (r.g - 1.0), q = cp * (kSigma - 1) * Tu;
+    const FvReactingDesign d = designOf(r);
+    if (div == Div::Cone) {
+        // nozzle_mesh.py reactContour(6.172901800721939, 2, 39, 6, 4, 1, "cone") at x = 45 + 4 xi (Python's repr).
+        const double py[5][2] = {{0.1, 1.0246740110027233}, {0.2, 1.0986960440108928}, {0.25, 1.153105936828941}, {0.6, 1.548323166308768},
+                                 {1.0, 2.0}};
+        double e = 0;
+        for (const auto& [xi, y] : py) e = std::max(e, rel(reactY2(45.0 + 4.0 * xi, r.epsC, kEpsE, 1.0, 39.0, div), y));
+        std::printf("S5b%s contour vs nozzle_mesh.py at 5 xi: max rel %.2e\n", tag, e);
+        check(e <= 1e-14, std::format("S5b{}: the host contour == nozzle_mesh.py's (1e-14)", tag));
+    }
     // The rig: 588 x 16 (and its one row), h = delta_th/15, y* = 12 h, Lc 39 y*, eps_c the 15-cell eps_c0.
     const double h = kDth / 15.0, S = 12.0 * h, lc = 39.0, astar = S * 0.1;
-    const auto yW = [&](double x) { return reactY2(x, r.epsC, kEpsE, S, lc); };
+    const auto yW = [&](double x) { return reactY2(x, r.epsC, kEpsE, S, lc, div); };
     const FaceMesh f2 = must(FaceMesh::fromPolyMesh(planarPoly(588, 16, yW, 0.0, 49.0 * S), CellOrder::Morton), "2D rig");
     const FaceMesh f1 = must(FaceMesh::fromPolyMesh(planarPoly(588, 1, yW, 0.0, 49.0 * S), CellOrder::Morton), "1D rig");
     const FvFlameSpec fl{.dir = {1, 0, 0}, .Tu = Tu, .sigma = kSigma, .dth = kDth, .gamma = r.g, .Rgas = 1.0, .q = q, .fuel = 0,
@@ -320,19 +339,20 @@ inline void s5Gates()
     const std::vector<FvBc> bc = rigBc();
     const auto sh = fvNozzleShapeOf(f2, p2, fvRoles(bc, f2), {0, 0, 0}, {0, 1, 0});
     const auto sh1 = fvNozzleShapeOf(f1, p1, fvRoles(bc, f1), {0, 0, 0}, {0, 1, 0});
-    std::printf("S5b rig 588 x 16: bins %d, chamber %d; H_c %.15g vs eps_c y* %.15g; one row: shape %s\n", p2.bins(), p2.chamberBins(),
-                sh ? sh->Hc : NAN, r.epsC * S, sh1 ? "SET" : "none");
-    check(p2.bins() == 588 && p2.chamberBins() == 468 && p1.chamberBins() == 468, "S5b: bins = columns, 468 chamber columns, both meshes");
-    check(sh && rel(sh->Hc, r.epsC * S) <= 1e-12, "S5b: H_c = the chamber wall's height (1e-12)");
-    check(!sh1, "S5b: the one-row chamber has no shape");
+    std::printf("S5b%s rig 588 x 16: bins %d, chamber %d; H_c %.15g vs eps_c y* %.15g; one row: shape %s\n", tag, p2.bins(),
+                p2.chamberBins(), sh ? sh->Hc : NAN, r.epsC * S, sh1 ? "SET" : "none");
+    check(p2.bins() == 588 && p2.chamberBins() == 468 && p1.chamberBins() == 468,
+          std::format("S5b{}: bins = columns, 468 chamber columns, both meshes", tag));
+    check(sh && rel(sh->Hc, r.epsC * S) <= 1e-12, std::format("S5b{}: H_c = the chamber wall's height (1e-12)", tag));
+    check(!sh1, std::format("S5b{}: the one-row chamber has no shape", tag));
     if (!sh) return;
     // --shock's mesh rule on the rig and on C6's (y* 35 h, 818 x 32): 0 unlined cells.
     {
         const long n = fvUnlinedCells(f2, must(fvFaceGeom(f2, FvFaceGradRule::AlongD, 1.0), "geom"));
-        std::printf("S5c S5 rig 588 x 16: %ld unlined cells\n", n);
-        check(n == 0, "S5c: S5 rig: 0 unlined cells (--shock's mesh rule)");
+        std::printf("S5c%s S5 rig 588 x 16: %ld unlined cells\n", tag, n);
+        check(n == 0, std::format("S5c{}: S5 rig: 0 unlined cells (--shock's mesh rule)", tag));
     }
-    {
+    if (div == Div::Cos) {
         const double S6 = 35.0 * h, lc6 = 468.0 / 35.0;
         const FaceMesh f6 = must(FaceMesh::fromPolyMesh(planarPoly(818, 32, [&](double x) { return reactY2(x, r.epsC, kEpsE, S6, lc6); }, 0.0,
                                                                    (lc6 + 10.0) * S6),
@@ -378,14 +398,15 @@ inline void s5Gates()
         vErr = std::max(vErr, std::abs(v - vGen));
         vScale = std::max(vScale, std::abs(vGen));
     }
-    std::printf("S5d IC: seed-0 chamber == the one-row body bitwise: %s; vs the 1D mesh per bin %.2e; nozzle-half v vs the generator's "
+    std::printf("S5d%s IC: seed-0 chamber == the one-row body bitwise: %s; vs the 1D mesh per bin %.2e; nozzle-half v vs the generator's "
                 "u y_w' r/y_w: %.2e of max |v| %.4g\n",
-                bits ? "yes" : "NO", vs1, vErr / vScale, vScale);
-    check(bits, "S5d: seed 0: every chamber cell == the one-row body (nullptr), bit for bit");
-    check(vs1 <= 1e-12, std::format("S5d: 2D chamber rows == the 1D chamber per bin ({:.2e} <= 1e-12)", vs1));
-    check(vScale > 0 && vErr <= 1e-3 * vScale, std::format("S5d: v within 1e-3 of max |v| of the generator's formula ({:.2e})", vErr / vScale));
+                tag, bits ? "yes" : "NO", vs1, vErr / vScale, vScale);
+    check(bits, std::format("S5d{}: seed 0: every chamber cell == the one-row body (nullptr), bit for bit", tag));
+    check(vs1 <= 1e-12, std::format("S5d{}: 2D chamber rows == the 1D chamber per bin ({:.2e} <= 1e-12)", tag, vs1));
+    check(vScale > 0 && vErr <= 1e-3 * vScale, std::format("S5d{}: v within 1e-3 of max |v| of the generator's formula ({:.2e})", tag, vErr / vScale));
     check(std::ranges::all_of(std::span(b.var(2), std::size_t(f2.nC)), [](double v) { return v == 0.0; }),
-          "S5d: the one-row body (nullptr) carries v 0.0 on the 2D mesh");
+          std::format("S5d{}: the one-row body (nullptr) carries v 0.0 on the 2D mesh", tag));
+    if (div != Div::Cos) return;
     // S5e: xIa of a synthetic front x_I(r) = x0 + A cos(pi r/H_c) (rho 1, rho Y = (1 - tanh((s - x0 - A cos)/w))/2).
     const auto synth = [&](double A) {
         FvState s = FvState::zeros(f2.nC, kFvMeanVars + 1);
@@ -416,6 +437,8 @@ inline int run()
     designGates();
     meshGates();
     s5Gates();
+    s5Rig(Div::Cos);
+    s5Rig(Div::Cone); // combscale N25
     return dnstest::finish();
 }
 

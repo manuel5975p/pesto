@@ -3,7 +3,8 @@
 
   nozzle_mesh.py --contour nc|nc-smooth|a1-smooth|parabola|cone6|rocket|react --nx N --ny N [--beta B]
                  --mode planar|wedge [--dphi DEG] [--pb P] [--exit extrapolate|fixed|riemann] [--pa PA] --out DIR
-  react: --eps-c E --eps-e E --lc L --lcon L --ldiv L --scale S (masterplan_combnozzle 2.2). --ny 1: the one-row
+  react: --eps-c E --eps-e E --lc L --lcon L --ldiv L --scale S [--div cos|cone|flat] (masterplan_combnozzle 2.2;
+  --div: combscale N25, cos the default). --ny 1: the one-row
   planar half nozzle, the quasi-1D FV scheme (docs/nozzle.md "Quasi-1D").
 
 Writes DIR/constant/polyMesh (the `note` line, else dns refuses the owner file), DIR/bc.toml (astar from the
@@ -93,15 +94,37 @@ def contour(a):
         xm = 0.2 * R  # |slope| <= 0.2
         return (lambda x: 1 + np.asarray(x, float) ** 2 / (2 * R)), -xm, xm
     if a.contour == "react":
-        return reactContour(a.eps_c, a.eps_e, a.lc, a.lcon, a.ldiv, a.scale)
+        return reactContour(a.eps_c, a.eps_e, a.lc, a.lcon, a.ldiv, a.scale, a.div)
     raise SystemExit("unknown contour " + a.contour)
 
 
-def reactContour(ec, ee, lc, lcon, ldiv, s=1.0):
+REACT_DIVS = ("cos", "cone", "flat")
+# cone: the parabola's end, 1 - sqrt(1 - 4/pi^2) (0.2288): there the tangent line reaches 1 at xi = 1.
+CONE_XB = 1 - math.sqrt(1 - 4 / math.pi**2)
+
+
+def reactDiv(xi, div):
+    """The react divergent's shape f(xi) on xi in [0, 1], y = 1 + (ee - 1) f, f(0) = f'(0) = 0, f(1) = 1 (numpy or a
+    float); the ONE definition of every shape but cos (reactContour and nozzle_react.py Rig.area keep that verbatim).
+    cone (combscale N25): convex, never concave: the cosine's throat parabola (pi^2/4) xi^2 to xi_b = CONE_XB, then
+    its tangent, (pi^2/4) xi_b (2 xi - xi_b): C1, a straight end of slope (pi^2/2) xi_b (ee - 1)/ldiv, exit NOT parallel.
+    flat (N25's recorded negative): 6 xi^2 - 8 xi^3 + 3 xi^4, the exit parallel with zero curvature."""
+    if div == "cone":
+        k = math.pi**2 / 4
+        return np.where(xi <= CONE_XB, k * xi * xi, k * CONE_XB * (2 * xi - CONE_XB))
+    if div == "flat":
+        return xi * xi * (6 + xi * (3 * xi - 8))
+    raise SystemExit(f"--div {div}: unknown react divergent (cos, cone, flat)")
+
+
+def reactContour(ec, ee, lc, lcon, ldiv, s=1.0, div="cos"):
     """masterplan_combnozzle 2.2, planar, y* = 1 before the scale s: chamber y = ec on [0, lc], contraction
     1 + (ec - 1)(1 + cos pi xi)/2 over lcon, divergent 1 + (ee - 1)(1 - cos pi xi)/2 over ldiv. C1, exit parallel.
+    div (combscale N25; cos: the bytes): the divergent 1 + (ee - 1) reactDiv(xi, div) instead.
     (y, x0, x2); the throat sits at x = s (lc + lcon) (throatOf)."""
     assert ec >= 1 and ee >= 1 and lc >= 0 and lcon > 0 and ldiv > 0 and s > 0
+    if div not in REACT_DIVS:
+        raise SystemExit(f"--div {div}: unknown react divergent (cos, cone, flat)")
 
     def y(x):
         u = np.asarray(x, float) / s
@@ -109,7 +132,10 @@ def reactContour(ec, ee, lc, lcon, ldiv, s=1.0):
         m = (u > lc) & (u <= lc + lcon)
         o[m] = 1 + (ec - 1) * (1 + np.cos(np.pi * (u[m] - lc) / lcon)) / 2
         m = u > lc + lcon
-        o[m] = 1 + (ee - 1) * (1 - np.cos(np.pi * np.minimum(u[m] - lc - lcon, ldiv) / ldiv)) / 2
+        if div == "cos":
+            o[m] = 1 + (ee - 1) * (1 - np.cos(np.pi * np.minimum(u[m] - lc - lcon, ldiv) / ldiv)) / 2
+        else:
+            o[m] = 1 + (ee - 1) * reactDiv(np.minimum(u[m] - lc - lcon, ldiv) / ldiv, div)
         return s * o
 
     return y, 0.0, s * (lc + lcon + ldiv)
@@ -417,6 +443,7 @@ def parser():
     p.add_argument("--lcon", type=float, default=4.0, help="react: contraction length / y*")
     p.add_argument("--ldiv", type=float, default=12.0, help="react: divergent length / y*")
     p.add_argument("--scale", type=float, default=1.0, help="react: y* (the mesh's length unit)")
+    p.add_argument("--div", default="cos", choices=list(REACT_DIVS), help="react: the divergent (cone: convex into a straight end, N25)")
     p.add_argument("--out", required=True)
     return p
 

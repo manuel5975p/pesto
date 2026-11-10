@@ -565,6 +565,61 @@ Supersonic: it cannot reach the throat or the chamber; its HLL share sits in one
 the vacuum thrust through `I_exit` only, and the 2D twin carries the same contour. The one-row rig senses 0 (no radial
 line); a 4-row smoke senses 0.
 
+**The cone divergent (N25 closed, masterplan_combscale B9).** The fix is the contour, not the sensor. `nozzle_mesh.py
+--contour react --div cos|cone|flat` (`reactDiv`, default cos = the bytes; `nozzle_react.py design --div`, design.json
+gains `div` only when not cos; `Rig.area`; `test_gpu_fv_nozzle reacttwinrow ... [DIV]`; host copy `fvref_react.hpp`
+`reactY2(..., Div)`, pinned to the generator at 5 xi to 0.0, S5b-S5d on the cone's 588 x 16: 0 unlined cells, v 1.94e-12
+of max |v|). No `dns` source changed (sha256 f3b2b4dd… as S7's). With xi = (x - x_throat)/Ldiv, y/y* = 1 + (eps_e - 1) f(xi):
+
+    cos   f = (1 - cos(pi xi))/2                                              max 21.4 deg, exit parallel, y'' < 0 past xi 1/2
+    cone  f = (pi^2/4) xi^2            for xi <= xi_b = 1 - sqrt(1 - 4/pi^2) = 0.22882
+          f = (pi^2/4) xi_b (2 xi - xi_b)  past it                             15.76 deg straight end, never concave
+    flat  f = 6 xi^2 - 8 xi^3 + 3 xi^4                                        max 24.0 deg, exit parallel with y'' = 0
+
+cone is the cosine's own throat parabola (same throat curvature (eps_e - 1) pi^2/(2 Ldiv^2), C1) run into its tangent:
+xi_b is where the tangent reaches eps_e at Ldiv exactly. The exit is NOT parallel (15.76 deg at the wall): every gate
+compares R2D with its twin on the same contour, the 1D runs read A(x) only. Candidates, R2D at tt 3 (provisional cd):
+
+| div | shockCells | where (`test_fvshock sensed`, t 2 checkpoint) |
+|---|---|---|
+| cos (S5) | 1 on every row | exit column, row 13 of 16, byte 13 |
+| flat | 5-18 on every row (251 of 251, from t 0.013) | 5 cells, row 13 of 16, columns 582-586 (x 62.20-62.62), bytes 2-10, p rising 52.9 -> 56.7 |
+| cone | **0 on every row** (221) | none |
+
+A zero-curvature end does not help (worse: more turning back, 24 deg to 0): ANY turn-back to parallel recompresses
+along the wall and the sensor reads it on the radial line; a divergent with no concave part does not. The cd fixed
+point on the cone, S5's recipe (Re* 18.878428964101555, pa 0.010037142353160357): I2D0 Cd 0.9557542854 ([500, 600] t*,
+|out/in - 1| 8.45e-5), I1D0 0.9691133626 (ratio 1.40% < 2%: one chamber); chamber on 0.9557542854 (eps_c
+5.89977734939337, H_c 7.5595); **I2D** (tt 1200 t*) Cd 0.9575863168, CfVac 1.3460452408 (|out/in - 1| 5.75e-8);
+**I1D** (tt 600) 0.9697579550, 1.3686202734. R2D 734 134 steps, 0.318 ms/step (the cosine's 0.475 carried the per-step
+sensor cadence of its one hot cell), 234 s; R1D 501 191 steps, 141 s. Rule: t_e 6.994, P_model 7.785 (fit refused,
+resid/amp 0.769), k 4, W [18.860, 50]. **These rows supersede the cosine table's R2D column as the P6a statement**
+(the cosine rows stay as measured; C6 and the inviscid twin were not rerun: C6 is the chamber's DL growth, upstream of
+a choked throat, no divergent in it):
+
+| gate | R2D cone | R2D cos (above) | R1D cone (reported) | band |
+|---|---|---|---|---|
+| G6.1 = G4.1f | 1.60e-16, ratio 0.87; control 0.42 | 1.86e-16, 0.81; 0.42 | 1.67e-16, 0.75 | 1e-13, 4; ctrl >= 1e-6 |
+| G4.2 | -8.66e-5 | -8.66e-5 | -9.71e-6 | 5e-4 |
+| G4.3 | +3.25e-5 (x_f' +0.0101) | +2.88e-5 | -1.23e-4 | 2e-3 S_L |
+| G4.4 T0b; fuel | +2.06e-5; 0.0 | +2.07e-5; 0.0 | +6.09e-5; 0.0 | 1e-4; 1e-8 |
+| G4.5 dCd (throat; exit) / dCf | +5.95e-6 (+5.73e-6) / -1.19e-6 | +5.93e-6 (+5.73e-6) / -1.19e-6 | -4.33e-6 / -7.76e-6 | 1e-4 |
+| G6.3 = G4.6 p0b; mdot = burn + storage | -1.51e-7; +1.145e-5 = -6.9e-8 + 1.15e-5 (ident -3.6e-17) | -1.22e-7; +1.171e-5 | +2.74e-5; +4.28e-5 | 4.9e-4; 1e-4; 1e-9 |
+| G6.3 control | 4.916e-3 | 4.916e-3 | 4.895e-3 | >= 4.9e-3 |
+| G4.8 shockCells | **0 on every row (3671): MET** | 1 on every row: UNMET | 0 | 0 |
+| G4.11 ring fit | refused (resid/amp 0.769): not evaluable (N26) | refused (0.739) | refused (0.164) | 3% / 15% |
+| G4.12 a / b | +1.86e-10 / -1.65e-4 at [4.5, 8.5] | +1.82e-10 / -1.65e-4 | -2.34e-10 / **-1.11e-3** | 1e-6 / 3e-4 |
+| G6.4a over [2.01, 16.99] | -0.1065/tau | -0.1066 | - | <= -0.03 |
+| G6.4b | 7.995e-4 (t_s 9.62e-4; band 1.058e-3) | 7.98e-4 | - | max(1.1 t_s, 1e-4) |
+| G6.5a | 0.635 vs 1.557 | same | - | <= \|W\|/20 |
+| G6.5b: p0b, mdot, dCd, dCf moves | -7.8e-8, -2.75e-6, -2.9e-7, +1.7e-7 | -4.2e-8, -2.6e-6, -2.7e-7, +1.9e-7 | - | band/10 |
+
+G6.2 (`pair`) on the cone: Delta_2D (Cd, Cf, mdot) = (+5.95e-6, -1.19e-6, +5.73e-6), Delta_1D = (-4.33e-6, -7.76e-6,
+-3.03e-6): |Delta_2D - Delta_1D| = **1.03e-5, 6.57e-6, 8.76e-6** (cos 1.05e-5, 7.06e-6, 9.06e-6; band 1e-4: met);
+control |Cd_R2D - Cd_I1D| 1.217e-2 (live). G6.0 on the cone: every G4 gate met but G4.11 (not evaluable, N26, unchanged).
+Everything upstream of the throat reproduces the cosine run to the print (G4.2, G4.12, G6.4, G6.5a); the divergent moves
+CfVac (+2.4e-3 on the 2D twin, +3.0e-3 on the 1D) and the twins' Cd by 1.5e-4 (2D) / 1.7e-4 (1D).
+
 **C6, the control** (H_c = lambda_c = 23.07 delta_D: y* 35 h, 818 x 32, `--wrinkle 0.02`, cd 1, tt 30, no twin; 408 634
 steps, 0.596 ms/step, 244 s): lambda_1 = 2 H_c = 46.14 = 2 lambda_c, MM's fastest mode (s_MM +0.0798, measured-lambda_c
 law +0.0871, G2b 0.0884). The slope of ln xIa1 over [8, 30] is **+0.1110/tau** (band [0.040, 0.120]: met; pre-registered
