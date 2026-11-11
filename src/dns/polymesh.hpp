@@ -17,7 +17,9 @@
 namespace dns {
 
 // OpenFOAM boundary types the reader accepts; any other type is rejected by name.
-enum class FoamPatchType : std::uint8_t { Wall, Patch, Symmetry, SymmetryPlane, Empty, Cyclic, Wedge };
+// CyclicAMI: a faceAreaWeightAMI pair without transform (the pimpleFoam FV path
+// only, FaceMeshOptions::ami; its faces stay boundary faces).
+enum class FoamPatchType : std::uint8_t { Wall, Patch, Symmetry, SymmetryPlane, Empty, Cyclic, Wedge, CyclicAMI };
 
 // The OpenFOAM spelling of a patch type ("wall", "symmetryPlane", ...).
 const char* foamPatchTypeName(FoamPatchType);
@@ -27,7 +29,7 @@ struct FoamPatch
     std::string name;
     FoamPatchType type{};
     std::int64_t nFaces = 0, startFace = 0;
-    std::string neighbourPatch;                        // Cyclic only
+    std::string neighbourPatch;                        // Cyclic, CyclicAMI
     std::optional<std::array<double, 3>> separation;   // Cyclic `transform translational`
                                                        // (separationVector: neighbour - this)
     bool operator==(const FoamPatch&) const = default;
@@ -61,8 +63,10 @@ struct PolyMesh
 };
 
 // Full read. Rejects by name: *.gz, processor* patches ("decomposed: run
-// reconstructParMesh"), cyclicAMI/ACMI/nonConformal*/mapped* types, cyclic
+// reconstructParMesh"), cyclicACMI/nonConformal*/mapped* types, cyclic
 // `rotational`, #include/#calc, owner >= neighbour on an internal face, labels
+// (cyclicAMI: accepted as FoamPatchType::CyclicAMI when noOrdering +
+// faceAreaWeightAMI + defaults, any other entry by name), labels
 // out of range, faces with < 3 nodes, patches not contiguous over
 // [nInternalFaces, nFaces), unpaired cyclics, overlapping cellZones,
 // truncated lists. Errors name the file (exit 3).

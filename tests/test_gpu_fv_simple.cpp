@@ -13,6 +13,12 @@
 //        frame fluxes -- + an inactive one; nonRotatingPatches literal and
 //        regex; a rotating wall; MRF-included open, slip and symmetryPlane
 //        faces; omega `constant`, a non-normalised axis)
+//   IF1g disc (two fvOptions actuationDiskSource, Froude, cellZones cut by
+//        topoSet, on a non-orthogonal 3D duct; $internalField, a `$_coeffs;`
+//        splice, two forces + two forceCoeffs objects, an equations ".*"
+//        factor matching p): fields and residuals as the others (measured
+//        4.8e-14 .. 3.0e-13), plus gateDisc: iterations 1-120 of
+//        actuationDiskSource.dat, force.dat, moment.dat, coefficient.dat row
 // Gates: U, p, phi at iterations 100 and 400 within 1e-10 of the field scale
 // (measured 3.6e-14 .. 7.4e-13); initial residuals of the first 50 iterations
 // within 1e-8 relative where above 1e-9 (measured 2e-12 .. 4.1e-10) (the history is the algorithm's);
@@ -62,6 +68,7 @@ struct Run
     FvSimpleSetup s;
     std::vector<gpu::FvIterLog> logs;
     std::vector<gpu::FvState> at; // states at the requested iterations
+    std::vector<std::vector<gpu::FvForceSums>> forces; // [iteration][forces object] (cases with function objects)
 };
 
 std::expected<Run, std::string> run(const char* name, std::vector<int> stops, const FvNumerics& num = {})
@@ -77,6 +84,7 @@ std::expected<Run, std::string> run(const char* name, std::vector<int> stops, co
     r.s = std::move(*s);
     if (r.L.c.ras.model != FvTurbModel::Laminar)
         if (auto x = buildRasSetup(r.L.pm, r.L.fm, r.L.c, r.s); !x) return std::unexpected(x.error());
+    if (auto x = buildDiskSetup(r.L.pm, r.L.fm, r.L.c, r.s); !x) return std::unexpected(x.error());
     auto ds = gpu::DeviceSimple::make(r.s, r.L.c, g, num);
     if (!ds) return std::unexpected(ds.error());
     const int N = stops.back();
@@ -84,6 +92,14 @@ std::expected<Run, std::string> run(const char* name, std::vector<int> stops, co
         auto lg = ds->iterate();
         if (!lg) return std::unexpected(std::format("iteration {}: {}", it, lg.error()));
         r.logs.push_back(*lg);
+        if (!r.L.c.forces.empty()) {
+            r.forces.emplace_back();
+            for (std::size_t k = 0; k < r.L.c.forces.size(); ++k) {
+                auto f = ds->forces(int(k));
+                if (!f) return std::unexpected(f.error());
+                r.forces.back().push_back(*f);
+            }
+        }
         if (std::ranges::find(stops, it) != stops.end()) {
             auto st = ds->state();
             if (!st) return std::unexpected(st.error());
@@ -293,6 +309,124 @@ void gateRas(const char* name, int last = 400)
     }
 }
 
+// The numeric rows of an OpenFOAM function-object .dat file ('#' lines
+// skipped, parentheses dropped): ref/postProcessing/<object>/0/<file>.
+std::vector<std::vector<double>> datRows(const char* name, const std::string& object, const char* file)
+{
+    std::ifstream f(fs::path(DNS_FV_DATA) / name / "ref" / "postProcessing" / object / "0" / file);
+    std::vector<std::vector<double>> rows;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::ranges::replace(line, '(', ' ');
+        std::ranges::replace(line, ')', ' ');
+        std::stringstream ss(line);
+        std::vector<double> row;
+        double v = 0;
+        while (ss >> v) row.push_back(v);
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
+
+// max over the reference's rows (the first kDatRows iterations) of |mine -
+// theirs| / (the column's max |theirs|), columns from `first`; columns
+// identically ~0 skipped.
+constexpr std::size_t kDatRows = 120;
+double datDiff(const std::vector<std::vector<double>>& mine, const std::vector<std::vector<double>>& ref,
+               std::size_t first = 1)
+{
+    if (ref.size() != kDatRows || mine.size() < ref.size()) return 1e300;
+    double worst = 0;
+    for (std::size_t j = first; j < ref[0].size(); ++j) {
+        double scale = 0;
+        for (const auto& r : ref) scale = std::max(scale, std::abs(r[j]));
+        if (scale < 1e-12) continue;
+        for (std::size_t i = 0; i < ref.size(); ++i) worst = std::max(worst, std::abs(mine[i][j] - ref[i][j]) / scale);
+    }
+    return worst;
+}
+
+// IF1g disc (tools/fv/make_cases.py disc): two fvOptions actuationDiskSource
+// (Froude, cellZone) vs simpleFoam, plus the M17 case's reader forms. Fields
+// and residuals by gate("disc"); here iterations 1-120 (the checked-in rows)
+// of actuationDiskSource.dat (Uref, Cp, Ct, a, T, diskDir: the monitor cells
+// are OpenFOAM's findCell, diskA's point on an edge four cells share), of the
+// forces objects' force.dat / moment.dat and of the forceCoeffs objects'
+// coefficient.dat, each within 1e-9 of its column's scale (measured 3.9e-12 ..
+// 1.2e-10; all 300 rows against the full simpleFoam files: the same maxima).
+void gateDisc()
+{
+    std::printf("IF1g disc: function objects and actuationDiskSource.dat\n");
+    auto r = run("disc", {300});
+    if (!r) {
+        check(false, "disc: " + r.error());
+        return;
+    }
+    const FoamCase& c = r->L.c;
+    check(c.disks.size() == 2 && r->s.disks.size() == 2 && r->s.disks[0].cells.size() == 28 &&
+              r->s.disks[1].cells.size() == 18 && r->s.disks[0].monitor.size() == 1 && r->s.disks[1].monitor.size() == 2,
+          std::format("setup: diskA {} cells (simpleFoam: 28), diskB {} (18); monitor cells {} / {} {}",
+                      r->s.disks[0].cells.size(), r->s.disks[1].cells.size(),
+                      r->s.disks[0].monitorSrc.empty() ? -1 : r->s.disks[0].monitorSrc[0],
+                      r->s.disks[1].monitorSrc.size() > 0 ? r->s.disks[1].monitorSrc[0] : -1,
+                      r->s.disks[1].monitorSrc.size() > 1 ? r->s.disks[1].monitorSrc[1] : -1));
+    // simpleFoam's log: "selected 28 cell(s) with volume 0.054687500000000021", "18 ... 0.035156249999999979"
+    check(r->s.disks[0].V == 0.054687500000000021 && r->s.disks[1].V == 0.035156249999999979,
+          std::format("zone volumes equal simpleFoam's printed 17 digits: {:.17g}, {:.17g}", r->s.disks[0].V,
+                      r->s.disks[1].V));
+    for (std::size_t k = 0; k < c.disks.size(); ++k) {
+        std::vector<std::vector<double>> mine;
+        for (std::size_t it = 0; it < r->logs.size(); ++it) {
+            const auto& d = r->logs[it].disks[k];
+            mine.push_back({double(it + 1), d.Uref[0], d.Uref[1], d.Uref[2], d.Cp, d.Ct, d.a, d.T, c.disks[k].dir[0],
+                            c.disks[k].dir[1], c.disks[k].dir[2]});
+        }
+        const auto ref = datRows("disc", c.disks[k].name, "actuationDiskSource.dat");
+        const double d = datDiff(mine, ref);
+        const bool first = !ref.empty() && mine[0] == ref[0]; // iteration 1: the initial field, exact
+        check(d < 1e-9 && first, std::format("{}: actuationDiskSource.dat, iterations 1-120: worst {:.2e} of column scale (gate "
+                                             "1e-9); row 1 {}",
+                                             c.disks[k].name, d, first ? "bitwise" : "DIFFERS"));
+    }
+    for (std::size_t k = 0; k < c.forces.size(); ++k) {
+        const FvForces& fo = c.forces[k];
+        std::vector<std::vector<double>> a, b;
+        for (std::size_t it = 0; it < r->forces.size(); ++it) {
+            const auto& x = r->forces[it][k];
+            if (fo.coeffs) {
+                const auto row = fvForceCoeffRow(fo, x.fp, x.fv, x.mp, x.mv);
+                a.push_back({double(it + 1)});
+                a.back().insert(a.back().end(), row.begin(), row.end());
+                continue;
+            }
+            a.push_back({double(it + 1)});
+            b.push_back({double(it + 1)});
+            for (int j = 0; j < 3; ++j) a.back().push_back(x.fp[std::size_t(j)] + x.fv[std::size_t(j)]);
+            for (int j = 0; j < 3; ++j) a.back().push_back(x.fp[std::size_t(j)]);
+            for (int j = 0; j < 3; ++j) a.back().push_back(x.fv[std::size_t(j)]);
+            for (int j = 0; j < 3; ++j) b.back().push_back(x.mp[std::size_t(j)] + x.mv[std::size_t(j)]);
+            for (int j = 0; j < 3; ++j) b.back().push_back(x.mp[std::size_t(j)]);
+            for (int j = 0; j < 3; ++j) b.back().push_back(x.mv[std::size_t(j)]);
+        }
+        if (fo.coeffs) {
+            const double d = datDiff(a, datRows("disc", fo.name, "coefficient.dat"));
+            check(d < 1e-9, std::format("{}: coefficient.dat (12 columns), iterations 1-120: worst {:.2e} of column scale (gate "
+                                        "1e-9)", fo.name, d));
+        } else {
+            const double df = datDiff(a, datRows("disc", fo.name, "force.dat"));
+            const double dm = datDiff(b, datRows("disc", fo.name, "moment.dat"));
+            check(df < 1e-9 && dm < 1e-9,
+                  std::format("{}: force.dat {:.2e}, moment.dat {:.2e} of column scale, iterations 1-120 (gate 1e-9)", fo.name,
+                              df, dm));
+        }
+    }
+    auto again = run("disc", {300});
+    check(again && again->at[0].U == r->at[0].U && again->at[0].p == r->at[0].p &&
+              again->logs.back().disks[0].T == r->logs.back().disks[0].T,
+          "two 300-iteration disc runs are byte-identical (U, p, T)");
+}
+
 void determinismRas()
 {
     std::printf("determinism (RAS)\n");
@@ -473,6 +607,8 @@ int main()
     gate("duct", 300);
     gate("cavity_lim");
     gate("mrf2", 300);
+    gate("disc", 300);
+    gateDisc();
     determinism();
     gateRas("sst_plate");
     gateRas("sst_skew");
@@ -482,6 +618,7 @@ int main()
     gateFp32("channel", 400, 1e-4);
     gateFp32("duct", 300, 1e-4);
     gateFp32("mrf2", 300, 1e-4);
+    gateFp32("disc", 300, 1e-4);
     gateFp32("sst_plate", 400, 1e-4, 3e-2);
     gateFp32("sa_skew", 400, 1e-4);
     floorsFp32();

@@ -1,0 +1,63 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+application simpleFoam;
+startFrom startTime;
+startTime 0;
+stopAt endTime;
+endTime 300;
+deltaT 1;
+writeControl timeStep;
+writeInterval 100;
+purgeWrite 0;
+writeFormat ascii;
+writePrecision 17;
+timeFormat general;
+timePrecision 10;
+runTimeModifiable false;
+_coeffs
+{
+    type            forceCoeffs;
+    libs            (forces);
+    writeControl    timeStep;
+    writeInterval   1;
+    rho             rhoInf;
+    rhoInf          1.2;
+    liftDir         (0.1 1 0);
+    dragDir         (1 0 0.05);
+    CofR            (1.5 0 0.5);
+    magUInf         1;
+    lRef            3;
+    Aref            3;
+}
+functions
+{
+    coeffsWalls { $_coeffs; patches (floor top); }
+    coeffsFloor { $_coeffs; patches (floor); }
+    forcesFloor
+    {
+        type            forces;
+        libs            (forces);
+        writeControl    timeStep;
+        writeInterval   1;
+        patches         (floor);
+        rho             rhoInf;
+        rhoInf          1.2;
+        CofR            (1.5 0 0.5);
+    }
+    forcesWalls
+    {
+        type            forces;
+        libs            (forces);
+        writeControl    timeStep;
+        writeInterval   1;
+        patches         ("(floor|top)");
+        rho             rhoInf;
+        rhoInf          1;
+        CofR            (0 0 0);
+    }
+}

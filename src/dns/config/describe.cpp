@@ -175,8 +175,11 @@ std::string Case::describeCase() const
                               "absolute tolerance max(fvSolution, floor), relTol unchanged)",
                               num.floors.U, num.floors.p, num.floors.s);
         return std::format("case:\n"
-                           "  mode       incompressible FV path: OpenFOAM simpleFoam (SIMPLE/SIMPLEC) on the "
-                           "identical polyMesh, {}, GPU [FV path, body-fitted]\n"
+                           "  mode       incompressible FV path: OpenFOAM simpleFoam (SIMPLE/SIMPLEC) | pimpleFoam "
+                           "(PIMPLE; static mesh, the whole mesh in solid-body rotation, or cellZones rotating behind "
+                           "cyclicAMI: constant/dynamicMeshDict), the "
+                           "case's controlDict `application`, on the identical polyMesh, {}, "
+                           "GPU [FV path, body-fitted]\n"
                            "  precision  {}\n"
                            "  polymesh   {}\n"
                            "  iterations {}\n"

@@ -52,14 +52,15 @@ std::expected<FvLoaded, std::string> loadFvCase(const std::filesystem::path& dir
     if (!c) return std::unexpected(c.error());
     L.c = std::move(*c);
     L.c.dir = dir.string();
-    auto fm = FaceMesh::fromPolyMesh(L.pm, CellOrder::Source);
+    auto fm = FaceMesh::fromPolyMesh(L.pm, CellOrder::Source, 0, {.ami = true});
     if (!fm) return std::unexpected((dir / "constant" / "polyMesh").string() + ": " + fm.error());
     L.fm = std::move(*fm);
     return L;
 }
 
 std::expected<FvSimpleSetup, std::string> buildSimpleSetup(const FaceMesh& fm, const FoamCase& c,
-                                                           const la::CellGraph& g, const la::EllPattern& pat)
+                                                           const la::CellGraph& g, const la::EllPattern& pat,
+                                                           const std::vector<FvAmiPair>* ami)
 {
     FvSimpleSetup s;
     s.nC = fm.nC;
@@ -225,6 +226,9 @@ std::expected<FvSimpleSetup, std::string> buildSimpleSetup(const FaceMesh& fm, c
         case FvUBc::InletOutlet: u = FvUCode::InletOutlet; assign = true; break;
         case FvUBc::Symmetry: u = FvUCode::Symmetry; assign = bc.uType != "slip"; break;
         case FvUBc::Freestream: u = FvUCode::FreestreamV; break;
+        // cyclicAMI: the patch kernels see a zeroGradient face and the AMI
+        // kernels (gpu/fv_ami) overwrite what they wrote (FvAmiSetup).
+        case FvUBc::Ami: u = FvUCode::ZeroGrad; assign = true; break;
         case FvUBc::Empty:
             return std::unexpected("patch '" + bc.name + "': velocity BC empty on a non-empty patch");
         }
@@ -233,13 +237,14 @@ std::expected<FvSimpleSetup, std::string> buildSimpleSetup(const FaceMesh& fm, c
         case FvPBc::Fixed: pc = FvPCode::Fixed; break;
         case FvPBc::ZeroGrad: pc = FvPCode::ZeroGrad; break;
         case FvPBc::Freestream: pc = FvPCode::FreestreamP; break;
+        case FvPBc::Ami: pc = FvPCode::ZeroGrad; break;
         case FvPBc::Empty: return std::unexpected("patch '" + bc.name + "': pressure BC empty on a non-empty patch");
         }
         s.bU[bb] = std::uint8_t(u);
         s.bP[bb] = std::uint8_t(pc);
         s.bAssign[bb] = assign;
         s.bSym[bb] = bc.meshType == FoamPatchType::Symmetry || bc.meshType == FoamPatchType::SymmetryPlane;
-        s.bAdjust[bb] = !(u == FvUCode::Fixed || u == FvUCode::FreestreamV);
+        s.bAdjust[bb] = !(u == FvUCode::Fixed || u == FvUCode::FreestreamV) && bc.u != FvUBc::Ami; // adjustPhi skips coupled
         V3 Up{};
         for (int q = 0; q < 3; ++q) Up[std::size_t(q)] = s.U0[std::size_t(q) * nC + std::size_t(o)];
         for (int q = 0; q < 3; ++q) {
@@ -268,7 +273,9 @@ std::expected<FvSimpleSetup, std::string> buildSimpleSetup(const FaceMesh& fm, c
         s.bP0[bb] = pc == FvPCode::Fixed      ? pref
                     : pc == FvPCode::ZeroGrad ? pP
                                               : (bc.pInit.v.empty() ? pref : valueAt(bc.pInit, local, 0, 1));
-        if (c.forces && std::ranges::find(c.forces->patches, bc.name) != c.forces->patches.end()) s.bForce[bb] = 1;
+        for (std::size_t k = 0; k < c.forces.size(); ++k)
+            if (std::ranges::find(c.forces[k].patches, bc.name) != c.forces[k].patches.end())
+                s.bForce[bb] |= std::uint8_t(1u << k);
     }
 
     // --- cells ---------------------------------------------------------------
@@ -388,17 +395,32 @@ std::expected<FvSimpleSetup, std::string> buildSimpleSetup(const FaceMesh& fm, c
         if (s.refCell < 0) return std::unexpected("pRefCell not found in the FaceMesh");
         s.refValue = c.simple.pRefValue;
     }
+    if (std::ranges::any_of(fm.patches, [](const MeshPatch& p) { return p.type == FoamPatchType::CyclicAMI; })) {
+        if (!ami) return std::unexpected("cyclicAMI patches need the AMI (buildFvGraph)");
+        if (auto r = bindFvAmi(fm, c, g, pat, *ami, s); !r) return std::unexpected(r.error());
+    }
     return s;
 }
 
 std::expected<void, std::string> buildRasSetup(const PolyMesh& pm, const FaceMesh& fm, const FoamCase& c,
-                                               FvSimpleSetup& s)
+                                               FvSimpleSetup& s, const std::vector<FvAmiPair>* ami)
 {
     const FvRas& r = c.ras;
     FvRasSetup& R = s.ras;
     R.model = r.model;
     const std::size_t nC = std::size_t(s.nC), nB = std::size_t(s.nB);
-    auto wd = fvWallDistance(pm, fm, r.exactDist, r.correctWalls);
+    // meshWave crosses cyclicAMI: every such patch in boundary order
+    std::vector<FvWaveAmi> wave;
+    if (ami)
+        for (std::size_t p = 0; p < pm.man.patches.size(); ++p)
+            for (const FvAmiPair& a : *ami) {
+                if (a.src == int(p)) wave.push_back(FvWaveAmi{a.src, a.tgt, true, &a.ami.src});
+                if (a.tgt == int(p)) wave.push_back(FvWaveAmi{a.tgt, a.src, false, &a.ami.tgt});
+            }
+    if (wave.empty() && std::ranges::any_of(pm.man.patches,
+                                            [](const FoamPatch& p) { return p.type == FoamPatchType::CyclicAMI; }))
+        return std::unexpected("wall distance: cyclicAMI patches need the AMI (buildFvGraph)");
+    auto wd = fvWallDistance(pm, fm, r.exactDist, r.correctWalls, wave);
     if (!wd) return std::unexpected(wd.error());
     R.y = std::move(wd->y);
     R.yWall.assign(nB, 0.0);
@@ -474,6 +496,7 @@ std::expected<void, std::string> buildRasSetup(const PolyMesh& pm, const FaceMes
                 x0 = bc.init.v.empty() ? xP : valueAt(bc.init, local, 0, 1);
                 break;
             case FvSBc::OmegaWall: code = FvSCode::OmegaWall; break; // extrapolateInternal()
+            case FvSBc::Ami: code = FvSCode::ZeroGrad; break;        // overwritten by the AMI kernels
             case FvSBc::Empty:
                 return std::unexpected("patch '" + c.patches[std::size_t(s.bPatch[b])].name +
                                        "': turbulence BC empty on a non-empty patch");
@@ -502,6 +525,7 @@ std::expected<void, std::string> buildRasSetup(const PolyMesh& pm, const FaceMes
         case FvNutBc::KWall: code = FvNutCode::KWall; break;
         case FvNutBc::Cell: code = FvNutCode::Cell; break;
         case FvNutBc::Fixed: code = FvNutCode::Fixed; break;
+        case FvNutBc::Ami: code = FvNutCode::Cell; break; // overwritten by the AMI kernels
         case FvNutBc::Empty:
             return std::unexpected("patch '" + c.patches[std::size_t(s.bPatch[b])].name + "': nut empty on a non-empty patch");
         }

@@ -35,6 +35,7 @@ std::expected<void, string> onlyKeys(const Dict& d, std::initializer_list<const 
                        " (expand it: foamDictionary -expand)");
         if (e.key == "FoamFile") continue;
         if (e.quotedKey && allowRegex) continue;
+        if (e.referenced) continue; // a `$key` macro's definition: OpenFOAM reads no such entry here
         if (std::ranges::none_of(allowed, [&](const char* k) { return e.key == k; }))
             return Err(at(d, e) + "'" + e.key + "' is not supported in " + what +
                        " (the FV path reproduces simpleFoam exactly; remove the entry)");
@@ -136,7 +137,7 @@ bool regexMatch(const string& pattern, const string& name)
 bool isConstraint(FoamPatchType t)
 {
     return t == FoamPatchType::Empty || t == FoamPatchType::Symmetry || t == FoamPatchType::SymmetryPlane ||
-           t == FoamPatchType::Cyclic || t == FoamPatchType::Wedge;
+           t == FoamPatchType::Cyclic || t == FoamPatchType::Wedge || t == FoamPatchType::CyclicAMI;
 }
 
 // The boundaryField entry of patch p (OpenFOAM precedence: exact name, then
@@ -183,6 +184,7 @@ std::expected<void, string> readUBc(const Dict& bf, const Entry& e, FvPatchBc& b
         if (!v) return Err(v.error());
         b.u = FvUBc::Fixed;
         b.uValue = *v;
+        b.movingWall = t == "movingWallVelocity";
     } else if (t == "noSlip") {
         if (auto r = onlyKeys(d, {"type", "value"}, where); !r) return r;
         b.u = FvUBc::Fixed;
@@ -222,6 +224,11 @@ std::expected<void, string> readUBc(const Dict& bf, const Entry& e, FvPatchBc& b
     } else if (t == "cyclic") {
         if (b.meshType != FoamPatchType::Cyclic) return Err(d.file + ": " + where + ": cyclic on a non-cyclic patch");
         b.u = FvUBc::Empty; // consumed: the FaceMesh merges cyclic pairs into internal faces
+    } else if (t == "cyclicAMI") {
+        if (b.meshType != FoamPatchType::CyclicAMI)
+            return Err(d.file + ": " + where + ": cyclicAMI on a non-cyclicAMI patch");
+        if (auto r = onlyKeys(d, {"type", "value"}, where); !r) return r;
+        b.u = FvUBc::Ami;
     } else {
         return Err(d.file + ": " + where + ": velocity BC '" + t +
                    "' is not supported (fixedValue, noSlip, movingWallVelocity, zeroGradient, inletOutlet, "
@@ -283,6 +290,11 @@ std::expected<void, string> readPBc(const Dict& bf, const Entry& e, FvPatchBc& b
     } else if (t == "cyclic") {
         if (b.meshType != FoamPatchType::Cyclic) return Err(d.file + ": " + where + ": cyclic on a non-cyclic patch");
         b.p = FvPBc::Empty;
+    } else if (t == "cyclicAMI") {
+        if (b.meshType != FoamPatchType::CyclicAMI)
+            return Err(d.file + ": " + where + ": cyclicAMI on a non-cyclicAMI patch");
+        if (auto r = onlyKeys(d, {"type", "value"}, where); !r) return r;
+        b.p = FvPBc::Ami;
     } else {
         return Err(d.file + ": " + where + ": pressure BC '" + t +
                    "' is not supported (fixedValue, zeroGradient, freestreamPressure, slip, symmetry, "
@@ -345,6 +357,10 @@ std::expected<void, string> readField(const Dict& d, const PolyManifest& man, bo
             if (isConstraint(p.type)) { // the constraint type implied (setConstraintTypes)
                 if (velocity) { b.u = FvUBc::Empty; b.uType = foamPatchTypeName(p.type); }
                 else { b.p = FvPBc::Empty; b.pType = foamPatchTypeName(p.type); }
+                if (p.type == FoamPatchType::CyclicAMI) {
+                    if (velocity) b.u = FvUBc::Ami;
+                    else b.p = FvPBc::Ami;
+                }
                 if (p.type == FoamPatchType::Symmetry || p.type == FoamPatchType::SymmetryPlane) {
                     if (velocity) b.u = FvUBc::Symmetry;
                     else b.p = FvPBc::ZeroGrad;
@@ -477,6 +493,11 @@ std::expected<void, string> readScalarBc(const Dict& bf, const Entry& e, const F
         if (t == "cyclic" && patch.type != FoamPatchType::Cyclic)
             return Err(d.file + ": " + where + ": cyclic on a non-cyclic patch");
         b.kind = FvSBc::Empty;
+    } else if (t == "cyclicAMI") {
+        if (patch.type != FoamPatchType::CyclicAMI)
+            return Err(d.file + ": " + where + ": cyclicAMI on a non-cyclicAMI patch");
+        if (auto r = onlyKeys(d, {"type", "value"}, where); !r) return r;
+        b.kind = FvSBc::Ami;
     } else {
         return Err(d.file + ": " + where + ": " + field + " BC '" + t +
                    "' is not supported (fixedValue, zeroGradient, kqRWallFunction, inletOutlet, freestream, "
@@ -551,6 +572,11 @@ std::expected<void, string> readNutBc(const Dict& bf, const Entry& e, const Foam
         if (auto r = readBlending(d, b.blend, b.n); !r) return r;
     } else if (t == "empty" || t == "cyclic") {
         b.kind = FvNutBc::Empty;
+    } else if (t == "cyclicAMI") {
+        if (patch.type != FoamPatchType::CyclicAMI)
+            return Err(d.file + ": " + where + ": cyclicAMI on a non-cyclicAMI patch");
+        if (auto r = onlyKeys(d, {"type", "value"}, where); !r) return r;
+        b.kind = FvNutBc::Ami;
     } else {
         return Err(d.file + ": " + where + ": nut BC '" + t +
                    "' is not supported (calculated, fixedValue, zeroGradient, nutLowReWallFunction, "
@@ -563,7 +589,7 @@ std::expected<void, string> readNutBc(const Dict& bf, const Entry& e, const Foam
     }
     if (wallFn)
         if (auto r = readWallCoeffs(d, b.wc); !r) return r;
-    if (b.kind != FvNutBc::Empty && b.kind != FvNutBc::Cell) {
+    if (b.kind != FvNutBc::Empty && b.kind != FvNutBc::Cell && b.kind != FvNutBc::Ami) {
         auto v = value(true); // fixedValue-derived and calculated patches read `value`
         if (!v) return Err(v.error());
         b.value = *v;
@@ -609,10 +635,12 @@ std::expected<void, string> readTurbField(const Dict& d, const PolyManifest& man
             const bool sym = p.type == FoamPatchType::Symmetry || p.type == FoamPatchType::SymmetryPlane;
             if (field == "nut") {
                 r.nut[i].kind = sym ? FvNutBc::Cell : FvNutBc::Empty;
+                if (p.type == FoamPatchType::CyclicAMI) r.nut[i].kind = FvNutBc::Ami;
                 r.nut[i].type = foamPatchTypeName(p.type);
             } else {
                 auto& b = (field == "k" ? r.k : field == "omega" ? r.omega : r.nuTilda)[i];
                 b.kind = sym ? FvSBc::ZeroGrad : FvSBc::Empty;
+                if (p.type == FoamPatchType::CyclicAMI) b.kind = FvSBc::Ami;
                 b.type = foamPatchTypeName(p.type);
             }
             continue;
@@ -789,8 +817,19 @@ std::expected<void, string> readSchemes(const Dict& d, FoamCase& c)
     if (!ddt) return Err(ddt.error());
     {
         const Entry* e = (*ddt)->find("default");
-        if (!e || foam::joined(*e) != "steadyState")
-            return Err(d.file + ": ddtSchemes default must be steadyState (SIMPLE; transient PISO/PIMPLE is not built)");
+        if (c.pimple.on) {
+            // pimpleFoam: Euler alone (fvm::ddt and fvc::ddtCorr are EulerDdtScheme's; `Euler X` would set
+            // ddtPhiCoeff, a per-field entry another scheme).
+            if (!e || foam::joined(*e) != "Euler")
+                return Err(d.file + ": ddtSchemes default must be Euler (pimpleFoam; got '" +
+                           (e ? foam::joined(*e) : string()) + "': backward, CrankNicolson, localEuler, steadyState and "
+                           "an explicit ddtPhiCoeff are not built)");
+            for (const Entry& x : (*ddt)->entries)
+                if (x.key != "FoamFile" && x.key != "default")
+                    return Err(at(**ddt, x) + "per-field ddt scheme '" + x.key + "' is not supported (default Euler)");
+        } else if (!e || foam::joined(*e) != "steadyState")
+            return Err(d.file + ": ddtSchemes default must be steadyState (simpleFoam; a transient case needs "
+                                "`application pimpleFoam`)");
     }
     auto gr = subDict(d, "gradSchemes", true, "fvSchemes");
     if (!gr) return Err(gr.error());
@@ -810,6 +849,17 @@ std::expected<void, string> readSchemes(const Dict& d, FoamCase& c)
         }
         if (!g) return Err(d.file + ": gradSchemes needs '" + key + "' or a default");
         (string(key) == "grad(U)" ? c.schemes.gradU : c.schemes.gradP) = *g;
+    }
+    if (c.motion.on) { // CorrectPhi's fvm::laplacian(rAUf, pcorr) correction reads grad(pcorr)
+        const Entry* e = (*gr)->find("grad(pcorr)");
+        std::optional<FvGradScheme> g = def;
+        if (e) {
+            auto x = gradScheme(**gr, *e);
+            if (!x) return Err(x.error());
+            g = *x;
+        }
+        if (!g) return Err(d.file + ": gradSchemes needs 'grad(pcorr)' or a default (moving mesh: CorrectPhi)");
+        c.schemes.gradPcorr = *g;
     }
     // RAS: the turbulence scalars' gradient (linearUpwind / limitedLinear /
     // CDkOmega / SA's Cb2 term), convection, and the wall distance.
@@ -856,7 +906,13 @@ std::expected<void, string> readSchemes(const Dict& d, FoamCase& c)
             auto cs = convScheme(**dv, f, xs);
             if (!cs) return Err(cs.error());
             (f == "k" ? ras.divK : f == "omega" ? ras.divOmega : ras.divNuTilda) = *cs;
+            if (c.pimple.on && cs->bounded)
+                return Err(d.file + ": div(phi," + f + ") '" + xs + "': `bounded` (the steady -Sp(div(phi)) term) with "
+                           "pimpleFoam is not built");
         }
+        if (c.pimple.on && c.schemes.bounded)
+            return Err(d.file + ": div(phi,U) '" + s + "': `bounded` (the steady -Sp(div(phi)) term) with pimpleFoam is "
+                       "not built");
     }
     if (ras.model != FvTurbModel::Laminar) {
         auto wd = subDict(d, "wallDist", true, "fvSchemes (RAS needs the wall distance method)");
@@ -998,6 +1054,223 @@ std::expected<std::optional<double>, string> relaxOf(const Dict& r, const char* 
     return std::optional<double>{*v};
 }
 
+// The tested PIMPLE loop counts (docs/fvpimple.md): each count's range is
+// what the parity gates exercise; outside it is rejected by name.
+constexpr int kPimpleMaxOuter = 3, kPimpleMaxCorr = 2, kPimpleMaxNonOrth = 2;
+
+// pimpleFoam's fvSolution: PIMPLE (pimpleControl::read + solutionControl::read
+// of v2606), the solver and relaxation entries by the names the loop selects
+// (FvPimpleCtl). Everything not built is rejected by name.
+std::expected<void, string> readPimpleSolution(const Dict& d, const PolyManifest& man, FoamCase& c)
+{
+    auto pdE = subDict(d, "PIMPLE", true, "fvSolution (application pimpleFoam)");
+    if (!pdE) return Err(pdE.error());
+    const Dict& s = **pdE;
+    if (auto r = onlyKeys(s, {"nOuterCorrectors", "nCorrectors", "nNonOrthogonalCorrectors", "momentumPredictor",
+                              "pRefCell", "pRefValue", "turbOnFinalIterOnly", "turbulenceOnFinalIterOnly",
+                              "correctPhi", "consistent", "transonic", "ddtCorr", "finalOnLastPimpleIterOnly",
+                              "residualControl", "checkMeshCourantNo", "moveMeshOuterCorrectors"},
+                          "PIMPLE");
+        !r)
+        return r;
+    FvPimpleCtl& pc = c.pimple;
+    auto count = [&](const char* key, int lo, int hi, int def) -> std::expected<int, string> {
+        const Entry* e = s.find(key);
+        if (!e) return def;
+        auto v = foam::scalarOf(s, *e);
+        if (!v) return Err(v.error());
+        if (*v != std::floor(*v)) return Err(at(s, *e) + key + " must be an integer");
+        if (*v < lo || *v > hi)
+            return Err(at(s, *e) + std::format("{} {:g}: pimpleFoam is built and gated for {} in [{}, {}] "
+                                               "(docs/fvpimple.md)", key, *v, key, lo, hi));
+        return int(*v);
+    };
+    auto no = count("nOuterCorrectors", 1, kPimpleMaxOuter, 1);
+    if (!no) return Err(no.error());
+    auto nc = count("nCorrectors", 1, kPimpleMaxCorr, 1);
+    if (!nc) return Err(nc.error());
+    auto nn = count("nNonOrthogonalCorrectors", 0, kPimpleMaxNonOrth, 0);
+    if (!nn) return Err(nn.error());
+    pc.nOuter = *no;
+    pc.nCorr = *nc;
+    c.simple.nNonOrthCorr = *nn;
+    // A switch that must keep its v2606 default (`def`): the other value is not built.
+    auto fixedSwitch = [&](const char* key, bool def, const char* why) -> std::expected<void, string> {
+        const Entry* e = s.find(key);
+        if (!e) return {};
+        auto v = foam::switchOf(s, *e);
+        if (!v) return Err(v.error());
+        if (*v != def) return Err(at(s, *e) + "PIMPLE " + key + " " + (*v ? "yes" : "no") + ": " + why);
+        return {};
+    };
+    if (auto r = fixedSwitch("momentumPredictor", true, "the predictor-free loop is not built"); !r) return r;
+    if (auto r = fixedSwitch("consistent", false, "PIMPLEC (rAtU = 1/max(1/rAU - H1, 0.1/rAU)) is not built"); !r)
+        return r;
+    if (auto r = fixedSwitch("transonic", false, "a compressible setting"); !r) return r;
+    if (auto r = fixedSwitch("ddtCorr", true, "the loop without fvc::ddtCorr is not built"); !r) return r;
+    if (auto r = fixedSwitch("finalOnLastPimpleIterOnly", false, "not built (pFinal on every outer corrector's last "
+                                                                  "inner iteration is)");
+        !r)
+        return r;
+    if (const Entry* e = s.find("residualControl"))
+        return Err(at(s, *e) + "PIMPLE residualControl (outer-corrector convergence control) is not built");
+    if (const Entry* e = s.find("turbOnFinalIterOnly")) {
+        auto v = foam::switchOf(s, *e);
+        if (!v) return Err(v.error());
+        pc.turbOnFinalIterOnly = *v;
+    }
+    if (s.find("turbulenceOnFinalIterOnly"))
+        c.notes.push_back(std::format("PIMPLE turbulenceOnFinalIterOnly is read by NOTHING in OpenFOAM v2606 (pimpleControl "
+                                      "reads `turbOnFinalIterOnly`, default yes): turbulence is corrected {}",
+                                      pc.turbOnFinalIterOnly ? "on the final outer corrector only"
+                                                             : "on every outer corrector (turbOnFinalIterOnly no)"));
+    // createDyMControls.H: correctPhi (default mesh.dynamic()), checkMeshCourantNo (no),
+    // moveMeshOuterCorrectors (no). Used only when the mesh changes.
+    if (auto r = fixedSwitch("moveMeshOuterCorrectors", false,
+                             "the mesh is moved once per time step, at the first outer corrector");
+        !r)
+        return r;
+    if (c.motion.on) {
+        pc.correctPhi = true;
+        for (const char* key : {"correctPhi", "checkMeshCourantNo"})
+            if (const Entry* e = s.find(key)) {
+                auto v = foam::switchOf(s, *e);
+                if (!v) return Err(v.error());
+                (string(key) == "correctPhi" ? pc.correctPhi : pc.checkMeshCourantNo) = *v;
+            }
+    } else {
+        if (s.find("correctPhi"))
+            c.notes.push_back("PIMPLE correctPhi is read by createDyMControls and used only when the mesh changes: inert "
+                              "on a static mesh");
+        if (s.find("checkMeshCourantNo"))
+            c.notes.push_back("PIMPLE checkMeshCourantNo is used only when the mesh changes: inert on a static mesh");
+    }
+    c.simple.consistent = false;
+    c.simple.momentumPredictor = true;
+    if (const Entry* e = s.find("pRefCell")) {
+        auto v = foam::scalarOf(s, *e);
+        if (!v) return Err(v.error());
+        if (*v < 0 || *v >= double(man.nCells) || *v != std::floor(*v))
+            return Err(at(s, *e) + "pRefCell out of range [0, nCells)");
+        c.simple.pRefCell = std::int64_t(*v);
+        c.simple.pRefGiven = true;
+    }
+    if (const Entry* e = s.find("pRefValue")) {
+        auto v = foam::scalarOf(s, *e);
+        if (!v) return Err(v.error());
+        c.simple.pRefValue = *v;
+    }
+
+    // Solvers: the entries the loop looks up, by name. The non-final ones exist
+    // only when a non-final iteration does.
+    auto sv = subDict(d, "solvers", true, "fvSolution");
+    if (!sv) return Err(sv.error());
+    FvRas& ras = c.ras;
+    const bool sst = ras.model == FvTurbModel::KOmegaSST, sa = ras.model == FvTurbModel::SpalartAllmaras;
+    const bool outerNonFinal = pc.nOuter > 1;
+    const bool innerNonFinal = pc.nCorr > 1 || c.simple.nNonOrthCorr > 0;
+    const bool turbNonFinal = outerNonFinal && !pc.turbOnFinalIterOnly;
+    struct Want
+    {
+        const char* name;
+        bool pressure, nonFinal;
+        FvSolverCtl *dst, *fin;
+    };
+    std::vector<Want> want = {{"U", false, outerNonFinal, &c.solverU, &pc.solverUFinal},
+                              {"p", true, innerNonFinal, &c.solverP, &pc.solverPFinal}};
+    if (sst) {
+        want.push_back({"k", false, turbNonFinal, &ras.solverK, &pc.solverKFinal});
+        want.push_back({"omega", false, turbNonFinal, &ras.solverOmega, &pc.solverOmegaFinal});
+    }
+    if (sa) want.push_back({"nuTilda", false, turbNonFinal, &ras.solverNuTilda, &pc.solverNuTildaFinal});
+    for (const Want& w : want) {
+        auto f = readSolver(**sv, string(w.name) + "Final", w.pressure);
+        if (!f) return Err(f.error());
+        *w.fin = *f;
+        *w.dst = *f; // never looked up by OpenFOAM when no non-final iteration exists
+        if (!w.nonFinal) continue;
+        auto n = readSolver(**sv, w.name, w.pressure);
+        if (!n) return Err(n.error());
+        *w.dst = *n;
+    }
+    if (c.motion.on && pc.correctPhi) {
+        // CorrectPhi: pcorr.select(pimple.finalNonOrthogonalIter()) -> pcorrFinal | pcorr
+        auto f = readSolver(**sv, "pcorrFinal", true);
+        if (!f) return Err(f.error() + " (moving mesh, correctPhi: CorrectPhi's pressure-corrector solve)");
+        pc.solverPcorrFinal = pc.solverPcorr = *f;
+        if (c.simple.nNonOrthCorr > 0) {
+            auto n = readSolver(**sv, "pcorr", true);
+            if (!n) return Err(n.error() + " (moving mesh, correctPhi, nNonOrthogonalCorrectors > 0)");
+            pc.solverPcorr = *n;
+        }
+    }
+
+    auto rf = subDict(d, "relaxationFactors", false, "fvSolution");
+    if (!rf) return Err(rf.error());
+    if (*rf) {
+        if (auto r = onlyKeys(**rf, {"fields", "equations"}, "relaxationFactors (use fields {} / equations {})"); !r)
+            return r;
+        for (const char* sub : {"fields", "equations"}) {
+            auto sd = subDict(**rf, sub, false, "relaxationFactors");
+            if (!sd) return Err(sd.error());
+            if (*sd && (*sd)->find("default"))
+                return Err(d.file + ": relaxationFactors/" + sub + "/default is not supported (name the fields)");
+        }
+        auto get = [&](const char* sub, const string& name) { return relaxOf(**rf, sub, name); };
+        auto rp = get("fields", "p");
+        if (!rp) return Err(rp.error());
+        auto rpf = get("fields", "pFinal");
+        if (!rpf) return Err(rpf.error());
+        if (*rp) {
+            c.relaxP = **rp;
+            c.relaxPGiven = true;
+        }
+        pc.relaxPFinal = *rpf;
+        // solutionControl::storePrevIter stores p's previous iteration only when relaxField("p") is found;
+        // p.relax() on the final corrector looks up "pFinal" and then needs it: OpenFOAM stops.
+        if (*rpf && !*rp)
+            return Err(d.file + ": relaxationFactors/fields has a factor for pFinal but none for p: OpenFOAM stores "
+                                "p's previous iteration only when `p` is found and stops in p.relax()");
+        for (const char* name : {"U", "UFinal", "k", "kFinal", "omega", "omegaFinal", "nuTilda", "nuTildaFinal"}) {
+            auto x = get("fields", name);
+            if (!x) return Err(x.error());
+            if (*x) return Err(d.file + ": relaxationFactors/fields/" + name + " (field relaxation) is not supported");
+        }
+        auto ru = get("equations", "U");
+        if (!ru) return Err(ru.error());
+        c.relaxU = *ru;
+        auto ruf = get("equations", "UFinal");
+        if (!ruf) return Err(ruf.error());
+        pc.relaxUFinal = *ruf;
+        for (const char* name : {"p", "pFinal"}) {
+            auto x = get("equations", name);
+            if (!x) return Err(x.error());
+            if (*x)
+                c.notes.push_back(std::format("relaxationFactors/equations: the factor {:g} matching {} is inert "
+                                              "(pimpleFoam never calls pEqn.relax(); p is relaxed by fields/p, pFinal)",
+                                              **x, name));
+        }
+        struct TR
+        {
+            const char* name;
+            std::optional<double> *dst, *fin;
+        };
+        std::vector<TR> tr;
+        if (sst) tr = {{"k", &ras.relaxK, &pc.relaxKFinal}, {"omega", &ras.relaxOmega, &pc.relaxOmegaFinal}};
+        if (sa) tr = {{"nuTilda", &ras.relaxNuTilda, &pc.relaxNuTildaFinal}};
+        for (const TR& t : tr) {
+            auto a = get("equations", t.name);
+            if (!a) return Err(a.error());
+            *t.dst = *a;
+            auto b = get("equations", string(t.name) + "Final");
+            if (!b) return Err(b.error());
+            *t.fin = *b;
+        }
+    }
+    if (d.find("SIMPLE") || d.find("PISO")) c.notes.push_back("fvSolution SIMPLE/PISO dictionaries ignored (PIMPLE run)");
+    return {};
+}
+
 std::expected<void, string> readSolution(const Dict& d, const PolyManifest& man, FoamCase& c)
 {
     if (auto r = onlyKeys(d, {"solvers", "SIMPLE", "relaxationFactors", "cache", "PIMPLE", "PISO",
@@ -1005,6 +1278,7 @@ std::expected<void, string> readSolution(const Dict& d, const PolyManifest& man,
                           "fvSolution");
         !r)
         return r;
+    if (c.pimple.on) return readPimpleSolution(d, man, c);
     auto sv = subDict(d, "solvers", true, "fvSolution");
     if (!sv) return Err(sv.error());
     auto su = readSolver(**sv, "U", false);
@@ -1101,7 +1375,12 @@ std::expected<void, string> readSolution(const Dict& d, const PolyManifest& man,
         c.relaxU = *ru;
         auto rpe = relaxOf(**rf, "equations", "p");
         if (!rpe) return Err(rpe.error());
-        if (*rpe) return Err(d.file + ": relaxationFactors/equations/p (equation relaxation of p) is not supported");
+        // simpleFoam's pEqn.H never calls pEqn.relax() (v2606: p.relax() only, the FIELD factor), so an
+        // equation factor matching p is read by nothing.
+        if (*rpe)
+            c.notes.push_back(std::format("relaxationFactors/equations: the factor {:g} matching p is inert "
+                                          "(simpleFoam never calls pEqn.relax(); p is relaxed by fields/p only)",
+                                          **rpe));
         auto rfu = relaxOf(**rf, "fields", "U");
         if (!rfu) return Err(rfu.error());
         if (*rfu) return Err(d.file + ": relaxationFactors/fields/U (field relaxation of U) is not supported");
@@ -1122,14 +1401,93 @@ std::expected<void, string> readSolution(const Dict& d, const PolyManifest& man,
     return {};
 }
 
-std::expected<void, string> readForces(const Dict& d, const string& name, const PolyManifest& man, FoamCase& c)
+double dot3(const FvVec3& a, const FvVec3& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+FvVec3 cross3(const FvVec3& a, const FvVec3& b)
 {
-    if (auto r = onlyKeys(d, {"type", "libs", "writeControl", "writeInterval", "executeControl", "executeInterval",
-                              "patches", "rho", "rhoInf", "CofR", "origin", "pRef", "log", "porosity", "enabled",
-                              "e1", "e3"},
-                          "functions/" + name);
+    return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+}
+
+// forceCoeffs: setCoordinateSystem(dict, "liftDir", "dragDir") =
+// coordSystem::cartesian(CofR, e3 = liftDir, e1 = dragDir), i.e.
+// coordinateRotations::axes::rotation(liftDir, dragDir, E3_E1) verbatim.
+std::expected<void, string> readForceCoeffs(const Dict& d, const string& where, FvForces& f)
+{
+    FvForceCoeffs k;
+    FvVec3 lift{}, drag{};
+    for (auto [key, dst] : {std::pair{"liftDir", &lift}, {"dragDir", &drag}}) {
+        const Entry* e = d.find(key);
+        if (!e) return Err(d.file + ": " + where + " needs '" + key + "'");
+        std::size_t pos = 0;
+        auto v = foam::vectorOf(d, e->value, pos, e->line, key);
+        if (!v) return Err(v.error());
+        if (pos != e->value.size()) return Err(at(d, *e) + where + ": '" + key + "' expects one vector");
+        *dst = {(*v)[0], (*v)[1], (*v)[2]};
+    }
+    const double mag1 = std::sqrt(dot3(lift, lift));
+    if (mag1 < 1e-150) return Err(d.file + ": " + where + ": liftDir has zero length");
+    const FvVec3 ax1{lift[0] / mag1, lift[1] / mag1, lift[2] / mag1};
+    FvVec3 ax2 = drag;
+    if (std::sqrt(dot3(ax2, ax2)) < 1e-150)
+        return Err(d.file + ": " + where + ": dragDir has zero length (OpenFOAM guesses an axis: not supported)");
+    const double col = dot3(ax2, ax1); // removeCollinear
+    for (int i = 0; i < 3; ++i) ax2[std::size_t(i)] -= col * ax1[std::size_t(i)];
+    const double mag2 = std::sqrt(dot3(ax2, ax2));
+    if (mag2 < 1e-15)
+        return Err(d.file + ": " + where + ": liftDir and dragDir are co-linear (OpenFOAM guesses an axis: not "
+                                           "supported)");
+    for (double& x : ax2) x /= mag2;
+    k.e1 = ax2;
+    k.e2 = cross3(ax1, ax2);
+    k.e3 = ax1;
+    for (auto [key, dst] : {std::pair{"magUInf", &k.magUInf}, {"lRef", &k.lRef}, {"Aref", &k.Aref}}) {
+        auto v = needScalar(d, key);
+        if (!v) return Err(v.error() + " (" + where + ")");
+        *dst = *v;
+    }
+    if (std::min(k.magUInf, f.rhoInf) < 1e-15 || std::min(k.lRef, k.Aref) < 1e-15)
+        return Err(d.file + ": " + where + ": Non-zero values are required for reference scales (magUInf, rhoInf, "
+                                           "lRef, Aref)");
+    if (const Entry* e = d.find("coefficients"))
+        return Err(at(d, *e) + where + ": 'coefficients' (a subset of the columns) is not supported: every "
+                                       "coefficient is written");
+    f.coeffs = k;
+    return {};
+}
+
+std::expected<void, string> readForces(const Dict& d, const string& name, bool coeffs, const PolyManifest& man,
+                                       FoamCase& c)
+{
+    if (auto r = coeffs ? onlyKeys(d, {"type", "libs", "writeControl", "writeInterval", "executeControl",
+                                       "executeInterval", "patches", "rho", "rhoInf", "CofR", "pRef", "log",
+                                       "porosity", "enabled", "liftDir", "dragDir", "pitchAxis", "magUInf", "lRef",
+                                       "Aref", "coefficients"},
+                                   "functions/" + name)
+                        : onlyKeys(d, {"type", "libs", "writeControl", "writeInterval", "executeControl",
+                                       "executeInterval", "patches", "rho", "rhoInf", "CofR", "origin", "pRef", "log",
+                                       "porosity", "enabled", "e1", "e3"},
+                                   "functions/" + name);
         !r)
         return r;
+    if (std::ranges::any_of(c.forces, [&](const FvForces& x) { return x.name == name; }))
+        return Err(d.file + ": functions/" + name + ": two function objects of that name");
+    if (int(c.forces.size()) == FoamCase::kMaxForces)
+        return Err(d.file + ": functions/" + name + std::format(": more than {} forces / forceCoeffs function objects "
+                                                                "are not supported", FoamCase::kMaxForces));
+    for (const char* k : {"writeControl", "executeControl"})
+        if (const Entry* e = d.find(k)) {
+            auto w = foam::wordOf(d, *e);
+            if (!w) return Err(w.error());
+            const char* iv = string(k) == "writeControl" ? "writeInterval" : "executeInterval";
+            double n = 1;
+            if (const Entry* x = d.find(iv)) {
+                auto v = foam::scalarOf(d, *x);
+                if (!v) return Err(v.error());
+                n = *v;
+            }
+            if (*w != "timeStep" || n != 1)
+                c.notes.push_back(std::format("functions/{}: {} {} {:g} ignored: the files get one row per iteration",
+                                              name, k, *w, n));
+        }
     FvForces f;
     f.name = name;
     const Entry* p = d.find("patches");
@@ -1188,7 +1546,13 @@ std::expected<void, string> readForces(const Dict& d, const string& name, const 
         if (!v) return Err(v.error());
         if (*v) return Err(at(d, *r) + "porosity forces are not supported");
     }
-    c.forces = f;
+    if (coeffs) {
+        if (auto r = readForceCoeffs(d, "functions/" + name, f); !r) return r;
+        if (d.find("pitchAxis"))
+            c.notes.push_back("functions/" + name + ": pitchAxis is read by nothing in v2606 forceCoeffs (the axes "
+                                                    "are liftDir, dragDir and their cross product)");
+    }
+    c.forces.push_back(std::move(f));
     return {};
 }
 
@@ -1198,14 +1562,19 @@ std::expected<void, string> readControl(const Dict& d, const PolyManifest& man, 
     if (auto r = onlyKeys(d, {"application", "startFrom", "startTime", "stopAt", "endTime", "deltaT",
                               "writeControl", "writeInterval", "purgeWrite", "writeFormat", "writePrecision",
                               "writeCompression", "timeFormat", "timePrecision", "runTimeModifiable", "libs",
-                              "functions", "graphFormat", "adjustTimeStep"},
+                              "functions", "graphFormat", "adjustTimeStep", "maxCo", "maxDeltaT"},
                           "controlDict");
         !r)
         return r;
     auto app = needWord(d, "application");
     if (!app) return Err(app.error());
-    if (*app != "simpleFoam")
-        return Err(d.file + ": application '" + *app + "': the FV path reproduces simpleFoam only (P5b)");
+    if (*app != "simpleFoam" && *app != "pimpleFoam")
+        return Err(d.file + ": application '" + *app + "': the FV path reproduces simpleFoam and pimpleFoam (static "
+                            "mesh) only");
+    const bool pimple = *app == "pimpleFoam";
+    if (!pimple)
+        for (const char* k : {"maxCo", "maxDeltaT"})
+            if (const Entry* e = d.find(k)) return Err(at(d, *e) + "'" + k + "' is a transient (pimpleFoam) setting");
     double start = 0;
     if (const Entry* e = d.find("startFrom")) {
         auto w = foam::wordOf(d, *e);
@@ -1234,17 +1603,61 @@ std::expected<void, string> readControl(const Dict& d, const PolyManifest& man, 
     auto dt = needScalar(d, "deltaT");
     if (!dt) return Err(dt.error());
     if (!(*dt > 0)) return Err(d.file + ": deltaT must be > 0");
-    c.endIter = int(std::llround(*end / *dt));
     c.deltaT = *dt;
-    if (c.endIter < 1) return Err(d.file + ": endTime/deltaT must be >= 1 iteration");
-    if (const Entry* e = d.find("writeControl")) {
-        auto w = foam::wordOf(d, *e);
+    if (pimple) {
+        // Time's controls as pimpleFoam reads them (createTimeControls.H, Time::readDict).
+        FvTimeCtl& tc = c.pimple.time;
+        tc.endTime = *end;
+        tc.deltaT = *dt;
+        if (!(*end > 0)) return Err(d.file + ": endTime must be > 0");
+        const Entry* wc = d.find("writeControl");
+        if (!wc) return Err(d.file + ": missing 'writeControl' (pimpleFoam: timeStep | runTime | adjustableRunTime)");
+        auto w = foam::wordOf(d, *wc);
         if (!w) return Err(w.error());
         auto wi = needScalar(d, "writeInterval");
         if (!wi) return Err(wi.error());
-        if (*w == "timeStep") c.writeInterval = int(std::llround(*wi));
-        else if (*w == "runTime") c.writeInterval = int(std::llround(*wi / *dt));
-        else return Err(at(d, *e) + "writeControl '" + *w + "' is not supported (timeStep, runTime)");
+        if (*w == "timeStep") tc.writeControl = FvWriteControl::TimeStep;
+        else if (*w == "runTime") tc.writeControl = FvWriteControl::RunTime;
+        else if (*w == "adjustableRunTime") tc.writeControl = FvWriteControl::AdjustableRunTime;
+        else
+            return Err(at(d, *wc) + "writeControl '" + *w + "' is not supported (timeStep, runTime, adjustableRunTime)");
+        tc.writeInterval = *wi;
+        if (tc.writeControl == FvWriteControl::TimeStep ? (*wi < 1 || *wi != std::floor(*wi)) : !(*wi > 0))
+            return Err(d.file + ": writeInterval must be an integer >= 1 (timeStep) or > 0 (runTime)");
+        if (const Entry* e = d.find("adjustTimeStep")) {
+            auto v = foam::switchOf(d, *e);
+            if (!v) return Err(v.error());
+            tc.adjust = *v;
+        }
+        for (auto [key, dst] : {std::pair{"maxCo", &tc.maxCo}, {"maxDeltaT", &tc.maxDeltaT}})
+            if (const Entry* e = d.find(key)) {
+                auto v = foam::scalarOf(d, *e);
+                if (!v) return Err(v.error());
+                if (!(*v > 0)) return Err(at(d, *e) + key + " must be > 0");
+                *dst = *v;
+            }
+        if (const Entry* e = d.find("timePrecision")) {
+            auto v = foam::scalarOf(d, *e);
+            if (!v) return Err(v.error());
+            tc.timePrecision = std::clamp(int(*v), 1, 17);
+        }
+        if (const Entry* e = d.find("timeFormat")) {
+            auto v = foam::wordOf(d, *e);
+            if (!v) return Err(v.error());
+            if (*v != "general") return Err(at(d, *e) + "timeFormat '" + *v + "' is not supported (general)");
+        }
+    } else {
+        c.endIter = int(std::llround(*end / *dt));
+        if (c.endIter < 1) return Err(d.file + ": endTime/deltaT must be >= 1 iteration");
+        if (const Entry* e = d.find("writeControl")) {
+            auto w = foam::wordOf(d, *e);
+            if (!w) return Err(w.error());
+            auto wi = needScalar(d, "writeInterval");
+            if (!wi) return Err(wi.error());
+            if (*w == "timeStep") c.writeInterval = int(std::llround(*wi));
+            else if (*w == "runTime") c.writeInterval = int(std::llround(*wi / *dt));
+            else return Err(at(d, *e) + "writeControl '" + *w + "' is not supported (timeStep, runTime)");
+        }
     }
     if (const Entry* e = d.find("writePrecision")) {
         auto v = foam::scalarOf(d, *e);
@@ -1259,7 +1672,7 @@ std::expected<void, string> readControl(const Dict& d, const PolyManifest& man, 
     if (const Entry* e = d.find("adjustTimeStep")) {
         auto v = foam::switchOf(d, *e);
         if (!v) return Err(v.error());
-        if (*v) return Err(at(d, *e) + "adjustTimeStep yes is a transient setting");
+        if (*v && !pimple) return Err(at(d, *e) + "adjustTimeStep yes is a transient setting");
     }
     if (const Entry* e = d.find("functions")) {
         if (!e->dict) return Err(at(d, *e) + "functions must be a dictionary");
@@ -1269,11 +1682,16 @@ std::expected<void, string> readControl(const Dict& d, const PolyManifest& man, 
             if (!f.dict) return Err(at(*e->dict, f) + "function object '" + f.key + "' must be a dictionary");
             auto type = needWord(*f.dict, "type");
             if (!type) return Err(type.error());
-            if (*type != "forces")
+            if (*type == "yPlus") {
+                // Read-only post-processing (yPlus.dat, the yPlus field): no effect on the solution.
+                c.notes.push_back("functions/" + f.key + " (yPlus) accepted and SKIPPED: no yPlus.dat / yPlus field "
+                                                         "is written");
+                continue;
+            }
+            if (*type != "forces" && *type != "forceCoeffs")
                 return Err(at(*e->dict, f) + "function object '" + f.key + "' of type '" + *type +
-                           "' is not supported (forces)");
-            if (c.forces) return Err(at(*e->dict, f) + "only one forces function object is supported");
-            if (auto r = readForces(*f.dict, f.key, man, c); !r) return r;
+                           "' is not supported (forces, forceCoeffs; yPlus is skipped)");
+            if (auto r = readForces(*f.dict, f.key, *type == "forceCoeffs", man, c); !r) return r;
         }
     }
     return {};
@@ -1353,9 +1771,309 @@ std::expected<void, string> readMrf(const Dict& d, const PolyManifest& man, Foam
     return {};
 }
 
-// fv::options: exactly ONE active constant specific momentum source on every
-// cell, explicit part only. Everything else simpleFoam would apply is rejected.
-std::expected<void, string> readFvOptions(const Dict& d, const string& file, FoamCase& c)
+// A constant Function1<scalar>: `key X;` | `key constant X;`.
+std::expected<double, string> constScalar(const Dict& s, const string& where, const char* key)
+{
+    const Entry* e = s.find(key);
+    if (!e) return Err(s.file + ": " + where + " needs '" + key + "'");
+    const auto& t = e->value;
+    if (!e->dict && t.size() == 1 && t[0].kind == Token::Number) return t[0].num;
+    if (!e->dict && t.size() == 2 && t[0].text == "constant" && t[1].kind == Token::Number) return t[1].num;
+    return Err(at(s, *e) + where + ": '" + key + "' must be a constant (`" + key + " X;` | `" + key +
+               " constant X;`): a Function1 of the monitored speed is not supported");
+}
+
+std::expected<FvVec3, string> constVector(const Dict& s, const string& where, const char* key, bool fn1);
+
+// d.optionalSubDict(key): the sub-dictionary when `key` names one, else d itself.
+const Dict* optionalSubDict(const Dict& d, const char* key)
+{
+    const Entry* e = d.find(key);
+    return e && e->dict ? e->dict.get() : &d;
+}
+
+// One motion solver dictionary (motionSolver::New + solidBodyMotionSolver +
+// solidBodyMotionFunction::New + rotatingMotion of v2606): `motionSolver` (or
+// the older `solver`) solidBody; its coefficients in optionalSubDict(
+// "solidBodyCoeffs"): solidBodyMotionFunction rotatingMotion, whose origin /
+// axis / omega sit in optionalSubDict("rotatingMotionCoeffs"). zoneInCoeffs:
+// the solver's own cellZone selection (zoneMotion) is read (single solver) or
+// rejected (a multi-motion entry: the mesh's `cellZone` selects the points).
+std::expected<FvSolidBody, string> readSolidBody(const Dict& d, const string& where, const PolyManifest& man,
+                                                 bool zoneInCoeffs)
+{
+    FvSolidBody b;
+    const Entry* se = d.find("motionSolver"); // getCompat("motionSolver", {{"solver", -1612}})
+    if (!se) se = d.find("solver");
+    if (!se) return Err(d.file + ": " + where + " needs 'motionSolver' (or 'solver')");
+    auto sn = foam::wordOf(d, *se);
+    if (!sn) return Err(sn.error());
+    if (*sn != "solidBody")
+        return Err(at(d, *se) + where + ": motion solver '" + *sn +
+                   "' is not built (solidBody; multiSolidBodyMotionSolver, displacementLaplacian, velocityLaplacian, "
+                   "sixDoFRigidBodyMotion, ... are not)");
+    const Dict& cd = *optionalSubDict(d, "solidBodyCoeffs");
+    const string cw = where + (&cd == &d ? "" : "/solidBodyCoeffs");
+    if (const Entry* e = cd.find("cellSet")) {
+        auto w = foam::wordOf(cd, *e);
+        if (!w || *w != "none") return Err(at(cd, *e) + cw + ": a cellSet motion selection is not built (cellZone)");
+    }
+    if (const Entry* e = cd.find("cellZone"); e && &cd != &d) {
+        // (the multi-motion entry's own `cellZone` lives in d and is the caller's)
+        if (!zoneInCoeffs)
+            return Err(at(cd, *e) + cw + ": a cellZone inside a dynamicMultiMotionSolverFvMesh entry's solidBodyCoeffs "
+                                         "(the solver would move a subset of the entry's points) is not built");
+    }
+    if (zoneInCoeffs)
+        if (const Entry* e = cd.find("cellZone")) {
+            if (e->quotedKey || e->value.size() != 1 || e->value[0].kind != Token::Word)
+                return Err(at(cd, *e) + cw + ": cellZone must be one zone name (a regular expression / list is not built)");
+            const string z(e->value[0].text);
+            if (z != "none") { // zoneMotion: `none` is a placeholder
+                if (std::ranges::find(man.cellZones, z) == man.cellZones.end())
+                    return Err(at(cd, *e) + cw + ": No matching cellZones: " + z);
+                b.cellZone = z;
+            }
+        }
+    const Entry* fe = cd.find("solidBodyMotionFunction");
+    if (!fe) return Err(cd.file + ": " + cw + " needs 'solidBodyMotionFunction'");
+    auto fn = foam::wordOf(cd, *fe);
+    if (!fn) return Err(fn.error());
+    if (*fn != "rotatingMotion")
+        return Err(at(cd, *fe) + cw + ": solidBodyMotionFunction '" + *fn +
+                   "' is not built (rotatingMotion; linearMotion, oscillatingRotatingMotion, axisRotationMotion, "
+                   "multiMotion, SDA, tabulated6DoFMotion, ... are not)");
+    const Dict& rd = *optionalSubDict(cd, "rotatingMotionCoeffs");
+    const string rw = cw + (&rd == &cd ? "" : "/rotatingMotionCoeffs");
+    for (const Dict* x : {&cd, &rd}) { // every key OpenFOAM reads here is known; nothing else may hide in them
+        if (x == &d) continue;         // the flat spelling: the top-level check is the caller's
+        if (auto r = onlyKeys(*x, {"cellZone", "cellSet", "solidBodyMotionFunction", "rotatingMotionCoeffs", "origin",
+                                   "axis", "omega"},
+                              x == &cd ? cw : rw);
+            !r)
+            return Err(r.error());
+    }
+    auto o = constVector(rd, rw, "origin", false);
+    if (!o) return Err(o.error());
+    auto a = constVector(rd, rw, "axis", false);
+    if (!a) return Err(a.error());
+    if (!((*a)[0] != 0 || (*a)[1] != 0 || (*a)[2] != 0)) return Err(rd.file + ": " + rw + ": axis must be non-zero");
+    const Entry* om = rd.find("omega");
+    if (!om) return Err(rd.file + ": " + rw + " needs 'omega' (rad/s)");
+    const auto& tv = om->value;
+    if (!om->dict && tv.size() == 1 && tv[0].kind == Token::Number) b.omega = tv[0].num;
+    else if (!om->dict && tv.size() == 2 && tv[0].text == "constant" && tv[1].kind == Token::Number) b.omega = tv[1].num;
+    else
+        return Err(at(rd, *om) + rw + ": omega must be a constant (`omega X;` | `omega constant X;`): a Function1 of time "
+                                      "(table, sine, ...) is not built");
+    b.origin = *o;
+    b.axis = *a;
+    return b;
+}
+
+// constant/dynamicMeshDict (dynamicFvMesh::New, dynamicMotionSolverFvMesh,
+// dynamicMultiMotionSolverFvMesh of v2606) into c.motion; staticFvMesh: off.
+std::expected<void, string> readDynamicMesh(const Dict& d, const PolyManifest& man, FoamCase& c)
+{
+    for (const Entry& e : d.entries)
+        if (e.directive) return Err(at(d, e) + "directive '" + e.key + "' is not supported in dynamicMeshDict");
+    auto type = needWord(d, "dynamicFvMesh");
+    if (!type) return Err(type.error());
+    if (*type == "staticFvMesh") {
+        if (auto r = onlyKeys(d, {"dynamicFvMesh"}, "dynamicMeshDict"); !r) return Err(r.error());
+        return {};
+    }
+    for (const char* k : {"updateControl", "updateInterval"})
+        if (const Entry* e = d.find(k))
+            return Err(at(d, *e) + "dynamicMeshDict " + k + " (a mesh update that skips time steps) is not built");
+    FvDynamicMesh& m = c.motion;
+    if (*type == "dynamicMotionSolverFvMesh") {
+        if (auto r = onlyKeys(d, {"dynamicFvMesh", "motionSolverLibs", "motionSolver", "solver", "solidBodyCoeffs",
+                                  "cellZone", "cellSet", "solidBodyMotionFunction", "rotatingMotionCoeffs", "origin",
+                                  "axis", "omega"},
+                              "dynamicMeshDict");
+            !r)
+            return Err(r.error());
+        auto b = readSolidBody(d, "dynamicMeshDict", man, true);
+        if (!b) return Err(b.error());
+        m.bodies.push_back(*b);
+    } else if (*type == "dynamicMultiMotionSolverFvMesh") {
+        if (auto r = onlyKeys(d, {"dynamicFvMesh", "motionSolverLibs", "dynamicMultiMotionSolverFvMeshCoeffs"},
+                              "dynamicMeshDict");
+            !r)
+            return Err(r.error());
+        auto cd = subDict(d, "dynamicMultiMotionSolverFvMeshCoeffs", true, "dynamicMeshDict");
+        if (!cd) return Err(cd.error());
+        m.multi = true;
+        for (const Entry& e : (*cd)->entries) {
+            if (e.directive) return Err(at(**cd, e) + "directive '" + e.key + "' is not supported in dynamicMeshDict");
+            if (!e.dict) continue; // `for (const entry& e : coeffs) if (e.dictPtr())`
+            const Dict& s = *e.dict;
+            const string where = "dynamicMultiMotionSolverFvMeshCoeffs/" + e.key;
+            if (auto r = onlyKeys(s, {"motionSolver", "solver", "cellZone", "solidBodyCoeffs", "motionSolverLibs",
+                                      "solidBodyMotionFunction", "rotatingMotionCoeffs", "origin", "axis", "omega"},
+                                  where);
+                !r)
+                return Err(r.error());
+            const Entry* ze = s.find("cellZone");
+            if (!ze) return Err(s.file + ": " + where + " needs 'cellZone'");
+            if (ze->value.size() != 1 || ze->value[0].kind != Token::Word)
+                return Err(at(s, *ze) + where + ": cellZone must be one zone name (a regular expression / group is not built)");
+            const string z(ze->value[0].text);
+            if (std::ranges::find(man.cellZones, z) == man.cellZones.end())
+                return Err(at(s, *ze) + where + ": No matching cellZones: " + z);
+            // (flat spelling, no solidBodyCoeffs: the solver's own zoneMotion reads this same cellZone -- the same points)
+            auto b = readSolidBody(s, where, man, false);
+            if (!b) return Err(b.error());
+            b->name = e.key;
+            b->cellZone = z;
+            if (std::ranges::any_of(m.bodies, [&](const FvSolidBody& x) { return x.cellZone == z; }))
+                return Err(at(s, *ze) + where + ": cellZone '" + z + "' is moved by an earlier entry too");
+            m.bodies.push_back(*b);
+        }
+        if (m.bodies.empty()) return Err(d.file + ": dynamicMultiMotionSolverFvMeshCoeffs has no motion entry");
+    } else
+        return Err(d.file + ": dynamicFvMesh '" + *type +
+                   "' is not built (staticFvMesh, dynamicMotionSolverFvMesh, dynamicMultiMotionSolverFvMesh; "
+                   "dynamicRefineFvMesh, dynamicOversetFvMesh, dynamicInkJetFvMesh, ... are not)");
+    m.on = true;
+    return {};
+}
+
+// A constant vector: `key (x y z);` | (fn1) `key constant (x y z);`.
+std::expected<FvVec3, string> constVector(const Dict& s, const string& where, const char* key, bool fn1)
+{
+    const Entry* e = s.find(key);
+    if (!e) return Err(s.file + ": " + where + " needs '" + key + "'");
+    std::size_t pos = !e->dict && fn1 && !e->value.empty() && e->value[0].text == "constant" ? 1 : 0;
+    if (e->dict || e->value.size() != pos + 5 || !e->value[pos].is('('))
+        return Err(at(s, *e) + where + ": '" + key + "' must be a constant vector" +
+                   (fn1 ? " (`(x y z)` | `constant (x y z)`): a Function1 of time is not supported" : " (x y z)"));
+    auto v = foam::vectorOf(s, e->value, pos, e->line, key);
+    if (!v) return Err(v.error());
+    return FvVec3{(*v)[0], (*v)[1], (*v)[2]};
+}
+
+// fvOptions actuationDiskSource (OpenFOAM v2606 actuationDiskSource.C +
+// cellSetOption + writeFile): variant Froude, selectionMode cellZone, one
+// cellZone, monitorMethod points; the constructor's checks and
+// calcFroudeMethod's "Cp and Ct must be greater than zero" at read time.
+std::expected<void, string> readDisk(const Dict& s, const string& name, const string& file, const PolyManifest& man,
+                                     FoamCase& c)
+{
+    const string where = file + "/" + name + " (actuationDiskSource)";
+    if (auto r = onlyKeys(s, {"type", "active", "log", "variant", "selectionMode", "cellZone", "diskArea", "diskDir",
+                              "sink", "Cp", "Ct", "monitorMethod", "monitorCoeffs", "upstreamPoint", "writeToFile",
+                              "writeFileStart", "writeFileEnd", "writePrecision", "updateHeader", "useUserTime"},
+                          where);
+        !r)
+        return r;
+    auto word = [&](const char* key, const char* dflt) -> std::expected<string, string> {
+        const Entry* e = s.find(key);
+        if (!e) return string(dflt);
+        return foam::wordOf(s, *e);
+    };
+    auto sw = [&](const char* key, bool dflt) -> std::expected<bool, string> {
+        const Entry* e = s.find(key);
+        if (!e) return dflt;
+        return foam::switchOf(s, *e);
+    };
+    auto active = sw("active", true);
+    if (!active) return Err(active.error());
+    if (!*active) return Err(s.file + ": " + where + ": an inactive source (remove it)");
+    auto variant = word("variant", "Froude");
+    if (!variant) return Err(variant.error());
+    if (*variant != "Froude")
+        return Err(s.file + ": " + where + ": variant '" + *variant + "' is not supported (Froude)");
+    auto mode = needWord(s, "selectionMode");
+    if (!mode) return Err(mode.error());
+    if (*mode != "cellZone")
+        return Err(s.file + ": " + where + ": selectionMode '" + *mode + "' is not supported (cellZone)");
+    FvDisk k;
+    k.name = name;
+    auto cz = needWord(s, "cellZone");
+    if (!cz) return Err(cz.error() + " (" + where + "; a `cellZones` list is not supported)");
+    k.cellZone = *cz;
+    if (std::ranges::find(man.cellZones, k.cellZone) == man.cellZones.end())
+        return Err(s.file + ": " + where + ": cellZone '" + k.cellZone + "' is not in the mesh");
+    if (std::ranges::any_of(c.disks, [&](const FvDisk& x) { return x.cellZone == k.cellZone; }))
+        return Err(s.file + ": " + where + ": a second actuationDiskSource on cellZone '" + k.cellZone +
+                   "' is not supported");
+    auto method = word("monitorMethod", "points");
+    if (!method) return Err(method.error());
+    if (*method != "points")
+        return Err(s.file + ": " + where + ": monitorMethod '" + *method + "' is not supported (points)");
+    auto sink = sw("sink", true);
+    if (!sink) return Err(sink.error());
+    const double sign = *sink ? 1.0 : -1.0;
+    auto area = needScalar(s, "diskArea");
+    if (!area) return Err(area.error());
+    if (!(*area >= 1e-300)) return Err(s.file + ": " + where + ": diskArea must be > 0");
+    k.diskArea = *area;
+    auto dir = constVector(s, where, "diskDir", true);
+    if (!dir) return Err(dir.error());
+    const double magDir = std::sqrt(dot3(*dir, *dir));
+    if (magDir < 1e-15)
+        return Err(s.file + ": " + where + ": Actuator disk surface-normal vector is zero (diskDir)");
+    k.dir = {(*dir)[0] / magDir, (*dir)[1] / magDir, (*dir)[2] / magDir}; // dir/magDir
+    auto cp = constScalar(s, where, "Cp");
+    if (!cp) return Err(cp.error());
+    auto ct = constScalar(s, where, "Ct");
+    if (!ct) return Err(ct.error());
+    k.Cp = sign * *cp;
+    k.Ct = sign * *ct;
+    if (k.Cp <= 1e-300 || k.Ct <= 1e-300)
+        return Err(s.file + ": " + where +
+                   std::format(": Cp and Ct must be greater than zero (after the sink sign {:+g}: Cp = {:g}, Ct = {:g})",
+                               sign, k.Cp, k.Ct));
+    if (const Entry* mc = s.find("monitorCoeffs")) {
+        if (!mc->dict) return Err(at(s, *mc) + where + ": monitorCoeffs must be a dictionary");
+        if (auto r = onlyKeys(*mc->dict, {"points"}, where + "/monitorCoeffs"); !r) return r;
+        const Entry* p = mc->dict->find("points");
+        if (!p) return Err(mc->dict->file + ": " + where + ": monitorCoeffs needs 'points'");
+        const auto& t = p->value;
+        // [N] ( (x y z) ... )
+        std::size_t pos = !t.empty() && t[0].kind == Token::Number ? 1 : 0;
+        if (pos >= t.size() || !t[pos].is('(') || !t.back().is(')'))
+            return Err(at(*mc->dict, *p) + where + ": points must be a list of points ((x y z) ...)");
+        for (++pos; pos + 1 < t.size();) {
+            auto v = foam::vectorOf(*mc->dict, t, pos, p->line, "points");
+            if (!v) return Err(v.error());
+            k.monitor.push_back({(*v)[0], (*v)[1], (*v)[2]});
+        }
+    } else {
+        auto up = constVector(s, where, "upstreamPoint", false);
+        if (!up) return Err(up.error() + " (or monitorCoeffs { points (...); })");
+        k.monitor.push_back(*up);
+    }
+    if (k.monitor.empty())
+        return Err(s.file + ": " + where + ": No cell is available for incoming velocity monitoring (no monitor point)");
+    auto wf = sw("writeToFile", true);
+    if (!wf) return Err(wf.error());
+    k.writeToFile = *wf;
+    for (auto [key, dst] : {std::pair{"writeFileStart", &k.writeStart}, {"writeFileEnd", &k.writeEnd}})
+        if (const Entry* e = s.find(key)) {
+            auto v = foam::scalarOf(s, *e);
+            if (!v) return Err(v.error());
+            *dst = *v;
+        }
+    if (const Entry* e = s.find("writePrecision")) {
+        auto v = foam::scalarOf(s, *e);
+        if (!v) return Err(v.error());
+        if (*v < 0 || *v != std::floor(*v)) return Err(at(s, *e) + where + ": writePrecision must be an integer >= 0");
+        k.writePrecision = std::min(int(*v), 17);
+    }
+    if (int(c.disks.size()) == FoamCase::kMaxDisks)
+        return Err(s.file + ": " + where + std::format(": more than {} actuationDiskSource entries are not supported",
+                                                       FoamCase::kMaxDisks));
+    c.disks.push_back(std::move(k));
+    return {};
+}
+
+// fv::options: ONE active constant specific momentum source on every cell
+// (explicit part only), or actuationDiskSource entries (readDisk). Everything
+// else simpleFoam would apply is rejected.
+std::expected<void, string> readFvOptions(const Dict& d, const string& file, const PolyManifest& man, FoamCase& c)
 {
     const string pre = file + ": fv::options (sources / constraints) are not supported";
     for (const Entry& e : d.entries) {
@@ -1365,8 +2083,12 @@ std::expected<void, string> readFvOptions(const Dict& d, const string& file, Foa
         const Dict& s = *e.dict;
         auto type = needWord(s, "type");
         if (!type) return Err(type.error());
+        if (*type == "actuationDiskSource") {
+            if (auto r = readDisk(s, e.key, file, man, c); !r) return r;
+            continue;
+        }
         if (*type != "vectorSemiImplicitSource")
-            return Err(pre + ": type '" + *type + "' (vectorSemiImplicitSource only)");
+            return Err(pre + ": type '" + *type + "' (vectorSemiImplicitSource, actuationDiskSource)");
         if (auto r = onlyKeys(s, {"type", "active", "selectionMode", "volumeMode", "sources", "injectionRateSuSp"},
                               file + "/" + e.key);
             !r)
@@ -1400,7 +2122,12 @@ std::expected<void, string> readFvOptions(const Dict& d, const string& file, Foa
         if (c.uSource) return Err(pre + ": a second U source");
         c.uSource = FvVec3{(*v)[0], (*v)[1], (*v)[2]};
     }
-    if (!c.uSource) return Err(pre + ": no source in the file");
+    // fv::optionList::reset counts the dictionary entries: none = an empty
+    // list, simpleFoam runs source-free (v2606 fvOptionList.C).
+    if (!c.uSource && c.disks.empty())
+        c.notes.push_back(file + ": no source in the file: fv::optionList is empty, the run is source-free (as simpleFoam)");
+    if (c.uSource && !c.disks.empty())
+        return Err(pre + ": vectorSemiImplicitSource together with actuationDiskSource");
     return {};
 }
 
@@ -1409,13 +2136,13 @@ std::expected<void, string> readFvOptions(const Dict& d, const string& file, Foa
 const char* fvUBcName(FvUBc b)
 {
     static constexpr const char* n[] = {"fixedValue", "zeroGradient", "inletOutlet", "basicSymmetry",
-                                        "freestreamVelocity", "empty"};
+                                        "freestreamVelocity", "empty", "cyclicAMI"};
     return n[std::size_t(b)];
 }
 
 const char* fvPBcName(FvPBc b)
 {
-    static constexpr const char* n[] = {"fixedValue", "zeroGradient", "freestreamPressure", "empty"};
+    static constexpr const char* n[] = {"fixedValue", "zeroGradient", "freestreamPressure", "empty", "cyclicAMI"};
     return n[std::size_t(b)];
 }
 
@@ -1428,6 +2155,20 @@ std::expected<FoamCase, string> parseFoamCase(const FoamCaseTexts& t, const Poly
         c.patches[i].meshType = man.patches[i].type;
     }
     bool have = false;
+    // The application picks the algorithm (and with it what fvSchemes / fvSolution must hold): read first.
+    {
+        auto cd = parseText(t, "system/controlDict", true, have);
+        if (!cd) return Err(cd.error());
+        if (const Entry* e = cd->find("application")) {
+            auto w = foam::wordOf(*cd, *e);
+            if (!w) return Err(w.error());
+            c.pimple.on = *w == "pimpleFoam";
+        }
+    }
+    if (!c.pimple.on &&
+        std::ranges::any_of(man.patches, [](const FoamPatch& p) { return p.type == FoamPatchType::CyclicAMI; }))
+        return Err("constant/polyMesh/boundary: cyclicAMI patches with simpleFoam are not built (application "
+                   "pimpleFoam only)");
     auto U = parseText(t, "0/U", true, have);
     if (!U) return Err(U.error());
     if (auto r = readField(*U, man, true, c); !r) return Err(r.error());
@@ -1511,6 +2252,17 @@ std::expected<FoamCase, string> parseFoamCase(const FoamCaseTexts& t, const Poly
         }
     }
 
+    if (c.pimple.on) { // before fvSchemes / fvSolution: mesh.dynamic() picks grad(pcorr), correctPhi, the pcorr solvers
+        bool haveDyn = false;
+        auto dm = parseText(t, "constant/dynamicMeshDict", false, haveDyn);
+        if (!dm) return Err(dm.error());
+        if (haveDyn)
+            if (auto r = readDynamicMesh(*dm, man, c); !r) return Err(r.error());
+        if (c.motion.on &&
+            std::ranges::any_of(man.patches, [](const FoamPatch& p) { return p.type == FoamPatchType::Cyclic; }))
+            return Err("constant/dynamicMeshDict: mesh motion with cyclic patches is not built (a moving cyclic pair's "
+                       "transform, meshWave across it)");
+    }
     auto sch = parseText(t, "system/fvSchemes", true, have);
     if (!sch) return Err(sch.error());
     if (auto r = readSchemes(*sch, c); !r) return Err(r.error());
@@ -1526,13 +2278,49 @@ std::expected<FoamCase, string> parseFoamCase(const FoamCaseTexts& t, const Poly
     if (!mrf) return Err(mrf.error());
     if (haveMrf)
         if (auto r = readMrf(*mrf, man, c); !r) return Err(r.error());
-    // fv::options (fvOptions.C reads constant/ then system/): sources/constraints simpleFoam applies.
+    // fv::options: sources/constraints simpleFoam applies. fvOptions.C createIOobject reads
+    // constant/fvOptions, and system/fvOptions ONLY when that one has no valid header.
+    if (t.contains("constant/fvOptions") && t.contains("system/fvOptions"))
+        return Err("constant/fvOptions and system/fvOptions both exist: OpenFOAM reads constant/fvOptions only "
+                   "(system/fvOptions when constant's header is invalid); remove one");
     for (const char* f : {"constant/fvOptions", "system/fvOptions"}) {
         bool haveOpt = false;
         auto o = parseText(t, f, false, haveOpt);
         if (!o) return Err(o.error());
         if (haveOpt)
-            if (auto r = readFvOptions(*o, f, c); !r) return Err(r.error());
+            if (auto r = readFvOptions(*o, f, man, c); !r) return Err(r.error());
+    }
+    if (c.pimple.on) {
+        // pimpleFoam: no MRF, no fv::option source (docs/fvpimple.md); the mesh motion was read above.
+        if (c.motion.on) {
+            if (std::ranges::none_of(c.patches, [](const FvPatchBc& b) { return b.movingWall; }) &&
+                std::ranges::any_of(c.patches, [](const FvPatchBc& b) { return b.meshType == FoamPatchType::Wall; }))
+                c.notes.push_back("moving mesh: no wall patch is movingWallVelocity -- every fixedValue / noSlip wall "
+                                  "keeps its LAB-frame value while its faces move (OpenFOAM does the same)");
+        }
+        if (std::ranges::any_of(c.mrf, [](const FvMrfZone& z) { return z.active; }))
+            return Err("constant/MRFProperties: an active MRF zone with pimpleFoam is not built");
+        if (c.uSource || !c.disks.empty())
+            return Err("fvOptions: a momentum source with pimpleFoam is not built");
+        if (c.ras.model == FvTurbModel::SpalartAllmaras)
+            return Err("RASModel SpalartAllmaras with pimpleFoam is not built (kOmegaSST, laminar)");
+    }
+    // cyclicAMI (docs/fvpimple.md "cyclicAMI"): pimpleFoam only, the gated scheme set.
+    if (std::ranges::any_of(man.patches, [](const FoamPatch& p) { return p.type == FoamPatchType::CyclicAMI; })) {
+        c.ami = true; // (simpleFoam: refused before the fields are read)
+        if (std::ranges::any_of(man.patches, [](const FoamPatch& p) { return p.type == FoamPatchType::Cyclic; }))
+            return Err("constant/polyMesh/boundary: cyclic and cyclicAMI patches in one mesh are not built");
+        if (!c.schemes.lapCorrected || !c.schemes.snGradCorrected)
+            return Err("system/fvSchemes: cyclicAMI needs corrected (or limited corrected) laplacian and snGrad "
+                       "schemes (uncorrected is not built on a coupled patch)");
+        if (c.ras.model != FvTurbModel::Laminar && c.ras.exactDist)
+            return Err("system/fvSchemes: wallDist exactDistance with cyclicAMI is not built (meshWave)");
+        if (c.ras.model == FvTurbModel::KOmegaSST &&
+            (c.ras.divK.kind == FvSDiv::LimitedLinear || c.ras.divOmega.kind == FvSDiv::LimitedLinear))
+            return Err("system/fvSchemes: limitedLinear convection of k / omega with cyclicAMI is not built (upwind, "
+                       "linear, linearUpwind)");
+        c.notes.push_back("cyclicAMI: the pressure matrix is not symmetric (each side's own weights and "
+                          "coefficients, as OpenFOAM's interface update); p / pcorr keep the flexible AMG-PCG");
     }
     if (c.solverP.solver == "GAMG")
         c.notes.push_back("p: OpenFOAM GAMG -> gpu/la AMG-PCG; OpenFOAM's tolerance/relTol stop reproduced (FP32: "
@@ -1544,6 +2332,36 @@ std::expected<FoamCase, string> parseFoamCase(const FoamCaseTexts& t, const Poly
                           (c.ras.model == FvTurbModel::KOmegaSST ? c.ras.solverK.solver : c.ras.solverNuTilda.solver) +
                           " -> gpu/la BiCGStab + multicolour GS; stop reproduced (FP32: at max(tolerance, floor))");
     return c;
+}
+
+std::array<double, 12> fvForceCoeffRow(const FvForces& f, const FvVec3& fp, const FvVec3& fv, const FvVec3& mp,
+                                       const FvVec3& mv)
+{
+    const FvForceCoeffs& k = *f.coeffs;
+    const double pDyn = 0.5 * f.rhoInf * (k.magUInf * k.magUInf);
+    const double fs = 1.0 / (k.Aref * pDyn + 1e-15), ms = 1.0 / (k.Aref * pDyn * k.lRef + 1e-15);
+    // coordSys.localVector(v) = R^T v, the local axes the columns of R
+    const auto local = [&](const FvVec3& v) { return FvVec3{dot3(k.e1, v), dot3(k.e2, v), dot3(k.e3, v)}; };
+    const FvVec3 lfp = local(fp), lfv = local(fv), lmp = local(mp), lmv = local(mv);
+    // forceComponents [c] = (pressure, viscous, internal = 0) of local component c
+    struct C3
+    {
+        double p, v, i;
+    };
+    const auto F = [&](int c) { return C3{fs * lfp[std::size_t(c)], fs * lfv[std::size_t(c)], fs * 0.0}; };
+    const auto M = [&](int c) { return C3{ms * lmp[std::size_t(c)], ms * lmv[std::size_t(c)], ms * 0.0}; };
+    const auto sum = [](const C3& x) { return x.p + x.v + x.i; };
+    const auto front = [&](int c0, int c1) {
+        const C3 a = F(c0), b = M(c1);
+        return sum(C3{0.5 * a.p + b.p, 0.5 * a.v + b.v, 0.5 * a.i + b.i});
+    };
+    const auto rear = [&](int c0, int c1) {
+        const C3 a = F(c0), b = M(c1);
+        return sum(C3{0.5 * a.p - b.p, 0.5 * a.v - b.v, 0.5 * a.i - b.i});
+    };
+    // Cd (0, 0), Cs (1, 2), Cl (2, 1); CmRoll 0, CmPitch 1, CmYaw 2
+    return {sum(F(0)), front(0, 0), rear(0, 0), sum(F(2)), front(2, 1), rear(2, 1),
+            sum(M(1)), sum(M(0)),   sum(M(2)),  sum(F(1)), front(1, 2), rear(1, 2)};
 }
 
 double FvWallCoeffs::yPlusLam() const
@@ -1582,7 +2400,8 @@ std::expected<FoamCaseTexts, string> readFoamCaseTexts(const fs::path& dir)
                            "0/omega",
                            "0/nuTilda",
                            "constant/fvOptions",
-                           "system/fvOptions"};
+                           "system/fvOptions",
+                           "constant/dynamicMeshDict"};
     for (const char* f : files) {
         std::error_code ec;
         const fs::path p = dir / f;
@@ -1615,8 +2434,15 @@ std::expected<FoamCaseTexts, string> readFoamCaseTexts(const fs::path& dir)
 
 std::string describeFoamCase(const FoamCase& c)
 {
-    string s = std::format("  case        {}\n  nu          {:g}\n  iterations  {} (write every {})\n", c.dir, c.nu,
-                           c.endIter, c.writeInterval);
+    string s = std::format("  case        {}\n  nu          {:g}\n", c.dir, c.nu);
+    if (c.pimple.on) {
+        const FvTimeCtl& t = c.pimple.time;
+        static constexpr const char* wc[] = {"timeStep", "runTime", "adjustableRunTime"};
+        s += std::format("  time        pimpleFoam: endTime {:g}, deltaT {:g}, {}; write {} {:g}\n", t.endTime, t.deltaT,
+                         t.adjust ? std::format("adjustTimeStep maxCo {:g} maxDeltaT {:g}", t.maxCo, t.maxDeltaT)
+                                  : string("fixed"),
+                         wc[std::size_t(t.writeControl)], t.writeInterval);
+    } else s += std::format("  iterations  {} (write every {})\n", c.endIter, c.writeInterval);
     for (const FvPatchBc& b : c.patches)
         s += std::format("  patch       {:<20} U {:<20} p {}\n", b.name, b.uType, b.pType);
     const auto& sc = c.schemes;
@@ -1628,6 +2454,35 @@ std::string describeFoamCase(const FoamCase& c)
                      g(sc.gradU), g(sc.gradP), sc.bounded ? "bounded " : "",
                      sc.divU == FvDiv::Linear ? "linear" : sc.divU == FvDiv::LinearUpwind ? "linearUpwind grad(U)" : "upwind",
                      snGradName(sc.lapCorrected, sc.lapLimit), snGradName(sc.snGradCorrected, sc.snGradLimit));
+    auto rxo = [](const std::optional<double>& x) { return x ? std::format("{:g}", *x) : string("-"); };
+    if (c.pimple.on) {
+        const FvPimpleCtl& pc = c.pimple;
+        s += std::format("  PIMPLE      nOuterCorrectors {}, nCorrectors {}, nNonOrthogonalCorrectors {}, "
+                         "turbOnFinalIterOnly {}, ddtCorr yes, pRefCell {} pRefValue {:g}\n",
+                         pc.nOuter, pc.nCorr, c.simple.nNonOrthCorr, pc.turbOnFinalIterOnly ? "yes" : "no",
+                         c.simple.pRefCell, c.simple.pRefValue);
+        s += std::format("  relax       p {} pFinal {} U {} UFinal {}\n",
+                         c.relaxPGiven ? std::format("{:g}", c.relaxP) : string("-"), rxo(pc.relaxPFinal), rxo(c.relaxU),
+                         rxo(pc.relaxUFinal));
+        auto so = [](const FvSolverCtl& x) { return std::format("{} tol {:g} relTol {:g}", x.solver, x.tolerance, x.relTol); };
+        s += std::format("  solvers     U {}; UFinal {}; p {}; pFinal {}\n", so(c.solverU), so(pc.solverUFinal),
+                         so(c.solverP), so(pc.solverPFinal));
+        if (c.motion.on) {
+            for (const FvSolidBody& b : c.motion.bodies)
+                s += std::format("  motion      {}solidBody rotatingMotion on {}: origin ({:g} {:g} {:g}) axis ({:g} {:g} "
+                                 "{:g}) omega {:g} rad/s\n",
+                                 b.name.empty() ? string() : b.name + ": ",
+                                 b.cellZone.empty() ? string("the whole mesh") : "cellZone " + b.cellZone, b.origin[0],
+                                 b.origin[1], b.origin[2], b.axis[0], b.axis[1], b.axis[2], b.omega);
+            s += std::format("  moving mesh {}, correctPhi {}{}, checkMeshCourantNo {}\n",
+                             c.motion.multi ? "dynamicMultiMotionSolverFvMesh" : "dynamicMotionSolverFvMesh",
+                             pc.correctPhi ? "yes" : "no",
+                             pc.correctPhi ? std::format(" (pcorr {}; pcorrFinal {})", so(pc.solverPcorr),
+                                                         so(pc.solverPcorrFinal))
+                                           : string(),
+                             pc.checkMeshCourantNo ? "yes" : "no");
+        }
+    } else {
     s += std::format("  SIMPLE      nNonOrthogonalCorrectors {}, consistent {}, momentumPredictor {}, pRefCell {} "
                      "pRefValue {:g}\n",
                      c.simple.nNonOrthCorr, c.simple.consistent ? "yes" : "no", c.simple.momentumPredictor ? "yes" : "no",
@@ -1636,6 +2491,7 @@ std::string describeFoamCase(const FoamCase& c)
                      c.relaxU ? std::format("{:g}", *c.relaxU) : string("-"));
     s += std::format("  solvers     U {} tol {:g} relTol {:g}; p {} tol {:g} relTol {:g}\n", c.solverU.solver,
                      c.solverU.tolerance, c.solverU.relTol, c.solverP.solver, c.solverP.tolerance, c.solverP.relTol);
+    }
     if (const FvRas& r = c.ras; r.model != FvTurbModel::Laminar) {
         const bool sst = r.model == FvTurbModel::KOmegaSST;
         auto cv = [](const FvConvScheme& x, const char* f) {
@@ -1685,6 +2541,15 @@ std::string describeFoamCase(const FoamCase& c)
         else
             s += std::format("  RAS solve   nuTilda {} tol {:g} relTol {:g} relax {}\n", r.solverNuTilda.solver,
                              r.solverNuTilda.tolerance, r.solverNuTilda.relTol, rx(r.relaxNuTilda));
+        if (const FvPimpleCtl& pc = c.pimple; pc.on) {
+            auto fin = [&](const char* n, const FvSolverCtl& x, const std::optional<double>& rl) {
+                return std::format("{}Final {} tol {:g} relTol {:g} relax {}", n, x.solver, x.tolerance, x.relTol, rx(rl));
+            };
+            s += "  RAS final   " +
+                 (sst ? fin("k", pc.solverKFinal, pc.relaxKFinal) + "; " + fin("omega", pc.solverOmegaFinal, pc.relaxOmegaFinal)
+                      : fin("nuTilda", pc.solverNuTildaFinal, pc.relaxNuTildaFinal)) +
+                 "\n";
+        }
     }
     if (c.uSource)
         s += std::format("  source      U ({:g} {:g} {:g}) per unit mass on every cell (fvOptions "
@@ -1702,11 +2567,24 @@ std::string describeFoamCase(const FoamCase& c)
                          m.name, m.cellZone, m.omega, m.axis[0], m.axis[1], m.axis[2], m.origin[0], m.origin[1],
                          m.origin[2], nr);
     }
-    if (c.forces) {
+    for (const FvDisk& k : c.disks) {
+        string mp;
+        for (const FvVec3& p : k.monitor) mp += std::format("{}({:g} {:g} {:g})", mp.empty() ? "" : " ", p[0], p[1], p[2]);
+        s += std::format("  source      {} actuationDiskSource Froude on cellZone {}: diskArea {:g} diskDir ({:g} {:g} "
+                         "{:g}) Cp {:g} Ct {:g} (a = 1 - Cp/Ct = {:g}), monitor points {}{}\n",
+                         k.name, k.cellZone, k.diskArea, k.dir[0], k.dir[1], k.dir[2], k.Cp, k.Ct, 1.0 - k.Cp / k.Ct, mp,
+                         k.writeToFile ? "" : ", writeToFile no");
+    }
+    for (const FvForces& f : c.forces) {
         string ps;
-        for (const auto& p : c.forces->patches) ps += (ps.empty() ? "" : " ") + p;
-        s += std::format("  forces      {} on ({}) rhoInf {:g} CofR ({:g} {:g} {:g})\n", c.forces->name, ps,
-                         c.forces->rhoInf, c.forces->CofR[0], c.forces->CofR[1], c.forces->CofR[2]);
+        for (const auto& p : f.patches) ps += (ps.empty() ? "" : " ") + p;
+        s += std::format("  forces      {} on ({}) rhoInf {:g} CofR ({:g} {:g} {:g})\n", f.name, ps, f.rhoInf, f.CofR[0],
+                         f.CofR[1], f.CofR[2]);
+        if (f.coeffs)
+            s += std::format("  forceCoeffs {} dragDir ({:g} {:g} {:g}) liftDir ({:g} {:g} {:g}) magUInf {:g} lRef {:g} "
+                             "Aref {:g}\n",
+                             f.name, f.coeffs->e1[0], f.coeffs->e1[1], f.coeffs->e1[2], f.coeffs->e3[0], f.coeffs->e3[1],
+                             f.coeffs->e3[2], f.coeffs->magUInf, f.coeffs->lRef, f.coeffs->Aref);
     }
     for (const auto& n : c.notes) s += "  note        " + n + "\n";
     return s;

@@ -76,6 +76,9 @@ struct StructuredSpec
 struct FaceMeshOptions
 {
     bool wedge = false;
+    // ami: keep `cyclicAMI` patches as boundary patches (the pimpleFoam FV path only,
+    // docs/fvpimple.md "cyclicAMI"; every other route keeps the refusal).
+    bool ami = false;
 };
 
 // Finite-volume mesh shared by every FV kernel, every builder, and the solver graph.

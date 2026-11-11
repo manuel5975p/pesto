@@ -1952,9 +1952,9 @@ Baseline at 644e596: `dns bench --physics compressible --n 256` 20.24 ms/step,
     type (e1, e2) or (e2, e3) or (e3, e1) found`, axesRotation.C:196;
     `Entry 'origin' not found in dictionary ...functions/forces1`) — now
     `CofR` is required (exit 3, `fvcase` C2 pins both forms). Every prop
-    case carries `CofR`. Kept deliberately: an EMPTY `fvOptions` (header
-    only) is rejected on presence although simpleFoam runs it source-free
-    (conservative, no parity risk).
+    case carries `CofR`. An EMPTY `fvOptions` (header only) was kept
+    rejected on presence although simpleFoam runs it source-free
+    (conservative, no parity risk); accepted since item 64 (h).
 
 60. **FV MRF = OpenFOAM `MRFZoneList` (phase MRF, `docs/fv.md` "MRF").**
     Several zones zone by zone (a zone/zone face gets both frame fluxes, as
@@ -2077,6 +2077,476 @@ Baseline at 644e596: `dns bench --physics compressible --n 256` 20.24 ms/step,
     (d) G-JAC is not exact with freestreamVelocity / freestreamPressure
         patches (duct 1.2e-4 / 3.8e-4: their value fractions follow Ub in
         the FD). G-PAR, G-FOAMRESTART, FP32, RAS, the CUDA backend: not built.
+
+64. **FV: an OpenFOAM actuator-disc case runs unmodified (`docs/fv.md` "Reading
+    the case", "fvOptions", "Output and CLI").** CLOSED reader gaps, each as
+    OpenFOAM v2606 behaves (`fvcase` D2, C3, K1): a `format binary`
+    `boundary` / `cellZones`; `$name` / `${name}` value macros and `$name;`
+    dictionary splices; an equations factor matching p (inert: simpleFoam
+    never calls `pEqn.relax()`); several `forces` objects, `forceCoeffs`
+    (coefficient.dat), `yPlus` (skipped, noted). Built: fvOptions
+    `actuationDiskSource` Froude on a cellZone (`kUDisk`, `foamFindCell`).
+    Gates: IF1g `disc` vs serial simpleFoam (`gpu_fv_simple`: fields ≤
+    3.0e-13, .dat rows ≤ 1.2e-10 of column scale); bit_perf 14/14
+    byte-identical FP32 and FP64, structured_bytes fail=0 vs the pre-change
+    binary. M17 (5.78M cells, SST, FP32, 500 it, 79.8 s) vs the user's np 14
+    simpleFoam: airframe force ≤ 5.3e-4 of |F|, disc thrust equal to 9 digits
+    at it 500; props-off rerun from the unmodified originals byte-identical
+    in force.dat / moment.dat to the pre-change run. Open:
+    (a) **The M17 discs brake.** OpenFOAM's Froude source is −T diskDir on
+        the fluid with T > 0 for every `sink`; the case has diskDir along the
+        flow, so each disc removes 2.09 N of momentum (IF1g, same spelling:
+        zone-mean Ux 1.187 → 1.113 in simpleFoam and here). Reproduced, not
+        changed: a propulsive disc is a dictionary change (diskDir against
+        the flow, or Cp/Ct > 1). The user's decision.
+    (b) The M17 monitor point (2 0 0.3) lies on an edge of 4 cells. Serial
+        simpleFoam takes the lowest index (verified on IF1g), dns too; the
+        np 14 reference takes one cell per processor finding it. Uref agrees
+        to 1.9e-7 of |U| (freestream neighbours), so the tie is not resolved
+        by this data. A monitor in a gradient would need the decomposition.
+    (c) Pitch moment about CofR: −1.9% (it 500), −3.1% (mean it 451–500) vs
+        simpleFoam; without the discs −0.42%, −3.3%. A cancellation (0.033
+        N m against |F| lRef = 6.5 N m: 1e-4 of that) in an unconverged
+        FP32 run at relTol 0.1 / 0.01; not chased, no FP64 run made (VRAM).
+    (d) Not built, rejected by name: `variableScaling`, `selectionMode` other
+        than `cellZone`, a `cellZones` list, `monitorMethod cellSet`,
+        Function1 Cp / Ct / diskDir, discs with `--fv-coupled`, discs
+        together with the constant U source, a monitor next to a cyclic
+        patch, forceCoeffs `coefficients`, scoped / environment macros, a
+        splice onto an existing sub-dictionary (OpenFOAM merges).
+    (e) Stated, not exact: the zone volume is summed in ascending cell order
+        (OpenFOAM: the zone file's order; equal for sorted zones); a function
+        object's `writeControl` is ignored (one row per iteration, noted);
+        `yPlus` writes nothing.
+    (f) CLAUDE.md still says "The one built fv::option is a constant specific
+        U source ... Everything else in fvOptions is rejected by name": stale
+        since this item (the file was not to be edited in this change).
+    **Phase 2: the M17 MRF frozen-rotor case runs unmodified** (two
+    contra-rotating zones, SST, 6 720 123 cells; docs/fv.md table). One
+    reader gap closed:
+    (h) An `fvOptions` with no source dictionary is the source-free solver
+        (dry-run note; `fvcase` C2). v2606 `fv::optionList::reset` counts
+        the dictionary entries, none = an empty list ("No finite volume
+        options present"). New rejection: `constant/fvOptions` and
+        `system/fvOptions` both present (`createIOobject` reads constant's
+        only; dns read both, so an empty constant file would now have let
+        system's source through).
+    Gate: FP64, solves tightened in a scratch `system/` (1e-12 / 1e-11,
+    relTol 0), vs SERIAL simpleFoam on the same mesh, 12 iterations: forces
+    and moments of forcesTotal / forcesPropFwd / forcesPropAft ≤ 3.1e-13 at
+    it 1, ≤ 2.5e-7 of |F| after (roll moment 1.5e-6 of |M|; props ≤ 1.6e-8),
+    residuals equal to 6 printed digits. bit_perf 14/14 byte-identical FP32
+    and FP64 vs the pre-change binary, gpu_fv_simple 87 PASS, fast 66/66. Open:
+    (i) **The unmodified case is not reproduced to 1e-3 at matched
+        iteration, and cannot be.** FP32 vs the user's np 14 run at it 298:
+        airframe Fx 2.6e-3 of |F|, roll moment −4.4%; propFwd thrust −0.128
+        vs −0.087 N (a cancellation: 10.8 N at it 1), torque +1.7%; propAft
+        thrust 6.3e-2 of |F| (mean it 249–298: 4.7e-3), torque 5e-3. Neither
+        side is steady (Uy residual 3e-4–5e-4 from it 200 to 800). Measured:
+        dns FP64 = FP32 in the means to 2e-3; dns with relTol halved (0.05 /
+        0.005) moves its own it-298 propFwd thrust to −0.100 N, fwd torque
+        1.2%, airframe roll moment 3.3% — the size of the gap; dns at it
+        450–800 passes through simpleFoam's it-298 values. No simpleFoam
+        data past it 298 exists; a converged comparison needs a case that
+        converges (smaller relTol, or the transient solver: phase 3).
+    (j) The tight gate's 1e-7 is simpleFoam's own first Ux solve (maxIter
+        1000 reached at 2.6e-10). Not re-run with a larger maxIter.
+    (k) Stated about the case, reproduced: 2 637 + 2 847 `airframe` faces
+        lie inside the MRF zones and `nonRotatingPatches` is empty, so they
+        rotate (U_b = Ω × r) in simpleFoam and here. The zones are not
+        adjacent (0 zone/zone faces): the two-zone face flux is still only
+        gated by IF1f.
+    (l) Late-state branches (wall functions in the log region, limiter
+        activity) are covered by the tight gate only as far as 12
+        iterations develop them; restarts from a simpleFoam time directory
+        are not built, so no tight comparison from a developed state.
+    (m) The FP32 continuity `sum local` floors at 2.2e-5 (FP64 and
+        simpleFoam 1.2e-6 at it 298): p is floor-limited in 232 of 299
+        solves (1e-6 vs fvSolution 1e-7). Forces unaffected at the 2e-3
+        level above.
+
+65. **FV: pimpleFoam on a STATIC mesh (phase 3, stage 3a; `docs/fvpimple.md`).**
+    CLOSED for 3a: `application pimpleFoam` on `dns flow --polymesh CASE` =
+    OpenFOAM v2606 pimpleFoam.C / UEqn.H / pEqn.H (Euler `fvm::ddt`,
+    `fvc::ddtCorr` with `fvcDdtPhiCoeff`, the outer / pressure / non-orthogonal
+    corrector loops, the `*Final` solver + relaxation entries, `p.relax()`,
+    turbCorr, CourantNo / setInitialDeltaT / setDeltaT / `Time::adjustDeltaT`),
+    built as a composition of the simpleFoam stage methods. Gates
+    (`gpu_fv_pimple`, FP64, serial pimpleFoam, tight solves): P1 PISO cavity,
+    P2 skewed cavity with the M17 PIMPLE / relaxation / scheme set, P3
+    adjustTimeStep channel, P3b 3D duct, P4 / P4b kOmegaSST: U, p, phi 1.3e-15
+    … 2.1e-12 of scale, residuals of every solve of every step ≤ 6.0e-11
+    (duct 8.2e-10, P4 1.1e-8), the P3 deltaT sequence equal to pimpleFoam's 17
+    printed digits on all 89 steps. simpleFoam path: bit_perf 14/14
+    byte-identical FP32 and FP64, structured_bytes fail=0 vs the pre-change
+    binary. Open:
+    (a) **The M17 case's `turbulenceOnFinalIterOnly no` is read by nothing.**
+        v2606 `pimpleControl::read` reads `turbOnFinalIterOnly` (default yes):
+        the user's pimpleFoam run corrects turbulence on the final outer
+        corrector only. Reproduced (dry-run note), not changed. The user's
+        decision whether the case should say `turbOnFinalIterOnly no`.
+    (b) P4 (`psst_plate`) sits at nut 1.6e-9, U 1.7e-12 at t = 0.5 and grows
+        in time. Not a code difference: serial pimpleFoam vs itself with U's
+        solver swapped (both tight) differs by nut 5.0e-9, U 5.4e-12. Its test
+        bands (nut 1e-7, residuals 1e-6) are that spread, stated in the test.
+    (c) FP32 runs (default) and is deterministic, but its floors (U, p 1e-6,
+        turbulence 1e-7) were measured on SIMPLE tails. Transient: `psst_plate`
+        nut 5.6e-2 of scale vs FP64 (2.5e-4 without floors), p 2.4e-4. No floor
+        study for PIMPLE; quote FP64. A time-accurate run that needs tight
+        continuity per step may want p's floor lower (64 (m) is the same floor).
+    (d) Rejected by name, not built: PIMPLEC (`consistent yes`), PIMPLE
+        `residualControl`, `momentumPredictor no`, `ddtCorr no`,
+        `finalOnLastPimpleIterOnly yes`, ddt schemes other than `default Euler`,
+        `bounded`, MRF / fvOptions sources / SpalartAllmaras under pimpleFoam,
+        loop counts outside nOuter 1–3, nCorr 1–2, nNonOrth 0–2 (combinations
+        inside the ranges other than the six gated ones run the same loops
+        ungated), restarts (`startFrom latestTime` with time directories: the
+        M17 case directory has them), cpuTime / clockTime write control.
+    (e) Stated, not exact: the end state is always written; `Time::operator++`'s
+        timePrecision growth is not built; function objects write one row per
+        step whatever their `writeControl` (M17's `forcesTotal` asks for 10).
+    (f) Wall time: the six cases are launch bound (7–16 ms per step vs
+        pimpleFoam serial 0.8–3.5 ms). No large-mesh timing yet; the SIMPLE
+        tail optimisations (`r0First`, lazy AMG refresh per iteration) are off
+        in `timeStep` (the AMG is refreshed once per pressure corrector).
+    (g) CLAUDE.md is not updated (not to be edited in this change): it has no
+        pimpleFoam invariant yet. Proposed: "`application pimpleFoam` on
+        `--polymesh` IS pimpleFoam (docs/fvpimple.md); a simpleFoam case is the
+        pre-pimple binary byte for byte; the Impl's FoamCase copy holds the
+        current corrector's entries".
+    **Stage 3b (solid-body mesh motion, no non-conformal interface): CLOSED**
+    (`docs/fvpimple.md` "Moving mesh"). pimpleFoam.C's dynamic branch for ONE
+    rigid rotation of the WHOLE mesh: `dynamicMotionSolverFvMesh` |
+    `dynamicMultiMotionSolverFvMesh` + `solidBody` + `rotatingMotion` (constant
+    omega; the M17 dictionary parses verbatim), points(t) from the initial
+    points by OpenFOAM's septernion (`dns/fvmotion`), the geometry recomputed
+    through `fromPolyMesh` + `buildSimpleSetup` + the wall distance every step,
+    `meshPhi` = `face::sweptVol / deltaT`, `movingWallVelocity::Uwall()`,
+    `Uf` / `fvc::ddtCorr(U, Uf)` / `correctUf`, `correctPhi.H` (pcorr, its
+    solver entries and BC types), `makeRelative` / `makeAbsolute`, `fvm::ddt`
+    on V0, kOmegaSST's divU on the absolute flux, `meshCourantNo.H`. Gates
+    (`gpu_fv_pimple` M1–M3, FP64, serial pimpleFoam, tight solves): the moved
+    points and meshPhi BIT FOR BIT; M1 closed 2D box spin-up U 2.9e-15, p
+    3.8e-14; M2 3D sheared duct with inlet / outlet on the rotating mesh,
+    adjustTimeStep U 3.4e-14, p 4.9e-14, deltaT of all 35 steps relative 0; M3
+    kOmegaSST + wall functions, the M17 fvSchemes U 1.4e-12, p 1.5e-12, nut
+    2.9e-12 (its OpenFOAM-vs-OpenFOAM twin, pressure solver swapped: U
+    2.6e-12, p 3.1e-12, nut 7.3e-12); phi compared RELATIVE, as written.
+    Static cases: bit_perf 14/14 FP32 and FP64, pimple_bytes 6/6 FP32 and FP64
+    byte-identical vs the pre-change binary. Open:
+    (h) **Only the whole mesh as one body is gated.** A motion over
+        disconnected regions (two bodies, or a body plus a static remainder
+        not sharing a face) is handled by the host code (`FvMeshMotion`: per
+        point body, bodies applied in dictionary order) but REFUSED by name:
+        no case gates it (it needs a two-region mesh with a p level per
+        region). A moving zone sharing ordinary faces with other cells is
+        refused by name too (OpenFOAM shears those cells): that is 3c.
+    (i) The mesh update is HOST work every step (FaceMesh + setup + meshWave +
+        re-upload): 7.5–26 ms per step on 256–640 cells against pimpleFoam's
+        0.7–5.5 ms. Nothing measured on a large mesh. A rigid zone's geometry
+        could be updated on the device, but OpenFOAM's is recomputed from the
+        rotated points, so a device rotation is another rounding (and a second
+        geometry code): the parity mode must keep the recomputation.
+    (j) The AMG hierarchy is the initial mesh's (the pressure matrix of a
+        rigid rotation changes at rounding only); its values are refreshed per
+        solve. With AMI the couplings change every step (3c).
+    (k) Not gated on a moving mesh: slip / symmetry / symmetryPlane and
+        freestream patches (the first step's `U.oldTime()` rule, fvpimple.md
+        "Old-time fields", only shows there), `correctPhi no`, nCorrectors 2
+        with nOuterCorrectors > 1, 2D with an inlet. They run the same code.
+    (l) Rejected by name, not built: every other dynamicFvMesh, motion solver
+        and solidBodyMotionFunction, Function1 omega, cellSet, zone regular
+        expressions, `updateControl`, `moveMeshOuterCorrectors yes`, cyclic
+        patches on a moving mesh (list: fvpimple.md).
+    (m) `tests/data/fv/m*` is 2.5 MB (the 3a six: 2.7 MB): Uf and the points
+        of two times per case. Not trimmed.
+    (n) CLAUDE.md is not updated (not to be edited). Proposed beside (g): "a
+        moving mesh is recomputed from the initial points through the one
+        geometry definition, never transformed; phi is relative between pEqn.H's
+        end and the next correctPhi / pEqn.H; a static pimpleFoam case is the
+        pre-motion binary byte for byte (`tools/fv/pimple_bytes.sh`)".
+    **Stage 3c (cyclicAMI, `faceAreaWeightAMI`, no transform): CLOSED for the
+    gated set** (`docs/fvpimple.md` "cyclicAMI"). Weights: `dns/fvami` =
+    OpenFOAM's `resetAMI` → `faceAreaWeightAMI::calculate`, addressing and
+    every value BIT FOR BIT against dumps of a v2606 utility
+    (`tools/fv/foamAmiDump`): 598 checks on 6 meshes at up to 9 rotor
+    positions + 105 on the M17 mesh, 0 differing values (`fvami`).
+    Discretisation: a coupled BOUNDARY face in every operator of the pimple
+    path (interpolation, Gauss + cellLimited gradients, linearUpwind, the
+    limited-corrected laplacian, the matrix couplings assembled into `gpu/la`,
+    relax's coupled branch, H, flux, ddtCorr 0, adjustPhi, correctPhi / pcorr,
+    kOmegaSST's k / omega / nut, meshWave across the interface). Motion: a
+    cellZone enclosed by cyclicAMI rotates, the AMI and the matrix pattern
+    rebuilt at every mesh update. Gates (`gpu_fv_pimple`, FP64, serial
+    pimpleFoam, tight solves): A1 planar 8 | 12 U 5.4e-15, p 2.0e-13; A1m
+    matching U 9.3e-15; A2 3D cylinder U 2.3e-14, p 1.1e-13; A3 rotating 2D
+    mixer (3, 1, 1), M17 relaxation, correctPhi, adjustTimeStep, 1.8 rad: U
+    4.4e-13, p 5.3e-13, deltaT of all 55 steps relative 0, blade force /
+    moment 5.8e-10; A4 rotating 3D mixer, kOmegaSST + wall functions +
+    meshWave, M17 fvSchemes, M17 dynamicMeshDict spelling: U 9.2e-11, p
+    2.7e-11, k 4.7e-12, omega 1.1e-12, nut 2.2e-10 (its OpenFOAM-vs-OpenFOAM
+    twin, p solver swapped: U 1.2e-10, p 6.4e-11, k 1.1e-11, nut 3.3e-10).
+    Scratch: the mixer refined to 86 016 cells, 8 steps: U 5.7e-13, p
+    6.0e-13, omega 2.1e-11, nut 2.8e-11, 0.32 s per step against serial
+    pimpleFoam's 33 s (tight GAMG). Without cyclicAMI: bit_perf 14/14 and
+    pimple_bytes 9/9 byte-identical vs the pre-change binary, FP32 and FP64
+    (FP32 `mspin` exits 7 at step 36 in BOTH binaries, same text: `adjustPhi:
+    continuity error cannot be removed` — pre-existing, FP32 on a closed
+    rotating box; not looked at). Open:
+    (o) CLOSED (stage 3d): **the M17 case runs**, FP64 and FP32, with ONE
+        dictionary line changed (`system/controlDict` `startFrom latestTime;`
+        → `startFrom startTime;`, a time-0 copy); `--dry-run` exit 0, 0
+        linear solves at maxIter. The 3c failure (`fv: Ux: bicgstab:
+        non-finite residual`: p / pcorr on BiCGStab around the scaled
+        V-cycle) does not occur on the flexible AMG-PCG. Numbers:
+        fvpimple.md "The M17 case".
+    (p) **NOT closed, sharper: dns's AMG-PCG stopped at the case's relTol
+        0.01 leaves more error than GAMG where the system is
+        ill-conditioned.** M17, FP64 vs serial pimpleFoam at the user's
+        tolerances, 20 steps: T_fwd ≤ 8.1e-5, but T_aft 3.2e-3 / Q_aft 2.8e-3
+        at step 10 (a bump over steps 6–13, peak +0.058 N of 18.38 N).
+        Chain, measured: (1) tightening only `tolerance` (p 1e-11, pcorr
+        1e-10) moves neither code (dns +0.0587 N, pimpleFoam within 1e-5 N
+        of its loose run); (2) with `relTol 0` on EVERY solve (12 steps) dns
+        vs serial pimpleFoam is T_fwd ≤ 1.5e-6, Q_fwd ≤ 1.6e-6, T_aft ≤
+        1.1e-6, Q_aft ≤ 1.3e-6 — not an algebra difference; (3) it lives in
+        the solves stopped at relTol 0.01 (first non-orthogonal p solve of
+        each corrector) / 0.1 (non-final U): the second p solve corrects
+        with an explicit non-orthogonal term built on an unconverged p.
+        OpenFOAM's GAMG at relTol 0.01 is within 6.1e-5 of its own converged
+        run on T_aft, dns's AMG-PCG 3.2e-3; (4) where: a dead-end cavity
+        inside the tail (x 0.78–0.9986, r < 0.045, first-step p 6e5–1.3e6
+        against 612 of stagnation), fed only through the ring at r 0.04
+        next to the aft AMI's end cap, where all 24 faces without overlap
+        sit and one AMIAft2 face's weight sum falls 0.33 → 0.0002 over steps
+        3–15; one step in p differs by a near-uniform 227 Pa there (2.7e-4
+        of its level), U by up to 0.56 m/s in hub cells, nut in 98 000 cells
+        by up to 37 % of scale (`cellLimited` amplifies U differences of
+        1e-4). OpenFOAM against itself over those 20 steps: np 14 vs serial
+        T_aft ≤ 1.3e-4, solver twin ≤ 6.4e-5. Iterations: GAMG 37–66 per
+        step, AMG-PCG 103–171. A parity run of this case needs `relTol 0`,
+        or a p solver whose error at relTol 0.01 is GAMG's (FGMRES + AMG is
+        in `gpu/la`, without the OpenFOAM norm start): not built. Done: a
+        solve that reaches maxIter is reported on stderr by name, its count
+        in the end summary (0 on every M17 run). Flexible PCG on the
+        non-symmetric matrix still has no guarantee.
+    (q) **Cost of the per-step rebuild** (correctness first), M17, 1 227 027
+        cells, per time step: FP64 2789 ms at the start of 3d → 2182 (host
+        mesh update 1624 + device 190 + solves 368); FP32 2236 (1832 + 224 +
+        181) on 20 steps, 2174.44 (1785.2 + 217.2 + 172.0) over 720 steps.
+        The one change (byte-identical: M17 20 steps FP32 and FP64, stats +
+        15 files each): the host part of the matrix rebuild (ELL pattern,
+        colours, AMG hierarchy) runs on a second thread beside the wall
+        distance, the meshPhi / Uwall sweeps are `forBlocks`. Device memory
+        FP32 2222 MiB, FP64 3718 MiB; host peak RSS 3.5–4.5 GiB (20 steps),
+        5673 MiB (720 steps). The user's np 14 pimpleFoam: 5.8 s per step,
+        serial 16.4 s. **Open: the host update is 82 % of the FP32 step and
+        meshWave is half of it** (host split, before the change: 1.74–1.88
+        s = meshWave 0.88–0.91 serial, AMI + graph 0.32–0.33, FaceMesh
+        0.20–0.22, setup 0.11–0.17, points + meshPhi + moves 0.22–0.25).
+        Not done (not byte-safe or not cheap): a threaded meshWave; FaceMesh
+        / setup recomputed for the rotor zones' faces only (161 224 of the
+        points move; identical bits, a restructure); the AMG aggregation
+        redone every step. Small cases: 42 (A3) / 53 (A4) ms per step vs
+        pimpleFoam 7.6 / 29 ms; 86 016 cells FP64 0.32 s, FP32 0.22 s.
+    (r) **Uncovered faces: CLOSED for the gated set (A1p `apartial`, A5
+        `amixtilt`), with three defects found and fixed**, each only on a
+        cyclicAMI face WITHOUT overlap (no lowWeightCorrection: neighbour
+        value 0). B1: laminar `nuEff` on a coupled face was the constant
+        `nu`; OpenFOAM interpolates the CELL field (0 without overlap) —
+        `apartial` U 14 % / 28 %, p 12 % / 14 % of scale before, U 9.1e-14 /
+        1.8e-13, p 2.3e-13 / 7.3e-13 after. B2: CorrectPhi's `rAUf` was
+        `lerp` of a cell field of ones (0 without overlap); OpenFOAM's is a
+        SURFACE field 1 on every face — tilted mixer U 9.5e-3 abs before,
+        3.7e-13 after. B3: normFactor's row sum lacked the share of a face
+        without overlap (`lduMatrix::sumA` subtracts `boundaryCoeffs`
+        whole; `kAmiSumA`) — A5's pcorr initial residuals 29 % off before,
+        7.5e-11 after; only the reported / stop residual moves. Gates at
+        the COMMON bands: A1p U 5.7e-14 / 1.2e-13, p 2.7e-14 / 2.0e-13,
+        residuals 1.65e-11 (799 values); A5 (A4 with axis (0.3 0 1), weight
+        sums 1 → 0, faces without overlap from step 49 of 74, kOmegaSST,
+        correctPhi) U 4.4e-14 / 2.4e-13, p 2.3e-13 / 9.0e-13, k 6.3e-13,
+        omega 1.1e-12, nut 1.8e-12, deltaT of all 74 steps relative 0,
+        forces 4.0e-12, residuals 7.5e-11 (1405 values). `gpu_fv_pimple`
+        157 PASS, 0 FAIL. A1–A3 are not byte-identical to 3c (B1 moves the
+        laminar coupled-face nuEff at rounding), by design. pimpleFoam runs
+        such a case only with `FOAM_SIGFPE=false` (the references are made
+        so). M17: 24 AMIAft1 faces without overlap at rest (28–30 at other
+        positions, 6 target faces at −2.3 rad), 39–56 source faces with a
+        weight sum below 0.2, AMIFwd 13 / 15 at 1 rad. The FP64 M17 20-step
+        run re-run on the final binary (B3 included): every field
+        byte-identical to the run before B3, iteration counts equal, only
+        reported initial residuals move (Ux ≤ 2.0e-9, k ≤ 4.0e-10 relative):
+        the (p) / fvpimple.md tables stand.
+    (s) A4 has ONE rotating zone; two contra-rotating zones (the M17 layout)
+        are covered by the host tests' motion groups and by the M17 AMI
+        dumps, not by a flow gate. Faces with more than 4 nodes on an AMI
+        patch (the recursive `face::split` path) are in no small mesh.
+    (t) **FP32 with cyclicAMI: runs M17 for 720 steps (0.698 revolution, t =
+        0.0052342239, foam 0.0052342864), stable, not gated.** Final binary,
+        the user's dictionaries with (o)'s one line, 0 solves at maxIter,
+        3636 `floor-limited` stops; wall 1569.9 s against the user's np-14
+        ClockTime 4170 s at step 720 (2.66×). vs the user's np-14 log at
+        equal steps, relative, step 1 / 10 / 100 / 720: T_fwd 1.5e-5 /
+        7.0e-6 / 5.6e-4 / 1.2e-4; T_aft 7.7e-7 / 1.7e-3 / 9.8e-4 / 2.5e-4;
+        Q_fwd 2.3e-5 / 1.9e-6 / 5.1e-4 / 7.0e-5; Q_aft 9.7e-6 / 1.5e-3 /
+        1.3e-3 / 4.7e-4; airframe |F| 3.4e-5 / 1.1e-3 / 7.8e-4 / 8.6e-3.
+        Worst of 720: T_fwd 1.3e-3 (655), Q_fwd 8.8e-4 (101), T_aft 6.6e-3
+        (603), Q_aft 5.3e-3 (603), airframe |F| 1.0e-1 (655; ~6 N, a small
+        difference of large terms), deltaT 2.4e-3 (628), Courant max 2.4e-3
+        (629), time 3.7e-5 (423). Mean of the last 100 common steps: T_fwd
+        25.39080 N (user) 25.38008 (dns), 4.2e-4; Q_fwd −1.69227 / −1.69191,
+        2.1e-4; T_aft 18.89050 / 18.88676, 2.0e-4; Q_aft 1.32988 / 1.32981,
+        5.8e-5. The aft excursions are (p)'s mechanism (measured for steps
+        6–13, inferred for 603). 20 steps FP32 vs serial (pre-fix binary):
+        T_fwd ≤ 8.8e-5, T_aft ≤ 2.3e-3, U residuals up to 12× (noise
+        floor), continuity sum local 1e-10 against 1e-15. A trajectory
+        comparison against a relTol 0.01 / 0.1 run, not a gate; no transient
+        FP32 floor study ((c)); the run was not taken past 720 steps.
+    (u) Two stated rounding differences from OpenFOAM's algebra: the momentum
+        solve's `source + bCoeffs pnf − bCoeffs pnf` is taken as `source`; on
+        a COVERED face a row sum takes `bCoeffs Σ w_j` for OpenFOAM's
+        `bCoeffs` (a face without overlap now subtracts `bCoeffs` whole:
+        (r) B3). A first-step residual of a component whose
+        source is rounding noise (0.99975…: Σ|b| / (Σ|b| + 1e-20)) is not
+        compared on the cyclicAMI gates.
+    (v) Rejected by name, not built: cyclicACMI, nonConformal*, AMI
+        transforms, other AMIMethods, lowWeightCorrection, requireMatch /
+        restartUncoveredSourceFace off, reverseTarget, cyclicAMI under
+        simpleFoam, cyclic + cyclicAMI in one mesh, uncorrected schemes,
+        exactDistance, limitedLinear k / omega, cyclicAMI on the other FV
+        routes (list: fvpimple.md).
+    (w) CLAUDE.md is not updated (not to be edited). Proposed: "a cyclicAMI
+        face is a coupled BOUNDARY face whose neighbour value is Σ w_j
+        x[N_j] in OpenFOAM's address order; the patch kernels see it as
+        zeroGradient and the `ami*()` hooks overwrite them; weights are
+        OpenFOAM's bit for bit (`fvami`); the pressure matrix is not
+        symmetric and stays on flexible PCG (BiCGStab around the scaled
+        V-cycle diverges); a matching cyclicAMI is not the conformal mesh
+        (ddtCouplingCoeff 0)".
+    (x) **The user's M17 mesh: `airframe` faces inside `rotorAft`, and a
+        dead-end cavity behind the aft hub** (stage 3d). The `airframe`
+        noSlip patch has faces in wall cells of the ROTATING zone, where all
+        24 faces without overlap sit; the cavity (x 0.78–0.9986, r < 0.045)
+        is fed only through the ring at r 0.04 next to the aft AMI's end
+        cap and carries p 6e5–1.3e6 on the first step. Reproduced as
+        OpenFOAM runs it; it is where (p)'s difference lives. The user's
+        decision whether the mesh should have them.
+    (y) **pimpleFoam needs `FOAM_SIGFPE=false` on the M17 case in serial**
+        (the user's np-14 log has no `trapFpe` line): with trapping it dies
+        in `kOmegaSSTBase::F2` at construction (division by the patch value
+        0 of omega on cyclicAMI faces without overlap). dns runs it.
+    (z) Stage 3d regression. Final binary (sha256 `ed54fed3e95fff83…`):
+        `ctest -L fast` 66/66, `gpu_fv_pimple` 157 PASS, `gpu_fv_simple` 87
+        PASS, bit_perf 14/14 byte-identical FP64 and FP32, pimple_bytes
+        9/9 FP64, FP32 8/9 + `mspin` rc 7 (pre-existing: the pre-3d binary
+        exits 7 there too; OPEN, not investigated) vs the pre-3d binary.
+        The 20-step FP64 M17 tables predate `kAmiSumA`, not re-run. One edit of
+        the stage bypassed the Edit tool (a 3-line python replace in
+        `src/dns/fvmotion.cpp`, the `kBlock` worker-count lines).
+    The source leads of the earlier research pass, with what the build
+    corrected (paths under src/; FV = finiteVolume, MT = meshTools):
+    - CORRECTIONS: `makeWeights` takes `di = mag(nf & (Cf − Cn))`, `dni =
+      mag(interpolate(…))`; `deltaCoeffs = 1/mag(delta)`, only
+      nonOrthDeltaCoeffs is `1/max(nf·δ, 0.05|δ|)`; `srcMagSf` / `tgtMagSf`
+      are projected triangle sums, not |Sf|; the walk starts on the pair (0,
+      0), not on a searched seed; a source face without a target does NOT
+      abort (weight sum 0, neighbour value 0); the clipping takes the target
+      triangle's vertices reversed and its coplanar tolerance scales with
+      sqrt(source triangle area); `linearUpwind` and the convection
+      coefficients on a coupled patch use the SCHEME's patch weight; the
+      FaceCellWave combine measures from the owner patch's face `start + i`
+      on both sides.
+    - **A cyclicAMI face is a COUPLED patch face, never an internal face.**
+      `cyclicAMIFvPatchField::updateInterfaceMatrix` (FV/fields/fvPatchFields/
+      constraint/cyclicAMI/cyclicAMIFvPatchField.txx): `pnf = psiInternal at
+      nbrFaceCells; pnf = cyclicAMIPatch_.interpolate(pnf, defaultValues);
+      addToInternalField(result, !add, faceCells, coeffs, pnf)`: row P gains
+      `−bouCoeff_f Σ_j w_fj ψ(nbrCell_j)` (`lduMatrix::Amul` /  `residual`
+      through `initMatrixInterfaces` / `updateMatrixInterfaces`,
+      interfaceBouCoeffs / interfaceIntCoeffs). The ELL pattern of `gpu/la`
+      and the AMG's coarse levels change every step. The implicit mode
+      (`useImplicit`, `lduPrimitiveMeshAssembly`, `manipulateMatrix`) is OFF
+      by default and scalar-only: not needed.
+    - Coefficients are `coupledFvPatchField`'s, not overridden (FV/fields/
+      fvPatchFields/basic/coupled/coupledFvPatchField.txx): valueInternal `w`,
+      valueBoundary `1 − w`, gradientInternal `−deltaCoeffs`, gradientBoundary
+      `+deltaCoeffs`; `gaussLaplacianScheme` / `gaussConvectionScheme` multiply
+      by gamma / the patch flux. `fvMatrix::addBoundaryDiag` adds
+      internalCoeffs on every patch; the vector solve (`fvMatrixSolve.C`
+      solveSegregated) adds the coupled boundary source explicitly and
+      subtracts the implicit part per component (net zero without a
+      transform); `fvMatrix::flux()` on the patch = `internalCoeffs ψ_P −
+      boundaryCoeffs patchNeighbourField`.
+    - `fvMatrix::relax` on a coupled patch: `D += iCoeffs`, `sumOff +=
+      mag(pCoeffs)`, after `D = max(|D|, sumOff)/alpha` `D −= iCoeffs`; no
+      cyclicAMI special case. (This path has never needed the coupled branch.)
+    - Geometry (FV/fvMesh/fvPatches/constraint/cyclicAMI/cyclicAMIFvPatch.C):
+      `makeWeights`: `w = dni/(di + dni)`, `di = nf & (Cf − Cn)`, `dni =
+      interpolate(nbr.nf & nbr.delta)`; `delta() = patchD − interpolate(nbrD)`;
+      deltaCoeffs / nonOrthDeltaCoeffs / correction vectors are
+      `basicFvGeometryScheme`'s on that delta (`1/max(n·δ, 0.05|δ|)`, `n − δ
+      dcNO`). Face value `w ψ_P + (1 − w) ψ_N~`, snGrad `dc (ψ_N~ − ψ_P)`, ψ_N~
+      = the AMI-interpolated neighbour cell values. `interpolate()`: the
+      OWNER patch (`index() < neighbPatchID()`) holds the AMI:
+      `interpolateToSource` on the owner, `neighbPatch().AMI().
+      interpolateToTarget` on the other.
+    - Weights (MT/AMIInterpolation/AMIInterpolation.C, faceAreaWeightAMI/
+      faceAreaWeightAMI.C, advancingFrontAMI/advancingFrontAMI.C,
+      MT/faceAreaIntersect/faceAreaIntersect.C): advancing-front walk,
+      `processSourceFace` keeps a pair when `interArea / srcMagSf > 1e-6`,
+      `interArea` = triangle-triangle clipping (src triangle against the 3
+      edge planes of each tgt triangle, projection normal `−n_src + n_tgt`),
+      `triMode mesh`, `areaNormalisationMode project`;
+      `restartUncoveredSourceFace` (default true) re-seeds faces covered <
+      0.95 (hard-coded). `requireMatch` default true → `normaliseWeights(
+      conformal)`: every face's weights are divided by their OWN sum (sum to
+      1; `weightsSum` keeps the covered fraction); `lowWeightCorrection`
+      default −1 = off: **a face with no overlap gets a neighbour value of
+      exactly 0** (the M17 log has sum(weights) min 0 on AMIAft1), and with
+      requireMatch a source face that finds no target seed aborts ("Unable to
+      set target face for source face"). `matchTolerance` is read only by the
+      rotational transform; `transform noOrdering` = no transform.
+    - When it is recomputed (MT/patches/cyclicAMI/cyclicAMIPolyPatch/
+      cyclicAMIPolyPatch.C): `initMovePoints` sets `AMIPtr_->upToDate(false)`,
+      `AMI()` calls `resetAMI()` lazily (`calculate` on the current points):
+      ONCE per `fvMesh::movePoints`, i.e. once per time step here; nothing per
+      outer corrector. `cyclicAMIFvPatch::movePoints` does nothing unless
+      `createAMIFaces`.
+    - `ddtCouplingCoeff = 0` on cyclicAMI patches (`ddtScheme::fvcDdtPhiCoeff`:
+      `fixesValue() || isA<cyclicAMIFvPatch>`); meshPhi has no AMI case
+      (`setMeshPhi`: each side its own swept volume: the rotating side's is
+      the motion's, the static side's 0); `adjustPhi` skips coupled patches;
+      `constrainHbyA` leaves it (assignable); pcorr takes the cyclicAMI
+      constraint type. **No code makes the flux of a face pair equal and
+      opposite**: each side's patch flux comes from its own Sf, coefficients
+      and interpolated neighbour values; continuity closes only as far as the
+      weights are consistent (nothing found that corrects it).
+    - meshWave crosses the interface (`FaceCellWave::handleAMICyclicPatches`,
+      meshTools/algorithms/MeshWave/FaceCellWave.C: the nearest-wall
+      `updateFace` combine over the AMI addressing, not a weighted average).
+      k, omega, nut, U, p all take type `cyclicAMI`; kOmegaSST has no AMI
+      code beyond `evaluateCoupled`.
+    - On this path: the polyMesh reader's AMI rejection lifted; boundary faces
+      of a new coupled kind in `FvSimpleSetup`; per step the AMI (host, FP64,
+      OpenFOAM's walk and clipping order if weights are to match to rounding);
+      every kernel that reads a patch value / snGrad / matrix coefficient gets
+      the coupled branch; `gpu/la` rows with a per-step coupling pattern; the
+      3b refusal "moving zone borders other cells" stays for ordinary faces.
+    **Stage 3d (M17 `m17_prop5_8000_ami`, 1 227 027 cells): MEASURED, not a
+    parity gate at the case's tolerances** (`docs/fvpimple.md` "The M17
+    case"). Closed: (o), (r) for the gated set. Open: (p) (3.2e-3 on aft
+    thrust at relTol 0.01 against GAMG's 6.1e-5; 1.1e-6 at relTol 0), (q)
+    (host mesh update 82 % of the step, meshWave half of it), (t) (FP32 not
+    gated), (x), (y), (z). Still as before: `--dry-run` of the case as it
+    stands exits 3 (`system/controlDict: the run must start from time 0
+    (startFrom resolves to 0.045; restarts are not supported)`), a time-0
+    copy with `startFrom startTime` runs; restarts from binary `writeFormat`
+    time directories, `purgeWrite`, forces `writeInterval 10`, the decision
+    of (a), FP32 floors for a transient (c) are not built / not decided. The
+    user's np 14 run is relTol 0.01 / 0.1 at maxCo 2: the matched-step
+    comparison is trajectory-limited ((t)); the tight short serial run
+    ((p) (2), 12 steps, relTol 0) is the parity number.
 
 78. **Compressible FV family (`docs/fvcomp.md`, `gpu/fv_comp`): explicit DNS/LES
     on any FaceMesh, FP32 default, cross-verified against the structured solver.**
@@ -2261,10 +2731,12 @@ Baseline at 644e596: `dns bench --physics compressible --n 256` 20.24 ms/step,
     `docs/fvstructured.md`).** Built: uniform, `--stretch`, `--focal`,
     channel, O-grid 2D / 3D, wedge, full revolution, laminar, SA, SST, MRF;
     `--export CASE`. Open:
-    (a) OpenFOAM absent: no generated case has been run by simpleFoam. The
-        `vectorSemiImplicitSource` spelling (`sources`, `injectionRateSuSp`)
-        and its sign are written from memory of v2606; Poiseuille pins the
-        solver's reading, not OpenFOAM's. First check when OpenFOAM is back.
+    (a) No GENERATED case has been run by simpleFoam yet (OpenFOAM v2606 is
+        installed again). CLOSED half: the `vectorSemiImplicitSource`
+        spelling and sign. simpleFoam v2606 reads both `sources` and
+        `injectionRateSuSp` (identical bytes) and dns matches it on the IF1g
+        mesh, source (0.3 0.05 −0.1): U 2.1e-13, p 9.2e-13 of scale at it
+        300 (docs/fv.md table; item 64).
     (b) OpenFOAM's `wedge` patch is not built: the wedge's sides are `symmetry`,
         a `cos(dphi/2)` difference in the face value. `Uz` is solved, so a
         wedge (and any 3D case with a zero component) never certifies a

@@ -1,0 +1,91 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2606                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    arch        "LSB;label=32;scalar=64";
+    class       regIOobject;
+    location    "constant/polyMesh";
+    object      cellZones;
+    meta
+    {
+        names           ( diskA diskB );
+    }
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+2
+(
+diskA
+{
+    type            cellZone;
+    cellLabels      List<label> 
+28
+(
+416
+417
+440
+441
+464
+465
+608
+609
+632
+633
+656
+657
+680
+681
+800
+801
+824
+825
+848
+849
+872
+873
+992
+993
+1016
+1017
+1040
+1041
+)
+;
+}
+diskB
+{
+    type            cellZone;
+    cellLabels      List<label> 
+18
+(
+494
+495
+518
+519
+541
+542
+686
+687
+710
+711
+733
+734
+878
+879
+902
+903
+925
+926
+)
+;
+}
+)
+
+// ************************************************************************* //

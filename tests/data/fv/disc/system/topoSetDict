@@ -1,0 +1,14 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      topoSetDict;
+}
+actions
+(
+    { name diskA; type cellSet; action new; source cylinderToCell; p1 (1.0 0.35 0.5); p2 (1.26 0.35 0.5); radius 0.26; }
+    { name diskA; type cellZoneSet; action new; source setToCellZone; set diskA; }
+    { name diskB; type cellSet; action new; source cylinderToCell; p1 (1.76 0.66 0.45); p2 (2.01 0.66 0.45); radius 0.22; }
+    { name diskB; type cellZoneSet; action new; source setToCellZone; set diskB; }
+);

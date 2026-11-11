@@ -56,6 +56,13 @@ int runFvFlow(const Case& c)
                             c.fvCoupled,
                             gpu::FvCoupledOpts{c.fvCoupledEta, c.fvCoupledAlpha, c.fvCoupledCheck},
                             c.fvs.refArea};
+    // The case's controlDict `application` picks the algorithm: simpleFoam | pimpleFoam (docs/fvpimple.md).
+    if (L->c.pimple.on) {
+        auto r = gpu::runFvPimple(sp, *L);
+        if (!r) return die(r.error().code, r.error().message);
+        std::printf("done: %ld time steps, %.2f ms/step\n", r->steps, r->msPerStep);
+        return 0;
+    }
     auto r = gpu::runFvSimple(sp, *L);
     if (!r) return die(r.error().code, r.error().message);
     std::printf("done: %ld iterations%s, %.2f ms/iteration\n", r->steps, r->converged ? " (converged)" : "",

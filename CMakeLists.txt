@@ -68,6 +68,11 @@ add_library(dns_core
     src/dns/fvlowmach.cpp
     src/dns/fvconv.cpp
     src/dns/fvsimple.cpp
+    src/dns/fvpimple.cpp
+    src/dns/fvmotion.cpp
+    src/dns/fvami.cpp
+    src/dns/fvamisetup.cpp
+    src/dns/fvdisk.cpp
     src/dns/fvstructured.cpp
     src/dns/fvwalldist.cpp
     src/dns/fvcomp_case.cpp
@@ -122,6 +127,12 @@ add_library(dns_core
     src/dns/webframes.cpp
     src/dns/wick.cpp
 )
+# dns/fvmotion restates OpenFOAM's point transform, swept volumes and wall
+# velocity operand for operand: no contraction, whatever the target flags.
+set_source_files_properties(src/dns/fvmotion.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+# dns/fvami (OpenFOAM's faceAreaWeightAMI) and dns/fvamisetup (cyclicAMIFvPatch's
+# weights, deltas, correction vectors): the same rule.
+set_source_files_properties(src/dns/fvami.cpp src/dns/fvamisetup.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 target_include_directories(dns_core PUBLIC src)
 # cgltf (trimesh.cpp) + toml++ (scene.cpp); SYSTEM mutes third-party warnings.
 target_include_directories(dns_core SYSTEM PRIVATE third_party)
@@ -201,6 +212,8 @@ set(DNS_GPU_SOURCES
     src/dns/gpu/fv_incomp.hip
     src/dns/gpu/fv_simple.hip
     src/dns/gpu/fv_coupled.hip
+    src/dns/gpu/fv_pimple.hip
+    src/dns/gpu/fv_ami.hip
     src/dns/gpu/fv_ras.hip
     src/dns/gpu/ghostfill.hip
     src/dns/gpu/kernels.hip
@@ -500,7 +513,7 @@ if(BUILD_TESTING)
         rotor focal cli_defaults comp_axis_permute rans rans_channel1d
         steady_stop blockband channel_line pseudo_time flow_rans_config precond
         host_threads flame1d flame_config lowmach_config fv_lowmach restart_config bunsen diffusion candle wick chamber_config
-        polymesh facemesh fvref fv_comp la amg fvcase fvwalldist fvstructured tfles poisson_sep fvincomp stage_bias)
+        polymesh facemesh fvref fv_comp la amg fvcase fvwalldist fvami fvstructured tfles poisson_sep fvincomp stage_bias)
     if(DNS_WITH_FFTW)
         list(APPEND DNS_TESTS ke_conservation hit_mini turb_ic)
     endif()
@@ -603,6 +616,8 @@ if(BUILD_TESTING)
     set(DNS_FV_DATA ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/fv)
     target_compile_definitions(test_fvcase PRIVATE DNS_FV_DATA="${DNS_FV_DATA}")
     target_compile_definitions(test_fvwalldist PRIVATE DNS_FV_DATA="${DNS_FV_DATA}")
+    # cyclicAMI weights against OpenFOAM's AMIInterpolation dumps (docs/fvpimple.md "cyclicAMI").
+    target_compile_definitions(test_fvami PRIVATE DNS_FV_DATA="${DNS_FV_DATA}")
     # The layered rotor2 L1 snappy mesh (tools/fv/make_rotor_bl.py, 123k cells,
     # runs/ is git-ignored: rc 77 when absent): meshWave vs simpleFoam's serial
     # wallDistance (checkMesh -writeFields, 12 digits).
@@ -815,6 +830,15 @@ if(BUILD_TESTING)
         target_compile_definitions(test_gpu_fv_simple PRIVATE DNS_FV_DATA="${DNS_FV_DATA}")
         add_test(NAME gpu_fv_simple COMMAND test_gpu_fv_simple)
         set_tests_properties(gpu_fv_simple PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+        # pimpleFoam on the FV path vs serial OpenFOAM pimpleFoam (docs/fvpimple.md,
+        # stage 3a, static mesh): P1 PISO cavity, P2 skewed cavity with the M17
+        # PIMPLE / Final set, P3 adjustTimeStep channel (deltaT sequence), P3b
+        # 3D duct, P4 / P4b kOmegaSST.
+        add_executable(test_gpu_fv_pimple tests/test_gpu_fv_pimple.cpp)
+        target_link_libraries(test_gpu_fv_pimple PRIVATE dns_gpu)
+        target_compile_definitions(test_gpu_fv_pimple PRIVATE DNS_FV_DATA="${DNS_FV_DATA}")
+        add_test(NAME gpu_fv_pimple COMMAND test_gpu_fv_pimple)
+        set_tests_properties(gpu_fv_pimple PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
         # Compressible FV family (docs/fvcomp.md): the device vs FvRef, and the
         # cross-verification against the structured solver.
         add_executable(test_gpu_fv_comp tests/test_gpu_fv_comp.cpp)

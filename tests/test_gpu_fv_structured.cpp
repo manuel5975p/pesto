@@ -114,7 +114,7 @@ std::expected<Result, std::string> solve(const FvStructured& s, FoamCaseTexts t,
         }
         m /= v;
         R.last = std::abs(m - prev) / std::max(std::abs(m), 1e-300);
-        if (fc->forces) { // the mean speed is far-field; the wall has its own clock
+        if (!fc->forces.empty()) { // the mean speed is far-field; the wall has its own clock
             auto f = ds->forces();
             if (!f) return std::unexpected(f.error());
             const double Fx = std::hypot(f->fp[0] + f->fv[0], f->fp[1] + f->fv[1]);
@@ -128,7 +128,7 @@ std::expected<Result, std::string> solve(const FvStructured& s, FoamCaseTexts t,
             break;
         }
     }
-    if (fc->forces) {
+    if (!fc->forces.empty()) {
         auto f = ds->forces();
         if (!f) return std::unexpected(f.error());
         R.fo = *f;

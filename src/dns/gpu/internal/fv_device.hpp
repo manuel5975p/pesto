@@ -56,7 +56,32 @@ struct Mesh
     const R *V = nullptr, *C = nullptr;
     const int *cStart = nullptr, *cEnt = nullptr, *cEll = nullptr;
     const u8* zone = nullptr;
+    // cyclicAMI (FvAmiSetup; nA == 0: none, the pointers null and unread)
+    int nA = 0, nR = 0;
+    const int *aB = nullptr, *bA = nullptr, *aStart = nullptr, *aCell = nullptr, *aEll = nullptr;
+    const R *aW = nullptr, *aWt = nullptr, *aK = nullptr, *aD = nullptr;
+    const int *rCell = nullptr, *rStart = nullptr, *rA = nullptr;
 };
+
+// cyclicAMI: patchNeighbourField() of the cell field x at AMI face a -- sum_j
+// w_j x[cell_j] from zero in OpenFOAM's address order, each product its own
+// rounding (AMIInterpolation::interpolateToSource / ToTarget).
+template <class R>
+__device__ inline R amiNbr(const Mesh<R>& m, int a, const R* x)
+{
+#pragma clang fp contract(off)
+    R s = 0;
+    for (int j = m.aStart[a]; j < m.aStart[a + 1]; ++j) s += m.aW[j] * x[m.aCell[j]];
+    return s;
+}
+
+// A coupled patch's face value: lerp(patchNeighbourField, patchInternalField, weights).
+template <class R>
+__device__ inline R amiLerp(R w, R pif, R pnf)
+{
+#pragma clang fp contract(off)
+    return (R(1.0) - w) * pnf + w * pif;
+}
 
 template <class R>
 struct Ctl
@@ -75,6 +100,7 @@ struct Ctl
     int emptyAxis = -1;
     bool force = false; // fvOptions: f per unit mass on the U source
     R f[3] = {0, 0, 0};
+    R rDeltaT = 0;      // pimpleFoam: 1 / deltaT of the current time step (Euler ddt); simpleFoam: unused
 };
 
 // --- small device helpers ---------------------------------------------------
@@ -214,7 +240,10 @@ __device__ inline void symTensor(const R (&n)[3], R (&g)[3][3])
 }
 
 // --- gradient: Gauss linear [+ cellLimited minmod], NC components ---------
-template <class R, int NC>
+// Cpl (a mesh with cyclicAMI faces; false is the kernel bit for bit): a coupled
+// face's value is lerp(pnf, pif, w) of the cell values, and cellLimited takes
+// the patch NEIGHBOUR value (psf.coupled(): patchNeighbourField) for min / max.
+template <class R, int NC, bool Cpl = false>
 __global__ void __launch_bounds__(256) kGrad(Mesh<R> m, const R* x, const R* xb, int lim, R kLim,
                                              R* G)
 {
@@ -246,6 +275,19 @@ __global__ void __launch_bounds__(256) kGrad(Mesh<R> m, const R* x, const R* xb,
             }
         } else {
             const std::size_t b = std::size_t(-code - 1);
+            if constexpr (Cpl) {
+                const int a = m.bA[b];
+                if (a >= 0) {
+                    const R w = m.aWt[a];
+                    for (int q = 0; q < NC; ++q) {
+                        const R* xq = x + std::size_t(q) * nC;
+                        const R vf = amiLerp(w, xq[c], amiNbr(m, a, xq));
+#pragma unroll
+                        for (int i = 0; i < 3; ++i) g[i][q] += m.bS[std::size_t(i) * nB + b] * vf;
+                    }
+                    continue;
+                }
+            }
 #pragma unroll
             for (int q = 0; q < NC; ++q)
 #pragma unroll
@@ -274,7 +316,13 @@ __global__ void __launch_bounds__(256) kGrad(Mesh<R> m, const R* x, const R* xb,
                     const std::size_t f = std::size_t(code >> 1);
                     const std::size_t other = std::size_t((code & 1) ? m.own[f] : m.nei[f]);
                     v = x[std::size_t(q) * nC + other];
-                } else v = xb[std::size_t(q) * nB + std::size_t(-code - 1)];
+                } else {
+                    v = xb[std::size_t(q) * nB + std::size_t(-code - 1)];
+                    if constexpr (Cpl) {
+                        const int a = m.bA[-code - 1];
+                        if (a >= 0) v = amiNbr(m, a, x + std::size_t(q) * nC);
+                    }
+                }
                 mx[q] = fmax(mx[q], v);
                 mn[q] = fmin(mn[q], v);
             }
@@ -319,6 +367,15 @@ __global__ void __launch_bounds__(256) kGrad(Mesh<R> m, const R* x, const R* xb,
     for (int i = 0; i < 3; ++i)
 #pragma unroll
         for (int q = 0; q < NC; ++q) G[std::size_t(i * NC + q) * nC + std::size_t(c)] = g[i][q];
+}
+
+// kGrad launched for mesh m (the Cpl instantiation when it has cyclicAMI faces).
+template <class R, int NC>
+inline void gradLaunch(const Mesh<R>& m, const R* x, const R* xb, int lim, R kLim, R* G)
+{
+    const unsigned gC = grid(std::size_t(m.nC));
+    if (m.nA) kGrad<R, NC, true><<<gC, kT>>>(m, x, xb, lim, kLim, G);
+    else kGrad<R, NC, false><<<gC, kT>>>(m, x, xb, lim, kLim, G);
 }
 
 template <class T>
@@ -395,15 +452,59 @@ struct CoupledState
     double r0 = -1;              // SER: the first probe
 };
 
+// pimpleFoam's state beside the SIMPLE one (gpu/fv_pimple.hip; null: a
+// simpleFoam case, no ddt kernel instantiation launches). The old-time fields
+// are the state at the start of the time step (GeometricField::oldTime()).
+// The Impl's FoamCase copy and RasState::co hold the CURRENT corrector's
+// solver / relaxation entries (the stage methods read them there); the case's
+// own two sets live here.
+// A moving mesh's state beside PimpleState (FoamCase::motion.on, mesh.dynamic();
+// null: a static mesh, none of its kernels launches). docs/fvpimple.md "Moving
+// mesh". phi is the RELATIVE flux between pEqn.H's end and the next
+// correctPhi / pEqn.H, absolute inside them.
+template <class R>
+struct MotionState
+{
+    DeviceBuffer<R> meshPhi, meshPhiB; // [nI] [nB] fvc::meshPhi of the current step
+    DeviceBuffer<R> Uf, UfB, UfOld, UfBOld; // [3 nI] [3 nB] the face velocity and its old-time value
+    DeviceBuffer<R> V0;                // [nC] mesh.V0(): the volumes before this step's motion
+    DeviceBuffer<R> phiAbs, phiAbsB;   // [nI] [nB] fvc::absolute(phi, U) for kOmegaSST's divU
+    DeviceBuffer<R> pc, pcB, zeroB;    // [nC] [nB] [nB] CorrectPhi's pcorr, its patch values, zeros (its fixed value)
+    DeviceBuffer<R> uWall;             // [3 nB] this step's Uwall() (host)
+    DeviceBuffer<fvd::u8> bMove, bPc;  // [nB] movingWallVelocity face; pcorr's patch type (0 fixedValue, 1 zeroGradient)
+    int pcRefCell = -1;                // pcorrEqn.setReference(0, 0): OpenFOAM cell 0 when pcorr needs a reference
+    bool limPc = false;                // grad(pcorr)
+    R kPc = 1;
+    long steps = 0;                    // time steps taken (the first one copies U.oldTime() AFTER the mesh update)
+    bool correctPhi = true, checkMeshCo = false;
+    FvSolverCtl solverPcorr, solverPcorrFinal;
+};
+
+template <class R>
+struct PimpleState
+{
+    std::unique_ptr<MotionState<R>> mov;          // null: static mesh
+    DeviceBuffer<R> Uold, UbOld, phiOld, phiBOld; // [3 nC] [3 nB] [nI] [nB]
+    std::array<DeviceBuffer<R>, 2> sOld;          // RAS scalars [nC]
+    DeviceBuffer<R> coPart;                       // [blocks] CourantNo.H's block maxima
+    FvSolverCtl solverU, solverUFinal, solverP, solverPFinal;
+    std::array<FvSolverCtl, 2> solverS, solverSFinal;         // RasState::s order
+    std::optional<double> relaxU, relaxUFinal, relaxP, relaxPFinal;
+    std::array<std::optional<double>, 2> relaxS, relaxSFinal;
+};
+
 // The precision-independent face of the solver state (DeviceSimple's).
 struct DeviceSimple::Impl
 {
     virtual ~Impl() = default;
+    virtual std::expected<FvCourant, std::string> courant(double deltaT) = 0;
+    virtual std::expected<FvStepLog, std::string> timeStep(double deltaT, const FvMovedMesh* moved) = 0;
     virtual std::expected<FvIterLog, std::string> iterate() = 0;
     virtual std::expected<FvIterLog, std::string> coupledIterate(const FvCoupledOpts& o) = 0;
-    virtual std::expected<FvForceSums, std::string> forces() = 0;
+    virtual std::expected<FvForceSums, std::string> forces(int k) = 0;
     virtual std::expected<FvState, std::string> state() const = 0;
     virtual int iteration() const = 0;
+    virtual void prepareMatrices(const FvSimpleSetup& s, const dns::la::CellGraph& g) = 0;
 };
 
 // The solver state in arithmetic R (double: the parity mode, bit for bit the
@@ -451,13 +552,137 @@ struct SimpleImpl final : DeviceSimple::Impl
     std::optional<la::Krylov<R>> kr, kr3; // kr3: bicgstabBatch of the U components
     std::unique_ptr<RasState<R>> ras; // null: laminar
     std::unique_ptr<CoupledState<R>> cp; // null: no coupled iteration yet
+    std::unique_ptr<PimpleState<R>> pim; // null: simpleFoam
+
+    // --- cyclicAMI (gpu/fv_ami.hip, docs/fvpimple.md "cyclicAMI"; m.nA == 0:
+    // null, none of it launches, the solver bit for bit). The patch kernels
+    // treat a coupled face as zeroGradient; each ami*() call below overwrites
+    // what they wrote there with OpenFOAM's coupled-patch expression.
+    struct AmiDev
+    {
+        DeviceBuffer<int> aB, bA, aStart, aCell, aEll, rCell, rStart, rA;
+        DeviceBuffer<R> aW, aWt, aK, aD;
+        // acU / acP [nB]: boundaryCoeffs of the U / p matrix on coupled faces
+        // (interfaceBouCoeffs; 0 elsewhere). ffcB [nB]: the p laplacian's
+        // faceFluxCorrection on coupled faces.
+        DeviceBuffer<R> acU, acP, ffcB;
+        // RAS scalars (gpu/fv_ras.hip): boundaryCoeffs and the explicit flux of
+        // the scalar being assembled, on coupled faces.
+        DeviceBuffer<R> acS, sfxB;
+    };
+    std::unique_ptr<AmiDev> amiD;
+    // (Re)uploads s.ami and points m at it. Error: allocation / upload.
+    std::expected<void, std::string> amiMake(const FvSimpleSetup& s);
+    // The matrices, GS, AMG and Krylov workspaces on graph g (make(); again
+    // after a mesh motion changed the AMI pattern). Error: theirs.
+    std::expected<void, std::string> makeMatrices(const FvSimpleSetup& s, const dns::la::CellGraph& g);
+    // makeMatrices' HOST part: the ELL pattern, the colours, the AMG hierarchy on
+    // the geometric weights. Pure (no device call, reads s and g only), so
+    // prepareMatrices may run it on another thread while the mesh update's wall
+    // distance is computed; makeMatrices takes a prepared one made on the SAME
+    // graph object and computes it itself otherwise -- one definition, the same
+    // values either way.
+    struct MatPrep
+    {
+        const dns::la::CellGraph* g = nullptr;
+        dns::la::EllPattern pat;
+        std::vector<std::uint8_t> colours;
+        std::expected<dns::la::AmgHierarchy, std::string> h;
+    };
+    std::optional<MatPrep> prep;
+    static MatPrep matPrepOf(const FvSimpleSetup& s, const dns::la::CellGraph& g);
+    void prepareMatrices(const FvSimpleSetup& s, const dns::la::CellGraph& g) override { prep.emplace(matPrepOf(s, g)); }
+    // evaluate(): xb = lerp(pnf, pif, w) on coupled faces, NC components. Async.
+    void amiEval(int nc, const R* x, R* xb);
+    // UEqn: internalCoeffs (ic), boundaryCoeffs (acU; bc = 0), the explicit
+    // boundary flux bfx on coupled faces; then the couplings into AU. Async.
+    void amiUBnd();
+    // fix (setValues: the omega wall cells): a fixed row's couplings are 0.
+    void amiOff(la::BlockEll<R>& A, const R* coef, bool negate, const fvd::u8* fix = nullptr);
+    // The couplings amiOff last assembled into AU / AP, and the row sum's share
+    // of the faces WITHOUT overlap (lduMatrix::sumA subtracts boundaryCoeffs
+    // whole; such a face has no assembled entry): added to rowSum (nComp
+    // component-major, mask) after A 1. No such face: nothing is written. Async.
+    struct AmiCpl
+    {
+        const R* coef = nullptr;
+        bool negate = false;
+        const fvd::u8* fix = nullptr;
+    };
+    AmiCpl cplU, cplP;
+    void amiSumA(const la::BlockEll<R>& A, int nComp, unsigned mask, R* rowSum);
+    // H(): bc = acU pnf(U) (addBoundarySource's coupled branch). phiHbyA on
+    // coupled faces = Sf & lerp(pnf, pif, w)(HbyA). Async.
+    void amiHsrc();
+    void amiPhiH();
+    // p | pcorr equation on coupled faces: pIc, acP, pBc = 0 (first) and ffcB
+    // from gamma rA and the field pv with gradient gp; phi_b = fHB - flux. Async.
+    void amiPBnd(const R* rA, const R* pv, const R* gp, bool first);
+    void amiPhiB(const R* fHB, const R* pv, R* out);
+
+    // gpu/fv_pimple.hip
+    std::expected<FvCourant, std::string> courant(double deltaT) override;
+    std::expected<FvStepLog, std::string> timeStep(double deltaT, const FvMovedMesh* moved) override;
+    // Allocates pim and takes the case's two control sets; with fc.motion.on the
+    // MotionState too (Uf = interpolate(U): createUfIfPresent.H). s: the setup
+    // make() uploaded. Error: allocation.
+    std::expected<void, std::string> pimpleMake(const FvSimpleSetup& s);
+    // pEqn.H: phiHbyA += interpolate(rAU) fvc::ddtCorr(U, phi, Uf): static mesh
+    // EulerDdtScheme::fvcDdtPhiCorr (phi.oldTime()), dynamic mesh fvcDdtUfCorr
+    // (Sf & Uf.oldTime() on the CURRENT Sf), both with ddtScheme::fvcDdtPhiCoeff,
+    // ddtPhiCoeff -1; internal and boundary faces. Called by prepP() right
+    // after flux(HbyA). Async.
+    void ddtCorr();
+    // --- moving mesh (pim->mov; gpu/fv_pimple.hip) ---
+    // mesh.update(): V0 = V, the moved geometry (and RAS wall distances), the
+    // mesh flux, then U.correctBoundaryConditions() with movingWallVelocity's
+    // Uwall(). Error: an upload's.
+    std::expected<void, std::string> meshUpdate(const FvMovedMesh& mv);
+    // pimpleFoam.C's correctPhi branch: phi = Sf & Uf, CorrectPhi (correctUphiBCs,
+    // the pcorr equation with its adjustPhi and non-orthogonal loop, phi -=
+    // pcorrEqn.flux()), continuityErrs.H into log.contCorr; phi is left ABSOLUTE.
+    // Error: adjustPhi's, a solver's.
+    std::expected<void, std::string> correctPhi(double deltaT, FvIterLog& log);
+    // fvc::makeRelative / makeAbsolute(f, U): f -+= meshPhi, internal and boundary. Async.
+    void relFlux(R* fI, R* fB, bool relative);
+    // fvc::correctUf(Uf, U, phi) with the ABSOLUTE phi. Async.
+    void correctUf();
+    // adjustPhi(f, U, p) on the internal / boundary flux f (p needs a reference).
+    // Error: "continuity error cannot be removed", a reduction's.
+    std::expected<void, std::string> adjustPhi(R* fI, R* fB);
+    // CourantNo.H / meshCourantNo.H of flux (f, fB) at deltaT. Error: a download's, non-finite.
+    std::expected<FvCourant, std::string> courantOf(const R* f, const R* fB, double deltaT);
+    // fvc::absolute(phi, U) of the current (relative) phi: phi itself on a static mesh.
+    const R* phiAbs() const { return pim && pim->mov ? pim->mov->phiAbs.data() : phi.data(); }
+    const R* phiAbsB() const { return pim && pim->mov ? pim->mov->phiAbsB.data() : phiB.data(); }
+    // fvm::ddt(X) of RAS scalar q onto the model's dAdd / sAdd (called by
+    // rasCorrect before each scalar's solve). Async.
+    void rasDdt(int q);
 
     std::expected<FvIterLog, std::string> iterate() override;
     // gpu/fv_coupled.hip
     std::expected<FvIterLog, std::string> coupledIterate(const FvCoupledOpts& o) override;
-    std::expected<FvForceSums, std::string> forces() override;
+    std::expected<FvForceSums, std::string> forces(int k) override;
     std::expected<FvState, std::string> state() const override;
     int iteration() const override { return iter; }
+
+    // fvOptions actuationDiskSource (docs/fv.md "fvOptions"): per disk the
+    // zone's cells and volume fractions on the device, the monitor cells, and
+    // this iteration's thrust T (evalDisks; rowsU subtracts it). Empty: no
+    // kernel launches, the solver bit for bit.
+    struct DiskDev
+    {
+        DeviceBuffer<int> cells;
+        DeviceBuffer<R> frac;
+        int n = 0;
+        std::vector<int> monitor;
+        double T = 0;
+    };
+    std::vector<DiskDev> disks;
+    // calcFroudeMethod's head: Uref (monitor mean of the current U), a, T per
+    // disk into disks[k].T and log.disks. Syncs (3 scalars per monitor cell).
+    // Error: a download's, a non-finite Uref.
+    std::expected<void, std::string> evalDisks(FvIterLog& log);
 
     // --- the stages of one SIMPLE iteration (iterate() is their composition,
     // in this order, bit for bit; the coupled prototype reuses them) ---

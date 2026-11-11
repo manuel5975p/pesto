@@ -6,8 +6,19 @@
 // parentheses (`div((nuEff*dev2(T(grad(U)))))` is ONE word), `(` opening a
 // value is a list, `//` and `/* */` are comments, `"..."` a string (a quoted
 // KEY is a regular expression in OpenFOAM: `"(U|e)"`). Directives (`#...`)
-// and `$` macros are kept as entries/tokens; the consumer accepts or rejects
-// them BY NAME -- this layer never expands anything.
+// are kept as entries; the consumer accepts or rejects them BY NAME.
+// `$name` / `${name}` macros are expanded while reading, as OpenFOAM does,
+// against the entries read SO FAR of the same dictionary, then of each
+// enclosing one (docs/fv.md "Macros"):
+//  - inside a value (primitiveEntry::expandVariable): the tokens of the
+//    LITERAL entry `name` (pattern keys do not match); a dictionary there is
+//    an error;
+//  - `$name;` as an entry (dictionary::substituteScopedKeyword): the entries
+//    of dictionary `name` (literal key, else the last matching pattern key)
+//    are added in place -- a later entry of the same key wins (find: the
+//    last); a sub-dictionary key already present is an error (OpenFOAM merges).
+// Every other form ($:a.b, $..a, $a.b, ${a:-b}, ${{expr}}, an environment
+// variable) is an error naming it.
 #pragma once
 
 #include <expected>
@@ -37,6 +48,7 @@ struct Entry
     std::string key;
     bool quotedKey = false;  // "..." key: an OpenFOAM regular expression
     bool directive = false;
+    bool referenced = false;    // a `$key` macro read this entry (a variable definition)
     std::shared_ptr<Dict> dict; // non-null for a sub-dictionary
     std::vector<Token> value;
     int line = 0;

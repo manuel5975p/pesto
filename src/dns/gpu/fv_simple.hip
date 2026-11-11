@@ -186,12 +186,19 @@ __global__ void __launch_bounds__(256) kUBnd(Mesh<R> m, Ctl<R> c, const R* U, co
 // Rows of the momentum matrix: negSumDiag, the off entries (ELL), the
 // explicit sources, bounded, MRF Coriolis, then fvMatrix::relax.
 // Multi: more than one MRF zone (Omega by zone index); single-zone and no-MRF
-// runs take the P5b instantiation.
-template <class R, bool Multi>
+// runs take the P5b instantiation. Ddt (pimpleFoam): fvm::ddt(U), Euler --
+// diag rDeltaT V, source (rDeltaT U_old) V0 -- before the relaxation; false is
+// the simpleFoam kernel bit for bit (Uold, V0 unread). V0: mesh.Vsc0(), the
+// volumes before the step's mesh motion (a static mesh: m.V itself).
+// Cpl (cyclicAMI; false: the kernel bit for bit, acU unread): on a coupled
+// face fvMatrix::relax adds the internal coefficient itself to D (component
+// 0, not the maximum magnitude), |boundaryCoeffs| (acU) to sumOff, and
+// removes the same coefficient after the division.
+template <class R, bool Multi, bool Ddt, bool Cpl = false>
 __global__ void __launch_bounds__(256) kURow(Mesh<R> m, Ctl<R> c, const R* U, const R* up, const R* lo,
                                              const R* fx, const R* phi, const R* phiB,
-                                             const R* ic, const R* bfx, R* off, R* dU,
-                                             R* sU)
+                                             const R* ic, const R* bfx, const R* Uold, const R* V0,
+                                             const R* acU, R* off, R* dU, R* sU)
 {
     const int cc = int(blockIdx.x) * kT + int(threadIdx.x);
     if (cc >= m.nC) return;
@@ -225,6 +232,14 @@ __global__ void __launch_bounds__(256) kURow(Mesh<R> m, Ctl<R> c, const R* U, co
 #pragma unroll
             for (int j = 0; j < 3; ++j) s[j] += bfx[std::size_t(j) * nB + b];
             const R x = ic[b], y = ic[nB + b], z = ic[2 * nB + b];
+            if constexpr (Cpl) {
+                if (m.bA[b] >= 0) {
+                    icMax += x;
+                    sumOff += fabs(acU[b]);
+                    icMin += x;
+                    continue;
+                }
+            }
             icMax += cmptMax3(fabs(x), fabs(y), fabs(z));
             icMin += cmptMin3(x, y, z);
         }
@@ -242,6 +257,12 @@ __global__ void __launch_bounds__(256) kURow(Mesh<R> m, Ctl<R> c, const R* U, co
                               om[0] * u[1] - om[1] * u[0]};
 #pragma unroll
         for (int j = 0; j < 3; ++j) s[j] -= V * cr[j];
+    }
+    if constexpr (Ddt) {
+        diag += c.rDeltaT * V;
+        const R Vold = V0[cc];
+#pragma unroll
+        for (int j = 0; j < 3; ++j) s[j] += (c.rDeltaT * Uold[std::size_t(j) * nC + std::size_t(cc)]) * Vold;
     }
     if (c.relaxU > 0) {
         const R D0 = diag;
@@ -268,6 +289,26 @@ __global__ void kUForce(Mesh<R> m, Ctl<R> c, R* sU)
     const std::size_t nC = std::size_t(m.nC);
 #pragma unroll
     for (int j = 0; j < 3; ++j) sU[std::size_t(j) * nC + std::size_t(cc)] += m.V[cc] * c.f[j];
+}
+
+// fvOptions actuationDiskSource (calcFroudeMethod): the fv::option's matrix
+// gets Usource[celli] += ((cellsV[celli] / V()) * T) * diskDir, and `UEqn ==
+// fvOptions(U)` subtracts that matrix's source from UEqn's. One thread per
+// zone cell (cellZones are disjoint: its own index only); the product keeps
+// its own rounding (no contraction into the subtraction). A pass of its own:
+// no disk, no launch.
+template <class R>
+__global__ void kUDisk(int n, int nC, const int* cells, const R* frac, R T, R dx, R dy, R dz, R* sU)
+{
+#pragma clang fp contract(off)
+    const int i = int(blockIdx.x) * kT + int(threadIdx.x);
+    if (i >= n) return;
+    const std::size_t c = std::size_t(cells[i]), N = std::size_t(nC);
+    const R x = frac[i] * T;
+    const R sx = x * dx, sy = x * dy, sz = x * dz;
+    sU[c] -= sx;
+    sU[N + c] -= sy;
+    sU[2 * N + c] -= sz;
 }
 
 // Component j's system for every j in mask: diag + boundary internalCoeffs,
@@ -470,6 +511,14 @@ __global__ void kAdjustTerms(Mesh<R> m, const R* phiHB, R* in, R* fixedOut, R* a
     adjOut[b] = (p >= 0 && m.bAdjust[b]) ? p : R(0.0);
 }
 
+// x = 0 on the cyclicAMI faces (x [nB]).
+template <class R>
+__global__ void kAmiZero(Mesh<R> m, R* x)
+{
+    const int a = int(blockIdx.x) * kT + int(threadIdx.x);
+    if (a < m.nA) x[m.aB[a]] = R(0.0);
+}
+
 template <class R>
 __global__ void kAdjustScale(Mesh<R> m, R corr, R* phiHB)
 {
@@ -601,9 +650,12 @@ __global__ void kPBnd(Mesh<R> m, const R* rAtU, const R* Ub, R* vfP, R* pIc, R* 
 // setReference, then the SPD system: Ad = -(diag + sum pIc), rhs = -(src + sum pBc).
 // Mat false (a later non-orthogonal corrector): rhs only -- off and Ad depend
 // on pUp and pIc alone, which the first corrector wrote.
-template <class R, bool Mat = true>
+// Cpl (cyclicAMI): the coupled faces' faceFluxCorrection ffcB [nB] (0 on the
+// other faces) joins fvc::div(faceFluxCorrection); false: the kernel bit for
+// bit, ffcB unread. The couplings' off entries are amiOff's.
+template <class R, bool Mat = true, bool Cpl = false>
 __global__ void kPRow(Mesh<R> m, const R* pUp, const R* ffc, const R* phiH, const R* phiHB,
-                      const R* pIc, const R* pBc, int refCell, R refValue, R* off, R* Ad,
+                      const R* pIc, const R* pBc, const R* ffcB, int refCell, R refValue, R* off, R* Ad,
                       R* rhs)
 {
     const int cc = int(blockIdx.x) * kT + int(threadIdx.x);
@@ -631,6 +683,7 @@ __global__ void kPRow(Mesh<R> m, const R* pUp, const R* ffc, const R* phiH, cons
             dphi += phiHB[b];
             bi += pIc[b];
             bs += pBc[b];
+            if constexpr (Cpl) dffc += ffcB[b];
         }
     }
     const R V = m.V[cc];
@@ -678,6 +731,34 @@ __global__ void kPhiB(Mesh<R> m, const R* phiHB, const R* pIc, const R* pBc, con
     const int b = int(blockIdx.x) * kT + int(threadIdx.x);
     if (b >= m.nB) return;
     phiB[b] = phiHB[b] - (pIc[b] * p[m.bOwn[b]] - pBc[b]);
+}
+
+// Moving mesh, pimpleFoam.C: phi = mesh.Sf() & Uf() (N faces, S and Uf component-major).
+template <class R>
+__global__ void kPhiUf(int N, const R* S, const R* Uf, R* phi)
+{
+    const int f = int(blockIdx.x) * kT + int(threadIdx.x);
+    if (f >= N) return;
+    const std::size_t n = std::size_t(N), ff = std::size_t(f);
+    R s = 0;
+#pragma unroll
+    for (int i = 0; i < 3; ++i) s += S[std::size_t(i) * n + ff] * Uf[std::size_t(i) * n + ff];
+    phi[f] = s;
+}
+
+// correctUphiBCs: on the U patches that fix their value, phi_b = U_b & Sf.
+template <class R>
+__global__ void kPhiFixedB(Mesh<R> m, const R* Ub, R* phiB)
+{
+    const int b = int(blockIdx.x) * kT + int(threadIdx.x);
+    if (b >= m.nB) return;
+    const u8 code = m.bU[b];
+    if (!(code == 0 || code == 2 || code == 4)) return;
+    const std::size_t nB = std::size_t(m.nB), bb = std::size_t(b);
+    R s = 0;
+#pragma unroll
+    for (int i = 0; i < 3; ++i) s += Ub[std::size_t(i) * nB + bb] * m.bS[std::size_t(i) * nB + bb];
+    phiB[b] = s;
 }
 
 // continuityErrs: V |div phi| and V div phi per cell.
@@ -761,12 +842,12 @@ __global__ void kFill(std::size_t n, R v, R* x)
 template <class R, bool Turb>
 __global__ void kForces(Mesh<R> m, R nu, R rho, R pRef, const R* cofr, const R* U,
                         const R* Ub, const R* G, const R* pb, const R* vfU, const R* nuB,
-                        R* out)
+                        R* out, u8 bit)
 {
     const int b = int(blockIdx.x) * kT + int(threadIdx.x);
     if (b >= m.nB) return;
     const std::size_t nB = std::size_t(m.nB), bb = std::size_t(b);
-    if (!m.bForce[b]) {
+    if (!(m.bForce[b] & bit)) { // bit: the forces object (FvSimpleSetup::bForce)
 #pragma unroll
         for (int k = 0; k < 12; ++k) out[std::size_t(k) * nB + bb] = 0;
         return;
@@ -851,7 +932,10 @@ std::expected<FvSolveLog, std::string> SimpleImpl<R>::solve(la::BlockEll<R>& A, 
 {
     const std::size_t N = std::size_t(m.nC);
     if (factor) factor->factorDeferred(kr->preFlag(), offChanged);
-    if (!sumAValid) A.spmv(ones.data(), sumA.data());
+    if (!sumAValid) {
+        A.spmv(ones.data(), sumA.data());
+        if (m.nA) amiSumA(A, 1, 1u, sumA.data());
+    }
     A.spmv(xv, Ax.data());
     // xRef = sum(x) / N on the device (the sums() pair form), then the
     // normFactor terms; their sum rides the Krylov solve's first batch.
@@ -886,6 +970,7 @@ std::expected<void, std::string> SimpleImpl<R>::solveU(unsigned mask, FvIterLog&
     // kURow wrote AU's off-diagonals this iteration: the private GS copy re-gathers
     if (auto f = gsU->factorMulti(3, mask, diag3.data(), fl, true); !f) return std::unexpected("fv: U: " + f.error());
     AU->spmvMulti(3, mask, diag3.data(), ones.data(), 0, sumA3.data());
+    if (m.nA) amiSumA(*AU, 3, mask, sumA3.data());
     AU->spmvMulti(3, mask, diag3.data(), U.data(), N, Ax3.data());
     la::internal::DotArgs<R> d{};
     for (int j = 0; j < 3; ++j) {
@@ -919,6 +1004,65 @@ std::expected<void, std::string> SimpleImpl<R>::solveU(unsigned mask, FvIterLog&
     return {};
 }
 
+// Matrices, solvers, AMG (hierarchy on the geometric weights |S| dcNO; a
+// cyclicAMI coupling's weight is its face's |S| dcNO times the AMI weight).
+template <class R>
+typename SimpleImpl<R>::MatPrep SimpleImpl<R>::matPrepOf(const FvSimpleSetup& s, const dns::la::CellGraph& g)
+{
+    const std::size_t nI = std::size_t(s.nI);
+    std::vector<double> wts(g.col.size(), 0.0);
+    for (std::size_t f = 0; f < nI; ++f) {
+        const double a = s.magS[f] * s.dc[f];
+        wts[std::size_t(g.ownSlot[f])] += a;
+        wts[std::size_t(g.neiSlot[f])] += a;
+    }
+    for (int a = 0; a < s.ami.nA; ++a) {
+        const std::size_t b = std::size_t(s.ami.aB[std::size_t(a)]);
+        for (int j = s.ami.aStart[std::size_t(a)]; j < s.ami.aStart[std::size_t(a) + 1]; ++j)
+            wts[std::size_t(s.ami.aSlot[std::size_t(j)])] += s.bMagS[b] * s.bDc[b] * s.ami.aW[std::size_t(j)];
+    }
+    return MatPrep{&g, dns::la::ellPattern(g), dns::la::greedyColour(g),
+                   dns::la::amgHierarchy(g, wts, 1, dns::la::AmgSetup{})};
+}
+
+template <class R>
+std::expected<void, std::string> SimpleImpl<R>::makeMatrices(const FvSimpleSetup& s, const dns::la::CellGraph& g)
+{
+    SimpleImpl<R>& I = *this;
+    I.amg.reset(); // they hold references into AU / AP
+    I.gsU.reset();
+    // the host part: prepared during the mesh update (prepareMatrices, on this graph object), or here
+    const MatPrep mp = I.prep && I.prep->g == &g ? std::move(*I.prep) : matPrepOf(s, g);
+    I.prep.reset();
+    const auto& pat = mp.pat;
+    const auto shape = dns::la::denseShape(1);
+    if (!shape) return std::unexpected(shape.error());
+    auto au = la::BlockEll<R>::make(pat, *shape);
+    if (!au) return std::unexpected(au.error());
+    I.AU.emplace(std::move(*au));
+    auto ap = la::BlockEll<R>::make(pat, *shape);
+    if (!ap) return std::unexpected(ap.error());
+    I.AP.emplace(std::move(*ap));
+    const auto& colours = mp.colours;
+    auto gs = la::MultiColourGS<R>::make(*I.AU, colours);
+    if (!gs) return std::unexpected(gs.error());
+    I.gsU.emplace(std::move(*gs));
+    const auto& h = mp.h;
+    if (!h) return std::unexpected("fv: AMG setup: " + h.error());
+    // p: scaled-V cycle (OpenFOAM GAMG's scaleCorrection) with 2 damped
+    // Jacobi sweeps per level. Measured on the 708k-cell F1 prop (50 SIMPLE
+    // iterations, relTol 0.01): 34.9 ms/iteration vs 45.2 for the gpu/la
+    // default (K-cycle, MC-GS level 0), 54.1 for a plain V-cycle.
+    la::AmgOptions ao;
+    ao.smoother = la::AmgSmoother::Jacobi;
+    ao.sweeps = 2;
+    ao.inner = 1;
+    auto amg = la::Amg<R>::make(*I.AP, *h, ao);
+    if (!amg) return std::unexpected("fv: AMG: " + amg.error());
+    I.amg.emplace(std::move(*amg));
+    return {};
+}
+
 DeviceSimple::DeviceSimple() = default;
 DeviceSimple::DeviceSimple(DeviceSimple&&) noexcept = default;
 DeviceSimple& DeviceSimple::operator=(DeviceSimple&&) noexcept = default;
@@ -926,11 +1070,17 @@ DeviceSimple::~DeviceSimple() = default;
 
 int DeviceSimple::iteration() const { return p_->iteration(); }
 std::expected<FvIterLog, std::string> DeviceSimple::iterate() { return p_->iterate(); }
+std::expected<FvCourant, std::string> DeviceSimple::courant(double deltaT) { return p_->courant(deltaT); }
+std::expected<FvStepLog, std::string> DeviceSimple::timeStep(double deltaT, const FvMovedMesh* moved)
+{
+    return p_->timeStep(deltaT, moved);
+}
+void DeviceSimple::prepareMatrices(const FvSimpleSetup& s, const dns::la::CellGraph& g) { p_->prepareMatrices(s, g); }
 std::expected<FvIterLog, std::string> DeviceSimple::coupledIterate(const FvCoupledOpts& o)
 {
     return p_->coupledIterate(o);
 }
-std::expected<FvForceSums, std::string> DeviceSimple::forces() { return p_->forces(); }
+std::expected<FvForceSums, std::string> DeviceSimple::forces(int k) { return p_->forces(k); }
 std::expected<FvState, std::string> DeviceSimple::state() const { return p_->state(); }
 
 namespace {
@@ -992,7 +1142,16 @@ std::expected<void, std::string> makeImpl(SimpleImpl<R>& I, const FvSimpleSetup&
     FV_ZERO(I.tmp, R, 12 * nMax) FV_ZERO(I.ones, R, nMax)
     FV_ZERO(I.part, double, std::size_t(la::internal::kMaxDotBatch) * std::size_t(la::internal::dotParts(nMax)))
     FV_ZERO(I.outv, double, std::size_t(la::internal::kMaxDotBatch))
-    FV_ZERO(I.cofrD, R, 3)
+    FV_ZERO(I.cofrD, R, 3 * std::max<std::size_t>(1, fc.forces.size()))
+    if (fc.disks.size() != s.disks.size())
+        return std::unexpected("fv: the case has actuationDiskSource entries the setup does not (buildDiskSetup)");
+    for (std::size_t k = 0; k < s.disks.size(); ++k) {
+        typename SimpleImpl<R>::DiskDev d;
+        FV_UP(d.cells, s.disks[k].cells) FV_UPR(d.frac, s.disks[k].frac)
+        d.n = int(s.disks[k].cells.size());
+        d.monitor = s.disks[k].monitor;
+        I.disks.push_back(std::move(d));
+    }
 #undef FV_UP
 #undef FV_UPR
 #undef FV_ZERO
@@ -1071,46 +1230,19 @@ std::expected<void, std::string> makeImpl(SimpleImpl<R>& I, const FvSimpleSetup&
         if (s.bMrf[b] == 1 && s.bU[b] != 0) I.mrfStatic = false; // kMrfBoundary would overwrite a moving Ub
     I.nSolve = 3;
     for (double v : s.V) I.sumV += v;
-    if (fc.forces) {
-        I.cofr = fc.forces->CofR;
-        const R cr[3] = {R(I.cofr[0]), R(I.cofr[1]), R(I.cofr[2])};
-        if (auto e = hipMemcpy(I.cofrD.data(), cr, 3 * sizeof(R), hipMemcpyHostToDevice); e != hipSuccess)
+    if (!fc.forces.empty()) {
+        I.cofr = fc.forces[0].CofR;
+        std::vector<R> cr;
+        for (const FvForces& f : fc.forces)
+            for (const double x : f.CofR) cr.push_back(R(x));
+        if (auto e = hipMemcpy(I.cofrD.data(), cr.data(), cr.size() * sizeof(R), hipMemcpyHostToDevice);
+            e != hipSuccess)
             return std::unexpected(std::string("fv: upload CofR: ") + hipGetErrorString(e));
     }
 
-    // Matrices, solvers, AMG (hierarchy on the geometric weights |S| dcNO).
-    const auto pat = dns::la::ellPattern(g);
-    const auto shape = dns::la::denseShape(1);
-    if (!shape) return std::unexpected(shape.error());
-    auto au = la::BlockEll<R>::make(pat, *shape);
-    if (!au) return std::unexpected(au.error());
-    I.AU.emplace(std::move(*au));
-    auto ap = la::BlockEll<R>::make(pat, *shape);
-    if (!ap) return std::unexpected(ap.error());
-    I.AP.emplace(std::move(*ap));
-    const auto colours = dns::la::greedyColour(g);
-    auto gs = la::MultiColourGS<R>::make(*I.AU, colours);
-    if (!gs) return std::unexpected(gs.error());
-    I.gsU.emplace(std::move(*gs));
-    std::vector<double> wts(g.col.size(), 0.0);
-    for (std::size_t f = 0; f < nI; ++f) {
-        const double a = s.magS[f] * s.dc[f];
-        wts[std::size_t(g.ownSlot[f])] += a;
-        wts[std::size_t(g.neiSlot[f])] += a;
-    }
-    auto h = dns::la::amgHierarchy(g, wts, 1, dns::la::AmgSetup{});
-    if (!h) return std::unexpected("fv: AMG setup: " + h.error());
-    // p: scaled-V cycle (OpenFOAM GAMG's scaleCorrection) with 2 damped
-    // Jacobi sweeps per level. Measured on the 708k-cell F1 prop (50 SIMPLE
-    // iterations, relTol 0.01): 34.9 ms/iteration vs 45.2 for the gpu/la
-    // default (K-cycle, MC-GS level 0), 54.1 for a plain V-cycle.
-    la::AmgOptions ao;
-    ao.smoother = la::AmgSmoother::Jacobi;
-    ao.sweeps = 2;
-    ao.inner = 1;
-    auto amg = la::Amg<R>::make(*I.AP, *h, ao);
-    if (!amg) return std::unexpected("fv: AMG: " + amg.error());
-    I.amg.emplace(std::move(*amg));
+    if (s.ami.nA)
+        if (auto r = I.amiMake(s); !r) return std::unexpected(r.error());
+    if (auto r = I.makeMatrices(s, g); !r) return std::unexpected(r.error());
     auto kr = la::Krylov<R>::make(nC, 0);
     if (!kr) return std::unexpected(kr.error());
     I.kr.emplace(std::move(*kr));
@@ -1118,7 +1250,10 @@ std::expected<void, std::string> makeImpl(SimpleImpl<R>& I, const FvSimpleSetup&
     if (!kr3) return std::unexpected(kr3.error());
     I.kr3.emplace(std::move(*kr3));
 
-    // createPhi: phi = flux(U) (linear interpolation; boundary U_b . S).
+    // createPhi: phi = flux(U) (linear interpolation; boundary U_b . S; a
+    // cyclicAMI face's U_b is the coupled interpolation).
+    if (m.nA) I.amiEval(3, I.U.data(), I.Ub.data());
+    if (m.nA) I.amiEval(1, I.p.data(), I.pb.data());
     kPhiH<R, false><<<grid(nI), kT>>>(m, Ctl<R>{}, I.U.data(), I.phi.data());
     kPhiHB<R><<<grid(nB), kT>>>(m, Ctl<R>{}, I.U.data(), I.Hc.data(), I.rAU.data(), I.Ub.data(), 1, I.phiB.data());
     if (auto e = hipDeviceSynchronize(); e != hipSuccess)
@@ -1127,6 +1262,8 @@ std::expected<void, std::string> makeImpl(SimpleImpl<R>& I, const FvSimpleSetup&
         return std::unexpected(std::string("fv: init: ") + hipGetErrorString(e));
     if (s.ras.model != FvTurbModel::Laminar)
         if (auto r = rasMake(I, s, fc); !r) return std::unexpected(r.error());
+    if (fc.pimple.on)
+        if (auto r = I.pimpleMake(s); !r) return std::unexpected(r.error());
     return {};
 }
 
@@ -1159,8 +1296,8 @@ void SimpleImpl<R>::assembleU()
     if (c.mrf) kMrfBoundary<R><<<gB, kT>>>(m, I.Ub.data());
     // G and gP of unchanged (U, Ub) and (p, pb) from the previous iteration's
     // forces() / rasCorrect and final corrector: the same kernel on the same inputs.
-    if (!(I.gValid && I.mrfStatic)) kGrad<R, 3><<<gC, kT>>>(m, I.U.data(), I.Ub.data(), c.limU, c.kU, I.G.data());
-    if (!I.gPValid) kGrad<R, 1><<<gC, kT>>>(m, I.p.data(), I.pb.data(), c.limP, c.kP, I.gP.data());
+    if (!(I.gValid && I.mrfStatic)) gradLaunch<R, 3>(m, I.U.data(), I.Ub.data(), c.limU, c.kU, I.G.data());
+    if (!I.gPValid) gradLaunch<R, 1>(m, I.p.data(), I.pb.data(), c.limP, c.kP, I.gP.data());
     I.gValid = I.gPValid = false; // U, Ub, p, pb change below
     const R* nuC = I.ras ? I.ras->nuEff.data() : nullptr;
     if (I.ras) {
@@ -1184,15 +1321,62 @@ void SimpleImpl<R>::boundaryU()
     else
         kUBnd<R, false><<<gB, kT>>>(m, c, U.data(), Ub.data(), G.data(), phiB.data(), nullptr, vfU.data(), ic.data(),
                                     bc.data(), bfx.data());
+    if (m.nA) amiUBnd();
 }
 
 template <class R>
 void SimpleImpl<R>::rowsU()
 {
-    (multiZone ? kURow<R, true> : kURow<R, false>)<<<grid(std::size_t(m.nC)), kT>>>(
-        m, c, U.data(), up.data(), lo.data(), fx.data(), phi.data(), phiB.data(), ic.data(), bfx.data(), AU->off(),
-        dU.data(), sU.data());
+    if (m.nA) { // cyclicAMI (pimpleFoam, no MRF): fvMatrix::relax's coupled branch, then the couplings
+        kURow<R, false, true, true><<<grid(std::size_t(m.nC)), kT>>>(
+            m, c, U.data(), up.data(), lo.data(), fx.data(), phi.data(), phiB.data(), ic.data(), bfx.data(),
+            pim->Uold.data(), pim->mov ? pim->mov->V0.data() : m.V, amiD->acU.data(), AU->off(), dU.data(), sU.data());
+        amiOff(*AU, amiD->acU.data(), true);
+    } else if (pim) // pimpleFoam: + fvm::ddt(U)
+        (multiZone ? kURow<R, true, true> : kURow<R, false, true>)<<<grid(std::size_t(m.nC)), kT>>>(
+            m, c, U.data(), up.data(), lo.data(), fx.data(), phi.data(), phiB.data(), ic.data(), bfx.data(),
+            pim->Uold.data(), pim->mov ? pim->mov->V0.data() : m.V, nullptr, AU->off(), dU.data(), sU.data());
+    else
+        (multiZone ? kURow<R, true, false> : kURow<R, false, false>)<<<grid(std::size_t(m.nC)), kT>>>(
+            m, c, U.data(), up.data(), lo.data(), fx.data(), phi.data(), phiB.data(), ic.data(), bfx.data(), nullptr,
+            nullptr, nullptr, AU->off(), dU.data(), sU.data());
     if (c.force) kUForce<R><<<grid(std::size_t(m.nC)), kT>>>(m, c, sU.data());
+    for (std::size_t k = 0; k < disks.size(); ++k) {
+        const FvVec3& dir = fc.disks[k].dir;
+        kUDisk<R><<<grid(std::size_t(disks[k].n)), kT>>>(disks[k].n, m.nC, disks[k].cells.data(), disks[k].frac.data(),
+                                                          R(disks[k].T), R(dir[0]), R(dir[1]), R(dir[2]), sU.data());
+    }
+}
+
+template <class R>
+std::expected<void, std::string> SimpleImpl<R>::evalDisks(FvIterLog& log)
+{
+#pragma clang fp contract(off) // OpenFOAM's operands, each product its own rounding
+    const std::size_t nC = std::size_t(m.nC);
+    for (std::size_t k = 0; k < disks.size(); ++k) {
+        const FvDisk& dk = fc.disks[k];
+        // Uref: the monitor cells' U summed in ascending cell order, / their count
+        std::array<double, 3> Uref{};
+        for (const int cell : disks[k].monitor)
+            for (std::size_t j = 0; j < 3; ++j) {
+                R v{};
+                if (auto e = hipMemcpy(&v, U.data() + j * nC + std::size_t(cell), sizeof(R), hipMemcpyDeviceToHost);
+                    e != hipSuccess)
+                    return std::unexpected(std::string("fv: actuationDiskSource monitor: ") + hipGetErrorString(e));
+                Uref[j] += double(v);
+            }
+        const double nMon = double(disks[k].monitor.size());
+        for (double& x : Uref) x /= nMon;
+        if (!std::isfinite(Uref[0] + Uref[1] + Uref[2]))
+            return std::unexpected("fv: actuationDiskSource '" + dk.name + "': non-finite monitored velocity");
+        const double rhoRef = 1.0; // geometricOneField (incompressible)
+        const double ud = Uref[0] * dk.dir[0] + Uref[1] * dk.dir[1] + Uref[2] * dk.dir[2];
+        const double a = 1.0 - dk.Cp / dk.Ct;
+        const double T = 2.0 * rhoRef * dk.diskArea * (ud * ud) * a * (1 - a);
+        disks[k].T = T;
+        log.disks.push_back(FvDiskLog{Uref, dk.Cp, dk.Ct, a, T});
+    }
+    return {};
 }
 
 template <class R>
@@ -1206,12 +1390,14 @@ template <class R>
 void SimpleImpl<R>::evalU(int update)
 {
     kUEval<R><<<grid(std::size_t(m.nB)), kT>>>(m, U.data(), Ub.data(), phiB.data(), vfU.data(), update);
+    if (m.nA) amiEval(3, U.data(), Ub.data());
 }
 
 template <class R>
 void SimpleImpl<R>::evalP()
 {
     kPEval<R><<<grid(std::size_t(m.nB)), kT>>>(m, p.data(), pb.data(), vfP.data());
+    if (m.nA) amiEval(1, p.data(), pb.data());
 }
 
 template <class R>
@@ -1222,35 +1408,20 @@ std::expected<void, std::string> SimpleImpl<R>::prepP()
     const Ctl<R>& c = I.c;
     const std::size_t nC = std::size_t(m.nC), nI = std::size_t(m.nI), nB = std::size_t(m.nB);
     const unsigned gC = grid(nC), gI = grid(nI), gB = grid(nB);
+    if (m.nA) I.amiHsrc(); // H(): the coupled faces' boundaryCoeffs x patchNeighbourField of the current U
     kRAU<R><<<gC, kT>>>(m, c, I.U.data(), I.dU.data(), I.up.data(), I.lo.data(), I.sU.data(), I.ic.data(),
                         I.bc.data(), I.rAU.data(), I.rAtU.data(), I.Hc.data(), I.HbyA.data());
     (c.mrfTwo ? kPhiH<R, true> : kPhiH<R, false>)<<<gI, kT>>>(m, c, I.HbyA.data(), I.phiH.data());
     kPhiHB<R><<<gB, kT>>>(m, c, I.HbyA.data(), I.Hc.data(), I.rAU.data(), I.Ub.data(), 0, I.phiHB.data());
-    if (I.needRef) { // adjustPhi
-        R* in = I.tmp.data();
-        R* fo = in + nB;
-        R* ao = fo + nB;
-        kAdjustTerms<R><<<gB, kT>>>(m, I.phiHB.data(), in, fo, ao);
-        const R* a3[3] = {in, fo, ao};
-        const bool n3[3] = {false, false, false};
-        auto sb = I.sums(nB, a3, n3);
-        if (!sb) return std::unexpected(sb.error());
-        // totalFlux = VSMALL + sum(mag(phi)): GeometricField sum = INTERNAL faces only (adjustPhi.C).
-        const R* ai[1] = {I.phiH.data()};
-        const bool yes[1] = {true};
-        auto ti = I.sums(nI, ai, yes);
-        if (!ti) return std::unexpected(ti.error());
-        const double massIn = (*sb)[0], fixedOut = (*sb)[1], adjOut = (*sb)[2];
-        const double totalFlux = 1e-300 + (*ti)[0];
-        double corr = 1.0;
-        if (std::abs(adjOut) > 1e-300 && std::abs(adjOut) / totalFlux > 1e-15)
-            corr = (massIn - fixedOut) / adjOut;
-        else if (std::abs(fixedOut - massIn) / totalFlux > 1e-8)
-            return std::unexpected(std::format("fv: adjustPhi: continuity error cannot be removed by adjusting the "
-                                               "outflow (total flux {:g}, specified inflow {:g}, specified outflow "
-                                               "{:g}, adjustable outflow {:g})",
-                                               totalFlux, massIn, fixedOut, adjOut));
-        if (corr != 1.0) kAdjustScale<R><<<gB, kT>>>(m, R(corr), I.phiHB.data());
+    if (I.pim) I.ddtCorr(); // pimpleFoam: phiHbyA += interpolate(rAU) fvc::ddtCorr(U, phi, Uf)
+    // cyclicAMI: flux(HbyA) of the coupled interpolation; ddtCouplingCoeff is 0 there
+    if (m.nA) I.amiPhiH();
+    if (I.needRef) {
+        // moving mesh: fvc::makeRelative(phiHbyA, U); adjustPhi; fvc::makeAbsolute(phiHbyA, U)
+        const bool moving = I.pim && I.pim->mov;
+        if (moving) I.relFlux(I.phiH.data(), I.phiHB.data(), true);
+        if (auto r = I.adjustPhi(I.phiH.data(), I.phiHB.data()); !r) return r;
+        if (moving) I.relFlux(I.phiH.data(), I.phiHB.data(), false);
     }
     if (c.consistent) {
         (c.snLim >= 0 ? kConsistentF<R, true> : kConsistentF<R, false>)<<<gI, kT>>>(m, c, I.rAU.data(), I.rAtU.data(), I.p.data(), I.gP.data(), I.phiH.data());
@@ -1258,6 +1429,43 @@ std::expected<void, std::string> SimpleImpl<R>::prepP()
                                     I.phiHB.data());
         kConsistentC<R><<<gC, kT>>>(m, I.rAU.data(), I.rAtU.data(), I.gP.data(), I.HbyA.data());
     }
+    return {};
+}
+
+template <class R>
+std::expected<void, std::string> SimpleImpl<R>::adjustPhi(R* fI, R* fB)
+{
+    SimpleImpl<R>& I = *this;
+    const std::size_t nI = std::size_t(m.nI), nB = std::size_t(m.nB);
+    const unsigned gB = grid(nB);
+    R* in = I.tmp.data();
+    R* fo = in + nB;
+    R* ao = fo + nB;
+    kAdjustTerms<R><<<gB, kT>>>(m, fB, in, fo, ao);
+    if (m.nA) { // adjustPhi skips coupled patches
+        const R* fz[3] = {in, fo, ao};
+        for (const R* z : fz) kAmiZero<R><<<grid(std::size_t(m.nA)), kT>>>(m, const_cast<R*>(z));
+    }
+    const R* a3[3] = {in, fo, ao};
+    const bool n3[3] = {false, false, false};
+    auto sb = I.sums(nB, a3, n3);
+    if (!sb) return std::unexpected(sb.error());
+    // totalFlux = VSMALL + sum(mag(phi)): GeometricField sum = INTERNAL faces only (adjustPhi.C).
+    const R* ai[1] = {fI};
+    const bool yes[1] = {true};
+    auto ti = I.sums(nI, ai, yes);
+    if (!ti) return std::unexpected(ti.error());
+    const double massIn = (*sb)[0], fixedOut = (*sb)[1], adjOut = (*sb)[2];
+    const double totalFlux = 1e-300 + (*ti)[0];
+    double corr = 1.0;
+    if (std::abs(adjOut) > 1e-300 && std::abs(adjOut) / totalFlux > 1e-15)
+        corr = (massIn - fixedOut) / adjOut;
+    else if (std::abs(fixedOut - massIn) / totalFlux > 1e-8)
+        return std::unexpected(std::format("fv: adjustPhi: continuity error cannot be removed by adjusting the "
+                                           "outflow (total flux {:g}, specified inflow {:g}, specified outflow "
+                                           "{:g}, adjustable outflow {:g})",
+                                           totalFlux, massIn, fixedOut, adjOut));
+    if (corr != 1.0) kAdjustScale<R><<<gB, kT>>>(m, R(corr), fB);
     return {};
 }
 
@@ -1270,16 +1478,22 @@ void SimpleImpl<R>::assembleP(int nc)
     const unsigned gC = grid(std::size_t(m.nC)), gI = grid(std::size_t(m.nI)), gB = grid(std::size_t(m.nB));
     // A later corrector re-forms ffc and the source only: the matrix (pUp,
     // pIc, off, Ad), vfP / pBc (rAtU, Ub) and sumA are the first's, bit for bit.
+    const R* ffcB = m.nA ? I.amiD->ffcB.data() : nullptr;
     if (nc > 0) {
-        kGrad<R, 1><<<gC, kT>>>(m, I.p.data(), I.pb.data(), c.limP, c.kP, I.gP.data());
+        gradLaunch<R, 1>(m, I.p.data(), I.pb.data(), c.limP, c.kP, I.gP.data());
         (c.lapLim >= 0 ? kPFace<R, true, false> : kPFace<R, false, false>)<<<gI, kT>>>(m, c, I.rAtU.data(), I.p.data(), I.gP.data(), I.pUp.data(), I.ffc.data());
-        kPRow<R, false><<<gC, kT>>>(m, I.pUp.data(), I.ffc.data(), I.phiH.data(), I.phiHB.data(), I.pIc.data(), I.pBc.data(),
-                                    I.needRef ? I.refCell : -1, R(I.refValue), I.AP->off(), I.AP->diag(), I.rhs.data());
+        if (m.nA) I.amiPBnd(I.rAtU.data(), I.p.data(), I.gP.data(), false);
+        (m.nA ? kPRow<R, false, true> : kPRow<R, false, false>)<<<gC, kT>>>(
+            m, I.pUp.data(), I.ffc.data(), I.phiH.data(), I.phiHB.data(), I.pIc.data(), I.pBc.data(), ffcB,
+            I.needRef ? I.refCell : -1, R(I.refValue), I.AP->off(), I.AP->diag(), I.rhs.data());
     } else {
         (c.lapLim >= 0 ? kPFace<R, true> : kPFace<R, false>)<<<gI, kT>>>(m, c, I.rAtU.data(), I.p.data(), I.gP.data(), I.pUp.data(), I.ffc.data());
         kPBnd<R><<<gB, kT>>>(m, I.rAtU.data(), I.Ub.data(), I.vfP.data(), I.pIc.data(), I.pBc.data());
-        kPRow<R><<<gC, kT>>>(m, I.pUp.data(), I.ffc.data(), I.phiH.data(), I.phiHB.data(), I.pIc.data(), I.pBc.data(),
-                             I.needRef ? I.refCell : -1, R(I.refValue), I.AP->off(), I.AP->diag(), I.rhs.data());
+        if (m.nA) I.amiPBnd(I.rAtU.data(), I.p.data(), I.gP.data(), true);
+        (m.nA ? kPRow<R, true, true> : kPRow<R, true, false>)<<<gC, kT>>>(
+            m, I.pUp.data(), I.ffc.data(), I.phiH.data(), I.phiHB.data(), I.pIc.data(), I.pBc.data(), ffcB,
+            I.needRef ? I.refCell : -1, R(I.refValue), I.AP->off(), I.AP->diag(), I.rhs.data());
+        if (m.nA) I.amiOff(*I.AP, I.amiD->acP.data(), false);
     }
 }
 
@@ -1291,6 +1505,7 @@ std::expected<void, std::string> SimpleImpl<R>::fluxes(FvIterLog& log)
     const std::size_t nC = std::size_t(m.nC);
     kPhi<R><<<grid(std::size_t(m.nI)), kT>>>(m, I.phiH.data(), I.pUp.data(), I.ffc.data(), I.p.data(), I.phi.data());
     kPhiB<R><<<grid(std::size_t(m.nB)), kT>>>(m, I.phiHB.data(), I.pIc.data(), I.pBc.data(), I.p.data(), I.phiB.data());
+    if (m.nA) I.amiPhiB(I.phiHB.data(), I.p.data(), I.phiB.data());
     R* a = I.tmp.data();
     R* g = a + nC;
     kContErr<R><<<grid(nC), kT>>>(m, I.phi.data(), I.phiB.data(), a, g);
@@ -1315,10 +1530,96 @@ void SimpleImpl<R>::correctU()
         kRelax<R><<<gC, kT>>>(int(nC), R(I.relaxP), I.pPrev.data(), I.p.data());
         kRelax<R><<<gB, kT>>>(int(nB), R(I.relaxP), I.pbPrev.data(), I.pb.data());
     }
-    kGrad<R, 1><<<gC, kT>>>(m, I.p.data(), I.pb.data(), c.limP, c.kP, I.gP.data());
+    gradLaunch<R, 1>(m, I.p.data(), I.pb.data(), c.limP, c.kP, I.gP.data());
     kUCorr<R><<<gC, kT>>>(m, I.HbyA.data(), I.rAtU.data(), I.gP.data(), I.U.data());
     kUEval<R><<<gB, kT>>>(m, I.U.data(), I.Ub.data(), I.phiB.data(), I.vfU.data(), 1);
+    if (m.nA) I.amiEval(3, I.U.data(), I.Ub.data());
     I.gPValid = true; // p, pb final for this iteration
+}
+
+// pimpleFoam.C on a changed mesh with correctPhi (docs/fvpimple.md "Moving
+// mesh"): phi = mesh.Sf() & Uf(); CorrectPhi(U, phi, p, rAUf = 1, divU = 0,
+// pimple); continuityErrs.H. The pcorr equation is the p equation's kernels on
+// rAUf = 1 (ones: l (1 - 1) + 1 = 1 exactly) with pcorr's patch types.
+template <class R>
+std::expected<void, std::string> SimpleImpl<R>::correctPhi(double deltaT, FvIterLog& log)
+{
+    SimpleImpl<R>& I = *this;
+    MotionState<R>& M = *I.pim->mov;
+    const std::size_t nC = std::size_t(m.nC), nI = std::size_t(m.nI), nB = std::size_t(m.nB);
+    const unsigned gC = grid(nC), gI = grid(nI), gB = grid(nB);
+    kPhiUf<R><<<gI, kT>>>(int(nI), m.S, M.Uf.data(), I.phi.data());
+    kPhiUf<R><<<gB, kT>>>(int(nB), m.bS, M.UfB.data(), I.phiB.data());
+    // correctUphiBCs(U, phi): the fixesValue patches evaluate (a mixed patch's
+    // updateCoeffs reads this phi), then phi_b = U_b & Sf there.
+    I.evalU(1);
+    kPhiFixedB<R><<<gB, kT>>>(m, I.Ub.data(), I.phiB.data());
+    // volScalarField pcorr("pcorr", ..., 0, pcorrTypes)
+    (void)hipMemsetAsync(M.pc.data(), 0, nC * sizeof(R), 0);
+    (void)hipMemsetAsync(M.pcB.data(), 0, std::max<std::size_t>(1, nB) * sizeof(R), 0);
+    Mesh<R> mc = m;
+    mc.bP = M.bPc.data();
+    mc.bRefP = M.zeroB.data();
+    if (I.needRef) { // pcorr.needReference(): makeRelative, adjustPhi(phi, U, pcorr), makeAbsolute
+        I.relFlux(I.phi.data(), I.phiB.data(), true);
+        if (auto r = I.adjustPhi(I.phi.data(), I.phiB.data()); !r) return r;
+        I.relFlux(I.phi.data(), I.phiB.data(), false);
+    }
+    bool amgFresh = false;
+    std::string amgError;
+    const la::LinOp<R> Mp = [&](const R* r, R* z) {
+        if (!amgFresh) {
+            amgFresh = true;
+            if (auto f = I.amg->refresh(); !f) amgError = f.error();
+        }
+        I.amg->apply(r, z);
+    };
+    const int nNonOrth = I.fc.simple.nNonOrthCorr;
+    const int ref = I.needRef ? M.pcRefCell : -1; // pcorrEqn.setReference(0, 0)
+    const R* ffcB = m.nA ? I.amiD->ffcB.data() : nullptr;
+    for (int nc = 0; nc <= nNonOrth; ++nc) {
+        gradLaunch<R, 1>(m, M.pc.data(), M.pcB.data(), M.limPc, M.kPc, I.gP.data());
+        if (nc > 0) {
+            (c.lapLim >= 0 ? kPFace<R, true, false> : kPFace<R, false, false>)<<<gI, kT>>>(m, c, I.ones.data(), M.pc.data(), I.gP.data(), I.pUp.data(), I.ffc.data());
+            if (m.nA) I.amiPBnd(nullptr, M.pc.data(), I.gP.data(), false); // rAUf: the surface field 1
+            (m.nA ? kPRow<R, false, true> : kPRow<R, false, false>)<<<gC, kT>>>(
+                m, I.pUp.data(), I.ffc.data(), I.phi.data(), I.phiB.data(), I.pIc.data(), I.pBc.data(), ffcB, ref,
+                R(0.0), I.AP->off(), I.AP->diag(), I.rhs.data());
+        } else {
+            (c.lapLim >= 0 ? kPFace<R, true> : kPFace<R, false>)<<<gI, kT>>>(m, c, I.ones.data(), M.pc.data(), I.gP.data(), I.pUp.data(), I.ffc.data());
+            kPBnd<R><<<gB, kT>>>(mc, I.ones.data(), I.Ub.data(), I.vfP.data(), I.pIc.data(), I.pBc.data());
+            if (m.nA) I.amiPBnd(nullptr, M.pc.data(), I.gP.data(), true); // rAUf: the surface field 1
+            (m.nA ? kPRow<R, true, true> : kPRow<R, true, false>)<<<gC, kT>>>(
+                m, I.pUp.data(), I.ffc.data(), I.phi.data(), I.phiB.data(), I.pIc.data(), I.pBc.data(), ffcB, ref,
+                R(0.0), I.AP->off(), I.AP->diag(), I.rhs.data());
+            if (m.nA) I.amiOff(*I.AP, I.amiD->acP.data(), false);
+        }
+        // pcorr.select(pimple.finalNonOrthogonalIter())
+        auto r = I.solve(*I.AP, Mp, true, nc == nNonOrth ? M.solverPcorrFinal : M.solverPcorr, I.floor.p, M.pc.data(),
+                         nullptr, true, nc > 0);
+        if (!amgError.empty()) return std::unexpected("fv: pcorr AMG: " + amgError);
+        if (!r) return std::unexpected("fv: pcorr: " + r.error());
+        log.pcorr.push_back(*r);
+        kPEval<R><<<gB, kT>>>(mc, M.pc.data(), M.pcB.data(), I.vfP.data());
+        if (m.nA) I.amiEval(1, M.pc.data(), M.pcB.data());
+    }
+    I.gPValid = false; // gP held grad(pcorr)
+    // phi -= pcorrEqn.flux()
+    kPhi<R><<<gI, kT>>>(m, I.phi.data(), I.pUp.data(), I.ffc.data(), M.pc.data(), I.phi.data());
+    if (m.nA) // the coupled faces' flux before the in-place update
+        (void)hipMemcpyAsync(I.tmp.data(), I.phiB.data(), nB * sizeof(R), hipMemcpyDeviceToDevice, 0);
+    kPhiB<R><<<gB, kT>>>(m, I.phiB.data(), I.pIc.data(), I.pBc.data(), M.pc.data(), I.phiB.data());
+    if (m.nA) I.amiPhiB(I.tmp.data(), M.pc.data(), I.phiB.data());
+    // continuityErrs.H
+    R* a = I.tmp.data();
+    R* g = a + nC;
+    kContErr<R><<<gC, kT>>>(m, I.phi.data(), I.phiB.data(), a, g);
+    const R* ag[2] = {a, g};
+    const bool nn[2] = {false, false};
+    auto ce = I.sums(nC, ag, nn);
+    if (!ce) return std::unexpected(ce.error());
+    log.contCorr = std::array<double, 2>{(*ce)[0] / I.sumV * deltaT, (*ce)[1] / I.sumV * deltaT};
+    return {};
 }
 
 template <class R>
@@ -1335,6 +1636,8 @@ std::expected<FvIterLog, std::string> SimpleImpl<R>::iterate()
         (void)hipMemcpyAsync(I.pbPrev.data(), I.pb.data(), nB * sizeof(R), hipMemcpyDeviceToDevice, 0);
     }
     // --- UEqn.H ---
+    if (!I.disks.empty()) // fvOptions(U): the sources read the iteration's start U
+        if (auto r = I.evalDisks(log); !r) return std::unexpected(r.error());
     I.assembleU();
     if (I.fc.simple.momentumPredictor) { // the components' systems share AU's off-diagonals: one batched solve
         const unsigned mask = I.uMask();
@@ -1384,24 +1687,27 @@ std::expected<FvIterLog, std::string> SimpleImpl<R>::iterate()
 }
 
 template <class R>
-std::expected<FvForceSums, std::string> SimpleImpl<R>::forces()
+std::expected<FvForceSums, std::string> SimpleImpl<R>::forces(int k)
 {
     SimpleImpl<R>& I = *this;
     const Mesh<R>& m = I.m;
     const std::size_t nB = std::size_t(m.nB);
     FvForceSums out;
-    if (!I.fc.forces || nB == 0) return out;
+    if (k < 0 || std::size_t(k) >= I.fc.forces.size() || nB == 0) return out;
+    const FvForces& fo = I.fc.forces[std::size_t(k)];
     // rasCorrect's grad(U) of this iteration's final (U, Ub) is this one
-    if (!I.gValid) kGrad<R, 3><<<grid(std::size_t(m.nC)), kT>>>(m, I.U.data(), I.Ub.data(), I.c.limU, I.c.kU, I.G.data());
+    if (!I.gValid) gradLaunch<R, 3>(m, I.U.data(), I.Ub.data(), I.c.limU, I.c.kU, I.G.data());
     I.gValid = true;
-    const double rho = I.fc.forces->rhoInf;
+    const double rho = fo.rhoInf;
+    const R* cofr = I.cofrD.data() + 3 * std::size_t(k);
+    const u8 bit = u8(1u << k);
     if (I.ras)
-        kForces<R, true><<<grid(nB), kT>>>(m, I.c.nu, R(rho), R(I.fc.forces->pRef / rho), I.cofrD.data(), I.U.data(),
-                                           I.Ub.data(), I.G.data(), I.pb.data(), I.vfU.data(), I.ras->nuEffB.data(),
-                                           I.tmp.data());
+        kForces<R, true><<<grid(nB), kT>>>(m, I.c.nu, R(rho), R(fo.pRef / rho), cofr, I.U.data(), I.Ub.data(),
+                                           I.G.data(), I.pb.data(), I.vfU.data(), I.ras->nuEffB.data(), I.tmp.data(),
+                                           bit);
     else
-        kForces<R, false><<<grid(nB), kT>>>(m, I.c.nu, R(rho), R(I.fc.forces->pRef / rho), I.cofrD.data(), I.U.data(),
-                                            I.Ub.data(), I.G.data(), I.pb.data(), I.vfU.data(), nullptr, I.tmp.data());
+        kForces<R, false><<<grid(nB), kT>>>(m, I.c.nu, R(rho), R(fo.pRef / rho), cofr, I.U.data(), I.Ub.data(),
+                                            I.G.data(), I.pb.data(), I.vfU.data(), nullptr, I.tmp.data(), bit);
     const R* a[12];
     bool nab[12];
     for (int k = 0; k < 12; ++k) {
@@ -1454,6 +1760,16 @@ std::expected<FvState, std::string> SimpleImpl<R>::state() const
                         {&s.phiB, &I.phiB}})
         if (auto e = download(*h, *d); e != hipSuccess)
             return std::unexpected(std::string("fv: download: ") + hipGetErrorString(e));
+    if (const MotionState<R>* M = I.pim ? I.pim->mov.get() : nullptr) {
+        s.Uf.resize(3 * nI);
+        s.UfB.resize(3 * nB);
+        s.meshPhi.resize(nI);
+        s.meshPhiB.resize(nB);
+        for (auto [h, d] : {std::pair{&s.Uf, &M->Uf}, {&s.UfB, &M->UfB}, {&s.meshPhi, &M->meshPhi},
+                            {&s.meshPhiB, &M->meshPhiB}})
+            if (auto e = download(*h, *d); e != hipSuccess)
+                return std::unexpected(std::string("fv: download: ") + hipGetErrorString(e));
+    }
     if (const RasState<R>* Rs = I.ras.get()) {
         s.nut.resize(nC);
         s.nutB.resize(nB);

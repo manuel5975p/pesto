@@ -25,7 +25,7 @@ static_assert(std::endian::native == std::endian::little,
               "binary polyMesh I/O assumes a little-endian host (OpenFOAM LSB)");
 
 constexpr const char* kTypeNames[] = {"wall",  "patch",  "symmetry", "symmetryPlane",
-                                      "empty", "cyclic", "wedge"};
+                                      "empty", "cyclic", "wedge", "cyclicAMI"};
 
 // One file's text and a cursor; every error names the file.
 struct Src
@@ -384,14 +384,14 @@ std::expected<FoamPatchType, string> patchType(const Src& s, const string& patch
     if (t.starts_with("processor"))
         return std::unexpected(s.err("patch '" + patch + "' is type " + t
                                      + ": the mesh is decomposed (run reconstructParMesh)"));
-    if (t == "cyclicAMI" || t == "cyclicACMI" || t.starts_with("nonConformal"))
+    if (t == "cyclicACMI" || t.starts_with("nonConformal"))
         return std::unexpected(s.err("patch '" + patch + "' is type " + t
                                      + ": non-conformal coupling is not supported"));
     if (t.starts_with("mapped"))
         return std::unexpected(s.err("patch '" + patch + "' is type " + t
                                      + ": mapped patches are not supported"));
     return std::unexpected(s.err("patch '" + patch + "' has unsupported type '" + t
-                                 + "' (wall, patch, symmetry, symmetryPlane, empty, cyclic, wedge)"));
+                                 + "' (wall, patch, symmetry, symmetryPlane, empty, cyclic, wedge, cyclicAMI)"));
 }
 
 std::expected<std::vector<FoamPatch>, string> readBoundary(const fs::path& dir)
@@ -400,8 +400,9 @@ std::expected<std::vector<FoamPatch>, string> readBoundary(const fs::path& dir)
     if (!s) return std::unexpected(s.error());
     auto h = readHeader(*s);
     if (!h) return std::unexpected(h.error());
-    if (h->binary)
-        return std::unexpected(s->err("binary-format boundary dictionary is not supported"));
+    // `format binary` (reconstructParMesh, a binary writeFormat) changes
+    // nothing here: OpenFOAM writes the patch entries of the supported types
+    // (words, labels, one vector) as text tokens in either format.
     auto n = listOpen(*s, "the patch list");
     if (!n) return std::unexpected(n.error());
     std::vector<FoamPatch> out;
@@ -465,9 +466,55 @@ std::expected<std::vector<FoamPatch>, string> readBoundary(const fs::path& dir)
                 return std::unexpected(s->err("cyclic '" + p.name
                                               + "': transform translational without separationVector"));
         }
+        if (p.type == FoamPatchType::CyclicAMI) {
+            // cyclicAMIPolyPatch: exactly the faceAreaWeightAMI pair without a
+            // transform (docs/fvpimple.md "cyclicAMI"); every other entry by name.
+            auto nb = one("neighbourPatch");
+            if (!nb) return std::unexpected(nb.error());
+            p.neighbourPatch = *nb;
+            auto word = [&](const char* key, const char* dflt) {
+                return kv.contains(key) && kv[key].size() == 1 ? kv[key][0] : string(dflt);
+            };
+            auto yes = [](const string& v) { return v == "1" || v == "true" || v == "yes" || v == "on"; };
+            auto no = [](const string& v) { return v == "0" || v == "false" || v == "no" || v == "off"; };
+            const string who = "cyclicAMI '" + p.name + "': ";
+            for (const auto& [key, v] : kv) {
+                static constexpr const char* kKnown[] = {"type", "inGroups", "nFaces", "startFace", "matchTolerance",
+                                                         "transform", "neighbourPatch", "AMIMethod",
+                                                         "restartUncoveredSourceFace", "requireMatch", "reverseTarget",
+                                                         "lowWeightCorrection", "physicalType"};
+                if (std::ranges::find(kKnown, key) == std::end(kKnown))
+                    return std::unexpected(s->err(who + "entry '" + key + "' is not supported"));
+            }
+            const string tr = word("transform", "unknown");
+            if (tr != "noOrdering" && tr != "unknown")
+                return std::unexpected(s->err(who + "transform " + tr + " is not supported (noOrdering only: no "
+                                                                         "rotational / translational AMI transform)"));
+            const string am = word("AMIMethod", "faceAreaWeightAMI");
+            if (am != "faceAreaWeightAMI")
+                return std::unexpected(s->err(who + "AMIMethod " + am + " is not supported (faceAreaWeightAMI only)"));
+            if (kv.contains("lowWeightCorrection"))
+                return std::unexpected(s->err(who + "lowWeightCorrection is not supported"));
+            if (!yes(word("restartUncoveredSourceFace", "1")))
+                return std::unexpected(s->err(who + "restartUncoveredSourceFace off is not supported"));
+            if (!yes(word("requireMatch", "1")))
+                return std::unexpected(s->err(who + "requireMatch off is not supported"));
+            if (!no(word("reverseTarget", "0")))
+                return std::unexpected(s->err(who + "reverseTarget on is not supported"));
+        }
         out.push_back(std::move(p));
     }
     if (auto e = listClose(*s, false, "the patch list"); !e) return std::unexpected(e.error());
+
+    // cyclicAMI pairing: each names the other (face counts are free).
+    for (const auto& p : out) {
+        if (p.type != FoamPatchType::CyclicAMI) continue;
+        const auto q = std::ranges::find(out, p.neighbourPatch, &FoamPatch::name);
+        if (q == out.end() || q->type != FoamPatchType::CyclicAMI || q->neighbourPatch != p.name
+            || q->name == p.name)
+            return std::unexpected(s->err("cyclicAMI '" + p.name + "': neighbourPatch '" + p.neighbourPatch
+                                          + "' is not a cyclicAMI naming it back"));
+    }
 
     // Cyclic pairing: each names the other, same size.
     for (const auto& p : out) {
@@ -854,6 +901,11 @@ std::expected<void, std::string> writePolyMesh(const std::filesystem::path& dir,
                 if (p.separation)
                     o += std::format("        separationVector ({} {} {});\n", (*p.separation)[0],
                                      (*p.separation)[1], (*p.separation)[2]);
+            }
+            if (p.type == FoamPatchType::CyclicAMI) {
+                o += "        matchTolerance  0.0001;\n        transform       noOrdering;\n";
+                o += std::format("        neighbourPatch  {};\n", p.neighbourPatch);
+                o += "        AMIMethod       faceAreaWeightAMI;\n        restartUncoveredSourceFace 1;\n";
             }
             o += "    }\n";
         }

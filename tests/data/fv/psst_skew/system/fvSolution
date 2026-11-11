@@ -1,0 +1,24 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      fvSolution;
+}
+solvers
+{
+    "p.*" { solver PCG; preconditioner DIC; tolerance 1e-13; relTol 0; maxIter 5000; }
+    "(U|k|omega).*" { solver PBiCGStab; preconditioner DILU; tolerance 1e-14; relTol 0; maxIter 5000; }
+}
+PIMPLE
+{
+    nOuterCorrectors 2;
+    nCorrectors 1;
+    nNonOrthogonalCorrectors 1;
+    turbOnFinalIterOnly no;
+}
+relaxationFactors
+{
+    fields { p 0.7; pFinal 1; }
+    equations { U 0.8; UFinal 1; k 0.7; omega 0.7; "(k|omega)Final" 1; }
+}

@@ -190,6 +190,11 @@ std::expected<SrcMesh, string> buildSource(const PolyMesh& pm, int threads, Face
             return std::unexpected("mesh: patch '" + p.name
                                    + "' is a wedge: axisymmetric FaceMeshes are not built yet "
                                      "(masterplan_meshsolver P8)");
+    for (const auto& p : man.patches)
+        if (p.type == FoamPatchType::CyclicAMI && !opt.ami)
+            return std::unexpected("mesh: patch '" + p.name
+                                   + "' is type cyclicAMI: non-conformal coupling is not supported on this "
+                                     "route (pimpleFoam on `dns flow --polymesh` only)");
     for (std::size_t f = 0; f < nF; ++f)
         if (pm.owner[f] < 0 || pm.owner[f] >= nC || (f < nI && (pm.neighbour[f] <= pm.owner[f]
                                                                  || pm.neighbour[f] >= nC)))

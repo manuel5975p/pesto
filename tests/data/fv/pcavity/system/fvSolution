@@ -1,0 +1,21 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      fvSolution;
+}
+solvers
+{
+    p { solver PCG; preconditioner DIC; tolerance 1e-13; relTol 0; maxIter 5000; }
+    pFinal { solver PCG; preconditioner DIC; tolerance 1e-13; relTol 0; maxIter 5000; }
+    UFinal { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-14; relTol 0; maxIter 5000; }
+}
+PIMPLE
+{
+    nOuterCorrectors 1;
+    nCorrectors 2;
+    nNonOrthogonalCorrectors 0;
+    pRefCell 0;
+    pRefValue 0;
+}

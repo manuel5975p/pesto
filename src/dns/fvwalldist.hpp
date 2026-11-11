@@ -15,9 +15,11 @@
 #pragma once
 
 #include "dns/facemesh.hpp"
+#include "dns/fvami.hpp"
 #include "dns/polymesh.hpp"
 
 #include <expected>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -30,10 +32,23 @@ struct FvWallDist
     long nUnset = 0;           // meshWave: cells the wave never reached (no wall in their region)
 };
 
-// Pre: fm = FaceMesh::fromPolyMesh(pm, CellOrder::Source). Error (exit 3): no
-// wall patch; meshWave on a mesh with cyclic patches (OpenFOAM's cyclic
+// One cyclicAMI patch as the wave crosses it (FaceCellWave::
+// handleAMICyclicPatches): face i of `patch` takes, in the AMI's address
+// order, the wall info of the faces side.addr of patch `nbr` (updateFace: the
+// nearest origin under the 1% propagation tolerance, no weighted average).
+// owner: `patch` is the pair's owner (side = the AMI's src, else its tgt).
+struct FvWaveAmi
+{
+    int patch = -1, nbr = -1; // polyMesh patch indices
+    bool owner = false;
+    const FoamAmiSide* side = nullptr;
+};
+
+// Pre: fm = FaceMesh::fromPolyMesh(pm, CellOrder::Source). ami: every
+// cyclicAMI patch of the mesh in boundary order (meshWave only). Error (exit
+// 3): no wall patch; meshWave on a mesh with cyclic patches (OpenFOAM's cyclic
 // transfer of the wave is not reproduced); a cell the wave never reached.
 std::expected<FvWallDist, std::string> fvWallDistance(const PolyMesh& pm, const FaceMesh& fm, bool exact,
-                                                      bool correctWalls);
+                                                      bool correctWalls, std::span<const FvWaveAmi> ami = {});
 
 } // namespace dns

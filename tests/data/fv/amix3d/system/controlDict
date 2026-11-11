@@ -1,0 +1,38 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+application pimpleFoam;
+startFrom startTime;
+startTime 0;
+stopAt endTime;
+endTime 0.45;
+deltaT 0.001;
+writeControl adjustableRunTime;
+writeInterval 0.15;
+purgeWrite 0;
+writeFormat ascii;
+writePrecision 17;
+timeFormat general;
+timePrecision 10;
+runTimeModifiable false;
+adjustTimeStep yes;
+maxCo 1;
+maxDeltaT 0.01;
+functions
+{
+    forcesBlade
+    {
+        type            forces;
+        libs            (forces);
+        writeControl    timeStep;
+        writeInterval   1;
+        patches         (blade);
+        rho             rhoInf;
+        rhoInf          1.225;
+        CofR            (0 0 0);
+    }
+}

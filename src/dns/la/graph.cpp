@@ -7,7 +7,16 @@
 
 namespace dns::la {
 
-CellGraph graphOf(const FaceMesh& fm)
+CellGraph graphOf(const FaceMesh& fm) { return graphOf(fm, {}); }
+
+int graphSlot(const CellGraph& g, int row, int col)
+{
+    const auto b = g.col.begin() + g.rowPtr[std::size_t(row)], e = g.col.begin() + g.rowPtr[std::size_t(row) + 1];
+    const auto it = std::lower_bound(b, e, col);
+    return it != e && *it == col ? int(it - g.col.begin()) : -1;
+}
+
+CellGraph graphOf(const FaceMesh& fm, std::span<const std::pair<int, int>> extra)
 {
     CellGraph g;
     g.n = fm.nC;
@@ -19,6 +28,7 @@ CellGraph graphOf(const FaceMesh& fm)
         ++deg[std::size_t(fm.own[std::size_t(f)]) + 1];
         ++deg[std::size_t(fm.nei[std::size_t(f)]) + 1];
     }
+    for (const auto& [r, c] : extra) ++deg[std::size_t(r) + 1];
     std::vector<int> start(deg);
     std::partial_sum(start.begin(), start.end(), start.begin());
     std::vector<int> nb(std::size_t(start.back()));
@@ -28,6 +38,7 @@ CellGraph graphOf(const FaceMesh& fm)
         nb[std::size_t(fill[std::size_t(o)]++)] = n;
         nb[std::size_t(fill[std::size_t(n)]++)] = o;
     }
+    for (const auto& [r, c] : extra) nb[std::size_t(fill[std::size_t(r)]++)] = c;
     g.rowPtr.assign(std::size_t(fm.nC) + 1, 0);
     for (int c = 0; c < fm.nC; ++c) {
         const auto b = nb.begin() + start[std::size_t(c)], e = nb.begin() + start[std::size_t(c) + 1];

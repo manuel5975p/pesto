@@ -13,15 +13,29 @@ was measured in — with the linear solves on `gpu/la` (`docs/la.md`). The case 
 `constant/{transportProperties,MRFProperties,turbulenceProperties}` are read
 as OpenFOAM reads them, and every entry the solver does not reproduce exactly
 is rejected by name (exit 3): among them every `constant/fvOptions` /
-`system/fvOptions` content but ONE constant specific U source (section
-fvOptions), and a forces object without `CofR` (OpenFOAM's
+`system/fvOptions` content but ONE constant specific U source or
+`actuationDiskSource` entries (section fvOptions), every function object but
+`forces`, `forceCoeffs` and (skipped) `yPlus`, every macro but `$name`
+(section Reading the case), and a forces object without `CofR` (OpenFOAM's
 `coordSystem::cartesian(dict)` then reads `origin` + `e1`/`e3` and writes
 force/moment in that rotated frame, or stops when they are missing:
 `origin` alone or nothing is an OpenFOAM error; with `CofR` OpenFOAM reads
 neither `origin` nor `e1`/`e3`, and CofR is the moment centre here too).
-An empty `fvOptions` is rejected too, by design. The mesh is the FaceMesh (`docs/mesh.md`) in
+An `fvOptions` holding no source (header only) is accepted with a dry-run
+note: `fv::optionList::reset` builds an empty list and simpleFoam runs
+source-free ("No finite volume options present"). `constant/fvOptions` AND
+`system/fvOptions` together are rejected (OpenFOAM reads the first only).
+The mesh is the FaceMesh (`docs/mesh.md`) in
 SOURCE order, i.e. OpenFOAM's own cell and face numbering, so every per-cell
 sum runs in OpenFOAM's order.
+
+**`application pimpleFoam` in the case's controlDict runs pimpleFoam** on the
+same route (static mesh, or the whole mesh in solid-body rotation by
+`constant/dynamicMeshDict`; `docs/fvpimple.md`: the algorithm, its reader
+entries, nine parity cases vs serial pimpleFoam at 1e-15 … 2e-12 of scale, the
+deltaT sequence digit for digit, the moved points and meshPhi bit for bit).
+Everything below is the simpleFoam path,
+byte for byte what it was before that stage.
 
 Measured (gfx1100, FP64 = `--fv-precision fp64`; OpenFOAM v2606 serial or np 12):
 
@@ -40,6 +54,12 @@ Measured (gfx1100, FP64 = `--fv-precision fp64`; OpenFOAM v2606 serial or np 12)
 | rotor2 L1 / L2 + MRF, laminar Re 220, J 0.63 (`runs/parity` meshes; `tools/fv/make_rotor_cases.sh`), corrected | 114 834 / 144 692 | np 6, 1500 it | CT 8.6e-12 / 8.7e-12, CQ 1.2e-13 / 1.2e-13 |
 | the same, `limited corrected 0.33` + cellLimited grad(U) | 114 834 / 144 692 | np 6, 1500 it | CT 8.4e-12 / 1.3e-11, CQ 1.2e-13 / 1.2e-13 |
 | DTMB 4119 F1 + MRF converged (1200 it, residual 1e-6 at it 944 / 945) | 708 044 | np 12 | CT 2.1e-9, CQ 1.2e-9 |
+| IF1g disc: two `actuationDiskSource` (Froude, cellZones by topoSet) on a non-orthogonal 3D duct, linearUpwind + cellLimited, SIMPLEC, 1 non-orth corrector; `$internalField`, a `$_coeffs;` splice, 2 forces + 2 forceCoeffs objects, an equations `".*"` factor matching p | 1 536 | serial, tight | U, p, phi at it 100 / 300: 4.8e-14 / 8.7e-14 / 4.2e-14 and 1.9e-13 / 3.0e-13 / 1.6e-13; residuals 2.6e-11; every actuationDiskSource.dat row of the 300 iterations 1.2e-10 / 8.9e-11 of column scale (row 1 bitwise; zone volumes equal to simpleFoam's 17 printed digits), force.dat / moment.dat ≤ 5.0e-11, coefficient.dat ≤ 7.3e-11 (the test gates the checked-in rows 1–120: the same maxima); the same case without the discs: forces ≤ 8.7e-12 |
+| the same mesh, one `vectorSemiImplicitSource` ((0.3 0.05 −0.1) 0), `sources` and `injectionRateSuSp` spellings (simpleFoam: identical bytes) | 1 536 | serial, tight | U 4.6e-14 / 2.1e-13, p 1.8e-13 / 9.2e-13, phi 4.3e-14 / 2.1e-13 (the source moves U 7.9e-2) |
+| M17 airframe, AoA 3°, kOmegaSST, two actuator discs (the user's case UNMODIFIED: binary-header boundary, `$internalField`, `$_coeffs;`, `".*" 0.7`, 2 forceCoeffs + forces + yPlus), **FP32**, relTol 0.1 / 0.01 | 5 784 394 | np 14, 500 it | force on the airframe at it 500: total x −1.4e-5, z −5.3e-4 of \|F\| (mean it 451–500: +1.1e-5, −4.8e-4); Cd −4.8e-5, Cl −5.5e-4 relative; disc thrust T at it 500: 1.70762794 / 1.70528634 on both sides (9 printed digits), mean 451–500 +1.0e-7; monitored Uref 1.9e-7 of \|U\|; zone cells 46 218 / 39 566 and volumes equal to the log's 10 digits. Pitch moment about CofR (a cancellation: 0.033 N m of \|F\| lRef 6.5 N m) −1.9% (it 500), −3.1% (mean) |
+| the same airframe without the discs (unmodified originals) | 5 784 394 | np 14, 500 it | total x −1.7e-4, z +2.0e-4 of \|F\| at it 500; Cd +5.9e-4, Cl +2.0e-4; pitch moment −0.42% (it 500), −3.3% (mean): the moment gap is not the discs'. force.dat / moment.dat byte-identical to the pre-change binary on the hand-expanded dictionaries |
+| M17 airframe + two contra-rotating MRF zones (the user's frozen-rotor case, mesh `m17mesh_mrf`; zones NOT adjacent: 0 zone/zone faces; 24 801 / 21 251 prop wall faces + 2 637 / 2 847 airframe faces inside the zones, all MRF-included, `nonRotatingPatches ()`; SST, nutk + omega wall functions, meshWave), solves tightened to 1e-12 (U, k, omega) / 1e-11 (p), relTol 0 in a scratch copy of `system/`, **FP64** | 6 720 123 | SERIAL simpleFoam, 12 it | forces of the three objects (airframe + rudders, propFwd, propAft; total / pressure / viscous, moment about each CofR) at it 1: ≤ 3.1e-13 of \|F\|, \|M\|; it 2–12: airframe ≤ 2.5e-7 (roll moment 1.5e-6 of \|M\|), props ≤ 1.6e-8; initial residuals of all six solves equal to the log's 6 printed digits, every iteration. The 1e-7 level is simpleFoam's Ux solve of it 1 stopping at maxIter 1000 (final residual 2.6e-10) |
+| the same case UNMODIFIED (relTol 0.1 / 0.01), **FP32** | 6 720 123 | np 14 (the user's run, 298 it logged), matched iteration | NOT a steady state on either side (Uy residual 3e-4–5e-4 from it 200 to 800). Airframe at it 298 / mean it 249–298: Fx +2.6e-3 / −2.9e-3 of \|F\| (2.42 N), roll moment −4.4% / −5.0% of \|M\|. propFwd: thrust Fx −0.1281 vs −0.0869 N (mean −0.1281 vs −0.0866: a cancellation, \|F\| 0.14 N against 10.8 N at it 1), torque Mx −0.14642 vs −0.14897 N m (+1.7%; mean +1.6%). propAft: Fx −0.2032 vs −0.2169 (mean −0.2037 vs −0.2027, −4.7e-3), Mx 0.07398 vs 0.07360 (+5.1e-3; mean −5.0e-3). The gap is the loose-solve trajectory: dns FP64 gives the FP32 means to 2e-3 (propFwd Fx −0.1278); dns with both relTol HALVED moves its own it-298 state as far (propFwd Fx −0.1003, torque −1.2%, airframe roll moment +3.3%); dns run on to it 800 drifts through simpleFoam's it-298 values (propFwd Fx −0.104 → −0.100 at it 450–600, torque −0.1479, airframe roll moment 0.130–0.132 vs 0.1349) |
 
 Wall time (IF3, `simjob --bench`; foam np 12 `--bind-to core` on the
 i5-14600KF; dns one RX 7900 XTX):
@@ -52,6 +72,13 @@ i5-14600KF; dns one RX 7900 XTX):
 | rotor2 L1 115k + MRF, 1500 it (foam np 6; np 12: 41 s) | 8.6 | 21.3 | 13.2 s | 32 s (ClockTime) | 2.1× to CT/CQ within 1e-3 of final (it 357 both: 4.5 vs 9.5 s loop) |
 | rotor2 L2 145k + MRF, 1500 it (foam np 6; np 12: 53 s) | 10.3 | 29.4 | 15.8 s | 44 s | 2.3× (it 437 both: 6.7 vs 15.2 s) |
 | F1 708k + MRF, 600 it (MRF phase re-bench) | 34.7 | 287 | 22.3 s | 174 s (ClockTime 172.5) | 8.2× (it 514 both: 18.0 vs 148.3 s) |
+| M17 5.78M SST + 2 actuator discs, 500 it, FP32 (NOT `--bench`; foam np 14, the user's run) | 121.8 (it 6+; without the discs 122.4) | 5981 (ExecutionTime 2990.5 s / 500) | 79.8 s (job wall: read 2.3 s, setup 3.7 s) | 3003 s (ClockTime) | not measured |
+| M17 6.72M SST + 2 MRF zones, 299 it, FP32 (NOT `--bench`; foam np 14, the user's run, 298 it) | 184.5 (800 it: 174.2; FP64 359.2) | 7780 (ExecutionTime 2318.3 s / 298) | 72.5 s (job wall: read 2.6 s, setup 4.6 s; FP64 124.5 s) | 2366 s (ClockTime, 298 it) | not measured (no steady state) |
+
+M17 MRF memory: host RSS peak 11.5 GB (job cap 16 384 MB), VRAM 10.5 GB FP32
+/ 18.2 GB FP64 (the 24 GB card with 3.5 GB held by the desktop: FP64 fits,
+2.2 GB to spare). Tight serial simpleFoam on this mesh: 923.7 s for 12
+iterations; dns FP64 27.9 s (2.33 s/it at 39–146 Krylov iterations per solve).
 
 The small mesh is launch / host-sync bound; the prop meshes are mostly
 bandwidth bound (the fine-level SpMV / smoother), with the coarse levels and
@@ -316,7 +343,7 @@ Boundary conditions (`fvPatchField` value/gradient coefficients verbatim):
 
 | U | p | notes |
 |---|---|---|
-| `fixedValue`, `noSlip`, `movingWallVelocity` (static mesh) | `fixedValue` | not assignable (constrainHbyA) |
+| `fixedValue`, `noSlip`, `movingWallVelocity` (a fixedValue unless the mesh moves: pimpleFoam, `docs/fvpimple.md` "Moving mesh") | `fixedValue` | not assignable (constrainHbyA) |
 | `zeroGradient` | `zeroGradient` | |
 | `inletOutlet` (`phi` only) | — | mixed, vf = neg(phi); assignable; adjustable in adjustPhi |
 | `freestream` (= inletOutlet on freestreamValue) | — | |
@@ -386,10 +413,27 @@ dns flow --polymesh CASE [--max-iters N] [--fv-precision fp32|fp64] [--out PREFI
   stats CSV appends the turbulence solves' initial residual and iteration
   count, in solve order) (ASCII, `writePrecision`, OpenFOAM cell / face /
   patch-face order, boundary `calculated`) at `writeInterval` and at the end,
-  and the forces function object's force.dat / moment.dat (pressure +
-  viscous, `rhoInf`, `CofR`, `−ρν devTwoSymm(grad U_b)` on the corrected
-  boundary gradient) every iteration. `tools/fv/foamdiff.py A B` diffs two
-  time directories cell by cell.
+  and the function objects' files every iteration (below). `tools/fv/foamdiff.py
+  A B` diffs two time directories cell by cell.
+- Function objects (`controlDict` `functions`, at most 8 of the first two
+  types, in file order; anything else is rejected by name):
+  - `forces`: `PREFIX/postProcessing/<name>/0/{force,moment}.dat` (pressure +
+    viscous, `rhoInf`, `CofR`, `−ρν devTwoSymm(grad U_b)` on the corrected
+    boundary gradient), one object per patch set, each with its own `rhoInf`,
+    `pRef`, `CofR`;
+  - `forceCoeffs`: `PREFIX/postProcessing/<name>/0/coefficient.dat` as
+    OpenFOAM writes it (header, the 12 columns Cd Cd(f) Cd(r) Cl Cl(f) Cl(r)
+    CmPitch CmRoll CmYaw Cs Cs(f) Cs(r), `writePrecision` digits):
+    `coordSystem::cartesian(CofR, liftDir, dragDir)` = `axes::rotation`
+    verbatim (liftDir normalised, dragDir made orthogonal to it, side = lift
+    × drag), `forceCoeffs::calcForceCoeffs` / `coeffDesc::value` verbatim
+    (`dns::fvForceCoeffRow`). `pitchAxis` is read by nothing in v2606 (noted);
+    `coefficients` (a column subset) and co-linear axes are rejected;
+  - `yPlus`: accepted and SKIPPED with a dry-run note (read-only
+    post-processing; no yPlus.dat).
+  `writeControl` / `writeInterval` other than `timeStep 1` are noted and
+  ignored: every file gets one row per iteration. The stats CSV's F / M
+  columns and the `cd` line are the FIRST object's.
 - Every other `dns flow` flag is rejected with `--polymesh` (exit 2).
   `--physics compressible` or `--bc` leave this path: `--polymesh DIR --bc FILE`
   is the time-accurate FV solver of `--physics` (`docs/fvcomp.md`,
@@ -401,7 +445,33 @@ parity mode; the next header line states every effective tolerance), plus
 `[MRF frozen rotor: APPROXIMATION, steady rotating frame]` with an active MRF
 zone; the dry-run names each zone `[MRF frozen rotor]`.
 
-## fvOptions (one constant U source)
+## Reading the case (what OpenFOAM's reader does that this one does too)
+
+- **`format binary` in `constant/polyMesh/boundary`** (reconstructParMesh, a
+  binary `writeFormat`): the patch entries of the supported types are text
+  tokens in either format — read as such. `cellZones` with a binary header
+  and raw `List<label>` bodies (and its `meta { names }` header entry): read.
+- **Macros** (`dns/foamdict`, expanded while reading, against the entries
+  read SO FAR of the same dictionary, then of each enclosing one):
+  - `$name` / `${name}` inside a value = `primitiveEntry::expandVariable`:
+    the tokens of the LITERAL entry `name` (pattern keys never match — the
+    `$internalField` in a patch must not hit a `".*"` patch entry);
+  - `$name;` as an entry = `dictionary::substituteScopedKeyword`: the
+    entries of dictionary `name` (literal, else the last matching pattern
+    key) are added in place; a later entry of the same key replaces it.
+    The definition itself (`_coeffs { … }` at the top of controlDict) is an
+    entry OpenFOAM reads nowhere: accepted because a macro read it — an
+    unknown entry no macro reads stays rejected.
+  Rejected by name: `$:a.b`, `$..a`, `$a.b`, `${a:-b}`, `${{expr}}`, an
+  environment variable (`$FOAM_CASE`), a dictionary inside a value, a
+  primitive as `$name;`, a spliced sub-dictionary whose key already exists
+  (OpenFOAM merges), `#include`, `#calc` and every other directive.
+- **`relaxationFactors/equations` matching p** (`".*" 0.7`): inert.
+  simpleFoam's pEqn.H calls `p.relax()` (the FIELD factor) and never
+  `pEqn.relax()` (v2606 source); accepted with a dry-run note. Field
+  relaxation of U stays rejected.
+
+## fvOptions (one constant U source, or actuator discs)
 
 `dns flow --solver simple`'s periodic channel needs a driver
 (`docs/fvstructured.md`), so exactly this form is read:
@@ -419,10 +489,88 @@ momentumSource
 `fvOptions(U)` on the right of UEqn: the matrix source gains V f, so H and the
 predictor both see it (`kUForce`, a pass after `kURow`; absent = the kernels
 bit for bit). One file, one source, Sp 0, every cell. Anything else (other
-types, Sp != 0, `absolute`, a cellZone, `timeStart`, a second source, an empty
-file) is rejected by name. Pinned by the exact Poiseuille gate, not by a
-simpleFoam run (OpenFOAM absent when it was built; the semantics are
-`fvOptionList::operator()` read from memory of v2606, issues.md).
+types, Sp != 0, `absolute`, a cellZone, `timeStart`, a second source) is
+rejected by name. A file with no source dictionary at all is the source-free
+solver (noted in the dry-run; it was rejected on presence until the M17 MRF
+case, "conservative, no parity risk", issues.md 59 — v2606
+`fvOptionList.C` `reset` counts the dictionary entries, none = an empty
+list). Both files present: rejected (`fvOptions.C` `createIOobject` reads
+`constant/fvOptions`, `system/fvOptions` only when that header is invalid).
+Pinned by the exact Poiseuille gate and, since
+OpenFOAM is installed, by a simpleFoam run on the IF1g mesh (both spellings:
+U 2.1e-13, p 9.2e-13 of scale at it 300; the table above).
+
+### actuationDiskSource (Froude, cellZone)
+
+OpenFOAM v2606 `fv::actuationDiskSource::calcFroudeMethod` verbatim
+(`src/fvOptions/sources/derived/actuationDiskSource`), any number of entries
+(at most 8, one per cellZone, not together with the constant source):
+
+```
+diskFwd
+{
+    type            actuationDiskSource;
+    variant         Froude;             // default Froude
+    selectionMode   cellZone;
+    cellZone        diskFwd;
+    diskArea        0.07134;
+    diskDir         constant (-1 0 0);  // | (x y z); normalised
+    sink            false;              // default true: the sign of Cp, Ct
+    Cp              -0.099009;          // | constant X
+    Ct              -0.1;
+    monitorMethod   points;             // default points
+    monitorCoeffs { points ((2.0 0.0 0.3)); }   // | upstreamPoint (x y z);
+    writeToFile     true;               // + writeFileStart, writeFileEnd, writePrecision
+}
+```
+
+Every iteration, at `fvOptions(U)` (the iteration's START U, before the
+momentum predictor):
+
+- `Uref` = the monitor cells' U summed in ascending cell order / their count;
+- `a = 1 − Cp/Ct`, `T = 2 ρref A (Uref · dir)² a (1 − a)`, ρref = 1 (the
+  incompressible `geometricOneField`), Cp and Ct after the `sink` sign (both
+  must be > 0: "Cp and Ct must be greater than zero" at read time);
+- zone cell c: the option's matrix source gains `((V_c / V) T) dir`, V = the
+  zone's volume summed in ascending cell order, and `UEqn == fvOptions(U)`
+  SUBTRACTS it: `kUDisk`, one thread per zone cell after `kURow` (no disc: no
+  launch, the kernels bit for bit; R = float | double; the product keeps its
+  own rounding). H, the predictor and the corrector all see it.
+
+**The force on the fluid is −T dir.** `dir` is OpenFOAM's "downstream"
+normal, so the disc DECELERATES the flow for every sign of `sink`: `sink
+false` only flips the sign of the coefficients read. Measured on IF1g: the
+zone-mean Ux falls 1.187 → 1.113 for the M17 spelling (sink false, negative
+Cp and Ct, dir along the flow), in simpleFoam and here alike. A propulsive
+disc needs `dir` against the flow or a < 0 (Cp/Ct > 1) — a statement about
+the user's case dictionary, not a difference between the solvers.
+
+Monitor cells = `polyMesh::findCell(p)` (CELL_TETS, `dns::foamFindCell`,
+`dns/fvdisk.cpp`): the cell whose tet decomposition (cell centre + each
+face's fan from its `tetBasePtIs` point, `findFaceBasePts` verbatim) holds
+p by `tetrahedron::inside` (tolerance SMALL per side). **Ties**: a point on
+a face / edge / vertex is inside every cell touching it; the LOWEST cell
+index is taken, which is what serial simpleFoam's cell octree returns
+(IF1g's diskA monitors the edge of four cells: Uref rows equal simpleFoam's).
+A DECOMPOSED simpleFoam instead takes one cell per processor that finds the
+point and averages them: the run log names every tie (the M17 point (2 0
+0.3) lies on an edge of 4 cells; Uref still agrees to 1.9e-7 of |U| with the
+np 14 run, the neighbours being freestream).
+
+`PREFIX/postProcessing/<name>/0/actuationDiskSource.dat` as OpenFOAM writes
+it (Time, Uref, Cp, Ct, a, T, diskDir; `writePrecision` digits), one row per
+iteration within [writeFileStart, writeFileEnd]. The label carries
+`[N actuator disks: … a MODEL momentum source, no blades, no swirl]`.
+
+Stated differences: V is summed in ascending cell order (OpenFOAM: the zone
+file's order — the same for zones written by topoSet, snappyHexMesh,
+reconstructParMesh); a monitor point in NO cell is an error at setup (OpenFOAM
+warns, then stops at the first iteration only if no point at all was found).
+Rejected by name: `variant variableScaling`, `selectionMode` other than
+`cellZone`, a `cellZones` list, `monitorMethod cellSet`, Cp / Ct / diskDir as
+any other Function1 (a table of the monitored speed or of time), `timeStart` /
+`duration`, `active no`, the `actuationDiskSourceCoeffs` sub-dictionary, two
+discs on one cellZone, a monitor point next to a cyclic patch, `--fv-coupled`.
 
 ## MRF (OpenFOAM `MRFZoneList` / `MRFZone`, v2606 source)
 
@@ -632,9 +780,11 @@ L1's Krylov reduction (0.52×): 1.57–2.0×, unmeasured. P1 not started.
 | file | content |
 |---|---|
 | `gpu/fv_coupled.hip` | EXPERIMENTAL coupled p-U prototype (`--fv-coupled`): R*, probe, composed Jacobian, SIMPLEC-step preconditioner, FGMRES |
-| `dns/foamdict.{hpp,cpp}` | OpenFOAM dictionary tokenizer/parser (balanced-paren words, regex keys, directives kept by name) |
-| `dns/fvcase.{hpp,cpp}` | `FoamCase`: BCs, schemes, controls, MRF, forces; `parseFoamCase` (pure), `readFoamCaseTexts` |
+| `dns/foamdict.{hpp,cpp}` | OpenFOAM dictionary tokenizer/parser (balanced-paren words, regex keys, directives kept by name, `$name` macros expanded) |
+| `dns/fvcase.{hpp,cpp}` | `FoamCase`: BCs, schemes, controls, MRF, forces / forceCoeffs (`fvForceCoeffRow`), fvOptions (`FvDisk`); `parseFoamCase` (pure), `readFoamCaseTexts` |
 | `dns/fvsimple.{hpp,cpp}` | `loadFvCase`, `buildSimpleSetup`: geometric factors, BC codes per face, CSR + ELL slots, MRF frame flux, pressure reference |
+| `dns/fvdisk.cpp` (declared in `dns/fvsimple.hpp`) | `foamFindCell` (OpenFOAM's findCell, tet decomposition, ties), `buildDiskSetup` (zone cells, volume fractions, monitor cells) |
+| `tests/data/fv/disc` (1.0 MB) | IF1g with simpleFoam's fields, residuals and `ref/postProcessing` .dat files (rows 1–120) (`tools/fv/make_cases.py disc`, `run_foam.sh disc`, `make_test_data.sh … disc`) |
 | `dns/foamio.{hpp,cpp}` | OpenFOAM ASCII field writer / internalField reader |
 | `dns/fvprecision.hpp` | `FvPrecision`, `FvFloors`, the measured `kFp32Floors`, `fvNumerics` |
 | `gpu/fv_simple.{hpp,hip}` | `DeviceSimple`: the kernels and one SIMPLE iteration, forces (templates on R; both instantiated) |
@@ -644,11 +794,13 @@ L1's Krylov reduction (0.52×): 1.57–2.0×, unmeasured. P1 not started.
 | `dns/fvwalldist.{hpp,cpp}` | meshWave (FaceCellWave, serial order) + correctBoundaryCells, exactDistance (AABB tree), nearWallDist |
 | `tools/fv/make_ras_cases.py`, `make_ras_test_data.sh`, `make_rotor_bl.py`, `plate_compare.py`, `fieldloc.py` | the RAS parity cases + references, the layered rotor2 case, the plate cf / profile gate, a field-difference locator |
 | `tests/data/fv/{sst_plate,sst_skew,sa_skew}` (1.7 MB), `tests/test_fvwalldist.cpp` (`fvwalldist`, `fvwalldist_rotor`) | the IF-T cases with simpleFoam's fields, residuals and `wallDistance` |
-| `gpu/runner_fv.{hpp,hip}` | the run loop, log, residualControl, outputs |
+| `gpu/runner_fv.{hpp,hip}` | the run loop, log, residualControl, outputs (`runFvSimple`; `runFvPimple`: docs/fvpimple.md) |
+| `gpu/fv_pimple.hip`, `dns/fvpimple.{hpp,cpp}` | pimpleFoam's time step on the same stage methods, `FoamClock` (docs/fvpimple.md) |
+| `dns/fvmotion.{hpp,cpp}` | pimpleFoam's solid-body mesh motion: OpenFOAM's point transform, swept-volume mesh flux, `movingWallVelocity`; the geometry itself is `fromPolyMesh` + `buildSimpleSetup` on the moved points (docs/fvpimple.md "Moving mesh") |
 | `tools/fv/make_cases.py`, `run_foam.sh`, `make_test_data.sh`, `foamdiff.py` | the parity cases, their OpenFOAM runs, the checked-in references, the field diff |
 | `tools/fv/make_rotor_cases.sh`, `mrf_compare.py` | the rotor2 L1/L2 MRF cases from the parity suite's meshes; CT/CQ, settle and residual iteration counts, times of a dns run vs its simpleFoam run |
 | `tests/data/fv/{cavity,cavity_skew,channel,duct,cavity_lim,mrf2}` (2.6 MB) | the IF1 cases with OpenFOAM's fields at it 100 / last and the initial-residual history |
-| `tests/test_fvcase.cpp` (`fvcase`), `tests/test_gpu_fv_simple.cpp` (`gpu_fv_simple`) | the case layer (M1: MRFZoneList parsing / setup / rejections); IF1 a–f, determinism, 2D w ≡ 0 |
+| `tests/test_fvcase.cpp` (`fvcase`), `tests/test_gpu_fv_simple.cpp` (`gpu_fv_simple`) | the case layer (M1: MRFZoneList parsing / setup / rejections; D2 macros; C3 binary boundary / zones, forceCoeffs vs simpleFoam; K1 discs, findCell); IF1 a–g, determinism, 2D w ≡ 0 |
 
 ## Invariants
 
@@ -673,7 +825,14 @@ L1's Krylov reduction (0.52×): 1.57–2.0×, unmeasured. P1 not started.
 
 ## Not built
 
-- PISO / PIMPLE (pimpleFoam: `ddtCorr`, Euler ddt), transient controls.
+- pimpleFoam is built on a static mesh, on a mesh rotating as ONE rigid body
+  and with cellZones rotating behind `cyclicAMI` pairs (`docs/fvpimple.md`:
+  Euler, `ddtCorr`, the PIMPLE loop and its Final entries, adjustTimeStep;
+  solidBody `rotatingMotion`, correctPhi, `movingWallVelocity`;
+  faceAreaWeightAMI without transform); not built: cyclicACMI, AMI
+  transforms, other AMI methods, lowWeightCorrection, other motion
+  solvers / functions, PIMPLEC, PIMPLE residualControl, other ddt schemes, MRF /
+  fvOptions / SpalartAllmaras under pimpleFoam (issues.md 65).
 - Other RAS models (kEpsilon, realizableKE, kOmegaSSTLM, ...), the
   compressible / variable-density turbulence forms, `kLowReWallFunction`,
   rough wall functions, `decayControl`, meshWave with cyclic patches,
@@ -682,8 +841,11 @@ L1's Krylov reduction (0.52×): 1.57–2.0×, unmeasured. P1 not started.
   `rotatingWallVelocity`, `limited uncorrected`, other snGrad schemes,
   `leastSquares` gradients, `pRefPoint`, `startFrom` a non-zero time,
   overlapping MRF zones, MRF zones touching cyclic faces, a time-dependent
-  `omega`, `makeAbsolute` (unused by simpleFoam), field relaxation of U /
-  equation relaxation of p.
+  `omega`, `makeAbsolute` (unused by simpleFoam), field relaxation of U.
+- fvOptions beyond the constant U source and `actuationDiskSource` Froude on
+  one cellZone (its `variableScaling` variant, cellSet monitors, Function1
+  coefficients); function objects beyond `forces`, `forceCoeffs` and the
+  skipped `yPlus`; `forceCoeffs` column subsets; scoped / environment macros.
 - `phi` output on meshes with cyclic patches (OpenFOAM's face order needs
   the cyclic patch faces the FaceMesh merges); U and p are written.
 - Rounding-level replication of OpenFOAM's per-term accumulation order (the

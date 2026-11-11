@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace dns::la {
@@ -25,6 +26,15 @@ struct CellGraph
 
 // The graph of fm's internal faces. Post: symmetric, slots consistent.
 CellGraph graphOf(const FaceMesh& fm);
+
+// graphOf(fm) plus the couplings (row, col) of extra (cyclicAMI: a patch face's
+// cell and each cell its AMI addresses). Pre: row != col, both in [0, nC).
+// Post: every (row, col) of extra is an entry (graphSlot finds it); symmetric
+// only if extra is.
+CellGraph graphOf(const FaceMesh& fm, std::span<const std::pair<int, int>> extra);
+
+// The slot (index into g.col) of column col in row row, -1: no such entry.
+int graphSlot(const CellGraph& g, int row, int col);
 
 // Distance-1 greedy colouring in row order, smallest free colour.
 // Pre: every row has at most 254 entries (colours fit uint8).

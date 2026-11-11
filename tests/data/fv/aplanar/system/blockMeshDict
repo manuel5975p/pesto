@@ -1,0 +1,44 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      blockMeshDict;
+}
+scale 1;
+vertices
+(
+    (0 0 0.0)
+    (1 0 0.0)
+    (1 1 0.0)
+    (0 1 0.0)
+    (1 0.0 0.0)
+    (2 0.0 0.0)
+    (2 1.0 0.0)
+    (1 1.0 0.0)
+    (0 0 0.1)
+    (1 0 0.1)
+    (1 1 0.1)
+    (0 1 0.1)
+    (1 0.0 0.1)
+    (2 0.0 0.1)
+    (2 1.0 0.1)
+    (1 1.0 0.1)
+);
+blocks
+(
+    hex (0 1 2 3 8 9 10 11)  (10 8 1) simpleGrading (1 1 1)
+    hex (4 5 6 7 12 13 14 15)  (10 12 1) simpleGrading (1 1 1)
+);
+edges
+(
+);
+boundary
+(
+    inlet { type patch; faces ((3 0 8 11)); }
+    outlet { type patch; faces ((5 6 14 13)); }
+    walls { type wall; faces ((0 1 9 8) (2 3 11 10) (4 5 13 12) (6 7 15 14)); }
+    AMI1 { type cyclicAMI; neighbourPatch AMI2; transform noOrdering; matchTolerance 0.0001; AMIMethod faceAreaWeightAMI; restartUncoveredSourceFace 1; faces ((1 2 10 9)); }
+    AMI2 { type cyclicAMI; neighbourPatch AMI1; transform noOrdering; matchTolerance 0.0001; AMIMethod faceAreaWeightAMI; restartUncoveredSourceFace 1; faces ((7 4 12 15)); }
+    frontAndBack { type empty; faces ((0 3 2 1) (8 9 10 11) (4 7 6 5) (12 13 14 15)); }
+);

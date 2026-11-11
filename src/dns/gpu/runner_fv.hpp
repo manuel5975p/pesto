@@ -34,4 +34,12 @@ struct FvRunSpec
 // 6 device resources, 7 numerical failure.
 std::expected<RunStats, RunError> runFvSimple(const FvRunSpec& spec, FvLoaded& L);
 
+// The same route for a case whose controlDict says `application pimpleFoam`
+// (docs/fvpimple.md): OpenFOAM's time loop (FoamClock: CourantNo, setDeltaT,
+// write times), one DeviceSimple::timeStep per step, pimpleFoam-style log,
+// forces rows every step, time directories at the write times and at the end.
+// spec.maxIters > 0: at most that many time steps. Pre: L.c.pimple.on.
+// Errors: as runFvSimple; 2 for --fv-coupled.
+std::expected<RunStats, RunError> runFvPimple(const FvRunSpec& spec, FvLoaded& L);
+
 } // namespace dns::gpu

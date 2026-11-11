@@ -168,7 +168,17 @@ void t4Rejections()
         rejects(d, token, what);
     };
     boundaryType("proc", "processor", "reconstructParMesh", "processor patch: decomposed, run reconstructParMesh");
-    boundaryType("ami", "cyclicAMI", "cyclicAMI", "cyclicAMI is rejected");
+    boundaryType("ami", "cyclicAMI", "neighbourPatch", "cyclicAMI without its neighbourPatch is rejected");
+    boundaryType("amirot", "cyclicAMI;\n        neighbourPatch x;\n        transform rotational", "transform rotational",
+                 "cyclicAMI with a rotational transform is rejected");
+    boundaryType("amimeth", "cyclicAMI;\n        neighbourPatch x;\n        AMIMethod nearestFaceAMI", "AMIMethod nearestFaceAMI",
+                 "cyclicAMI with another AMIMethod is rejected");
+    boundaryType("amilow", "cyclicAMI;\n        neighbourPatch x;\n        lowWeightCorrection 0.2", "lowWeightCorrection",
+                 "cyclicAMI with lowWeightCorrection is rejected");
+    boundaryType("amikey", "cyclicAMI;\n        neighbourPatch x;\n        rotationAxis (0 0 1)", "rotationAxis",
+                 "cyclicAMI with an unknown entry is rejected");
+    boundaryType("amipair", "cyclicAMI;\n        neighbourPatch nowhere", "not a cyclicAMI naming it back",
+                 "cyclicAMI without a partner is rejected");
     boundaryType("acmi", "cyclicACMI", "cyclicACMI", "cyclicACMI is rejected");
     boundaryType("nc", "nonConformalCyclic", "nonConformal", "nonConformal* is rejected");
     boundaryType("mapped", "mappedWall", "mapped", "mapped* is rejected");

@@ -493,11 +493,15 @@ __global__ void kSBnd(Mesh<R> m, SEq<R> e, const R* phiB, R* ic, R* bc)
 // Rows: negSumDiag, off entries, explicit face sources, bounded, the model's
 // sources, fvMatrix::relax(alpha) (alpha <= 0: none), setValues on the fixed
 // cells (fix != null), then the solved system (addBoundaryDiag/Source).
-template <class R>
+// Cpl (cyclicAMI; false: the kernel bit for bit, acS / sfxB unread): a coupled
+// face's explicit flux sfxB (laplacian correction, linearUpwind) joins the
+// face sum, and fvMatrix::relax takes its coupled branch (D += the internal
+// coefficient itself, sumOff += |boundaryCoeffs|). The couplings: kAmiOff.
+template <class R, bool Cpl = false>
 __global__ void __launch_bounds__(256) kSRow(Mesh<R> m, SEq<R> e, const R* up, const R* lo, const R* fx,
                                              const R* phi, const R* phiB, const R* ic,
-                                             const R* bc, const R* dAdd, const R* sAdd,
-                                             R alpha, const u8* fix, R* off, R* Ad, R* rhs)
+                                             const R* bc, const R* dAdd, const R* sAdd, const R* acS,
+                                             const R* sfxB, R alpha, const u8* fix, R* off, R* Ad, R* rhs)
 {
     const int c = int(blockIdx.x) * kT + int(threadIdx.x);
     if (c >= m.nC) return;
@@ -521,6 +525,15 @@ __global__ void __launch_bounds__(256) kSRow(Mesh<R> m, SEq<R> e, const R* up, c
         } else {
             const std::size_t b = std::size_t(-code - 1);
             divphi += phiB[b];
+            if constexpr (Cpl) {
+                if (m.bA[b] >= 0) {
+                    s += sfxB[b];
+                    icMag += ic[b];
+                    sumOff += fabs(acS[b]);
+                    icMin += ic[b];
+                    continue;
+                }
+            }
             icMag += fabs(ic[b]);
             icMin += ic[b];
         }
@@ -568,6 +581,52 @@ __global__ void __launch_bounds__(256) kSRow(Mesh<R> m, SEq<R> e, const R* up, c
     rhs[c] = s + bs;
 }
 
+// cyclicAMI faces of a transported scalar (kSBnd's outputs there): convection
+// (the scheme's patch weight: linear w, upwind / linearUpwind pos0(phi)) and
+// -laplacian(Gamma) with Gamma_f = lerp(pnf, pif, w) of the cell diffusivity:
+// internalCoeffs ic, boundaryCoeffs acS (bc = 0), and the explicit flux sfxB.
+template <class R, bool LimLap>
+__global__ void kAmiSBnd(Mesh<R> m, Ctl<R> c, SEq<R> e, const R* phiB, R* ic, R* acS, R* bc, R* sfxB)
+{
+#pragma clang fp contract(off)
+    const int a = int(blockIdx.x) * kT + int(threadIdx.x);
+    if (a >= m.nA) return;
+    const std::size_t nC = std::size_t(m.nC), nB = std::size_t(m.nB), nA = std::size_t(m.nA);
+    const int b = m.aB[a], P = m.bOwn[b];
+    const R w = m.aWt[a], ph = phiB[b], dc = m.bDc[b];
+    const R wc = e.div == kSDivLinear ? w : pos0(ph);
+    const R gm = amiLerp(w, e.gC[P], amiNbr(m, a, e.gC)) * m.bMagS[b];
+    ic[b] = ph * wc - gm * (-dc);
+    acS[b] = -ph * (R(1.0) - wc) + gm * dc;
+    bc[b] = R(0.0);
+    R gP[3], gN[3];
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        const R* g = e.gx + std::size_t(i) * nC;
+        gP[i] = g[P];
+        gN[i] = amiNbr(m, a, g);
+    }
+    R corr = 0;
+    if (c.lapCorr) {
+        R kc = 0;
+#pragma unroll
+        for (int i = 0; i < 3; ++i) kc += m.aK[std::size_t(i) * nA + std::size_t(a)] * amiLerp(w, gP[i], gN[i]);
+        if constexpr (LimLap) corr = gm * (snLimiter(c.lapLim, fabs(dc * (amiNbr(m, a, e.x) - e.x[P])), fabs(kc)) * kc);
+        else corr = gm * kc;
+    }
+    R cl = 0;
+    if (e.div == kSDivLUD) { // linearUpwind::correction, coupled patch
+#pragma unroll
+        for (int i = 0; i < 3; ++i) {
+            const R r = m.bCf[std::size_t(i) * nB + std::size_t(b)] - m.C[std::size_t(i) * nC + std::size_t(P)];
+            if (ph > 0) cl += r * gP[i];
+            else cl += (m.bCf[std::size_t(i) * nB + std::size_t(b)] - m.aD[std::size_t(i) * nA + std::size_t(a)] -
+                        m.C[std::size_t(i) * nC + std::size_t(P)]) * gN[i];
+        }
+    }
+    sfxB[b] = corr - ph * cl;
+}
+
 // The mixed patches' updateCoeffs alone (omega_.boundaryFieldRef().updateCoeffs()
 // before CDkOmega: grad(omega)'s boundary snGrad sees the new valueFraction).
 template <class R>
@@ -613,8 +672,9 @@ __global__ void kMinPart(int n, const R* x, R* part)
     if (threadIdx.x == 0) part[blockIdx.x] = sh[0];
 }
 
-// max(max(x, average(max(x, lb)) pos0(-x)), lb) into xn.
-template <class R>
+// max(max(x, average(max(x, lb)) pos0(-x)), lb) into xn. Cpl (cyclicAMI): a
+// coupled face's value is lerp(pnf, pif, w) of the cell field max(x, lb).
+template <class R, bool Cpl = false>
 __global__ void kBoundCells(Mesh<R> m, const R* x, const R* xb, R lb, R* xn)
 {
     const int c = int(blockIdx.x) * kT + int(threadIdx.x);
@@ -630,6 +690,17 @@ __global__ void kBoundCells(Mesh<R> m, const R* x, const R* xb, R lb, R* xn)
             den += m.magS[f];
         } else {
             const std::size_t b = std::size_t(-code - 1);
+            if constexpr (Cpl) {
+                const int a = m.bA[b];
+                if (a >= 0) {
+#pragma clang fp contract(off)
+                    R pnf = 0;
+                    for (int j = m.aStart[a]; j < m.aStart[a + 1]; ++j) pnf += m.aW[j] * fmax(x[m.aCell[j]], lb);
+                    num += m.bMagS[b] * amiLerp(m.aWt[a], fmax(x[c], lb), pnf);
+                    den += m.bMagS[b];
+                    continue;
+                }
+            }
             num += m.bMagS[b] * fmax(xb[b], lb);
             den += m.bMagS[b];
         }
@@ -859,8 +930,8 @@ void gradS(SimpleImpl<R>& I, int q)
 {
     RasState<R>& Rs = *I.ras;
     const FvGradScheme& g = gradOf(Rs.co, q);
-    kGrad<R, 1><<<grid(std::size_t(I.m.nC)), kT>>>(I.m, Rs.s[std::size_t(q)].data(), Rs.sb[std::size_t(q)].data(),
-                                                    g.kind == FvGrad::CellLimited, R(g.k), Rs.gs[std::size_t(q)].data());
+    gradLaunch<R, 1>(I.m, Rs.s[std::size_t(q)].data(), Rs.sb[std::size_t(q)].data(), g.kind == FvGrad::CellLimited,
+                     R(g.k), Rs.gs[std::size_t(q)].data());
 }
 
 // bound(x, lb): true when it acted (the comparison and the bound in R).
@@ -880,7 +951,8 @@ std::expected<bool, std::string> boundS(SimpleImpl<R>& I, int q, double lbIn)
     if (!std::isfinite(mn)) return std::unexpected("fv: non-finite turbulence field");
     if (!(mn < lb)) return false;
     R* tmp = I.tmp.data();
-    kBoundCells<R><<<nb, kT>>>(m, Rs.s[std::size_t(q)].data(), Rs.sb[std::size_t(q)].data(), lb, tmp);
+    (m.nA ? kBoundCells<R, true> : kBoundCells<R, false>)<<<nb, kT>>>(m, Rs.s[std::size_t(q)].data(),
+                                                                       Rs.sb[std::size_t(q)].data(), lb, tmp);
     (void)hipMemcpyAsync(Rs.s[std::size_t(q)].data(), tmp, nC * sizeof(R), hipMemcpyDeviceToDevice, 0);
     kBoundB<R><<<grid(std::size_t(m.nB)), kT>>>(m, seq(I, q), lb);
     return true;
@@ -899,13 +971,27 @@ std::expected<FvSolveLog, std::string> solveS(SimpleImpl<R>& I, int q, const FvS
         kSFace<R, true><<<grid(nI), kT>>>(m, I.c, e, I.phi.data(), Rs.sup.data(), Rs.slo.data(), Rs.sfx.data());
     else kSFace<R, false><<<grid(nI), kT>>>(m, I.c, e, I.phi.data(), Rs.sup.data(), Rs.slo.data(), Rs.sfx.data());
     kSBnd<R><<<grid(nB), kT>>>(m, e, I.phiB.data(), Rs.sic.data(), Rs.sbc.data());
-    kSRow<R><<<grid(nC), kT>>>(m, e, Rs.sup.data(), Rs.slo.data(), Rs.sfx.data(), I.phi.data(), I.phiB.data(),
-                               Rs.sic.data(), Rs.sbc.data(), Rs.dAdd.data(), Rs.sAdd.data(), R(relax ? *relax : 0.0),
-                               fixWall ? Rs.fixC.data() : nullptr, I.AU->off(), I.AU->diag(), I.rhs.data());
+    const u8* fix = fixWall ? Rs.fixC.data() : nullptr;
+    if (m.nA) { // cyclicAMI: the coupled faces' coefficients, the rows' coupled branch, the couplings
+        auto& D = *I.amiD;
+        const unsigned gA = grid(std::size_t(m.nA));
+        if (I.c.lapLim >= 0) kAmiSBnd<R, true><<<gA, kT>>>(m, I.c, e, I.phiB.data(), Rs.sic.data(), D.acS.data(), Rs.sbc.data(), D.sfxB.data());
+        else kAmiSBnd<R, false><<<gA, kT>>>(m, I.c, e, I.phiB.data(), Rs.sic.data(), D.acS.data(), Rs.sbc.data(), D.sfxB.data());
+        kSRow<R, true><<<grid(nC), kT>>>(m, e, Rs.sup.data(), Rs.slo.data(), Rs.sfx.data(), I.phi.data(), I.phiB.data(),
+                                         Rs.sic.data(), Rs.sbc.data(), Rs.dAdd.data(), Rs.sAdd.data(), D.acS.data(),
+                                         D.sfxB.data(), R(relax ? *relax : 0.0), fix, I.AU->off(), I.AU->diag(),
+                                         I.rhs.data());
+        I.amiOff(*I.AU, D.acS.data(), true, fix);
+    } else
+        kSRow<R, false><<<grid(nC), kT>>>(m, e, Rs.sup.data(), Rs.slo.data(), Rs.sfx.data(), I.phi.data(),
+                                          I.phiB.data(), Rs.sic.data(), Rs.sbc.data(), Rs.dAdd.data(), Rs.sAdd.data(),
+                                          nullptr, nullptr, R(relax ? *relax : 0.0), fix, I.AU->off(), I.AU->diag(),
+                                          I.rhs.data());
     const la::LinOp<R> M = [&I](const R* r, R* z) { I.gsU->apply(r, z); };
     auto r = I.solve(*I.AU, M, false, ctl, I.floor.s, Rs.s[std::size_t(q)].data(), &*I.gsU); // refactors gsU first
     if (!r) return std::unexpected(r.error());
     kSEval<R><<<grid(nB), kT>>>(m, e);
+    if (m.nA) I.amiEval(1, e.x, e.xb);
     return *r;
 }
 
@@ -930,6 +1016,7 @@ void correctNut(SimpleImpl<R>& I)
                                           Rs.sb[0].data(), Rs.sb[0].data(), I.U.data(), I.Ub.data(), I.vfU.data(),
                                           I.G.data(), Rs.nut.data(), Rs.nutB.data(), Rs.nuEffB.data());
     }
+    if (m.nA) I.amiEval(1, Rs.nut.data(), Rs.nutB.data()); // nut_.correctBoundaryConditions() on cyclicAMI
 }
 
 } // namespace
@@ -979,13 +1066,15 @@ std::expected<void, std::string> rasMake(SimpleImpl<R>& I, const FvSimpleSetup& 
     FV_TRY(zero(Rs.minPart, grid(nC) + 1, "minPart"))
 #undef FV_TRY
     const Mesh<R>& m = I.m;
+    if (m.nA) // cyclicAMI: the patch values are the coupled interpolation of the initial fields
+        for (int q = 0; q < Rs.nS; ++q) I.amiEval(1, Rs.s[std::size_t(q)].data(), Rs.sb[std::size_t(q)].data());
     // The model constructor: bound(k, kMin), bound(omega, omegaMin).
     if (Rs.co.model == FvTurbModel::KOmegaSST) {
         if (auto b = boundS(I, 0, Rs.co.kMin); !b) return std::unexpected(b.error());
         if (auto b = boundS(I, 1, Rs.co.omegaMin); !b) return std::unexpected(b.error());
     }
     // validate(): correctNut on the initial fields (gradU of the initial U).
-    kGrad<R, 3><<<grid(nC), kT>>>(m, I.U.data(), I.Ub.data(), I.c.limU, I.c.kU, I.G.data());
+    gradLaunch<R, 3>(m, I.U.data(), I.Ub.data(), I.c.limU, I.c.kU, I.G.data());
     if (Rs.co.model == FvTurbModel::KOmegaSST)
         kSstCell1<R><<<grid(nC), kT>>>(m, I.G.data(), I.phi.data(), I.phiB.data(), Rs.nut.data(), Rs.S2.data(),
                                        Rs.GbyNu.data(), Rs.Gk.data(), Rs.divU.data());
@@ -1004,12 +1093,13 @@ std::expected<void, std::string> rasCorrect(SimpleImpl<R>& I, FvIterLog& lg)
     const Mesh<R>& m = I.m;
     const std::size_t nC = std::size_t(m.nC), nB = std::size_t(m.nB);
     const unsigned gC = grid(nC), gB = grid(nB);
-    kGrad<R, 3><<<gC, kT>>>(m, I.U.data(), I.Ub.data(), I.c.limU, I.c.kU, I.G.data()); // fvc::grad(U)
+    gradLaunch<R, 3>(m, I.U.data(), I.Ub.data(), I.c.limU, I.c.kU, I.G.data()); // fvc::grad(U)
     I.gValid = true; // of the final (U, Ub): the RAS correct writes neither
     lg.nT = 0;
     if (Rs.co.model == FvTurbModel::KOmegaSST) {
         const SstK<R> K = sstK(Rs);
-        kSstCell1<R><<<gC, kT>>>(m, I.G.data(), I.phi.data(), I.phiB.data(), Rs.nut.data(), Rs.S2.data(),
+        // divU = fvc::div(fvc::absolute(phi, U)): phi itself unless the mesh moves
+        kSstCell1<R><<<gC, kT>>>(m, I.G.data(), I.phiAbs(), I.phiAbsB(), Rs.nut.data(), Rs.S2.data(),
                                  Rs.GbyNu.data(), Rs.Gk.data(), Rs.divU.data());
         // omega_.boundaryFieldRef().updateCoeffs(): the wall function's G and omega
         kOmegaWall<R><<<gC, kT>>>(m, K, Rs.bS[1].data(), Rs.yWall.data(), Rs.bPatch.data(), Rs.wf.data(),
@@ -1024,6 +1114,7 @@ std::expected<void, std::string> rasCorrect(SimpleImpl<R>& I, FvIterLog& lg)
                                  Rs.D[0].data(), Rs.D[1].data(), Rs.dAdd.data(), Rs.sAdd.data());
         kSstBnd<R><<<gB, kT>>>(m, K, seq(I, 0), seq(I, 1), Rs.bWall.data(), Rs.y.data(), Rs.nutB.data(),
                                Rs.DB[0].data(), Rs.DB[1].data());
+        if (I.pim) I.rasDdt(1); // pimpleFoam: + fvm::ddt(omega)
         auto ro = solveS(I, 1, Rs.co.solverOmega, Rs.co.relaxOmega, true);
         if (!ro) return std::unexpected("fv: omega: " + ro.error());
         lg.T[std::size_t(lg.nT++)] = *ro;
@@ -1032,6 +1123,7 @@ std::expected<void, std::string> rasCorrect(SimpleImpl<R>& I, FvIterLog& lg)
         lg.bounded[1] = *bo;
         kSstKSrc<R><<<gC, kT>>>(m, K, Rs.s[0].data(), Rs.s[1].data(), Rs.Gk.data(), Rs.divU.data(), Rs.dAdd.data(),
                                 Rs.sAdd.data());
+        if (I.pim) I.rasDdt(0); // + fvm::ddt(k)
         auto rk = solveS(I, 0, Rs.co.solverK, Rs.co.relaxK, false);
         if (!rk) return std::unexpected("fv: k: " + rk.error());
         lg.T[std::size_t(lg.nT++)] = *rk;
@@ -1044,6 +1136,7 @@ std::expected<void, std::string> rasCorrect(SimpleImpl<R>& I, FvIterLog& lg)
         kSaCell<R><<<gC, kT>>>(m, K, I.G.data(), Rs.y.data(), Rs.s[0].data(), Rs.gs[0].data(), Rs.D[0].data(),
                                Rs.dAdd.data(), Rs.sAdd.data());
         kSaBnd<R><<<gB, kT>>>(m, K, Rs.sb[0].data(), Rs.DB[0].data());
+        if (I.pim) I.rasDdt(0); // pimpleFoam: + fvm::ddt(nuTilda)
         auto rn = solveS(I, 0, Rs.co.solverNuTilda, Rs.co.relaxNuTilda, false);
         if (!rn) return std::unexpected("fv: nuTilda: " + rn.error());
         lg.T[std::size_t(lg.nT++)] = *rn;
@@ -1051,6 +1144,7 @@ std::expected<void, std::string> rasCorrect(SimpleImpl<R>& I, FvIterLog& lg)
         if (!bn) return std::unexpected(bn.error());
         lg.bounded[0] = *bn;
         kSEval<R><<<gB, kT>>>(m, seq(I, 0)); // nuTilda_.correctBoundaryConditions()
+        if (m.nA) I.amiEval(1, Rs.s[0].data(), Rs.sb[0].data());
     }
     correctNut(I);
     for (int q = 0; q < lg.nT; ++q)

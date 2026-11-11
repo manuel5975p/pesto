@@ -18,6 +18,10 @@
   mrf2         two adjacent MRF zones + an inactive one, nonRotatingPatches
                (literal + regex), rotating wall, MRF-included open/slip/
                symmetryPlane faces (phase MRF)
+  disc         two fvOptions actuationDiskSource (Froude, cellZone by topoSet)
+               on a non-orthogonal 3D duct; $internalField, a `$_coeffs;`
+               splice, two forces + two forceCoeffs objects, an equations
+               ".*" factor matching p
 
 Linear solvers of the IF1 cases are converged TIGHT (PCG/smoothSolver to
 1e-12, relTol 0): every SIMPLE iteration is then the algorithm's own, so an
@@ -487,8 +491,159 @@ ghost
     common(root, 0.05, 300, 100, SCHEMES_LINEAR, tight_solution(simple, relax))
 
 
+def disc(root):
+    # fvOptions actuationDiskSource (Froude, cellZone) twice on a non-orthogonal
+    # 3D duct, 24 x 8 x 8: zones diskA / diskB cut by topoSet (cylinderToCell).
+    # diskA: the M17 spelling (sink false, negative Cp / Ct, diskDir constant,
+    # one monitor point ON THE EDGE four cells share: findCell's tie). diskB:
+    # the defaults (sink true, variant and monitorMethod absent), a
+    # non-normalised diskDir, Cp `constant`, two interior monitor points.
+    # The reader forms of the M17 case ride along: $internalField, a `$_coeffs;`
+    # splice into two forceCoeffs objects, two forces objects, an equations
+    # ".*" factor that matches p (inert in simpleFoam).
+    put(root, "system/blockMeshDict", "dictionary", "blockMeshDict", """vertices
+(
+    (0 0 0) (3 0 0) (3.1 1 0) (0.1 1 0)
+    (0 0 1) (3 0 1) (3.1 1 1) (0.1 1 1)
+);
+blocks ( hex (0 1 2 3 4 5 6 7) (24 8 8) simpleGrading (1 1 1) );
+edges ();
+boundary
+(
+    inlet { type patch; faces ((0 4 7 3)); }
+    outlet { type patch; faces ((2 6 5 1)); }
+    floor { type wall; faces ((1 5 4 0)); }
+    top { type wall; faces ((3 7 6 2)); }
+    zlo { type patch; faces ((0 3 2 1)); }
+    zhi { type patch; faces ((4 5 6 7)); }
+);
+""")
+    put(root, "system/topoSetDict", "dictionary", "topoSetDict", """actions
+(
+    { name diskA; type cellSet; action new; source cylinderToCell; p1 (1.0 0.35 0.5); p2 (1.26 0.35 0.5); radius 0.26; }
+    { name diskA; type cellZoneSet; action new; source setToCellZone; set diskA; }
+    { name diskB; type cellSet; action new; source cylinderToCell; p1 (1.76 0.66 0.45); p2 (2.01 0.66 0.45); radius 0.22; }
+    { name diskB; type cellZoneSet; action new; source setToCellZone; set diskB; }
+);
+""")
+    put(root, "0/U", "volVectorField", "U", """dimensions [0 1 -1 0 0 0 0];
+internalField uniform (1 0 0);
+boundaryField
+{
+    inlet { type fixedValue; value $internalField; }
+    outlet { type inletOutlet; inletValue uniform (0 0 0); value $internalField; }
+    "(floor|top)" { type noSlip; }
+    "z.*" { type slip; }
+}
+""")
+    put(root, "0/p", "volScalarField", "p", """dimensions [0 2 -2 0 0 0 0];
+internalField uniform 0;
+boundaryField
+{
+    inlet { type zeroGradient; }
+    outlet { type fixedValue; value $internalField; }
+    "(floor|top)" { type zeroGradient; }
+    "z.*" { type slip; }
+}
+""")
+    put(root, "system/fvOptions", "dictionary", "fvOptions", """diskA
+{
+    type            actuationDiskSource;
+    variant         Froude;
+    selectionMode   cellZone;
+    cellZone        diskA;
+    diskArea        0.2124;
+    diskDir         constant (1 0 0);
+    sink            false;
+    writeToFile     true;
+    Cp              -0.45;
+    Ct              -0.5;
+    monitorMethod   points;
+    monitorCoeffs
+    {
+        points ((0.3625 0.5 0.5));
+    }
+}
+diskB
+{
+    type            actuationDiskSource;
+    selectionMode   cellZone;
+    cellZone        diskB;
+    diskArea        0.1521;
+    diskDir         (2 0 0.2);
+    Cp              constant 0.4;
+    Ct              0.5;
+    monitorCoeffs
+    {
+        points ((0.33 0.27 0.61) (0.41 0.73 0.33));
+    }
+}
+""")
+    simple = "    nNonOrthogonalCorrectors 1;\n    consistent yes;"
+    relax = 'equations { U 0.9; ".*" 0.7; }'
+    common(root, 0.01, 300, 100, SCHEMES_LUD, tight_solution(simple, relax))
+    put(root, "system/controlDict", "dictionary", "controlDict", """application simpleFoam;
+startFrom startTime;
+startTime 0;
+stopAt endTime;
+endTime 300;
+deltaT 1;
+writeControl timeStep;
+writeInterval 100;
+purgeWrite 0;
+writeFormat ascii;
+writePrecision 17;
+timeFormat general;
+timePrecision 10;
+runTimeModifiable false;
+_coeffs
+{
+    type            forceCoeffs;
+    libs            (forces);
+    writeControl    timeStep;
+    writeInterval   1;
+    rho             rhoInf;
+    rhoInf          1.2;
+    liftDir         (0.1 1 0);
+    dragDir         (1 0 0.05);
+    CofR            (1.5 0 0.5);
+    magUInf         1;
+    lRef            3;
+    Aref            3;
+}
+functions
+{
+    coeffsWalls { $_coeffs; patches (floor top); }
+    coeffsFloor { $_coeffs; patches (floor); }
+    forcesFloor
+    {
+        type            forces;
+        libs            (forces);
+        writeControl    timeStep;
+        writeInterval   1;
+        patches         (floor);
+        rho             rhoInf;
+        rhoInf          1.2;
+        CofR            (1.5 0 0.5);
+    }
+    forcesWalls
+    {
+        type            forces;
+        libs            (forces);
+        writeControl    timeStep;
+        writeInterval   1;
+        patches         ("(floor|top)");
+        rho             rhoInf;
+        rhoInf          1;
+        CofR            (0 0 0);
+    }
+}
+""")
+
+
 CASES = {"cavity": lambda r: cavity(r, False), "cavity_skew": lambda r: cavity(r, True),
-         "channel": channel, "duct": duct, "sphere": sphere, "cavity_lim": cavity_lim, "mrf2": mrf2}
+         "channel": channel, "duct": duct, "sphere": sphere, "cavity_lim": cavity_lim, "mrf2": mrf2,
+         "disc": disc}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

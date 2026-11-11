@@ -37,6 +37,17 @@ for c in $cases; do
     [ -f "$src/constant/polyMesh/cellZones" ] && cp "$src/constant/polyMesh/cellZones" "$dst/constant/polyMesh/"
     [ -f "$src/constant/MRFProperties" ] && cp "$src/constant/MRFProperties" "$dst/constant/"
     cp "$src"/system/{controlDict,fvSchemes,fvSolution,blockMeshDict} "$dst/system/"
+    for f in fvOptions topoSetDict; do
+        [ -f "$src/system/$f" ] && cp "$src/system/$f" "$dst/system/"
+    done
+    # function-object and fvOptions output files (forces, forceCoeffs,
+    # actuationDiskSource): the header and the rows of iterations 1..120
+    # (the transient; check-in size)
+    if [ -d "$src/postProcessing" ]; then
+        (cd "$src" && find postProcessing -name '*.dat' | while read -r f; do
+            mkdir -p "$dst/ref/$(dirname "$f")" && awk '/^#/ || $1 <= 120' "$f" > "$dst/ref/$f"
+        done)
+    fi
     last=$(ls -d "$src"/[0-9]* | xargs -n1 basename | sort -n | tail -1)
     for t in 100 $last; do
         mkdir -p "$dst/ref/$t"

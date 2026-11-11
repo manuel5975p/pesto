@@ -11,6 +11,7 @@
 #pragma once
 
 #include "dns/facemesh.hpp"
+#include "dns/fvami.hpp"
 #include "dns/fvcase.hpp"
 #include "dns/la/ell.hpp"
 
@@ -58,8 +59,51 @@ struct FvRasSetup
     std::vector<double> dlt;                      // [3 nI] C_n - C_o (FaceMesh d; limitedLinear's d)
 };
 
+// One actuationDiskSource bound to the mesh (FaceMesh numbering).
+struct FvDiskSetup
+{
+    std::vector<int> cells;      // the cellZone's cells, ascending OpenFOAM index
+    std::vector<double> frac;    // V_c / V per zone cell (cellsV[celli] / V())
+    double V = 0;                // cellSetOption::V(): sum of V_c over `cells` in that order
+    std::vector<int> monitor;    // monitor cells, ascending OpenFOAM index, unique
+    std::vector<std::int64_t> monitorSrc; // their OpenFOAM cell indices (reports)
+    // per FvDisk::monitor point: how many cells hold it (> 1: on a face / edge /
+    // vertex -- the lowest index is taken, a parallel simpleFoam may take others)
+    std::vector<int> monitorHolders;
+};
+
+// cyclicAMI (docs/fvpimple.md "cyclicAMI"): the coupled boundary faces of the
+// setup. AMI face a is boundary face aB[a] of cell P = bOwn[aB[a]]; its
+// neighbour value of a cell field x is sum_j aW[j] x[aCell[j]], j in
+// [aStart[a], aStart[a + 1]) in OpenFOAM's address order (the AMI weights after
+// normalisation; patchNeighbourField()). Geometry as cyclicAMIFvPatch /
+// basicFvGeometryScheme: wt = fvPatch::weights(), d = delta(), the patch's
+// nonOrthDeltaCoeffs (stored in FvSimpleSetup::bDc) and k =
+// nonOrthCorrectionVectors. nA == 0: none, nothing of it is read.
+struct FvAmiSetup
+{
+    int nA = 0;
+    std::vector<int> aB;                   // [nA] the boundary face
+    std::vector<int> bA;                   // [nB] its AMI face, -1: not coupled
+    std::vector<int> aStart, aCell, aFace; // CSR: the neighbour cell and its boundary face per address
+    std::vector<int> aSlot, aEll;          // the CellGraph slot / ELL position of (P, aCell)
+    std::vector<double> aW;                // weights
+    std::vector<double> wt;                // [nA]
+    std::vector<double> k, d;              // [3 nA] component-major
+    std::vector<int> rCell, rStart, rA;    // the rows with AMI faces: cell, CSR of their AMI faces (ascending b)
+    // per cyclicAMI patch pair, OpenFOAM's "AMI: Patch source|target sum(weights) min max average"
+    struct Report
+    {
+        std::string src, tgt;
+        std::array<double, 3> srcSum{}, tgtSum{};
+        int srcFaces = 0, tgtFaces = 0, srcLow = 0, tgtLow = 0; // Low: faces with a weight sum < 0.2
+    };
+    std::vector<Report> report;
+};
+
 struct FvSimpleSetup
 {
+    FvAmiSetup ami;
     int nC = 0, nI = 0, nB = 0; // nB: NON-empty boundary faces only
     int emptyAxis = -1;         // 2D: the component OpenFOAM does not solve
     // internal faces (FaceMesh order)
@@ -108,8 +152,11 @@ struct FvSimpleSetup
     bool needRef = false;
     int refCell = -1;
     double refValue = 0;
-    // forces patches: per boundary face 1 when on a forces patch
+    // forces patches: per boundary face, bit k set when on a patch of
+    // FoamCase::forces[k] (kMaxForces = 8 objects)
     std::vector<std::uint8_t> bForce;
+    // fvOptions actuationDiskSource (buildDiskSetup, dns/fvdisk): empty = none
+    std::vector<FvDiskSetup> disks;
     // OpenFOAM order maps: FaceMesh cell -> OpenFOAM cell; per OpenFOAM patch
     // its boundary-face list in local order (-1: an empty patch face)
     std::vector<std::int64_t> srcCell;
@@ -135,18 +182,72 @@ std::expected<FoamCase, std::string> loadFoamCaseManifest(const std::filesystem:
 // Phase 3: the whole case. Error (exit 3) as above plus every mesh rejection.
 std::expected<FvLoaded, std::string> loadFvCase(const std::filesystem::path& caseDir);
 
-// Binds case c to fm. pat: ellPattern(graphOf(fm)). Errors (exit 3) by name:
+// One cyclicAMI pair on the mesh's current points: the owner patch (the lower
+// polyMesh patch index) and its neighbour, OpenFOAM's AMI of them (dns/fvami).
+struct FvAmiPair
+{
+    int src = -1, tgt = -1; // polyMesh patch indices
+    FoamAmi ami;
+};
+
+// The matrix pattern of the FV path on pm's CURRENT points: fm's internal
+// faces plus, per cyclicAMI face, its cell against every cell it addresses
+// (a row gains one entry per coupled cell; the pattern changes when the AMI
+// does, i.e. at every mesh motion). No cyclicAMI patch: graphOf(fm), no pairs.
+struct FvGraph
+{
+    la::CellGraph g;
+    la::EllPattern pat;
+    std::vector<FvAmiPair> ami;
+};
+// Pre: fm = fromPolyMesh(pm, Source, .ami = true). Error (exit 3): the AMI's
+// (OpenFOAM's own fatal conditions, dns/fvami), a cell pair joined both by a
+// face and by a cyclicAMI address.
+std::expected<FvGraph, std::string> buildFvGraph(const PolyMesh& pm, const FaceMesh& fm);
+// buildSimpleSetup's cyclicAMI part (dns/fvamisetup.cpp): s.ami and the coupled
+// faces' s.bDc from the pairs. Pre: s holds the boundary faces of (fm, c).
+std::expected<void, std::string> bindFvAmi(const FaceMesh& fm, const FoamCase& c, const la::CellGraph& g,
+                                           const la::EllPattern& pat, const std::vector<FvAmiPair>& ami,
+                                           FvSimpleSetup& s);
+
+// Binds case c to fm. pat: ellPattern(g), g = graphOf(fm) or buildFvGraph's;
+// ami: buildFvGraph's pairs (required when the mesh has cyclicAMI patches:
+// fills FvSimpleSetup::ami and the coupled faces' bDc). Errors (exit 3) by name:
 // more than kMaxMrfZones active MRF zones, two active zones on one cellZone,
 // an MRF zone cell on a cyclic face, a pressure reference needed but pRefCell
-// absent.
+// absent, cyclicAMI patches without `ami`.
 std::expected<FvSimpleSetup, std::string> buildSimpleSetup(const FaceMesh& fm, const FoamCase& c,
-                                                           const la::CellGraph& g, const la::EllPattern& pat);
+                                                           const la::CellGraph& g, const la::EllPattern& pat,
+                                                           const std::vector<FvAmiPair>* ami = nullptr);
 
 // RAS: the wall distances (fvwalldist) and the turbulence fields' BC codes,
 // reference and initial values into s.ras. Pre: s = buildSimpleSetup(fm, c,
 // ...), c.ras.model != Laminar, fm from pm in Source order. Error (exit 3): the
 // wall distance's (no wall patch, meshWave with cyclics, unreached cells).
+// ami: buildFvGraph's pairs (the wave crosses cyclicAMI; required with such patches).
 std::expected<void, std::string> buildRasSetup(const PolyMesh& pm, const FaceMesh& fm, const FoamCase& c,
-                                               FvSimpleSetup& s);
+                                               FvSimpleSetup& s, const std::vector<FvAmiPair>* ami = nullptr);
+
+// OpenFOAM v2606 polyMesh::findCell(p) (CELL_TETS, the default): the cell
+// whose tet decomposition (cell centre + each face's fan from its
+// tetBasePtIs point, polyMeshTetDecomposition::findFaceBasePts) contains p
+// by tetrahedron::inside (tolerance SMALL on every side: a point on a face,
+// edge or vertex is inside every cell touching it). TIES: the LOWEST cell
+// index, which is what the serial cell octree returns (its leaves list cells
+// in ascending order). A parallel simpleFoam instead takes one cell PER
+// PROCESSOR that finds the point. Returns the OpenFOAM cell index, -1: in no
+// cell. Pre: fm = fromPolyMesh(pm, Source) (fm.C the cell centres). Error: a
+// candidate cell on a cyclic patch (its base points need the neighbour
+// half's cell centres: not built).
+std::expected<std::int64_t, std::string> foamFindCell(const PolyMesh& pm, const FaceMesh& fm,
+                                                      const std::array<double, 3>& p);
+
+// fvOptions actuationDiskSource: binds c.disks to the mesh into s.disks (the
+// zone's cells and volume fractions, the monitor cells by foamFindCell). No
+// disk: nothing. Pre: as buildRasSetup. Error (exit 3): a zone without
+// cells or volume, a monitor point in no cell ("No cell is available for
+// incoming velocity monitoring").
+std::expected<void, std::string> buildDiskSetup(const PolyMesh& pm, const FaceMesh& fm, const FoamCase& c,
+                                                FvSimpleSetup& s);
 
 } // namespace dns

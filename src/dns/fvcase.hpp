@@ -25,16 +25,19 @@ namespace dns {
 using FvVec3 = std::array<double, 3>;
 
 // Velocity boundary conditions (OpenFOAM fvPatchField semantics, verbatim).
-//  Fixed      fixedValue / noSlip / movingWallVelocity (static mesh)
+//  Fixed      fixedValue / noSlip / movingWallVelocity (FvPatchBc::movingWall:
+//             on a moving mesh its value is Uwall() of the mesh motion)
 //  ZeroGrad   zeroGradient
 //  InletOutlet mixed, valueFraction neg(phi), refValue inletValue
 //  Symmetry   slip / symmetry / symmetryPlane (basicSymmetry, per-face normal)
 //  Freestream freestreamVelocity: mixed, valueFraction 0.5 - 0.5 (U_b.n)/|U_b|
 //  Empty      empty (no fvPatch faces)
-enum class FvUBc : std::uint8_t { Fixed, ZeroGrad, InletOutlet, Symmetry, Freestream, Empty };
+//  Ami        cyclicAMI (a coupled patch: docs/fvpimple.md "cyclicAMI"); the same
+//             word on p (FvPBc), the turbulence scalars (FvSBc) and nut (FvNutBc)
+enum class FvUBc : std::uint8_t { Fixed, ZeroGrad, InletOutlet, Symmetry, Freestream, Empty, Ami };
 // Pressure: Fixed (fixedValue), ZeroGrad (zeroGradient, and the scalar side of
 // slip/symmetry), Freestream (freestreamPressure: mixed, vf 0.5 + 0.5 (U_b.n)/|U_b|), Empty.
-enum class FvPBc : std::uint8_t { Fixed, ZeroGrad, Freestream, Empty };
+enum class FvPBc : std::uint8_t { Fixed, ZeroGrad, Freestream, Empty, Ami };
 
 const char* fvUBcName(FvUBc);
 const char* fvPBcName(FvPBc);
@@ -54,6 +57,7 @@ struct FvPatchBc
     FvUBc u{};
     FvPBc p{};
     std::string uType, pType;  // the OpenFOAM spellings (reports)
+    bool movingWall = false;   // U type movingWallVelocity
     FvValue uValue;            // Fixed: value; InletOutlet: inletValue; Freestream: freestreamValue
     FvValue uInit;             // InletOutlet/Freestream `value` (initial boundary value), may be empty
     FvValue pValue;            // Fixed / Freestream value
@@ -72,6 +76,7 @@ enum class FvDiv : std::uint8_t { Linear, LinearUpwind, Upwind };
 struct FvSchemes
 {
     FvGradScheme gradU, gradP;   // grad(U), grad(p) (default when not named)
+    FvGradScheme gradPcorr;      // grad(pcorr): CorrectPhi's non-orthogonal correction (moving mesh only)
     FvDiv divU = FvDiv::Linear;  // div(phi,U)
     bool bounded = false;        // `bounded Gauss ...`
     bool lapCorrected = true;    // laplacian Gauss linear corrected | uncorrected
@@ -132,12 +137,12 @@ enum class FvTurbModel : std::uint8_t { Laminar, KOmegaSST, SpalartAllmaras };
 //  OmegaWall   omegaWallFunction (omega only, wall patches): the near-wall cell
 //              value set by the wall function, the cell fixed by setValues
 //  Empty       empty, cyclic (no fvPatch faces)
-enum class FvSBc : std::uint8_t { Fixed, ZeroGrad, InletOutlet, OmegaWall, Empty };
+enum class FvSBc : std::uint8_t { Fixed, ZeroGrad, InletOutlet, OmegaWall, Empty, Ami };
 // nut: Calculated (the model's expression), LowRe (nutLowReWallFunction: 0),
 // Spalding (nutUSpaldingWallFunction), KWall (nutkWallFunction), Cell
 // (zeroGradient / symmetry types: the cell value), Fixed (fixedValue: kept),
 // Empty (empty, cyclic).
-enum class FvNutBc : std::uint8_t { Calculated, LowRe, Spalding, KWall, Cell, Fixed, Empty };
+enum class FvNutBc : std::uint8_t { Calculated, LowRe, Spalding, KWall, Cell, Fixed, Empty, Ami };
 // wallFunctionBlenders (omegaWallFunction default binomial n 2, nutk stepwise).
 enum class FvBlend : std::uint8_t { Stepwise, Max, Binomial, Exponential, Tanh };
 const char* fvBlendName(FvBlend);
@@ -211,7 +216,81 @@ struct FvRas
 
 const char* fvTurbModelName(FvTurbModel);
 
-// The forces function object (rho rhoInf, kinematic p).
+// --- pimpleFoam (controlDict `application pimpleFoam`, docs/fvpimple.md) ---
+
+// Time::writeControl as pimpleFoam reads it (adjustableRunTime also ADJUSTS
+// deltaT to land on the write times: Time::adjustDeltaT).
+enum class FvWriteControl : std::uint8_t { TimeStep, RunTime, AdjustableRunTime };
+
+// controlDict's time controls of a transient run (createTimeControls.H, Time).
+struct FvTimeCtl
+{
+    double endTime = 0, deltaT = 0;
+    bool adjust = false;             // adjustTimeStep
+    double maxCo = 1, maxDeltaT = 1e15; // defaults 1, GREAT
+    FvWriteControl writeControl = FvWriteControl::TimeStep;
+    double writeInterval = 1;        // steps (TimeStep) or seconds
+    int timePrecision = 6;
+};
+
+// The PIMPLE dictionary (pimpleControl::read, solutionControl::read) and the
+// entries OpenFOAM selects by NAME inside the loop: on the final outer
+// corrector (mesh.data().isFinalIteration()) the U / k / omega / nuTilda
+// equations take the `<name>Final` solver and relaxation entries and p.relax()
+// the `pFinal` field factor; the p solve takes `pFinal` on the last corrector's
+// last non-orthogonal iteration (finalInnerIter). The non-final entries are
+// FoamCase::solverU, solverP, relaxU, relaxP and FvRas::solver*, relax*.
+// An entry of a name OpenFOAM never looks up in this case is left default.
+struct FvPimpleCtl
+{
+    bool on = false;                 // application pimpleFoam
+    int nOuter = 1, nCorr = 1;       // nOuterCorrectors, nCorrectors
+    bool turbOnFinalIterOnly = true; // turbOnFinalIterOnly (v2606's key)
+    FvSolverCtl solverUFinal, solverPFinal, solverKFinal, solverOmegaFinal, solverNuTildaFinal;
+    std::optional<double> relaxUFinal, relaxPFinal, relaxKFinal, relaxOmegaFinal, relaxNuTildaFinal;
+    FvTimeCtl time;
+    // Moving mesh only (FoamCase::motion.on; createDyMControls.H): correctPhi
+    // (default mesh.dynamic() = yes), checkMeshCourantNo (default no), and
+    // CorrectPhi's `pcorr` | `pcorrFinal` solver entries (pcorr: only looked up
+    // with nNonOrthogonalCorrectors > 0).
+    bool correctPhi = true, checkMeshCourantNo = false;
+    FvSolverCtl solverPcorr, solverPcorrFinal;
+};
+
+// One solid-body motion (solidBodyMotionSolver + rotatingMotion, constant
+// omega): the points of `cellZone`'s cells (empty: every point) are, at time t,
+// the INITIAL points transformed by septernion(-origin) * quaternion(axis,
+// omega t) * septernion(origin).
+struct FvSolidBody
+{
+    std::string name;     // dynamicMultiMotionSolverFvMesh entry key ("" for the single solver)
+    std::string cellZone; // "" = the whole mesh
+    FvVec3 origin{}, axis{}; // axis as written (quaternion(axis, angle) normalises it)
+    double omega = 0;     // rad/s
+};
+
+// constant/dynamicMeshDict as pimpleFoam's dynamicFvMesh reads it (docs/
+// fvpimple.md "Moving mesh"): dynamicMotionSolverFvMesh (one body) or
+// dynamicMultiMotionSolverFvMesh (its entries in dictionary order).
+struct FvDynamicMesh
+{
+    bool on = false;    // mesh.dynamic(): Uf, fvc::ddtCorr(U, Uf), correctPhi
+    bool multi = false; // dynamicMultiMotionSolverFvMesh
+    std::vector<FvSolidBody> bodies;
+};
+
+// forceCoeffs' part of a forces-type function object (OpenFOAM v2606
+// forceCoeffs): the local axes e1 (drag), e2 (side), e3 (lift) of
+// coordSystem::cartesian(CofR, liftDir, dragDir) and the reference scales.
+struct FvForceCoeffs
+{
+    FvVec3 e1{}, e2{}, e3{};
+    double magUInf = 0, lRef = 0, Aref = 0;
+};
+
+// One forces | forceCoeffs function object (rho rhoInf, kinematic p). Each
+// writes its own PREFIX/postProcessing/<name>/0/: forces force.dat +
+// moment.dat, forceCoeffs coefficient.dat.
 struct FvForces
 {
     std::string name = "forces";
@@ -219,6 +298,31 @@ struct FvForces
     double rhoInf = 1;
     FvVec3 CofR{};
     double pRef = 0;
+    std::optional<FvForceCoeffs> coeffs; // set: type forceCoeffs
+};
+
+// The coefficient.dat columns of one iteration, in file order (OpenFOAM's
+// sorted names): Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) CmPitch CmRoll CmYaw Cs Cs(f)
+// Cs(r). fp, fv, mp, mv: the object's pressure / viscous force and moment
+// sums (global axes). forceCoeffs::calcForceCoeffs / coeffDesc::value verbatim.
+std::array<double, 12> fvForceCoeffRow(const FvForces& f, const FvVec3& fp, const FvVec3& fv, const FvVec3& mp,
+                                       const FvVec3& mv);
+
+// One fvOptions actuationDiskSource, variant Froude, selectionMode cellZone
+// (OpenFOAM v2606 actuationDiskSource::calcFroudeMethod, docs/fv.md
+// "fvOptions"). Per iteration, from the monitor cells' mean U of the
+// iteration's start state: T = 2 A (Uref . dir)^2 a (1 - a), a = 1 - Cp / Ct;
+// the U matrix source of zone cell c loses ((V_c / V_zone) T) dir.
+struct FvDisk
+{
+    std::string name, cellZone;
+    double diskArea = 0;
+    FvVec3 dir{};              // diskDir / |diskDir|
+    double Cp = 0, Ct = 0;     // sink sign applied: both > 0
+    std::vector<FvVec3> monitor; // monitorCoeffs/points | upstreamPoint
+    bool writeToFile = true;
+    double writeStart = 0, writeEnd = 1e300; // writeFileStart / writeFileEnd (VGREAT)
+    int writePrecision = -1;   // < 0: the case's writePrecision
 };
 
 struct FoamCase
@@ -233,16 +337,27 @@ struct FoamCase
     FvValue uInternal, pInternal;
     FvSchemes schemes;
     FvSolverCtl solverU, solverP;
+    // SIMPLE; with pimple.on the PIMPLE dictionary's nNonOrthogonalCorrectors,
+    // momentumPredictor, pRefCell, pRefValue (consistent no, no residualControl).
     FvSimpleCtl simple;
+    FvPimpleCtl pimple;                     // on: pimpleFoam (docs/fvpimple.md)
+    FvDynamicMesh motion;                   // on: a moving mesh (pimpleFoam only)
+    bool ami = false;                       // the mesh has cyclicAMI patches (pimpleFoam only)
     double relaxP = 1;                      // fields { p }: absent = 1 (no relax)
     bool relaxPGiven = false;
     std::optional<double> relaxU;           // equations { U }: absent = no relax
     std::vector<FvMrfZone> mrf;
     // fvOptions: vectorSemiImplicitSource, selectionMode all, specific, Sp 0.
-    // U equation source per unit mass; absent: none (the only fv::option built).
+    // U equation source per unit mass; absent: none.
     std::optional<FvVec3> uSource;
+    // fvOptions: actuationDiskSource entries in file order (not with uSource,
+    // at most kMaxDisks, one per cellZone).
+    static constexpr int kMaxDisks = 8;
+    std::vector<FvDisk> disks;
     FvRas ras;                              // model Laminar: the P5b laminar solver
-    std::optional<FvForces> forces;
+    // forces / forceCoeffs function objects in controlDict order (at most 8).
+    static constexpr int kMaxForces = 8;
+    std::vector<FvForces> forces;
     std::vector<std::string> notes;         // accepted-but-not-reproduced entries (reported)
 };
 
@@ -252,7 +367,8 @@ struct FoamCase
 // constant/momentumTransport | constant/turbulenceProperties; with RAS:
 // 0/nut and 0/k + 0/omega (kOmegaSST) or 0/nuTilda (SpalartAllmaras).
 // constant/fvOptions | system/fvOptions: one constant specific U source
-// (vectorSemiImplicitSource) or rejected by name.
+// (vectorSemiImplicitSource) or actuationDiskSource entries (Froude,
+// cellZone); everything else rejected by name.
 using FoamCaseTexts = std::map<std::string, std::string>;
 
 // Pure: resolves the case against the mesh manifest (every non-cyclic patch

@@ -1,0 +1,14 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      dynamicMeshDict;
+}
+dynamicFvMesh   dynamicMotionSolverFvMesh;
+motionSolverLibs (fvMotionSolvers);
+motionSolver    solidBody;
+solidBodyMotionFunction rotatingMotion;
+origin          (0 0 0);
+axis            (0 0 1);
+omega           2;

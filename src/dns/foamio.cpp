@@ -53,7 +53,8 @@ std::expected<void, std::string> writeFoamField(const fs::path& dir, const std::
     std::error_code ec;
     fs::create_directories(dir, ec);
     if (ec) return std::unexpected(dir.string() + ": cannot create (" + ec.message() + ")");
-    const char* cls = surface ? "surfaceScalarField" : (nc == 1 ? "volScalarField" : "volVectorField");
+    const char* cls = surface ? (nc == 1 ? "surfaceScalarField" : "surfaceVectorField")
+                              : (nc == 1 ? "volScalarField" : "volVectorField");
     std::string o;
     o.reserve(internal.size() * 24 + 4096);
     o += std::format("FoamFile\n{{\n    version     2.0;\n    format      ascii;\n    arch        \"LSB;label=32;scalar=64\";\n"
@@ -74,6 +75,34 @@ std::expected<void, std::string> writeFoamField(const fs::path& dir, const std::
     }
     o += "}\n";
     const fs::path file = dir / object;
+    std::ofstream f(file, std::ios::binary | std::ios::trunc);
+    if (!f) return std::unexpected(file.string() + ": cannot create");
+    f.write(o.data(), std::streamsize(o.size()));
+    f.close();
+    if (!f) return std::unexpected(file.string() + ": write failed");
+    return {};
+}
+
+std::expected<void, std::string> writeFoamPoints(const fs::path& timeDir, const std::vector<double>& px,
+                                                 const std::vector<double>& py, const std::vector<double>& pz,
+                                                 int precision)
+{
+    const fs::path dir = timeDir / "polyMesh";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) return std::unexpected(dir.string() + ": cannot create (" + ec.message() + ")");
+    std::string o;
+    o.reserve(px.size() * 72 + 512);
+    o += std::format("FoamFile\n{{\n    version     2.0;\n    format      ascii;\n    arch        \"LSB;label=32;scalar=64\";\n"
+                     "    class       vectorField;\n    location    \"{}/polyMesh\";\n    object      points;\n}}\n\n{}\n(\n",
+                     timeDir.filename().string(), px.size());
+    for (std::size_t i = 0; i < px.size(); ++i) {
+        const double v[3] = {px[i], py[i], pz[i]};
+        putValue(o, v, 3, precision);
+        o += '\n';
+    }
+    o += ")\n";
+    const fs::path file = dir / "points";
     std::ofstream f(file, std::ios::binary | std::ios::trunc);
     if (!f) return std::unexpected(file.string() + ": cannot create");
     f.write(o.data(), std::streamsize(o.size()));

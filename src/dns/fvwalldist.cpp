@@ -267,7 +267,7 @@ struct Bvh
 } // namespace
 
 std::expected<FvWallDist, std::string> fvWallDistance(const PolyMesh& pm, const FaceMesh& fm, bool exact,
-                                                      bool correctWalls)
+                                                      bool correctWalls, std::span<const FvWaveAmi> ami)
 {
     const Poly P{pm};
     const std::size_t nCells = std::size_t(pm.man.nCells), nFaces = std::size_t(pm.man.nFaces);
@@ -356,6 +356,40 @@ std::expected<FvWallDist, std::string> fvWallDistance(const PolyMesh& pm, const 
             myO = origin;
             return true;
         };
+        // FaceCellWave::handleAMICyclicPatches, patch by patch in boundary order:
+        // receiveInfo[i] starts invalid and takes the neighbour patch's face
+        // infos (ALL faces, not only the changed ones) in the AMI's address
+        // order through the combine operator, which measures from the face
+        // centre at `owner patch start + i` WHATEVER the receiving patch is
+        // (OpenFOAM's own indexing, reproduced: on the non-owner side that is
+        // not face i's centre); the result is then merged into the face with
+        // updateFace on the face's own centre.
+        auto handleAmi = [&] {
+            for (const FvWaveAmi& A : ami) {
+                const FoamPatch& me = pm.man.patches[std::size_t(A.patch)];
+                const FoamPatch& nb = pm.man.patches[std::size_t(A.nbr)];
+                const std::int64_t cmbStart = A.owner ? me.startFace : nb.startFace;
+                std::vector<P3> ro(std::size_t(me.nFaces), {kGreat, kGreat, kGreat});
+                std::vector<double> rd(std::size_t(me.nFaces), -kGreat);
+                for (std::int64_t i = 0; i < me.nFaces; ++i)
+                    for (int j = A.side->start[std::size_t(i)]; j < A.side->start[std::size_t(i) + 1]; ++j) {
+                        const std::size_t y = std::size_t(nb.startFace + A.side->addr[std::size_t(j)]);
+                        if (!(fd[y] > -kSmall)) continue; // y.valid()
+                        const std::size_t at = std::size_t(cmbStart + i);
+                        if (at >= nFaces) continue; // OpenFOAM would read past the face list
+                        update(fc[at], fo[y], ro[std::size_t(i)], rd[std::size_t(i)]);
+                    }
+                for (std::int64_t i = 0; i < me.nFaces; ++i) {
+                    const std::size_t f = std::size_t(me.startFace + i);
+                    if (!(rd[std::size_t(i)] > -kSmall) || fo[f] == ro[std::size_t(i)]) continue;
+                    if (update(fc[f], ro[std::size_t(i)], fo[f], fd[f]) && !fChanged[f]) {
+                        fChanged[f] = 1;
+                        changedFaces.push_back(int(f));
+                    }
+                }
+            }
+        };
+        handleAmi(); // FaceCellWave::iterate's head
         const long maxIter = long(nCells) + 1;
         for (long iter = 0; iter < maxIter; ++iter) {
             // faceToCell
@@ -394,6 +428,7 @@ std::expected<FvWallDist, std::string> fvWallDistance(const PolyMesh& pm, const 
                 cChanged[std::size_t(c)] = 0;
             }
             changedCells.clear();
+            handleAmi(); // cellToFace's tail
             if (changedFaces.empty()) break;
         }
         for (std::size_t c = 0; c < nCells; ++c) {

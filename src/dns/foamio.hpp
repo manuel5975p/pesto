@@ -21,8 +21,14 @@ struct FoamPatchOut
     std::vector<double> values; // n x nc, component-interleaved, patch-local order
 };
 
+// Writes <timeDir>/polyMesh/points (a moving mesh's points at that time), as
+// OpenFOAM writes them. Creates the directory.
+std::expected<void, std::string> writeFoamPoints(const std::filesystem::path& timeDir, const std::vector<double>& px,
+                                                 const std::vector<double>& py, const std::vector<double>& pz,
+                                                 int precision);
+
 // Writes <dir>/<object> as a vol{Scalar,Vector}Field (nc 1 / 3) or a
-// surfaceScalarField (surface = true: internal = the internal faces).
+// surface{Scalar,Vector}Field (surface = true: internal = the internal faces).
 // internal: n x nc interleaved. dims: OpenFOAM dimension set text.
 // precision: significant digits (controlDict writePrecision). Creates dir.
 std::expected<void, std::string> writeFoamField(const std::filesystem::path& dir, const std::string& object,

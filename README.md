@@ -316,7 +316,15 @@ stops there. Laminar, SA, SST, MRF.
 on the IDENTICAL polyMesh on the GPU (FP32 by default, `--fv-precision fp64`
 the parity mode; below), the linear solves on `gpu/la`
 (U: BiCGStab + multicolour GS; p: AMG-PCG) with OpenFOAM's normalised-residual
-stop. The case is the OpenFOAM case directory (0/, system/, constant/);
+stop. A case whose controlDict says `application pimpleFoam` runs pimpleFoam
+on the same route (Euler, PIMPLE with its Final entries, adjustTimeStep; a
+static mesh, or the WHOLE mesh in solid-body rotation by
+`constant/dynamicMeshDict` with `movingWallVelocity` walls and correctPhi;
+`docs/fvpimple.md`: nine cases vs serial pimpleFoam at 1e-15 … 2e-12 of scale,
+the deltaT sequence digit for digit, the moved points and mesh flux bit for
+bit; `cyclicAMI` pairs (faceAreaWeightAMI, no transform), static or with
+cellZones rotating behind them: OpenFOAM's AMI weights bit for bit, five
+cases at 5e-15 … 9e-11 of scale). The case is the OpenFOAM case directory (0/, system/, constant/);
 anything the solver does not reproduce exactly is rejected by name. Fields
 match simpleFoam to 1e-13 iteration by iteration on blockMesh cases with
 tight solves; the snappy sphere Re 100 cd to 9e-13; the DTMB 4119 prop + MRF
