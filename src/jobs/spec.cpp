@@ -173,7 +173,7 @@ std::expected<JobSpec, std::string> parseSpec(const Value& v)
     auto rt = f.integer("max_runtime_s");
     if (!rt) return err(rt.error());
     if (*rt < 1 || *rt > kMaxRuntimeS)
-        return err(std::format("job: max_runtime_s must be in [1, {}] (30 min), got {}", kMaxRuntimeS, *rt));
+        return err(std::format("job: max_runtime_s must be in [1, {}] (4 h), got {}", kMaxRuntimeS, *rt));
     s.maxRuntimeS = int(*rt);
     auto mem = f.integer("max_mem_mb");
     if (!mem) return err(mem.error());

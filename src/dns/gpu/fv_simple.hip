@@ -951,6 +951,7 @@ std::expected<FvSolveLog, std::string> SimpleImpl<R>::solve(la::BlockEll<R>& A, 
     o.absTol = std::max(ctl.tolerance, floor);
     o.flexible = pcg;
     o.r0First = r0First;
+    if (!pcg && ctl.relTol > 0) o.minIterStarted = looseMinIter;
     const la::KrylovStart<R> st{Ax.data(), tmp.data()};
     const la::LinOp<R> Aop = [&A](const R* in, R* out) { A.spmv(in, out); };
     auto r = pcg ? kr->pcg(Aop, M, rhs.data(), xv, o, st) : kr->bicgstab(Aop, M, rhs.data(), xv, o, st);
@@ -983,6 +984,7 @@ std::expected<void, std::string> SimpleImpl<R>::solveU(unsigned mask, FvIterLog&
     la::KrylovOptions o;
     o.maxIter = ctl.maxIter;
     o.minIter = ctl.minIter;
+    o.minIterStarted = ctl.relTol > 0 ? looseMinIter : 0;
     o.relTol = ctl.relTol;
     o.absTol = std::max(ctl.tolerance, floor.U);
     const la::KrylovStart<R> st{Ax3.data(), tmp.data()};

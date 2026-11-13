@@ -386,8 +386,25 @@ initial guess's mean, `lduMatrix::solver::normFactor`), stop when below
 between `minIter` and `maxIter`
 (`KrylovOptions::normFactor`, `minIter`). OpenFOAM's solver NAMES (GAMG,
 PCG, smoothSolver, PBiCGStab) select our solver per field; their iterates are
-not reproduced (`notes` in the case description), so a relTol-0.01 transient
-agrees to ~1e-3, the fixed point to solver tolerance.
+not reproduced (`notes` in the case description). The solver-INTERNAL keys
+(`smoother`, `preconditioner`, `nSweeps`, `nCellsInCoarsestLevel`,
+`cacheAgglomeration`, `agglomerator`, `mergeLevels`, `n/maxPre/PostSweeps`,
+`*SweepsLevelMultiplier`, `nFinestSweeps`, `directSolveCoarsest`,
+`nVcycles`, `scaleCorrection`, `interpolateCorrection`,
+`processorAgglomerator`, `log`) are accepted, values not validated, and not
+used: they shape OpenFOAM's ITERATE inside a solve, which dns never
+reproduces (solver choice is free). The STOP keys (`tolerance`, `relTol`,
+`maxIter`, `minIter`) are reproduced exactly. Admissible because dns's
+iterate at a relTol stop is, measured, at least as close to converged as
+OpenFOAM's: p AMG-PCG leaves 5x less error than GAMG on one identical M17
+solve (rms 175 vs 850 Pa); U under the pimpleFoam loose-solve rule is 2.5x
+closer than pimpleFoam's own loose run (M17 aft thrust 4.9e-5 vs 1.2e-4 off
+converged). A key that would change OpenFOAM's ANSWER (not its iterate)
+stays rejected by name. pimpleFoam adds one rule: a BiCGStab +
+multicolour-GS solve whose entry has relTol > 0 iterates at least twice once
+it starts (docs/fvpimple.md "Reading the case"). So a relTol-0.01 transient
+agrees to the loose run's own distance from converged (M17: 1e-4), the fixed
+point to solver tolerance.
 
 ## Output and CLI
 

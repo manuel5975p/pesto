@@ -39,6 +39,11 @@ struct KrylovOptions
     double normFactor = 0;
     // PCG and BiCGStab: iterate at least this often (OpenFOAM minIter).
     int minIter = 0;
+    // BiCGStab (solo and batch) only: a solve whose r0 is above its target (one
+    // that iterates at all) iterates at least this often; one converged at r0
+    // keeps x0 (OpenFOAM tests r0 before its first sweep). 0 = off, the loop
+    // byte for byte. PCG does not read it.
+    int minIterStarted = 0;
     // PCG with minIter 0: read r0 BEFORE the first M apply (an already-
     // converged solve then costs no M, one extra sync otherwise); false: M
     // first, r0 and (r, z) in one batch. The same results either way -- a

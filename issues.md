@@ -2300,36 +2300,58 @@ Baseline at 644e596: `dns bench --physics compressible --n 256` 20.24 ms/step,
         non-finite residual`: p / pcorr on BiCGStab around the scaled
         V-cycle) does not occur on the flexible AMG-PCG. Numbers:
         fvpimple.md "The M17 case".
-    (p) **NOT closed, sharper: dns's AMG-PCG stopped at the case's relTol
-        0.01 leaves more error than GAMG where the system is
-        ill-conditioned.** M17, FP64 vs serial pimpleFoam at the user's
-        tolerances, 20 steps: T_fwd ≤ 8.1e-5, but T_aft 3.2e-3 / Q_aft 2.8e-3
-        at step 10 (a bump over steps 6–13, peak +0.058 N of 18.38 N).
-        Chain, measured: (1) tightening only `tolerance` (p 1e-11, pcorr
-        1e-10) moves neither code (dns +0.0587 N, pimpleFoam within 1e-5 N
-        of its loose run); (2) with `relTol 0` on EVERY solve (12 steps) dns
-        vs serial pimpleFoam is T_fwd ≤ 1.5e-6, Q_fwd ≤ 1.6e-6, T_aft ≤
-        1.1e-6, Q_aft ≤ 1.3e-6 — not an algebra difference; (3) it lives in
-        the solves stopped at relTol 0.01 (first non-orthogonal p solve of
-        each corrector) / 0.1 (non-final U): the second p solve corrects
-        with an explicit non-orthogonal term built on an unconverged p.
-        OpenFOAM's GAMG at relTol 0.01 is within 6.1e-5 of its own converged
-        run on T_aft, dns's AMG-PCG 3.2e-3; (4) where: a dead-end cavity
-        inside the tail (x 0.78–0.9986, r < 0.045, first-step p 6e5–1.3e6
-        against 612 of stagnation), fed only through the ring at r 0.04
-        next to the aft AMI's end cap, where all 24 faces without overlap
-        sit and one AMIAft2 face's weight sum falls 0.33 → 0.0002 over steps
-        3–15; one step in p differs by a near-uniform 227 Pa there (2.7e-4
-        of its level), U by up to 0.56 m/s in hub cells, nut in 98 000 cells
-        by up to 37 % of scale (`cellLimited` amplifies U differences of
-        1e-4). OpenFOAM against itself over those 20 steps: np 14 vs serial
-        T_aft ≤ 1.3e-4, solver twin ≤ 6.4e-5. Iterations: GAMG 37–66 per
-        step, AMG-PCG 103–171. A parity run of this case needs `relTol 0`,
-        or a p solver whose error at relTol 0.01 is GAMG's (FGMRES + AMG is
-        in `gpu/la`, without the OpenFOAM norm start): not built. Done: a
-        solve that reaches maxIter is reported on stderr by name, its count
-        in the end summary (0 on every M17 run). Flexible PCG on the
-        non-symmetric matrix still has no guarantee.
+    (p) **CLOSED: the aft bump was the non-final U solve, not the p solve**
+        (plans/masterplan_pquality.md; plans/analysis_pquality_{1,2,3}.md).
+        M17 FP64 at the user's tolerances: aft thrust 3.1e-3 off pimpleFoam
+        relTol 0 at step 10 (steps 6-13, +0.058 N of 18.38 N). Isolated with
+        fvSolution copies (T_aft worst, 12 steps): p relTol 0 alone 2.3e-3;
+        p 1e-3 2.4e-3; U relTol 0 alone (p at 0.01) 1.8e-5-4.2e-5; U relTol
+        0.01 3.1e-3 (still one iteration).
+        Cause: a non-final U solve (relTol 0.1) stops after ONE BiCGStab
+        iteration at its half step, x0 + alpha M^-1 r0, alpha ~ 1 = one
+        multicolour symmetric GS sweep. OpenFOAM's smoothSolver does one
+        SEQUENTIAL symGaussSeidel sweep. Single-solve errors differ 1.2-1.8x
+        (step 2 aft-box max 0.36 vs 0.24 m/s: host lexicographic sweep on the
+        same matrix), but the MC iterate seeds aft-blade wall cells (r/R
+        0.82-0.89, both blades, x ~1.010; cell 1819 0.18 vs pimpleFoam's
+        0.0078 m/s at step 2) that grow 10x by step 4 and to 14 m/s by step
+        8. At step 8 one face carries 77 % of the T_aft error, five faces
+        94 %. Not the tail cavity, not the uncovered AMI faces: the earlier
+        item (4) located where p and nut differ, not where T_aft's error
+        lives.
+        p is cleared: dns's AMG-PCG at relTol 0.01 leaves 5x LESS p error
+        than GAMG on one identical solve (rms 175 vs 850 Pa). OpenFOAM with
+        p on PCG + GAMG-preconditioner at relTol 0.01 stays within 8.4e-5
+        over 13 steps (`runs/pquality/a3/S7c`): a Krylov p stop does not make
+        the bump.
+        Fix: a pimpleFoam BiCGStab + MC-GS solve (U, k, omega) whose entry
+        has relTol > 0 iterates at least TWICE once it starts
+        (`KrylovOptions::minIterStarted`, `kPimpleLooseMinIter`). A solve
+        converged at r0 keeps x0 (OpenFOAM's r0 test). simpleFoam untouched:
+        its answer is the fixed point (bit_perf byte-identical).
+        Numbers, M17 20 steps vs dns relTol 0 (itself <= 1.5e-6 from
+        pimpleFoam relTol 0 over 12): FP64 T_aft <= 4.9e-5, T_fwd <= 6.2e-6
+        (before 3.1e-3 / 9.9e-5; pimpleFoam's own loose run T_aft <= 1.2e-4);
+        FP32 T_aft <= 4.5e-5, T_fwd <= 5.3e-5; vs serial pimpleFoam at the
+        same tolerances T_aft <= 1.48e-4 (its own distance from converged).
+        Cost +7 ms per 2.2 s step (FP64 solves 384.5 -> 391.8 ms).
+        Open, recorded: (p1) WHY one MC sweep's 1.2-1.8x larger iterate
+        error becomes a 50x trajectory difference while a sequential sweep's
+        does not (threshold response, `cellLimited` suspected); the deciding
+        probe: one non-final solveU instrumented from a tight-trajectory
+        state at steps 2-4, per-cell error vs a 1e-14 solve for the half
+        step, iteration 1, iteration 2, one MC sweep, one host lexicographic
+        sweep, at cells 1819 / 125164 / 294586 vs the bulk. (p2) The
+        k/omega half of the rule is by analogy; no case solves them loose
+        and measures it. (p3) The 720-step FP32 run (fvpimple.md) predates
+        the rule; its step-603 excursion (T_aft 6.6e-3) is not re-run (26
+        min). (p4) Flexible PCG on the non-symmetric cyclicAMI p matrix
+        still has no guarantee (0 failures on every M17 solve). (p5) Not
+        adopted, measured: p K-cycle (Jacobi) 3-4x less p error at equal
+        cost on the 36 M17 p probes (no trajectory need); a stationary
+        GAMG-like cycle on dns's hierarchy 10-50x MORE.
+        Iterations (GAMG 37-66, AMG-PCG 103-171 per step) are cost, not
+        quality.
     (q) **Cost of the per-step rebuild** (correctness first), M17, 1 227 027
         cells, per time step: FP64 2789 ms at the start of 3d → 2182 (host
         mesh update 1624 + device 190 + solves 368); FP32 2236 (1832 + 224 +

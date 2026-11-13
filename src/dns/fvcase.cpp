@@ -1124,6 +1124,8 @@ std::expected<void, string> readPimpleSolution(const Dict& d, const PolyManifest
                                       "reads `turbOnFinalIterOnly`, default yes): turbulence is corrected {}",
                                       pc.turbOnFinalIterOnly ? "on the final outer corrector only"
                                                              : "on every outer corrector (turbOnFinalIterOnly no)"));
+    c.notes.push_back("pimpleFoam: a U / k / omega solve with relTol > 0 that iterates takes at least 2 BiCGStab "
+                      "iterations (one multicolour GS sweep is not OpenFOAM's sequential sweep: issues.md 65 (p))");
     // createDyMControls.H: correctPhi (default mesh.dynamic()), checkMeshCourantNo (no),
     // moveMeshOuterCorrectors (no). Used only when the mesh changes.
     if (auto r = fixedSwitch("moveMeshOuterCorrectors", false,
@@ -2324,13 +2326,16 @@ std::expected<FoamCase, string> parseFoamCase(const FoamCaseTexts& t, const Poly
     }
     if (c.solverP.solver == "GAMG")
         c.notes.push_back("p: OpenFOAM GAMG -> gpu/la AMG-PCG; OpenFOAM's tolerance/relTol stop reproduced (FP32: "
-                          "at max(tolerance, floor)), its iterates are not");
+                          "at max(tolerance, floor)), its iterates are not; smoother / cycle / agglomeration keys "
+                          "accepted, not used");
     if (c.solverU.solver == "smoothSolver")
-        c.notes.push_back("U: OpenFOAM smoothSolver -> gpu/la BiCGStab + multicolour GS; stop reproduced (FP32: at max(tolerance, floor))");
+        c.notes.push_back("U: OpenFOAM smoothSolver -> gpu/la BiCGStab + multicolour GS; stop reproduced (FP32: at max(tolerance, "
+                          "floor)); smoother, nSweeps accepted, not used");
     if (c.ras.model != FvTurbModel::Laminar)
         c.notes.push_back(std::string("RAS scalars: OpenFOAM ") +
                           (c.ras.model == FvTurbModel::KOmegaSST ? c.ras.solverK.solver : c.ras.solverNuTilda.solver) +
-                          " -> gpu/la BiCGStab + multicolour GS; stop reproduced (FP32: at max(tolerance, floor))");
+                          " -> gpu/la BiCGStab + multicolour GS; stop reproduced (FP32: at max(tolerance, floor)); "
+                          "smoother, nSweeps accepted, not used");
     return c;
 }
 

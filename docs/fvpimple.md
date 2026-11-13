@@ -16,7 +16,9 @@ path, static or with a cellZone rotating behind it. Stage 3d ("The M17 case"
 below) is the user's sliding-mesh propeller case (`m17_prop5_8000_ami`,
 1 227 027 cells, two contra-rotating zones) run through it with ONE
 dictionary line changed, compared step by step with pimpleFoam: measured, not
-a parity gate at the case's own tolerances (a stated solver-quality gap).
+a parity gate at the case's own tolerances; at those tolerances dns is closer
+to the converged run than pimpleFoam's own loose run (the loose-solve rule,
+"Reading the case").
 Open points: `issues.md` item 65 of "FaceMesh / FV path".
 
 Dispatch: `drive::runFvFlow` reads the case (`loadFvCase`), then
@@ -145,6 +147,12 @@ order).
   `k`, `omega` only with `turbOnFinalIterOnly no`. Relaxation: `fields { p;
   pFinal; }`, `equations { U; UFinal; k; kFinal; omega; omegaFinal; }`, literal
   or regex keys.
+- Linear solves are simpleFoam's (docs/fv.md), plus one rule: a BiCGStab +
+  multicolour-GS solve (U; k, omega with `turbOnFinalIterOnly no`) whose
+  entry has relTol > 0 iterates at least twice once it starts
+  (`kPimpleLooseMinIter`). One MC sweep is not OpenFOAM's sequential sweep:
+  M17 aft thrust 3.1e-3 -> 4.9e-5 off converged. relTol 0 entries (every
+  gate) are untouched.
 - **`turbulenceOnFinalIterOnly` is not a v2606 key.** `pimpleControl::read`
   reads `turbOnFinalIterOnly` (default yes); the M17 case's
   `turbulenceOnFinalIterOnly no;` is read by nothing, so its pimpleFoam run
@@ -533,68 +541,78 @@ user's np-14 log has no `trapFpe` line): with trapping it dies in
 `kOmegaSSTBase::F2` at construction (division by the patch value 0 of omega
 on cyclicAMI faces without overlap).
 
-**20 steps from time 0, FP64** (re-run on the final binary, B3 included:
-every written field byte-identical to the run before B3, every iteration count
-equal; only reported initial residuals move — Ux ≤ 2.0e-9, k ≤ 4.0e-10
-relative, pcorr in the 6th digit — so the table below holds as printed).
-References: the user's np-14 log; serial pimpleFoam at the case's own
-tolerances (328 s for 20 steps); a serial OpenFOAM-vs-OpenFOAM twin (U / k /
-omega `PBiCGStab + DILU`, p `GaussSeidel`, `nCellsInCoarsestLevel 10`).
+**20 steps from time 0, FP64, with the loose-solve rule** ("Reading the
+case"; `runs/pquality/impl/m64`, byte-identical to the planner's twin
+`runs/pquality/mp/umin2_64`: U `minIter 2`). References: the user's np-14 log;
+serial pimpleFoam at the case's own tolerances (328 s for 20 steps); a serial
+OpenFOAM-vs-OpenFOAM twin (U / k / omega `PBiCGStab + DILU`, p
+`GaussSeidel`, `nCellsInCoarsestLevel 10`).
 
 Equal to the printed digits on every step: deltaT (worst 7.4e-9 = the log's 8
 digits), every `AMI: … sum(weights)` number of both pairs (0 difference at 8
-digits), Courant mean (1.9e-8). Courant max: 3.1e-6.
+digits), Courant mean (1.9e-8). Courant max: 1.8e-5 (step 2).
 
 dns FP64 vs SERIAL pimpleFoam, the user's tolerances (relative):
 
 | step | time | T_fwd | Q_fwd | T_aft | Q_aft | airframe \|F\| | first-corrector U residuals | first p residual per corrector | omega / k residual |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | 5.9952038e-06 | 6.3e-6 | 7.1e-6 | 2.4e-6 | 2.0e-6 | 1.3e-5 | 1.8e-3 | 2.8e-4 | 1.1e-6 / 3.6e-6 |
-| 10 | 7.2076379e-05 | 4.0e-5 | 2.1e-5 | **3.2e-3** | **2.8e-3** | 8.7e-4 | 4.1e-3 | 3.0e-4 | 1.1e-4 / 2.1e-4 |
-| 20 | 0.00014634826 | 6.9e-6 | 8.6e-6 | 1.4e-4 | 1.5e-4 | 5.3e-4 | 8.1e-3 | 2.3e-3 | 2.4e-4 / 5.4e-5 |
-| worst of 20 | | 8.1e-5 (15) | 6.7e-5 (2) | 3.15e-3 (10) | 2.8e-3 (10) | 2.9e-3 (2) | 1.15e-2 (15) | 2.3e-3 (20) | 2.4e-4 / 4.1e-4 |
+| 1 | 5.9952038e-06 | 9.3e-6 | 2.8e-6 | 3.8e-6 | 2.1e-6 | 2.1e-5 | 2.9e-3 | 1.5e-3 | 3.6e-7 / 3.6e-6 |
+| 10 | 7.2076379e-05 | 2.2e-5 | 2.1e-5 | 2.8e-5 | 1.4e-5 | 6.0e-4 | 3.1e-3 | 1.4e-3 | 1.1e-4 / 1.6e-4 |
+| 20 | 0.00014634826 | 4.2e-5 | 3.3e-5 | 1.4e-4 | 1.4e-4 | 3.2e-4 | 8.0e-3 | 1.5e-3 | 2.2e-4 / 1.0e-5 |
+| worst of 20 | | 5.55e-5 (6) | 4.92e-5 (2) | 1.48e-4 (14) | 1.52e-4 (19) | 4.96e-3 (2) | 7.96e-3 (20) | 2.43e-3 (17) | 2.22e-4 / 3.71e-4 |
 
-Against the user's np-14 run: T_fwd 1.4e-5 / 4.8e-5 / 1.7e-4, T_aft 1.1e-5 /
-3.1e-3 / 3.3e-5 at steps 1 / 10 / 20 (run before B1–B3; the aft numbers did
-not move with them). OpenFOAM against itself over the same 20 steps: np 14 vs
-serial T_fwd ≤ 2.6e-4, T_aft ≤ 1.3e-4, airframe 1.9e-3 (step 2); twin vs
-serial T_fwd ≤ 4.5e-5, T_aft ≤ 6.4e-5. Second non-orthogonal p residuals and
-the continuity errors are not comparable (they measure how the first, relTol
-0.01, solve stopped): up to 48 % apart. Iterations: GAMG 37–66 per step, dns
-AMG-PCG 103–171. FP32 (pre-fix binary) vs serial: T_fwd ≤ 8.8e-5, T_aft ≤
-2.3e-3, U residuals up to 12× (FP32 noise floor), continuity sum local 1e-10
-against 1e-15; 125 `floor-limited` stops in 20 steps.
+Before the rule (binary `ed54fed3e95fff83…`) the same comparison read T_aft
+**3.2e-3** / Q_aft 2.8e-3 at step 10. The airframe's worst (4.96e-3, step 2)
+is inside pimpleFoam's own distance from its converged run there (5.44e-3).
 
-**The aft bump (steps 6–13, peak +0.058 N of 18.38 N at step 10) is NOT an
-algebra difference; it is a stated solver-quality gap, not closed** (issues.md
-65 (p)). Measured chain:
-1. Tightening only `tolerance` (p 1e-11, pcorr 1e-10) changes neither code:
-   dns +0.0587 N, pimpleFoam within 1e-5 N of its loose run.
-2. With `relTol 0` on EVERY solve as well (12 steps): **dns FP64 vs serial
-   pimpleFoam T_fwd ≤ 1.5e-6, Q_fwd ≤ 1.6e-6, T_aft ≤ 1.1e-6, Q_aft ≤ 1.3e-6**
-   (step 10: T_aft 2.9e-7), Courant max 6.2e-8, airframe |F| 2.3e-5 typical,
-   2.7e-4 at step 2.
-3. So the difference lives in the solves the case stops at relTol 0.01 (first
-   non-orthogonal p solve of each corrector) / 0.1 (non-final U): the second p
-   solve then corrects with an explicit non-orthogonal term built on an
-   unconverged p. OpenFOAM's GAMG at relTol 0.01 is within 6.1e-5 of its own
-   converged run on T_aft; **dns's AMG-PCG at the same stop is 3.2e-3 off**:
-   it leaves more error where the system is ill-conditioned.
-4. Where: a dead-end cavity inside the tail, x 0.78–0.9986, r < 0.045
-   (first-step p 6e5–1.3e6 against 612 of stagnation), fed only through the
-   ring at r 0.04 next to the aft AMI's end cap, where all 24 faces without
-   overlap sit (each in an `airframe` wall cell of the ROTATING zone: the
-   user's `airframe` noSlip patch has faces inside `rotorAft`) and where one
-   AMIAft2 face's weight sum falls 0.33 → 0.0002 over steps 3–15. One step in:
-   p differs by a near-uniform 227 Pa in that cavity (2.7e-4 of its level), U
-   by up to 0.56 m/s in hub cells; nut differs in 98 000 cells by up to 37 %
-   of scale because `cellLimited` amplifies U differences of 1e-4 (k, omega
-   agree to 1e-3 / 1e-4 there).
+Against dns relTol 0 (`runs/pquality/mp/tight64`: every solve relTol 0,
+itself ≤ 1.54e-6 from pimpleFoam relTol 0 over 12 steps,
+`runs/ami3d/m17full_foam`), worst over 20 steps:
 
-A parity run of this case needs `relTol 0`, or a p solver whose error at
-relTol 0.01 is GAMG's (FGMRES + AMG is in `gpu/la`).
+| run (20 steps) | T_fwd | Q_fwd | T_aft | Q_aft |
+|---|---|---|---|---|
+| dns FP64, rule (`pquality/impl/m64`) | 6.24e-6 | 6.08e-6 | **4.89e-5** | 4.41e-5 |
+| dns FP64, before (`ami3d/final64`) | 9.93e-5 | 7.98e-5 | 3.12e-3 | 2.79e-3 |
+| dns FP32, rule (`pquality/impl/m32`) | 5.30e-5 | 4.24e-5 | 4.52e-5 | 3.71e-5 |
+| pimpleFoam serial, user tolerances (`ami3d/foam_serial20`) | 5.72e-5 | 4.91e-5 | 1.21e-4 | 1.31e-4 |
 
-**720 steps, FP32 (the default), final binary** (sha256 `ed54fed3e95fff83…`),
+At the user's tolerances dns is 2.5× closer to converged than pimpleFoam's own
+loose run. Against pimpleFoam relTol 0 (12 steps): FP64 T_aft ≤ 4.24e-5 (step
+5), Q_aft 3.71e-5, T_fwd 6.49e-6; FP32 T_aft 4.53e-5, T_fwd 5.33e-5.
+
+Against the user's np-14 run (pre-rule binary): T_fwd 1.4e-5 / 4.8e-5 /
+1.7e-4, T_aft 1.1e-5 / 3.1e-3 / 3.3e-5 at steps 1 / 10 / 20. OpenFOAM against
+itself over the same 20 steps: np 14 vs serial T_fwd ≤ 2.6e-4, T_aft ≤
+1.3e-4, airframe 1.9e-3 (step 2); twin vs serial T_fwd ≤ 4.5e-5, T_aft ≤
+6.4e-5. Second non-orthogonal p residuals and the continuity errors are not
+comparable (they measure how the first, relTol 0.01, solve stopped): up to
+48 % apart. Iterations: GAMG 37–66 per step, dns AMG-PCG 103–171. FP32 with
+the rule (`pquality/impl/m32`) vs serial: T_fwd ≤ 2.63e-5, T_aft ≤ 1.21e-4
+(step 14), U residuals up to 12× (relative 11.1, the FP32 noise floor),
+continuity sum local 1e-10 against 1e-15; 125 `floor-limited` stops in 20
+steps.
+
+**The aft bump (steps 6–13, peak +0.058 N of 18.38 N at step 10, before the
+rule) was the non-final U solve, not p** (issues.md 65 (p), closed). Cause: a
+non-final U solve (relTol 0.1) stopped after ONE BiCGStab iteration at its
+half step, x0 + alpha M^-1 r0 with alpha ~ 1 = one multicolour symmetric GS
+sweep, where OpenFOAM's smoothSolver does one SEQUENTIAL symGaussSeidel sweep.
+The single-solve errors differ only 1.2–1.8×, but the MC iterate seeds
+aft-blade wall cells (r/R 0.82–0.89, both blades) that grow 10× by step 4; at
+step 8 one face carries 77 % of the T_aft error. Isolation (fvSolution copies,
+T_aft worst over 12 steps): (1) tightening only `tolerance` (p 1e-11, pcorr
+1e-10) changes neither code (dns +0.0587 N, pimpleFoam within 1e-5 N of its
+loose run); (2) `relTol 0` on EVERY solve: dns FP64 vs serial pimpleFoam T_fwd
+≤ 1.5e-6, Q_fwd ≤ 1.6e-6, T_aft ≤ 1.1e-6, Q_aft ≤ 1.3e-6; (3) p relTol 0
+alone 2.3e-3, p relTol 1e-3 2.4e-3; (4) U relTol 0 alone (p at 0.01)
+1.8e-5–4.2e-5; U relTol 0.01 3.1e-3 (still one iteration); U `minIter 2`
+1.8e-5. p is cleared: dns's AMG-PCG at relTol 0.01 leaves 5× less p error
+than GAMG on one identical solve, and OpenFOAM with p on PCG +
+GAMG-preconditioner at relTol 0.01 stays within 8.4e-5. Fix: the loose-solve
+rule (`kPimpleLooseMinIter`).
+
+**720 steps, FP32 (the default), binary before the loose-solve rule** (sha256
+`ed54fed3e95fff83…`, not re-run),
 the user's dictionaries with the one line above, against the user's np-14
 pimpleFoam log at equal step numbers: t = 0.0052342239 (foam 0.0052342864),
 0.698 of a revolution at 8000 rpm. Stable in FP32: 0 linear solves at maxIter,
@@ -623,9 +641,9 @@ cavity's): 1.0e-1 at step 655. Values at step 720: T_fwd 25.25578 N (user)
 | T_aft [N] | 18.89050 | 18.88676 | 2.0e-4 |
 | Q_aft | 1.32988 | 1.32981 | 5.8e-5 |
 
-The aft excursions (steps ~10, ~603) are the relTol / cavity mechanism above:
-measured for steps 6–13, inferred for step 603. This is a trajectory
-comparison against a relTol 0.01 / 0.1 np-14 run, not a gate.
+The step-10 excursion is the one-iteration non-final U solve (closed above);
+step 603 is inferred the same, not re-run (issues 65 (p3)). This is a
+trajectory comparison against a relTol 0.01 / 0.1 np-14 run, not a gate.
 
 **Cost.** The 720-step run: 2174.44 ms per step = host mesh update 1785.2 +
 device 217.2 + solves 172.0; wall 1569.9 s against the user's ClockTime 4170 s
@@ -639,6 +657,13 @@ MiB. Per time step on 20-step runs (CPU otherwise idle unless noted):
 | after the overlap change (the side thread), FP32 | 2236 | 1832 | 224 | 181 |
 | after the overlap change, FP64 | 2414 | 1848 | 199 | 368 |
 | final algebra (B1, B2), FP64 | 2182 | 1624 | 190 | 368 |
+| loose-solve rule, FP64 | 2205.6 | 1625.6 | 188.1 | 391.8 |
+| loose-solve rule, FP32 | 2005.7 | 1605.4 | 212.4 | 187.9 |
+
+The two loose-solve rows are the planner's twin (job 2773, U `minIter 2`),
+byte-identical to the rule's run (same iterations, every force and stats
+column); the rule's own run (job 2779) ran beside an external GPU load (100 %,
+271 W, no KFD process) and read 3544.2 / 2802.6 ms: not a cost number.
 
 Device memory (free-memory delta): FP32 2222 MiB, FP64 3718 MiB; host peak
 RSS 3.5–4.5 GiB on the 20-step runs. The user's np-14 pimpleFoam: 5.8 s per
@@ -654,7 +679,12 @@ restructure); the AMG aggregation is redone every step.
 PASS, `gpu_fv_simple` 87 PASS. `bit_perf.sh` 14/14 byte-identical FP64 and
 FP32, `pimple_bytes.sh` 9/9 FP64, FP32 8/9 + `mspin` rc 7 (pre-existing,
 stage 3c: the pre-3d binary exits 7 there too), all against the pre-3d
-binary's outputs.
+binary's outputs. Loose-solve rule binary: `ctest -L fast` 66/66,
+`gpu_fv_pimple` 161 PASS (157 + L1–L3, every old gate line identical),
+`gpu_fv_simple` 87 PASS (identical), `gpu_la_ref` 384 PASS, `gpu_la1` 172,
+`gpu_la2` 67; `bit_perf.sh` 14/14 byte-identical FP64 and FP32,
+`pimple_bytes.sh` 9/9 FP64, FP32 8/9 + `mspin` rc 7 with the same text, all
+against the pre-rule binary's (`ed54fed3e95fff83…`) outputs.
 
 ### Reading the case
 
@@ -774,3 +804,8 @@ directory names is not built; a function object's `writeControl` is ignored
   in step with the cell field.
 - **The AMI is recomputed, never rotated**: `foamCyclicAmi` on the moved
   points once per mesh update, and the matrix pattern with it.
+- **A loose solve is held to OpenFOAM's converged run, not to OpenFOAM's
+  iterate**: a pimpleFoam BiCGStab + MC-GS solve with relTol > 0 that starts
+  takes >= 2 iterations (`kPimpleLooseMinIter`); relTol-0 entries are
+  untouched (`pimple_bytes.sh` byte-identical). Without it M17's aft bump
+  (3.1e-3) returns.

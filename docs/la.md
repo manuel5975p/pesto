@@ -142,7 +142,10 @@ atomics) straight into `BlockEll::off()`.
   normFactor (the caller computes `lduMatrix::solver::normFactor` from the
   initial guess; the L1 sum rides the same dot batch: a pair with b = null
   is Σ|a_i|), so r0, residual and the stop are OpenFOAM's; BiCGStab keeps
-  its 2-norms for the shadow-restart test. `minIter` = OpenFOAM's. Both
+  its 2-norms for the shadow-restart test. `minIter` = OpenFOAM's.
+  `minIterStarted` (BiCGStab only): at least that many iterations once r0 is
+  above the target; a solve converged at r0 keeps x0; 0 = byte for byte
+  (`gpu_la_ref`). Both
   default off: the 2-norm loop byte for byte. `KrylovResult` reports iterations, r0, the
   recursive |r| and |r|/|r0|, converged, breakdown, BiCGStab restarts.
 - **Device-side start** (`KrylovStart`): `Ax` = A x0 computed by the caller

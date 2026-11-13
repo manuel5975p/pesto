@@ -76,8 +76,8 @@ json::Value spec(int runtime, long long mem, const std::string& extraKey = "")
 void specTests()
 {
     std::printf("spec\n");
-    check(parseSpec(spec(1800, 16384)).has_value(), "30 min / 16 GiB accepted");
-    check(!parseSpec(spec(1801, 1024)).has_value(), "1801 s rejected");
+    check(parseSpec(spec(14400, 16384)).has_value(), "4 h / 16 GiB accepted");
+    check(!parseSpec(spec(14401, 1024)).has_value(), "14401 s rejected");
     check(!parseSpec(spec(0, 1024)).has_value(), "0 s rejected");
     check(!parseSpec(spec(60, 16385)).has_value(), "16385 MB rejected");
     check(!parseSpec(spec(60, kMinMemMb - 1)).has_value(), "below the runner's own floor rejected");

@@ -533,6 +533,10 @@ struct SimpleImpl final : DeviceSimple::Impl
     // where r0 is read before the V-cycle (KrylovOptions::r0First, solve()).
     std::vector<int> pLastIters;
     bool r0First = false;
+    // pimpleFoam (timeStep sets kPimpleLooseMinIter): a BiCGStab + MC-GS solve
+    // (U, k, omega) with relTol > 0 that starts iterates at least this often
+    // (KrylovOptions::minIterStarted). 0 = simpleFoam: the solves as before.
+    int looseMinIter = 0;
 
     // mesh storage
     DeviceBuffer<int> own, nei, bOwn, cStart, cEnt, cEll;

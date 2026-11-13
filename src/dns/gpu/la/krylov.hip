@@ -502,12 +502,13 @@ std::expected<KrylovResult, std::string> Krylov<T>::bicgstab(const LinOp<T>& A, 
     res.r0 = res.residual = l1 ? d[1] / nf : r2;
     if (!std::isfinite(res.r0) || !std::isfinite(r2)) return nonFinite("bicgstab");
     const double target = std::max(o.relTol * res.r0, o.absTol);
+    const int minIt = res.r0 > target ? std::max(o.minIter, o.minIterStarted) : o.minIter;
     double rho = 1, alpha = 1, omega = 1, rhoNew = d[0], rhNorm = r2;
     internal::DotArgs<T> rvArgs{};
     rvArgs.a[0] = rh;
     rvArgs.b[0] = v;
     bool fresh = true;
-    while ((res.residual > target || res.iterations < o.minIter) && res.iterations < o.maxIter) {
+    while ((res.residual > target || res.iterations < minIt) && res.iterations < o.maxIter) {
         if (std::abs(rhoNew) <= kShadowRestart * rhNorm * r2) {
             // Lanczos breakdown (r ~ orthogonal to the shadow): restart the
             // shadow residual at the current r (measured: rho -> 1e-18 |rh||r|).
@@ -543,7 +544,7 @@ std::expected<KrylovResult, std::string> Krylov<T>::bicgstab(const LinOp<T>& A, 
         if (!std::isfinite(d[0] + d[1] + d[2])) return nonFinite("bicgstab");
         ++res.iterations;
         const double sMeasure = l1 ? d[3] / nf : std::sqrt(d[2]);
-        if (sMeasure <= target && res.iterations >= o.minIter) { // converged at the half step
+        if (sMeasure <= target && res.iterations >= minIt) { // converged at the half step
             lin<T>(N, 1.0, x, alpha, ph, x);
             res.residual = sMeasure;
             break;
@@ -595,6 +596,7 @@ Krylov<T>::bicgstabBatch(int nb, unsigned mask, const LinOp<T>& A, const LinOp<T
     {
         KrylovResult res;
         double nf = 0, target = 0, rho = 1, alpha = 1, omega = 1, rhoNew = 0, rhNorm = 0, r2 = 0;
+        int minIt = 0;
         bool fresh = true;
     };
     std::array<Sys, kMaxBatch> S{};
@@ -616,7 +618,7 @@ Krylov<T>::bicgstabBatch(int nb, unsigned mask, const LinOp<T>& A, const LinOp<T
     };
     auto cont = [&](int j) {
         const Sys& q = S[std::size_t(j)];
-        return (q.res.residual > q.target || q.res.iterations < o.minIter) && q.res.iterations < o.maxIter;
+        return (q.res.residual > q.target || q.res.iterations < q.minIt) && q.res.iterations < o.maxIter;
     };
     auto lin = [&](const LinBatch& L, const T* xx, const T* yy, const T* zz, T* oo) {
         if (std::ranges::any_of(L.mode, [](int m) { return m != 0; }))
@@ -678,6 +680,7 @@ Krylov<T>::bicgstabBatch(int nb, unsigned mask, const LinOp<T>& A, const LinOp<T
             continue;
         }
         q.target = std::max(o.relTol * q.res.r0, o.absTol);
+        q.minIt = q.res.r0 > q.target ? std::max(o.minIter, o.minIterStarted) : o.minIter;
         q.rhoNew = dj[0];
         q.rhNorm = q.r2;
         if (!cont(j)) finish(j);
@@ -755,7 +758,7 @@ Krylov<T>::bicgstabBatch(int nb, unsigned mask, const LinOp<T>& A, const LinOp<T
             }
             ++q.res.iterations;
             const double sMeasure = l1 ? dj[3] / q.nf : std::sqrt(dj[2]);
-            if (sMeasure <= q.target && q.res.iterations >= o.minIter) { // converged at the half step
+            if (sMeasure <= q.target && q.res.iterations >= q.minIt) { // converged at the half step
                 Lx.mode[j] = 2;
                 Lx.a[j] = 1.0;
                 Lx.b[j] = q.alpha;

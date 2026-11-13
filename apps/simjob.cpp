@@ -30,7 +30,7 @@ constexpr const char* kUsage = R"(usage: simjob [--socket PATH] COMMAND ...
         one-step job. EXE without a slash is looked up in PATH. sha256 of EXE
         (and of every --verify FILE) is taken NOW; the server re-checks it at
         submit and again at launch, so a rebuilt binary is rejected, never run.
-        -t <= 1800 s, -m <= 16384 MB. --bench: runs alone on the machine.
+        -t <= 14400 s, -m <= 16384 MB. --bench: runs alone on the machine.
         --inherit-env sends this shell's whole environment (OpenFOAM needs it).
   submit --spec FILE.json [--inherit-env] [--wait]
         multi-step job (e.g. blockMesh, snappyHexMesh, decomposePar, mpirun).

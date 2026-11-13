@@ -1022,52 +1022,60 @@ void krylovCase(const std::string& gname, const CellGraph& g, bool spd, unsigned
                 for (const int minIt : {0, 2})
                     for (const int maxIt : {3, 200})
                         for (const double absTol : {0.0, 1e30}) // 1e30: converged at r0
-                            for (const bool r0First : {true, false}) {
-                            if (indef && !pcg) continue;
-                            if (!pcg && !r0First) continue;
-                            const BlockEll<T>& Op = indef ? Ai : A;
-                            const LinOp<T> Aop = [&](const T* in, T* o2) { Op.spmv(in, o2); };
-                            KrylovOptions o;
-                            o.relTol = 1e-8;
-                            o.absTol = absTol;
-                            o.minIter = minIt;
-                            o.maxIter = maxIt;
-                            o.flexible = pcg && minIt == 0;
-                            o.r0First = r0First;
-                            KrylovStart<T> st{};
-                            if (useStart) { // the FV solve's start: A x0 and normFactor terms on the device
-                                Op.spmv(x0.data(), Ax.data());
-                                kNormTerms<<<grid(N), kT>>>(int(N), Ax.data(), b.data(), nt.data());
-                                internal::DotArgs<T> da{};
-                                da.a[0] = nt.data();
-                                da.b[0] = nullptr;
-                                internal::deviceDots(N, da, 1, part.data(), sum.data());
-                                double h = 0;
-                                if (sum.download(&h) != hipSuccess) std::exit(1);
-                                o.normFactor = h + 1e-20; // the reference's host normFactor
-                                st = {Ax.data(), nt.data()};
-                            }
-                            copyDev(xa.data(), x0.data(), N);
-                            copyDev(xb.data(), x0.data(), N);
-                            KrylovOptions ol = o;
-                            if (useStart) ol.normFactor = 0; // the library takes it from st
-                            auto rl = pcg ? K.pcg(Aop, Mj, b.data(), xa.data(), ol, st)
-                                          : K.bicgstab(Aop, Mj, b.data(), xa.data(), ol, st);
-                            auto rr = pcg ? R.pcg(Aop, Mj, b.data(), xb.data(), o) : R.bicgstab(Aop, Mj, b.data(), xb.data(), o);
-                            ++cases;
-                            const bool ok = rl && rr && same(*rl, *rr) && bytes(xa.data(), N) == bytes(xb.data(), N);
-                            if (!ok) {
-                                ++fails;
-                                std::printf("    mismatch: %s indef %d start %d minIter %d maxIter %d absTol %g: it %d/%d "
-                                            "r0 %.17g/%.17g res %.17g/%.17g bd %d/%d\n",
-                                            pcg ? "pcg" : "bicgstab", indef, useStart, minIt, maxIt, absTol,
-                                            rl ? rl->iterations : -1, rr ? rr->iterations : -1, rl ? rl->r0 : 0,
-                                            rr ? rr->r0 : 0, rl ? rl->residual : 0, rr ? rr->residual : 0,
-                                            rl ? rl->breakdown : 0, rr ? rr->breakdown : 0);
-                            }
-                            }
+                            for (const bool r0First : {true, false})
+                                for (const int started : {0, 2}) { // KrylovOptions::minIterStarted
+                                    if (indef && !pcg) continue;
+                                    if (!pcg && !r0First) continue;
+                                    if (pcg && started) continue; // PCG does not read it
+                                    const BlockEll<T>& Op = indef ? Ai : A;
+                                    const LinOp<T> Aop = [&](const T* in, T* o2) { Op.spmv(in, o2); };
+                                    KrylovOptions o;
+                                    o.relTol = 1e-8;
+                                    o.absTol = absTol;
+                                    o.minIter = minIt;
+                                    o.maxIter = maxIt;
+                                    o.flexible = pcg && minIt == 0;
+                                    o.r0First = r0First;
+                                    KrylovStart<T> st{};
+                                    if (useStart) { // the FV solve's start: A x0 and normFactor terms on the device
+                                        Op.spmv(x0.data(), Ax.data());
+                                        kNormTerms<<<grid(N), kT>>>(int(N), Ax.data(), b.data(), nt.data());
+                                        internal::DotArgs<T> da{};
+                                        da.a[0] = nt.data();
+                                        da.b[0] = nullptr;
+                                        internal::deviceDots(N, da, 1, part.data(), sum.data());
+                                        double h = 0;
+                                        if (sum.download(&h) != hipSuccess) std::exit(1);
+                                        o.normFactor = h + 1e-20; // the reference's host normFactor
+                                        st = {Ax.data(), nt.data()};
+                                    }
+                                    copyDev(xa.data(), x0.data(), N);
+                                    copyDev(xb.data(), x0.data(), N);
+                                    KrylovOptions ol = o;
+                                    if (useStart) ol.normFactor = 0; // the library takes it from st
+                                    ol.minIterStarted = started;
+                                    // the oracle: minIter 2 when the solve starts (absTol 0, relTol 1e-8:
+                                    // r0 above the target), minIter when converged at r0 (absTol 1e30)
+                                    o.minIter = (started && absTol == 0.0) ? std::max(minIt, started) : minIt;
+                                    auto rl = pcg ? K.pcg(Aop, Mj, b.data(), xa.data(), ol, st)
+                                                  : K.bicgstab(Aop, Mj, b.data(), xa.data(), ol, st);
+                                    auto rr =
+                                        pcg ? R.pcg(Aop, Mj, b.data(), xb.data(), o) : R.bicgstab(Aop, Mj, b.data(), xb.data(), o);
+                                    ++cases;
+                                    const bool ok = rl && rr && same(*rl, *rr) && bytes(xa.data(), N) == bytes(xb.data(), N);
+                                    if (!ok) {
+                                        ++fails;
+                                        std::printf("    mismatch: %s indef %d start %d minIter %d maxIter %d absTol %g "
+                                                    "started %d: it %d/%d r0 %.17g/%.17g res %.17g/%.17g bd %d/%d\n",
+                                                    pcg ? "pcg" : "bicgstab", indef, useStart, minIt, maxIt, absTol, started,
+                                                    rl ? rl->iterations : -1, rr ? rr->iterations : -1, rl ? rl->r0 : 0,
+                                                    rr ? rr->r0 : 0, rl ? rl->residual : 0, rr ? rr->residual : 0,
+                                                    rl ? rl->breakdown : 0, rr ? rr->breakdown : 0);
+                                    }
+                                }
     check(fails == 0, gname + (spd ? " SPD" : " non-symmetric") + ": pcg / bicgstab (start or not, minIter 0/2, maxIter "
-                      "3/200, converged at r0, r0First or not, indefinite breakdown) == the pre-change loops bit for bit (" +
+                      "3/200, converged at r0, r0First or not, minIterStarted 0/2 (== minIter 2 when it starts, == "
+                      "minIter when converged at r0), indefinite breakdown) == the pre-change loops bit for bit (" +
                       std::to_string(cases) + " cases)");
     // the pre-flag: the solve stops at its first readback, x untouched, flag cleared
     const LinOp<T> Aop = [&](const T* in, T* o2) { A.spmv(in, o2); };
@@ -1127,15 +1135,18 @@ void batchCase(const std::string& gname, const CellGraph& g, unsigned seed)
     okOp = bytes(y1.data(), 3 * N) == bytes(y3.data(), 3 * N) && bytes(xs.data(), 3 * N) == bytes(xb.data(), 3 * N);
     check(okOp, gname + ": spmvMulti / factorMulti + applyMulti == spmv / factor + apply per system, bit for bit");
     int fails = 0, cases = 0;
+    int startedIdle = 0; // started 2, minIter 0, system 1 at r0 = 0: 0 iterations, x untouched
     for (const unsigned mask : {7u, 5u, 2u})
         for (const bool useStart : {false, true})
             for (const int minIt : {0, 2})
                 for (const int maxIt : {2, 300})
-                    for (const int special : {0, 1, 2}) { // 1: system 1 starts converged; 2: system 2's factor fails
+                    for (const int special : {0, 1, 2}) // 1: system 1 starts converged; 2: system 2's factor fails
+                    for (const int started : {0, 2}) { // KrylovOptions::minIterStarted
                         KrylovOptions o;
                         o.relTol = 1e-9;
                         o.minIter = minIt;
                         o.maxIter = maxIt;
+                        o.minIterStarted = started;
                         std::vector<double> d = d3;
                         if (special == 2) d[2 * N + N / 2] = 0.0;
                         auto dd = devVec<T>(d);
@@ -1198,14 +1209,24 @@ void batchCase(const std::string& gname, const CellGraph& g, unsigned seed)
                         for (int j = 0; ok && j < 3; ++j) // masked-out systems untouched
                             if (!((mask >> j) & 1u))
                                 ok = bytes(xb.data() + std::size_t(j) * N, N) == bytes(x0.data() + std::size_t(j) * N, N);
+                        if (ok && special == 1 && started == 2 && minIt == 0 && ((mask >> 1) & 1u)) {
+                            // converged at r0 (exact zero): minIterStarted does not start it, x0 kept
+                            const auto& q = (*rb)[1];
+                            ok = q && q->iterations == 0 && solo[1].iterations == 0 &&
+                                 bytes(xb.data() + N, N) == bytes(x0.data() + N, N) &&
+                                 bytes(xs.data() + N, N) == bytes(x0.data() + N, N);
+                            startedIdle += ok;
+                        }
                         if (!ok) {
                             ++fails;
-                            std::printf("    batch mismatch: mask %u start %d minIter %d maxIter %d special %d\n", mask,
-                                        useStart, minIt, maxIt, special);
+                            std::printf("    batch mismatch: mask %u start %d minIter %d maxIter %d special %d started %d\n",
+                                        mask, useStart, minIt, maxIt, special, started);
                         }
                     }
-    check(fails == 0, gname + ": bicgstabBatch == one bicgstab per system bit for bit (masks 7/5/2, start or not, "
-                      "minIter, maxIter, a system converged at r0, a failed factor; " + std::to_string(cases) + " cases)");
+    check(fails == 0 && startedIdle == 8,
+          gname + ": bicgstabBatch == one bicgstab per system bit for bit (masks 7/5/2, start or not, minIter, maxIter, "
+                  "minIterStarted 0/2, a system converged at r0 (minIterStarted 2: 0 iterations, x0 kept, " +
+                  std::to_string(startedIdle) + " cases), a failed factor; " + std::to_string(cases) + " cases)");
 }
 } // namespace
 

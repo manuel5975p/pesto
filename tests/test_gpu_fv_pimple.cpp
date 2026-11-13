@@ -37,6 +37,11 @@
 // residual of every corrector (1e-8 relative where above 1e-9); force.dat;
 // 2D: the empty-axis U exactly 0; two runs byte-identical; FP32 runs and stays
 // within a stated band of FP64.
+// Loose solves (kPimpleLooseMinIter, issues.md 65 (p)), cases edited after
+// loading: L1 amixtilt U relTol 0.1, every non-final U solve >= 2 iterations,
+// two runs byte-identical; L2 psst_skew U / k / omega relTol 0.1, outer
+// corrector 1's solves >= 2 iterations; L3 the same at tolerance 1e30, 0
+// iterations and final == initial (converged at r0 keeps x0).
 #include "dns/foamio.hpp"
 #include "dns/fvpimple.hpp"
 #include "dns/fvsimple.hpp"
@@ -54,6 +59,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -86,12 +92,15 @@ struct Run
 };
 
 // The run loop of gpu::runFvPimple without its outputs: FoamClock + DeviceSimple.
-std::expected<Run, std::string> run(const char* name, const FvNumerics& num = {}, int maxSteps = 0)
+// edit: applied to the loaded case before anything is built (e.g. a looser solver entry).
+std::expected<Run, std::string> run(const char* name, const FvNumerics& num = {}, int maxSteps = 0,
+                                    const std::function<void(FoamCase&)>& edit = {})
 {
     Run r;
     auto L = loadFvCase(fs::path(DNS_FV_DATA) / name);
     if (!L) return std::unexpected(L.error());
     r.L = std::move(*L);
+    if (edit) edit(r.L.c);
     if (!r.L.c.pimple.on) return std::unexpected("not a pimpleFoam case");
     auto graph = buildFvGraph(r.L.pm, r.L.fm);
     if (!graph) return std::unexpected(graph.error());
@@ -528,6 +537,123 @@ void determinism()
     }
 }
 
+// The loose-solve rule (kPimpleLooseMinIter, issues.md 65 (p)): a non-final
+// BiCGStab + MC-GS solve (U; k, omega with turbOnFinalIterOnly no) whose entry
+// has relTol > 0 iterates at least twice once it starts; one converged at r0
+// keeps x0. Every gate case is relTol 0, so the cases are edited after loading.
+void looseSolves()
+{
+    using gpu::FvIterLog, gpu::FvSolveLog;
+    std::printf("loose solves (relTol > 0: >= 2 BiCGStab iterations once started)\n");
+    const auto looseU = [](FoamCase& c) { c.solverU.relTol = 0.1; };
+    const auto looseAll = [](FoamCase& c) {
+        c.solverU.relTol = c.ras.solverK.relTol = c.ras.solverOmega.relTol = 0.1;
+    };
+    const auto convergedAll = [&](FoamCase& c) {
+        looseAll(c);
+        c.solverU.tolerance = c.ras.solverK.tolerance = c.ras.solverOmega.tolerance = 1e30;
+    };
+    // L1: amixtilt (rotating cyclicAMI, kOmegaSST, nOuter 3), U relTol 0.1
+    {
+        auto a = run("amixtilt", {}, 10, looseU);
+        auto b = run("amixtilt", {}, 10, looseU);
+        if (!a || !b || a->steps.empty()) {
+            check(false, std::string("L1 amixtilt runs: ") + (a ? (b ? "no steps" : b.error()) : a.error()));
+        } else {
+            int n = 0, two = 0, bad = 0;
+            for (const Step& st : a->steps)
+                for (std::size_t k = 0; k + 1 < st.log.outer.size(); ++k)
+                    for (const FvSolveLog& u : st.log.outer[k].U) {
+                        if (u.initial == 0) continue; // unsolved component
+                        ++n;
+                        two += u.iterations == 2;
+                        bad += u.iterations < 2;
+                    }
+            check(n > 0 && bad == 0, std::format("L1 amixtilt, U relTol 0.1, {} steps: every non-final U solve takes >= 2 "
+                                                 "iterations ({} solves, {} at exactly 2, {} below)",
+                                                 a->steps.size(), n, two, bad));
+            bool same = a->steps.size() == b->steps.size();
+            const auto eq = [](const FvSolveLog& x, const FvSolveLog& y) {
+                return x.initial == y.initial && x.final == y.final && x.iterations == y.iterations;
+            };
+            for (std::size_t i = 0; same && i < a->steps.size(); ++i) {
+                const Step& x = a->steps[i];
+                const Step& y = b->steps[i];
+                same = x.deltaT == y.deltaT && x.coMax == y.coMax && x.log.outer.size() == y.log.outer.size();
+                for (std::size_t k = 0; same && k < x.log.outer.size(); ++k) {
+                    const FvIterLog& p = x.log.outer[k];
+                    const FvIterLog& q = y.log.outer[k];
+                    same = p.p.size() == q.p.size();
+                    for (int j = 0; same && j < 3; ++j) same = eq(p.U[std::size_t(j)], q.U[std::size_t(j)]);
+                    for (std::size_t j = 0; same && j < p.p.size(); ++j) same = eq(p.p[j], q.p[j]);
+                }
+            }
+            check(same, "L1 two amixtilt loose runs: deltaT, Courant numbers and every U / p initial, final, iterations "
+                        "byte-identical");
+        }
+    }
+    // L2: psst_skew (nOuter 2, turbOnFinalIterOnly no, PBiCGStab entries: the rule is name-independent), U, k,
+    // omega relTol 0.1
+    {
+        auto a = run("psst_skew", {}, 10, looseAll);
+        if (!a || a->steps.empty()) {
+            check(false, std::string("L2 psst_skew run: ") + (a ? "no steps" : a.error()));
+        } else {
+            int nU = 0, nT = 0, bad = 0;
+            for (const Step& st : a->steps) {
+                if (st.log.outer.size() != 2) ++bad;
+                if (st.log.outer.empty()) continue;
+                const FvIterLog& o = st.log.outer[0];
+                for (const FvSolveLog& u : o.U)
+                    if (u.initial != 0) {
+                        ++nU;
+                        bad += u.iterations < 2;
+                    }
+                if (o.nT == 0) ++bad;
+                for (int q = 0; q < o.nT; ++q) {
+                    ++nT;
+                    bad += o.T[std::size_t(q)].iterations < 2;
+                }
+            }
+            check(nU > 0 && nT > 0 && bad == 0,
+                  std::format("L2 psst_skew, U / k / omega relTol 0.1, {} steps: outer corrector 1's U ({} solves) and "
+                              "k / omega ({} solves) take >= 2 iterations ({} violations)",
+                              a->steps.size(), nU, nT, bad));
+        }
+    }
+    // L3: as L2 with tolerance 1e30: converged at r0, no iteration, x0 kept
+    {
+        auto a = run("psst_skew", {}, 10, convergedAll);
+        if (!a || a->steps.empty()) {
+            check(false, std::string("L3 psst_skew run: ") + (a ? "no steps" : a.error()));
+        } else {
+            int n = 0, bad = 0;
+            const auto idle = [](const FvSolveLog& s) { return s.iterations == 0 && s.final == s.initial; };
+            for (const Step& st : a->steps) {
+                if (st.log.outer.empty()) {
+                    ++bad;
+                    continue;
+                }
+                const FvIterLog& o = st.log.outer[0];
+                for (const FvSolveLog& u : o.U)
+                    if (u.initial != 0) {
+                        ++n;
+                        bad += !idle(u);
+                    }
+                if (o.nT == 0) ++bad;
+                for (int q = 0; q < o.nT; ++q) {
+                    ++n;
+                    bad += !idle(o.T[std::size_t(q)]);
+                }
+            }
+            check(n > 0 && bad == 0, std::format("L3 psst_skew, U / k / omega relTol 0.1 tolerance 1e30, {} steps: outer "
+                                                 "corrector 1's solves converged at r0 take 0 iterations, final == "
+                                                 "initial ({} solves, {} violations)",
+                                                 a->steps.size(), n, bad));
+        }
+    }
+}
+
 // FP32 (the CLI's default precision, default floors) vs FP64 at the last write time.
 void gateFp32(const char* name, double band, double nutBand)
 {
@@ -583,6 +709,7 @@ int main()
     gate("A1p", "apartial");
     gate("A5", "amixtilt");
     determinism();
+    looseSolves();
     gateFp32("pcavity_skew", 1e-3, 1e-3);
     gateFp32("psst_plate", 1e-3, 2e-1);
     gateFp32("psst_skew", 1e-3, 1e-2);

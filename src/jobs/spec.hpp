@@ -16,7 +16,7 @@
 namespace jobs {
 
 // Hard caps. A spec over either is rejected at submit, never clamped.
-inline constexpr int kMaxRuntimeS = 1800;      // 30 min
+inline constexpr int kMaxRuntimeS = 14400;     // 4 h
 inline constexpr std::int64_t kMaxMemMb = 16384; // 16 GiB
 inline constexpr std::int64_t kMinMemMb = 16;    // below this the runner itself cannot live
 inline constexpr std::size_t kMaxSteps = 64;

@@ -21,6 +21,14 @@ using namespace fvd;
 
 namespace {
 
+// A pimpleFoam BiCGStab + multicolour-GS solve stopped by relTol > 0 iterates at
+// least twice once it starts: its first iterate (the half-step exit = one MC
+// symmetric sweep, alpha ~ 1) is not OpenFOAM's one SEQUENTIAL symGaussSeidel
+// sweep. M17 (issues.md 65 (p)), FP64, user tolerances, vs dns relTol 0 over 20
+// steps: aft thrust 3.1e-3 with one iteration, 4.9e-5 with two (pimpleFoam's
+// own loose run: 1.2e-4).
+constexpr int kPimpleLooseMinIter = 2;
+
 // phiHbyA += interpolate(rAU) ddtCorr(U, phi), internal faces.
 // EulerDdtScheme::fvcDdtPhiCorr: phiCorr = phi.oldTime() - (Sf & interpolate(
 // U.oldTime())); ddtCorr = (ddtCouplingCoeff rDeltaT) phiCorr with
@@ -467,6 +475,7 @@ std::expected<FvStepLog, std::string> SimpleImpl<R>::timeStep(double deltaT, con
     const int nOuter = pc.nOuter, nCorr = pc.nCorr, nNonOrth = fc.simple.nNonOrthCorr;
     const bool sst = fc.ras.model == FvTurbModel::KOmegaSST;
     r0First = false;
+    looseMinIter = kPimpleLooseMinIter;
     FvStepLog out;
     for (int corr = 1; corr <= nOuter; ++corr) { // while (pimple.loop())
         const bool fin = corr == nOuter;         // mesh.data().isFinalIteration()

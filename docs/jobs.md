@@ -12,7 +12,7 @@ tree (`build/simjobd`, `build/simjob`) and link nothing of the solver.
   may overlap. FIFO per resource. A `benchmark` job runs ALONE: it starts only
   when nothing runs and nothing submitted before it still waits, and nothing
   submitted after it starts until it ends.
-- **Limits are hard and capped.** `max_runtime_s` ≤ 1800 (30 min) for the whole
+- **Limits are hard and capped.** `max_runtime_s` ≤ 14400 (4 h) for the whole
   job, all steps; `max_mem_mb` ≤ 16384 (16 GiB) for the whole job's cgroup, swap
   0. Over a cap is a refusal at submit, never a clamp. At the deadline every
   process in the job gets SIGTERM, then SIGKILL 10 s later (`cgroup.kill`).
